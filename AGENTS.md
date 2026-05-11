@@ -13,6 +13,7 @@ User-facing:
 - `docs/directives.md`
 - `docs/diagnostics.md`
 - `docs/indentation.md`
+- `docs/syntax-highlighting.md`
 - `docs/r-console.md`
 - `docs/plot-viewer.md`
 - `docs/data-viewer.md`

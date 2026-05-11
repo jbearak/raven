@@ -24,7 +24,7 @@ Compared with [REditorSupport's R extension](https://marketplace.visualstudio.co
 - **[Smart indentation](https://github.com/jbearak/raven/blob/main/docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Cross-file awareness](https://github.com/jbearak/raven/blob/main/docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **Syntax highlighting** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
+- **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
 ### R session integration
 
