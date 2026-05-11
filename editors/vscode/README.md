@@ -72,7 +72,7 @@ If you work with Stata, see [Sight](https://github.com/jbearak/sight) — a Stat
 
 ## More Information
 
-See the [main repository](https://github.com/jbearak/raven) for full documentation including cross-file directives, editor integrations, a [comparison with other R tools](https://github.com/jbearak/raven/blob/main/docs/comparison.md), and [why Raven exists](https://github.com/jbearak/raven/blob/main/docs/comparison.md#why-raven-exists).
+See the [main repository](https://github.com/jbearak/raven) for full documentation including cross-file directives, editor integrations, and comparison with other R tools.
 
 ## License
 
