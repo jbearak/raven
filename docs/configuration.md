@@ -47,6 +47,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | `raven.packages.missingPackageSeverity` | `"warning"` | Severity for missing package diagnostics (`"off"` to disable) |
 | `raven.packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on install/remove |
 | `raven.packages.watchDebounceMs` | `500` | Coalesce rapid filesystem events into a single invalidation pass (ms) |
+| `raven.packages.packageMode` | `"auto"` | R package workspace mode: `"auto"` (detect DESCRIPTION), `"enabled"` (always), `"disabled"` (never). See [R Package Development](r-package-dev.md). |
 
 ### Refresh Command
 

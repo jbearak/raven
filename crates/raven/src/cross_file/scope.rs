@@ -2887,6 +2887,11 @@ pub fn scope_at_position_with_graph<F, G>(
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
+    // Package-mode contribution. When `Some`, provides the set of symbols
+    // defined in `R/` files and imported via NAMESPACE so that package-internal
+    // and imported symbols can be resolved via the standard scope engine
+    // (Phase 5a wires the actual scope injection).
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -2921,6 +2926,7 @@ where
         is_cancelled,
         true,
         None,
+        package_contribution,
     )
 }
 
@@ -2985,6 +2991,9 @@ pub fn scope_at_position_with_graph_cached<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &mut ParentPrefixCache,
+    // Package-mode contribution. When `Some`, synthetic package-internal and
+    // imported symbols are injected into the root-file scope (Phase 5a).
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -3072,6 +3081,7 @@ where
         is_cancelled,
         true,
         Some(&prefix_arc),
+        package_contribution,
     )
 }
 
@@ -3289,6 +3299,7 @@ where
             is_cancelled,
             false,
             None,
+            None,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -3484,6 +3495,15 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // 1 across snapshots' diagnostic passes. Internal recursion (parent walks
     // in `parent_prefix_at`, forward children in STEP 2) always passes `None`.
     pre_computed_prefix: Option<&Arc<ParentPrefix>>,
+    // Package-mode contribution. Only consulted at depth 0 (the root query
+    // file). When `Some` and the queried file is under `<root>/R/` or
+    // `<root>/tests/testthat/`, synthetic `ScopedSymbol` entries for
+    // package-internal and NAMESPACE-imported symbols are appended to
+    // `scope.symbols` after all local timeline events have been processed,
+    // filling in any names not already resolved by the standard scope engine.
+    // Internal recursive calls (forward source children, parent walks) always
+    // receive `None` — the contribution applies only to the root query file.
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -3858,6 +3878,7 @@ where
                                 is_cancelled,
                                 true,
                                 None,
+                                None,
                             )
                         } else {
                             scope_at_position_with_graph_recursive(
@@ -3878,6 +3899,7 @@ where
                                 backward_dep_mode,
                                 is_cancelled,
                                 false,
+                                None,
                                 None,
                             )
                         };
@@ -4048,7 +4070,100 @@ where
         }
     }
 
+    // Phase 5a: inject package-mode contribution at depth 0 only.
+    // Appends synthetic ScopedSymbol entries for package-internal symbols and
+    // NAMESPACE-imported symbols that were not already resolved by the
+    // standard scope engine above. This ensures existing local definitions
+    // always take precedence (additive-only).
+    if current_depth == 0 {
+        if let Some(contrib) = package_contribution {
+            append_package_contribution(&mut scope.symbols, uri, contrib);
+        }
+    }
+
     scope
+}
+
+/// Synthetic `source_uri` used for symbols injected by
+/// [`append_package_contribution`].
+///
+/// Package-mode "contribution" symbols (package-internal defs from sibling
+/// `R/*.R` files and `importFrom` NAMESPACE targets) don't carry per-symbol
+/// file locations, so they get this stable synthetic URI instead. Downstream
+/// consumers that filter by URI scheme (completions, goto-definition, hover)
+/// should compare against this constant rather than matching `"package:"` as a
+/// prefix — that prefix also covers external package-export pseudo-URIs
+/// (`package:dplyr`, `package:base`, ...) which need different handling.
+pub const PACKAGE_INTERNAL_URI: &str = "package:///internal";
+
+/// Returns `true` when `uri` is the synthetic package-internal URI produced by
+/// [`append_package_contribution`].
+pub fn is_package_internal_uri(uri: &Url) -> bool {
+    uri.as_str() == PACKAGE_INTERNAL_URI
+}
+
+/// Inject package-mode symbols into a visible-symbol map for Phase 5a.
+///
+/// Called only at depth 0 from `scope_at_position_with_graph_recursive`.
+/// Inserts synthetic `ScopedSymbol` entries for:
+/// - Every name in `contrib.r_internal_symbols` (package-internal definitions)
+/// - Every key in `contrib.imported_symbols` (NAMESPACE `importFrom` targets)
+///
+/// Names already present in `symbols` are NOT overwritten — local and cross-file
+/// definitions always take precedence. `full_imports` entries are intentionally
+/// skipped: enumerating their symbols requires the package library, which is
+/// handled by the existing `pkg_resolver` / combined-exports path.
+pub(crate) fn append_package_contribution(
+    symbols: &mut HashMap<Arc<str>, ScopedSymbol>,
+    uri: &Url,
+    contrib: &crate::package_state::PackageScopeContribution,
+) {
+    let Some(root) = contrib.workspace_root.as_ref() else {
+        return;
+    };
+    let Ok(path) = uri.to_file_path() else {
+        return;
+    };
+    // Only inject for files under <root>/R/ or <root>/tests/testthat/.
+    if crate::package_state::is_r_source_path(&path, root).is_none() {
+        return;
+    }
+
+    // Use a synthetic URI scheme for package-internal symbols so consumers
+    // can distinguish them from real file-backed definitions.
+    let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
+        .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
+
+    // `PackageScopeContribution` does not (yet) carry per-symbol metadata, so
+    // we cannot classify injected symbols as function vs. variable. Default
+    // to `Variable` — the neutral choice — so non-function imports and
+    // assignments aren't misclassified as functions. When
+    // `PackageScopeContribution` propagates kind metadata, use it here.
+    for sym in contrib.r_internal_symbols.iter() {
+        let name: Arc<str> = Arc::from(sym.as_str());
+        symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
+            name,
+            kind: SymbolKind::Variable,
+            source_uri: pkg_uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+            is_declared: false,
+        });
+    }
+
+    for sym in contrib.imported_symbols.keys() {
+        let name: Arc<str> = Arc::from(sym.as_str());
+        symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
+            name,
+            kind: SymbolKind::Variable,
+            source_uri: pkg_uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+            is_declared: false,
+        });
+    }
 }
 
 // ============================================================================
@@ -5040,6 +5155,7 @@ where
             self.is_cancelled,
             true,
             Some(&child_prefix),
+            None,
         );
 
         // Same-file leak filter: drop child symbols whose `source_uri` is
@@ -5591,6 +5707,7 @@ mod tests {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -5790,6 +5907,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -5816,6 +5934,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_function.symbols.contains_key("child_var"),
@@ -5891,6 +6010,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -5919,6 +6039,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_after_function.symbols.contains_key("child_var"),
@@ -6031,6 +6152,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -6109,6 +6231,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -6229,6 +6352,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -6372,6 +6496,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -6541,6 +6666,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Should have depth_exceeded entry
@@ -6737,6 +6863,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -6827,6 +6954,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -9099,6 +9227,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -9119,6 +9248,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -9139,6 +9269,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_eof.symbols.contains_key("helper_func"),
@@ -9218,6 +9349,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -9246,6 +9378,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -9383,6 +9516,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_at_x.symbols.contains_key("z"),
@@ -9478,6 +9612,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -9569,6 +9704,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -9653,6 +9789,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -9673,6 +9810,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -9693,6 +9831,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_after_redef.symbols.contains_key("helper_func"),
@@ -9779,6 +9918,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -9865,6 +10005,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -9885,6 +10026,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_in_parent.symbols.contains_key("helper_func"),
@@ -9988,6 +10130,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -10008,6 +10151,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("deep_func"),
@@ -10121,6 +10265,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -11831,6 +11976,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Child should have inherited dplyr from parent
@@ -11910,6 +12056,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -11989,6 +12136,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Child should have both packages
@@ -12073,6 +12221,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -12147,6 +12296,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -12231,6 +12381,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -12312,6 +12463,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Symbols from child SHOULD be available in parent
@@ -12431,6 +12583,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -12455,6 +12608,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
@@ -12537,6 +12691,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -12561,6 +12716,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
@@ -12719,6 +12875,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -12823,6 +12980,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
 
         assert!(
@@ -12846,6 +13004,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
         );
 
         assert!(
@@ -13423,6 +13582,7 @@ y <- filter(df)"#;
                         crate::cross_file::config::BackwardDependencyMode::Auto,
                         &is_cancelled,
                         &mut throwaway,
+                        None,
                     );
 
                     let streamed_syms: std::collections::BTreeSet<String> =
@@ -13686,6 +13846,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
             );
 
             let stream_has_x = streamed.symbols.contains_key("x");
@@ -13836,6 +13997,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
             );
 
             let stream_x = streamed
@@ -13956,6 +14118,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
             );
 
             // Both paths should include helper_uri in chain (forward source()).
@@ -14165,6 +14328,7 @@ y <- filter(df)"#;
                 true, // hoisting ON
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -14186,6 +14350,7 @@ y <- filter(df)"#;
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -14238,6 +14403,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -14368,6 +14534,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -14456,6 +14623,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -14604,6 +14772,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -14744,6 +14913,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -14874,6 +15044,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15012,6 +15183,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15130,6 +15302,7 @@ y <- filter(df)"#;
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15263,6 +15436,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15368,6 +15542,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15483,6 +15658,7 @@ y <- filter(df)"#;
                 true, // hoisting ON, but query is at global level
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             // At global level, parent is queried at call site (line 0 col 0),
@@ -15634,6 +15810,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15773,6 +15950,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15865,6 +16043,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -15989,6 +16168,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -16074,6 +16254,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -16209,6 +16390,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -16236,6 +16418,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -16321,6 +16504,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             assert!(
@@ -16462,6 +16646,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             &mut cache,
+            None,
         );
 
         // Query 2: inside child's function body (line 2 col 4).
@@ -16479,6 +16664,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             &mut cache,
+            None,
         );
 
         // After both queries, cache must have two entries (one per inside bit).
@@ -16569,6 +16755,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
                 &mut cache,
+                None,
             );
             let direct = scope_at_position_with_graph(
                 &child_uri,
@@ -16583,6 +16770,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
             );
 
             // Compare key fields. Symbol HashMap, package sets, package
@@ -16707,6 +16895,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
             );
 
             let streamed_syms: std::collections::BTreeSet<&str> =
@@ -16968,6 +17157,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &mut throwaway,
+            None,
         );
         assert!(
             direct.symbols.contains_key("x"),
@@ -17069,6 +17259,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &mut throwaway,
+            None,
         );
         assert!(
             !direct.symbols.contains_key("fa"),
@@ -17081,6 +17272,456 @@ y <- filter(df)"#;
         assert_eq!(
             stream_names, direct_names,
             "stream and recursive resolver must agree on symbol set inside sibling function",
+        );
+    }
+}
+
+// ============================================================================
+// Phase 5a integration tests: PackageScopeContribution → scope injection
+// ============================================================================
+
+// These tests use hard-coded POSIX file URLs (e.g. `file:///work/pkg/...`).
+// On Windows, `Url::to_file_path()` rejects such URLs, so gate the module
+// to Unix-only rather than teaching every test to build platform-specific
+// URIs.
+#[cfg(all(test, unix))]
+mod package_contribution_tests {
+    use super::*;
+    use crate::package_state::PackageScopeContribution;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use tree_sitter::Parser;
+
+    fn parse_r(code: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    /// Build a minimal `PackageScopeContribution` with the given internal symbols
+    /// and imported symbols, rooted at `workspace_root_path`.
+    fn make_contribution(
+        workspace_root_path: &str,
+        internal: &[&str],
+        imported: &[&str],
+    ) -> PackageScopeContribution {
+        let r_internal_symbols: BTreeSet<String> = internal.iter().map(|s| s.to_string()).collect();
+        let imported_symbols: BTreeMap<String, BTreeSet<String>> = imported
+            .iter()
+            .map(|s| (s.to_string(), BTreeSet::new()))
+            .collect();
+        PackageScopeContribution {
+            workspace_root: Some(std::path::PathBuf::from(workspace_root_path)),
+            r_internal_symbols: Arc::new(r_internal_symbols),
+            imported_symbols: Arc::new(imported_symbols),
+            full_imports: Arc::new(BTreeSet::new()),
+        }
+    }
+
+    /// Parse R code and return a `ScopeArtifacts` (no cross-file graph needed).
+    fn artifacts_for(uri: &Url, code: &str) -> Arc<ScopeArtifacts> {
+        let tree = parse_r(code);
+        Arc::new(compute_artifacts(uri, &tree, code))
+    }
+
+    // ------------------------------------------------------------------
+    // Test 1: package-internal symbol visible in file under R/
+    // ------------------------------------------------------------------
+
+    /// When `r_internal_symbols` carries `helper` and the queried file is
+    /// under `<root>/R/`, the scope result must list `helper` as visible even
+    /// though it is not defined in the queried file itself (simulating mutual
+    /// visibility across package files).
+    #[test]
+    fn package_internal_symbol_resolves_via_scope() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // main.R: calls helper() — the definition lives in another R/ file
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- helper()";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Without contribution, `helper` is NOT in scope.
+        let scope_no_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+        );
+        assert!(
+            !scope_no_contrib.symbols.contains_key("helper"),
+            "without contribution, helper must not be in scope"
+        );
+
+        // With contribution carrying `helper`, it MUST appear.
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope_with_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope_with_contrib.symbols.contains_key("helper"),
+            "with contribution, helper must be visible in R/ file. \
+             visible symbols: {:?}",
+            scope_with_contrib.symbols.keys().collect::<Vec<_>>()
+        );
+        let sym = scope_with_contrib.symbols.get("helper").unwrap();
+        // `PackageScopeContribution` does not carry per-symbol kind metadata,
+        // so injected symbols default to `Variable` (the neutral choice).
+        assert_eq!(sym.kind, SymbolKind::Variable);
+        assert!(
+            sym.source_uri.as_str().starts_with("package:"),
+            "synthetic symbol source_uri must use package: scheme, got {}",
+            sym.source_uri
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 2: NAMESPACE-imported symbol visible in file under R/
+    // ------------------------------------------------------------------
+
+    /// When `imported_symbols` carries `filter` (e.g. from a NAMESPACE
+    /// `importFrom(dplyr, filter)`) and the queried file is under `<root>/R/`,
+    /// the scope result must list `filter` as visible.
+    #[test]
+    fn imported_symbol_resolves_via_scope() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- filter(df, x > 0)";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Without contribution, `filter` is not in scope (no library() call).
+        let scope_no_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+        );
+        assert!(
+            !scope_no_contrib.symbols.contains_key("filter"),
+            "without contribution, filter must not be in scope"
+        );
+
+        // With contribution, `filter` must appear.
+        let contrib = make_contribution("/work/pkg", &[], &["filter"]);
+        let scope_with_contrib = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope_with_contrib.symbols.contains_key("filter"),
+            "with contribution, filter must be visible in R/ file. \
+             visible symbols: {:?}",
+            scope_with_contrib.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 3: contribution does NOT inject into file outside R/
+    // ------------------------------------------------------------------
+
+    /// A file NOT under `<root>/R/` or `<root>/tests/testthat/` must NOT
+    /// receive the package contribution, even when `Some(&contrib)` is passed.
+    #[test]
+    fn contribution_not_injected_outside_r_dir() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // Script under inst/ — not a package source file.
+        let script_uri = Url::parse("file:///work/pkg/inst/script.R").unwrap();
+        let script_code = "result <- helper()";
+        let script_arts = artifacts_for(&script_uri, script_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &script_uri {
+                Some(script_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope = scope_at_position_with_graph(
+            &script_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("helper"),
+            "files outside R/ must not receive package contribution; \
+             visible symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: package-internal symbol visible in tests/testthat/ file
+    // ------------------------------------------------------------------
+
+    /// Mirrors `package_internal_symbol_resolves_via_scope` but for a file under
+    /// `tests/testthat/`. The scope engine must inject the contribution into
+    /// test files (one-way visibility: test files see R/ symbols).
+    #[test]
+    fn package_contribution_visible_in_testthat_files() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // test-x.R: calls helper() — defined in R/ (not in this file).
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-x.R").unwrap();
+        let test_code = "result <- helper()";
+        let test_arts = artifacts_for(&test_uri, test_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &test_uri {
+                Some(test_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Without contribution, `helper` is NOT in scope.
+        let scope_no_contrib = scope_at_position_with_graph(
+            &test_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+        );
+        assert!(
+            !scope_no_contrib.symbols.contains_key("helper"),
+            "without contribution, helper must not be in scope for test file"
+        );
+
+        // With contribution carrying `helper` in r_internal_symbols, it MUST
+        // appear in the test file's scope (tests → R/ one-way visibility).
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope_with_contrib = scope_at_position_with_graph(
+            &test_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope_with_contrib.symbols.contains_key("helper"),
+            "with contribution, helper must be visible in tests/testthat/ file. \
+             visible symbols: {:?}",
+            scope_with_contrib.symbols.keys().collect::<Vec<_>>()
+        );
+        let sym = scope_with_contrib.symbols.get("helper").unwrap();
+        // `PackageScopeContribution` does not carry per-symbol kind metadata,
+        // so injected symbols default to `Variable` (the neutral choice).
+        assert_eq!(sym.kind, SymbolKind::Variable);
+        assert!(
+            sym.source_uri.as_str().starts_with("package:"),
+            "synthetic symbol source_uri must use package: scheme, got {}",
+            sym.source_uri
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: test-file symbols do NOT pollute contribution seen by R/ files
+    // ------------------------------------------------------------------
+
+    /// The `r_internal_symbols` set is built exclusively from R/ files; a symbol
+    /// that only appears in `tests/testthat/` must NOT be present in any
+    /// contribution. This verifies the asymmetric (one-way) nature of visibility:
+    /// test files see R/ symbols, but R/ files do NOT see test symbols.
+    ///
+    /// Here we confirm the scope side: even if a caller mistakenly passes a
+    /// contribution that omits the test-only symbol, the R/ file's scope stays clean.
+    /// The derive-side invariant (test symbols never enter `r_internal_symbols`) is
+    /// verified in `package_state::derive::tests`.
+    #[test]
+    fn r_file_does_not_see_test_only_symbol() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // R/main.R calls test_helper() — which only lives in tests/testthat/.
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- test_helper()";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // A correctly-derived contribution will NOT carry `test_helper` (derive
+        // excludes test files from r_internal_symbols). We simulate this by
+        // passing a contribution with only `helper` (an R/ symbol).
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("test_helper"),
+            "test-only symbol must not be visible in R/ file. \
+             visible symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 4: local definition takes priority over contribution
+    // ------------------------------------------------------------------
+
+    /// If the file already defines a symbol with the same name as one in the
+    /// contribution, the local definition must win (contribution is additive-only).
+    #[test]
+    fn local_definition_takes_priority_over_contribution() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        // Local definition of `helper` as a variable assignment.
+        let main_code = "helper <- 42\nresult <- helper + 1";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Contribution also carries `helper` as a Function-kind synthetic symbol.
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            1,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        let sym = scope.symbols.get("helper").expect("helper must be visible");
+        // Local definition wins: source_uri should be the file URI, not package:
+        assert_eq!(
+            sym.source_uri, main_uri,
+            "local definition must take precedence over package contribution"
+        );
+        // Local definition is Variable (assigned with `<-`), not Function.
+        assert_eq!(
+            sym.kind,
+            SymbolKind::Variable,
+            "local definition kind must be Variable, not the synthetic Function"
         );
     }
 }

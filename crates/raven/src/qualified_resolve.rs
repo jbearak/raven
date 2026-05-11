@@ -474,6 +474,7 @@ fn collect_qualified_member_candidates_with_cancel(
         position.character,
         cancel,
         &mut prefix_cache,
+        Some(state.package_state.scope_contribution()),
     );
     if cancel.is_cancelled() {
         return None;
@@ -826,6 +827,7 @@ fn candidate_lhs_matches_symbol(
         c.lhs_pos.character,
         cancel,
         prefix_cache,
+        Some(state.package_state.scope_contribution()),
     );
     if cancel.is_cancelled() {
         return false;
@@ -1537,6 +1539,7 @@ mod tests {
                     3,
                     &cancel,
                     &mut cache,
+                    Some(state.package_state.scope_contribution()),
                 );
                 *s = start.elapsed();
             }
@@ -1631,6 +1634,7 @@ mod tests {
                     3,
                     &cancel,
                     &mut cache,
+                    Some(state.package_state.scope_contribution()),
                 );
                 *s = start.elapsed();
             }

@@ -7,9 +7,16 @@ This document is for contributors/maintainers (and LLMs) working on Raven’s Ru
 User-facing docs:
 - `README.md`
 - `docs/cross-file.md`
+- `docs/r-package-dev.md`
 - `docs/directives.md`
 - `docs/diagnostics.md`
-- `docs/completion.md`
+- `docs/indentation.md`
+- `docs/r-console.md`
+- `docs/plot-viewer.md`
+- `docs/data-viewer.md`
+- `docs/help-viewer.md`
+- `docs/document-outline.md`
+- `docs/coexistence.md`
 - `docs/configuration.md`
 
 Key code entry points:
@@ -20,6 +27,14 @@ Key code entry points:
 - Real-time updates / diagnostics gating: `crates/raven/src/cross_file/revalidation.rs`
 - On-demand background indexing: `crates/raven/src/cross_file/background_indexer.rs`
 - Package loading: `crates/raven/src/package_library.rs`
+- Package state: `crates/raven/src/package_state/` (`PackageState`, `derive_package_state()`)
+- Package namespace: `crates/raven/src/package_namespace.rs` (workspace detection, namespace model)
+- Help rendering: `crates/raven/src/help/` (Rd2txt, Rd2HTML)
+- Libpath watching: `crates/raven/src/libpath_watcher.rs`
+- Qualified member resolution: `crates/raven/src/qualified_resolve.rs`
+- Parameter resolution: `crates/raven/src/parameter_resolver.rs`
+- Roxygen parsing: `crates/raven/src/roxygen.rs`
+- Content provider: `crates/raven/src/content_provider.rs`
 
 ## Build from source
 
@@ -38,9 +53,22 @@ cargo build --release -p raven
 
 - Debug build: `cargo build -p raven`
 - Release build: `cargo build --release -p raven`
-- Tests: `cargo test -p raven`
-- Benchmarks: `cargo bench --bench startup`
 - Run (stdio): `RAVEN_PERF=1 cargo run -p raven -- --stdio`
+- Unit tests: `cargo test -p raven`
+- Integration tests: `cargo test -p raven --features test-support -- --test`
+- Bun tests (TypeScript): `bun test` (from repo root; `bunfig.toml` sets root to `./tests/bun`)
+- VS Code extension tests: `cd editors/vscode && bun run test`
+- Setup (build + install + package): `./scripts/setup.sh`
+
+### Benchmarks
+
+All benchmarks except `startup` require `--features test-support`. Set `RAVEN_BENCH_ALLOC=1` for allocation tracking.
+
+- `cargo bench --bench startup`
+- `cargo bench --bench lsp_operations --features test-support`
+- `cargo bench --bench cross_file --features test-support`
+- `cargo bench --bench libpath_capture --features test-support`
+- `cargo bench --bench edit_to_publish --features test-support`
 
 ## Profiling startup
 
@@ -110,6 +138,27 @@ Rough pipeline:
 3. Compute per-file artifacts (exported interface, timeline, interface hash)
 4. Resolve scope at a position by traversing edges and applying call-site filtering
 5. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
+
+### Module map
+
+Key files under `crates/raven/src/cross_file/`:
+
+- `mod.rs` — Public API (`extract_metadata()`)
+- `dependency.rs` — Dependency graph (forward + backward edges)
+- `scope.rs` — Scope artifacts, interface hash, scope-at-position resolution
+- `path_resolve.rs` — Path resolution (forward vs backward invariant)
+- `revalidation.rs` — Real-time updates, diagnostics gating, debounce
+- `background_indexer.rs` — On-demand background indexing
+- `source_detect.rs` — AST-based detection of `source()`, `sys.source()`, and related calls
+- `directive.rs` — Parsing of `@lsp-*` directive comments
+- `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
+- `config.rs` — Cross-file configuration (cache sizes, debounce intervals, feature flags)
+- `parent_resolve.rs` — Parent-prefix scope resolution (backward-edge traversal)
+- `content_provider.rs` — Cross-file content provider (open-doc-authoritative reads)
+- `cache.rs` — `MetadataCache`
+- `file_cache.rs` — `CrossFileFileCache` (content + existence)
+- `workspace_index.rs` — `CrossFileWorkspaceIndex`
+- `property_tests.rs` / `integration_tests.rs` — Property-based and integration test suites
 
 ### Path resolution invariant (forward vs backward)
 
@@ -213,6 +262,19 @@ All R subprocess calls must:
 
 See `crates/raven/src/package_library.rs` and `crates/raven/src/r_subprocess.rs`.
 
+## Other subsystems
+
+Brief orientation for modules outside the cross-file and package-library subsystems.
+
+- **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
+- **`package_namespace.rs`** — R package workspace detection (DESCRIPTION-based) and namespace model. Detects roxygen-managed packages by scanning for `#' @export` in `R/*.R` files.
+- **`help/`** — R help text and HTML rendering. `text` submodule provides Rd2txt for hover/completion; `html` submodule shells out to R's `tools::Rd2HTML` for the webview help panel. Results are cached via `HtmlHelpCache`.
+- **`libpath_watcher.rs`** — Filesystem watcher for `.libPaths()` directories using the `notify` crate. Watches recursively, debounces events, diffs directory snapshots, and emits `LibpathEvent::Changed` with added/removed/touched package deltas.
+- **`qualified_resolve.rs`** — Resolves the RHS of `$` and `@` operators for go-to-definition. Collects member-assignment candidates from the defining file and cross-file scope contributors, validates via re-resolution, and tie-breaks by dependency-graph distance.
+- **`parameter_resolver.rs`** — Resolves function parameter info for completion suggestions. Extracts parameters from AST for user-defined functions; queries R subprocess `formals()` for package functions. Uses an LRU cache for subprocess results.
+- **`roxygen.rs`** — Parses roxygen2 (`#'`) and plain comment blocks above function definitions. Extracts title, description, and `@param` entries for hover and completion documentation.
+- **`content_provider.rs`** — Unified file access abstraction. Respects the "open docs are authoritative" rule: open documents are read from the document store; closed files fall through to disk/cache.
+
 ## Coding conventions (repo-level)
 
 - Avoid `bail!`; prefer explicit `return Err(anyhow!(...))`.
@@ -224,6 +286,9 @@ See `crates/raven/src/package_library.rs` and `crates/raven/src/r_subprocess.rs`
 
 - Unit tests live alongside modules under `#[cfg(test)]`.
 - Property-based tests use `proptest`.
+- Integration tests live in `crates/raven/tests/` (performance budgets, libpath watching, indentation). These require `--features test-support`.
+- Bun tests (`tests/bun/`) cover TypeScript extension logic: plot viewer, data viewer, help viewer, send-to-R, config validation.
+- VS Code extension tests (`editors/vscode/src/test/`) use `@vscode/test-cli` with Mocha.
 
 ### AST inspection utility
 
@@ -231,6 +296,4 @@ For quickly validating tree-sitter node kinds, use the `inspect_ast()` helper (s
 
 ## Learnings
 
-Canonical list: `AGENTS.md`.
-
-When a learning is best kept next to the code it constrains, add/expand a localized module doc/comment and keep the corresponding `AGENTS.md` entry as a pointer.
+Canonical list: `AGENTS.md`. Prefer code comments over Learnings entries — see `AGENTS.md` header for the policy.

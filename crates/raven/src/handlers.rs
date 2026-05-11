@@ -98,7 +98,6 @@ pub(crate) struct DiagnosticsSnapshot {
     pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
     pub workspace_scan_complete: bool,
-    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
@@ -129,6 +128,11 @@ pub(crate) struct DiagnosticsSnapshot {
     /// mutate the cache. The snapshot is owned by a single tokio task; no
     /// `Sync` bound is required.
     pub(crate) parent_prefix_cache: std::cell::RefCell<scope::ParentPrefixCache>,
+    /// Package-mode scope contribution snapshot. Passed to the scope engine
+    /// (Phase 5a) so that `get_scope` can inject package-internal and imported
+    /// symbols into resolution results for files under `R/` and `tests/testthat/`.
+    /// Also used in the diagnostic loop for full-import package checks.
+    pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
 }
 
 impl DiagnosticsSnapshot {
@@ -241,7 +245,6 @@ impl DiagnosticsSnapshot {
             base_exports,
             package_library_ready: state.package_library_ready,
             workspace_scan_complete: state.workspace_scan_complete,
-            workspace_imports: state.workspace_imports.clone(),
             artifacts_map,
             metadata_map,
             cycle_detection,
@@ -249,6 +252,7 @@ impl DiagnosticsSnapshot {
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
+            scope_contribution: state.package_state.scope_contribution().clone(),
         })
     }
 
@@ -289,6 +293,7 @@ impl DiagnosticsSnapshot {
             self.cross_file_config.backward_dependencies,
             &is_cancelled,
             &mut cache,
+            Some(&self.scope_contribution),
         )
     }
 }
@@ -2893,7 +2898,15 @@ fn get_cross_file_symbols(
     line: u32,
     column: u32,
 ) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
-    get_cross_file_scope(state, uri, line, column, &DiagCancelToken::never()).symbols
+    get_cross_file_scope(
+        state,
+        uri,
+        line,
+        column,
+        &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
+    )
+    .symbols
 }
 
 /// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
@@ -2931,6 +2944,13 @@ pub(crate) fn get_cross_file_scope(
     line: u32,
     column: u32,
     cancel: &DiagCancelToken,
+    // Package-mode contribution: production LSP/diagnostics paths now pass
+    // `Some(state.package_state.scope_contribution())` (see
+    // `DiagnosticsSnapshot::scope_contribution` and call sites) so package-
+    // internal and imported symbols are injected into the resolved scope.
+    // `None` is an explicit opt-out used by tests and non-package-mode
+    // contexts; it is no longer a "wire it up later" placeholder.
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> scope::ScopeAtPosition {
     let content_provider = state.content_provider();
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
@@ -2956,6 +2976,7 @@ pub(crate) fn get_cross_file_scope(
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
+        package_contribution,
     )
 }
 
@@ -2977,6 +2998,13 @@ pub(crate) fn get_cross_file_scope_with_cache(
     column: u32,
     cancel: &DiagCancelToken,
     prefix_cache: &mut scope::ParentPrefixCache,
+    // Package-mode contribution: production LSP/diagnostics paths now pass
+    // `Some(state.package_state.scope_contribution())` (see
+    // `DiagnosticsSnapshot::scope_contribution` and call sites) so package-
+    // internal and imported symbols are injected into the resolved scope.
+    // `None` is an explicit opt-out used by tests and non-package-mode
+    // contexts; it is no longer a "wire it up later" placeholder.
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
 ) -> scope::ScopeAtPosition {
     let content_provider = state.content_provider();
     let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
@@ -3003,6 +3031,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
         prefix_cache,
+        package_contribution,
     )
 }
 
@@ -4522,6 +4551,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         false,
         snapshot.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
+        Some(&snapshot.scope_contribution),
     );
 
     {
@@ -5012,17 +5042,6 @@ fn collect_undefined_variables_from_snapshot(
         &text[start..end]
     };
 
-    // Map each NAMESPACE-imported symbol to the packages that export it. The
-    // suppression below only fires when at least one source package is actually
-    // installed — otherwise the import declaration is broken and the symbol
-    // should still be flagged as undefined.
-    let workspace_imports_map: HashMap<&str, Vec<&str>> = {
-        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (pkg, sym) in snapshot.workspace_imports.iter() {
-            map.entry(sym.as_str()).or_default().push(pkg.as_str());
-        }
-        map
-    };
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
@@ -5119,6 +5138,9 @@ fn collect_undefined_variables_from_snapshot(
         &snapshot.parent_prefix_cache,
     );
 
+    // Reusable buffer for position-aware packages; avoids per-iteration allocation.
+    let mut position_aware_packages_buf: Vec<String> = Vec::new();
+
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
             return;
@@ -5136,17 +5158,6 @@ fn collect_undefined_variables_from_snapshot(
 
         if is_builtin(&name) {
             continue;
-        }
-        // Workspace NAMESPACE-imported symbols are suppressed only if at least
-        // one source package is actually installed. A broken import (the
-        // package mentioned in importFrom() is not on disk) must NOT silence
-        // the diagnostic — the symbol won't actually be loadable at runtime.
-        if let Some(pkgs) = workspace_imports_map.get(name.as_str()) {
-            if pkgs.iter().any(|p| {
-                package_exists_memoized(p, &snapshot.package_library, &mut package_exists_memo)
-            }) {
-                continue;
-            }
         }
 
         // Compute usage_col_utf16 once per iteration; subsequent checks
@@ -5239,14 +5250,21 @@ fn collect_undefined_variables_from_snapshot(
         }
 
         if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
-            let position_aware_packages: Vec<String> = scope
-                .inherited_packages
-                .iter()
-                .chain(scope.loaded_packages.iter())
-                .cloned()
-                .collect();
+            position_aware_packages_buf.clear();
+            position_aware_packages_buf.extend(
+                scope
+                    .inherited_packages
+                    .iter()
+                    .chain(scope.loaded_packages.iter())
+                    .chain(snapshot.scope_contribution.full_imports.iter())
+                    .cloned(),
+            );
 
-            if is_package_export(&name, &position_aware_packages, &snapshot.package_library) {
+            if is_package_export(
+                &name,
+                &position_aware_packages_buf,
+                &snapshot.package_library,
+            ) {
                 continue;
             }
 
@@ -5259,13 +5277,15 @@ fn collect_undefined_variables_from_snapshot(
             // not yet been loaded into cache — not when it is simply not installed.
             // Using package_exists() guards against treating a permanently-missing
             // package as one that will eventually be cached.
-            let package_cache_pending = position_aware_packages.iter().any(|pkg| {
+            let package_cache_pending = position_aware_packages_buf.iter().any(|pkg| {
                 if snapshot.package_library.is_cached_sync(pkg) {
                     return false;
                 }
                 package_exists_memoized(pkg, &snapshot.package_library, &mut package_exists_memo)
             });
-            if (has_prior_library_call || has_cross_file_packages)
+            if (has_prior_library_call
+                || has_cross_file_packages
+                || !snapshot.scope_contribution.full_imports.is_empty())
                 && package_cache_pending
                 && is_function_call_identifier_textually(usage_node, text)
             {
@@ -9009,7 +9029,21 @@ fn push_scoped_symbol_completion(
     items: &mut Vec<CompletionItem>,
     seen_names: &mut std::collections::HashSet<String>,
 ) {
-    if symbol.source_uri.as_str().starts_with("package:") || seen_names.contains(name) {
+    if seen_names.contains(name) {
+        return;
+    }
+
+    // External package-export pseudo-URIs (`package:dplyr`, `package:base`,
+    // ...) are added via the separate per-package loop later; skip them
+    // here to avoid duplicate entries. Package-internal symbols injected by
+    // `append_package_contribution` use the synthetic URI
+    // `scope::PACKAGE_INTERNAL_URI` — these are the user's OWN package's
+    // symbols (from sibling `R/*.R` files or `importFrom` NAMESPACE
+    // targets) and are NOT added anywhere else, so they must pass through
+    // this filter.
+    let is_package_internal = crate::cross_file::scope::is_package_internal_uri(&symbol.source_uri);
+    let source_uri_str = symbol.source_uri.as_str();
+    if source_uri_str.starts_with("package:") && !is_package_internal {
         return;
     }
 
@@ -9023,7 +9057,13 @@ fn push_scoped_symbol_completion(
         crate::cross_file::SymbolKind::Parameter => CompletionItemKind::FIELD,
     };
 
-    let is_cross_file = symbol.source_uri.as_str() != request_uri.as_str();
+    // Package-internal symbols come from another file in the user's
+    // package, but the contribution doesn't carry per-symbol origin — so
+    // we can't render a meaningful relative path and `compute_relative_path`
+    // would fall through to "internal" (the last path segment of
+    // `package:///internal`). Treat them like cross-file entries for sort
+    // priority but render a package-attribution detail instead of a path.
+    let is_cross_file = is_package_internal || symbol.source_uri.as_str() != request_uri.as_str();
     let sort_prefix = if is_cross_file {
         SORT_PREFIX_WORKSPACE
     } else {
@@ -9031,7 +9071,7 @@ fn push_scoped_symbol_completion(
     };
 
     // Use signature if available, otherwise show source file for cross-file symbols.
-    let relative_path = if is_cross_file {
+    let relative_path = if is_cross_file && !is_package_internal {
         Some(compute_relative_path(
             &symbol.source_uri,
             state.workspace_folders.first(),
@@ -9039,15 +9079,19 @@ fn push_scoped_symbol_completion(
     } else {
         None
     };
-    let detail = match (&symbol.signature, is_cross_file) {
-        (Some(sig), _) => Some(sig.clone()),
-        (None, true) => Some(format!("from {}", relative_path.as_ref().unwrap())),
-        (None, false) => None,
+    let detail = match (&symbol.signature, is_cross_file, is_package_internal) {
+        (Some(sig), _, _) => Some(sig.clone()),
+        (None, true, true) => Some("package-internal".to_string()),
+        (None, true, false) => Some(format!("from {}", relative_path.as_ref().unwrap())),
+        (None, false, _) => None,
     };
 
     // For user-defined functions from scope, include data for
     // completionItem/resolve to locate the roxygen block for documentation.
-    let data = if kind == CompletionItemKind::FUNCTION {
+    // Package-internal symbols have a synthetic URI and no precise origin
+    // line, so omit the resolve data — the resolver can't locate a roxygen
+    // block without a real file URI.
+    let data = if kind == CompletionItemKind::FUNCTION && !is_package_internal {
         let mut json = serde_json::json!({
             "type": "user_function",
             "function_name": name_string.clone(),
@@ -9183,6 +9227,7 @@ pub fn completion(
         position.line,
         position.character,
         &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
     );
 
     // Add visible same-file symbols first so local definitions take precedence
@@ -9224,6 +9269,19 @@ pub fn completion(
             .iter()
             .chain(scope.loaded_packages.iter())
         {
+            if pkg_set.insert(pkg.as_str()) {
+                all_packages.push(pkg.clone());
+            }
+        }
+
+        // Also include NAMESPACE `import(pkg)` whole-package imports. Without
+        // this, the diagnostic pipeline (which already consults
+        // `scope_contribution.full_imports`, see
+        // `collect_undefined_variables_from_snapshot`) stays silent on
+        // references to those packages' exports while the completion list
+        // doesn't offer them — an asymmetry that forces users to type
+        // imported function names from memory.
+        for pkg in state.package_state.scope_contribution().full_imports.iter() {
             if pkg_set.insert(pkg.as_str()) {
                 all_packages.push(pkg.clone());
             }
@@ -10378,6 +10436,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             position.line,
             position.character,
             &DiagCancelToken::never(),
+            Some(state.package_state.scope_contribution()),
         );
         let all_packages: Vec<String> = scope
             .inherited_packages
@@ -10969,6 +11028,7 @@ pub fn prepare_signature_help(
         position.line,
         position.character,
         &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
     );
 
     /// Try user signature, falling back to a minimal signature with source attribution.
@@ -11303,7 +11363,14 @@ pub fn goto_definition_with_cancel(
     // 1. Position (definitions must be before usage)
     // 2. Function scope (locals don't leak)
     // 3. Shadowing (locals override globals)
-    let scope = get_cross_file_scope(state, uri, position.line, position.character, cancel);
+    let scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        cancel,
+        Some(state.package_state.scope_contribution()),
+    );
 
     if let Some(symbol) = scope.symbols.get(name) {
         // Check if this is a package export (source_uri starts with "package:")
@@ -14130,6 +14197,305 @@ clean_data <- function(x) {
                 panic!("Expected CompletionResponse::Array");
             }
         });
+    }
+
+    // ========================================================================
+    // Package-mode completion: package-internal and NAMESPACE full-imports
+    // Regression tests for bugs found by the 2026-05-10 review.
+    // ========================================================================
+
+    /// Package-internal symbols (from sibling `R/*.R` files) injected via
+    /// `append_package_contribution` must appear in completions.
+    ///
+    /// Regression: `push_scoped_symbol_completion` previously filtered every
+    /// URI starting with `"package:"`, which unintentionally caught the
+    /// synthetic `package:///internal` URI used for internal symbols and
+    /// excluded the user's OWN package exports from autocomplete.
+    #[test]
+    fn test_completion_includes_package_internal_symbols() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let workspace_root = Url::parse("file:///work/pkg").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.workspace_folders = vec![workspace_root.clone()];
+            state.workspace_scan_complete = true;
+
+            // Seed the package contribution as if `R/utils.R` defined
+            // `helper_fn` and the scan has already derived the contribution.
+            let mut internal = BTreeSet::new();
+            internal.insert("helper_fn".to_string());
+            state
+                .package_state
+                .set_from(crate::package_state::PackageState {
+                    scope_contribution: PackageScopeContribution {
+                        workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        r_internal_symbols: std::sync::Arc::new(internal),
+                        imported_symbols: Default::default(),
+                        full_imports: Default::default(),
+                    },
+                    ..Default::default()
+                });
+
+            // Open `R/main.R` under the package.
+            let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+            let code = "result <- h";
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let completions = super::completion(&state, &uri, Position::new(0, 11), None);
+            let items = match completions.expect("completions returned") {
+                CompletionResponse::Array(items) => items,
+                other => panic!("Expected Array, got {:?}", other),
+            };
+
+            assert!(
+                items.iter().any(|i| i.label == "helper_fn"),
+                "`helper_fn` must appear in completions for a package R/ file when \
+                 r_internal_symbols carries it. labels: {:?}",
+                items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+            );
+
+            let helper = items.iter().find(|i| i.label == "helper_fn").unwrap();
+            // The synthetic `package:///internal` URI must not leak into
+            // user-visible fields — check detail doesn't say "from internal".
+            if let Some(detail) = &helper.detail {
+                assert!(
+                    !detail.contains("from internal"),
+                    "package-internal detail must not expose the synthetic URI path segment; got: {:?}",
+                    detail,
+                );
+            }
+        });
+    }
+
+    /// NAMESPACE `import(pkg)` (whole-package imports) must contribute
+    /// exports to completions, matching how they already contribute to
+    /// diagnostic suppression via `scope_contribution.full_imports`.
+    ///
+    /// Regression: the completion `all_packages` collection chained only
+    /// `inherited_packages` and `loaded_packages`, missing `full_imports`.
+    #[test]
+    fn test_completion_includes_full_imports_packages() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeSet, HashSet};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let workspace_root = Url::parse("file:///work/pkg").unwrap();
+            let mut state = WorldState::new(vec![]);
+            state.workspace_folders = vec![workspace_root.clone()];
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = true;
+
+            // Seed `ggplot2` with an export and register it as a full
+            // (whole-package) import in `scope_contribution`.
+            let mut ggplot_exports = HashSet::new();
+            ggplot_exports.insert("ggplot".to_string());
+            state
+                .package_library
+                .insert_package(PackageInfo::new("ggplot2".to_string(), ggplot_exports))
+                .await;
+            let mut full = BTreeSet::new();
+            full.insert("ggplot2".to_string());
+            state
+                .package_state
+                .set_from(crate::package_state::PackageState {
+                    scope_contribution: PackageScopeContribution {
+                        workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        r_internal_symbols: Default::default(),
+                        imported_symbols: Default::default(),
+                        full_imports: std::sync::Arc::new(full),
+                    },
+                    ..Default::default()
+                });
+
+            let uri = Url::parse("file:///work/pkg/R/plot.R").unwrap();
+            let code = "p <- g";
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            let completions = super::completion(&state, &uri, Position::new(0, 6), None);
+            let items = match completions.expect("completions returned") {
+                CompletionResponse::Array(items) => items,
+                other => panic!("Expected Array, got {:?}", other),
+            };
+
+            assert!(
+                items.iter().any(|i| i.label == "ggplot"),
+                "NAMESPACE `import(ggplot2)` must contribute `ggplot` to completions. \
+                 labels: {:?}",
+                items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+            );
+        });
+    }
+
+    /// Diagnostic pipeline: a NAMESPACE `importFrom(tidyr, pivot_longer)`
+    /// must suppress "Undefined variable: pivot_longer" for an `R/*.R`
+    /// file under the package.
+    ///
+    /// The suppression flows through `parent_symbol_names` — the collector
+    /// pre-computes scope at `(0, 0)` via the recursive
+    /// `scope_at_position_with_graph_cached` entry point, which DOES receive
+    /// `Some(&scope_contribution)` and therefore injects both
+    /// `r_internal_symbols` and `imported_symbols`. Names in the resulting
+    /// parent set short-circuit the diagnostic loop before it reaches the
+    /// `ScopeStream` fast path. This test pins that end-to-end behavior.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_importFrom_in_package_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // `pivot_longer` is not a base-R builtin, so it's NOT filtered out
+        // by `is_builtin` — the suppression must come from the package
+        // contribution.
+        let mut imported: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut pkgs = BTreeSet::new();
+        pkgs.insert("tidyr".to_string());
+        imported.insert("pivot_longer".to_string(), pkgs);
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: std::sync::Arc::new(imported),
+                    full_imports: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "x <- pivot_longer(df)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        // Sanity: the baseline undefined symbol MUST still be flagged —
+        // otherwise the collector isn't running and the test is vacuous.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: pivot_longer"),
+            "importFrom(tidyr, pivot_longer) in the package NAMESPACE must suppress \
+             `Undefined variable: pivot_longer` for R/ files. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Package-internal symbols from `r_internal_symbols` must also suppress
+    /// the undefined-variable diagnostic in the hot ScopeStream path.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_package_internal_in_R_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut internal = BTreeSet::new();
+        internal.insert("helper_fn".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: std::sync::Arc::new(internal),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "x <- helper_fn()\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: helper_fn"),
+            "r_internal_symbols must suppress undefined-variable for R/ files. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
     }
 
     // ========================================================================
@@ -36919,6 +37285,7 @@ source(\"helpers.R\")
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             !scope_at.symbols.contains_key("xyz"),
@@ -37032,6 +37399,7 @@ source(\"helpers.R\")
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         let in_loaded = scope_at.loaded_packages.contains("somepkg");
         let in_inherited = scope_at.inherited_packages.contains("somepkg");
@@ -37059,6 +37427,7 @@ source(\"helpers.R\")
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
         );
         assert!(
             scope_at_end.loaded_packages.contains("somepkg"),
@@ -37126,6 +37495,7 @@ source(\"helpers.R\")
                 snapshot.cross_file_config.backward_dependencies,
                 &|| false,
                 &mut cache,
+                None,
             );
             let direct = crate::cross_file::scope::scope_at_position_with_graph(
                 &uri,
@@ -37140,6 +37510,7 @@ source(\"helpers.R\")
                 snapshot.cross_file_config.hoist_globals_in_functions,
                 snapshot.cross_file_config.backward_dependencies,
                 &|| false,
+                None,
             );
 
             let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
@@ -37367,6 +37738,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
             &mut cache,
+            None,
         );
 
         // The same-file leak filter must keep `xyz` out of scope at its own RHS.
@@ -37397,6 +37769,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.hoist_globals_in_functions,
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
+            None,
         );
         let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
         let direct_keys: BTreeSet<&str> = direct.symbols.keys().map(|n| n.as_ref()).collect();
@@ -37478,6 +37851,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
             &mut cache,
+            None,
         );
 
         assert!(
@@ -37505,6 +37879,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.hoist_globals_in_functions,
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
+            None,
         );
         let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
         let direct_keys: BTreeSet<&str> = direct.symbols.keys().map(|n| n.as_ref()).collect();
@@ -38122,31 +38497,17 @@ my_func <- function(a = default_value) {
 
     #[tokio::test]
     async fn test_namespace_import_does_not_suppress_when_source_package_uninstalled() {
-        // Post-workspace-scan reproduction of "diagnostic appears then clears".
+        // Regression test: a NAMESPACE `importFrom(lme4, lmer)` must NOT suppress
+        // the "Undefined variable: lmer" diagnostic when lme4 is not actually installed.
         //
-        // If the workspace contains an R package with NAMESPACE that contains
-        // `importFrom(lme4, lmer)`, then `parse_namespace_imports_from_text`
-        // populates `state.workspace_imports` with `["lmer"]` after the scan
-        // completes. The undefined-variable check then suppresses `lmer` via
-        // `workspace_imports_set.contains(name)` — even though lme4 is not
-        // installed and the import is therefore broken.
-        //
-        // Cold-start sequence with this workspace:
-        // - 200ms publish: workspace_imports is empty (scan still running),
-        //   `lmer` is flagged → user sees diagnostic
-        // - apply_workspace_index runs, populates workspace_imports = ["lmer"]
-        // - post-scan republish: workspace_imports check fires → diagnostic
-        //   disappears
-        //
-        // Fix: the workspace_imports suppression must verify the import's
-        // source package is installed before suppressing.
+        // Previously this was tested via the workspace_imports suppression set (deleted
+        // in Phase 5b.1). Now the scope engine handles symbol visibility, and this test
+        // verifies the package-library export check does the right thing when the
+        // package is cached with empty exports and not installed on disk.
         let mut state = create_test_state();
         state.package_library_ready = true;
         state.cross_file_config.packages_enabled = true;
         state.workspace_scan_complete = true;
-        // Simulates a NAMESPACE with `importFrom(lme4, lmer)` after scan.
-        state.workspace_imports =
-            std::sync::Arc::new(vec![("lme4".to_string(), "lmer".to_string())]);
 
         let pkg_lib = crate::package_library::PackageLibrary::new_empty();
         // lme4 cached with empty exports (prefetch saw R fail to load it).

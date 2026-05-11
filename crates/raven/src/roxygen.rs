@@ -1127,3 +1127,667 @@ mod prop_tests {
         }
     }
 }
+
+// ============================================================================
+// Roxygen namespace tag extraction (for R package mode)
+// ============================================================================
+
+/// Namespace-relevant information extracted from roxygen blocks in a single file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoxygenNamespace {
+    /// Symbols exported via `@export` (the name of the function/variable
+    /// defined immediately after the roxygen block).
+    pub exports: Vec<String>,
+    /// Packages imported wholesale via `@import pkg`.
+    pub imports: Vec<String>,
+    /// `(package, symbol)` pairs from `@importFrom pkg sym1 sym2 ...`.
+    pub import_from: Vec<(String, String)>,
+}
+
+/// Process a single accumulated roxygen tag line (possibly with continuation
+/// content appended). Handles @export, @import, and @importFrom.
+fn process_roxygen_tag(
+    tag_line: &str,
+    has_export: &mut bool,
+    explicit_export_names: &mut Vec<String>,
+    ns: &mut RoxygenNamespace,
+) {
+    if tag_line == "@export" {
+        *has_export = true;
+    } else if tag_line.starts_with("@export")
+        && tag_line
+            .as_bytes()
+            .get(7)
+            .map_or(false, |b| b.is_ascii_whitespace())
+    {
+        *has_export = true;
+        for name in tag_line[7..].split_whitespace() {
+            if !name.is_empty() {
+                explicit_export_names.push(name.to_string());
+            }
+        }
+    } else if tag_line.starts_with("@importFrom")
+        && tag_line
+            .as_bytes()
+            .get(11)
+            .map_or(false, |b| b.is_ascii_whitespace())
+    {
+        let mut parts = tag_line[11..].split_whitespace();
+        if let Some(pkg) = parts.next() {
+            for sym in parts {
+                if !sym.is_empty() {
+                    ns.import_from.push((pkg.to_string(), sym.to_string()));
+                }
+            }
+        }
+    } else if tag_line.starts_with("@import")
+        && !tag_line.starts_with("@importFrom")
+        && tag_line
+            .as_bytes()
+            .get(7)
+            .map_or(false, |b| b.is_ascii_whitespace())
+    {
+        for pkg in tag_line[7..].split_whitespace() {
+            if !pkg.is_empty() {
+                ns.imports.push(pkg.to_string());
+            }
+        }
+    }
+    // bare @import with no args — ignore
+}
+
+/// For `@export`, the exported symbol name is the identifier defined on the
+/// first non-blank, non-comment line after the roxygen block (function or
+/// assignment target).
+pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
+    let mut ns = RoxygenNamespace::default();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if !trimmed.starts_with("#'") {
+            i += 1;
+            continue;
+        }
+
+        // We're in a roxygen block — collect all contiguous #' lines
+        let mut has_export = false;
+        let mut explicit_export_names: Vec<String> = Vec::new();
+        let block_start = i;
+
+        // Accumulate tag lines with continuation support.
+        // In roxygen2, a #' line that doesn't start with @ continues the
+        // previous tag's content.
+        let mut current_tag = String::new();
+
+        while i < lines.len() && lines[i].trim_start().starts_with("#'") {
+            let tag_line = lines[i]
+                .trim_start()
+                .strip_prefix("#'")
+                .unwrap_or("")
+                .trim();
+
+            if tag_line.starts_with('@') || tag_line.is_empty() {
+                // Process the previously accumulated tag (if any)
+                if !current_tag.is_empty() {
+                    process_roxygen_tag(
+                        &current_tag,
+                        &mut has_export,
+                        &mut explicit_export_names,
+                        &mut ns,
+                    );
+                    current_tag.clear();
+                }
+                if !tag_line.is_empty() {
+                    current_tag = tag_line.to_string();
+                }
+            } else if !current_tag.is_empty() {
+                // Continuation line — append to current tag
+                current_tag.push(' ');
+                current_tag.push_str(tag_line);
+            }
+            // else: text before any tag (e.g. @title) — ignore
+
+            i += 1;
+        }
+        // Process the last accumulated tag
+        if !current_tag.is_empty() {
+            process_roxygen_tag(
+                &current_tag,
+                &mut has_export,
+                &mut explicit_export_names,
+                &mut ns,
+            );
+        }
+        let _ = block_start; // suppress unused warning
+
+        // If @export was found, extract the symbol name from the next definition
+        if has_export {
+            if !explicit_export_names.is_empty() {
+                // Explicit @export name(s) override auto-detection
+                ns.exports.extend(explicit_export_names);
+            } else {
+                // Skip blank lines and comments after the block
+                while i < lines.len() {
+                    let next = lines[i].trim();
+                    if next.is_empty() || (next.starts_with('#') && !next.starts_with("#'")) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if i < lines.len() {
+                    if let Some(name) = extract_definition_name(lines[i]) {
+                        ns.exports.push(name);
+                    }
+                }
+            }
+        }
+    }
+    ns
+}
+
+/// Extract the symbol name from a line that defines a function or variable.
+///
+/// Handles patterns like:
+/// - `foo <- function(...)`
+/// - `foo = function(...)`
+/// - `foo <- value`
+/// - `"foo" <- function(...)` (quoted names)
+/// - `foo <<- value`
+/// - `setGeneric("foo", ...)` (extracts first string arg)
+fn extract_definition_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    // Find the assignment operator, skipping operators inside quotes.
+    let (name_part, _) = if let Some((pos, len)) = find_assignment_op(trimmed) {
+        (&trimmed[..pos], &trimmed[pos + len..])
+    } else {
+        // Could be setGeneric("name", ...), setMethod("name", ...), setClass("name", ...)
+        // Try to extract the first quoted string argument
+        if let Some(name) = extract_first_string_arg(trimmed) {
+            return Some(name);
+        }
+        return extract_first_identifier(trimmed);
+    };
+
+    let name = name_part.trim();
+    // Handle quoted names
+    let name = name.trim_matches('"').trim_matches('\'').trim_matches('`');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Find the first top-level assignment operator (`<<-`, `<-`, or `=`) outside
+/// of quoted strings and balanced brackets. Returns `(byte_offset, op_len)`.
+///
+/// R backticks open/close a non-syntactic-identifier literal and do NOT honor
+/// `\` as an escape, so a trailing `\` inside a backtick-quoted name (e.g.
+/// `` `foo\` ``) must not swallow the closing backtick. Mirrors R's own
+/// parser and `count_unquoted_parens` / `strip_trailing_comment` in
+/// `package_namespace.rs`.
+fn find_assignment_op(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    let mut in_quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_quote {
+            Some(b'`') => {
+                if b == b'`' {
+                    in_quote = None;
+                }
+            }
+            Some(q) => {
+                if b == b'\\' {
+                    i += 1; // skip escaped character
+                } else if b == q {
+                    in_quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' | b'`' => {
+                    in_quote = Some(b);
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                }
+                b')' | b']' | b'}' => {
+                    depth = depth.saturating_sub(1);
+                }
+                b'<' if depth == 0 => {
+                    // Check for <<- first, then <-
+                    if i + 2 < bytes.len() && bytes[i + 1] == b'<' && bytes[i + 2] == b'-' {
+                        return Some((i, 3));
+                    }
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                        return Some((i, 2));
+                    }
+                }
+                b'=' if depth == 0 => {
+                    // Skip ==, !=, >=, <=
+                    if i > 0 && matches!(bytes.get(i - 1), Some(b'!') | Some(b'>') | Some(b'<')) {
+                        // skip
+                    } else if bytes.get(i + 1) == Some(&b'=') {
+                        i += 1; // skip second '=' so it isn't re-examined
+                    } else {
+                        return Some((i, 1));
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract the first quoted string argument from a function call like `setGeneric("foo", ...)`.
+fn extract_first_string_arg(line: &str) -> Option<String> {
+    let open = line.find('(')?;
+    let after = &line[open + 1..];
+    let after = after.trim_start();
+    // Check for quoted string
+    let quote = after.as_bytes().first().copied()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    // Scan for closing quote, respecting backslash escapes
+    let bytes = after.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // skip escaped character
+        } else if bytes[i] == quote {
+            let name = &after[1..i];
+            return if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            };
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Find `=` that's not inside parentheses or string literals.
+#[cfg(test)]
+fn find_toplevel_equals(s: &str) -> Option<usize> {
+    let mut depth: usize = 0;
+    let mut in_quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match in_quote {
+            Some(q) if c == q => {
+                in_quote = None;
+                continue;
+            }
+            Some(_) => {
+                continue;
+            }
+            None => {}
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                in_quote = Some(c);
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => {
+                // Make sure it's not ==, !=, >=, or <=
+                if i > 0
+                    && matches!(
+                        s.as_bytes().get(i - 1),
+                        Some(b'!') | Some(b'>') | Some(b'<')
+                    )
+                {
+                    continue;
+                }
+                if s.as_bytes().get(i + 1) == Some(&b'=') {
+                    continue;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract the first R identifier from a line (for setGeneric etc.).
+fn extract_first_identifier(line: &str) -> Option<String> {
+    let mut chars = line.chars().peekable();
+    // Skip whitespace
+    while chars.peek().map_or(false, |c| c.is_whitespace()) {
+        chars.next();
+    }
+    // Collect identifier chars
+    let mut name = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '.' || c == '_' {
+            name.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Extract top-level definition names from R source text.
+///
+/// Delegates to `cross_file::scope::compute_artifacts` so the result agrees
+/// with the workspace index. Uses a synthetic `memory:///` URI for the call.
+pub fn extract_top_level_defs(text: &str) -> std::collections::BTreeSet<String> {
+    use tree_sitter::Parser;
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .is_err()
+    {
+        return std::collections::BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return std::collections::BTreeSet::new();
+    };
+    let uri = match tower_lsp::lsp_types::Url::parse("memory:///derive.R") {
+        Ok(u) => u,
+        Err(_) => return std::collections::BTreeSet::new(),
+    };
+    let artifacts = crate::cross_file::scope::compute_artifacts(&uri, &tree, text);
+    artifacts
+        .exported_interface
+        .keys()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod namespace_tag_tests {
+    use super::*;
+
+    #[test]
+    fn export_before_function() {
+        let content = "#' Title\n#' @export\nfoo <- function(x) x + 1\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn export_before_assignment() {
+        let content = "#' A constant\n#' @export\nMY_CONST <- 42\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["MY_CONST"]);
+    }
+
+    #[test]
+    fn import_package() {
+        let content = "#' @import dplyr\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.imports, vec!["dplyr"]);
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn import_from() {
+        let content = "#' @importFrom dplyr mutate filter\n#' @export\nbar <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.import_from.len(), 2);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));
+    }
+
+    #[test]
+    fn multiple_blocks() {
+        let content = r#"#' @export
+foo <- function() {}
+
+#' @importFrom tidyr pivot_longer
+#' @export
+bar <- function() {}
+"#;
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo", "bar"]);
+        assert_eq!(
+            ns.import_from,
+            vec![("tidyr".into(), "pivot_longer".into())]
+        );
+    }
+
+    #[test]
+    fn no_roxygen() {
+        let content = "foo <- function() {}\nbar <- 1\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.exports.is_empty());
+        assert!(ns.imports.is_empty());
+        assert!(ns.import_from.is_empty());
+    }
+
+    #[test]
+    fn quoted_name() {
+        let content = "#' @export\n\"%>%\" <- function(lhs, rhs) rhs(lhs)\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["%>%"]);
+    }
+
+    #[test]
+    fn double_arrow_assignment() {
+        let content = "#' @export\nfoo <<- function(x) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn set_generic() {
+        let content =
+            "#' @export\nsetGeneric(\"myGeneric\", function(x) standardGeneric(\"myGeneric\"))\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["myGeneric"]);
+    }
+
+    #[test]
+    fn set_method_single_quotes() {
+        let content =
+            "#' @export\nsetMethod('show', 'MyClass', function(object) cat(object@name))\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["show"]);
+    }
+
+    #[test]
+    fn extract_first_string_arg_with_escape() {
+        // Escaped quote inside the string argument
+        assert_eq!(
+            extract_first_string_arg(r#"setGeneric("foo\"bar", function(x) x)"#),
+            Some(r#"foo\"bar"#.to_string())
+        );
+    }
+
+    #[test]
+    fn find_assignment_op_skips_double_equals() {
+        // The second '=' in '==' must not be returned as an assignment operator.
+        assert_eq!(find_assignment_op("x == 5"), None);
+        assert_eq!(find_assignment_op("if (x == y) z"), None);
+        // Regular = assignment still works
+        assert_eq!(find_assignment_op("z = 1"), Some((2, 1)));
+        // == followed by a later assignment
+        assert_eq!(find_assignment_op("a == b; c <- 1"), Some((10, 2)));
+    }
+
+    #[test]
+    fn find_assignment_op_handles_escaped_quotes() {
+        // Escaped quote inside a string should not exit quote mode
+        assert_eq!(find_assignment_op(r#""foo\"bar" <- 1"#), Some((11, 2)));
+        // Escaped backslash before closing quote
+        assert_eq!(find_assignment_op(r#""foo\\" <- 1"#), Some((8, 2)));
+    }
+
+    #[test]
+    fn find_assignment_op_backtick_no_escape() {
+        // Backticks do NOT honor `\` as an escape. A trailing `\` inside a
+        // backtick-quoted name must not swallow the closing backtick (which
+        // would prevent the assignment from being detected at all).
+        // Example: the replacement function `foo\` (name ends in backslash).
+        // Previously the parser kept `in_quote` stuck open and returned None;
+        // now it correctly finds the `<-` at position 8.
+        assert_eq!(find_assignment_op("`foo\\` <- 1"), Some((7, 2)));
+        // A plain backtick-quoted replacement function.
+        assert_eq!(find_assignment_op("`names<-` <- 1"), Some((10, 2)));
+    }
+
+    #[test]
+    fn find_toplevel_equals_skips_gte_and_lte() {
+        assert_eq!(find_toplevel_equals("x >= 5"), None);
+        assert_eq!(find_toplevel_equals("y <= 3"), None);
+        // Regular assignment still works
+        assert_eq!(find_toplevel_equals("z = 1"), Some(2));
+    }
+
+    #[test]
+    fn find_toplevel_equals_skips_quoted_strings() {
+        // = inside a quoted string should not be found
+        assert_eq!(find_toplevel_equals(r#""a=b" = 1"#), Some(6));
+        assert_eq!(find_toplevel_equals(r#""x=y""#), None);
+    }
+
+    #[test]
+    fn export_explicit_name() {
+        // @export with explicit name should use that name, not the definition
+        let content = "#' @export myAlias\nfoo_internal <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["myAlias"]);
+    }
+
+    #[test]
+    fn replacement_function_names_arrow() {
+        // Replacement functions like `names<-` should be parsed correctly
+        let content = "#' @export\n`names<-` <- function(x, value) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["names<-"]);
+    }
+
+    #[test]
+    fn replacement_function_quoted() {
+        let content = "#' @export\n\"names<-\" <- function(x, value) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["names<-"]);
+    }
+
+    #[test]
+    fn bracket_replacement_function() {
+        let content = "#' @export\n\"[<-\" <- function(x, i, value) x\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["[<-"]);
+    }
+
+    #[test]
+    fn multiple_explicit_export_names() {
+        // Multiple @export tags with explicit names in one block should all be captured
+        let content = "#' @export foo\n#' @export bar\nbaz <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(
+            ns.exports.contains(&"foo".to_string()),
+            "first explicit @export name should be kept"
+        );
+        assert!(
+            ns.exports.contains(&"bar".to_string()),
+            "second explicit @export name should be kept"
+        );
+        assert_eq!(ns.exports.len(), 2);
+    }
+
+    #[test]
+    fn mixed_bare_and_explicit_export() {
+        // A bare @export followed by @export with name: bare triggers auto-detect,
+        // explicit name is also captured
+        let content = "#' @export\n#' @export alias\nmy_func <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        // When explicit names exist, they override auto-detection
+        assert!(ns.exports.contains(&"alias".to_string()));
+        assert_eq!(ns.exports.len(), 1);
+    }
+
+    #[test]
+    fn export_with_tab_separator() {
+        // @export followed by a tab should still be recognized
+        let content = "#' @export\tfoo_name\nbar <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.exports, vec!["foo_name"]);
+    }
+
+    #[test]
+    fn import_with_tab_separator() {
+        // @import followed by a tab should still be recognized
+        let content = "#' @import\tdplyr\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert_eq!(ns.imports, vec!["dplyr"]);
+    }
+
+    #[test]
+    fn import_from_with_tab_separator() {
+        // @importFrom followed by a tab should still be recognized
+        let content = "#' @importFrom\tdplyr\tmutate filter\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));
+    }
+
+    #[test]
+    fn export_explicit_names_split_by_whitespace() {
+        // @export with multiple names on one line should produce multiple exports
+        // (roxygen2 uses tag_words which splits by whitespace)
+        let content = "#' @export foo bar\nbaz <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.exports.contains(&"foo".to_string()));
+        assert!(ns.exports.contains(&"bar".to_string()));
+        assert_eq!(ns.exports.len(), 2);
+    }
+
+    #[test]
+    fn import_from_multiline_continuation() {
+        // @importFrom with symbols on continuation lines
+        let content =
+            "#' @importFrom dplyr\n#'   mutate filter\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.import_from.contains(&("dplyr".into(), "filter".into())));
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn import_multiline_continuation() {
+        // @import with packages on continuation line
+        let content = "#' @import dplyr\n#'   tidyr\n#' @export\nbar <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.imports.contains(&"dplyr".to_string()));
+        assert!(ns.imports.contains(&"tidyr".to_string()));
+    }
+
+    #[test]
+    fn continuation_stops_at_new_tag() {
+        // Continuation should stop when a new @tag is encountered
+        let content = "#' @importFrom dplyr\n#'   mutate\n#' @import ggplot2\n#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(ns.import_from.contains(&("dplyr".into(), "mutate".into())));
+        assert!(ns.imports.contains(&"ggplot2".to_string()));
+        assert_eq!(ns.exports, vec!["foo"]);
+    }
+
+    #[test]
+    fn extract_top_level_defs_finds_assigned_names() {
+        let text = "foo <- function() 1\nbar = function(x) x\nbaz <- 42\n";
+        let defs = extract_top_level_defs(text);
+        assert!(defs.contains("foo"), "got: {:?}", defs);
+        assert!(defs.contains("bar"), "got: {:?}", defs);
+        assert!(defs.contains("baz"), "got: {:?}", defs);
+    }
+}

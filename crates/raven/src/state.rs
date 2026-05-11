@@ -428,56 +428,6 @@ fn parse_index(path: &PathBuf) -> Option<Vec<String>> {
     Some(symbols)
 }
 
-#[allow(dead_code)]
-fn parse_namespace_imports(path: &PathBuf, library: &Library) -> Vec<(String, String)> {
-    let mut imports = Vec::new();
-
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return imports,
-    };
-
-    for line in text.lines() {
-        let line = line.trim();
-
-        // import(pkg) - imports all exports from pkg
-        if line.starts_with("import(") {
-            if let Some(args) = line
-                .strip_prefix("import(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                for pkg_name in args.split(',') {
-                    let pkg_name = pkg_name.trim().trim_matches('"');
-                    if let Some(pkg) = library.get(pkg_name) {
-                        for sym in &pkg.exports {
-                            imports.push((pkg_name.to_string(), sym.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        // importFrom(pkg, sym1, sym2, ...)
-        else if line.starts_with("importFrom(") {
-            if let Some(args) = line
-                .strip_prefix("importFrom(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 2 {
-                    // First arg is package name, rest are symbols
-                    let pkg = parts[0].trim_matches('"').to_string();
-                    for sym in &parts[1..] {
-                        let sym = sym.trim_matches('"');
-                        imports.push((pkg.clone(), sym.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    imports
-}
-
 /// Library of installed packages
 #[allow(dead_code)]
 pub struct Library {
@@ -549,14 +499,14 @@ pub struct WorldState {
     // Legacy fields (kept for migration compatibility)
     pub documents: HashMap<Url, Document>,
     pub workspace_index: HashMap<Url, Document>,
-    /// (package, symbol) pairs from workspace NAMESPACE importFrom() entries.
-    ///
-    /// Wrapped in `Arc` so `DiagnosticsSnapshot::build` does a refcount bump
-    /// rather than deep-cloning the entire vector on every snapshot build.
-    pub workspace_imports: Arc<Vec<(String, String)>>,
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
+    // Legacy package metadata store. Superseded by `package_library` below,
+    // but retained (gated by `#[allow(dead_code)]` here and on the struct)
+    // because an integration test still exercises it to verify R library
+    // discovery from `.libPaths()`.
+    #[allow(dead_code)]
     pub library: Library,
 
     // Package function awareness
@@ -595,6 +545,30 @@ pub struct WorldState {
     /// dependency mode, undefined variable diagnostics are deferred for files
     /// without explicit backward directives until this flag is true.
     pub workspace_scan_complete: bool,
+    /// Container for all derived R package mode state. See package_state/mod.rs.
+    pub package_state: crate::package_state::PackageState,
+    /// Inputs to the package-mode `derive` function. Updated by event handlers
+    /// before calling `apply_package_event`. See package_state::PackageInputs.
+    pub package_inputs: crate::package_state::PackageInputs,
+}
+
+impl WorldState {
+    /// Passthrough for legacy `state.package_workspace` reads.
+    pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
+        self.package_state.workspace()
+    }
+
+    /// Apply a `PackageInputDelta` produced by an event handler.
+    /// Caller has already mutated `self.package_inputs` to reflect the event.
+    /// Recomputes `package_state` as a pure function of inputs.
+    pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
+        let new_package_state = crate::package_state::derive_package_state(
+            &self.package_state,
+            &self.package_inputs,
+            delta,
+        );
+        self.package_state.set_from(new_package_state);
+    }
 }
 
 impl WorldState {
@@ -661,7 +635,6 @@ impl WorldState {
             // Legacy fields (kept for migration compatibility)
             documents: HashMap::new(),
             workspace_index: HashMap::new(),
-            workspace_imports: Arc::new(Vec::new()),
 
             // Workspace configuration
             workspace_folders: Vec::new(),
@@ -692,6 +665,8 @@ impl WorldState {
             libpath_watcher_handle: None,
             package_library_ready: false,
             workspace_scan_complete: false,
+            package_state: crate::package_state::PackageState::new(),
+            package_inputs: crate::package_state::PackageInputs::default(),
         }
     }
 
@@ -781,6 +756,7 @@ impl WorldState {
             workspace_folder: self.workspace_folders.first().cloned(),
             max_chain_depth: self.cross_file_config.max_chain_depth,
             backward_dependencies: self.cross_file_config.backward_dependencies,
+            scope_contribution: self.package_state.scope_contribution().clone(),
         }
     }
 
@@ -942,23 +918,39 @@ impl WorldState {
             }
         }
         log::info!("Indexed {} workspace files", self.workspace_index.len());
-
-        // Load workspace NAMESPACE imports
-        self.load_workspace_namespace();
     }
 
-    /// Apply pre-scanned workspace index results (for non-blocking initialization)
+    /// Apply pre-scanned workspace index results (for non-blocking initialization).
+    ///
+    /// Package-mode state is *not* set from parameters: this function
+    /// resets `self.package_state` to its default (neutral) value, and
+    /// the caller is expected to follow with
+    /// `apply_package_event(PackageInputDelta::Initial)` — which in turn
+    /// derives `workspace` / `namespace_model` / `r_file_facts` /
+    /// `scope_contribution` from `self.package_inputs` via
+    /// `derive_package_state`. This keeps package derivation single-sourced.
+    ///
+    /// Tests and benchmarks that only exercise cross-file / workspace
+    /// scanning behavior (and don't care about package state) can rely on
+    /// the post-reset `PackageState::default()` — they don't need to call
+    /// `apply_package_event` themselves.
     ///
     /// **Validates: Requirements 11.1, 13.1**
     pub fn apply_workspace_index(
         &mut self,
         index: HashMap<Url, Document>,
-        imports: Vec<(String, String)>,
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
         self.workspace_index = index;
-        self.workspace_imports = Arc::new(imports);
+
+        // Atomic reset of package state. Per-mode transitions (e.g. toggling
+        // packageMode) must never leave stale `r_file_facts` or
+        // `scope_contribution` from a prior mode, so we always start from a
+        // neutral default here. The scan-completion caller follows this
+        // with `apply_package_event`, which repopulates every field from
+        // `package_inputs` via `derive_package_state`.
+        self.package_state = crate::package_state::PackageState::default();
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -981,9 +973,8 @@ impl WorldState {
         }
 
         log::info!(
-            "Applied {} workspace files, {} imports, {} cross-file entries, {} new index entries",
+            "Applied {} workspace files, {} cross-file entries, {} new index entries",
             self.workspace_index.len(),
-            self.workspace_imports.len(),
             self.cross_file_workspace_index.uris().len(),
             self.workspace_index_new.len()
         );
@@ -1046,24 +1037,6 @@ impl WorldState {
     }
 
     #[allow(dead_code)]
-    fn load_workspace_namespace(&mut self) {
-        for folder_url in &self.workspace_folders {
-            if let Ok(folder_path) = folder_url.to_file_path() {
-                let namespace_path = folder_path.join("NAMESPACE");
-                if namespace_path.exists() {
-                    self.workspace_imports =
-                        Arc::new(parse_namespace_imports(&namespace_path, &self.library));
-                    log::info!(
-                        "Loaded {} workspace imports from NAMESPACE",
-                        self.workspace_imports.len()
-                    );
-                    break; // Only process first workspace folder with NAMESPACE
-                }
-            }
-        }
-    }
-
-    #[allow(dead_code)]
     fn index_directory(&mut self, dir: &std::path::Path) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -1096,14 +1069,17 @@ impl WorldState {
 ///
 /// Returns:
 /// - `HashMap<Url, Document>` - Legacy index for backward compatibility
-/// - `Vec<String>` - Workspace imports from NAMESPACE
 /// - `HashMap<Url, crate::cross_file::workspace_index::IndexEntry>` - Cross-file entries (legacy)
 /// - `HashMap<Url, crate::workspace_index::IndexEntry>` - New unified WorkspaceIndex entries
+///
+/// Package-mode state (workspace/namespace model, roxygen cache, NAMESPACE
+/// imports) is intentionally **not** produced here. The canonical derivation
+/// is `derive_package_state`, invoked through `apply_package_event` after
+/// the caller populates `WorldState::package_inputs`.
 ///
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
 pub type WorkspaceScanResult = (
     HashMap<Url, Document>,
-    Vec<(String, String)>,
     HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     HashMap<Url, crate::workspace_index::IndexEntry>,
 );
@@ -1214,8 +1190,6 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
     use rayon::prelude::*;
 
-    let mut imports = Vec::new();
-
     // Get workspace root for path resolution
     let workspace_root = folders.first().cloned();
 
@@ -1225,15 +1199,6 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
             collect_file_paths(&path, &mut file_paths);
-
-            // Check for NAMESPACE file
-            let namespace_path = path.join("NAMESPACE");
-            if namespace_path.exists() && imports.is_empty() {
-                if let Ok(text) = fs::read_to_string(&namespace_path) {
-                    imports = parse_namespace_imports_from_text(&text);
-                    log::info!("Found {} imports from NAMESPACE", imports.len());
-                }
-            }
         }
     }
 
@@ -1358,7 +1323,18 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         cross_file_entries.len(),
         new_index_entries.len()
     );
-    (index, imports, cross_file_entries, new_index_entries)
+
+    // Package-mode detection is *not* done here. `scan_workspace` used to
+    // construct `PackageWorkspace` and a `PackageNamespaceModel` inline —
+    // detecting roxygen, parsing NAMESPACE, aggregating roxygen tags per
+    // file, and caching per-file roxygen tags — but
+    // that logic duplicated `derive_package_state` and the result was
+    // unconditionally overwritten by the `apply_package_event(Initial)`
+    // call that follows `apply_workspace_index` in `backend.rs`.
+    // The canonical derivation is now single-sourced through the event path
+    // (`PackageInputs` → `derive_package_state`).
+
+    (index, cross_file_entries, new_index_entries)
 }
 
 /// Directories to skip during workspace scanning.
@@ -1404,50 +1380,6 @@ fn is_stat_model_extension(path: &Path) -> bool {
 // `scan_directory` was replaced by `collect_file_paths` + `process_workspace_file`
 // for parallel scanning via rayon. See `scan_workspace`.
 
-/// Parse NAMESPACE imports without needing a `Library` reference.
-///
-/// Only handles `importFrom(pkg, sym, ...)`: it returns concrete `(package, symbol)`
-/// pairs that downstream diagnostic suppression can match by name. `import(pkg)`
-/// (whole-namespace import) is intentionally skipped here because expanding it
-/// requires reading `pkg`'s exports, which this parser has no access to during the
-/// initial workspace scan (the `PackageLibrary` may not be initialized yet, and
-/// even when it is, this function is called during the parallel workspace scan
-/// implemented by `collect_file_paths` + `process_workspace_file` / `scan_workspace`).
-///
-/// The Library-aware variant `parse_namespace_imports` (above) does expand
-/// `import(pkg)`. If a workspace package uses `import(pkg)` to re-export an
-/// entire namespace, symbols imported that way will not appear in
-/// `state.workspace_imports` and therefore will not silence undefined-variable
-/// diagnostics — users will see them flagged. This is a known limitation;
-/// `importFrom()` is the dominant pattern in practice (≥99% of CRAN packages).
-fn parse_namespace_imports_from_text(text: &str) -> Vec<(String, String)> {
-    let mut imports = Vec::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-
-        // importFrom(pkg, sym1, sym2, ...)
-        // import(pkg) is not handled here — see function docs.
-        if line.starts_with("importFrom(") {
-            if let Some(args) = line
-                .strip_prefix("importFrom(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 2 {
-                    let pkg = parts[0].trim_matches('"').to_string();
-                    for sym in &parts[1..] {
-                        let sym = sym.trim_matches('"');
-                        imports.push((pkg.clone(), sym.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    imports
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,17 +1387,6 @@ mod tests {
 
     // Include workspace scanning tests
     include!("state_tests.rs");
-
-    #[test]
-    fn test_workspace_imports_is_arc_wrapped() {
-        // Locks in S5: WorldState.workspace_imports must be Arc<Vec<...>>
-        // so DiagnosticsSnapshot::build does a refcount bump rather than
-        // deep-cloning the (package, symbol) Vec on every snapshot build.
-        let state = WorldState::new(vec![]);
-        let arc1: Arc<Vec<(String, String)>> = state.workspace_imports.clone();
-        let arc2 = arc1.clone();
-        assert!(Arc::ptr_eq(&arc1, &arc2), "Arc clones must share storage");
-    }
 
     #[test]
     fn test_document_apply_change_ascii() {

@@ -32,6 +32,8 @@ pub mod jags_builtins;
 pub mod libpath_watcher;
 pub mod namespace_parser;
 pub mod package_library;
+pub mod package_namespace;
+pub mod package_state;
 pub mod parameter_resolver;
 pub mod perf;
 pub mod qualified_resolve;

@@ -338,6 +338,13 @@ pub(crate) fn parse_cross_file_config(
         if let Some(v) = packages.get("watchDebounceMs").and_then(|v| v.as_u64()) {
             config.packages_watch_debounce_ms = v.clamp(100, 5000);
         }
+        if let Some(v) = packages.get("packageMode").and_then(|v| v.as_str()) {
+            config.package_mode = match v {
+                "enabled" => crate::cross_file::config::PackageMode::Enabled,
+                "disabled" => crate::cross_file::config::PackageMode::Disabled,
+                _ => crate::cross_file::config::PackageMode::Auto,
+            };
+        }
     }
 
     log::info!("Cross-file configuration loaded from LSP settings:");
@@ -841,6 +848,377 @@ impl Backend {
     }
 }
 
+/// Collect open R/*.R and tests/testthat/ siblings of `closing_uri` whose
+/// diagnostics must refresh after a package-mode visibility change triggered
+/// by `did_close`. Filters out the closing URI and non-package files,
+/// enforces `max_revalidations_per_trigger` (priority-ordered via
+/// `cross_file_activity`), then snapshots each survivor's `(version, revision)`
+/// for the `run_debounced_diagnostics` freshness guard.
+///
+/// Returned as a `Vec` (not a `HashSet`) because the caller iterates in the
+/// post-cap, post-priority order to spawn one debounced diagnostic task per
+/// sibling.
+fn collect_close_fanout_siblings(
+    state: &WorldState,
+    closing_uri: &Url,
+    workspace_root: &std::path::Path,
+) -> Vec<(Url, Option<i32>, Option<u64>)> {
+    let mut candidates: Vec<Url> = state
+        .documents
+        .keys()
+        .filter(|open_uri| *open_uri != closing_uri)
+        .filter(|open_uri| {
+            open_uri.to_file_path().ok().is_some_and(|p| {
+                crate::package_state::is_r_source_path(&p, workspace_root).is_some()
+            })
+        })
+        .cloned()
+        .collect();
+    cap_watched_file_revalidations(
+        &mut candidates,
+        &state.cross_file_activity,
+        state.cross_file_config.max_revalidations_per_trigger,
+    );
+    candidates
+        .into_iter()
+        .filter_map(|sibling_uri| {
+            state
+                .documents
+                .get(&sibling_uri)
+                .map(|doc| (sibling_uri, doc.version, Some(doc.revision)))
+        })
+        .collect()
+}
+
+fn extend_with_open_package_docs(
+    affected: &mut Vec<Url>,
+    affected_set: &mut std::collections::HashSet<Url>,
+    state: &WorldState,
+    workspace_root: &std::path::Path,
+) {
+    for open_uri in state.documents.keys() {
+        if open_uri
+            .to_file_path()
+            .ok()
+            .is_some_and(|p| crate::package_state::is_r_source_path(&p, workspace_root).is_some())
+            && affected_set.insert(open_uri.clone())
+        {
+            affected.push(open_uri.clone());
+        }
+    }
+}
+
+/// Whether the DELETED-only branch of `did_change_watched_files` should
+/// run `apply_package_event(Initial)` to re-derive package state.
+///
+/// `derive_package_state` walks every R file's roxygen tags and rebuilds
+/// the namespace model from inputs. Skip when no package-relevant
+/// deletions occurred in this batch — non-R deletions (e.g.
+/// `data/foo.csv`) leave `package_inputs` untouched, and re-deriving
+/// from unchanged inputs cannot change `package_state`.
+///
+/// Matches the gate in the parallel mixed-batch branch:
+/// `else if had_pkg_deletion && state.package_inputs.workspace_root.is_some()`.
+fn should_rederive_after_deletion_batch(
+    workspace_is_package: bool,
+    had_pkg_deletion: bool,
+) -> bool {
+    workspace_is_package && had_pkg_deletion
+}
+
+/// Extend `affected_open_docs` with URIs from `open_keys` not already
+/// present, conditionally marking the new URIs for force-republish.
+///
+/// Called from the DESCRIPTION/NAMESPACE manifest event block in
+/// `did_change_watched_files`. Marking is gated on `sync_publish_path`
+/// because the manifest block runs before either the synchronous
+/// publish loop or the async cap+mark+publish block:
+///
+/// - **Sync path** (`uris_to_update.is_empty()`): every URI in
+///   `affected_open_docs` is published without an additional cap, so the
+///   newly added URIs must be marked here to allow the same-version
+///   forced republish through the gate.
+/// - **Async path** (`uris_to_update` non-empty): the spawned task caps
+///   `affected_for_async` to `max_revalidations_per_trigger` and only
+///   marks the post-cap survivors. Marking here would create orphan
+///   force-republish markers for URIs the cap drops, which would
+///   incorrectly allow a future same-version publish to succeed without
+///   an explicit mark.
+fn extend_affected_for_manifest_change(
+    affected_open_docs: &mut Vec<Url>,
+    open_keys: Vec<Url>,
+    sync_publish_path: bool,
+    gate: &crate::cross_file::revalidation::CrossFileDiagnosticsGate,
+) {
+    let existing: std::collections::HashSet<Url> = affected_open_docs.iter().cloned().collect();
+    let new_uris: Vec<Url> = open_keys
+        .into_iter()
+        .filter(|u| !existing.contains(u))
+        .collect();
+    if sync_publish_path {
+        gate.mark_force_republish_many(new_uris.iter());
+    }
+    affected_open_docs.extend(new_uris);
+}
+
+#[cfg(test)]
+mod deletion_rederive_decision_tests {
+    use super::*;
+
+    #[test]
+    fn rederive_after_pkg_deletion_in_package_workspace() {
+        assert!(should_rederive_after_deletion_batch(true, true));
+    }
+
+    #[test]
+    fn no_rederive_for_non_pkg_deletion_in_package_workspace() {
+        // Regression: previously the DELETED-only branch unconditionally
+        // re-derived whenever workspace_root.is_some(), even if no package
+        // source files were deleted. `derive_package_state` walks every R
+        // file's roxygen tags — wasted work per non-package deletion in a
+        // package workspace (e.g. deleting `data/foo.csv`).
+        assert!(!should_rederive_after_deletion_batch(true, false));
+    }
+
+    #[test]
+    fn no_rederive_outside_package_workspace() {
+        assert!(!should_rederive_after_deletion_batch(false, true));
+        assert!(!should_rederive_after_deletion_batch(false, false));
+    }
+}
+
+#[cfg(test)]
+mod manifest_extend_tests {
+    use super::*;
+    use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
+
+    fn test_uri(name: &str) -> Url {
+        Url::parse(&format!("file:///{name}")).unwrap()
+    }
+
+    #[test]
+    fn sync_path_marks_new_uris_only() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let existing = test_uri("R/existing.R");
+        let new1 = test_uri("R/new1.R");
+        let new2 = test_uri("R/new2.R");
+        for u in &[&existing, &new1, &new2] {
+            gate.record_publish(u, 1);
+        }
+        let mut affected: Vec<Url> = vec![existing.clone()];
+        let open_keys = vec![existing.clone(), new1.clone(), new2.clone()];
+
+        extend_affected_for_manifest_change(&mut affected, open_keys, true, &gate);
+
+        assert_eq!(affected.len(), 3, "all unique open keys appended");
+        assert!(
+            gate.can_publish(&new1, 1),
+            "new URI {new1} must be force-marked in sync path"
+        );
+        assert!(
+            gate.can_publish(&new2, 1),
+            "new URI {new2} must be force-marked in sync path"
+        );
+        assert!(
+            !gate.can_publish(&existing, 1),
+            "pre-existing URI {existing} (already in affected) must not be re-marked by this helper"
+        );
+    }
+
+    #[test]
+    fn async_path_extends_without_marking() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let new1 = test_uri("R/new1.R");
+        let new2 = test_uri("R/new2.R");
+        for u in &[&new1, &new2] {
+            gate.record_publish(u, 1);
+        }
+        let mut affected: Vec<Url> = vec![];
+        let open_keys = vec![new1.clone(), new2.clone()];
+
+        extend_affected_for_manifest_change(&mut affected, open_keys.clone(), false, &gate);
+
+        assert_eq!(affected, open_keys, "affected extended with open_keys");
+        for u in &open_keys {
+            assert!(
+                !gate.can_publish(u, 1),
+                "URI {u} must NOT be force-marked in async path (post-cap mark owns marking)"
+            );
+        }
+    }
+
+    #[test]
+    fn async_path_followed_by_cap_publish_leaves_no_orphan_markers() {
+        // Regression: prior to this fix, the manifest event block in
+        // did_change_watched_files called mark_force_republish_many on
+        // ALL open documents unconditionally. The async block then
+        // applied max_revalidations_per_trigger and force-marked only
+        // the post-cap survivors, leaving URIs dropped by the cap with
+        // orphan force-republish markers. Those orphan markers would
+        // incorrectly allow a future same-version publish to succeed
+        // without an explicit mark for that publish.
+        let gate = CrossFileDiagnosticsGate::new();
+        let max_revalidations = 10usize;
+        let open_uris: Vec<Url> = (0..20).map(|i| test_uri(&format!("R/f{i}.R"))).collect();
+        for u in &open_uris {
+            gate.record_publish(u, 1);
+        }
+
+        // Manifest block (fixed pattern): extend, do NOT mark.
+        let mut affected: Vec<Url> = vec![];
+        extend_affected_for_manifest_change(&mut affected, open_uris.clone(), false, &gate);
+
+        // Async block: cap, mark, publish.
+        let mut affected_for_async = affected.clone();
+        affected_for_async.truncate(max_revalidations);
+        gate.mark_force_republish_many(affected_for_async.iter());
+        for u in &affected_for_async {
+            assert!(
+                gate.try_consume_publish(u, 1),
+                "force-marked URI must publish at v=1"
+            );
+        }
+
+        // URIs dropped by the cap must NOT have orphan force markers.
+        for u in &open_uris[max_revalidations..] {
+            assert!(
+                !gate.can_publish(u, 1),
+                "URI {u} dropped by cap retained an orphan force-republish marker"
+            );
+        }
+    }
+}
+
+fn is_package_source_dir(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let r_dir = root.join("R");
+    let testthat_dir = root.join("tests").join("testthat");
+    path == r_dir
+        || path.starts_with(&r_dir)
+        || path == testthat_dir
+        || path.starts_with(testthat_dir)
+}
+
+fn is_package_manifest_path(path: &std::path::Path, root: &std::path::Path) -> bool {
+    path == root.join("DESCRIPTION") || path == root.join("NAMESPACE")
+}
+
+fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
+    uri.to_file_path().ok().is_some_and(|path| {
+        crate::package_state::is_r_source_path(&path, root).is_some()
+            || is_package_manifest_path(&path, root)
+    })
+}
+
+fn collect_package_r_file_inputs_from_disk(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
+    let mut r_files = std::collections::BTreeMap::new();
+    for base in [root.join("R"), root.join("tests").join("testthat")] {
+        if !base.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(base)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.into_path();
+            let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let text: std::sync::Arc<str> = text.into();
+            let digest = crate::package_state::ContentDigest::of(&text);
+            r_files.insert(
+                path,
+                crate::package_state::RFileInput {
+                    kind,
+                    text,
+                    content_digest: digest,
+                },
+            );
+        }
+    }
+    r_files
+}
+
+fn hydrate_package_r_files_from_state(
+    state: &WorldState,
+    root: &std::path::Path,
+    mut r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
+) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
+    let open_uris: std::collections::HashSet<Url> = state.documents.keys().cloned().collect();
+
+    for uri in state.workspace_index_new.uris() {
+        if open_uris.contains(&uri) {
+            continue;
+        }
+        if let Ok(path) = uri.to_file_path() {
+            if let Some(kind) = crate::package_state::is_r_source_path(&path, root) {
+                if let Some(entry) = state.workspace_index_new.get(&uri) {
+                    let text: std::sync::Arc<str> = entry.contents.to_string().into();
+                    let digest = crate::package_state::ContentDigest::of(&text);
+                    r_files.insert(
+                        path,
+                        crate::package_state::RFileInput {
+                            kind,
+                            text,
+                            content_digest: digest,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    for uri in &open_uris {
+        if let Ok(path) = uri.to_file_path() {
+            if let Some(kind) = crate::package_state::is_r_source_path(&path, root) {
+                let text: std::sync::Arc<str> = state
+                    .documents
+                    .get(uri)
+                    .map(|d| d.text())
+                    .unwrap_or_default()
+                    .into();
+                let digest = crate::package_state::ContentDigest::of(&text);
+                r_files.insert(
+                    path,
+                    crate::package_state::RFileInput {
+                        kind,
+                        text,
+                        content_digest: digest,
+                    },
+                );
+            }
+        }
+    }
+
+    r_files
+}
+
+fn initialize_package_inputs_from_state(
+    state: &mut WorldState,
+    root: std::path::PathBuf,
+    desc_text: Option<Arc<str>>,
+    ns_text: Option<Arc<str>>,
+    disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
+) {
+    state.package_inputs.workspace_root = Some(root.clone());
+    state.package_inputs.package_mode = state.cross_file_config.package_mode;
+
+    state.package_inputs.description =
+        desc_text.map(|text| crate::package_state::DescriptionInput { text });
+    state.package_inputs.namespace =
+        ns_text.map(|text| crate::package_state::NamespaceInput { text });
+
+    let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
+    state.package_inputs.r_files = new_r_files;
+    state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+}
+
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
 /// per-trigger cap before any force-republish markers are created.
 fn cap_watched_file_revalidations(
@@ -1238,6 +1616,10 @@ impl LanguageServer for Backend {
         // priority over the background scan.
         let state_clone = self.state.clone();
         let folders_clone = folders.clone();
+        // Capture the workspace root before spawning the blocking scan so we can
+        // read DESCRIPTION/NAMESPACE outside the WorldState write lock below.
+        let root_for_pkg_inputs: Option<std::path::PathBuf> =
+            folders.first().and_then(|u| u.to_file_path().ok());
         let client_clone = self.client.clone();
         if index_workspace {
             tokio::task::spawn(async move {
@@ -1259,16 +1641,49 @@ impl LanguageServer for Backend {
 
                 // Apply results when scan completes
                 match scan_result {
-                    Ok((index, imports, cross_file_entries, new_index_entries)) => {
+                    Ok((index, cross_file_entries, new_index_entries)) => {
+                        // Read DESCRIPTION and NAMESPACE BEFORE acquiring the
+                        // WorldState write lock — `std::fs::read_to_string` is
+                        // blocking and would stall any concurrent writer (e.g.
+                        // an in-flight `did_change`) for the duration of disk
+                        // I/O. Files were already touched during the blocking
+                        // scan above, so the read is typically a warm cache hit.
+                        let (desc_text, ns_text) = if let Some(ref root) = root_for_pkg_inputs {
+                            let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
+                                .ok()
+                                .map(|t| std::sync::Arc::from(t.as_str()));
+                            let ns = std::fs::read_to_string(root.join("NAMESPACE"))
+                                .ok()
+                                .map(|t| std::sync::Arc::from(t.as_str()));
+                            (desc, ns)
+                        } else {
+                            (None, None)
+                        };
+
                         // Apply index and snapshot trigger versions under a single write lock
                         let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
                             let mut state = state_clone.write().await;
                             state.apply_workspace_index(
                                 index,
-                                imports,
                                 cross_file_entries,
                                 new_index_entries,
                             );
+                            if let Some(root) = root_for_pkg_inputs.clone() {
+                                // Populate package_inputs from the now-applied
+                                // workspace index and overlay open documents
+                                // (authoritative unsaved edits).
+                                initialize_package_inputs_from_state(
+                                    &mut state,
+                                    root,
+                                    desc_text,
+                                    ns_text,
+                                    Default::default(),
+                                );
+                            } else {
+                                state.apply_package_event(
+                                    &crate::package_state::PackageInputDelta::Initial,
+                                );
+                            }
                             // Mark force republish for all open documents so they pick up
                             // newly discovered backward edges from the dependency graph
                             // and snapshot trigger versions while we hold the lock.
@@ -1350,9 +1765,41 @@ impl LanguageServer for Backend {
                 }
             });
         } else {
-            // No workspace scan — mark complete immediately
+            let package_seed = if let Some(root) = root_for_pkg_inputs.clone() {
+                let root_clone = root.clone();
+                Some((
+                    root,
+                    tokio::task::spawn_blocking(move || {
+                        let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                            .ok()
+                            .map(|s| Arc::from(s.as_str()));
+                        let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                            .ok()
+                            .map(|s| Arc::from(s.as_str()));
+                        let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                        (desc, ns, disk_r_files)
+                    })
+                    .await
+                    .unwrap_or((None, None, Default::default())),
+                ))
+            } else {
+                None
+            };
+
+            // No workspace scan — mark complete immediately and still seed
+            // package inputs from disk/open documents so package mode starts
+            // with a derived state.
             let mut state = self.state.write().await;
             state.workspace_scan_complete = true;
+            if let Some((root, (desc_text, ns_text, disk_r_files))) = package_seed {
+                initialize_package_inputs_from_state(
+                    &mut state,
+                    root,
+                    desc_text,
+                    ns_text,
+                    disk_r_files,
+                );
+            }
         }
 
         // Task B: Initialize PackageLibrary (await this - diagnostics need it)
@@ -1720,6 +2167,29 @@ impl LanguageServer for Backend {
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
+            // Update package state via event-driven path when a package input opens.
+            // This uses the `DidOpen` variant, which consumes caller-supplied
+            // buffer text only; the disk-reading `WatchedFileChanged` variant
+            // is handled by watched-file code paths instead.
+            let mut package_visibility_changed = false;
+            {
+                let arc_text: std::sync::Arc<str> = text.as_str().into();
+                let old_ns_model = state.package_state.namespace_model().cloned();
+                let old_contribution = state.package_state.scope_contribution().clone();
+                let event = crate::package_state::event::HandlerEvent::DidOpen {
+                    uri: uri.clone(),
+                    text: arc_text,
+                };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
+                    state.apply_package_event(&delta);
+                    package_visibility_changed = state.package_state.namespace_model()
+                        != old_ns_model.as_ref()
+                        || state.package_state.scope_contribution() != &old_contribution;
+                }
+            }
+
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
             let packages_enabled = state.cross_file_config.packages_enabled;
 
@@ -1866,11 +2336,41 @@ impl LanguageServer for Backend {
                     old_interface_hash,
                     new_interface_hash
                 );
+                // Package-internal symbols are now updated by apply_package_event
+                // above (via scope_contribution → internal_symbols_cache). No
+                // separate rebuild is needed here.
             }
 
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
             let mut affected: std::collections::HashSet<Url> =
                 std::collections::HashSet::from([uri.clone()]);
+
+            // In package mode, when an R/*.R file's interface changed on open
+            // (e.g., external edit), revalidate siblings so they pick up
+            // added/removed symbols via mutual visibility. Sibling files
+            // include BOTH `R/` (two-way visible to each other) and
+            // `tests/testthat/` (one-way: sees R/ but R/ doesn't see it).
+            // `append_package_contribution` injects package-internal symbols
+            // into both kinds — so when an R/ interface changes, both kinds
+            // of open files have potentially stale diagnostics.
+            if interface_changed || package_visibility_changed {
+                if let Some(pkg) = state.package_workspace() {
+                    if let Ok(fp) = uri.to_file_path() {
+                        let r_dir = pkg.root.join("R");
+                        if package_visibility_changed || fp.starts_with(&r_dir) {
+                            for open_uri in state.documents.keys() {
+                                if let Ok(p) = open_uri.to_file_path() {
+                                    if crate::package_state::is_r_source_path(&p, &pkg.root)
+                                        .is_some()
+                                    {
+                                        affected.insert(open_uri.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Invalidate cross-file scope neighbors if interface changed OR
             // dependency edges changed. See `compute_affected_dependents_after_edit`
@@ -2305,6 +2805,7 @@ impl LanguageServer for Backend {
                     false,
                     probe.backward_dependencies,
                     &|| false,
+                    Some(&probe.scope_contribution),
                 );
 
                 let mut pkgs = scope.inherited_packages;
@@ -2539,6 +3040,52 @@ impl LanguageServer for Backend {
                 state.document_store.update(&uri, changes, version).await;
             }
 
+            // Update package state via event-driven path when an R/*.R file
+            // changes in a package workspace.
+            //
+            // Guard the potentially expensive full-document `Rope -> String ->
+            // Arc<str>` materialization behind a cheap path check. Without
+            // the guard, every keystroke on every open R file in every
+            // workspace (including non-package and scratch-file workflows)
+            // paid two full-document heap allocations just to have
+            // `translate()` short-circuit on `is_r_source_path == None`.
+            // The `DidChange` variant uses only this in-memory buffer text;
+            // watched-file events are the only package events that may read
+            // from disk and are handled on their own code paths.
+            let mut package_visibility_changed = false;
+            let in_package_input_path = state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .zip(uri.to_file_path().ok())
+                .is_some_and(|(root, path)| {
+                    crate::package_state::is_r_source_path(&path, root).is_some()
+                        || path == root.join("DESCRIPTION")
+                        || path == root.join("NAMESPACE")
+                });
+            if in_package_input_path {
+                let text: std::sync::Arc<str> = state
+                    .documents
+                    .get(&uri)
+                    .map(|d| d.text())
+                    .unwrap_or_default()
+                    .into();
+                let old_ns_model = state.package_state.namespace_model().cloned();
+                let old_contribution = state.package_state.scope_contribution().clone();
+                let event = crate::package_state::event::HandlerEvent::DidChange {
+                    uri: uri.clone(),
+                    text,
+                };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
+                    state.apply_package_event(&delta);
+                    package_visibility_changed = state.package_state.namespace_model()
+                        != old_ns_model.as_ref()
+                        || state.package_state.scope_contribution() != &old_contribution;
+                }
+            }
+
             // Compute new interface_hash after applying changes
             // Use document_store which has artifacts computed with metadata (including declared symbols)
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
@@ -2563,6 +3110,9 @@ impl LanguageServer for Backend {
                     old_interface_hash,
                     new_interface_hash
                 );
+                // Package-internal symbols are now updated by apply_package_event
+                // above (via scope_contribution → internal_symbols_cache). No
+                // separate rebuild is needed here.
             }
 
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
@@ -2602,6 +3152,46 @@ impl LanguageServer for Backend {
             for child in wd_affected {
                 if state.documents.contains_key(&child) {
                     affected.insert(child);
+                }
+            }
+            // When package-mode visibility changed, all open package files
+            // need revalidation so imports and internal symbols propagate.
+            // Both `R/` (two-way) and `tests/testthat/` (one-way) receive the
+            // contribution via `append_package_contribution`, so both need
+            // the affected-set.
+            if package_visibility_changed {
+                if let Some(pkg) = state.package_workspace() {
+                    for open_uri in state.documents.keys() {
+                        if let Ok(p) = open_uri.to_file_path() {
+                            if crate::package_state::is_r_source_path(&p, &pkg.root).is_some() {
+                                affected.insert(open_uri.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // In package mode, when the exported interface of an R/*.R file
+            // changes, other open package files depend on it via mutual
+            // visibility (not the source() graph). Revalidate them so
+            // added/removed symbols propagate to undefined-variable
+            // diagnostics. `tests/testthat/` sees R/ symbols (one-way), so
+            // include test files in the affected set too.
+            if interface_changed && !package_visibility_changed {
+                if let Some(pkg) = state.package_workspace() {
+                    if let Ok(fp) = uri.to_file_path() {
+                        let r_dir = pkg.root.join("R");
+                        if fp.starts_with(&r_dir) {
+                            for open_uri in state.documents.keys() {
+                                if let Ok(p) = open_uri.to_file_path() {
+                                    if crate::package_state::is_r_source_path(&p, &pkg.root)
+                                        .is_some()
+                                    {
+                                        affected.insert(open_uri.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             // Convert to Vec for sorting
@@ -2723,6 +3313,7 @@ impl LanguageServer for Backend {
                         false,
                         probe.backward_dependencies,
                         &|| false,
+                        Some(&probe.scope_contribution),
                     );
                     all_packages.extend(scope.inherited_packages);
                     all_packages.extend(scope.loaded_packages);
@@ -2803,26 +3394,139 @@ impl LanguageServer for Backend {
         // Cancel pending background indexing for this URI
         self.background_indexer.cancel_uri(uri);
 
-        let mut state = self.state.write().await;
+        let (package_close_path, close_text): (bool, Option<Arc<str>>) = {
+            let state = self.state.read().await;
+            let package_close_path = state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .zip(uri.to_file_path().ok())
+                .is_some_and(|(root, path)| {
+                    crate::package_state::is_r_source_path(&path, root).is_some()
+                        || is_package_manifest_path(&path, root)
+                });
+            let in_memory_text = if package_close_path {
+                state.documents.get(uri).map(|doc| Arc::from(doc.text()))
+            } else {
+                None
+            };
+            (package_close_path, in_memory_text)
+        };
 
-        // Close in new DocumentStore (Requirement 1.5)
-        state.document_store.close(uri);
+        let close_text = if package_close_path && close_text.is_none() {
+            let path = uri.to_file_path().ok();
+            if let Some(path) = path {
+                tokio::task::spawn_blocking(move || {
+                    std::fs::read_to_string(path)
+                        .ok()
+                        .map(|text| Arc::from(text.as_str()))
+                })
+                .await
+                .unwrap_or(None)
+            } else {
+                None
+            }
+        } else {
+            close_text
+        };
 
-        // Clear diagnostics gate state
-        state.diagnostics_gate.clear(uri);
+        let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
+            let mut state = self.state.write().await;
 
-        // Cancel pending revalidation
-        state.cross_file_revalidation.cancel(uri);
+            // Close in new DocumentStore (Requirement 1.5)
+            state.document_store.close(uri);
 
-        // Remove from activity tracking
-        state.cross_file_activity.remove(uri);
+            // Clear diagnostics gate state
+            state.diagnostics_gate.clear(uri);
 
-        // Close the document (legacy)
-        state.close_document(uri);
+            // Cancel pending revalidation
+            state.cross_file_revalidation.cancel(uri);
 
-        // Refresh the pin set now that the open set has shrunk; URIs reachable
-        // only from the closed file are no longer protected from eviction.
-        state.recompute_open_neighborhood_pins();
+            // Remove from activity tracking
+            state.cross_file_activity.remove(uri);
+
+            // Close the document (legacy)
+            state.close_document(uri);
+
+            // Snapshot package visibility before applying the close event, so we
+            // can detect symbol/import changes caused by switching the closed
+            // file's content from Open (unsaved buffer) to Disk. Open siblings
+            // resolved against the unsaved buffer must refresh their diagnostics
+            // when the buffer-only symbols disappear; otherwise stale "no error"
+            // diagnostics linger until the user touches each sibling.
+            let old_ns_model = state.package_state.namespace_model().cloned();
+            let old_contribution = state.package_state.scope_contribution().clone();
+
+            // In package mode, update package inputs on close from the
+            // authoritative snapshot captured above: the last in-memory
+            // document text when available, otherwise a fresh filesystem read.
+            if package_close_path {
+                let event = crate::package_state::event::HandlerEvent::DidClose {
+                    uri: uri.clone(),
+                    on_disk_text: close_text,
+                };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
+                    state.apply_package_event(&delta);
+                }
+            }
+
+            // Detect package-mode visibility changes triggered by the close.
+            // When an unsaved buffer with buffer-only symbols (e.g. a freshly
+            // added function) closes, those symbols leave `r_internal_symbols`
+            // and any open sibling that referenced them needs its diagnostics
+            // recomputed. Mirrors the watched-file fanout above (including
+            // `max_revalidations_per_trigger`).
+            let mut sibling_fanout: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
+            let pkg_visibility_changed = state.package_state.namespace_model()
+                != old_ns_model.as_ref()
+                || state.package_state.scope_contribution() != &old_contribution;
+            if pkg_visibility_changed {
+                if let Some(root) = state.package_inputs.workspace_root.clone() {
+                    sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
+                }
+                if !sibling_fanout.is_empty() {
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(sibling_fanout.iter().map(|(u, _, _)| u));
+                }
+            }
+
+            // Invalidate the workspace index entry so the next scan re-reads from disk.
+            if let Ok(p) = uri.to_file_path() {
+                if state
+                    .package_workspace()
+                    .is_some_and(|pkg| is_package_source_dir(&p, &pkg.root))
+                {
+                    state.cross_file_workspace_index.invalidate(uri);
+                    state.workspace_index_new.invalidate(uri);
+                }
+            }
+
+            // Refresh the pin set now that the open set has shrunk; URIs reachable
+            // only from the closed file are no longer protected from eviction.
+            state.recompute_open_neighborhood_pins();
+
+            let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
+            (sibling_fanout, debounce_ms)
+        };
+
+        // Schedule revalidation for affected open siblings outside the write
+        // lock. The debounce window collapses bursts (e.g. "close all" closing
+        // many files in quick succession) into a single republish per sibling.
+        for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
+            let state_arc = self.state.clone();
+            let client = self.client.clone();
+            tokio::spawn(run_debounced_diagnostics(
+                state_arc,
+                client,
+                sibling_uri,
+                debounce_ms,
+                trigger_version,
+                trigger_revision,
+            ));
+        }
     }
 
     /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
@@ -2881,6 +3585,7 @@ impl LanguageServer for Backend {
             packages_enabled,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
+            pkg_mode_io_needed,
         ) = {
             let mut state = self.state.write().await;
 
@@ -2952,10 +3657,45 @@ impl LanguageServer for Backend {
                 .unwrap_or(state.cross_file_config.packages_enabled);
 
             // Apply new config if parsed
+            let package_mode_changed = new_config
+                .as_ref()
+                .map(|c| c.package_mode != state.cross_file_config.package_mode)
+                .unwrap_or(false);
             if let Some(config) = new_config {
                 state.resize_caches(&config);
                 state.cross_file_config = config;
             }
+
+            // If package_mode changed, apply the setting change via the event-driven
+            // path. For Disabled: translate immediately (derive yields no workspace).
+            // For Auto/Enabled: capture root for disk I/O outside the lock.
+            let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
+                use crate::cross_file::config::PackageMode;
+                let mode = state.cross_file_config.package_mode;
+                // Translate the setting change — updates package_inputs.package_mode.
+                let event =
+                    crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
+                    if mode == PackageMode::Disabled {
+                        // Derive immediately: effective_workspace returns None for Disabled.
+                        state.apply_package_event(&delta);
+                        None
+                    } else {
+                        // Need to repopulate description/namespace from disk outside the
+                        // lock; capture root so caller can do the I/O.
+                        state
+                            .workspace_folders
+                            .first()
+                            .and_then(|u| u.to_file_path().ok())
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // Apply new symbol config if parsed
             // Requirement 11.2: Apply symbols.workspaceMaxResults from settings
@@ -3001,8 +3741,45 @@ impl LanguageServer for Backend {
                 packages_enabled,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
+                pkg_mode_io_needed,
             )
         };
+
+        // --- Package mode rebuild: repopulate inputs after mode switch ---
+        // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
+        // from disk (lightweight; R files are already in package_inputs from
+        // prior did_open/did_change/scan events). Then derive package state.
+        if let Some(root) = pkg_mode_io_needed {
+            let root_clone = root.clone();
+            let (desc_text, ns_text, disk_r_files) = tokio::task::spawn_blocking(move || {
+                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                    .ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                    .ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                (desc, ns, disk_r_files)
+            })
+            .await
+            .unwrap_or((None, None, Default::default()));
+
+            // Re-acquire write lock to apply results
+            let mut state = self.state.write().await;
+            // Repopulate description/namespace inputs with fresh disk content.
+            state.package_inputs.workspace_root = Some(root.clone());
+            state.package_inputs.description =
+                desc_text.map(|text| crate::package_state::DescriptionInput { text });
+            state.package_inputs.namespace =
+                ns_text.map(|text| crate::package_state::NamespaceInput { text });
+            // Seed from disk so packageMode switches still see closed R files
+            // when the background workspace index has not populated yet; then
+            // overlay index entries and open buffers through the shared helper.
+            let new_r_files = hydrate_package_r_files_from_state(&state, &root, disk_r_files);
+            state.package_inputs.r_files = new_r_files;
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+            log::info!("Rebuilt package state after packageMode change (event-driven)");
+        }
 
         // Log diagnostics_enabled change - Requirement 5.2
         if diagnostics_enabled_changed {
@@ -3157,7 +3934,11 @@ impl LanguageServer for Backend {
         }
 
         // Collect URIs to update and affected open documents
-        let (uris_to_update, affected_open_docs): (Vec<Url>, Vec<Url>) = {
+        let (uris_to_update, mut affected_open_docs, pkg_manifest_changes): (
+            Vec<Url>,
+            Vec<Url>,
+            Vec<(Url, bool)>,
+        ) = {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
             let mut affected: Vec<Url> = Vec::new();
@@ -3165,6 +3946,17 @@ impl LanguageServer for Backend {
             // watched-file changes can otherwise spend the lock-hold time
             // doing Vec::contains scans per dependent.
             let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+            // Track whether any deletion touched `package_inputs`, so that
+            // mixed batches (deletions + non-R creates/changes) still trigger
+            // a re-derive. Without this, a batch like
+            // `DELETE R/foo.R + CREATE inst/data.csv` skipped the sync
+            // `apply_package_event` (because `!to_update.is_empty()`) AND
+            // skipped the async path's `has_pkg_files` check (because
+            // `inst/data.csv` is not a package source file) — leaving
+            // symbols from the deleted R file stale in
+            // `scope_contribution.r_internal_symbols` until the next R/
+            // edit happened to trigger a derive.
+            let mut had_pkg_deletion = false;
 
             for change in &params.changes {
                 let uri = &change.uri;
@@ -3237,6 +4029,27 @@ impl LanguageServer for Backend {
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
                         state.cross_file_meta.remove(uri);
+
+                        // Update package inputs for deleted R/*.R or DESCRIPTION/NAMESPACE files.
+                        // The event-driven path in the post-loop block handles the derive.
+                        // (Accumulated here; apply_package_event called once after the loop.)
+                        {
+                            let event =
+                                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                                    uri: uri.clone(),
+                                    on_disk_text: None,
+                                    deleted: true,
+                                };
+                            if crate::package_state::event::translate(
+                                &mut state.package_inputs,
+                                event,
+                            )
+                            .is_some()
+                            {
+                                had_pkg_deletion = true;
+                            }
+                        }
+
                         log::trace!("Removed deleted file from cross-file state: {}", uri);
                     }
                     _ => {}
@@ -3249,6 +4062,35 @@ impl LanguageServer for Backend {
             // has added newly reachable open documents. For DELETED-only
             // batches, the graph is already updated here, so cap and mark now.
             if to_update.is_empty() {
+                // Derive package state after processing all deletions.
+                // The translate calls above accumulated input mutations; now
+                // derive the final state from the updated inputs. Skip the
+                // re-derive when no package source files were deleted —
+                // non-package deletions (e.g. `data/foo.csv`) leave
+                // `package_inputs` untouched, and a re-derive from
+                // unchanged inputs cannot change `package_state`.
+                if should_rederive_after_deletion_batch(
+                    state.package_inputs.workspace_root.is_some(),
+                    had_pkg_deletion,
+                ) {
+                    let old_ns_model = state.package_state.namespace_model().cloned();
+                    let old_contribution = state.package_state.scope_contribution().clone();
+                    state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+                    let pkg_visibility_changed = state.package_state.namespace_model()
+                        != old_ns_model.as_ref()
+                        || state.package_state.scope_contribution() != &old_contribution;
+                    if pkg_visibility_changed {
+                        if let Some(root) = state.package_inputs.workspace_root.clone() {
+                            extend_with_open_package_docs(
+                                &mut affected,
+                                &mut affected_set,
+                                &state,
+                                &root,
+                            );
+                        }
+                    }
+                }
+
                 cap_watched_file_revalidations(
                     &mut affected,
                     &state.cross_file_activity,
@@ -3259,13 +4101,141 @@ impl LanguageServer for Backend {
                 state
                     .diagnostics_gate
                     .mark_force_republish_many(affected.iter());
+            } else if had_pkg_deletion && state.package_inputs.workspace_root.is_some() {
+                // Mixed batch: deletions of package source files were applied
+                // above but `to_update` is non-empty, so the DELETED-only
+                // branch doesn't run. The async block below gates its derive
+                // on `uris_to_update` containing a package source path, which
+                // doesn't cover deletion-only mutations to `package_inputs`.
+                // Run the derive eagerly here so sibling diagnostics don't
+                // see stale `r_internal_symbols` entries for the deleted
+                // files until some later edit happens to trigger a derive.
+                let old_ns_model = state.package_state.namespace_model().cloned();
+                let old_contribution = state.package_state.scope_contribution().clone();
+                state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+                let pkg_visibility_changed = state.package_state.namespace_model()
+                    != old_ns_model.as_ref()
+                    || state.package_state.scope_contribution() != &old_contribution;
+                if pkg_visibility_changed {
+                    if let Some(root) = state.package_inputs.workspace_root.clone() {
+                        extend_with_open_package_docs(
+                            &mut affected,
+                            &mut affected_set,
+                            &state,
+                            &root,
+                        );
+                    }
+                }
             }
             // Watched-file deletions can drop edges that put a closed neighbor
             // outside the open-document neighborhood; refresh the pin set so
             // newly unreachable URIs become LRU-evictable again.
             state.recompute_open_neighborhood_pins();
-            (to_update, affected)
+
+            // Identify DESCRIPTION/NAMESPACE changes for the event-driven path.
+            // Content is read outside the lock (spawn_blocking) below.
+            let pkg_manifest_changes: Vec<(Url, bool)> = {
+                let workspace_root = state
+                    .workspace_folders
+                    .first()
+                    .and_then(|u| u.to_file_path().ok());
+                workspace_root
+                    .map(|root| {
+                        params
+                            .changes
+                            .iter()
+                            .filter_map(|c| {
+                                let p = c.uri.to_file_path().ok()?;
+                                if p == root.join("DESCRIPTION") || p == root.join("NAMESPACE") {
+                                    Some((c.uri.clone(), c.typ == FileChangeType::DELETED))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            (to_update, affected, pkg_manifest_changes)
         };
+
+        // --- Package manifest (DESCRIPTION/NAMESPACE) event-driven update ---
+        // For each changed manifest file, read content outside the lock then
+        // translate into package input mutations and re-derive state.
+        if !pkg_manifest_changes.is_empty() {
+            let mut manifest_contents: Vec<(Url, Option<std::sync::Arc<str>>, bool)> = Vec::new();
+            for (uri, deleted) in &pkg_manifest_changes {
+                let on_disk_text = if *deleted {
+                    None
+                } else {
+                    let path = uri.to_file_path().ok();
+                    if let Some(path) = path {
+                        let path_clone = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            std::fs::read_to_string(path_clone)
+                                .ok()
+                                .map(|s| std::sync::Arc::from(s.as_str()))
+                        })
+                        .await
+                        .unwrap_or(None)
+                    } else {
+                        None
+                    }
+                };
+                manifest_contents.push((uri.clone(), on_disk_text, *deleted));
+            }
+
+            // Apply manifest events under write lock
+            let mut state = self.state.write().await;
+            let mut deltas = Vec::new();
+            for (uri, on_disk_text, deleted) in manifest_contents {
+                let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                    uri,
+                    on_disk_text,
+                    deleted,
+                };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
+                    deltas.push(delta);
+                }
+            }
+            if !deltas.is_empty() {
+                let batch = crate::package_state::PackageInputDelta::Batch(deltas);
+                state.apply_package_event(&batch);
+                log::info!("Updated package state after DESCRIPTION/NAMESPACE change");
+                // Force republish for all open R files so namespace model
+                // changes propagate (they're not dependency-graph neighbors of
+                // DESCRIPTION/NAMESPACE so the sync pass didn't add them).
+                // Marking is gated on the publish path: see
+                // `extend_affected_for_manifest_change`. The async block below
+                // applies `max_revalidations_per_trigger` and force-marks only
+                // the post-cap survivors, so marking everything here would
+                // leave orphan markers on cap-dropped URIs.
+                let open_keys_filtered: Vec<Url> = state
+                    .package_inputs
+                    .workspace_root
+                    .as_ref()
+                    .map(|root| {
+                        state
+                            .documents
+                            .keys()
+                            .filter(|uri| is_package_relevant_open_uri(uri, root))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let sync_publish_path = uris_to_update.is_empty();
+                extend_affected_for_manifest_change(
+                    &mut affected_open_docs,
+                    open_keys_filtered,
+                    sync_publish_path,
+                    &state.diagnostics_gate,
+                );
+                drop(state);
+            }
+        }
 
         // Schedule async disk reads to update workspace index for changed files.
         // CREATED/CHANGED graph mutations happen inside the spawned task, so
@@ -3282,7 +4252,7 @@ impl LanguageServer for Backend {
             let mut affected_for_async_set: std::collections::HashSet<Url> =
                 affected_for_async.iter().cloned().collect();
             tokio::spawn(async move {
-                for uri in uris_to_update {
+                for uri in &uris_to_update {
                     // Read file content asynchronously
                     let path = match uri.to_file_path() {
                         Ok(p) => p,
@@ -3454,6 +4424,85 @@ impl LanguageServer for Backend {
                     }
 
                     log::trace!("Updated workspace index for: {}", uri);
+                }
+
+                // Update package inputs and derive state for CREATED/CHANGED R/*.R
+                // files so roxygen tag changes from external edits (e.g. git
+                // checkout) propagate to the namespace model and internal symbols.
+                {
+                    let mut state = state_arc.write().await;
+                    // Gate on any package source file — `is_r_source_path`
+                    // matches both `R/` and `tests/testthat/`. Without the
+                    // `tests/` branch, external edits that touch only test
+                    // files (e.g. `git checkout` on a topic branch) would
+                    // leave their RFileFacts stale in `package_state`.
+                    let root_for_check = state.package_inputs.workspace_root.clone();
+                    let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
+                        uris_to_update.iter().any(|u| {
+                            u.to_file_path().ok().is_some_and(|p| {
+                                crate::package_state::is_r_source_path(&p, root).is_some()
+                                    || is_package_source_dir(&p, root)
+                            })
+                        })
+                    });
+                    if has_pkg_files {
+                        let mut deltas = Vec::new();
+                        let mut ns_changed = false;
+                        let old_ns_model = state.package_state.namespace_model().cloned();
+                        // Snapshot the package's visibility/contribution state
+                        // (Arc-backed clones are cheap) so visibility-only
+                        // changes — e.g. internal symbol or NAMESPACE-import
+                        // edits that don't alter exports — also trigger the
+                        // open-file fanout below.
+                        let old_contribution = state.package_state.scope_contribution().clone();
+                        for uri in &uris_to_update {
+                            if state.documents.contains_key(uri) {
+                                continue; // open docs are authoritative; skip
+                            }
+                            // Use the file cache content (already inserted above).
+                            let on_disk_text: Option<std::sync::Arc<str>> = state
+                                .cross_file_file_cache
+                                .get(uri)
+                                .map(|s| std::sync::Arc::from(s.as_str()));
+                            let event =
+                                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                                    uri: uri.clone(),
+                                    on_disk_text,
+                                    deleted: false,
+                                };
+                            if let Some(delta) = crate::package_state::event::translate(
+                                &mut state.package_inputs,
+                                event,
+                            ) {
+                                deltas.push(delta);
+                            }
+                        }
+                        if !deltas.is_empty() {
+                            let batch = crate::package_state::PackageInputDelta::Batch(deltas);
+                            state.apply_package_event(&batch);
+                            ns_changed = state.package_state.namespace_model()
+                                != old_ns_model.as_ref()
+                                || state.package_state.scope_contribution() != &old_contribution;
+                        }
+                        if ns_changed {
+                            // Namespace model changed (e.g. roxygen tags changed in an
+                            // external edit). Add all open package files (R/ and
+                            // tests/testthat/) to affected set so their @import
+                            // diagnostics are refreshed.
+                            if let Some(ref root) = state.package_inputs.workspace_root.clone() {
+                                for open_uri in state.documents.keys() {
+                                    if let Ok(p) = open_uri.to_file_path() {
+                                        if crate::package_state::is_r_source_path(&p, root)
+                                            .is_some()
+                                            && affected_for_async_set.insert(open_uri.clone())
+                                        {
+                                            affected_for_async.push(open_uri.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Now that the graph reflects every CREATED/CHANGED file in
@@ -4656,6 +5705,7 @@ pub(crate) async fn prefetch_packages_for_open_documents(
             false,
             probe.backward_dependencies,
             &|| false,
+            Some(&probe.scope_contribution),
         );
         for p in scope.inherited_packages {
             all_pkgs.insert(p);
@@ -4848,6 +5898,7 @@ pub(crate) struct ScopeProbeSnapshot {
     pub(crate) workspace_folder: Option<Url>,
     pub(crate) max_chain_depth: usize,
     pub(crate) backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
+    pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
 }
 
 /// State-side preparation for a `LibpathEvent::Dropped`: clears the package
@@ -5010,6 +6061,7 @@ async fn run_libpath_consumer(
                             false,
                             probe.backward_dependencies,
                             &|| false,
+                            Some(&probe.scope_contribution),
                         );
                         // Scope probe captures inherited + global-scope packages.
                         // Also check the document's full loaded_packages which
@@ -5500,6 +6552,264 @@ mod tests {
             cap_watched_file_revalidations(&mut affected, &activity, 0);
 
             assert!(affected.is_empty());
+        }
+    }
+
+    /// Regression tests for `collect_close_fanout_siblings`, which decides
+    /// which open package files get force-republished when a sibling closes
+    /// and the close changes package-mode visibility.
+    mod close_fanout_siblings {
+        use super::super::{
+            collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
+            extend_with_open_package_docs, hydrate_package_r_files_from_state,
+            initialize_package_inputs_from_state, is_package_relevant_open_uri,
+            is_package_source_dir,
+        };
+        use crate::state::{Document, WorldState};
+        use std::path::PathBuf;
+        use tower_lsp::lsp_types::Url;
+
+        fn pkg_root() -> PathBuf {
+            PathBuf::from("/work/pkg")
+        }
+
+        fn r_uri(name: &str) -> Url {
+            Url::from_file_path(pkg_root().join("R").join(name)).unwrap()
+        }
+
+        fn make_state_with_open_pkg_docs(names: &[&str]) -> WorldState {
+            let mut state = WorldState::new(vec![]);
+            state
+                .workspace_folders
+                .push(Url::from_file_path(pkg_root()).unwrap());
+            // Deterministic cap for tests; explicit overrides come per-test.
+            state.cross_file_config.max_revalidations_per_trigger = 10;
+            for name in names {
+                state
+                    .documents
+                    .insert(r_uri(name), Document::new("x <- 1\n", Some(1)));
+            }
+            state
+        }
+
+        #[test]
+        fn fanout_excludes_the_closing_uri() {
+            let state = make_state_with_open_pkg_docs(&["a.R", "b.R", "c.R"]);
+            let closing = r_uri("a.R");
+
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert_eq!(
+                fanout.len(),
+                2,
+                "should fan out to the two non-closing siblings"
+            );
+            assert!(
+                fanout.iter().all(|(u, _, _)| u != &closing),
+                "fanout must not include the closing URI"
+            );
+            assert!(fanout.iter().any(|(u, _, _)| u == &r_uri("b.R")));
+            assert!(fanout.iter().any(|(u, _, _)| u == &r_uri("c.R")));
+        }
+
+        #[test]
+        fn fanout_filters_out_files_outside_the_package_layout() {
+            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
+            // Same workspace root, but not under R/ or tests/testthat/.
+            let scratch = Url::from_file_path(pkg_root().join("scratch.R")).unwrap();
+            state
+                .documents
+                .insert(scratch.clone(), Document::new("y <- 2\n", Some(1)));
+            // Different workspace entirely.
+            let outside = Url::from_file_path("/other/proj/foo.R").unwrap();
+            state
+                .documents
+                .insert(outside.clone(), Document::new("z <- 3\n", Some(1)));
+
+            let closing = r_uri("a.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert!(
+                fanout
+                    .iter()
+                    .all(|(u, _, _)| u != &scratch && u != &outside),
+                "files outside R/ and tests/testthat/ must not appear in fanout"
+            );
+        }
+
+        #[test]
+        fn fanout_includes_testthat_siblings() {
+            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
+            let test_uri =
+                Url::from_file_path(pkg_root().join("tests").join("testthat").join("test-a.R"))
+                    .unwrap();
+            state.documents.insert(
+                test_uri.clone(),
+                Document::new("expect_equal(1, 1)\n", Some(1)),
+            );
+
+            let closing = r_uri("a.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert!(
+                fanout.iter().any(|(u, _, _)| u == &test_uri),
+                "tests/testthat/ siblings should refresh on R/ close"
+            );
+        }
+
+        #[test]
+        fn fanout_respects_max_revalidations_per_trigger() {
+            let names: Vec<String> = (0..20).map(|i| format!("f{i}.R")).collect();
+            let names_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut state = make_state_with_open_pkg_docs(&names_refs);
+            state.cross_file_config.max_revalidations_per_trigger = 3;
+
+            let closing = r_uri("f0.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            assert_eq!(
+                fanout.len(),
+                3,
+                "fanout must be capped at max_revalidations_per_trigger \
+                 to bound diagnostic bursts on close-all"
+            );
+        }
+
+        #[test]
+        fn fanout_snapshots_each_siblings_version_and_revision() {
+            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
+            // Insert a sibling with a specific version/revision pair.
+            let b = r_uri("b.R");
+            let mut doc_b = Document::new("y <- 2\n", Some(7));
+            doc_b.revision = 42;
+            state.documents.insert(b.clone(), doc_b);
+
+            let closing = r_uri("a.R");
+            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
+
+            let (got_uri, got_version, got_revision) = fanout
+                .into_iter()
+                .find(|(u, _, _)| u == &b)
+                .expect("b.R in fanout");
+            assert_eq!(got_uri, b);
+            assert_eq!(got_version, Some(7));
+            assert_eq!(got_revision, Some(42));
+        }
+
+        #[test]
+        fn open_package_doc_extension_dedupes_and_includes_tests() {
+            let mut state = make_state_with_open_pkg_docs(&["a.R", "b.R"]);
+            let test_uri =
+                Url::from_file_path(pkg_root().join("tests").join("testthat").join("test-a.R"))
+                    .unwrap();
+            state
+                .documents
+                .insert(test_uri.clone(), Document::new("helper()\n", Some(1)));
+            let scratch = Url::from_file_path(pkg_root().join("scratch.R")).unwrap();
+            state
+                .documents
+                .insert(scratch.clone(), Document::new("scratch <- 1\n", Some(1)));
+
+            let existing = r_uri("a.R");
+            let mut affected = vec![existing.clone()];
+            let mut affected_set = std::collections::HashSet::from([existing.clone()]);
+
+            extend_with_open_package_docs(&mut affected, &mut affected_set, &state, &pkg_root());
+
+            assert_eq!(affected.iter().filter(|u| *u == &existing).count(), 1);
+            assert!(affected.contains(&r_uri("b.R")));
+            assert!(affected.contains(&test_uri));
+            assert!(!affected.contains(&scratch));
+        }
+
+        #[test]
+        fn package_hydration_uses_disk_fallback_with_open_overlay() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path();
+            let r_dir = root.join("R");
+            std::fs::create_dir_all(&r_dir).unwrap();
+            let disk_only = r_dir.join("disk-only.R");
+            let open_path = r_dir.join("open.R");
+            std::fs::write(&disk_only, "disk_only <- 1\n").unwrap();
+            std::fs::write(&open_path, "open_value <- 'disk'\n").unwrap();
+
+            let mut state = WorldState::new(vec![]);
+            let open_uri = Url::from_file_path(&open_path).unwrap();
+            state
+                .documents
+                .insert(open_uri, Document::new("open_value <- 'buffer'\n", Some(3)));
+
+            let disk_seed = collect_package_r_file_inputs_from_disk(root);
+            let hydrated = hydrate_package_r_files_from_state(&state, root, disk_seed);
+
+            assert!(hydrated.contains_key(&disk_only));
+            let open_entry = hydrated.get(&open_path).expect("open file hydrated");
+            assert_eq!(&*open_entry.text, "open_value <- 'buffer'\n");
+        }
+
+        #[test]
+        fn package_initialization_helper_populates_inputs_and_derives_state() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path();
+            let r_dir = root.join("R");
+            std::fs::create_dir_all(&r_dir).unwrap();
+            let helper_path = r_dir.join("helper.R");
+            std::fs::write(&helper_path, "helper <- function() 1\n").unwrap();
+
+            let mut state = WorldState::new(vec![]);
+            let disk_seed = collect_package_r_file_inputs_from_disk(root);
+            initialize_package_inputs_from_state(
+                &mut state,
+                root.to_path_buf(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+            );
+
+            assert_eq!(state.package_inputs.workspace_root.as_deref(), Some(root));
+            assert!(state.package_inputs.r_files.contains_key(&helper_path));
+            assert!(
+                state
+                    .package_state
+                    .scope_contribution()
+                    .r_internal_symbols
+                    .contains("helper"),
+                "initial package input seeding must derive package state"
+            );
+        }
+
+        #[test]
+        fn package_source_dir_matches_r_and_testthat_files() {
+            let root = pkg_root();
+            assert!(is_package_source_dir(&root.join("R").join("foo.R"), &root));
+            assert!(is_package_source_dir(
+                &root.join("tests").join("testthat").join("test-foo.R"),
+                &root
+            ));
+            assert!(!is_package_source_dir(
+                &root.join("tests").join("helper.R"),
+                &root
+            ));
+            assert!(!is_package_source_dir(&root.join("scratch.R"), &root));
+        }
+
+        #[test]
+        fn package_relevant_open_uri_filters_to_package_inputs() {
+            let root = pkg_root();
+            let source = Url::from_file_path(root.join("R").join("foo.R")).unwrap();
+            let test = Url::from_file_path(root.join("tests").join("testthat").join("test-foo.R"))
+                .unwrap();
+            let desc = Url::from_file_path(root.join("DESCRIPTION")).unwrap();
+            let namespace = Url::from_file_path(root.join("NAMESPACE")).unwrap();
+            let scratch = Url::from_file_path(root.join("scratch.R")).unwrap();
+            let data = Url::from_file_path(root.join("data").join("foo.R")).unwrap();
+
+            assert!(is_package_relevant_open_uri(&source, &root));
+            assert!(is_package_relevant_open_uri(&test, &root));
+            assert!(is_package_relevant_open_uri(&desc, &root));
+            assert!(is_package_relevant_open_uri(&namespace, &root));
+            assert!(!is_package_relevant_open_uri(&scratch, &root));
+            assert!(!is_package_relevant_open_uri(&data, &root));
         }
     }
 
@@ -6956,6 +8266,7 @@ mod refresh_packages_tests {
             false,
             snapshot.backward_dependencies,
             &|| false,
+            Some(&snapshot.scope_contribution),
         );
         // dplyr appears in loaded_packages (from forward source() chain),
         // not inherited_packages (which come from backward/parent edges).
@@ -6970,6 +8281,46 @@ mod refresh_packages_tests {
              inherited={:?}, loaded={:?}",
             scope.inherited_packages,
             scope.loaded_packages
+        );
+    }
+
+    #[test]
+    fn package_scope_snapshot_carries_package_contribution() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+        use std::path::PathBuf;
+
+        let root = PathBuf::from("/work/pkg");
+        let uri = Url::from_file_path(root.join("R").join("main.R")).unwrap();
+        let mut world = WorldState::new(vec![]);
+        world
+            .documents
+            .insert(uri.clone(), Document::new("helper()\n", Some(1)));
+        world.package_inputs.workspace_root = Some(root.clone());
+        world.package_inputs.description = Some(DescriptionInput {
+            text: "Package: pkg\n".into(),
+        });
+        let text: Arc<str> = "helper <- function() 1\n".into();
+        world.package_inputs.r_files.insert(
+            root.join("R").join("helper.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                content_digest: ContentDigest::of(&text),
+                text,
+            },
+        );
+        world.apply_package_event(&PackageInputDelta::Initial);
+
+        let snapshot = world.build_package_scope_snapshot(&[(uri, 0)]);
+
+        assert!(
+            snapshot
+                .scope_contribution
+                .r_internal_symbols
+                .contains("helper"),
+            "background scope probes must carry package-internal symbols"
         );
     }
 
@@ -7197,7 +8548,6 @@ mod refresh_packages_tests {
         new_entries.insert(parent_uri.clone(), parent_entry);
         world.apply_workspace_index(
             std::collections::HashMap::new(),
-            Vec::new(),
             std::collections::HashMap::new(),
             new_entries,
         );

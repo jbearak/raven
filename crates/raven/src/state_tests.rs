@@ -18,7 +18,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 1, "Should find 1 .R file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
@@ -32,7 +32,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 1, "Should find 1 .r file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
@@ -48,7 +48,7 @@ mod workspace_scan_tests {
         fs::write(temp_dir.path().join("lowercase.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 2, "Should find both .R and .r files");
         assert_eq!(cross_file_entries.len(), 2, "Should have 2 cross-file entries");
@@ -69,7 +69,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "my_func <- function() { 42 }").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (_, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(cross_file_entries.len(), 1);
         assert_eq!(new_index_entries.len(), 1);
@@ -97,7 +97,7 @@ mod workspace_scan_tests {
         fs::write(subdir.join("nested.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 2, "Should find files in root and subdirectory");
         assert_eq!(new_index_entries.len(), 2, "Should have 2 new index entries");
@@ -115,7 +115,7 @@ my_func <- function(x) { x + 1 }
 "#).unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, _, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (_, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(new_index_entries.len(), 1);
         
@@ -171,7 +171,7 @@ mod jags_stan_indexing_tests {
         fs::write(dir.join("readme.txt"), "not indexed").unwrap();
 
         let workspace_url = Url::from_file_path(dir).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) =
+        let (index, cross_file_entries, new_index_entries) =
             scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         // All R, JAGS, and Stan files should be indexed (4 total), .txt excluded
@@ -199,7 +199,7 @@ mod jags_stan_indexing_tests {
         fs::write(dir.join("upper.STAN"), "data { int N; }").unwrap();
 
         let workspace_url = Url::from_file_path(dir).unwrap();
-        let (index, _, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 3, "Should index uppercase JAGS/BUGS/STAN extensions");
     }
@@ -258,7 +258,7 @@ mod jags_stan_indexing_property_tests {
             fs::write(&file_path, "model { x ~ dnorm(0, 1) }").unwrap();
 
             let workspace_url = Url::from_file_path(dir).unwrap();
-            let (index, _, _, new_index_entries) =
+            let (index, _, new_index_entries) =
                 scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
             // The file must be present in the index
@@ -494,3 +494,202 @@ mod preservation {
         }
     }
 }
+
+// ============================================================================
+// Package mode: tests/testthat one-way visibility integration tests (Phase 6.2)
+//
+// These tests drive the full pipeline:
+//   PackageInputs → WorldState::apply_package_event → scope_at_position_with_graph
+// to confirm end-to-end that test files see R/ symbols (one-way visibility) and
+// R/ files do NOT see test-only symbols.
+// ============================================================================
+
+#[cfg(test)]
+mod package_testthat_visibility_tests {
+    use super::super::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::Url;
+
+    use crate::cross_file::dependency::DependencyGraph;
+    use crate::cross_file::scope::{
+        compute_artifacts, scope_at_position_with_graph, ScopeArtifacts,
+    };
+    use crate::cross_file::config::PackageMode;
+    use crate::package_state::{
+        ContentDigest, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+    };
+
+    // Match the depth used by the other test modules so future adjustments
+    // propagate uniformly.
+    const TEST_MAX_CHAIN_DEPTH: usize = 20;
+
+    /// Parse R source into `ScopeArtifacts` using tree-sitter-r.
+    fn make_artifacts(uri: &Url, code: &str) -> Arc<ScopeArtifacts> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        Arc::new(compute_artifacts(uri, &tree, code))
+    }
+
+    /// Resolve visible symbols at EOF in `uri` using the given contribution.
+    fn resolve_symbols(
+        uri: &Url,
+        artifacts: Arc<ScopeArtifacts>,
+        workspace_root: &Url,
+        contribution: &crate::package_state::PackageScopeContribution,
+    ) -> std::collections::HashMap<Arc<str>, crate::cross_file::scope::ScopedSymbol> {
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == uri { Some(artifacts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+        let graph = DependencyGraph::new();
+
+        let scope = scope_at_position_with_graph(
+            uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(workspace_root),
+            TEST_MAX_CHAIN_DEPTH,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(contribution),
+        );
+        scope.symbols
+    }
+
+    /// Build a `WorldState` pre-populated with DESCRIPTION + the given R files,
+    /// then call `apply_package_event(Initial)` to drive full package-mode derivation.
+    fn build_state_with_files(
+        workspace_root_path: &str,
+        r_files: Vec<(PathBuf, RFileKind, &str)>,
+    ) -> WorldState {
+        let mut state = WorldState::new(vec![]);
+        state.package_inputs.workspace_root = Some(PathBuf::from(workspace_root_path));
+        state.package_inputs.package_mode = PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: foo\n".into(),
+        });
+        for (path, kind, text) in r_files {
+            let text: Arc<str> = Arc::from(text);
+            let digest = ContentDigest::of(&text);
+            state.package_inputs.r_files.insert(
+                path,
+                RFileInput { kind, text, content_digest: digest },
+            );
+        }
+        state.apply_package_event(&PackageInputDelta::Initial);
+        state
+    }
+
+    // ------------------------------------------------------------------
+    // Test A: test file sees R/ symbol (one-way: tests → R/)
+    // ------------------------------------------------------------------
+
+    /// End-to-end: a symbol defined in R/utils.R is visible when resolving
+    /// scope inside tests/testthat/test-utils.R.
+    #[test]
+    fn test_file_sees_r_dir_symbol_end_to_end() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/R/utils.R", root)),
+                    RFileKind::Source,
+                    "helper <- function() 1\n",
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/test-utils.R", root)),
+                    RFileKind::Test,
+                    "result <- helper()\n",
+                ),
+            ],
+        );
+
+        // The derived contribution must carry `helper` from R/.
+        assert!(
+            state.package_state.scope_contribution().r_internal_symbols.contains("helper"),
+            "helper must appear in r_internal_symbols for injection into test files"
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-utils.R").unwrap();
+        let test_arts = make_artifacts(&test_uri, "result <- helper()\n");
+
+        let symbols = resolve_symbols(
+            &test_uri,
+            test_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+
+        assert!(
+            symbols.contains_key("helper"),
+            "helper must be visible in tests/testthat/ file after end-to-end package derivation. \
+             visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test B: R/ file does NOT see test-only symbol (asymmetry enforced)
+    // ------------------------------------------------------------------
+
+    /// End-to-end: a symbol defined only in tests/testthat/ must NOT appear
+    /// in scope when resolving inside R/main.R — confirming the asymmetry.
+    #[test]
+    fn r_file_does_not_see_test_only_symbol_end_to_end() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/R/main.R", root)),
+                    RFileKind::Source,
+                    "result <- test_helper()\n",
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/test-utils.R", root)),
+                    RFileKind::Test,
+                    "test_helper <- function() 99\n",
+                ),
+            ],
+        );
+
+        // The derived contribution must NOT carry `test_helper` (test symbols
+        // are excluded from r_internal_symbols by build_scope_contribution).
+        assert!(
+            !state.package_state.scope_contribution().r_internal_symbols.contains("test_helper"),
+            "test_helper must NOT appear in r_internal_symbols"
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_arts = make_artifacts(&main_uri, "result <- test_helper()\n");
+
+        let symbols = resolve_symbols(
+            &main_uri,
+            main_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+
+        assert!(
+            !symbols.contains_key("test_helper"),
+            "test_helper must NOT be visible in R/main.R. \
+             visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+}
+

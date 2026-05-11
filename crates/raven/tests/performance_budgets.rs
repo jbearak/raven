@@ -431,6 +431,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
         true,
         mode,
         &never_cancel,
+        None,
     );
 
     let elapsed = median_of_3(|| {
@@ -447,6 +448,7 @@ fn assert_scope_resolution_budget_50_file_workspace(
             true,
             mode,
             &never_cancel,
+            None,
         );
     });
 
@@ -519,8 +521,8 @@ fn budget_single_file_completion() {
     }
 
     // Run workspace scan and apply index (populates cross-file state)
-    let (index, imports, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
-    state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
+    let (index, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
+    state.apply_workspace_index(index, cross_file_entries, new_index_entries);
 
     let uri = Url::from_file_path(workspace_path.join("file_0.R")).unwrap();
     // Position inside the first function body (line 5, col 4 — on `result`)
@@ -534,4 +536,100 @@ fn budget_single_file_completion() {
     });
 
     assert_within_budget("single_file_completion", elapsed, 20);
+}
+
+// ---------------------------------------------------------------------------
+// derive_package_state budget
+// Requirements: 2.11 — single-file delta in 500-file workspace < 50ms median
+// ---------------------------------------------------------------------------
+
+#[test]
+fn derive_package_state_500_file_keystroke_budget() {
+    use raven::cross_file::config::PackageMode;
+    use raven::package_state::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let root: PathBuf = "/work/pkg".into();
+    let mut inputs = PackageInputs {
+        workspace_root: Some(root.clone()),
+        package_mode: PackageMode::Auto,
+        description: Some(DescriptionInput {
+            text: "Package: foo\n".into(),
+        }),
+        namespace: None,
+        r_files: BTreeMap::new(),
+    };
+    for i in 0..500 {
+        let p = root.join("R").join(format!("file_{}.R", i));
+        let text: Arc<str> = format!("fn_{} <- function() {}\n", i, i).into();
+        let digest = ContentDigest::of(&text);
+        inputs.r_files.insert(
+            p,
+            RFileInput {
+                kind: RFileKind::Source,
+                text,
+                content_digest: digest,
+            },
+        );
+    }
+    let s0 = derive_package_state(
+        &PackageState::default(),
+        &inputs,
+        &PackageInputDelta::Initial,
+    );
+
+    // Single-file delta: change file_42
+    let p = root.join("R").join("file_42.R");
+    let new_text: Arc<str> = "fn_42 <- function() 99\n".into();
+    let new_digest = ContentDigest::of(&new_text);
+    inputs.r_files.insert(
+        p.clone(),
+        RFileInput {
+            kind: RFileKind::Source,
+            text: new_text,
+            content_digest: new_digest,
+        },
+    );
+
+    // Warm-up: JIT/cache priming so the first measured iteration doesn't
+    // dominate the max sample.
+    let _ = derive_package_state(
+        &s0,
+        &inputs,
+        &PackageInputDelta::RFileChanged {
+            path: p.clone(),
+            kind: RFileKind::Source,
+        },
+    );
+
+    let mut times = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        let _s = derive_package_state(
+            &s0,
+            &inputs,
+            &PackageInputDelta::RFileChanged {
+                path: p.clone(),
+                kind: RFileKind::Source,
+            },
+        );
+        times.push(start.elapsed());
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    // With only 20 samples, (len * 99 / 100) always picks the last element,
+    // so report it as `max` rather than misleadingly labeling it `p99`.
+    let max = times.last().cloned().unwrap();
+    eprintln!(
+        "derive_package_state 500-file: median={:?} max={:?}",
+        median, max
+    );
+    // Generous budget; tighten later. The point of the test is to catch
+    // pathological regressions. Use assert_within_budget so CI relaxation
+    // (RAVEN_PERF_CI_FACTOR) applies uniformly with the rest of the file.
+    assert_within_budget("derive_package_state_500_file_keystroke_median", median, 50);
+    assert_within_budget("derive_package_state_500_file_keystroke_max", max, 200);
 }

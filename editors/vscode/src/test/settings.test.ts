@@ -113,6 +113,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'packages.missingPackageSeverity', jsonPath: ['packages', 'missingPackageSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'packages.watchLibraryPaths', jsonPath: ['packages', 'watchLibraryPaths'], type: 'boolean' },
     { vsCodeKey: 'packages.watchDebounceMs', jsonPath: ['packages', 'watchDebounceMs'], type: 'number' },
+    { vsCodeKey: 'packages.packageMode', jsonPath: ['packages', 'packageMode'], type: 'enum', enumValues: ['auto', 'enabled', 'disabled'] as const },
     // Symbol settings
     { vsCodeKey: 'symbols.workspaceMaxResults', jsonPath: ['symbols', 'workspaceMaxResults'], type: 'number' },
     // Completion settings

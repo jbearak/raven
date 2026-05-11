@@ -46,7 +46,6 @@ Key settings (all under the `raven.*` prefix):
 | `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens (`"active"` or `"beside"`). The help viewer activates regardless of `raven.rConsole.activation`. |
 | `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
 | `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
-| `raven.packages.enabled` | `true` | Enable package function awareness |
 | `raven.packages.rPath` | auto-detect | Path to R executable |
 | `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |
 | `raven.server.path` | bundled | Path to `raven` binary (if not using the bundled one) |
