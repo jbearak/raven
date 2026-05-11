@@ -20,7 +20,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 ### Code intelligence
 
 - **[Completions](docs/completion.md)** — Symbols, packages, and function parameters — across files
-- **Go-to-definition** — Jump to definitions across file boundaries
+- **[Go-to-definition](docs/go-to-definition.md)** — Jump to definitions across file boundaries
 - **[Find references](docs/find-references.md)** — Locate all usages of a symbol across your project
 - **Hover** — Symbol info including source file and package origin
 - **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
@@ -50,6 +50,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - [Directives](docs/directives.md) — All `@lsp-*` directive syntax
 - [Diagnostics](docs/diagnostics.md) — What's reported and how to suppress
 - [Completions](docs/completion.md) — What's offered and scope rules
+- [Go-to-Definition](docs/go-to-definition.md) — Cross-file navigation, `$`/`@` members, declared symbols
 - [Find References](docs/find-references.md) — Cross-file reference finding
 - [Document Outline](docs/document-outline.md) — Hierarchical symbol view
 - [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
