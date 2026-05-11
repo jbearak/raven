@@ -30,7 +30,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **Syntax highlighting** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
+- **[Syntax Highlighting](docs/syntax_highlighting.md)** — LSP semantic tokens for R, plus JAGS and Stan grammars
 
 ### R session integration
 
