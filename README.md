@@ -40,7 +40,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
 
 > [!NOTE]
-> Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation. See [Document Outline](docs/document-outline.md#jags-and-stan-model-structure).
+> Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: [syntax highlighting](docs/syntax-highlighting.md#jags-and-stan), completions (keywords, distributions, file-local symbols), [go-to-definition](docs/go-to-definition.md#jags-and-stan), find references, and [document outline with model structure navigation](docs/document-outline.md#jags-and-stan-model-structure).
 
 ## Documentation
 
