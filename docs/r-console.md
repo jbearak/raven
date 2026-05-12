@@ -42,6 +42,23 @@ The selected program must be available on your PATH.
 | **Run Downward Lines** | Sends all lines from the current line to the end of the file (extending upward to include the full statement start). |
 | **Source File** | Runs `source("filepath", echo = TRUE)` in the R terminal. |
 
+### Quick Inspection Commands
+
+These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R terminal — one keystroke to check an object's shape. They're registered under the **Raven** category, so typing `Raven:` in the Command Palette surfaces them all. No default keybindings; bind them in `keybindings.json` if you want shortcuts.
+
+| Command | Sends to R |
+|---------|------------|
+| **Raven: Show nrow** | `nrow(<target>)` |
+| **Raven: Show length** | `length(<target>)` |
+| **Raven: Show head** | `head(<target>)` |
+| **Raven: Show head (transposed)** | `t(head(<target>))` |
+| **Raven: Show names** | `names(<target>)` |
+| **Raven: View** | `View(<target>)` |
+
+If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used. The commands only run when the active editor's language is R — typically `.R`/`.r` files and untitled buffers whose language has been set to R. R Markdown and Quarto documents claimed by other extensions (`languageId` of `rmd`, `quarto`, etc.) are not currently in scope.
+
+Single-line wrapped expressions go straight to the terminal via direct paste; if the wrapped expression spans multiple lines (because the selection did), it honors the user's `raven.sendToR.sendMethod` setting. This avoids writing a one-liner like `nrow(x)` to a temp file just because `tempfile` mode is configured for normal sends.
+
 ## Editor Toolbar
 
 A toolbar button (▶) appears in the editor title bar for R files, providing quick access to all send commands. The menu is organized into two sections:
