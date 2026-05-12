@@ -67,7 +67,7 @@
   },
   "vapply": {
     "prefix": "vapply",
-    "body": "vapply(${1:x}, function(${2:el}) ${3}, ${0:FUN.VALUE})",
+    "body": "vapply(${1:x}, function(${2:el}) ${3}, ${0:character(1)})",
     "description": "vapply (type-safe)"
   },
   "mapply": {
@@ -192,7 +192,7 @@
 
   "cat": {
     "prefix": "cat",
-    "body": "cat(${1:...}, ${0:sep = \"\\n\"})",
+    "body": "cat(${1:...}, sep = ${2:\"\\n\"})${0}",
     "description": "cat"
   },
   "print": {
@@ -202,7 +202,7 @@
   },
   "paste": {
     "prefix": "paste",
-    "body": "paste(${1:...}, sep = ${0:\" \"})",
+    "body": "paste(${1:...}, sep = ${2:\" \"})${0}",
     "description": "paste"
   },
   "paste0": {

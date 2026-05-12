@@ -73,7 +73,7 @@ The following table lists every snippet to ship. The trigger column is what the 
 | `lam` | Anonymous lambda (R ≥ 4.1) | `\\(${1:x}) ${0}` |
 | `lapply` | `lapply` over list | `lapply(${1:x}, function(${2:el}) ${0})` |
 | `sapply` | `sapply` over list | `sapply(${1:x}, function(${2:el}) ${0})` |
-| `vapply` | `vapply` (type-safe) | `vapply(${1:x}, function(${2:el}) ${3}, ${0:FUN.VALUE})` |
+| `vapply` | `vapply` (type-safe) | `vapply(${1:x}, function(${2:el}) ${3}, ${0:character(1)})` |
 | `mapply` | `mapply` multi-arg | `mapply(function(${1:a}, ${2:b}) ${3}, ${4:x}, ${0:y})` |
 | `apply` | `apply` over matrix | `apply(${1:X}, ${2:MARGIN}, ${0:FUN})` |
 | `docall` | `do.call` | `do.call(${1:what}, ${0:args})` |
@@ -124,9 +124,9 @@ The following table lists every snippet to ship. The trigger column is what the 
 
 | Trigger | Description | Body |
 |---|---|---|
-| `cat` | `cat` | `cat(${1:...}, ${0:sep = "\\n"})` |
+| `cat` | `cat` | `cat(${1:...}, sep = ${2:"\\n"})${0}` |
 | `print` | `print` | `print(${0:x})` |
-| `paste` | `paste` | `paste(${1:...}, sep = ${0:" "})` |
+| `paste` | `paste` | `paste(${1:...}, sep = ${2:" "})${0}` |
 | `paste0` | `paste0` | `paste0(${0:...})` |
 | `sprintf` | `sprintf` | `sprintf(${1:"%s"}, ${0:args})` |
 | `msg` | `message` | `message(${0:"..."})` |
