@@ -115,9 +115,11 @@ suite('R snippets', () => {
         //   $N            (bare tab stop)
         // Known limitation: the [^}]* default-group is non-recursive, so
         // tab-stop numbers that appear *inside* a nested ${...} default
-        // (e.g. ${1:${2:x}}) are not collected. The balance check below
-        // still catches malformed nesting. None of our 65 snippets nest
-        // placeholders in defaults; flag this if that changes.
+        // are not collected. The "for" snippet does this intentionally —
+        // body `for (${1:i} in ${2:seq_along(${3:x})})` — and stop 3 is
+        // invisible to this regex. The balance check below still catches
+        // malformed nesting. If a future snippet adds duplicate stops
+        // inside nested defaults, this regex won't flag them.
         const tabStopPattern = /\$\{(\d+)(?::([^}]*))?\}|\$(\d+)/g;
 
         for (const [name, entry] of Object.entries(snippets)) {
