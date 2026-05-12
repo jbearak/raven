@@ -44,18 +44,18 @@ The selected program must be available on your PATH.
 
 ### Quick Inspection Commands
 
-These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R terminal — one keystroke to check an object's shape. No default keybindings; bind them in `keybindings.json` or run them from the Command Palette.
+These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R terminal — one keystroke to check an object's shape. They're registered under the **R** category, so typing `R:` in the Command Palette surfaces them all. No default keybindings; bind them in `keybindings.json` if you want shortcuts.
 
 | Command | Sends to R |
 |---------|------------|
-| **Show nrow** | `nrow(<target>)` |
-| **Show length** | `length(<target>)` |
-| **Show head** | `head(<target>)` |
-| **Show head (transposed)** | `t(head(<target>))` |
-| **Show names** | `names(<target>)` |
-| **View** | `View(<target>)` |
+| **R: Show nrow** | `nrow(<target>)` |
+| **R: Show length** | `length(<target>)` |
+| **R: Show head** | `head(<target>)` |
+| **R: Show head (transposed)** | `t(head(<target>))` |
+| **R: Show names** | `names(<target>)` |
+| **R: View** | `View(<target>)` |
 
-If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used.
+If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used. The commands only run when the active editor is an R document (`.R`, `.r`, `.rmd`, `.qmd`, or an untitled buffer whose language is R).
 
 ## Editor Toolbar
 

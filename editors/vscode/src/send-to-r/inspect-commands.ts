@@ -10,32 +10,32 @@ export interface InspectionCommand {
 export const INSPECTION_COMMANDS: InspectionCommand[] = [
     {
         id: 'raven.inspect.nrow',
-        title: 'Raven: Show nrow',
+        title: 'Show nrow',
         wrap: (e) => `nrow(${e})`,
     },
     {
         id: 'raven.inspect.length',
-        title: 'Raven: Show length',
+        title: 'Show length',
         wrap: (e) => `length(${e})`,
     },
     {
         id: 'raven.inspect.head',
-        title: 'Raven: Show head',
+        title: 'Show head',
         wrap: (e) => `head(${e})`,
     },
     {
         id: 'raven.inspect.headTransposed',
-        title: 'Raven: Show head (transposed)',
+        title: 'Show head (transposed)',
         wrap: (e) => `t(head(${e}))`,
     },
     {
         id: 'raven.inspect.names',
-        title: 'Raven: Show names',
+        title: 'Show names',
         wrap: (e) => `names(${e})`,
     },
     {
         id: 'raven.inspect.view',
-        title: 'Raven: View',
+        title: 'View',
         wrap: (e) => `View(${e})`,
     },
 ];
@@ -59,7 +59,7 @@ export function register_inspection_commands(
         context.subscriptions.push(
             vscode.commands.registerCommand(cmd.id, async () => {
                 const editor = vscode.window.activeTextEditor;
-                if (!editor) {
+                if (!editor || editor.document.languageId !== 'r') {
                     vscode.window.showInformationMessage(
                         'Open an R file to use quick inspection commands.'
                     );

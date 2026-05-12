@@ -79,27 +79,33 @@
       },
       {
         "command": "raven.inspect.nrow",
-        "title": "Raven: Show nrow"
+        "title": "Show nrow",
+        "category": "R"
       },
       {
         "command": "raven.inspect.length",
-        "title": "Raven: Show length"
+        "title": "Show length",
+        "category": "R"
       },
       {
         "command": "raven.inspect.head",
-        "title": "Raven: Show head"
+        "title": "Show head",
+        "category": "R"
       },
       {
         "command": "raven.inspect.headTransposed",
-        "title": "Raven: Show head (transposed)"
+        "title": "Show head (transposed)",
+        "category": "R"
       },
       {
         "command": "raven.inspect.names",
-        "title": "Raven: Show names"
+        "title": "Show names",
+        "category": "R"
       },
       {
         "command": "raven.inspect.view",
-        "title": "Raven: View"
+        "title": "View",
+        "category": "R"
       },
       {
         "command": "raven.openHelpPanel",
