@@ -55,7 +55,7 @@ These commands wrap the word under the cursor (or the current selection) in a co
 | **R: Show names** | `names(<target>)` |
 | **R: View** | `View(<target>)` |
 
-If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used. The commands only run when the active editor is an R document (`.R`, `.r`, `.rmd`, `.qmd`, or an untitled buffer whose language is R).
+If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used. The commands only run when the active editor's language is R — typically `.R`/`.r` files and untitled buffers whose language has been set to R. R Markdown and Quarto documents claimed by other extensions (`languageId` of `rmd`, `quarto`, etc.) are not currently in scope.
 
 Single-line wrapped expressions go straight to the terminal via direct paste; if the wrapped expression spans multiple lines (because the selection did), it honors the user's `raven.sendToR.sendMethod` setting. This avoids writing a one-liner like `nrow(x)` to a temp file just because `tempfile` mode is configured for normal sends.
 
