@@ -9,6 +9,7 @@ Compared with [REditorSupport's R extension](https://marketplace.visualstudio.co
 > [!NOTE]
 > If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](docs/coexistence.md). Raven still provides code intelligence and scope-aware help in either setup.
 
+
 > **Status:** Raven is under active development. It works well for day-to-day use but hasn't been widely announced yet. Bug reports and feedback are welcome!
 
 > **Quick Start:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r), or download from the [releases page](https://github.com/jbearak/raven/releases). See [Installation](#installation) for details.
@@ -40,7 +41,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
 
 > [!TIP]
-> Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: [syntax highlighting](docs/syntax-highlighting.md#jags-and-stan), completions (keywords, distributions, file-local symbols), [go-to-definition](docs/go-to-definition.md#jags-and-stan), find references, and [document outline with model structure navigation](docs/document-outline.md#jags-and-stan-model-structure).
+> Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: [syntax highlighting](docs/syntax-highlighting.md#jags-and-stan), [completions](docs/completion.md#jags-and-stan) (keywords, distributions, file-local symbols), [go-to-definition](docs/go-to-definition.md#jags-and-stan), [find references](docs/find-references.md#jags-and-stan), and [document outline with model structure navigation](docs/document-outline.md#jags-and-stan-model-structure).
 
 ## Documentation
 

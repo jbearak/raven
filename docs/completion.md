@@ -81,6 +81,17 @@ source("utils.R")
 help  # Offers: helper_function (from utils.R)
 ```
 
+## JAGS and Stan
+
+For `.stan`, `.jags`, and `.bugs` files, Raven offers completions tailored to each language:
+
+| Language | What's offered |
+|---|---|
+| **JAGS** | Keywords (`model`, `data`, `var`), distributions (`dnorm`, `dgamma`, …), built-in functions (`abs`, `log`, …), and file-local symbols |
+| **Stan** | Types (`int`, `real`, `vector`, …), block keywords (`data`, `parameters`, `model`, …), control flow (`if`, `for`, `while`, …), built-in functions (`normal_lpdf`, `bernoulli_lpmf`, …), and file-local symbols |
+
+File-local symbols are discovered by scanning the current file for variable declarations and assignments. R-specific reserved words are excluded from JAGS completions to avoid noise.
+
 ## Scope Rules Summary
 
 1. Local definitions: available after their definition line
