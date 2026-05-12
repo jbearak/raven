@@ -1,3 +1,7 @@
+// IDE-only: forces @types/mocha into scope for TS language servers that
+// check this file in isolation and don't see the project's tsconfig
+// auto-loaded @types. The compile already works without this — see the
+// identical `declare const suite` pattern in settings.test.ts.
 /// <reference types="mocha" />
 
 import * as assert from 'assert';
@@ -27,7 +31,9 @@ const snippetsAbsolutePath = path.join(vscodeRoot, 'snippets', 'r.json');
 const packageJsonPath = path.join(vscodeRoot, 'package.json');
 
 interface SnippetEntry {
-    prefix: string;
+    // VS Code allows a snippet to bind multiple trigger words by setting
+    // prefix to a string[]; accept both forms.
+    prefix: string | string[];
     body: string | string[];
     description: string;
 }
@@ -62,9 +68,13 @@ suite('R snippets', () => {
     test('every snippet has required fields with correct types', () => {
         const snippets = loadSnippets();
         for (const [name, entry] of Object.entries(snippets)) {
+            const prefixIsString = typeof entry.prefix === 'string' && entry.prefix.length > 0;
+            const prefixIsStringArray = Array.isArray(entry.prefix)
+                && entry.prefix.length > 0
+                && entry.prefix.every((p) => typeof p === 'string' && p.length > 0);
             assert.ok(
-                typeof entry.prefix === 'string' && entry.prefix.length > 0,
-                `Snippet "${name}" must have a non-empty string prefix`,
+                prefixIsString || prefixIsStringArray,
+                `Snippet "${name}" must have a non-empty string or non-empty string-array prefix`,
             );
             const bodyIsString = typeof entry.body === 'string';
             const bodyIsStringArray = Array.isArray(entry.body)
@@ -84,13 +94,16 @@ suite('R snippets', () => {
         const snippets = loadSnippets();
         const seen = new Map<string, string>(); // prefix -> first snippet name
         for (const [name, entry] of Object.entries(snippets)) {
-            const prior = seen.get(entry.prefix);
-            assert.ok(
-                prior === undefined,
-                `Prefix "${entry.prefix}" is used by both "${prior}" and "${name}" — `
-                + 'duplicates silently overwrite each other in VS Code',
-            );
-            seen.set(entry.prefix, name);
+            const prefixes = Array.isArray(entry.prefix) ? entry.prefix : [entry.prefix];
+            for (const prefix of prefixes) {
+                const prior = seen.get(prefix);
+                assert.ok(
+                    prior === undefined,
+                    `Prefix "${prefix}" is used by both "${prior}" and "${name}" — `
+                    + 'duplicates silently overwrite each other in VS Code',
+                );
+                seen.set(prefix, name);
+            }
         }
     });
 
@@ -98,10 +111,13 @@ suite('R snippets', () => {
         const snippets = loadSnippets();
         // Matches:
         //   ${N}          (placeholder, no default)
-        //   ${N:default}  (placeholder with default — default may contain
-        //                   nested ${...} for recursive snippets)
+        //   ${N:default}  (placeholder with default, non-nested)
         //   $N            (bare tab stop)
-        // We use a permissive matcher then validate balance separately.
+        // Known limitation: the [^}]* default-group is non-recursive, so
+        // tab-stop numbers that appear *inside* a nested ${...} default
+        // (e.g. ${1:${2:x}}) are not collected. The balance check below
+        // still catches malformed nesting. None of our 65 snippets nest
+        // placeholders in defaults; flag this if that changes.
         const tabStopPattern = /\$\{(\d+)(?::([^}]*))?\}|\$(\d+)/g;
 
         for (const [name, entry] of Object.entries(snippets)) {
@@ -169,8 +185,13 @@ suite('R snippets', () => {
 
     test('registered snippets path resolves to an existing file', () => {
         const pkg = loadPackageJson();
-        const contributes = pkg.contributes as Record<string, unknown>;
-        const snippetEntries = contributes.snippets as Array<{ language: string; path: string }>;
+        const contributes = pkg.contributes as Record<string, unknown> | undefined;
+        assert.ok(contributes, 'package.json must have a contributes section');
+        const snippetEntries = contributes.snippets as Array<{ language: string; path: string }> | undefined;
+        assert.ok(
+            Array.isArray(snippetEntries),
+            'package.json contributes.snippets must be an array',
+        );
         const rEntry = snippetEntries.find((e) => e.language === 'r');
         assert.ok(rEntry, 'No snippet entry found for r language');
         // Path in package.json is relative to the extension root, which is vscodeRoot.
