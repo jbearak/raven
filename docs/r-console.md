@@ -95,15 +95,15 @@ By default, the cursor advances to the next line after sending a single statemen
 By default (`auto`), Raven pastes short blocks directly and switches to a temporary file once a block has at least `raven.sendToR.autoTempFileThresholdLines` lines (≥ N — default 25, so paste up to 24 lines, temp-file 25 or more), running it with `source()`. Override this with `raven.sendToR.sendMethod`:
 
 - **`paste`** — always pastes. For multi-line code, uses bracketed paste mode to deliver the block as a single unit.
-- **`tempfile`** — always writes to a temp file and runs `source()`. Use this when you want larger and smaller sends to follow the same `source()` path, or when even single-line paste is unreliable.
+- **`tempfile`** — always writes to a temp file and runs `source()`. Use this when you want larger and smaller sends to follow the same `source()` path.
 
 ### Why `auto` switches to a temp file for larger blocks
 
-Pasting works well for short blocks. For longer blocks it gets slow — the terminal feeds characters to R's stdin one at a time, so code that would start executing sooner via `source()` can take noticeably longer to type out. Pasting can also be unreliable over remote sessions (SSH, VS Code Remote, mosh): if too many lines arrive at once they sometimes get garbled.
+Pasting works well for short blocks. For longer blocks it gets slow — the terminal feeds characters to R's stdin one at a time, so code that would start executing sooner via `source()` can take noticeably longer to type out.
 
-Writing larger blocks to a temp file and `source()`-ing them sidesteps both, avoiding the inter-line paste delay and bracketed-paste compatibility issues for those blocks. `source(echo = TRUE)` also produces cleaner output, with `+` continuation prompts matching how R normally displays interactive input.
+Writing larger blocks to a temp file and `source()`-ing them sidesteps this, avoiding the inter-line paste delay and bracketed-paste compatibility issues for those blocks.
 
-The cutover point is controlled by `raven.sendToR.autoTempFileThresholdLines` — a block with at least this many lines (≥ N) goes through a temp file; smaller blocks are pasted. The default of 25 is arbitrary but reasonable — most blocks below it paste fast and reliably on a local terminal. Lower it for slow remote connections; raise it if you prefer to see your code echoed in the terminal. Setting it to 2 reproduces the prior behavior of always temp-filing any multi-line block.
+The cutover point is controlled by `raven.sendToR.autoTempFileThresholdLines` — a block with at least this many lines (≥ N) goes through a temp file; smaller blocks are pasted. The default of 25 is arbitrary but reasonable — most blocks below it paste fast and reliably on a local terminal. Lower it for slow remote connections; raise it if you prefer to see your code echoed in the terminal.
 
 For a comparison with how the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) sends code, see [Comparison: R console](./comparison.md#r-console). If you prefer paste-everywhere behavior — for example, because you want raw paste output rather than `source()` echoing — set `raven.sendToR.sendMethod` to `"paste"`.
 
