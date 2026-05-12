@@ -1,5 +1,7 @@
 export { register_r_terminal, get_or_create_r_terminal } from './r-terminal-manager';
 export { register_send_to_r_commands } from './commands';
+export { send_code, get_send_options } from './send-code';
+export type { SendOptions } from './send-code';
 export {
     register_inspection_commands,
     get_inspection_target,

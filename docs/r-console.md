@@ -57,6 +57,8 @@ These commands wrap the word under the cursor (or the current selection) in a co
 
 If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used. The commands only run when the active editor is an R document (`.R`, `.r`, `.rmd`, `.qmd`, or an untitled buffer whose language is R).
 
+Single-line wrapped expressions go straight to the terminal via direct paste; if the wrapped expression spans multiple lines (because the selection did), it honors the user's `raven.sendToR.sendMethod` setting. This avoids writing a one-liner like `nrow(x)` to a temp file just because `tempfile` mode is configured for normal sends.
+
 ## Editor Toolbar
 
 A toolbar button (▶) appears in the editor title bar for R files, providing quick access to all send commands. The menu is organized into two sections:
