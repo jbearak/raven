@@ -260,6 +260,12 @@
         "path": "./syntaxes/stan.tmLanguage.json"
       }
     ],
+    "snippets": [
+      {
+        "language": "r",
+        "path": "./snippets/r.json"
+      }
+    ],
     "configurationDefaults": {
       "[r]": {
         "editor.formatOnType": true
