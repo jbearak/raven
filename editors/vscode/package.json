@@ -2,7 +2,7 @@
   "name": "raven-r",
   "displayName": "Raven - R Language Server",
   "description": "R language server with cross-file awareness, plus an R console and plot, data, and help viewers",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "publisher": "jbearak",
   "icon": "icon.png",
   "license": "GPL-3.0",
@@ -595,7 +595,11 @@
         "raven.packages.packageMode": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "enabled", "disabled"],
+          "enum": [
+            "auto",
+            "enabled",
+            "disabled"
+          ],
           "enumDescriptions": [
             "Detect automatically: enable package mode when a DESCRIPTION file is found at the workspace root.",
             "Always enable package mode (for non-standard package layouts without DESCRIPTION).",
@@ -607,7 +611,7 @@
           "type": "number",
           "default": 1000,
           "minimum": 100,
-          "maximum": 1e4,
+          "maximum": 10000,
           "description": "Maximum number of symbols returned by workspace symbol search (Ctrl+T / Cmd+T). Higher values show more results but may impact performance. Valid range: 100-10000."
         },
         "raven.completion.triggerOnOpenParen": {
@@ -632,7 +636,11 @@
         },
         "raven.rConsole.activation": {
           "type": "string",
-          "enum": ["enabled", "disabled", "auto"],
+          "enum": [
+            "enabled",
+            "disabled",
+            "auto"
+          ],
           "enumDescriptions": [
             "Always activate Raven's R console, plot viewer, and data viewer.",
             "Never activate Raven's R console, plot viewer, or data viewer.",
@@ -643,7 +651,10 @@
         },
         "raven.plot.viewerColumn": {
           "type": "string",
-          "enum": ["active", "beside"],
+          "enum": [
+            "active",
+            "beside"
+          ],
           "enumDescriptions": [
             "Open the plot viewer in the active editor column.",
             "Open the plot viewer beside the active editor."
@@ -653,7 +664,10 @@
         },
         "raven.help.viewerColumn": {
           "type": "string",
-          "enum": ["active", "beside"],
+          "enum": [
+            "active",
+            "beside"
+          ],
           "enumDescriptions": [
             "Open the help viewer in the active editor column.",
             "Open the help viewer beside the active editor."
@@ -663,7 +677,11 @@
         },
         "raven.dataViewer.missingValueStyle": {
           "type": "string",
-          "enum": ["foreground", "background", "none"],
+          "enum": [
+            "foreground",
+            "background",
+            "none"
+          ],
           "enumDescriptions": [
             "Color the cell text for NA / NaN.",
             "Tint the cell background for NA / NaN.",

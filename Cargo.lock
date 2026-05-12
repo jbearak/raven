@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "raven"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "ammonia",
  "anyhow",
