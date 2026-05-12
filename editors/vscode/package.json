@@ -78,6 +78,30 @@
         "title": "Raven: Terminal - Source File"
       },
       {
+        "command": "raven.inspect.nrow",
+        "title": "Raven: Show nrow"
+      },
+      {
+        "command": "raven.inspect.length",
+        "title": "Raven: Show length"
+      },
+      {
+        "command": "raven.inspect.head",
+        "title": "Raven: Show head"
+      },
+      {
+        "command": "raven.inspect.headTransposed",
+        "title": "Raven: Show head (transposed)"
+      },
+      {
+        "command": "raven.inspect.names",
+        "title": "Raven: Show names"
+      },
+      {
+        "command": "raven.inspect.view",
+        "title": "Raven: View"
+      },
+      {
         "command": "raven.openHelpPanel",
         "title": "Raven: Open R Help Panel"
       },

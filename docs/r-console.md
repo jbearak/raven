@@ -42,6 +42,21 @@ The selected program must be available on your PATH.
 | **Run Downward Lines** | Sends all lines from the current line to the end of the file (extending upward to include the full statement start). |
 | **Source File** | Runs `source("filepath", echo = TRUE)` in the R terminal. |
 
+### Quick Inspection Commands
+
+These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R terminal — one keystroke to check an object's shape. No default keybindings; bind them in `keybindings.json` or run them from the Command Palette.
+
+| Command | Sends to R |
+|---------|------------|
+| **Show nrow** | `nrow(<target>)` |
+| **Show length** | `length(<target>)` |
+| **Show head** | `head(<target>)` |
+| **Show head (transposed)** | `t(head(<target>))` |
+| **Show names** | `names(<target>)` |
+| **View** | `View(<target>)` |
+
+If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used.
+
 ## Editor Toolbar
 
 A toolbar button (▶) appears in the editor title bar for R files, providing quick access to all send commands. The menu is organized into two sections:

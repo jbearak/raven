@@ -20,7 +20,12 @@ import {
     shouldTriggerDirectivePathSuggest,
     shouldTriggerNestedPathSuggest,
 } from './pathCompletionTriggers';
-import { register_r_terminal, register_send_to_r_commands, get_or_create_r_terminal } from './send-to-r';
+import {
+    register_r_terminal,
+    register_send_to_r_commands,
+    register_inspection_commands,
+    get_or_create_r_terminal,
+} from './send-to-r';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
 import type { DataViewerManager } from './data-viewer/manager';
@@ -196,6 +201,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         // Register R terminal and send-to-R commands
         register_r_terminal(context, plot_services);
         register_send_to_r_commands(context);
+        register_inspection_commands(context);
     }
 
     // Register restart command — re-reads trace config so changed settings take effect.

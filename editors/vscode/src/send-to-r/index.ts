@@ -1,5 +1,11 @@
 export { register_r_terminal, get_or_create_r_terminal } from './r-terminal-manager';
 export { register_send_to_r_commands } from './commands';
+export {
+    register_inspection_commands,
+    get_inspection_target,
+    INSPECTION_COMMANDS,
+} from './inspect-commands';
+export type { InspectionCommand } from './inspect-commands';
 export { create_temp_file, schedule_temp_file_cleanup } from './temp-file';
 export {
     detect_r_statement,
