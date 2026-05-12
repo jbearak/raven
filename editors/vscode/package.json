@@ -80,32 +80,32 @@
       {
         "command": "raven.inspect.nrow",
         "title": "Show nrow",
-        "category": "R"
+        "category": "Raven"
       },
       {
         "command": "raven.inspect.length",
         "title": "Show length",
-        "category": "R"
+        "category": "Raven"
       },
       {
         "command": "raven.inspect.head",
         "title": "Show head",
-        "category": "R"
+        "category": "Raven"
       },
       {
         "command": "raven.inspect.headTransposed",
         "title": "Show head (transposed)",
-        "category": "R"
+        "category": "Raven"
       },
       {
         "command": "raven.inspect.names",
         "title": "Show names",
-        "category": "R"
+        "category": "Raven"
       },
       {
         "command": "raven.inspect.view",
         "title": "View",
-        "category": "R"
+        "category": "Raven"
       },
       {
         "command": "raven.openHelpPanel",
