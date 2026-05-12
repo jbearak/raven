@@ -1,1 +1,348 @@
-{}
+{
+  "if": {
+    "prefix": "if",
+    "body": ["if (${1:condition}) {", "\t${0}", "}"],
+    "description": "if block"
+  },
+  "if-else": {
+    "prefix": "ife",
+    "body": ["if (${1:condition}) {", "\t${2}", "} else {", "\t${0}", "}"],
+    "description": "if/else block"
+  },
+  "else-if": {
+    "prefix": "el",
+    "body": ["else if (${1:condition}) {", "\t${0}", "}"],
+    "description": "else if chain (after a closing brace)"
+  },
+  "for": {
+    "prefix": "for",
+    "body": ["for (${1:i} in ${2:seq_along(${3:x})}) {", "\t${0}", "}"],
+    "description": "for loop"
+  },
+  "while": {
+    "prefix": "while",
+    "body": ["while (${1:condition}) {", "\t${0}", "}"],
+    "description": "while loop"
+  },
+  "repeat": {
+    "prefix": "repeat",
+    "body": ["repeat {", "\t${1}", "\tif (${2:condition}) break", "}"],
+    "description": "repeat/break loop"
+  },
+  "switch": {
+    "prefix": "switch",
+    "body": ["switch(${1:expr},", "\t${2:case1} = ${3},", "\t${0:default}", ")"],
+    "description": "switch expression"
+  },
+  "trycatch": {
+    "prefix": "trycatch",
+    "body": ["tryCatch(", "\t${1:expr},", "\terror = function(e) ${0:NULL}", ")"],
+    "description": "tryCatch block"
+  },
+  "withCallingHandlers": {
+    "prefix": "wch",
+    "body": ["withCallingHandlers(", "\t${1:expr},", "\twarning = function(w) ${0}", ")"],
+    "description": "withCallingHandlers"
+  },
+
+  "function": {
+    "prefix": "fun",
+    "body": ["${1:name} <- function(${2:args}) {", "\t${0}", "}"],
+    "description": "Function definition"
+  },
+  "lambda": {
+    "prefix": "lam",
+    "body": "\\(${1:x}) ${0}",
+    "description": "Anonymous lambda (R >= 4.1)"
+  },
+  "lapply": {
+    "prefix": "lapply",
+    "body": "lapply(${1:x}, function(${2:el}) ${0})",
+    "description": "lapply over list"
+  },
+  "sapply": {
+    "prefix": "sapply",
+    "body": "sapply(${1:x}, function(${2:el}) ${0})",
+    "description": "sapply over list"
+  },
+  "vapply": {
+    "prefix": "vapply",
+    "body": "vapply(${1:x}, function(${2:el}) ${3}, ${0:FUN.VALUE})",
+    "description": "vapply (type-safe)"
+  },
+  "mapply": {
+    "prefix": "mapply",
+    "body": "mapply(function(${1:a}, ${2:b}) ${3}, ${4:x}, ${0:y})",
+    "description": "mapply multi-arg"
+  },
+  "apply": {
+    "prefix": "apply",
+    "body": "apply(${1:X}, ${2:MARGIN}, ${0:FUN})",
+    "description": "apply over matrix"
+  },
+  "do.call": {
+    "prefix": "docall",
+    "body": "do.call(${1:what}, ${0:args})",
+    "description": "do.call"
+  },
+
+  "Map": {
+    "prefix": "Map",
+    "body": "Map(function(${1:a}, ${2:b}) ${3}, ${4:x}, ${0:y})",
+    "description": "Map over multiple"
+  },
+  "Reduce": {
+    "prefix": "Reduce",
+    "body": "Reduce(function(${1:acc}, ${2:x}) ${3}, ${4:x}, ${0:init})",
+    "description": "Reduce to scalar"
+  },
+  "Filter": {
+    "prefix": "Filter",
+    "body": "Filter(function(${1:x}) ${2}, ${0:x})",
+    "description": "Filter by predicate"
+  },
+
+  "data.frame": {
+    "prefix": "df",
+    "body": ["data.frame(", "\t${1:col1} = ${2},", "\t${0}", ")"],
+    "description": "data.frame"
+  },
+  "list": {
+    "prefix": "lst",
+    "body": ["list(", "\t${1:name} = ${2},", "\t${0}", ")"],
+    "description": "Named list"
+  },
+  "matrix": {
+    "prefix": "mat",
+    "body": "matrix(${1:data}, nrow = ${2}, ncol = ${3})${0}",
+    "description": "matrix"
+  },
+  "vector": {
+    "prefix": "vec",
+    "body": "c(${0})",
+    "description": "c() vector"
+  },
+  "seq": {
+    "prefix": "seq",
+    "body": "seq(${1:from}, ${2:to}, by = ${3:1})${0}",
+    "description": "seq()"
+  },
+  "seq_along": {
+    "prefix": "seq_along",
+    "body": "seq_along(${0:x})",
+    "description": "seq_along(x)"
+  },
+  "seq_len": {
+    "prefix": "seq_len",
+    "body": "seq_len(${0:n})",
+    "description": "seq_len(n)"
+  },
+  "rep": {
+    "prefix": "rep",
+    "body": "rep(${1:x}, ${2:times})${0}",
+    "description": "rep()"
+  },
+
+  "pipe": {
+    "prefix": "pipe",
+    "body": "|> ${0}",
+    "description": "Native pipe |>"
+  },
+  "magrittr": {
+    "prefix": "magrittr",
+    "body": "%>% ${0}",
+    "description": "Magrittr pipe %>%"
+  },
+
+  "read.csv": {
+    "prefix": "readcsv",
+    "body": "read.csv(${0:\"path.csv\"})",
+    "description": "read.csv"
+  },
+  "write.csv": {
+    "prefix": "writecsv",
+    "body": "write.csv(${1:x}, ${2:\"path.csv\"}, row.names = ${3:FALSE})${0}",
+    "description": "write.csv"
+  },
+  "readRDS": {
+    "prefix": "readrds",
+    "body": "readRDS(${0:\"path.rds\"})",
+    "description": "readRDS"
+  },
+  "saveRDS": {
+    "prefix": "saverds",
+    "body": "saveRDS(${1:object}, ${2:\"path.rds\"})${0}",
+    "description": "saveRDS"
+  },
+  "source": {
+    "prefix": "source",
+    "body": "source(${0:\"path.R\"})",
+    "description": "source() call"
+  },
+  "library": {
+    "prefix": "lib",
+    "body": "library(${0:pkg})",
+    "description": "library call"
+  },
+  "require": {
+    "prefix": "req",
+    "body": "require(${0:pkg})",
+    "description": "require call"
+  },
+
+  "cat": {
+    "prefix": "cat",
+    "body": "cat(${1:...}, ${0:sep = \"\\n\"})",
+    "description": "cat"
+  },
+  "print": {
+    "prefix": "print",
+    "body": "print(${0:x})",
+    "description": "print"
+  },
+  "paste": {
+    "prefix": "paste",
+    "body": "paste(${1:...}, sep = ${0:\" \"})",
+    "description": "paste"
+  },
+  "paste0": {
+    "prefix": "paste0",
+    "body": "paste0(${0:...})",
+    "description": "paste0"
+  },
+  "sprintf": {
+    "prefix": "sprintf",
+    "body": "sprintf(${1:\"%s\"}, ${0:args})",
+    "description": "sprintf"
+  },
+  "message": {
+    "prefix": "msg",
+    "body": "message(${0:\"...\"})",
+    "description": "message"
+  },
+  "warning": {
+    "prefix": "warn",
+    "body": "warning(${0:\"...\"})",
+    "description": "warning"
+  },
+  "stop": {
+    "prefix": "stop",
+    "body": "stop(${0:\"...\"})",
+    "description": "stop"
+  },
+
+  "plot": {
+    "prefix": "plot",
+    "body": "plot(${1:x}, ${2:y})${0}",
+    "description": "Base plot"
+  },
+  "ggplot": {
+    "prefix": "ggplot",
+    "body": ["ggplot(${1:data}, aes(x = ${2}, y = ${3})) +", "\t${0}"],
+    "description": "ggplot scaffold"
+  },
+  "geom_point": {
+    "prefix": "geom_point",
+    "body": "geom_point(${0})",
+    "description": "geom_point()"
+  },
+  "geom_line": {
+    "prefix": "geom_line",
+    "body": "geom_line(${0})",
+    "description": "geom_line()"
+  },
+  "geom_bar": {
+    "prefix": "geom_bar",
+    "body": "geom_bar(${0})",
+    "description": "geom_bar()"
+  },
+
+  "lm": {
+    "prefix": "lm",
+    "body": "lm(${1:y} ~ ${2:x}, data = ${3:df})${0}",
+    "description": "Linear model"
+  },
+  "glm": {
+    "prefix": "glm",
+    "body": "glm(${1:y} ~ ${2:x}, data = ${3:df}, family = ${4:gaussian()})${0}",
+    "description": "Generalized linear model"
+  },
+  "loess": {
+    "prefix": "loess",
+    "body": "loess(${1:y} ~ ${2:x}, data = ${3:df})${0}",
+    "description": "Local regression"
+  },
+
+  "roxygen-block": {
+    "prefix": "rox",
+    "body": [
+      "#' ${1:Title}",
+      "#'",
+      "#' ${2:Description}",
+      "#'",
+      "#' @param ${3:name} ${4:description}",
+      "#' @return ${5:return value}",
+      "#' @export",
+      "#'",
+      "#' @examples",
+      "#' ${0:example}"
+    ],
+    "description": "Full roxygen block"
+  },
+  "roxygen-param": {
+    "prefix": "@param",
+    "body": "@param ${1:name} ${0:description}",
+    "description": "@param name desc"
+  },
+  "roxygen-return": {
+    "prefix": "@return",
+    "body": "@return ${0:description}",
+    "description": "@return desc"
+  },
+  "roxygen-export": {
+    "prefix": "@export",
+    "body": "@export",
+    "description": "@export tag"
+  },
+  "roxygen-title": {
+    "prefix": "@title",
+    "body": "@title ${0:title}",
+    "description": "@title desc"
+  },
+  "roxygen-description": {
+    "prefix": "@description",
+    "body": "@description ${0:description}",
+    "description": "@description desc"
+  },
+  "roxygen-examples": {
+    "prefix": "@examples",
+    "body": ["@examples", "#' ${0:example}"],
+    "description": "@examples block"
+  },
+  "roxygen-inheritParams": {
+    "prefix": "@inheritParams",
+    "body": "@inheritParams ${0:source_fun}",
+    "description": "@inheritParams source"
+  },
+  "roxygen-seealso": {
+    "prefix": "@seealso",
+    "body": "@seealso \\code{\\link{${0:fun}}}",
+    "description": "@seealso link"
+  },
+  "roxygen-noRd": {
+    "prefix": "@noRd",
+    "body": "@noRd",
+    "description": "@noRd tag"
+  },
+
+  "test_that": {
+    "prefix": "tc",
+    "body": ["test_that(\"${1:description}\", {", "\t${0}", "})"],
+    "description": "test_that block"
+  },
+  "load_all": {
+    "prefix": "loadall",
+    "body": "devtools::load_all(${0})",
+    "description": "devtools::load_all()"
+  }
+}
