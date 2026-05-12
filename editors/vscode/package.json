@@ -638,7 +638,7 @@
             "Activate Raven's R console, plot viewer, and data viewer unless the REditorSupport (R) extension is enabled or VS Code is running as Positron."
           ],
           "default": "auto",
-          "description": "Controls when Raven's R console (and the plot and data viewers it powers) activates. The help viewer is unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
+          "description": "Controls when Raven's R console (and the plot and data viewers it powers) activates. The default `auto` leaves them off when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't interfere with existing R-session integration. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
         },
         "raven.plot.viewerColumn": {
           "type": "string",

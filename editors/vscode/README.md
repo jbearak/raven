@@ -42,8 +42,8 @@ Key settings (all under the `raven.*` prefix):
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates: `"enabled"`, `"disabled"`, or `"auto"` (off when REditorSupport.r is enabled or running in Positron). |
-| `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens (`"active"` or `"beside"`). The help viewer activates regardless of `raven.rConsole.activation`. |
+| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates: `"enabled"`, `"disabled"`, or `"auto"` (off when REditorSupport.r is enabled or running in Positron). See [Coexistence](https://github.com/jbearak/raven/blob/main/docs/coexistence.md). |
+| `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens (`"active"` or `"beside"`). Code intelligence and the help viewer are unaffected by `raven.rConsole.activation`. |
 | `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
 | `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
 | `raven.packages.rPath` | auto-detect | Path to R executable |
@@ -54,9 +54,9 @@ See the [full configuration reference](https://github.com/jbearak/raven/blob/mai
 
 ## Coexistence with vscode-R and Positron
 
-Raven's R-console features (R console, plot viewer, data viewer) and REditorSupport's [vscode-R](https://github.com/REditorSupport/vscode-R) cover overlapping ground. By default `raven.rConsole.activation` is `"auto"`, which means: if vscode-R is enabled, or you're running inside Positron, Raven's R-console features step aside automatically. Raven's help viewer and language server activate either way.
+Raven's R-console features (R console, plot viewer, data viewer) and REditorSupport's [vscode-R](https://github.com/REditorSupport/vscode-R) cover overlapping ground. By default `raven.rConsole.activation` is `"auto"`, which leaves Raven's R-console features off when vscode-R is enabled or you're running inside Positron. Raven's help viewer and language server activate either way.
 
-Set `"enabled"` to override and run both extensions' R-session features at once — you'll then own any keybinding or `View()`-override conflicts.
+Set `"enabled"` so Raven's R console is available alongside REditorSupport's. `Cmd+Enter` / `Ctrl+Enter` can only be bound to one extension's send command; VS Code's keybinding editor lets you rebind either. See [Coexistence](https://github.com/jbearak/raven/blob/main/docs/coexistence.md) for when you'd want to do this.
 
 REditorSupport's `lintr` diagnostics are provided by its language server. If you want lintr alongside Raven, leave `r.lsp.enabled` at its default (`true`) — both language servers will run, with some overlap in completions and diagnostics. If you don't need lintr and only want vscode-R for its R-session features, disable its language server:
 
