@@ -7,7 +7,7 @@ The language server analyzes your code in realtime: it completes variable and ac
 Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), [Positron](https://github.com/posit-dev/positron), and RStudio, Raven's language server is the only one that traces `source()` chains, so completions, diagnostics, and navigation reflect the actual order of execution at each cursor position. Of those three, REditorSupport is the only other VS Code option; against REditorSupport specifically, Raven adds RStudio-style indentation on Enter without disturbing the surrounding code, sends large blocks of code to R faster, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
 > [!NOTE]
-> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](docs/coexistence.md). The language server and help viewer are unaffected.
+> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](docs/coexistence.md). Raven still provides code intelligence and scope-aware help in either setup.
 
 > **Status:** Raven is under active development. It works well for day-to-day use but hasn't been widely announced yet. Bug reports and feedback are welcome!
 
