@@ -4,6 +4,7 @@
   "description": "R language server with cross-file awareness, plus an R console and plot, data, and help viewers",
   "version": "0.5.1",
   "publisher": "jbearak",
+  "icon": "icon.png",
   "license": "GPL-3.0",
   "repository": {
     "type": "git",

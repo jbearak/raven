@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Raven extension icon.
+
+  Concept: a raven perched on the lowest bar of a three-bar chart. The raven
+  reads first; the evergreen chart gives the mark an R/data-analysis cue
+  without forcing a letterform into the bird silhouette.
+
+  Canvas: 128x128. Safe area is ~112x112 centered (8px margin all round) so
+  the mark reads at small sizes in the VS Code Marketplace and extension UI.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="128" height="128"
+     viewBox="0 0 128 128"
+     role="img"
+     aria-label="Raven - R Language Server">
+  <!-- Forest dusk tile -->
+  <rect width="128" height="128" rx="24" fill="#26352D"/>
+
+  <!-- Three-bar chart perch -->
+  <rect x="22" y="82" width="18" height="24" rx="3" fill="#8FA878"/>
+  <rect x="55" y="64" width="18" height="42" rx="3" fill="#678C64"/>
+  <rect x="88" y="42" width="18" height="64" rx="3" fill="#4A7656"/>
+
+  <!-- Muted chart baseline, kept thin so it supports without becoming the focus. -->
+  <path d="M18 106H110" stroke="#8FA878" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Top edge of the short bar under the raven's feet. -->
+  <path d="M24 82H40" stroke="#D4DEC9" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Raven silhouette -->
+  <path d="
+      M 28 82
+      C 28 72, 32 62, 40 52
+      C 49 41, 62 33, 79 29
+      C 75 38, 74 46, 77 53
+      C 84 54, 91 57, 97 61
+      C 88 63, 80 67, 73 72
+      C 72 83, 67 92, 57 98
+      C 45 105, 34 101, 28 82
+      Z"
+    fill="#05070A"/>
+
+  <!-- Beak -->
+  <path d="
+      M 60 43
+      C 71 36, 84 34, 99 36
+      L 73 55
+      Z"
+    fill="#05070A"/>
+
+  <!-- Tail feathers -->
+  <path d="
+      M 35 59
+      C 26 63, 17 65, 7 64
+      C 14 73, 23 80, 35 86
+      C 40 77, 40 68, 35 59
+      Z"
+    fill="#05070A"/>
+
+  <!-- Folded wing -->
+  <path d="
+      M 45 57
+      C 49 63, 52 70, 53 78
+      C 44 75, 36 71, 30 65
+      C 36 62, 40 60, 45 57
+      Z"
+    fill="#1F2933"/>
+
+  <!-- Feet and talons gripping the low bar -->
+  <path d="M30 78V82 M38 78V82" stroke="#05070A" stroke-width="5" stroke-linecap="round"/>
+  <path d="
+      M 28 82 L 23 85
+      M 31 82 L 34 86
+      M 38 82 L 34 86
+      M 40 82 L 45 85"
+    stroke="#05070A"
+    stroke-width="2.4"
+    stroke-linecap="round"/>
+
+  <!-- Subtle feather highlight -->
+  <path d="M55 56C51 63, 50 70, 52 77"
+        stroke="#F5F1E8"
+        stroke-width="4"
+        stroke-linecap="round"
+        opacity="0.22"/>
+
+  <!-- Warm eye accent -->
+  <circle cx="65" cy="48" r="3" fill="#D69E2E"/>
+</svg>
