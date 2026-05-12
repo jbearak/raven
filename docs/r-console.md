@@ -21,9 +21,6 @@ The `raven.rTerminal.program` setting controls which program is launched:
 | **arf** | Rust-based R console with syntax highlighting, fuzzy history search (`Ctrl+R`), interactive help, and rig integration |
 | **radian** | Python-based R console with syntax highlighting, multiline editing, and mouse support |
 
-> [!TIP]
-> Both [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) add interactive features the standard R console lacks: syntax highlighting, multiline editing, popup completions, and `Ctrl+R` history search. radian is no longer under active development; arf is its successor.
-
 The selected program must be available on your PATH.
 
 ## Keyboard Shortcuts
@@ -49,10 +46,15 @@ The selected program must be available on your PATH.
 
 A toolbar button (▶) appears in the editor title bar for R files, providing quick access to all send commands. The menu is organized into two sections:
 
-- **Main commands** — Send code to the managed R (Raven) terminal. If no R terminal is open, one is created automatically.
+- **Main commands** — Send code to the managed R terminal. If no R terminal is open, one is created automatically.
 - **Terminal submenu** — Send code to whatever terminal is currently active in VS Code, regardless of type. This is useful for sending commands to R running inside `tmux`, a Docker container, or any other terminal session that isn't the extension's built-in R terminal.
 
 Code sent via the Terminal submenu follows the same send method as the main commands. By default, Raven pastes short blocks directly and writes longer blocks to a temporary file, executing them with `source()`. **Terminal: Source File** runs `source()` directly against the document's saved path on disk (saving first if the buffer has unsaved changes).
+
+> [!TIP]
+> **Remote sessions and long-running jobs** — If you're connected to a remote host via VS Code Remote Development and want an R session that survives disconnections (closing your laptop, losing internet, etc.), launch a terminal multiplexer like `tmux` and start R inside it. Then use the Terminal submenu to send code to that tmux-hosted R session. Because tmux keeps running on the remote host independently of your VS Code connection, you can disconnect and reconnect hours or days later with your session — and any long-running computation (MCMC sampling in Stan or JAGS, large simulations, etc.) — still intact.
+
+The Terminal submenu has its own default keyboard shortcuts that mirror the main send shortcuts exactly, with `Option` (Mac) or `Alt` (Windows/Linux) replacing `Cmd`/`Ctrl`. So `Option+Enter` sends a line or selection to the active terminal, and `Shift+Option+Enter` sources the file — the same gestures, just swapping the modifier.
 
 ## Statement Detection
 
