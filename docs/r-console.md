@@ -44,16 +44,16 @@ The selected program must be available on your PATH.
 
 ### Quick Inspection Commands
 
-These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R terminal — one keystroke to check an object's shape. They're registered under the **R** category, so typing `R:` in the Command Palette surfaces them all. No default keybindings; bind them in `keybindings.json` if you want shortcuts.
+These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R terminal — one keystroke to check an object's shape. They're registered under the **Raven** category, so typing `Raven:` in the Command Palette surfaces them all. No default keybindings; bind them in `keybindings.json` if you want shortcuts.
 
 | Command | Sends to R |
 |---------|------------|
-| **R: Show nrow** | `nrow(<target>)` |
-| **R: Show length** | `length(<target>)` |
-| **R: Show head** | `head(<target>)` |
-| **R: Show head (transposed)** | `t(head(<target>))` |
-| **R: Show names** | `names(<target>)` |
-| **R: View** | `View(<target>)` |
+| **Raven: Show nrow** | `nrow(<target>)` |
+| **Raven: Show length** | `length(<target>)` |
+| **Raven: Show head** | `head(<target>)` |
+| **Raven: Show head (transposed)** | `t(head(<target>))` |
+| **Raven: Show names** | `names(<target>)` |
+| **Raven: View** | `View(<target>)` |
 
 If a selection is active, the entire selection is used as the target — handy for expressions like `df$col` or `subset(df, x > 0)`. Otherwise the word at the cursor is used. The commands only run when the active editor's language is R — typically `.R`/`.r` files and untitled buffers whose language has been set to R. R Markdown and Quarto documents claimed by other extensions (`languageId` of `rmd`, `quarto`, etc.) are not currently in scope.
 
