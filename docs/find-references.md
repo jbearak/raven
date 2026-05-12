@@ -38,6 +38,10 @@ For project-wide symbol search without scoping constraints, use **Cmd/Ctrl+T**. 
 
 The maximum number of results is configurable via `raven.symbols.workspaceMaxResults` (default: 1000).
 
+## JAGS and Stan
+
+For `.stan`, `.jags`, and `.bugs` files, Find References returns all occurrences of the identifier across every open or indexed file of the same language. Unlike R, there is no dependency graph — results are collected by name match across all reachable Stan (or JAGS) files in the workspace.
+
 ## Go-to-Definition
 
 Go-to-definition is the reverse of find references — it navigates to a symbol's definition rather than listing its usages. See [Go-to-Definition](go-to-definition.md).
