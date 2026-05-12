@@ -21,6 +21,7 @@ Compared with [REditorSupport's R extension](https://marketplace.visualstudio.co
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
 - **[Smart indentation](https://github.com/jbearak/raven/blob/main/docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
+- **Snippets** — Built-in snippets for common R patterns (control flow, apply family, ggplot2 scaffolds, roxygen2 tags)
 - **[Cross-file awareness](https://github.com/jbearak/raven/blob/main/docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
