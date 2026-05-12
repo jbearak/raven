@@ -6,8 +6,7 @@ The language server analyzes your code in realtime: it completes variable and ac
 
 Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), [Positron](https://github.com/posit-dev/positron), and RStudio, Raven's language server is the only one that traces `source()` chains, so completions, diagnostics, and navigation reflect the actual order of execution at each cursor position. Of those three, REditorSupport is the only other VS Code option; against REditorSupport specifically, Raven adds RStudio-style indentation on Enter without disturbing the surrounding code, sends large blocks of code to R faster, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
-> [!NOTE]
-> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](#coexistence-with-vscode-r-and-positron) below. The language server and help viewer are unaffected.
+> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](#coexistence-with-vscode-r-and-positron) below. Raven still provides code intelligence and scope-aware help in either setup.
 
 ## Features
 
@@ -33,7 +32,6 @@ Compared with [REditorSupport's R extension](https://marketplace.visualstudio.co
 - **[Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
 - **[Help viewer](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
 
-> [!NOTE]
 > Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation.
 
 ## Settings
