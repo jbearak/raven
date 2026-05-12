@@ -54,8 +54,8 @@ export function resolveRConsoleActivation(
 }
 
 /**
- * One-time popover explaining why `auto` chose to disable Raven's R
- * console. Fires only when the setting is `auto`, the resolution chose
+ * One-time popover explaining why `auto` left Raven's R-session features
+ * off. Fires only when the setting is `auto`, the resolution chose
  * `disabled`, and the user has not previously dismissed the message.
  */
 export async function notifyAutoDisable(
@@ -66,8 +66,8 @@ export async function notifyAutoDisable(
     if (context.globalState.get<boolean>(AUTO_NOTICE_DISMISSED_KEY)) return;
 
     const message = reason === 'reditorsupport'
-        ? "Raven now includes an R console, plot viewer, and data viewer. Because the REditorSupport (R) extension is enabled, Raven's R-session features are off by default to avoid disrupting your existing setup. Set `raven.rConsole.activation` to \"enabled\" to override."
-        : "Raven now includes an R console, plot viewer, and data viewer. Because you're using Positron, which has its own R session integration, Raven's R-session features are off by default. Set `raven.rConsole.activation` to \"enabled\" to override.";
+        ? "Raven includes an R console, plot viewer, and data viewer. Because REditorSupport (R) is enabled, Raven leaves these turned off by default so it doesn't interfere with your existing setup. Raven's code intelligence (completions, diagnostics, navigation) activates either way. See Learn more to decide whether to turn them on."
+        : "Raven includes an R console, plot viewer, and data viewer. Because you're running Positron, which has its own R-session integration, Raven leaves these turned off by default. Raven's code intelligence (completions, diagnostics, navigation) activates either way. See Learn more to decide whether to turn them on.";
 
     const LEARN_MORE = 'Learn more';
     const OPEN_SETTINGS = 'Open setting';

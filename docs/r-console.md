@@ -5,7 +5,7 @@ Raven provides an integrated R console inside VS Code, plus commands to send R c
 The R console is the entry point to Raven's [plot viewer](./plot-viewer.md) and [data viewer](./data-viewer.md): plots produced in this console render in a VS Code panel via httpgd, and `View(df)` opens Raven's data viewer instead of R's default. Raven's [help viewer](./help-viewer.md) works independently of the R console.
 
 > [!NOTE]
-> Whether the R console activates is controlled by `raven.rConsole.activation` (default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore its plot and data viewers — steps aside automatically to avoid disrupting your existing R-session setup. See [Coexistence](./coexistence.md) for details.
+> Whether the R console activates is controlled by `raven.rConsole.activation` (default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore its plot and data viewers — is off by default. See [Coexistence](./coexistence.md) for details.
 
 ## R Terminal Profile
 

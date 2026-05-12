@@ -7,7 +7,7 @@ The extension provides a built-in help viewer that renders R help (Rd) documenta
 Raven's help viewer uses the language server's scope analysis to disambiguate which package's help to show. If you hover over `filter(...)` after `library(dplyr)`, Raven's static scope model picks `dplyr::filter` over `stats::filter`. The scope-aware resolution looks at namespace qualifiers (`pkg::fn`), `library()` / `require()` calls in this file and any sourced files, package imports declared via `@lsp-*` directives, and the standard package-search-path order. See [Comparison: Hover help](./comparison.md#hover-help) for how this differs from other R hover implementations.
 
 > [!NOTE]
-> The help viewer activates regardless of `raven.rConsole.activation`. Unlike the plot and data viewers, the help viewer doesn't need a running R session managed by Raven — it shells out to R on demand to render Rd documentation as HTML.
+> Code intelligence and the help viewer are unaffected by `raven.rConsole.activation`. Unlike the plot and data viewers, the help viewer doesn't need a running R session managed by Raven — it shells out to R on demand to render Rd documentation as HTML.
 
 ## How to open it
 
