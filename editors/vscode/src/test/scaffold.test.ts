@@ -20,6 +20,7 @@ const packageJsonPath = path.join(vscodeRoot, 'package.json');
 interface CommandContribution {
     command: string;
     title: string;
+    category?: string;
 }
 
 function loadCommandContributions(): CommandContribution[] {
@@ -89,16 +90,32 @@ suite('scaffold templates', () => {
 suite('scaffold package.json contributions', () => {
     test('declares raven.scaffold.gitignore and raven.scaffold.lintr commands', () => {
         const commands = loadCommandContributions();
-        const byId = new Map(commands.map((c) => [c.command, c.title]));
+        const byId = new Map(commands.map((c) => [c.command, c]));
+
+        const gitignore = byId.get('raven.scaffold.gitignore');
+        assert.ok(gitignore, 'raven.scaffold.gitignore must be declared');
         assert.strictEqual(
-            byId.get('raven.scaffold.gitignore'),
-            'Raven: Create .gitignore',
-            'raven.scaffold.gitignore must be declared with the Raven: prefix',
+            gitignore.title,
+            'Create .gitignore',
+            'raven.scaffold.gitignore must use the short title',
         );
         assert.strictEqual(
-            byId.get('raven.scaffold.lintr'),
-            'Raven: Create .lintr',
-            'raven.scaffold.lintr must be declared with the Raven: prefix',
+            gitignore.category,
+            'Raven',
+            'raven.scaffold.gitignore must be under the Raven category',
+        );
+
+        const lintr = byId.get('raven.scaffold.lintr');
+        assert.ok(lintr, 'raven.scaffold.lintr must be declared');
+        assert.strictEqual(
+            lintr.title,
+            'Create .lintr',
+            'raven.scaffold.lintr must use the short title',
+        );
+        assert.strictEqual(
+            lintr.category,
+            'Raven',
+            'raven.scaffold.lintr must be under the Raven category',
         );
     });
 });

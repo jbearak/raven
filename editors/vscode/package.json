@@ -39,43 +39,53 @@
     "commands": [
       {
         "command": "raven.restart",
-        "title": "Raven: Restart Language Server"
+        "title": "Restart Language Server",
+        "category": "Raven"
       },
       {
         "command": "raven.refreshPackages",
-        "title": "Raven: Refresh package cache"
+        "title": "Refresh package cache",
+        "category": "Raven"
       },
       {
         "command": "raven.runLineOrSelection",
-        "title": "Raven: Run Line or Selection"
+        "title": "Run Line or Selection",
+        "category": "Raven"
       },
       {
         "command": "raven.runUpwardLines",
-        "title": "Raven: Run Upward Lines"
+        "title": "Run Upward Lines",
+        "category": "Raven"
       },
       {
         "command": "raven.runDownwardLines",
-        "title": "Raven: Run Downward Lines"
+        "title": "Run Downward Lines",
+        "category": "Raven"
       },
       {
         "command": "raven.sourceFile",
-        "title": "Raven: Source File"
+        "title": "Source File",
+        "category": "Raven"
       },
       {
         "command": "raven.terminal.runLineOrSelection",
-        "title": "Raven: Terminal - Run Line or Selection"
+        "title": "Terminal - Run Line or Selection",
+        "category": "Raven"
       },
       {
         "command": "raven.terminal.runUpwardLines",
-        "title": "Raven: Terminal - Run Upward Lines"
+        "title": "Terminal - Run Upward Lines",
+        "category": "Raven"
       },
       {
         "command": "raven.terminal.runDownwardLines",
-        "title": "Raven: Terminal - Run Downward Lines"
+        "title": "Terminal - Run Downward Lines",
+        "category": "Raven"
       },
       {
         "command": "raven.terminal.sourceFile",
-        "title": "Raven: Terminal - Source File"
+        "title": "Terminal - Source File",
+        "category": "Raven"
       },
       {
         "command": "raven.inspect.nrow",
@@ -109,23 +119,28 @@
       },
       {
         "command": "raven.scaffold.gitignore",
-        "title": "Raven: Create .gitignore"
+        "title": "Create .gitignore",
+        "category": "Raven"
       },
       {
         "command": "raven.scaffold.lintr",
-        "title": "Raven: Create .lintr"
+        "title": "Create .lintr",
+        "category": "Raven"
       },
       {
         "command": "raven.openHelpPanel",
-        "title": "Raven: Open R Help Panel"
+        "title": "Open R Help Panel",
+        "category": "Raven"
       },
       {
         "command": "raven.help.back",
-        "title": "Raven: Help Back"
+        "title": "Help Back",
+        "category": "Raven"
       },
       {
         "command": "raven.help.forward",
-        "title": "Raven: Help Forward"
+        "title": "Help Forward",
+        "category": "Raven"
       }
     ],
     "keybindings": [
