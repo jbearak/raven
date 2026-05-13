@@ -32,6 +32,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **[Syntax highlighting](docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
+- **[Snippets](docs/snippets.md)** — Built-in snippets for common R patterns (control flow, apply family, ggplot2 scaffolds, roxygen2 tags)
 
 ### R session integration
 
