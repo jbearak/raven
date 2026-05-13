@@ -27,6 +27,8 @@ import {
     register_inspection_commands,
     get_or_create_r_terminal,
 } from './send-to-r';
+import { register_build_commands } from './build-commands';
+import { register_r_package_detection } from './r-package-detection';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
 import type { DataViewerManager } from './data-viewer/manager';
@@ -203,7 +205,16 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_r_terminal(context, plot_services);
         register_send_to_r_commands(context);
         register_inspection_commands(context);
+        register_build_commands(context);
     }
+
+    // Package-mode context key. The `raven.isRPackage` key gates the
+    // Build commands' palette entries and editor-title submenu — every
+    // `when` clause that uses it is also gated on `raven.rConsoleEnabled`,
+    // so the key has no visible effect when R-console is disabled. We
+    // still register the detection unconditionally so the key is
+    // populated for whichever surfaces (current or future) consult it.
+    register_r_package_detection(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //

@@ -52,6 +52,58 @@ In contrast, a function defined in `tests/testthat/test-helpers.R` is **not**
 visible to `R/helpers.R` — symbols in `R/` are visible from `tests/testthat/`,
 but not the other way around.
 
+### Build commands
+
+When the workspace is detected as an R package (DESCRIPTION with a non-empty
+`Package:` field, or `raven.packages.packageMode` set to `enabled`), Raven
+contributes six Command Palette entries that wrap the standard
+`devtools` / `testthat` / `roxygen2` workflows. Names mirror RStudio's
+**Build** menu so existing muscle memory carries over:
+
+| Palette title | Runs in | R call |
+|---|---|---|
+| `Raven Build: Load All` | active R terminal | `devtools::load_all("<workspace>")` |
+| `Raven Build: Document` | active R terminal | `devtools::document("<workspace>")` |
+| `Raven Build: Install and Restart` | active R terminal | `devtools::install("<workspace>")` followed by `quit(save = "no")` |
+| `Raven Build: Test Package` | `R: Package Tasks` terminal | `devtools::test("<workspace>")` |
+| `Raven Build: Check Package` | `R: Package Tasks` terminal | `devtools::check("<workspace>")` |
+| `Raven Build: Build Source Package` | `R: Package Tasks` terminal | `devtools::build("<workspace>")` |
+
+Each command passes the first workspace folder's absolute path explicitly,
+so a stray `setwd()` in the R session — or a terminal launched from a
+subdirectory — can't redirect the build at the wrong project.
+
+The six commands also appear as a single `$(package)` submenu in the
+editor title bar when an R file is open in a package workspace.
+
+#### Terminal routing
+
+The three session-mutating commands (`Load All`, `Document`,
+`Install and Restart`) run in the same R terminal that Send-to-R uses,
+so their side effects land where you'd expect.
+
+The three long-running commands (`Test Package`, `Check Package`,
+`Build Source Package`) run in a dedicated `R: Package Tasks` terminal.
+This avoids tying up the interactive prompt for the 20–60s+ these
+commands can take, and keeps a clean separation between exploratory
+work and batch-style package checks. The tasks terminal is reused
+across invocations — Raven doesn't pay R-startup cost on every
+`devtools::test()`. Both terminals respect `raven.rTerminal.program`,
+so a configured `radian` or `arf` carries over.
+
+#### Install and Restart semantics
+
+`Install and Restart` chains `devtools::install()` with
+`quit(save = "no")` so the R process exits after install completes.
+When the terminal closes, Raven recreates it in the same pane. The next
+Send-to-R or Build command runs in a fresh R session that picks up the
+newly installed version of the package — which is the whole point of
+the command.
+
+If the install fails, the wrapper surfaces the error via `message()`
+before R exits; the failure output stays visible in the closed-terminal
+scrollback so you can read it before dismissing.
+
 ### testthat problem matcher
 
 When you run `devtools::test()` or `testthat::test_dir()`, testthat's

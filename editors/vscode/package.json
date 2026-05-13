@@ -128,6 +128,36 @@
         "category": "Raven"
       },
       {
+        "command": "raven.build.loadAll",
+        "title": "Load All",
+        "category": "Raven Build"
+      },
+      {
+        "command": "raven.build.document",
+        "title": "Document",
+        "category": "Raven Build"
+      },
+      {
+        "command": "raven.build.installAndRestart",
+        "title": "Install and Restart",
+        "category": "Raven Build"
+      },
+      {
+        "command": "raven.build.testPackage",
+        "title": "Test Package",
+        "category": "Raven Build"
+      },
+      {
+        "command": "raven.build.checkPackage",
+        "title": "Check Package",
+        "category": "Raven Build"
+      },
+      {
+        "command": "raven.build.buildSource",
+        "title": "Build Source Package",
+        "category": "Raven Build"
+      },
+      {
         "command": "raven.openHelpPanel",
         "title": "Open R Help Panel",
         "category": "Raven"
@@ -166,14 +196,76 @@
       {
         "id": "raven.sendToR.terminal",
         "label": "Terminal"
+      },
+      {
+        "id": "raven.build",
+        "label": "R Package Build",
+        "icon": "$(package)"
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "raven.build.loadAll",
+          "when": "raven.rConsoleEnabled && raven.isRPackage"
+        },
+        {
+          "command": "raven.build.document",
+          "when": "raven.rConsoleEnabled && raven.isRPackage"
+        },
+        {
+          "command": "raven.build.installAndRestart",
+          "when": "raven.rConsoleEnabled && raven.isRPackage"
+        },
+        {
+          "command": "raven.build.testPackage",
+          "when": "raven.rConsoleEnabled && raven.isRPackage"
+        },
+        {
+          "command": "raven.build.checkPackage",
+          "when": "raven.rConsoleEnabled && raven.isRPackage"
+        },
+        {
+          "command": "raven.build.buildSource",
+          "when": "raven.rConsoleEnabled && raven.isRPackage"
+        }
+      ],
       "editor/title": [
         {
           "submenu": "raven.sendToR",
           "when": "editorLangId == r && raven.rConsoleEnabled",
           "group": "navigation"
+        },
+        {
+          "submenu": "raven.build",
+          "when": "editorLangId == r && raven.rConsoleEnabled && raven.isRPackage",
+          "group": "navigation"
+        }
+      ],
+      "raven.build": [
+        {
+          "command": "raven.build.loadAll",
+          "group": "1_session@1"
+        },
+        {
+          "command": "raven.build.document",
+          "group": "1_session@2"
+        },
+        {
+          "command": "raven.build.installAndRestart",
+          "group": "1_session@3"
+        },
+        {
+          "command": "raven.build.testPackage",
+          "group": "2_tasks@1"
+        },
+        {
+          "command": "raven.build.checkPackage",
+          "group": "2_tasks@2"
+        },
+        {
+          "command": "raven.build.buildSource",
+          "group": "2_tasks@3"
         }
       ],
       "raven.sendToR": [
