@@ -1,0 +1,98 @@
+{
+  "rmarkdown-r-chunk": {
+    "prefix": "rchunk",
+    "body": [
+      "```{r ${1:label}}",
+      "$0",
+      "```"
+    ],
+    "description": "R code chunk (R Markdown / Quarto)"
+  },
+  "rmarkdown-r-chunk-opts": {
+    "prefix": "rchunkopts",
+    "body": [
+      "```{r ${1:label}, echo = ${2:FALSE}, message = ${3:FALSE}, warning = ${4:FALSE}}",
+      "$0",
+      "```"
+    ],
+    "description": "R code chunk with common knitr options"
+  },
+  "rmarkdown-setup-chunk": {
+    "prefix": "setupchunk",
+    "body": [
+      "```{r setup, include = FALSE}",
+      "knitr::opts_chunk\\$set(echo = ${1:TRUE})",
+      "$0",
+      "```"
+    ],
+    "description": "knitr setup chunk"
+  },
+  "quarto-python-chunk": {
+    "prefix": "pychunk",
+    "body": [
+      "```{python}",
+      "$0",
+      "```"
+    ],
+    "description": "Python code chunk (Quarto)"
+  },
+  "quarto-sql-chunk": {
+    "prefix": "sqlchunk",
+    "body": [
+      "```{sql connection=${1:con}}",
+      "$0",
+      "```"
+    ],
+    "description": "SQL code chunk"
+  },
+  "quarto-bash-chunk": {
+    "prefix": "bashchunk",
+    "body": [
+      "```{bash}",
+      "$0",
+      "```"
+    ],
+    "description": "Bash code chunk"
+  },
+  "rmarkdown-yaml": {
+    "prefix": "rmdyaml",
+    "body": [
+      "---",
+      "title: \"${1:Title}\"",
+      "author: \"${2:Author}\"",
+      "date: \"`r format(Sys.time(), '%Y-%m-%d')`\"",
+      "output: ${3|html_document,pdf_document,word_document|}",
+      "---",
+      "$0"
+    ],
+    "description": "R Markdown YAML frontmatter"
+  },
+  "quarto-yaml": {
+    "prefix": "qyaml",
+    "body": [
+      "---",
+      "title: \"${1:Title}\"",
+      "author: \"${2:Author}\"",
+      "date: today",
+      "format: ${3|html,pdf,docx,revealjs|}",
+      "---",
+      "$0"
+    ],
+    "description": "Quarto YAML frontmatter"
+  },
+  "rmarkdown-include-graphics": {
+    "prefix": "incgraphics",
+    "body": "knitr::include_graphics(${0:\"path/to/img.png\"})",
+    "description": "knitr::include_graphics()"
+  },
+  "rmarkdown-kable": {
+    "prefix": "kable",
+    "body": "knitr::kable(${1:df}, caption = ${0:\"Caption\"})",
+    "description": "knitr::kable()"
+  },
+  "rmarkdown-inline-r": {
+    "prefix": "inliner",
+    "body": "`r ${0:expr}`",
+    "description": "Inline R expression"
+  }
+}

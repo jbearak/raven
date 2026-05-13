@@ -287,6 +287,10 @@
       {
         "language": "r",
         "path": "./snippets/r.json"
+      },
+      {
+        "language": "r",
+        "path": "./snippets/rmarkdown.json"
       }
     ],
     "configurationDefaults": {
