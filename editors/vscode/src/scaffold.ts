@@ -95,20 +95,34 @@ export async function createScaffoldFile(
     return target;
 }
 
+/**
+ * Run `createScaffoldFile` and surface a Raven-branded error notification on
+ * failure. Mirrors the try/catch pattern used by `raven.refreshPackages` so
+ * filesystem errors (permission denied, read-only workspace) get a clearer
+ * message than VS Code's default rejection toast.
+ */
+async function runScaffoldCommand(fileName: string, content: string): Promise<void> {
+    const folder = getTargetWorkspaceFolder();
+    if (!folder) return;
+    try {
+        await createScaffoldFile(folder, fileName, content);
+    } catch (err) {
+        void vscode.window.showErrorMessage(
+            `Raven: failed to create ${fileName}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+    }
+}
+
 export function registerScaffoldCommands(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
-        vscode.commands.registerCommand('raven.scaffold.gitignore', async () => {
-            const folder = getTargetWorkspaceFolder();
-            if (!folder) return;
-            await createScaffoldFile(folder, '.gitignore', GITIGNORE_TEMPLATE);
-        }),
+        vscode.commands.registerCommand('raven.scaffold.gitignore', () =>
+            runScaffoldCommand('.gitignore', GITIGNORE_TEMPLATE),
+        ),
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('raven.scaffold.lintr', async () => {
-            const folder = getTargetWorkspaceFolder();
-            if (!folder) return;
-            await createScaffoldFile(folder, '.lintr', LINTR_TEMPLATE);
-        }),
+        vscode.commands.registerCommand('raven.scaffold.lintr', () =>
+            runScaffoldCommand('.lintr', LINTR_TEMPLATE),
+        ),
     );
 }

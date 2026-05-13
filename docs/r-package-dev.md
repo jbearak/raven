@@ -91,15 +91,6 @@ imports remain visible if some `R/*.R` files don't carry roxygen tags.
 
 Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running `devtools::document()` or editing these files directly, diagnostics update automatically without restarting the editor.
 
-## Scaffold commands
-
-The Raven VS Code extension can write starter R-specific config files. Both run from the Command Palette and write to the first workspace folder; if a file with the same name already exists, you're prompted before it's overwritten.
-
-| Command | File | Contents |
-|---|---|---|
-| `R: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`, etc.) |
-| `R: Create .lintr` | `.lintr` | `linters_with_defaults(line_length_linter(120))` |
-
 ## Configuration
 
 | Setting | Default | Description |

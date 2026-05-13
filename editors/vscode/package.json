@@ -109,11 +109,11 @@
       },
       {
         "command": "raven.scaffold.gitignore",
-        "title": "R: Create .gitignore"
+        "title": "Raven: Create .gitignore"
       },
       {
         "command": "raven.scaffold.lintr",
-        "title": "R: Create .lintr"
+        "title": "Raven: Create .lintr"
       },
       {
         "command": "raven.openHelpPanel",

@@ -79,13 +79,13 @@ suite('scaffold package.json contributions', () => {
         const byId = new Map(commands.map((c) => [c.command, c.title]));
         assert.strictEqual(
             byId.get('raven.scaffold.gitignore'),
-            'R: Create .gitignore',
-            'raven.scaffold.gitignore must be declared with the R: prefix',
+            'Raven: Create .gitignore',
+            'raven.scaffold.gitignore must be declared with the Raven: prefix',
         );
         assert.strictEqual(
             byId.get('raven.scaffold.lintr'),
-            'R: Create .lintr',
-            'raven.scaffold.lintr must be declared with the R: prefix',
+            'Raven: Create .lintr',
+            'raven.scaffold.lintr must be declared with the Raven: prefix',
         );
     });
 });
