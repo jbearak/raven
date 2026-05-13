@@ -113,6 +113,23 @@ Raven sets `editor.formatOnType` to `true` for R files by default (lowest-priori
 
 See [Smart Indentation](indentation.md) for details.
 
+## Linting Settings
+
+Native style/lint diagnostics. Off by default; opt in with `raven.linting.enabled`. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions.
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.linting.enabled` | `false` | Master switch for all lint diagnostics |
+| `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
+| `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
+| `raven.linting.lineLengthSeverity` | `"hint"` | Severity for over-long lines (or `"off"`) |
+| `raven.linting.trailingWhitespaceSeverity` | `"hint"` | Severity for trailing whitespace |
+| `raven.linting.noTabSeverity` | `"hint"` | Severity for tab characters |
+| `raven.linting.trailingBlankLinesSeverity` | `"hint"` | Severity for blank lines or missing newline at end of file |
+| `raven.linting.assignmentOperatorSeverity` | `"hint"` | Severity for mismatched assignment operator |
+
+To disable an individual rule while leaving the rest enabled, set its severity to `"off"`.
+
 ## Server Settings
 
 | Setting | Default | Description |

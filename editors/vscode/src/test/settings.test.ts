@@ -120,6 +120,15 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'completion.triggerOnOpenParen', jsonPath: ['completion', 'triggerOnOpenParen'], type: 'boolean' },
     // Indentation settings
     { vsCodeKey: 'indentation.style', jsonPath: ['indentation', 'style'], type: 'enum', enumValues: ['rstudio', 'rstudio-minus', 'off'] as const },
+    // Linting settings
+    { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'boolean' },
+    { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number' },
+    { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const },
+    { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'linting.trailingWhitespaceSeverity', jsonPath: ['linting', 'trailingWhitespaceSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     // Help viewer settings
     { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];

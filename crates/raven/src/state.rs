@@ -531,6 +531,9 @@ pub struct WorldState {
     pub completion_config: CompletionConfig,
     /// Indentation configuration
     pub indentation_config: IndentationSettings,
+    /// Style/lint configuration.
+    /// Master switch defaults to off; opt in via `raven.linting.enabled`.
+    pub lint_config: crate::linting::LintConfig,
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_revalidation: CrossFileRevalidationState,
@@ -657,6 +660,7 @@ impl WorldState {
             symbol_config: SymbolConfig::default(),
             completion_config: CompletionConfig::default(),
             indentation_config: IndentationSettings::default(),
+            lint_config: crate::linting::LintConfig::default(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),

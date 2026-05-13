@@ -48,6 +48,26 @@ Raven checks whether each symbol reference has a visible definition — either i
 | Ambiguous parent | warning | Multiple parents source this file and auto-inference can't determine which to use |
 | Redundant directive | hint | `@lsp-source` directive for a file already sourced via `source()` on the same line |
 
+### Style Lints
+
+Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Off by default; enable with `raven.linting.enabled` and tune per rule via the `raven.linting.*` severities. All rules default to severity `hint` so they don't crowd the Problems pane.
+
+| Diagnostic | Default Severity | Trigger |
+|---|---|---|
+| Line length | hint | Line exceeds `raven.linting.lineLength` (default 80 UTF-16 code units) |
+| Trailing whitespace | hint | Spaces or tabs at end of line |
+| Tab character | hint | Tab character anywhere in source |
+| Trailing blank lines | hint | Blank lines at end of file, or missing final newline |
+| Assignment operator | hint | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
+
+Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
+
+**Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
+
+- `# nolint` on a line suppresses lints on that line (rule-name filters like `# nolint: line_length` are accepted; for now, all rules are suppressed on suppressed lines).
+- `# nolint start` / `# nolint end` brackets a region.
+- The standard `# @lsp-ignore` and `# @lsp-ignore-next` markers also apply to lint diagnostics.
+
 ## Suppression
 
 ### Per-Line: @lsp-ignore

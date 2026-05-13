@@ -431,6 +431,96 @@ pub(crate) fn parse_cross_file_config(
     Ok(Some(config))
 }
 
+/// Parse linting configuration from LSP settings.
+///
+/// Reads the `linting` section and constructs a [`LintConfig`]. Returns
+/// `None` when the section is absent so callers can fall back to defaults
+/// without losing the "section never seen" signal.
+///
+/// Recognised keys:
+/// * `enabled` (bool) — master switch.
+/// * `lineLength` (number) — max line length; clamped to `[20, 10_000]`.
+/// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
+/// * Per-rule severities (string, `"error" | "warning" | "information" |
+///   "hint" | "off"`):
+///   - `lineLengthSeverity`
+///   - `trailingWhitespaceSeverity`
+///   - `noTabSeverity`
+///   - `trailingBlankLinesSeverity`
+///   - `assignmentOperatorSeverity`
+pub(crate) fn parse_lint_config(
+    settings: &serde_json::Value,
+) -> Option<crate::linting::LintConfig> {
+    let linting = settings.get("linting")?;
+    if !linting.is_object() {
+        log::warn!("linting settings must be an object; ignoring.");
+        return None;
+    }
+
+    let mut config = crate::linting::LintConfig::default();
+
+    if let Some(v) = linting.get("enabled").and_then(|v| v.as_bool()) {
+        config.enabled = v;
+    }
+    if let Some(v) = linting.get("lineLength").and_then(|v| v.as_u64()) {
+        config.line_length = (v as u32).clamp(20, 10_000);
+    }
+    if let Some(op) = linting.get("assignmentOperator").and_then(|v| v.as_str()) {
+        config.assignment_operator_style = match op {
+            "=" => crate::linting::AssignmentOperatorStyle::Equals,
+            "<-" => crate::linting::AssignmentOperatorStyle::LeftArrow,
+            other => {
+                log::warn!(
+                    "Unrecognised linting.assignmentOperator '{other}', defaulting to '<-'."
+                );
+                crate::linting::AssignmentOperatorStyle::LeftArrow
+            }
+        };
+    }
+    if let Some(sev) = linting.get("lineLengthSeverity").and_then(|v| v.as_str()) {
+        config.line_length_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting
+        .get("trailingWhitespaceSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.trailing_whitespace_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting.get("noTabSeverity").and_then(|v| v.as_str()) {
+        config.no_tab_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting
+        .get("trailingBlankLinesSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.trailing_blank_lines_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting
+        .get("assignmentOperatorSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.assignment_operator_severity = parse_severity(sev);
+    }
+
+    log::info!("Linting configuration loaded from LSP settings:");
+    log::info!("  enabled: {}", config.enabled);
+    log::info!("  line_length: {}", config.line_length);
+    log::info!(
+        "  assignment_operator_style: {:?}",
+        config.assignment_operator_style
+    );
+    log::info!(
+        "  severities: line={:?} ws={:?} tab={:?} blank={:?} assign={:?}",
+        config.line_length_severity,
+        config.trailing_whitespace_severity,
+        config.no_tab_severity,
+        config.trailing_blank_lines_severity,
+        config.assignment_operator_severity
+    );
+
+    Some(config)
+}
+
 /// Parse indentation configuration from LSP settings.
 ///
 /// Reads the `indentation` section from a serde_json::Value and constructs a
@@ -1506,6 +1596,11 @@ impl LanguageServer for Backend {
             // Parse indentation configuration
             if let Some(config) = parse_indentation_config(init_options) {
                 state.indentation_config = config;
+            }
+
+            // Parse linting configuration
+            if let Some(config) = parse_lint_config(init_options) {
+                state.lint_config = config;
             }
         }
 
@@ -3573,6 +3668,9 @@ impl LanguageServer for Backend {
         // Parse indentation configuration if provided
         let new_indentation_config = parse_indentation_config(&params.settings);
 
+        // Parse linting configuration if provided
+        let new_lint_config = parse_lint_config(&params.settings);
+
         let (
             open_uris,
             scope_changed,
@@ -3708,6 +3806,11 @@ impl LanguageServer for Backend {
             // Apply new indentation config if parsed
             if let Some(config) = new_indentation_config {
                 state.indentation_config = config;
+            }
+
+            // Apply new linting config if parsed
+            if let Some(config) = new_lint_config {
+                state.lint_config = config;
             }
 
             // Apply new completion config if parsed, tracking trigger change
@@ -7214,6 +7317,85 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(cfg.packages_watch_debounce_ms, 5000);
+        }
+    }
+
+    // ============================================================================
+    // LintConfig Parsing Tests
+    // ============================================================================
+    mod lint_config_parsing {
+        use serde_json::json;
+
+        #[test]
+        fn parse_lint_config_returns_none_when_section_absent() {
+            let settings = json!({});
+            assert!(crate::backend::parse_lint_config(&settings).is_none());
+        }
+
+        #[test]
+        fn parse_lint_config_reads_master_switch_and_line_length() {
+            let settings = json!({
+                "linting": {
+                    "enabled": true,
+                    "lineLength": 120
+                }
+            });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(cfg.line_length, 120);
+        }
+
+        #[test]
+        fn parse_lint_config_clamps_line_length() {
+            let settings = json!({ "linting": { "lineLength": 1 } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.line_length, 20);
+
+            let settings = json!({ "linting": { "lineLength": 999_999 } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.line_length, 10_000);
+        }
+
+        #[test]
+        fn parse_lint_config_reads_assignment_operator_styles() {
+            let settings = json!({ "linting": { "assignmentOperator": "=" } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(
+                cfg.assignment_operator_style,
+                crate::linting::AssignmentOperatorStyle::Equals
+            );
+
+            let settings = json!({ "linting": { "assignmentOperator": "<-" } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(
+                cfg.assignment_operator_style,
+                crate::linting::AssignmentOperatorStyle::LeftArrow
+            );
+        }
+
+        #[test]
+        fn parse_lint_config_severities_off_disables_each_rule() {
+            let settings = json!({
+                "linting": {
+                    "lineLengthSeverity": "off",
+                    "trailingWhitespaceSeverity": "off",
+                    "noTabSeverity": "off",
+                    "trailingBlankLinesSeverity": "off",
+                    "assignmentOperatorSeverity": "off"
+                }
+            });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.line_length_severity, None);
+            assert_eq!(cfg.trailing_whitespace_severity, None);
+            assert_eq!(cfg.no_tab_severity, None);
+            assert_eq!(cfg.trailing_blank_lines_severity, None);
+            assert_eq!(cfg.assignment_operator_severity, None);
+        }
+
+        #[test]
+        fn parse_lint_config_non_object_returns_none() {
+            let settings = json!({ "linting": 42 });
+            assert!(crate::backend::parse_lint_config(&settings).is_none());
         }
     }
 

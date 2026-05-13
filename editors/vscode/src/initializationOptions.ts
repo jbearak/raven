@@ -82,6 +82,16 @@ export interface RavenInitializationOptions {
     indentation?: {
         style?: "rstudio" | "rstudio-minus" | "off";
     };
+    linting?: {
+        enabled?: boolean;
+        lineLength?: number;
+        assignmentOperator?: "<-" | "=";
+        lineLengthSeverity?: SeverityLevel;
+        trailingWhitespaceSeverity?: SeverityLevel;
+        noTabSeverity?: SeverityLevel;
+        trailingBlankLinesSeverity?: SeverityLevel;
+        assignmentOperatorSeverity?: SeverityLevel;
+    };
     helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
 
@@ -316,6 +326,52 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     const indentationStyle = getExplicitSetting<"rstudio" | "rstudio-minus" | "off">(config, 'indentation.style');
     if (indentationStyle !== undefined) {
         options.indentation = { style: indentationStyle };
+    }
+
+    const lintingEnabled = getExplicitSetting<boolean>(config, 'linting.enabled');
+    const lintingLineLength = getExplicitSetting<number>(config, 'linting.lineLength');
+    const lintingAssignmentOperator = getExplicitSetting<"<-" | "=">(config, 'linting.assignmentOperator');
+    const lintingLineLengthSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.lineLengthSeverity');
+    const lintingTrailingWhitespaceSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.trailingWhitespaceSeverity');
+    const lintingNoTabSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.noTabSeverity');
+    const lintingTrailingBlankLinesSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.trailingBlankLinesSeverity');
+    const lintingAssignmentOperatorSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.assignmentOperatorSeverity');
+
+    if (
+        lintingEnabled !== undefined ||
+        lintingLineLength !== undefined ||
+        lintingAssignmentOperator !== undefined ||
+        lintingLineLengthSeverity !== undefined ||
+        lintingTrailingWhitespaceSeverity !== undefined ||
+        lintingNoTabSeverity !== undefined ||
+        lintingTrailingBlankLinesSeverity !== undefined ||
+        lintingAssignmentOperatorSeverity !== undefined
+    ) {
+        options.linting = {};
+        if (lintingEnabled !== undefined) {
+            options.linting.enabled = lintingEnabled;
+        }
+        if (lintingLineLength !== undefined) {
+            options.linting.lineLength = lintingLineLength;
+        }
+        if (lintingAssignmentOperator !== undefined) {
+            options.linting.assignmentOperator = lintingAssignmentOperator;
+        }
+        if (lintingLineLengthSeverity !== undefined) {
+            options.linting.lineLengthSeverity = lintingLineLengthSeverity;
+        }
+        if (lintingTrailingWhitespaceSeverity !== undefined) {
+            options.linting.trailingWhitespaceSeverity = lintingTrailingWhitespaceSeverity;
+        }
+        if (lintingNoTabSeverity !== undefined) {
+            options.linting.noTabSeverity = lintingNoTabSeverity;
+        }
+        if (lintingTrailingBlankLinesSeverity !== undefined) {
+            options.linting.trailingBlankLinesSeverity = lintingTrailingBlankLinesSeverity;
+        }
+        if (lintingAssignmentOperatorSeverity !== undefined) {
+            options.linting.assignmentOperatorSeverity = lintingAssignmentOperatorSeverity;
+        }
     }
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');
