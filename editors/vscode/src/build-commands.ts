@@ -74,11 +74,29 @@ export const BUILD_COMMANDS: BuildCommand[] = [
 
 const TASKS_TERMINAL_NAME = 'R: Package Tasks';
 let tasks_terminal: vscode.Terminal | null = null;
+// Shared in-flight promise so two tasks-group commands fired in quick
+// succession (e.g. Test Package immediately followed by Check Package)
+// don't both pass the `tasks_terminal` null check around the
+// `await resolve_program()` yield point and spawn two terminals. Mirrors
+// the `creation_in_flight` guard in `r-terminal-manager.ts`.
+let tasks_creation_in_flight: Promise<vscode.Terminal> | null = null;
 
 function handle_tasks_terminal_closed(terminal: vscode.Terminal): void {
     if (terminal === tasks_terminal) {
         tasks_terminal = null;
     }
+}
+
+async function create_tasks_terminal(): Promise<vscode.Terminal> {
+    const program = await resolve_program();
+    const terminal = vscode.window.createTerminal({
+        name: TASKS_TERMINAL_NAME,
+        shellPath: program,
+        shellArgs: ['--no-save', '--no-restore'],
+        isTransient: true,
+    });
+    tasks_terminal = terminal;
+    return terminal;
 }
 
 /**
@@ -90,14 +108,11 @@ function handle_tasks_terminal_closed(terminal: vscode.Terminal): void {
  */
 export async function get_or_create_tasks_terminal(): Promise<vscode.Terminal> {
     if (tasks_terminal) return tasks_terminal;
-    const program = await resolve_program();
-    tasks_terminal = vscode.window.createTerminal({
-        name: TASKS_TERMINAL_NAME,
-        shellPath: program,
-        shellArgs: ['--no-save', '--no-restore'],
-        isTransient: true,
+    if (tasks_creation_in_flight) return tasks_creation_in_flight;
+    tasks_creation_in_flight = create_tasks_terminal().finally(() => {
+        tasks_creation_in_flight = null;
     });
-    return tasks_terminal;
+    return tasks_creation_in_flight;
 }
 
 async function run_simple(code: string, target: 'r-console' | 'tasks'): Promise<void> {
@@ -168,4 +183,5 @@ export function register_build_commands(context: vscode.ExtensionContext): void 
 /** Reset the tasks-terminal slot. Tests only. */
 export function _reset_tasks_terminal_for_test(): void {
     tasks_terminal = null;
+    tasks_creation_in_flight = null;
 }

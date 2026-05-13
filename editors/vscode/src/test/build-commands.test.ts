@@ -4,7 +4,11 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { BUILD_COMMANDS } from '../build-commands';
+import {
+    BUILD_COMMANDS,
+    get_or_create_tasks_terminal,
+    _reset_tasks_terminal_for_test,
+} from '../build-commands';
 import { activate } from './helper';
 
 declare const suite: Mocha.SuiteFunction;
@@ -160,6 +164,36 @@ suite('build commands: registration', () => {
                 all.has(cmd.id),
                 `expected build command "${cmd.id}" to be registered`,
             );
+        }
+    });
+});
+
+suite('build commands: tasks terminal', () => {
+    test('concurrent get_or_create calls return the same terminal instance', async function () {
+        this.timeout(15000);
+        await activate();
+        _reset_tasks_terminal_for_test();
+        try {
+            // Fire both calls before awaiting either. With the
+            // creation-in-flight guard, both promises must resolve to the
+            // same vscode.Terminal — otherwise two terminals would be
+            // spawned and the first would be orphaned.
+            const [a, b] = await Promise.all([
+                get_or_create_tasks_terminal(),
+                get_or_create_tasks_terminal(),
+            ]);
+            assert.strictEqual(a, b, 'concurrent calls must share a single terminal');
+            assert.strictEqual(a.name, 'R: Package Tasks');
+        } finally {
+            // Best-effort cleanup: dispose the terminal so it doesn't
+            // linger between tests. The next test's reset will null out
+            // our module-local slot.
+            try {
+                (await get_or_create_tasks_terminal()).dispose();
+            } catch {
+                // ignore
+            }
+            _reset_tasks_terminal_for_test();
         }
     });
 });

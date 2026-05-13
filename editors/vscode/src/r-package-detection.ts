@@ -53,20 +53,34 @@ export function register_r_package_detection(
 ): void {
     void refresh_context();
 
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (folder) {
+    // The watcher is anchored to the first workspace folder's DESCRIPTION,
+    // so it must be rebuilt when the workspace folder list changes —
+    // otherwise a folder switch leaves the watcher pointed at the previous
+    // root and edits to the new DESCRIPTION never re-trigger detection.
+    let watcher_disposables: vscode.Disposable[] = [];
+    const reset_description_watcher = (): void => {
+        for (const d of watcher_disposables) d.dispose();
+        watcher_disposables = [];
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        if (!folder) return;
         // Pattern is anchored to the root DESCRIPTION; nested packages (e.g.
         // inst/extdata/DESCRIPTION inside a non-package workspace) shouldn't
         // toggle the context key.
         const pattern = new vscode.RelativePattern(folder, 'DESCRIPTION');
         const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-        context.subscriptions.push(
+        watcher_disposables = [
             watcher,
             watcher.onDidCreate(refresh_context),
             watcher.onDidChange(refresh_context),
             watcher.onDidDelete(refresh_context),
-        );
-    }
+        ];
+    };
+    reset_description_watcher();
+    context.subscriptions.push({
+        dispose: () => {
+            for (const d of watcher_disposables) d.dispose();
+        },
+    });
 
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((event) => {
@@ -75,6 +89,7 @@ export function register_r_package_detection(
             }
         }),
         vscode.workspace.onDidChangeWorkspaceFolders(() => {
+            reset_description_watcher();
             void refresh_context();
         }),
     );
