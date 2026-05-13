@@ -53,6 +53,15 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 
 **Raven: Refresh package cache** (`raven.refreshPackages`) — re-runs `.libPaths()`, rebuilds the package library, restarts the filesystem watcher, clears the cache, and republishes diagnostics. Use after `renv::activate()`, `.libPaths()` changes, or if the watcher misses an event.
 
+## Scaffold Commands
+
+These Command Palette entries write starter R config files to the first workspace folder. If the target file already exists, Raven prompts before overwriting.
+
+| Command | File | Contents |
+|---|---|---|
+| `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch dirs, and AI-tool user-local overrides |
+| `Raven: Create .lintr` | `.lintr` | `linters_with_defaults(line_length_linter(120))` |
+
 ## R Console Activation
 
 | Setting | Default | Description |

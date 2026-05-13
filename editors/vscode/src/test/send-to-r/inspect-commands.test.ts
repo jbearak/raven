@@ -83,7 +83,7 @@ suite('quick inspection commands', () => {
         assert.strictEqual(get_inspection_target(editor), null);
     });
 
-    test('INSPECTION_COMMANDS are advertised in package.json under the R category', () => {
+    test('INSPECTION_COMMANDS are advertised in package.json under the Raven category', () => {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const pkg = require('../../../package.json') as {
             contributes: {
@@ -107,8 +107,8 @@ suite('quick inspection commands', () => {
             );
             assert.strictEqual(
                 entry.category,
-                'R',
-                `package.json must declare ${cmd.id} under the "R" category`
+                'Raven',
+                `package.json must declare ${cmd.id} under the "Raven" category`
             );
         }
     });

@@ -8,6 +8,7 @@ import {
 } from 'vscode-languageclient/node';
 import { activateHelpViewer, wrapHoverWithHelpTrust } from './help';
 import { registerAutoCloseFix } from './autoCloseFix';
+import { registerScaffoldCommands } from './scaffold';
 import {
     getInitializationOptions as buildInitializationOptions,
     RavenInitializationOptions,
@@ -103,7 +104,7 @@ function sendActivityNotification() {
 /**
  * Public extension API surface, returned from `activate()` and reachable
  * from other extensions and the test harness via
- * `vscode.extensions.getExtension('jbearak.raven').exports`.
+ * `vscode.extensions.getExtension('jbearak.raven-r').exports`.
  *
  * The only consumer today is the Mocha test suite, which uses the live
  * LanguageClient to round-trip `workspace/executeCommand` calls (e.g.
@@ -245,6 +246,9 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
+
+    // Register .gitignore / .lintr scaffold commands
+    registerScaffoldCommands(context);
 
     // If `auto` chose to disable, surface a one-time popover so the user knows
     // why their R console / plot viewer / data viewer didn't activate.
