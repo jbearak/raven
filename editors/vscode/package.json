@@ -108,6 +108,14 @@
         "category": "Raven"
       },
       {
+        "command": "raven.scaffold.gitignore",
+        "title": "R: Create .gitignore"
+      },
+      {
+        "command": "raven.scaffold.lintr",
+        "title": "R: Create .lintr"
+      },
+      {
         "command": "raven.openHelpPanel",
         "title": "Raven: Open R Help Panel"
       },
