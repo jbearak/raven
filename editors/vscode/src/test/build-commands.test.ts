@@ -1,0 +1,165 @@
+/// <reference types="mocha" />
+
+import * as assert from 'assert';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { BUILD_COMMANDS } from '../build-commands';
+import { activate } from './helper';
+
+declare const suite: Mocha.SuiteFunction;
+declare const test: Mocha.TestFunction;
+
+const vscodeRoot = path.resolve(__dirname, '..', '..');
+const packageJsonPath = path.join(vscodeRoot, 'package.json');
+
+interface CommandContribution {
+    command: string;
+    title: string;
+    category?: string;
+}
+
+interface MenuEntry {
+    command?: string;
+    submenu?: string;
+    when?: string;
+    group?: string;
+}
+
+interface SubmenuContribution {
+    id: string;
+    label: string;
+    icon?: string;
+}
+
+interface PackageJson {
+    contributes: {
+        commands: CommandContribution[];
+        submenus?: SubmenuContribution[];
+        menus?: Record<string, MenuEntry[]>;
+    };
+}
+
+function loadPackageJson(): PackageJson {
+    return JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
+}
+
+suite('build commands: definitions', () => {
+    test('declares the six RStudio-Build-menu commands in order', () => {
+        const ids = BUILD_COMMANDS.map((c) => c.id);
+        assert.deepStrictEqual(ids, [
+            'raven.build.loadAll',
+            'raven.build.document',
+            'raven.build.installAndRestart',
+            'raven.build.testPackage',
+            'raven.build.checkPackage',
+            'raven.build.buildSource',
+        ]);
+    });
+
+    test('r-console group invokes the live R session, tasks group is dedicated', () => {
+        const target = Object.fromEntries(BUILD_COMMANDS.map((c) => [c.id, c.target]));
+        assert.strictEqual(target['raven.build.loadAll'], 'r-console');
+        assert.strictEqual(target['raven.build.document'], 'r-console');
+        assert.strictEqual(target['raven.build.installAndRestart'], 'r-console');
+        assert.strictEqual(target['raven.build.testPackage'], 'tasks');
+        assert.strictEqual(target['raven.build.checkPackage'], 'tasks');
+        assert.strictEqual(target['raven.build.buildSource'], 'tasks');
+    });
+
+    test('command code wraps the matching devtools call', () => {
+        const code = Object.fromEntries(BUILD_COMMANDS.map((c) => [c.id, c.code]));
+        assert.strictEqual(code['raven.build.loadAll'], 'devtools::load_all()');
+        assert.strictEqual(code['raven.build.document'], 'devtools::document()');
+        assert.strictEqual(code['raven.build.testPackage'], 'devtools::test()');
+        assert.strictEqual(code['raven.build.checkPackage'], 'devtools::check()');
+        assert.strictEqual(code['raven.build.buildSource'], 'devtools::build()');
+        // installAndRestart composes its R code dynamically because it must
+        // chain devtools::install() with quit(save = "no") to force the
+        // R-terminal restart that gives the command its name.
+        assert.strictEqual(code['raven.build.installAndRestart'], undefined);
+    });
+});
+
+suite('build commands: package.json contributions', () => {
+    test('every BUILD_COMMANDS entry is declared in package.json under the "Raven Build" category', () => {
+        const pkg = loadPackageJson();
+        const byId = new Map(pkg.contributes.commands.map((c) => [c.command, c]));
+        for (const cmd of BUILD_COMMANDS) {
+            const declared = byId.get(cmd.id);
+            assert.ok(declared, `${cmd.id} must be declared in package.json`);
+            assert.strictEqual(
+                declared.title,
+                cmd.title,
+                `${cmd.id} title should match BUILD_COMMANDS`,
+            );
+            assert.strictEqual(
+                declared.category,
+                'Raven Build',
+                `${cmd.id} should sit under the "Raven Build" category`,
+            );
+        }
+    });
+
+    test('declares the raven.build submenu with the package codicon', () => {
+        const pkg = loadPackageJson();
+        const submenu = pkg.contributes.submenus?.find((s) => s.id === 'raven.build');
+        assert.ok(submenu, 'package.json must declare the raven.build submenu');
+        assert.strictEqual(submenu.icon, '$(package)');
+    });
+
+    test('every build command appears in the raven.build submenu in the documented order', () => {
+        const pkg = loadPackageJson();
+        const entries = pkg.contributes.menus?.['raven.build'] ?? [];
+        const commandIds = entries.map((e) => e.command).filter((id): id is string => !!id);
+        assert.deepStrictEqual(
+            commandIds,
+            BUILD_COMMANDS.map((c) => c.id),
+            'raven.build submenu must list all six commands in BUILD_COMMANDS order',
+        );
+    });
+
+    test('raven.build editor/title entry is gated on package mode and the R console', () => {
+        const pkg = loadPackageJson();
+        const editorTitle = pkg.contributes.menus?.['editor/title'] ?? [];
+        const buildEntry = editorTitle.find((e) => e.submenu === 'raven.build');
+        assert.ok(buildEntry, 'editor/title must include the raven.build submenu');
+        const when = buildEntry.when ?? '';
+        assert.ok(when.includes('raven.isRPackage'), 'submenu must be gated on raven.isRPackage');
+        assert.ok(when.includes('raven.rConsoleEnabled'), 'submenu must require r-console activation');
+        assert.ok(when.includes("editorLangId == r"), 'submenu must require an R file');
+        assert.strictEqual(buildEntry.group, 'navigation');
+    });
+
+    test('palette entries for build commands are gated on package mode and the R console', () => {
+        const pkg = loadPackageJson();
+        const palette = pkg.contributes.menus?.commandPalette ?? [];
+        for (const cmd of BUILD_COMMANDS) {
+            const entry = palette.find((e) => e.command === cmd.id);
+            assert.ok(entry, `command palette must gate ${cmd.id}`);
+            const when = entry.when ?? '';
+            assert.ok(
+                when.includes('raven.isRPackage'),
+                `${cmd.id} palette entry must require raven.isRPackage`,
+            );
+            assert.ok(
+                when.includes('raven.rConsoleEnabled'),
+                `${cmd.id} palette entry must require raven.rConsoleEnabled`,
+            );
+        }
+    });
+});
+
+suite('build commands: registration', () => {
+    test('extension registers every build command after activation', async function () {
+        this.timeout(15000);
+        await activate();
+        const all = new Set(await vscode.commands.getCommands(true));
+        for (const cmd of BUILD_COMMANDS) {
+            assert.ok(
+                all.has(cmd.id),
+                `expected build command "${cmd.id}" to be registered`,
+            );
+        }
+    });
+});

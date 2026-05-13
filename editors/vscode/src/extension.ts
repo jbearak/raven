@@ -27,6 +27,8 @@ import {
     register_inspection_commands,
     get_or_create_r_terminal,
 } from './send-to-r';
+import { register_build_commands } from './build-commands';
+import { register_r_package_detection } from './r-package-detection';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
 import type { DataViewerManager } from './data-viewer/manager';
@@ -203,7 +205,16 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_r_terminal(context, plot_services);
         register_send_to_r_commands(context);
         register_inspection_commands(context);
+        register_build_commands(context);
     }
+
+    // Package-mode context key. Wired regardless of R-console activation so
+    // the palette gating works even when Send-to-R is disabled (e.g. when
+    // coexisting with REditorSupport, which provides its own R session).
+    // The Build commands themselves require an R terminal, so they're only
+    // registered above when r-console is enabled; the context key still
+    // hides their palette entries when the workspace isn't a package.
+    register_r_package_detection(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //
