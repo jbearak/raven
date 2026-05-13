@@ -104,7 +104,7 @@ function sendActivityNotification() {
 /**
  * Public extension API surface, returned from `activate()` and reachable
  * from other extensions and the test harness via
- * `vscode.extensions.getExtension('jbearak.raven').exports`.
+ * `vscode.extensions.getExtension('jbearak.raven-r').exports`.
  *
  * The only consumer today is the Mocha test suite, which uses the live
  * LanguageClient to round-trip `workspace/executeCommand` calls (e.g.
