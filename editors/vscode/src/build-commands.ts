@@ -28,10 +28,12 @@ export interface BuildCommand {
     /** Where the command runs. */
     target: 'r-console' | 'tasks';
     /**
-     * The R code sent to the selected terminal. For `installAndRestart` this
-     * is composed dynamically (see `run_install_and_restart`).
+     * The R code sent to the selected terminal, parameterized by a
+     * pre-quoted R-string-literal representing the package path
+     * (e.g. `"\"/Users/foo/pkg\""` or `"\".\""`). `installAndRestart`
+     * composes its code in `run_install_and_restart` instead.
      */
-    code?: string;
+    make_code?: (pkg_arg: string) => string;
 }
 
 export const BUILD_COMMANDS: BuildCommand[] = [
@@ -39,13 +41,13 @@ export const BUILD_COMMANDS: BuildCommand[] = [
         id: 'raven.build.loadAll',
         title: 'Load All',
         target: 'r-console',
-        code: 'devtools::load_all()',
+        make_code: (pkg) => `devtools::load_all(${pkg})`,
     },
     {
         id: 'raven.build.document',
         title: 'Document',
         target: 'r-console',
-        code: 'devtools::document()',
+        make_code: (pkg) => `devtools::document(${pkg})`,
     },
     {
         id: 'raven.build.installAndRestart',
@@ -56,21 +58,45 @@ export const BUILD_COMMANDS: BuildCommand[] = [
         id: 'raven.build.testPackage',
         title: 'Test Package',
         target: 'tasks',
-        code: 'devtools::test()',
+        make_code: (pkg) => `devtools::test(${pkg})`,
     },
     {
         id: 'raven.build.checkPackage',
         title: 'Check Package',
         target: 'tasks',
-        code: 'devtools::check()',
+        make_code: (pkg) => `devtools::check(${pkg})`,
     },
     {
         id: 'raven.build.buildSource',
         title: 'Build Source Package',
         target: 'tasks',
-        code: 'devtools::build()',
+        make_code: (pkg) => `devtools::build(${pkg})`,
     },
 ];
+
+/**
+ * Compute the R-string-literal argument passed to every devtools call.
+ *
+ * The terminal's working directory can drift away from the package root
+ * (the user runs `setwd()`, or the terminal launches from a subdirectory),
+ * which means a bare `devtools::load_all()` would silently target the
+ * wrong project. Resolving the path against the first workspace folder
+ * keeps the build commands anchored to the package Raven detected.
+ *
+ * Falls back to `"."` only when no workspace folder is open — that's the
+ * `raven.packages.packageMode = "enabled"` escape hatch for users who
+ * force package mode without a DESCRIPTION-bearing root, and matches
+ * devtools' own default.
+ *
+ * `JSON.stringify` of an absolute path produces a valid R double-quoted
+ * string literal: identical escape rules for `\` and `"`, so Windows
+ * paths like `C:\foo\bar` round-trip safely.
+ */
+export function get_package_path_arg(): string {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return '"."';
+    return JSON.stringify(folder.uri.fsPath);
+}
 
 const TASKS_TERMINAL_NAME = 'R: Package Tasks';
 let tasks_terminal: vscode.Terminal | null = null;
@@ -139,9 +165,10 @@ async function run_install_and_restart(): Promise<void> {
     const terminal = await get_or_create_r_terminal();
     terminal.show(true);
 
+    const pkg_arg = get_package_path_arg();
     const code = [
         'local({',
-        '  status <- tryCatch({ devtools::install(); "ok" },',
+        `  status <- tryCatch({ devtools::install(${pkg_arg}); "ok" },`,
         '    error = function(e) conditionMessage(e))',
         '  if (!identical(status, "ok"))',
         '    message("Raven: install failed: ", status)',
@@ -165,8 +192,8 @@ async function run_build_command(cmd: BuildCommand): Promise<void> {
         await run_install_and_restart();
         return;
     }
-    if (!cmd.code) return;
-    await run_simple(cmd.code, cmd.target);
+    if (!cmd.make_code) return;
+    await run_simple(cmd.make_code(get_package_path_arg()), cmd.target);
 }
 
 export function register_build_commands(context: vscode.ExtensionContext): void {
@@ -177,6 +204,17 @@ export function register_build_commands(context: vscode.ExtensionContext): void 
     }
     context.subscriptions.push(
         vscode.window.onDidCloseTerminal(handle_tasks_terminal_closed),
+        // Mirror the `raven.rTerminal.program`-change behaviour in
+        // `r-terminal-manager.ts`: clear the slot so the next build command
+        // launches a fresh terminal with the newly-configured program. The
+        // existing terminal keeps running so the user can read scrollback;
+        // they close it themselves when they're done with it.
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration('raven.rTerminal.program')) {
+                tasks_terminal = null;
+                tasks_creation_in_flight = null;
+            }
+        }),
     );
 }
 

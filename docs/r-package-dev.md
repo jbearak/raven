@@ -62,12 +62,16 @@ contributes six Command Palette entries that wrap the standard
 
 | Palette title                  | Runs in                  | R call                |
 |--------------------------------|--------------------------|-----------------------|
-| `Raven Build: Load All`        | active R terminal        | `devtools::load_all()` |
-| `Raven Build: Document`        | active R terminal        | `devtools::document()` |
-| `Raven Build: Install and Restart` | active R terminal    | `devtools::install()` followed by `quit(save = "no")` |
-| `Raven Build: Test Package`    | `R: Package Tasks` terminal | `devtools::test()` |
-| `Raven Build: Check Package`   | `R: Package Tasks` terminal | `devtools::check()` |
-| `Raven Build: Build Source Package` | `R: Package Tasks` terminal | `devtools::build()` |
+| `Raven Build: Load All`        | active R terminal        | `devtools::load_all("<workspace>")` |
+| `Raven Build: Document`        | active R terminal        | `devtools::document("<workspace>")` |
+| `Raven Build: Install and Restart` | active R terminal    | `devtools::install("<workspace>")` followed by `quit(save = "no")` |
+| `Raven Build: Test Package`    | `R: Package Tasks` terminal | `devtools::test("<workspace>")` |
+| `Raven Build: Check Package`   | `R: Package Tasks` terminal | `devtools::check("<workspace>")` |
+| `Raven Build: Build Source Package` | `R: Package Tasks` terminal | `devtools::build("<workspace>")` |
+
+Each command passes the first workspace folder's absolute path explicitly,
+so a stray `setwd()` in the R session — or a terminal launched from a
+subdirectory — can't redirect the build at the wrong project.
 
 The six commands also appear as a single `$(package)` submenu in the
 editor title bar when an R file is open in a package workspace.
