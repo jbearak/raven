@@ -1,0 +1,21 @@
+{
+  "name": "R .Rbuildignore",
+  "scopeName": "source.r-buildignore",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#pattern" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.r-buildignore",
+      "match": "^#.*$"
+    },
+    "pattern": {
+      "name": "meta.pattern.r-buildignore",
+      "match": "^[^#\\s].*$",
+      "captures": {
+        "0": { "name": "string.regexp.r-buildignore" }
+      }
+    }
+  }
+}

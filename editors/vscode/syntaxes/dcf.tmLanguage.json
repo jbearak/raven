@@ -1,0 +1,28 @@
+{
+  "name": "DCF",
+  "scopeName": "source.dcf",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#field" },
+    { "include": "#continuation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.dcf",
+      "match": "^#.*$"
+    },
+    "field": {
+      "name": "meta.field.dcf",
+      "match": "^([A-Za-z][A-Za-z0-9_.-]*)(:)(.*)",
+      "captures": {
+        "1": { "name": "keyword.other.field-name.dcf" },
+        "2": { "name": "punctuation.separator.key-value.dcf" },
+        "3": { "name": "string.unquoted.field-value.dcf" }
+      }
+    },
+    "continuation": {
+      "name": "string.unquoted.continuation.dcf",
+      "match": "^[ \\t]+.*$"
+    }
+  }
+}
