@@ -3,14 +3,28 @@
 /**
  * Structural tests for problem-matcher contributions in package.json.
  *
- * The $testthat matcher parses failure headers emitted by testthat's default
- * progress reporter so VS Code can surface failing tests in the Problems panel
- * with clickable file:line links.
+ * The $testthat matcher parses test-failure headers emitted by testthat 3.x.
+ * Three distinct reporters are in active use and the matcher must handle all
+ * three. Samples below were captured from `testthat 3.3.2` + `devtools 2.5.2`
+ * running against a temporary package with three failing tests.
  *
- * Tests are pure file/JSON assertions — they parse the regex out of
- * package.json and exercise it against captured testthat output samples,
- * which keeps the matcher honest without needing to spawn R or VS Code's
- * task runner.
+ *   ProgressReporter (default for `devtools::test()` / `testthat::test_dir()`):
+ *     Failure ('test-sample.R:2:3'): expect_equal mismatch
+ *     Error   ('test-sample.R:6:3'): error inside test
+ *
+ *   CompactProgressReporter:
+ *     ── Failure ('test-sample.R:2:3'): expect_equal mismatch ───────────────
+ *     ── Error   ('test-sample.R:6:3'): error inside test ───────────────────
+ *
+ *   LlmReporter — auto-selected when CLAUDECODE / AGENT / GEMINI_CLI /
+ *   CURSOR_AGENT env vars are set, so CI agents and reviewers running under
+ *   Claude / Gemini / Cursor see this form (not what end users get in
+ *   VS Code's terminal, but the matcher handles it for completeness):
+ *     FAILURE: 'test-sample.R:2:3' ----------------------
+ *     ERROR:   'test-sample.R:6:3' ------------------------
+ *
+ * Common shape: a single-quoted location `'file:line:col'`. Test name is
+ * absent in the LlmReporter form.
  */
 
 import * as assert from 'assert';
@@ -105,10 +119,10 @@ suite('problem matcher contributions', () => {
 
     test('pattern uses the documented capture-group indices', () => {
         const pattern = singlePattern(getTestthatMatcher());
-        assert.strictEqual(pattern.file, 2);
-        assert.strictEqual(pattern.line, 3);
-        assert.strictEqual(pattern.column, 4);
-        assert.strictEqual(pattern.message, 5);
+        assert.strictEqual(pattern.file, 3);
+        assert.strictEqual(pattern.line, 4);
+        assert.strictEqual(pattern.column, 5);
+        assert.strictEqual(pattern.message, 6);
     });
 
     test('regex compiles as a JavaScript RegExp', () => {
@@ -120,98 +134,191 @@ suite('problem matcher contributions', () => {
     });
 });
 
-suite('testthat regex captures', () => {
+interface ExpectedCapture {
+    file: string;
+    line: string;
+    column?: string;
+    message?: string;
+}
+
+suite('testthat regex captures (real reporter output)', () => {
     function regex(): RegExp {
         return new RegExp(singlePattern(getTestthatMatcher()).regexp);
     }
 
-    test('matches a standard testthat 3.x failure header', () => {
-        const sample = '── Failure (test-helpers.R:12:3): process_data handles NAs ──';
+    function expectMatch(sample: string, expected: ExpectedCapture): void {
         const m = sample.match(regex());
-        assert.ok(m, 'standard failure header must match');
-        assert.strictEqual(m[1], 'Failure');
-        assert.strictEqual(m[2], 'test-helpers.R');
-        assert.strictEqual(m[3], '12');
-        assert.strictEqual(m[4], '3');
-        assert.strictEqual(m[5], 'process_data handles NAs');
-    });
+        assert.ok(m, `expected match for: ${JSON.stringify(sample)}`);
+        const pattern = singlePattern(getTestthatMatcher());
+        assert.strictEqual(m[pattern.file!], expected.file, 'file capture');
+        assert.strictEqual(m[pattern.line!], expected.line, 'line capture');
+        assert.strictEqual(m[pattern.column!], expected.column, 'column capture');
+        assert.strictEqual(m[pattern.message!], expected.message, 'message capture');
+    }
 
-    test('matches an error header', () => {
-        const sample = '── Error (test-foo.R:50:1): boots when fed an empty frame ──';
-        const m = sample.match(regex());
-        assert.ok(m, 'error header must match');
-        assert.strictEqual(m[1], 'Error');
-        assert.strictEqual(m[2], 'test-foo.R');
-        assert.strictEqual(m[3], '50');
-        assert.strictEqual(m[4], '1');
-        assert.strictEqual(m[5], 'boots when fed an empty frame');
-    });
-
-    test('matches a header without an explicit column', () => {
-        const sample = '── Failure (test-foo.R:12): something ──';
-        const m = sample.match(regex());
-        assert.ok(m, 'header without column must still match');
-        assert.strictEqual(m[2], 'test-foo.R');
-        assert.strictEqual(m[3], '12');
-        assert.strictEqual(m[4], undefined, 'column should be unset when omitted');
-        assert.strictEqual(m[5], 'something');
-    });
-
-    test('matches an ASCII fallback header', () => {
-        const sample = '-- Failure (test-foo.R:1:1): plain ASCII fallback --';
-        const m = sample.match(regex());
-        assert.ok(m, 'ASCII fallback (-- ... --) must match');
-        assert.strictEqual(m[2], 'test-foo.R');
-        assert.strictEqual(m[5], 'plain ASCII fallback');
-    });
-
-    test('matches a header with extra leading dashes/spaces', () => {
-        const sample = '────── Failure (test-foo.R:9:1): wide rule ──────';
-        const m = sample.match(regex());
-        assert.ok(m, 'longer dash rules must still match');
-        assert.strictEqual(m[2], 'test-foo.R');
-        assert.strictEqual(m[5], 'wide rule');
-    });
-
-    test('matches a path containing dots and dashes', () => {
-        const sample = '── Failure (test-foo.bar.baz-2.R:3:7): odd-name ──';
-        const m = sample.match(regex());
-        assert.ok(m, 'paths with dots and dashes must match');
-        assert.strictEqual(m[2], 'test-foo.bar.baz-2.R');
-    });
-
-    test('rejects a header missing the leading rule', () => {
-        const sample = 'Failure (test-foo.R:12:3): without dashes';
-        assert.strictEqual(
-            sample.match(regex()),
-            null,
-            'header without leading dashes should not match the matcher',
-        );
-    });
-
-    test('rejects unrelated output', () => {
-        const samples = [
-            '',
-            '> devtools::test()',
-            '[ FAIL 0 | WARN 0 | SKIP 0 | PASS 17 ]',
-            'Expected: 1',
-            'Backtrace:',
-        ];
-        for (const sample of samples) {
-            assert.strictEqual(
-                sample.match(regex()),
-                null,
-                `non-failure line should not match: ${JSON.stringify(sample)}`,
+    suite('ProgressReporter (default for devtools::test / testthat::test_dir)', () => {
+        test('failure header captures file, line, column, test name', () => {
+            expectMatch(
+                "Failure ('test-sample.R:2:3'): expect_equal mismatch",
+                {
+                    file: 'test-sample.R',
+                    line: '2',
+                    column: '3',
+                    message: 'expect_equal mismatch',
+                },
             );
-        }
+        });
+
+        test('error header captures file, line, column, test name', () => {
+            expectMatch(
+                "Error ('test-sample.R:6:3'): error inside test",
+                {
+                    file: 'test-sample.R',
+                    line: '6',
+                    column: '3',
+                    message: 'error inside test',
+                },
+            );
+        });
+
+        test('captures a verbose test name', () => {
+            expectMatch(
+                "Failure ('test-sample.R:10:3'): multi-line description that should be captured",
+                {
+                    file: 'test-sample.R',
+                    line: '10',
+                    column: '3',
+                    message: 'multi-line description that should be captured',
+                },
+            );
+        });
     });
 
-    test('does not match testthat skip headers (skips are not problems)', () => {
-        const sample = '── Skipped (test-foo.R:7:3): not on CI ──';
-        assert.strictEqual(
-            sample.match(regex()),
-            null,
-            'Skip headers should not produce diagnostics',
-        );
+    suite('CompactProgressReporter', () => {
+        test('failure header with surrounding box rule', () => {
+            expectMatch(
+                "── Failure ('test-sample.R:2:3'): expect_equal mismatch ────────────────────────",
+                {
+                    file: 'test-sample.R',
+                    line: '2',
+                    column: '3',
+                    message: 'expect_equal mismatch',
+                },
+            );
+        });
+
+        test('error header with surrounding box rule', () => {
+            expectMatch(
+                "── Error ('test-sample.R:6:3'): error inside test ──────────────────────────────",
+                {
+                    file: 'test-sample.R',
+                    line: '6',
+                    column: '3',
+                    message: 'error inside test',
+                },
+            );
+        });
+
+        test('ASCII fallback rule (cli.unicode=FALSE)', () => {
+            expectMatch(
+                "-- Failure ('test-sample.R:2:3'): expect_equal mismatch ----",
+                {
+                    file: 'test-sample.R',
+                    line: '2',
+                    column: '3',
+                    message: 'expect_equal mismatch',
+                },
+            );
+        });
+    });
+
+    suite('LlmReporter (CLAUDECODE/AGENT env active)', () => {
+        test('FAILURE: header captures file, line, column (no test name)', () => {
+            expectMatch(
+                "FAILURE: 'test-sample.R:2:3' ----------------------",
+                {
+                    file: 'test-sample.R',
+                    line: '2',
+                    column: '3',
+                    message: undefined,
+                },
+            );
+        });
+
+        test('ERROR: header captures file, line, column (no test name)', () => {
+            expectMatch(
+                "ERROR: 'test-sample.R:6:3' ------------------------",
+                {
+                    file: 'test-sample.R',
+                    line: '6',
+                    column: '3',
+                    message: undefined,
+                },
+            );
+        });
+    });
+
+    suite('Edge cases', () => {
+        test('header without column (srcref missing column info)', () => {
+            expectMatch(
+                "Failure ('test-sample.R:2'): no column captured",
+                {
+                    file: 'test-sample.R',
+                    line: '2',
+                    column: undefined,
+                    message: 'no column captured',
+                },
+            );
+        });
+
+        test('file path with hyphens and dots', () => {
+            expectMatch(
+                "Failure ('test-foo.bar.baz-2.R:1:1'): odd-name",
+                {
+                    file: 'test-foo.bar.baz-2.R',
+                    line: '1',
+                    column: '1',
+                    message: 'odd-name',
+                },
+            );
+        });
+
+        test('test name containing ASCII dashes', () => {
+            expectMatch(
+                "── Failure ('test-foo.R:9:1'): name with -- inside ──",
+                {
+                    file: 'test-foo.R',
+                    line: '9',
+                    column: '1',
+                    message: 'name with -- inside',
+                },
+            );
+        });
+    });
+
+    suite('Negative cases', () => {
+        const negatives = [
+            '',
+            'Expected 1 to equal 2.',
+            'Differences:',
+            '[ FAIL 3 | WARN 0 | SKIP 0 | PASS 0 ]',
+            '────────────────────────────────────────────────────────────────────────────────',
+            '✖ | 3        0 | sample',
+            '> devtools::test()',
+            'Some random text',
+            "── Skip ('test-foo.R:7:3'): not on CI ──",
+            "── Skipped ('test-foo.R:7:3'): not on CI ──",
+            "WARNING: 'test-foo.R:1:1' ----",
+            // Old (pre-3.0) testthat shape — not supported; verifies we don't
+            // accidentally fall back to the prior over-broad matcher.
+            '── Failure (test-foo.R:12:3): unquoted location ──',
+        ];
+
+        for (const sample of negatives) {
+            test(`rejects: ${JSON.stringify(sample)}`, () => {
+                const m = sample.match(regex());
+                assert.strictEqual(m, null);
+            });
+        }
     });
 });

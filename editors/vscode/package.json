@@ -373,11 +373,11 @@
         ],
         "severity": "error",
         "pattern": {
-          "regexp": "^[-─]+\\s+(Failure|Error)\\s+\\((.+?):(\\d+)(?::(\\d+))?\\):\\s+(.+?)\\s+[-─]+\\s*$",
-          "file": 2,
-          "line": 3,
-          "column": 4,
-          "message": 5
+          "regexp": "^[-─]*\\s*(?:(Failure|Error)|(FAILURE|ERROR):)\\s+\\(?'([^':]+):(\\d+)(?::(\\d+))?'\\)?(?::\\s+(.+?))?\\s*[-─]*\\s*$",
+          "file": 3,
+          "line": 4,
+          "column": 5,
+          "message": 6
         }
       }
     ],

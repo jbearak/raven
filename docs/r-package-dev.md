@@ -54,13 +54,15 @@ but not the other way around.
 
 ### testthat problem matcher
 
-When you run `devtools::test()` or `testthat::test_file()`, the default
-progress reporter prints failure headers like:
+When you run `devtools::test()` or `testthat::test_dir()`, testthat's
+default progress reporter prints failure headers like:
 
 ```text
-── Failure (test-helpers.R:12:3): process_data handles NAs ──
-Expected: 1
-Actual: 2
+Failure ('test-helpers.R:12:3'): process_data handles NAs
+Expected 1 to equal 2.
+Differences:
+1/1 mismatches
+[1] 1 - 2 == -1
 ```
 
 Raven contributes a `$testthat` problem matcher that parses those headers
@@ -86,12 +88,17 @@ To wire it up, add a task to `.vscode/tasks.json` (or run it ad hoc via
 }
 ```
 
-The matcher captures both `── Failure (…) ──` and `── Error (…) ──`
-headers and resolves paths relative to `${workspaceFolder}/tests/testthat`,
-matching the directory testthat sets as the working directory while a
-test runs. The Problems-panel entry's message is the test name; the full
-expected/actual output stays in the terminal where you can read it
-alongside any other context the test printed.
+The matcher recognises `Failure (…)` / `Error (…)` headers from the
+default `ProgressReporter`, the `── Failure (…) ──` form from the
+`CompactProgressReporter`, and the all-caps `FAILURE: …` / `ERROR: …`
+shape that testthat's `LlmReporter` emits when running under an AI
+coding agent (`CLAUDECODE` / `AGENT` / `GEMINI_CLI` / `CURSOR_AGENT`).
+Paths resolve relative to `${workspaceFolder}/tests/testthat`, matching
+the directory testthat sets as the working directory while a test
+runs. The Problems-panel entry's message is the test name (when the
+reporter emits one); the full expected/actual output stays in the
+terminal where you can read it alongside any other context the test
+printed.
 
 ### Roxygen Namespace Tags
 
