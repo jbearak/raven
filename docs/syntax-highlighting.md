@@ -1,6 +1,6 @@
 # Syntax Highlighting
 
-Raven contributes syntax highlighting in two ways: LSP semantic tokens for R function names, plus TextMate grammars for JAGS and Stan. For R, Raven augments whatever TextMate grammar is already loaded rather than replacing it. For JAGS and Stan, Raven ships the grammar itself because VS Code doesn't bundle one.
+Raven contributes syntax highlighting in two ways: LSP semantic tokens for R function names, plus TextMate grammars for JAGS, Stan, and R package development files. For R, Raven augments whatever TextMate grammar is already loaded rather than replacing it. For JAGS, Stan, and the package infrastructure files, Raven ships the grammar itself because VS Code doesn't bundle one.
 
 ## R
 
@@ -20,6 +20,44 @@ VS Code ships a built-in R grammar. It covers roxygen comments, line comments, s
 That grammar isn't maintained by Microsoft directly. It's a periodic sync of [REditorSupport/vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax): VS Code's `extensions/r/package.json` has a single `update-grammar` script that runs `vscode-grammar-updater` against the REditorSupport source, and the generated file's header points readers back to the upstream repo for fixes. The two are the same grammar, with the built-in trailing upstream by however many commits have landed since the last sync.
 
 The one capability the upstream extension adds that VS Code doesn't bundle is **R Markdown**. [`REditorSupport.r-syntax`](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r-syntax) registers a separate `rmd` language with a Markdown-aware grammar: `.Rmd` files are parsed as Markdown with R code chunks, and 30+ embedded languages (Python, SQL, C, CSS, etc.) are recognized inside their respective fenced blocks. Without it, VS Code treats `.Rmd` as plain R source — you lose Markdown headings, prose styling, and embedded-language highlighting inside code chunks.
+
+## R Package Development Files
+
+VS Code doesn't ship grammars for the infrastructure files that ship inside every R package, so Raven adds TextMate grammars and language configurations for four file types. Each file gets syntax highlighting, bracket matching, and comment toggling (`#` for DCF/NAMESPACE/.Rbuildignore, `%` for Rd).
+
+### DCF (`DESCRIPTION`, `.Rproj`, `.lintr`)
+
+Registered via the `r-dcf` language ID for `DESCRIPTION`, `.Rproj`, and `.lintr`. DCF (Debian Control File) is the format used for R package metadata and project configuration. The grammar recognizes:
+
+- **Field names** — Identifiers before `:` (e.g., `Package`, `Version`, `Depends`), styled as keywords.
+- **Field values** — The text after `:` on the same line, styled as strings.
+- **Continuation lines** — Lines starting with whitespace that continue a multi-line field value.
+- **Comments** — `#` to end of line.
+
+### NAMESPACE
+
+Registered via the `r-namespace` language ID for the `NAMESPACE` file. The grammar recognizes:
+
+- **Directives** — `export`, `exportClasses`, `exportMethods`, `exportPattern`, `import`, `importClassesFrom`, `importFrom`, `importMethodsFrom`, `S3method`, `S4method`, `useDynLib`, styled as keywords.
+- **Symbol names** — Package and function identifiers inside directive arguments.
+- **Strings** — Double-quoted names.
+- **Comments** — `#` to end of line.
+
+### Rd (`.Rd`, `.rd`)
+
+Registered via the `rd` language ID. Rd is R's documentation format. The grammar recognizes:
+
+- **Section tags** — `\title`, `\usage`, `\arguments`, `\description`, `\details`, `\value`, `\examples`, and the rest of the standard Rd section set, styled as keywords.
+- **Inline tags** — `\code`, `\emph`, `\strong`, `\link`, `\pkg`, `\url`, `\var`, and the full inline tag set, styled as entity names.
+- **Escape sequences** — `\{`, `\}`, `\\`, `\%`.
+- **Comments** — `%` to end of line (but not `\%`, which is an escaped literal percent).
+
+### `.Rbuildignore`
+
+Registered via the `r-buildignore` language ID. `.Rbuildignore` contains one extended regular expression per line listing paths to exclude from the package tarball. The grammar recognizes:
+
+- **Patterns** — Non-comment lines, styled as `string.regexp`.
+- **Comments** — `#` to end of line.
 
 ## JAGS and Stan
 

@@ -10,7 +10,7 @@
   "repository": {
     "comment": {
       "name": "comment.line.percent.rd",
-      "match": "%.*$"
+      "match": "(?<!\\\\)%.*$"
     },
     "section-tag": {
       "name": "meta.section.rd",
@@ -26,8 +26,7 @@
       "patterns": [
         { "include": "#comment" },
         { "include": "#inline-tag" },
-        { "include": "#escaped" },
-        { "include": "#code-block" }
+        { "include": "#escaped" }
       ]
     },
     "inline-tag": {
@@ -46,10 +45,6 @@
         { "include": "#inline-tag" },
         { "include": "#escaped" }
       ]
-    },
-    "code-block": {
-      "name": "markup.raw.code.rd",
-      "match": "\\\\code\\{[^}]*\\}"
     },
     "escaped": {
       "name": "constant.character.escape.rd",
