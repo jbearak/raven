@@ -423,7 +423,7 @@ Note JSON escaping rules: `\n` becomes a newline, `\t` becomes a tab, `\\` is a 
   },
   "vapply": {
     "prefix": "vapply",
-    "body": "vapply(${1:x}, function(${2:el}) ${3}, ${0:FUN.VALUE})",
+    "body": "vapply(${1:x}, function(${2:el}) ${3}, ${0:character(1)})",
     "description": "vapply (type-safe)"
   },
   "mapply": {
@@ -548,7 +548,7 @@ Note JSON escaping rules: `\n` becomes a newline, `\t` becomes a tab, `\\` is a 
 
   "cat": {
     "prefix": "cat",
-    "body": "cat(${1:...}, ${0:sep = \"\\n\"})",
+    "body": "cat(${1:...}, sep = ${2:\"\\n\"})${0}",
     "description": "cat"
   },
   "print": {
@@ -558,7 +558,7 @@ Note JSON escaping rules: `\n` becomes a newline, `\t` becomes a tab, `\\` is a 
   },
   "paste": {
     "prefix": "paste",
-    "body": "paste(${1:...}, sep = ${0:\" \"})",
+    "body": "paste(${1:...}, sep = ${2:\" \"})${0}",
     "description": "paste"
   },
   "paste0": {
@@ -792,7 +792,7 @@ Triggers to spot-check (one per category):
 - `fun` → `name <- function(args) { … }`
 - `Map` → `Map(function(a, b) …, x, y)`
 - `df` → `data.frame(col1 = …, …)`
-- `pipe` → `|> `
+- `pipe` → `|>` followed by a trailing space and cursor
 - `source` → `source("path.R")`
 - `cat` → `cat(..., sep = "\n")`
 - `ggplot` → `ggplot(data, aes(x = , y = )) + …`
