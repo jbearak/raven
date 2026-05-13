@@ -269,6 +269,53 @@
           ".STAN"
         ],
         "configuration": "./stan-language-configuration.json"
+      },
+      {
+        "id": "r-dcf",
+        "aliases": [
+          "R DCF",
+          "DCF"
+        ],
+        "extensions": [
+          ".Rproj"
+        ],
+        "filenames": [
+          "DESCRIPTION",
+          ".lintr"
+        ],
+        "configuration": "./dcf-language-configuration.json"
+      },
+      {
+        "id": "r-namespace",
+        "aliases": [
+          "R NAMESPACE"
+        ],
+        "filenames": [
+          "NAMESPACE"
+        ],
+        "configuration": "./namespace-language-configuration.json"
+      },
+      {
+        "id": "rd",
+        "aliases": [
+          "Rd",
+          "rd"
+        ],
+        "extensions": [
+          ".Rd",
+          ".rd"
+        ],
+        "configuration": "./rd-language-configuration.json"
+      },
+      {
+        "id": "r-buildignore",
+        "aliases": [
+          "R .Rbuildignore"
+        ],
+        "filenames": [
+          ".Rbuildignore"
+        ],
+        "configuration": "./rbuildignore-language-configuration.json"
       }
     ],
     "grammars": [
@@ -281,6 +328,26 @@
         "language": "stan",
         "scopeName": "source.stan",
         "path": "./syntaxes/stan.tmLanguage.json"
+      },
+      {
+        "language": "r-dcf",
+        "scopeName": "source.dcf",
+        "path": "./syntaxes/dcf.tmLanguage.json"
+      },
+      {
+        "language": "r-namespace",
+        "scopeName": "source.r-namespace",
+        "path": "./syntaxes/namespace.tmLanguage.json"
+      },
+      {
+        "language": "rd",
+        "scopeName": "source.rd",
+        "path": "./syntaxes/rd.tmLanguage.json"
+      },
+      {
+        "language": "r-buildignore",
+        "scopeName": "source.r-buildignore",
+        "path": "./syntaxes/rbuildignore.tmLanguage.json"
       }
     ],
     "snippets": [

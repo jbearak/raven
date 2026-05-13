@@ -1,0 +1,46 @@
+{
+  "name": "R NAMESPACE",
+  "scopeName": "source.r-namespace",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#directive" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.r-namespace",
+      "match": "#.*$"
+    },
+    "directive": {
+      "name": "meta.directive.r-namespace",
+      "begin": "\\b(export|exportClasses|exportMethods|exportPattern|import|importClassesFrom|importFrom|importMethodsFrom|S3method|S4method|useDynLib)\\s*(\\()",
+      "beginCaptures": {
+        "1": { "name": "keyword.other.directive.r-namespace" },
+        "2": { "name": "punctuation.definition.arguments.begin.r-namespace" }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.arguments.end.r-namespace" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#string" },
+        {
+          "name": "variable.other.r-namespace",
+          "match": "[A-Za-z.][A-Za-z0-9._]*"
+        },
+        {
+          "name": "punctuation.separator.comma.r-namespace",
+          "match": ","
+        }
+      ]
+    },
+    "string": {
+      "name": "string.quoted.double.r-namespace",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.r-namespace", "match": "\\\\." }
+      ]
+    }
+  }
+}
