@@ -38,6 +38,19 @@ suite('scaffold templates', () => {
             '.Ruserdata',
             '.Rproj.user/',
             '.Renviron',
+            '.DS_Store',
+            'Thumbs.db',
+            '*_cache/',
+            '*_files/',
+            '.Rcheck/',
+            '.quarto/',
+            'output/',
+            'scratch/',
+            'scratch.R',
+            '.claude/settings.local.json',
+            '.claude/agent-memory-local/',
+            '.claude/scheduled_tasks.lock',
+            '.cursorignore.local',
         ];
         for (const line of expected) {
             assert.ok(

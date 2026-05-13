@@ -59,7 +59,7 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Command | File | Contents |
 |---|---|---|
-| `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`, etc.) |
+| `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch dirs, and AI-tool user-local overrides |
 | `Raven: Create .lintr` | `.lintr` | `linters_with_defaults(line_length_linter(120))` |
 
 ## R Console Activation

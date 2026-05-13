@@ -28,6 +28,31 @@ docs/
 
 # translation temp files
 po/*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# R Markdown / knitr artifacts
+*_cache/
+*_files/
+
+# R CMD check output
+.Rcheck/
+
+# Quarto cache
+.quarto/
+
+# Local scratch / output
+output/
+scratch/
+scratch.R
+
+# AI tool user-local files
+.claude/settings.local.json
+.claude/agent-memory-local/
+.claude/scheduled_tasks.lock
+.cursorignore.local
 `;
 
 export const LINTR_TEMPLATE = `linters: linters_with_defaults(
