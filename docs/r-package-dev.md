@@ -52,6 +52,54 @@ In contrast, a function defined in `tests/testthat/test-helpers.R` is **not**
 visible to `R/helpers.R` — symbols in `R/` are visible from `tests/testthat/`,
 but not the other way around.
 
+### testthat problem matcher
+
+When you run `devtools::test()` or `testthat::test_dir()`, testthat's
+default progress reporter prints failure headers like:
+
+```text
+Failure ('test-helpers.R:12:3'): process_data handles NAs
+Expected 1 to equal 2.
+Differences:
+1/1 mismatches
+[1] 1 - 2 == -1
+```
+
+Raven contributes a `$testthat` problem matcher that parses those headers
+and surfaces each failing test in VS Code's Problems panel, with a
+clickable file:line link that jumps to the failing assertion.
+
+To wire it up, add a task to `.vscode/tasks.json` (or run it ad hoc via
+**Terminal → Run Task…**):
+
+```json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "R: Test package",
+      "type": "shell",
+      "command": "Rscript",
+      "args": ["-e", "devtools::test()"],
+      "problemMatcher": "$testthat",
+      "group": "test"
+    }
+  ]
+}
+```
+
+The matcher recognises `Failure (…)` / `Error (…)` headers from the
+default `ProgressReporter`, the `── Failure (…) ──` form from the
+`CompactProgressReporter`, and the all-caps `FAILURE: …` / `ERROR: …`
+shape that testthat's `LlmReporter` emits when running under an AI
+coding agent (`CLAUDECODE` / `AGENT` / `GEMINI_CLI` / `CURSOR_AGENT`).
+Paths resolve relative to `${workspaceFolder}/tests/testthat`, matching
+the directory testthat sets as the working directory while a test
+runs. The Problems-panel entry's message is the test name (when the
+reporter emits one); the full expected/actual output stays in the
+terminal where you can read it alongside any other context the test
+printed.
+
 ### Roxygen Namespace Tags
 
 When roxygen is detected, Raven parses these tags from source:

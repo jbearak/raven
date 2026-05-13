@@ -360,6 +360,27 @@
         "path": "./snippets/rmarkdown.json"
       }
     ],
+    "problemMatchers": [
+      {
+        "name": "testthat",
+        "label": "R testthat test failures",
+        "owner": "raven-testthat",
+        "source": "testthat",
+        "applyTo": "allDocuments",
+        "fileLocation": [
+          "relative",
+          "${workspaceFolder}/tests/testthat"
+        ],
+        "severity": "error",
+        "pattern": {
+          "regexp": "^[-─]*\\s*(?:(Failure|Error)|(FAILURE|ERROR):)\\s+\\(?'([^':]+):(\\d+)(?::(\\d+))?'\\)?(?::\\s+(.+?))?\\s*[-─]*\\s*$",
+          "file": 3,
+          "line": 4,
+          "column": 5,
+          "message": 6
+        }
+      }
+    ],
     "configurationDefaults": {
       "[r]": {
         "editor.formatOnType": true
