@@ -26,7 +26,8 @@
       "patterns": [
         { "include": "#comment" },
         { "include": "#inline-tag" },
-        { "include": "#escaped" }
+        { "include": "#escaped" },
+        { "include": "#braced-content" }
       ]
     },
     "inline-tag": {
@@ -43,7 +44,25 @@
       "patterns": [
         { "include": "#comment" },
         { "include": "#inline-tag" },
-        { "include": "#escaped" }
+        { "include": "#escaped" },
+        { "include": "#braced-content" }
+      ]
+    },
+    "braced-content": {
+      "name": "meta.braced.rd",
+      "begin": "\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.brace.begin.rd" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.brace.end.rd" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#inline-tag" },
+        { "include": "#escaped" },
+        { "include": "#braced-content" }
       ]
     },
     "escaped": {
