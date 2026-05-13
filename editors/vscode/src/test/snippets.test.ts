@@ -172,9 +172,10 @@ suite('Snippet contributions', () => {
 
     test('placeholder grammar is well-formed in every snippet body', () => {
         // Matches:
-        //   ${N}          (placeholder, no default)
-        //   ${N:default}  (placeholder with default, non-nested)
-        //   $N            (bare tab stop)
+        //   ${N}            (placeholder, no default)
+        //   ${N:default}    (placeholder with default, non-nested)
+        //   ${N|opt1,opt2|} (choice placeholder)
+        //   $N              (bare tab stop)
         // Known limitation: the [^}]* default-group is non-recursive, so
         // tab-stop numbers that appear *inside* a nested ${...} default
         // are not collected. The "for" snippet does this intentionally —
@@ -182,7 +183,7 @@ suite('Snippet contributions', () => {
         // invisible to this regex. The balance check below still catches
         // malformed nesting. If a future snippet adds duplicate stops
         // inside nested defaults, this regex won't flag them.
-        const tabStopPattern = /\$\{(\d+)(?::([^}]*))?\}|\$(\d+)/g;
+        const tabStopPattern = /\$\{(\d+)(?::[^}]*)?\}|\$\{(\d+)\|[^}]*\|\}|\$(\d+)/g;
 
         for (const entry of loadSnippetContributions()) {
             const snippets = loadSnippets(entry.path);
@@ -204,7 +205,7 @@ suite('Snippet contributions', () => {
                 let match: RegExpExecArray | null;
                 tabStopPattern.lastIndex = 0;
                 while ((match = tabStopPattern.exec(body)) !== null) {
-                    const numStr = match[1] ?? match[3];
+                    const numStr = match[1] ?? match[2] ?? match[3];
                     if (numStr !== undefined) {
                         tabStopNumbers.push(parseInt(numStr, 10));
                     }
