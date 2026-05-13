@@ -208,12 +208,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_build_commands(context);
     }
 
-    // Package-mode context key. Wired regardless of R-console activation so
-    // the palette gating works even when Send-to-R is disabled (e.g. when
-    // coexisting with REditorSupport, which provides its own R session).
-    // The Build commands themselves require an R terminal, so they're only
-    // registered above when r-console is enabled; the context key still
-    // hides their palette entries when the workspace isn't a package.
+    // Package-mode context key. The `raven.isRPackage` key gates the
+    // Build commands' palette entries and editor-title submenu — every
+    // `when` clause that uses it is also gated on `raven.rConsoleEnabled`,
+    // so the key has no visible effect when R-console is disabled. We
+    // still register the detection unconditionally so the key is
+    // populated for whichever surfaces (current or future) consult it.
     register_r_package_detection(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.

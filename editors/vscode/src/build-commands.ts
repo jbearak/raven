@@ -121,7 +121,14 @@ async function create_tasks_terminal(): Promise<vscode.Terminal> {
         shellArgs: ['--no-save', '--no-restore'],
         isTransient: true,
     });
-    tasks_terminal = terminal;
+    // `resolve_program()` can yield for seconds (shell `which` validation,
+    // or a "Switch to R / Keep" dialog). If `raven.rTerminal.program`
+    // changed during that window, the config handler cleared
+    // `tasks_creation_in_flight`; don't cache this now-stale terminal —
+    // the next call should launch a fresh one with the updated program.
+    if (tasks_creation_in_flight !== null) {
+        tasks_terminal = terminal;
+    }
     return terminal;
 }
 
@@ -161,7 +168,9 @@ async function run_simple(code: string, target: 'r-console' | 'tasks'): Promise<
  * never ends up stuck in a broken half-restarted state. Failure output
  * remains visible in the closed-terminal scrollback.
  */
-async function run_install_and_restart(): Promise<void> {
+async function run_install_and_restart(
+    context: vscode.ExtensionContext,
+): Promise<void> {
     const terminal = await get_or_create_r_terminal();
     terminal.show(true);
 
@@ -176,6 +185,10 @@ async function run_install_and_restart(): Promise<void> {
         '})',
     ].join('\n');
 
+    // Self-disposing one-shot listener — but also tracked in
+    // `context.subscriptions` so it's disposed if the extension deactivates
+    // before the terminal closes (otherwise the callback would later fire
+    // against a torn-down module and spawn an orphaned terminal).
     const restart_listener = vscode.window.onDidCloseTerminal((closed) => {
         if (closed !== terminal) return;
         restart_listener.dispose();
@@ -183,13 +196,17 @@ async function run_install_and_restart(): Promise<void> {
         // fresh R session loaded with the newly installed package.
         void get_or_create_r_terminal();
     });
+    context.subscriptions.push(restart_listener);
 
     send_code(terminal, code, get_send_options());
 }
 
-async function run_build_command(cmd: BuildCommand): Promise<void> {
+async function run_build_command(
+    cmd: BuildCommand,
+    context: vscode.ExtensionContext,
+): Promise<void> {
     if (cmd.id === 'raven.build.installAndRestart') {
-        await run_install_and_restart();
+        await run_install_and_restart(context);
         return;
     }
     if (!cmd.make_code) return;
@@ -199,7 +216,7 @@ async function run_build_command(cmd: BuildCommand): Promise<void> {
 export function register_build_commands(context: vscode.ExtensionContext): void {
     for (const cmd of BUILD_COMMANDS) {
         context.subscriptions.push(
-            vscode.commands.registerCommand(cmd.id, () => run_build_command(cmd)),
+            vscode.commands.registerCommand(cmd.id, () => run_build_command(cmd, context)),
         );
     }
     context.subscriptions.push(

@@ -60,13 +60,13 @@ contributes six Command Palette entries that wrap the standard
 `devtools` / `testthat` / `roxygen2` workflows. Names mirror RStudio's
 **Build** menu so existing muscle memory carries over:
 
-| Palette title                  | Runs in                  | R call                |
-|--------------------------------|--------------------------|-----------------------|
-| `Raven Build: Load All`        | active R terminal        | `devtools::load_all("<workspace>")` |
-| `Raven Build: Document`        | active R terminal        | `devtools::document("<workspace>")` |
-| `Raven Build: Install and Restart` | active R terminal    | `devtools::install("<workspace>")` followed by `quit(save = "no")` |
-| `Raven Build: Test Package`    | `R: Package Tasks` terminal | `devtools::test("<workspace>")` |
-| `Raven Build: Check Package`   | `R: Package Tasks` terminal | `devtools::check("<workspace>")` |
+| Palette title | Runs in | R call |
+|---|---|---|
+| `Raven Build: Load All` | active R terminal | `devtools::load_all("<workspace>")` |
+| `Raven Build: Document` | active R terminal | `devtools::document("<workspace>")` |
+| `Raven Build: Install and Restart` | active R terminal | `devtools::install("<workspace>")` followed by `quit(save = "no")` |
+| `Raven Build: Test Package` | `R: Package Tasks` terminal | `devtools::test("<workspace>")` |
+| `Raven Build: Check Package` | `R: Package Tasks` terminal | `devtools::check("<workspace>")` |
 | `Raven Build: Build Source Package` | `R: Package Tasks` terminal | `devtools::build("<workspace>")` |
 
 Each command passes the first workspace folder's absolute path explicitly,
