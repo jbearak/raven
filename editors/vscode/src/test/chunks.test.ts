@@ -1,4 +1,8 @@
 import * as assert from 'assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 
 const CHUNK_COMMANDS = [
@@ -48,20 +52,33 @@ const R_CELL_FIXTURE = [
     '',
 ].join('\n');
 
+const TEMP_FIXTURE_FILES: string[] = [];
+
 /**
- * Open an untitled buffer with the supplied content. The `language` argument
- * controls how the chunk detector classifies the document:
- *   - `'rmd'` (default) — RMarkdown / Quarto fenced-block mode; required to
- *     test fixtures that use ```{r} fences. Even though our extension only
- *     registers the `r` languageId for saved files, the chunk classifier
- *     also accepts `'rmd'` / `'quarto'` languageIds so untitled test buffers
- *     can stand in for RMarkdown documents without writing a temp file.
- *   - `'r'` — plain R / `# %%` cell-marker mode.
+ * Open a document with the supplied content for the chunk detector:
+ *   - `'rmd'` (default) — RMarkdown / Quarto fenced-block mode. Written
+ *     to a temp `.rmd` file so the chunk classifier's URI-extension path
+ *     reliably classifies it as `'rmd'`. An untitled buffer with
+ *     `language: 'rmd'` would also work in principle (the classifier
+ *     accepts the `'rmd'` languageId), but VS Code does not always
+ *     preserve unregistered languageIds across platforms — the extension
+ *     only contributes `'r'`, and on Linux VS Code 1.120 the languageId
+ *     gets coerced away from `'rmd'`, breaking classification.
+ *   - `'r'` — plain R / `# %%` cell-marker mode. Uses an untitled buffer
+ *     because the extension registers the `'r'` languageId, so it
+ *     survives the round-trip.
  */
 async function open_doc(
     content: string,
     language: 'rmd' | 'r' = 'rmd',
 ): Promise<vscode.TextEditor> {
+    if (language === 'rmd') {
+        const tmp = path.join(os.tmpdir(), `raven-chunks-${randomUUID()}.rmd`);
+        fs.writeFileSync(tmp, content);
+        TEMP_FIXTURE_FILES.push(tmp);
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(tmp));
+        return vscode.window.showTextDocument(doc);
+    }
     const doc = await vscode.workspace.openTextDocument({ language, content });
     return vscode.window.showTextDocument(doc);
 }
@@ -137,6 +154,13 @@ function stub_create_terminal(): TerminalStub {
 }
 
 suite('chunk commands: registration and behavior', () => {
+    suiteTeardown(() => {
+        for (const file of TEMP_FIXTURE_FILES) {
+            try { fs.unlinkSync(file); } catch { /* best-effort */ }
+        }
+        TEMP_FIXTURE_FILES.length = 0;
+    });
+
     test('every chunk command is registered in VS Code', async () => {
         // Skip when R-console activation is disabled (REditorSupport / Positron):
         // the run / CodeLens-positional commands aren't registered then. The

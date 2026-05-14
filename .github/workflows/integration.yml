@@ -1,0 +1,157 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Sibling job 1: the Rust test suite. Mirrors what `bun test` runs
+  # locally as the first half of `tests/bun/workspace-suite.test.ts`.
+  # Runs in release profile so its `target/` cache lines up with the
+  # release LSP binary that the Mocha suite builds — same cache key
+  # means whichever job finishes first warms the other on subsequent runs.
+  cargo:
+    name: Cargo Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            integration-cargo-${{ runner.os }}-
+
+      # `--features test-support` exposes `raven::test_utils`, which the
+      # `performance_budgets` integration test imports. Without the flag,
+      # the test binary fails to compile (E0433: cannot find `test_utils`).
+      - name: Run cargo tests (release)
+        run: cargo test --release -p raven --features test-support
+
+  # Sibling job 2: the VS Code Mocha integration suite — runs the
+  # extension under a real Electron host via `vscode-test`. Mirrors
+  # the second half of the local `workspace-suite` invocation.
+  vscode-mocha:
+    name: VS Code Mocha Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            integration-cargo-${{ runner.os }}-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # Electron (the runtime VS Code uses for integration tests) needs an
+      # X server plus a handful of native libs that aren't in the default
+      # `ubuntu-latest` image. The `*t64` package names target Ubuntu 24.04
+      # (current `ubuntu-latest`); they Provide the legacy names so this
+      # block also works if the image rolls back to 22.04.
+      #
+      # R goes alongside so suites that drive the live R session (help,
+      # send-to-r, future knit / rmarkdown coverage) can run instead of
+      # skipping. `r-base-core` is the minimal install; tests that need
+      # specific packages (e.g. `arrow` for the data-viewer suite) still
+      # skip themselves when those packages aren't installed.
+      #
+      # `r-cran-plyr` is needed by the cross-file LSP test
+      # (`lsp.test.ts: cross-file: sibling package propagation …`): the
+      # LSP's libpath scan must know `plyr` exports `ddply` before it can
+      # suppress the undefined-variable diagnostic that the test asserts
+      # against. Other widely-used CRAN packages can be added here as
+      # the suite grows.
+      - name: Install Xvfb, Electron runtime deps, and R
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            libnss3 \
+            libatk-bridge2.0-0t64 \
+            libatk1.0-0t64 \
+            libgtk-3-0t64 \
+            libasound2t64 \
+            libdrm2 \
+            libxkbcommon-x11-0 \
+            libgbm1 \
+            libsecret-1-0 \
+            xdg-utils \
+            r-base-core \
+            r-cran-plyr
+
+      - name: Build LSP binary (release)
+        run: cargo build --release -p raven
+
+      # The extension uses `package-lock.json` (no `bun.lockb`), so `npm ci`
+      # gives us a reproducible install. The test scripts themselves still
+      # run under Bun (matching the local `bun run test` invocation used by
+      # `tests/bun/workspace-suite.test.ts`).
+      - name: Install VS Code extension dependencies
+        working-directory: editors/vscode
+        run: npm ci
+
+      # `vscode-test` downloads a VS Code build (~150 MB) on first run.
+      # Caching it on the .vscode-test.mjs hash keeps PR feedback fast and
+      # invalidates the cache when the pinned VS Code version changes.
+      - name: Cache VS Code download
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: editors/vscode/.vscode-test
+          key: vscode-test-${{ runner.os }}-${{ hashFiles('editors/vscode/.vscode-test.mjs') }}
+          restore-keys: |
+            vscode-test-${{ runner.os }}-
+
+      # `vscode:prepublish` runs `bundle` (esbuild → `dist/extension.js`, the
+      # extension's `main` entry) and `copy-binary` (places the LSP binary at
+      # `bin/raven`). Both must exist before `vscode-test` activates the
+      # extension; `pretest` (below) only handles the test-side `tsc` build.
+      - name: Bundle extension and place LSP binary
+        working-directory: editors/vscode
+        run: bun run vscode:prepublish
+
+      - name: Compile tests
+        working-directory: editors/vscode
+        run: bun run pretest
+
+      - name: Run integration tests under Xvfb
+        working-directory: editors/vscode
+        run: xvfb-run -a bun run test
