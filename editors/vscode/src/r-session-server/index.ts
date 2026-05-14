@@ -192,14 +192,20 @@ export class RSessionServer {
 
         // Path-trust: canonicalize and require strict containment in the
         // allowed directory. realpathSync also rejects non-existent files.
+        // Canonicalize BOTH paths so symlinks in the parent chain (notably
+        // macOS's `/var → /private/var` and `/tmp → /private/tmp`) don't
+        // cause a legitimate file under the allowed dir to fail the prefix
+        // check just because one side followed the symlink and the other
+        // didn't.
         let canonical: string;
+        let allowed: string;
         try {
             canonical = fs.realpathSync(filePath);
+            allowed = fs.realpathSync(this.allowed_data_viewer_dir);
         } catch {
             res.writeHead(400).end();
             return;
         }
-        const allowed = this.allowed_data_viewer_dir;
         if (canonical !== allowed && !canonical.startsWith(allowed + path.sep)) {
             res.writeHead(400).end();
             return;
