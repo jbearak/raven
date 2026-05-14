@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import {
     classify_chunk_document,
     detect_chunks,
+    has_chunk_anchor,
     is_runnable_chunk,
 } from './chunk-detector';
 
@@ -52,6 +53,14 @@ class ChunkDecorationManager {
             return;
         }
         const kind = classify_chunk_document(editor.document.uri.fsPath || editor.document.uri.path);
+        // Fast path: avoid the per-line scan on `.R` files without `# %%`
+        // markers and prose-only `.Rmd` documents. Still clears any stale
+        // decorations from a prior state in case markers were just removed.
+        if (!has_chunk_anchor(editor.document.getText(), kind)) {
+            editor.setDecorations(this.active_type, []);
+            editor.setDecorations(this.inactive_type, []);
+            return;
+        }
         const lines: string[] = [];
         for (let i = 0; i < editor.document.lineCount; i++) lines.push(editor.document.lineAt(i).text);
         const chunks = detect_chunks(lines, kind);

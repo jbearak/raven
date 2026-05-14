@@ -62,6 +62,21 @@ export function classify_chunk_document(file_name_or_uri: string): DocumentKind 
 }
 
 /**
+ * Cheap substring screen for "does this document contain any chunk anchors?".
+ * Lets callers skip the per-line detector loop on plain `.R` files that never
+ * use cell markers and on prose-only `.Rmd` documents.
+ *
+ * The screen is intentionally coarse: returning `true` only guarantees that an
+ * anchor character sequence is present somewhere in the text, not that any
+ * valid chunk will actually be detected. Use the result as a fast-path gate,
+ * not as authoritative chunk presence.
+ */
+export function has_chunk_anchor(text: string, kind: DocumentKind): boolean {
+    if (kind === 'r') return text.includes('%%');
+    return text.includes('```') || text.includes('~~~');
+}
+
+/**
  * Parse the body of a chunk header (everything between `{` and `}`, excluding the
  * leading language tag). Returns the optional label (first bare identifier) and a
  * map of `key=value` options. Values are returned unquoted and trimmed.

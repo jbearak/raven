@@ -5,6 +5,7 @@ import {
     find_chunk_at_line,
     chunks_above,
     extract_chunk_code,
+    has_chunk_anchor,
     is_runnable_chunk,
     Chunk,
 } from './chunk-detector';
@@ -23,6 +24,10 @@ function get_document_lines(document: vscode.TextDocument): string[] {
 
 function chunks_for_document(document: vscode.TextDocument): Chunk[] {
     const kind = classify_chunk_document(document.uri.fsPath || document.uri.path);
+    // Fast path: skip the per-line scan when the document has no chunk anchors.
+    // For a plain `.R` file with no `# %%` markers this avoids materializing the
+    // line array AND running the marker regex on every keystroke.
+    if (!has_chunk_anchor(document.getText(), kind)) return [];
     return detect_chunks(get_document_lines(document), kind);
 }
 

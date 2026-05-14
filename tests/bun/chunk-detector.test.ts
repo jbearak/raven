@@ -5,6 +5,7 @@ import {
     find_chunk_at_line,
     chunks_above,
     extract_chunk_code,
+    has_chunk_anchor,
     is_runnable_chunk,
     Chunk,
 } from '../../editors/vscode/src/chunks/chunk-detector';
@@ -356,6 +357,35 @@ describe('extract_chunk_code', () => {
         ].join('\n'));
         const chunks = detect_chunks(src, 'rmd');
         expect(extract_chunk_code(src, chunks[0])).toBe('');
+    });
+});
+
+describe('has_chunk_anchor', () => {
+    test('returns false for plain R code with no markers', () => {
+        const text = 'x <- 1\nprint(x)\n# comment\nfn <- function(a, b) a + b\n';
+        expect(has_chunk_anchor(text, 'r')).toBe(false);
+    });
+
+    test('returns true when an .R file contains `%%`', () => {
+        // Coarse: any `%%` in the text triggers the slow path. False positives
+        // are acceptable; the real regex confirms whether the line is a marker.
+        expect(has_chunk_anchor('# %% one\nx <- 1', 'r')).toBe(true);
+        expect(has_chunk_anchor('x <- "50%%"\n', 'r')).toBe(true);
+    });
+
+    test('returns false for prose-only Rmd / Qmd', () => {
+        const text = '# Title\n\nSome prose.\nNo fences here.\n';
+        expect(has_chunk_anchor(text, 'rmd')).toBe(false);
+    });
+
+    test('returns true when an Rmd document contains backtick or tilde fences', () => {
+        expect(has_chunk_anchor('```{r}\n1\n```\n', 'rmd')).toBe(true);
+        expect(has_chunk_anchor('~~~{r}\n1\n~~~\n', 'rmd')).toBe(true);
+    });
+
+    test('does not false-trigger on single backticks (inline code)', () => {
+        const text = 'Inline `r 1 + 1` math here.\n';
+        expect(has_chunk_anchor(text, 'rmd')).toBe(false);
     });
 });
 
