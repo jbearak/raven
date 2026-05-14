@@ -151,6 +151,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     const outputChannel = vscode.window.createOutputChannel('Raven');
 
     const clientOptions: LanguageClientOptions = {
+        // Deliberate scope: the Rust tree-sitter parser is R-only, so the
+        // selector does NOT include the `rmd` / `quarto` language IDs.
+        // Subscribing to them would surface prose lines as syntax errors and
+        // diagnostics. Chunk-level LSP features inside `.Rmd` / `.qmd` are
+        // tracked as a follow-up to #230 and will need a more targeted flow
+        // (e.g. virtual-document injection per fenced R block).
         documentSelector: [
             { scheme: 'file', language: 'r' },
             { scheme: 'untitled', language: 'r' },
