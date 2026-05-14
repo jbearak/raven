@@ -120,15 +120,17 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'completion.triggerOnOpenParen', jsonPath: ['completion', 'triggerOnOpenParen'], type: 'boolean' },
     // Indentation settings
     { vsCodeKey: 'indentation.style', jsonPath: ['indentation', 'style'], type: 'enum', enumValues: ['rstudio', 'rstudio-minus', 'off'] as const },
-    // Linting settings
-    { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'boolean' },
-    { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number' },
-    { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const },
-    { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'linting.trailingWhitespaceSeverity', jsonPath: ['linting', 'trailingWhitespaceSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    // Linting settings — always emitted using each key's package.json default
+    // so that resetting a key propagates to the server instead of leaving
+    // stale state active. Defaults below mirror package.json.
+    { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'boolean', defaultWhenUnconfigured: false },
+    { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number', defaultWhenUnconfigured: 80 },
+    { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const, defaultWhenUnconfigured: '<-' },
+    { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.trailingWhitespaceSeverity', jsonPath: ['linting', 'trailingWhitespaceSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     // Help viewer settings
     { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];
@@ -347,6 +349,16 @@ suite('Settings Transmission Property Tests', () => {
             diagnostics: {
                 enabled: true,
             },
+            linting: {
+                enabled: false,
+                lineLength: 80,
+                assignmentOperator: '<-',
+                lineLengthSeverity: 'hint',
+                trailingWhitespaceSeverity: 'hint',
+                noTabSeverity: 'hint',
+                trailingBlankLinesSeverity: 'hint',
+                assignmentOperatorSeverity: 'hint',
+            },
         }, 'Empty configuration should produce only runtime defaults');
 
     });
@@ -470,6 +482,48 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, false);
         assert.strictEqual(options.crossFile?.onDemandIndexing?.maxTransitiveDepth, 5);
         assert.strictEqual(options.crossFile?.onDemandIndexing?.maxQueueSize, 100);
+    });
+
+    /**
+     * Regression: resetting an explicitly-configured lint setting must
+     * propagate to the server as the package.json default, not be silently
+     * omitted. If a key were omitted, the server treats absence as "preserve
+     * the previous value" — so a user who toggled `linting.enabled` on and
+     * later reset it would still have linting active until restart.
+     */
+    test('lint settings always emit (reset propagates as default)', () => {
+        const mockConfig = createMockConfig(new Map<string, unknown>());
+        const options = getInitializationOptions(mockConfig);
+        // Whole linting block populated with package.json defaults.
+        assert.deepStrictEqual(options.linting, {
+            enabled: false,
+            lineLength: 80,
+            assignmentOperator: '<-',
+            lineLengthSeverity: 'hint',
+            trailingWhitespaceSeverity: 'hint',
+            noTabSeverity: 'hint',
+            trailingBlankLinesSeverity: 'hint',
+            assignmentOperatorSeverity: 'hint',
+        });
+    });
+
+    test('lint settings forward explicit values', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['linting.enabled', true],
+            ['linting.lineLength', 120],
+            ['linting.assignmentOperator', '='],
+            ['linting.lineLengthSeverity', 'warning'],
+            ['linting.assignmentOperatorSeverity', 'off'],
+        ]);
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+        assert.strictEqual(options.linting?.enabled, true);
+        assert.strictEqual(options.linting?.lineLength, 120);
+        assert.strictEqual(options.linting?.assignmentOperator, '=');
+        assert.strictEqual(options.linting?.lineLengthSeverity, 'warning');
+        assert.strictEqual(options.linting?.assignmentOperatorSeverity, 'off');
+        // Untouched keys still emit their defaults.
+        assert.strictEqual(options.linting?.trailingWhitespaceSeverity, 'hint');
     });
 
     /**

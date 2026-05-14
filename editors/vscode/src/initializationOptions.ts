@@ -328,51 +328,21 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         options.indentation = { style: indentationStyle };
     }
 
-    const lintingEnabled = getExplicitSetting<boolean>(config, 'linting.enabled');
-    const lintingLineLength = getExplicitSetting<number>(config, 'linting.lineLength');
-    const lintingAssignmentOperator = getExplicitSetting<"<-" | "=">(config, 'linting.assignmentOperator');
-    const lintingLineLengthSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.lineLengthSeverity');
-    const lintingTrailingWhitespaceSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.trailingWhitespaceSeverity');
-    const lintingNoTabSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.noTabSeverity');
-    const lintingTrailingBlankLinesSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.trailingBlankLinesSeverity');
-    const lintingAssignmentOperatorSeverity = getExplicitSetting<SeverityLevel>(config, 'linting.assignmentOperatorSeverity');
-
-    if (
-        lintingEnabled !== undefined ||
-        lintingLineLength !== undefined ||
-        lintingAssignmentOperator !== undefined ||
-        lintingLineLengthSeverity !== undefined ||
-        lintingTrailingWhitespaceSeverity !== undefined ||
-        lintingNoTabSeverity !== undefined ||
-        lintingTrailingBlankLinesSeverity !== undefined ||
-        lintingAssignmentOperatorSeverity !== undefined
-    ) {
-        options.linting = {};
-        if (lintingEnabled !== undefined) {
-            options.linting.enabled = lintingEnabled;
-        }
-        if (lintingLineLength !== undefined) {
-            options.linting.lineLength = lintingLineLength;
-        }
-        if (lintingAssignmentOperator !== undefined) {
-            options.linting.assignmentOperator = lintingAssignmentOperator;
-        }
-        if (lintingLineLengthSeverity !== undefined) {
-            options.linting.lineLengthSeverity = lintingLineLengthSeverity;
-        }
-        if (lintingTrailingWhitespaceSeverity !== undefined) {
-            options.linting.trailingWhitespaceSeverity = lintingTrailingWhitespaceSeverity;
-        }
-        if (lintingNoTabSeverity !== undefined) {
-            options.linting.noTabSeverity = lintingNoTabSeverity;
-        }
-        if (lintingTrailingBlankLinesSeverity !== undefined) {
-            options.linting.trailingBlankLinesSeverity = lintingTrailingBlankLinesSeverity;
-        }
-        if (lintingAssignmentOperatorSeverity !== undefined) {
-            options.linting.assignmentOperatorSeverity = lintingAssignmentOperatorSeverity;
-        }
-    }
+    // Linting settings: always emit the full section using each setting's
+    // package.json default. Otherwise, resetting an explicitly-configured key
+    // (e.g. via VS Code's "Reset Setting") would omit it from the payload,
+    // and the server treats absent keys as "preserve current value" — so the
+    // previous state would persist until restart.
+    options.linting = {
+        enabled: config.get<boolean>('linting.enabled', false),
+        lineLength: config.get<number>('linting.lineLength', 80),
+        assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
+        lineLengthSeverity: config.get<SeverityLevel>('linting.lineLengthSeverity', 'hint'),
+        trailingWhitespaceSeverity: config.get<SeverityLevel>('linting.trailingWhitespaceSeverity', 'hint'),
+        noTabSeverity: config.get<SeverityLevel>('linting.noTabSeverity', 'hint'),
+        trailingBlankLinesSeverity: config.get<SeverityLevel>('linting.trailingBlankLinesSeverity', 'hint'),
+        assignmentOperatorSeverity: config.get<SeverityLevel>('linting.assignmentOperatorSeverity', 'hint'),
+    };
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');
     if (helpViewerColumn !== undefined) {

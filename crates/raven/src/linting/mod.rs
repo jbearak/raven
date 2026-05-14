@@ -202,6 +202,58 @@ mod tests {
     }
 
     #[test]
+    fn assignment_operator_flags_inside_function_body_passed_as_arg() {
+        let config = LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            ..enabled_config()
+        };
+        // `y = x` inside the function body is a real assignment, not a named
+        // argument — even though it lives transitively under an arguments
+        // list. Regression: an earlier draft propagated a sticky
+        // `inside_call_args` flag through descendants and suppressed this.
+        let diags = lint("lapply(xs, function(x) { y = x; y })\n", &config);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one assignment-operator lint for `y = x`, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn assignment_operator_flags_inside_braced_block_passed_as_arg() {
+        let config = LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            ..enabled_config()
+        };
+        // `{ y = 1 }` is a braced expression evaluated as the argument; the
+        // inner `y = 1` is a real assignment, not a named argument.
+        let diags = lint("f({ y = 1 })\n", &config);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn assignment_operator_flags_inside_if_body_passed_as_arg() {
+        let config = LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            ..enabled_config()
+        };
+        // `y = 1` is the body of an `if` used as an argument — a real
+        // assignment evaluated when the call runs.
+        let diags = lint("f(if (cond) y = 1)\n", &config);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
     fn assignment_operator_equals_style_flags_left_arrow() {
         let config = LintConfig {
             assignment_operator_style: AssignmentOperatorStyle::Equals,
