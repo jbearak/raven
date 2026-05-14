@@ -193,6 +193,34 @@ function stub_create_terminal(): TerminalStub {
     } as TerminalStub;
 }
 
+/**
+ * Poll `vscode.executeCodeLensProvider` until `predicate(lenses)` is true
+ * or `timeoutMs` elapses. Returns the most-recently observed lens array
+ * either way so the caller can assert against it on timeout.
+ *
+ * Use this after mutating settings that the CodeLens provider listens to
+ * (e.g. `raven.chunks.codeLens.commands`): `config.update()` resolves
+ * before the provider's `onDidChangeConfiguration` handler runs and VS
+ * Code's CodeLens cache refreshes, so a fixed sleep is racy.
+ */
+async function poll_for_lenses(
+    uri: vscode.Uri,
+    predicate: (lenses: vscode.CodeLens[]) => boolean,
+    { timeoutMs = 3000, intervalMs = 50 }: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<vscode.CodeLens[]> {
+    const deadline = Date.now() + timeoutMs;
+    let lenses: vscode.CodeLens[] = [];
+    while (true) {
+        lenses = (await vscode.commands.executeCommand<vscode.CodeLens[]>(
+            'vscode.executeCodeLensProvider',
+            uri,
+        )) ?? [];
+        if (predicate(lenses)) return lenses;
+        if (Date.now() >= deadline) return lenses;
+        await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+    }
+}
+
 suite('chunk commands: registration and behavior', () => {
     suiteTeardown(() => {
         for (const file of TEMP_FIXTURE_FILES) {
@@ -528,15 +556,13 @@ suite('chunk commands: registration and behavior', () => {
                 ['raven.runCurrentChunk', 'raven.runAllChunks', 'raven.runBelowChunks'],
                 vscode.ConfigurationTarget.Global,
             );
-            // Allow the CodeLens provider's onDidChangeConfiguration handler to
-            // fire and VS Code's CodeLens cache to refresh.
-            await new Promise<void>((resolve) => setTimeout(resolve, 100));
-            const lenses = (await vscode.commands.executeCommand<vscode.CodeLens[]>(
-                'vscode.executeCodeLensProvider',
-                editor.document.uri,
-            )) ?? [];
             // RMD_FIXTURE contains three R chunks. Each runnable chunk should
-            // contribute exactly three lenses in the configured order.
+            // contribute exactly three lenses in the configured order →
+            // 3 R chunks × 3 lenses = 9. Poll until the cache catches up.
+            const lenses = await poll_for_lenses(
+                editor.document.uri,
+                (ls) => ls.length === 9,
+            );
             const titles = lenses.map((l) => l.command?.title ?? '');
             const first_chunk_titles = titles.slice(0, 3);
             assert.ok(
@@ -579,11 +605,10 @@ suite('chunk commands: registration and behavior', () => {
                 [],
                 vscode.ConfigurationTarget.Global,
             );
-            await new Promise<void>((resolve) => setTimeout(resolve, 100));
-            const lenses = (await vscode.commands.executeCommand<vscode.CodeLens[]>(
-                'vscode.executeCodeLensProvider',
+            const lenses = await poll_for_lenses(
                 editor.document.uri,
-            )) ?? [];
+                (ls) => ls.length === 0,
+            );
             assert.strictEqual(lenses.length, 0, 'empty array should hide every lens');
         } finally {
             await config.update(
