@@ -277,6 +277,50 @@ export function chunks_above(chunks: Chunk[], line: number): Chunk[] {
 }
 
 /**
+ * Return chunks whose header line is strictly below the cursor line. When the cursor
+ * sits inside a chunk, that chunk is NOT included in the result.
+ */
+export function chunks_below(chunks: Chunk[], line: number): Chunk[] {
+    const out: Chunk[] = [];
+    for (const c of chunks) {
+        if (c.header_line > line) out.push(c);
+    }
+    return out;
+}
+
+/**
+ * Find the runnable chunk immediately above the cursor line. When the cursor
+ * sits inside a chunk, that chunk itself is skipped — "previous" means the
+ * chunk before it. Non-runnable chunks (e.g. `{python}`) are skipped as well.
+ * Returns `null` if there is no runnable chunk above.
+ */
+export function previous_runnable_chunk(chunks: Chunk[], line: number): Chunk | null {
+    let candidate: Chunk | null = null;
+    for (const c of chunks) {
+        const last = c.closing_fence_line ?? c.end_line;
+        if (last < line && is_runnable_chunk(c)) {
+            candidate = c;
+        } else if (c.header_line > line) {
+            break;
+        }
+    }
+    return candidate;
+}
+
+/**
+ * Find the runnable chunk immediately below the cursor line. When the cursor
+ * sits inside a chunk, that chunk itself is skipped — "next" means the chunk
+ * after it. Non-runnable chunks are skipped as well.
+ * Returns `null` if there is no runnable chunk below.
+ */
+export function next_runnable_chunk(chunks: Chunk[], line: number): Chunk | null {
+    for (const c of chunks) {
+        if (c.header_line > line && is_runnable_chunk(c)) return c;
+    }
+    return null;
+}
+
+/**
  * Return the executable code inside the chunk, joined with `\n`.
  * Excludes the header/fence lines.
  */

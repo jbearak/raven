@@ -36,12 +36,18 @@ In `.R` files, `Cmd+Shift+Enter` keeps its usual meaning of **Source File** — 
 | **Run Current Chunk** | Sends the chunk at the cursor to R. |
 | **Run Current Chunk and Move** | Runs the current chunk, then moves the cursor into the next R chunk. |
 | **Run Above Chunks** | Runs every R chunk that ends before the cursor. The current chunk is not included. |
+| **Run Below Chunks** | Runs every R chunk whose header is strictly below the cursor. The current chunk is not included. |
+| **Run Current and Below Chunks** | Runs the chunk at the cursor plus every R chunk after it. |
+| **Run Previous Chunk** | Runs the R chunk immediately above the cursor (skipping non-R chunks). |
+| **Run Next Chunk** | Runs the R chunk immediately below the cursor (skipping non-R chunks). |
 | **Run All Chunks** | Runs every R chunk in the document, top to bottom. |
 | **Go to Next Chunk** | Moves the cursor to the body of the next R chunk. |
 | **Go to Previous Chunk** | Moves the cursor to the body of the previous R chunk. |
 | **Select Current Chunk** | Selects the body of the chunk at the cursor (excludes header and closing fence). |
 
-CodeLens buttons appear on every R chunk header:
+## CodeLens buttons
+
+By default each R chunk header shows two buttons:
 
 ```text
 ▷ Run Chunk    ↥ Run Above
@@ -50,6 +56,36 @@ CodeLens buttons appear on every R chunk header:
 ```
 
 Buttons for non-R languages are intentionally omitted.
+
+The set of buttons (and their order) is controlled by `raven.chunks.codeLens.commands` — an array of run-command ids. The available ids are:
+
+| Command id | Default label |
+|------------|---------------|
+| `raven.runCurrentChunk` | `▷ Run Chunk` |
+| `raven.runCurrentChunkAndMove` | `▷⇣ Run & Move` |
+| `raven.runAboveChunks` | `↥ Run Above` |
+| `raven.runBelowChunks` | `↧ Run Below` |
+| `raven.runCurrentAndBelowChunks` | `▷↓ Run Current and Below` |
+| `raven.runPreviousChunk` | `← Run Previous` |
+| `raven.runNextChunk` | `→ Run Next` |
+| `raven.runAllChunks` | `↻ Run All` |
+
+Example — show four buttons in a custom order:
+
+```jsonc
+{
+  "raven.chunks.codeLens.commands": [
+    "raven.runCurrentChunk",
+    "raven.runCurrentAndBelowChunks",
+    "raven.runAboveChunks",
+    "raven.runAllChunks"
+  ]
+}
+```
+
+Set the array to `[]` to hide all lenses while keeping the commands available from the palette and keybindings. Unknown command ids are silently ignored.
+
+When a chunk's header sets `eval = FALSE`, the `▷ Run Chunk` and `▷⇣ Run & Move` labels gain a `(eval = FALSE)` suffix so you know the chunk would otherwise be skipped by `knitr` / `quarto render`.
 
 ## Chunk options
 

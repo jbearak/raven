@@ -4,15 +4,26 @@ import {
     detect_chunks,
     find_chunk_at_line,
     chunks_above,
+    chunks_below,
     extract_chunk_code,
     has_chunk_anchor,
     is_runnable_chunk,
+    next_runnable_chunk,
+    previous_runnable_chunk,
     Chunk,
 } from './chunk-detector';
 import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
 import { send_code, get_send_options } from '../send-to-r/send-code';
 
-type RunMode = 'current' | 'currentAndMove' | 'above' | 'all';
+export type RunMode =
+    | 'current'
+    | 'currentAndMove'
+    | 'above'
+    | 'all'
+    | 'currentAndBelow'
+    | 'below'
+    | 'previous'
+    | 'next';
 
 function get_document_lines(document: vscode.TextDocument): string[] {
     const lines: string[] = [];
@@ -106,6 +117,47 @@ async function run_chunk_at(
         return;
     }
 
+    if (mode === 'below') {
+        const below = chunks_below(chunks, cursor_line);
+        const code = combined_code(lines, below);
+        if (code.length === 0) {
+            vscode.window.showInformationMessage('Raven: no runnable chunks below the cursor.');
+            return;
+        }
+        await send_to_r(code);
+        return;
+    }
+
+    if (mode === 'previous') {
+        const previous = previous_runnable_chunk(chunks, cursor_line);
+        if (!previous) {
+            vscode.window.showInformationMessage('Raven: no runnable chunk above the cursor.');
+            return;
+        }
+        const code = extract_chunk_code(lines, previous);
+        if (code.trim().length === 0) {
+            vscode.window.showInformationMessage('Raven: previous chunk is empty.');
+            return;
+        }
+        await send_to_r(code);
+        return;
+    }
+
+    if (mode === 'next') {
+        const next = next_runnable_chunk(chunks, cursor_line);
+        if (!next) {
+            vscode.window.showInformationMessage('Raven: no runnable chunk below the cursor.');
+            return;
+        }
+        const code = extract_chunk_code(lines, next);
+        if (code.trim().length === 0) {
+            vscode.window.showInformationMessage('Raven: next chunk is empty.');
+            return;
+        }
+        await send_to_r(code);
+        return;
+    }
+
     const current = find_chunk_at_line(chunks, cursor_line);
     if (!current) {
         vscode.window.showInformationMessage(
@@ -119,6 +171,18 @@ async function run_chunk_at(
         );
         return;
     }
+
+    if (mode === 'currentAndBelow') {
+        const below = chunks_below(chunks, current.header_line);
+        const code = combined_code(lines, [current, ...below]);
+        if (code.length === 0) {
+            vscode.window.showInformationMessage('Raven: current chunk and chunks below are empty.');
+            return;
+        }
+        await send_to_r(code);
+        return;
+    }
+
     const code = extract_chunk_code(lines, current);
     if (code.trim().length === 0) {
         vscode.window.showInformationMessage('Raven: current chunk is empty.');
@@ -163,12 +227,91 @@ async function run_chunk_at_command(
     await run_chunk_at(mode, document, line);
 }
 
+/**
+ * Run commands a user can list in `raven.chunks.codeLens.commands` to choose
+ * which CodeLens buttons appear on chunk headers and in what order. Each entry
+ * maps the user-facing command id (the one declared in `package.json` and
+ * invokable from the command palette) to the positional `*At` variant the
+ * lens click should dispatch — so clicking a lens always targets the chunk it
+ * is attached to, regardless of where the cursor sits.
+ *
+ * `eval_aware` lenses append a `(eval = FALSE)` suffix to their title when
+ * the chunk header sets `eval = FALSE`, matching the existing "Run Chunk"
+ * behavior. Multi-chunk lenses (above / below / all) don't add the suffix
+ * because the chunk under the lens isn't the one being executed.
+ */
+export interface ChunkLensCommand {
+    /** Command id dispatched by the CodeLens click (positional variant). */
+    readonly positional_id: string;
+    /** Lens button label. */
+    readonly title: string;
+    /** Hover tooltip. */
+    readonly tooltip: string;
+    /** Whether to append a `(eval = FALSE)` suffix when the chunk skips eval. */
+    readonly eval_aware: boolean;
+}
+
+export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = Object.freeze({
+    'raven.runCurrentChunk': {
+        positional_id: 'raven.runCurrentChunkAt',
+        title: '▷ Run Chunk',
+        tooltip: 'Run this chunk in the R console',
+        eval_aware: true,
+    },
+    'raven.runCurrentChunkAndMove': {
+        positional_id: 'raven.runCurrentChunkAndMoveAt',
+        title: '▷⇣ Run & Move',
+        tooltip: 'Run this chunk, then move the cursor into the next R chunk',
+        eval_aware: true,
+    },
+    'raven.runAboveChunks': {
+        positional_id: 'raven.runAboveChunksAt',
+        title: '↥ Run Above',
+        tooltip: 'Run every R chunk above this one',
+        eval_aware: false,
+    },
+    'raven.runCurrentAndBelowChunks': {
+        positional_id: 'raven.runCurrentAndBelowChunksAt',
+        title: '▷↓ Run Current and Below',
+        tooltip: 'Run this chunk and every R chunk after it',
+        eval_aware: false,
+    },
+    'raven.runBelowChunks': {
+        positional_id: 'raven.runBelowChunksAt',
+        title: '↧ Run Below',
+        tooltip: 'Run every R chunk below this one',
+        eval_aware: false,
+    },
+    'raven.runPreviousChunk': {
+        positional_id: 'raven.runPreviousChunkAt',
+        title: '← Run Previous',
+        tooltip: 'Run the R chunk immediately above this one',
+        eval_aware: false,
+    },
+    'raven.runNextChunk': {
+        positional_id: 'raven.runNextChunkAt',
+        title: '→ Run Next',
+        tooltip: 'Run the R chunk immediately below this one',
+        eval_aware: false,
+    },
+    'raven.runAllChunks': {
+        positional_id: 'raven.runAllChunksAt',
+        title: '↻ Run All',
+        tooltip: 'Run every R chunk in the document',
+        eval_aware: false,
+    },
+});
+
 export function register_chunk_commands(context: vscode.ExtensionContext): void {
     const handlers: Array<[string, RunMode]> = [
         ['raven.runCurrentChunk', 'current'],
         ['raven.runCurrentChunkAndMove', 'currentAndMove'],
         ['raven.runAboveChunks', 'above'],
         ['raven.runAllChunks', 'all'],
+        ['raven.runCurrentAndBelowChunks', 'currentAndBelow'],
+        ['raven.runBelowChunks', 'below'],
+        ['raven.runPreviousChunk', 'previous'],
+        ['raven.runNextChunk', 'next'],
     ];
     for (const [id, mode] of handlers) {
         context.subscriptions.push(
@@ -179,7 +322,13 @@ export function register_chunk_commands(context: vscode.ExtensionContext): void 
     // Positional variants used by CodeLens (header line is known up-front).
     const positional: Array<[string, RunMode]> = [
         ['raven.runCurrentChunkAt', 'current'],
+        ['raven.runCurrentChunkAndMoveAt', 'currentAndMove'],
         ['raven.runAboveChunksAt', 'above'],
+        ['raven.runAllChunksAt', 'all'],
+        ['raven.runCurrentAndBelowChunksAt', 'currentAndBelow'],
+        ['raven.runBelowChunksAt', 'below'],
+        ['raven.runPreviousChunkAt', 'previous'],
+        ['raven.runNextChunkAt', 'next'],
     ];
     for (const [id, mode] of positional) {
         context.subscriptions.push(

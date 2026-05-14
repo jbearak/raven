@@ -140,6 +140,26 @@
         "category": "Raven"
       },
       {
+        "command": "raven.runCurrentAndBelowChunks",
+        "title": "Run Current and Below Chunks",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.runBelowChunks",
+        "title": "Run Below Chunks",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.runPreviousChunk",
+        "title": "Run Previous Chunk",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.runNextChunk",
+        "title": "Run Next Chunk",
+        "category": "Raven"
+      },
+      {
         "command": "raven.goToNextChunk",
         "title": "Go to Next Chunk",
         "category": "Raven"
@@ -1273,6 +1293,27 @@
           "type": "boolean",
           "default": true,
           "description": "Highlight R code chunks in .Rmd / .qmd files (and `# %%` cells in .R files) with a background color. Disable to remove the background entirely."
+        },
+        "raven.chunks.codeLens.commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "raven.runCurrentChunk",
+              "raven.runCurrentChunkAndMove",
+              "raven.runAboveChunks",
+              "raven.runCurrentAndBelowChunks",
+              "raven.runBelowChunks",
+              "raven.runPreviousChunk",
+              "raven.runNextChunk",
+              "raven.runAllChunks"
+            ]
+          },
+          "default": [
+            "raven.runCurrentChunk",
+            "raven.runAboveChunks"
+          ],
+          "markdownDescription": "Ordered list of run commands shown as CodeLens buttons above every R chunk header. Set to `[]` to hide all lenses while keeping the underlying commands available from the palette and keybindings. Unknown command ids are ignored."
         },
         "raven.linting.objectNameSeverity": {
           "type": "string",

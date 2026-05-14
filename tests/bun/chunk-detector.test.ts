@@ -5,9 +5,12 @@ import {
     detect_chunks,
     find_chunk_at_line,
     chunks_above,
+    chunks_below,
     extract_chunk_code,
     has_chunk_anchor,
     is_runnable_chunk,
+    next_runnable_chunk,
+    previous_runnable_chunk,
     Chunk,
 } from '../../editors/vscode/src/chunks/chunk-detector';
 
@@ -325,6 +328,96 @@ describe('chunks_above', () => {
     test('returns empty list when cursor is above all chunks', () => {
         const result = chunks_above(chunks, 0);
         expect(result.length).toBe(0);
+    });
+});
+
+describe('chunks_below', () => {
+    const chunks: Chunk[] = [
+        { header_line: 0, end_line: 2, closing_fence_line: 3, language: 'r', label: null, options: {}, is_eval_false: false, kind: 'rmd' },
+        { header_line: 5, end_line: 6, closing_fence_line: 7, language: 'r', label: null, options: {}, is_eval_false: false, kind: 'rmd' },
+        { header_line: 10, end_line: 12, closing_fence_line: 13, language: 'r', label: null, options: {}, is_eval_false: false, kind: 'rmd' },
+    ];
+
+    test('returns chunks whose header is strictly below cursor', () => {
+        // Cursor on line 8 (between chunk 2's close at 7 and chunk 3's header at 10)
+        // → only chunk 3 is below.
+        const result = chunks_below(chunks, 8);
+        expect(result.length).toBe(1);
+        expect(result[0].header_line).toBe(10);
+    });
+
+    test('when cursor is on a header, that chunk is not below', () => {
+        // Cursor on chunk 2's header at line 5 → only chunk 3 (header 10) is below.
+        const result = chunks_below(chunks, 5);
+        expect(result.length).toBe(1);
+        expect(result[0].header_line).toBe(10);
+    });
+
+    test('returns empty list when cursor is past every chunk', () => {
+        const result = chunks_below(chunks, 99);
+        expect(result.length).toBe(0);
+    });
+});
+
+describe('previous_runnable_chunk / next_runnable_chunk', () => {
+    function r_chunk(header: number, last: number): Chunk {
+        return {
+            header_line: header,
+            end_line: last,
+            closing_fence_line: last + 1,
+            language: 'r',
+            label: null,
+            options: {},
+            is_eval_false: false,
+            kind: 'rmd',
+        };
+    }
+    function py_chunk(header: number, last: number): Chunk {
+        return { ...r_chunk(header, last), language: 'python' };
+    }
+
+    test('previous returns the chunk before the one containing the cursor', () => {
+        const chunks: Chunk[] = [r_chunk(0, 2), r_chunk(5, 7), r_chunk(10, 12)];
+        // Cursor inside chunk 2 (line 6) → previous is chunk 1.
+        expect(previous_runnable_chunk(chunks, 6)?.header_line).toBe(0);
+    });
+
+    test('next returns the chunk after the one containing the cursor', () => {
+        const chunks: Chunk[] = [r_chunk(0, 2), r_chunk(5, 7), r_chunk(10, 12)];
+        // Cursor inside chunk 2 (line 6) → next is chunk 3.
+        expect(next_runnable_chunk(chunks, 6)?.header_line).toBe(10);
+    });
+
+    test('previous returns the nearest chunk strictly above when cursor is in prose', () => {
+        const chunks: Chunk[] = [r_chunk(0, 2), r_chunk(5, 7), r_chunk(10, 12)];
+        // Cursor on line 9 (between chunk 2 and 3) → previous is chunk 2.
+        expect(previous_runnable_chunk(chunks, 9)?.header_line).toBe(5);
+    });
+
+    test('next returns the nearest chunk strictly below when cursor is in prose', () => {
+        const chunks: Chunk[] = [r_chunk(0, 2), r_chunk(5, 7), r_chunk(10, 12)];
+        // Cursor on line 9 → next is chunk 3.
+        expect(next_runnable_chunk(chunks, 9)?.header_line).toBe(10);
+    });
+
+    test('previous skips non-runnable chunks', () => {
+        // R (0..2), Python (5..7), R (10..12). Cursor inside the last R chunk
+        // (line 11) → previous runnable is R(0) because the only "previous"
+        // chunk between is Python and gets skipped.
+        const chunks: Chunk[] = [r_chunk(0, 2), py_chunk(5, 7), r_chunk(10, 12)];
+        expect(previous_runnable_chunk(chunks, 11)?.header_line).toBe(0);
+    });
+
+    test('next skips non-runnable chunks', () => {
+        const chunks: Chunk[] = [r_chunk(0, 2), py_chunk(5, 7), r_chunk(10, 12)];
+        // Cursor at line 3 → next runnable is the R chunk at line 10, skipping python.
+        expect(next_runnable_chunk(chunks, 3)?.header_line).toBe(10);
+    });
+
+    test('returns null when no chunk above / below', () => {
+        const chunks: Chunk[] = [r_chunk(5, 7)];
+        expect(previous_runnable_chunk(chunks, 5)).toBeNull();
+        expect(next_runnable_chunk(chunks, 7)).toBeNull();
     });
 });
 

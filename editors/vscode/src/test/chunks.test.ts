@@ -10,6 +10,10 @@ const CHUNK_COMMANDS = [
     'raven.runCurrentChunkAndMove',
     'raven.runAboveChunks',
     'raven.runAllChunks',
+    'raven.runCurrentAndBelowChunks',
+    'raven.runBelowChunks',
+    'raven.runPreviousChunk',
+    'raven.runNextChunk',
     'raven.goToNextChunk',
     'raven.goToPreviousChunk',
     'raven.selectCurrentChunk',
@@ -346,5 +350,86 @@ suite('chunk commands: registration and behavior', () => {
         await vscode.commands.executeCommand('raven.selectCurrentChunk');
         const text = editor.document.getText(editor.selection);
         assert.strictEqual(text, 'a <- 1\nb <- 2');
+    });
+
+    test('raven.chunks.codeLens.commands controls lens count and order', async function () {
+        // Skip when R-console activation is disabled — the CodeLens provider is
+        // only registered alongside the run commands.
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runCurrentChunkAt');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        const config = vscode.workspace.getConfiguration();
+        const previous = config.inspect<string[]>('raven.chunks.codeLens.commands')?.globalValue;
+        try {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                ['raven.runCurrentChunk', 'raven.runAllChunks', 'raven.runBelowChunks'],
+                vscode.ConfigurationTarget.Global,
+            );
+            // Allow the CodeLens provider's onDidChangeConfiguration handler to
+            // fire and VS Code's CodeLens cache to refresh.
+            await new Promise<void>((resolve) => setTimeout(resolve, 100));
+            const lenses = (await vscode.commands.executeCommand<vscode.CodeLens[]>(
+                'vscode.executeCodeLensProvider',
+                editor.document.uri,
+            )) ?? [];
+            // RMD_FIXTURE contains three R chunks. Each runnable chunk should
+            // contribute exactly three lenses in the configured order.
+            const titles = lenses.map((l) => l.command?.title ?? '');
+            const first_chunk_titles = titles.slice(0, 3);
+            assert.ok(
+                first_chunk_titles[0]?.startsWith('▷ Run Chunk'),
+                `first lens should be Run Chunk, got: ${first_chunk_titles[0]}`,
+            );
+            assert.ok(
+                first_chunk_titles[1]?.startsWith('↻ Run All'),
+                `second lens should be Run All, got: ${first_chunk_titles[1]}`,
+            );
+            assert.ok(
+                first_chunk_titles[2]?.startsWith('↧ Run Below'),
+                `third lens should be Run Below, got: ${first_chunk_titles[2]}`,
+            );
+            // 3 R chunks × 3 lenses each → 9 lenses (python chunk produces none).
+            assert.strictEqual(
+                lenses.length,
+                9,
+                `expected 9 lenses (3 R chunks × 3 buttons), got ${lenses.length}`,
+            );
+        } finally {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                previous,
+                vscode.ConfigurationTarget.Global,
+            );
+        }
+    });
+
+    test('raven.chunks.codeLens.commands set to [] hides all lenses', async function () {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runCurrentChunkAt');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        const config = vscode.workspace.getConfiguration();
+        const previous = config.inspect<string[]>('raven.chunks.codeLens.commands')?.globalValue;
+        try {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                [],
+                vscode.ConfigurationTarget.Global,
+            );
+            await new Promise<void>((resolve) => setTimeout(resolve, 100));
+            const lenses = (await vscode.commands.executeCommand<vscode.CodeLens[]>(
+                'vscode.executeCodeLensProvider',
+                editor.document.uri,
+            )) ?? [];
+            assert.strictEqual(lenses.length, 0, 'empty array should hide every lens');
+        } finally {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                previous,
+                vscode.ConfigurationTarget.Global,
+            );
+        }
     });
 });
