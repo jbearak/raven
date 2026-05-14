@@ -1332,7 +1332,7 @@
     "fast-check": "^4.5.3",
     "jsdom": "^29.1.1",
     "mocha": "^11.0.0",
-    "svelte": "^5.0.0",
+    "svelte": "^5.55.7",
     "svelte-preprocess": "^6.0.0",
     "typescript": "^5.0.0"
   }
