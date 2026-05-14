@@ -160,7 +160,11 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             { scheme: 'untitled', language: 'stan' },
         ],
         synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,RMD,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
+            // Matches the LSP `documentSelector` above: only the file extensions
+            // mapped to the `r` / `jags` / `stan` language IDs. `.Rmd` / `.qmd`
+            // are tracked under `rmd` / `quarto` and the server does not parse
+            // them, so they are intentionally omitted from this glob.
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions,

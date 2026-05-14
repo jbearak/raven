@@ -117,10 +117,10 @@ function chunks_enabled(): boolean {
 }
 
 function is_chunk_capable_document(document: vscode.TextDocument): boolean {
-    // Accept our registered `r` languageId (which today covers `.r` / `.R` and
-    // `.Rmd` / `.qmd`), plus any sibling extension that contributes a dedicated
-    // `rmd` or `quarto` languageId. For `.R` files we still draw highlight for
-    // `# %%` cells.
+    // Accept the three language IDs Raven contributes: `r` (covering `.r` /
+    // `.R`, where chunks take the `# %%` cell form), `rmd` (covering `.Rmd`),
+    // and `quarto` (covering `.qmd`). A sibling extension that wins the
+    // `rmd` / `quarto` languageId race falls into the same branch by design.
     const lang = document.languageId.toLowerCase();
     return lang === 'r' || lang === 'rmd' || lang === 'quarto';
 }

@@ -7,6 +7,12 @@ let applying = false;
 
 const CLOSING_DELIMITERS = new Set([')', ']', '}']);
 
+// Languages where Raven applies the auto-close pair overtype fix. R code in
+// `.Rmd` / `.qmd` chunks benefits from the same correction; we accept the
+// minor cost of running the listener on prose lines (which never produce
+// duplicate-delimiter typing patterns in practice).
+const R_LIKE_LANGUAGES: ReadonlySet<string> = new Set(['r', 'rmd', 'quarto']);
+
 /**
  * Register a listener that fixes auto-closing pair overtype after
  * onTypeFormatting moves a closing delimiter to a new line.
@@ -17,7 +23,7 @@ const CLOSING_DELIMITERS = new Set([')', ']', '}']);
 export function registerAutoCloseFix(): vscode.Disposable {
     return vscode.workspace.onDidChangeTextDocument(async (e) => {
         if (applying) return;
-        if (e.document.languageId !== 'r') return;
+        if (!R_LIKE_LANGUAGES.has(e.document.languageId)) return;
         if (e.contentChanges.length !== 1) return;
 
         const change = e.contentChanges[0];

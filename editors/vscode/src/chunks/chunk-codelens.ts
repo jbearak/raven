@@ -69,10 +69,17 @@ class ChunkCodeLensProvider implements vscode.CodeLensProvider {
 export function register_chunk_codelens(context: vscode.ExtensionContext): ChunkCodeLensProvider {
     const provider = new ChunkCodeLensProvider();
     context.subscriptions.push(
+        // Chunks live in `.R` files (via `# %%` cells) and in `.Rmd` / `.qmd`
+        // files (via fenced code blocks). After the language-ID split each
+        // file type uses its own `languageId`, so the selector lists all three.
         vscode.languages.registerCodeLensProvider(
             [
                 { scheme: 'file', language: 'r' },
                 { scheme: 'untitled', language: 'r' },
+                { scheme: 'file', language: 'rmd' },
+                { scheme: 'untitled', language: 'rmd' },
+                { scheme: 'file', language: 'quarto' },
+                { scheme: 'untitled', language: 'quarto' },
             ],
             provider,
         ),
