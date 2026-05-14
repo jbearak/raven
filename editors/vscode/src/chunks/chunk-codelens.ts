@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import {
-    classify_chunk_document,
+    classify_chunk_document_for_document,
     detect_chunks,
     has_chunk_anchor,
     is_runnable_chunk,
@@ -33,7 +33,7 @@ class ChunkCodeLensProvider implements vscode.CodeLensProvider {
         document: vscode.TextDocument,
         _token: vscode.CancellationToken,
     ): vscode.CodeLens[] {
-        const kind = classify_chunk_document(document.uri.fsPath || document.uri.path);
+        const kind = classify_chunk_document_for_document(document);
         // Fast path: plain `.R` files without `# %%` markers (and prose-only
         // `.Rmd` documents) skip the per-line scan entirely.
         if (!has_chunk_anchor(document.getText(), kind)) return [];

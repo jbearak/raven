@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import {
-    classify_chunk_document,
+    classify_chunk_document_for_document,
     detect_chunks,
     find_chunk_at_line,
     chunks_above,
@@ -23,7 +23,7 @@ function get_document_lines(document: vscode.TextDocument): string[] {
 }
 
 function chunks_for_document(document: vscode.TextDocument): Chunk[] {
-    const kind = classify_chunk_document(document.uri.fsPath || document.uri.path);
+    const kind = classify_chunk_document_for_document(document);
     // Fast path: skip the per-line scan when the document has no chunk anchors.
     // For a plain `.R` file with no `# %%` markers this avoids materializing the
     // line array AND running the marker regex on every keystroke.

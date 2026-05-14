@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import {
-    classify_chunk_document,
+    classify_chunk_document_for_document,
     detect_chunks,
     has_chunk_anchor,
     is_runnable_chunk,
@@ -52,7 +52,7 @@ class ChunkDecorationManager {
             editor.setDecorations(this.inactive_type, []);
             return;
         }
-        const kind = classify_chunk_document(editor.document.uri.fsPath || editor.document.uri.path);
+        const kind = classify_chunk_document_for_document(editor.document);
         // Fast path: avoid the per-line scan on `.R` files without `# %%`
         // markers and prose-only `.Rmd` documents. Still clears any stale
         // decorations from a prior state in case markers were just removed.
@@ -117,9 +117,12 @@ function chunks_enabled(): boolean {
 }
 
 function is_chunk_capable_document(document: vscode.TextDocument): boolean {
-    if (document.languageId !== 'r') return false;
-    // For .R files we still draw highlight for `# %%` cells.
-    return true;
+    // Accept our registered `r` languageId (which today covers `.r` / `.R` and
+    // `.Rmd` / `.qmd`), plus any sibling extension that contributes a dedicated
+    // `rmd` or `quarto` languageId. For `.R` files we still draw highlight for
+    // `# %%` cells.
+    const lang = document.languageId.toLowerCase();
+    return lang === 'r' || lang === 'rmd' || lang === 'quarto';
 }
 
 export function register_chunk_decorations(context: vscode.ExtensionContext): ChunkDecorationManager {

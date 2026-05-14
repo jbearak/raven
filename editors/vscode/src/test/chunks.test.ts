@@ -48,11 +48,21 @@ const R_CELL_FIXTURE = [
     '',
 ].join('\n');
 
-async function open_rmd(content: string): Promise<vscode.TextEditor> {
-    const doc = await vscode.workspace.openTextDocument({
-        language: 'r',
-        content,
-    });
+/**
+ * Open an untitled buffer with the supplied content. The `language` argument
+ * controls how the chunk detector classifies the document:
+ *   - `'rmd'` (default) — RMarkdown / Quarto fenced-block mode; required to
+ *     test fixtures that use ```{r} fences. Even though our extension only
+ *     registers the `r` languageId for saved files, the chunk classifier
+ *     also accepts `'rmd'` / `'quarto'` languageIds so untitled test buffers
+ *     can stand in for RMarkdown documents without writing a temp file.
+ *   - `'r'` — plain R / `# %%` cell-marker mode.
+ */
+async function open_doc(
+    content: string,
+    language: 'rmd' | 'r' = 'rmd',
+): Promise<vscode.TextEditor> {
+    const doc = await vscode.workspace.openTextDocument({ language, content });
     return vscode.window.showTextDocument(doc);
 }
 
@@ -166,7 +176,7 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('goToNextChunk places cursor inside the next R chunk body', async () => {
-        const editor = await open_rmd(RMD_FIXTURE);
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 0); // before any chunk
         await vscode.commands.executeCommand('raven.goToNextChunk');
         // First chunk header is line 6 ("```{r setup, ...}"), body starts at line 7.
@@ -181,7 +191,7 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('goToPreviousChunk walks chunks in reverse', async () => {
-        const editor = await open_rmd(RMD_FIXTURE);
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the second R chunk body
         await vscode.commands.executeCommand('raven.goToPreviousChunk');
         // Previous chunk is python at line 12 → body line 13.
@@ -189,7 +199,7 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('selectCurrentChunk selects only the body of the chunk under the cursor', async () => {
-        const editor = await open_rmd(RMD_FIXTURE);
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the "second" R chunk
         await vscode.commands.executeCommand('raven.selectCurrentChunk');
         const text = editor.document.getText(editor.selection);
@@ -200,7 +210,7 @@ suite('chunk commands: registration and behavior', () => {
         const r_console_disabled = !(await vscode.commands.getCommands(true))
             .includes('raven.runCurrentChunk');
         if (r_console_disabled) return; // command not registered in this env
-        const editor = await open_rmd(RMD_FIXTURE);
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 4); // prose line, not in a chunk
         const stub = stub_information_message();
         try {
@@ -218,7 +228,7 @@ suite('chunk commands: registration and behavior', () => {
         const r_console_disabled = !(await vscode.commands.getCommands(true))
             .includes('raven.runCurrentChunk');
         if (r_console_disabled) return;
-        const editor = await open_rmd(RMD_FIXTURE);
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 13); // inside the python chunk
         const stub = stub_information_message();
         try {
@@ -236,7 +246,7 @@ suite('chunk commands: registration and behavior', () => {
         const r_console_disabled = !(await vscode.commands.getCommands(true))
             .includes('raven.runCurrentChunk');
         if (r_console_disabled) return;
-        const editor = await open_rmd('x <- 1\nprint(x)\n');
+        const editor = await open_doc('x <- 1\nprint(x)\n', 'r');
         place_cursor(editor, 0);
         const stub = stub_information_message();
         try {
@@ -254,7 +264,7 @@ suite('chunk commands: registration and behavior', () => {
         const r_console_disabled = !(await vscode.commands.getCommands(true))
             .includes('raven.runCurrentChunk');
         if (r_console_disabled) return;
-        const editor = await open_rmd(RMD_FIXTURE);
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the "second" R chunk
         const term = stub_create_terminal();
         try {
@@ -280,7 +290,7 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('# %% cell mode in .R: selectCurrentChunk grabs the cell body', async () => {
-        const editor = await open_rmd(R_CELL_FIXTURE);
+        const editor = await open_doc(R_CELL_FIXTURE, 'r');
         place_cursor(editor, 1); // inside cell "one"
         await vscode.commands.executeCommand('raven.selectCurrentChunk');
         const text = editor.document.getText(editor.selection);

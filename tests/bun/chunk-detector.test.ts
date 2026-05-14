@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
     classify_chunk_document,
+    classify_chunk_document_for_document,
     detect_chunks,
     find_chunk_at_line,
     chunks_above,
@@ -357,6 +358,29 @@ describe('extract_chunk_code', () => {
         ].join('\n'));
         const chunks = detect_chunks(src, 'rmd');
         expect(extract_chunk_code(src, chunks[0])).toBe('');
+    });
+});
+
+describe('classify_chunk_document_for_document', () => {
+    test('prefers languageId rmd / quarto over URI extension', () => {
+        const doc = { languageId: 'rmd', uri: { fsPath: '/tmp/untitled-1', path: '/tmp/untitled-1' } };
+        expect(classify_chunk_document_for_document(doc)).toBe('rmd');
+        const qdoc = { languageId: 'Quarto', uri: { fsPath: '', path: 'Untitled-1' } };
+        expect(classify_chunk_document_for_document(qdoc)).toBe('rmd');
+    });
+
+    test('falls back to URI extension for `r` languageId', () => {
+        const rmd = { languageId: 'r', uri: { fsPath: '/tmp/report.Rmd', path: '/tmp/report.Rmd' } };
+        expect(classify_chunk_document_for_document(rmd)).toBe('rmd');
+        const qmd = { languageId: 'r', uri: { fsPath: '/tmp/notes.qmd', path: '/tmp/notes.qmd' } };
+        expect(classify_chunk_document_for_document(qmd)).toBe('rmd');
+        const r = { languageId: 'r', uri: { fsPath: '/tmp/main.R', path: '/tmp/main.R' } };
+        expect(classify_chunk_document_for_document(r)).toBe('r');
+    });
+
+    test('returns r for an untitled buffer with languageId r and no extension', () => {
+        const doc = { languageId: 'r', uri: { fsPath: '', path: 'Untitled-1' } };
+        expect(classify_chunk_document_for_document(doc)).toBe('r');
     });
 });
 

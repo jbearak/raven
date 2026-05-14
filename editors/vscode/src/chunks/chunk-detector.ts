@@ -62,6 +62,26 @@ export function classify_chunk_document(file_name_or_uri: string): DocumentKind 
 }
 
 /**
+ * Classify a document by inspecting both its languageId and its URI. Used at
+ * the VS Code adapter layer (commands, CodeLens, decorations) where we have
+ * a full `TextDocument`. Checks languageId first so untitled buffers and
+ * environments with a dedicated `rmd` / `quarto` languageId classify correctly,
+ * then falls back to the extension-based check for saved files registered
+ * under our single `r` languageId.
+ *
+ * Today the extension registers only `r` (covering `.r` / `.R` / `.rmd` /
+ * `.Rmd` / `.RMD` / `.qmd` / `.Qmd` / `.QMD`); the languageId path remains
+ * forward-compatible should that ever change.
+ */
+export function classify_chunk_document_for_document(
+    document: { languageId: string; uri: { fsPath: string; path: string } },
+): DocumentKind {
+    const lang = document.languageId.toLowerCase();
+    if (lang === 'rmd' || lang === 'quarto') return 'rmd';
+    return classify_chunk_document(document.uri.fsPath || document.uri.path);
+}
+
+/**
  * Cheap substring screen for "does this document contain any chunk anchors?".
  * Lets callers skip the per-line detector loop on plain `.R` files that never
  * use cell markers and on prose-only `.Rmd` documents.
