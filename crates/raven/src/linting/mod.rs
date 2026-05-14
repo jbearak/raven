@@ -11,8 +11,11 @@
 //! * `trailing_blank_lines` — blank lines at the very end of the file.
 //! * `assignment_operator` — enforce `<-` (or `=`) for top-level assignment.
 //!
-//! Suppression follows lintr conventions: `# nolint` suppresses the line, and
-//! `# nolint start` / `# nolint end` brackets suppress a region.
+//! Suppression supports both lintr and Raven conventions:
+//! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
+//! * `# nolint start` / `# nolint end` brackets a region.
+//! * `# @lsp-ignore` suppresses the line it appears on.
+//! * `# @lsp-ignore-next` suppresses the *following* source line.
 
 pub mod config;
 mod nolint;

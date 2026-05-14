@@ -463,7 +463,11 @@ pub(crate) fn parse_lint_config(
         config.enabled = v;
     }
     if let Some(v) = linting.get("lineLength").and_then(|v| v.as_u64()) {
-        config.line_length = (v as u32).clamp(20, 10_000);
+        // Clamp on u64 first; casting to u32 before clamping would wrap values
+        // above u32::MAX (e.g. u32::MAX + 5 becomes 4) into a small value and
+        // then clamp to the floor of 20 — silently bogus. The clamp ceiling
+        // is well below u32::MAX so the post-clamp cast is lossless.
+        config.line_length = v.clamp(20, 10_000) as u32;
     }
     if let Some(op) = linting.get("assignmentOperator").and_then(|v| v.as_str()) {
         config.assignment_operator_style = match op {
@@ -3735,7 +3739,16 @@ impl LanguageServer for Backend {
             // Future-proof: compare the entire config with watch fields
             // reverted so any new diagnostic-affecting field is automatically
             // covered without maintaining a manual exclusion list.
+            // Lint config affects diagnostic output, so a lint-config change
+            // must trigger a republish even if the watcher-only optimization
+            // would otherwise skip it.
+            let lint_config_changed = new_lint_config
+                .as_ref()
+                .map(|c| c != &state.lint_config)
+                .unwrap_or(false);
+
             let only_watch_changed = watch_settings_changed
+                && !lint_config_changed
                 && new_config
                     .as_ref()
                     .map(|c| {
@@ -7352,6 +7365,18 @@ mod tests {
             assert_eq!(cfg.line_length, 20);
 
             let settings = json!({ "linting": { "lineLength": 999_999 } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.line_length, 10_000);
+        }
+
+        #[test]
+        fn parse_lint_config_clamps_before_u32_truncation() {
+            // Regression: casting `u64 as u32` before clamping wraps values
+            // above u32::MAX into a small number (u32::MAX + 5 -> 4), which
+            // then clamps to the floor of 20 instead of the ceiling of
+            // 10_000.
+            let oversized = (u32::MAX as u64) + 5;
+            let settings = json!({ "linting": { "lineLength": oversized } });
             let cfg = crate::backend::parse_lint_config(&settings).unwrap();
             assert_eq!(cfg.line_length, 10_000);
         }

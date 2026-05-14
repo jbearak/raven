@@ -131,7 +131,7 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
         .trim_start_matches(|c: char| c == '#' || c.is_whitespace())
         .to_ascii_lowercase();
 
-    if let Some(rest) = trimmed.strip_prefix("nolint") {
+    if let Some(rest) = matches_keyword(&trimmed, "nolint") {
         let rest = rest.trim_start();
         return if rest.starts_with("start") {
             Some(NolintMarker::Start)
@@ -144,12 +144,12 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
         };
     }
 
-    if let Some(rest) = trimmed.strip_prefix("@lsp-ignore") {
-        // Match `-next`, `:next`, or bare `next` after the marker so all of
+    if let Some(rest) = matches_keyword(&trimmed, "@lsp-ignore") {
+        // Match `-next`, `:next`, or whitespace+`next` after the marker so
         // `@lsp-ignore-next`, `@lsp-ignore: next`, and `@lsp-ignore next`
-        // resolve to NextLine. Anything else is a same-line ignore.
-        let rest = rest
-            .trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
+        // all resolve to NextLine. Anything else on the same line is a
+        // same-line ignore.
+        let rest = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
         return if rest.starts_with("next") {
             Some(NolintMarker::NextLine)
         } else {
@@ -158,6 +158,29 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
     }
 
     None
+}
+
+/// Match `keyword` as a word in `haystack`: the keyword must appear as a
+/// prefix and the next character (if any) must be a non-identifier byte. This
+/// prevents `nolinter` or `@lsp-ignored` from matching `nolint` /
+/// `@lsp-ignore` — mirroring the strictness of the directive parser at
+/// `cross_file/directive.rs` for `# @lsp-ignore`.
+fn matches_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = haystack.strip_prefix(keyword)?;
+    match rest.as_bytes().first() {
+        // EOL, whitespace, colon, or `-` (used by `@lsp-ignore-next` and
+        // `# nolint:`). Anything else means we matched the middle of an
+        // unrelated word.
+        None => Some(rest),
+        Some(b) => {
+            let c = *b as char;
+            if c.is_whitespace() || c == ':' || c == '-' {
+                Some(rest)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +241,19 @@ mod tests {
         assert!(!s.is_suppressed(0));
         assert!(s.is_suppressed(1));
         assert!(!s.is_suppressed(2));
+    }
+
+    #[test]
+    fn typo_lsp_ignored_does_not_suppress() {
+        // `@lsp-ignored` must not be parsed as `@lsp-ignore` — otherwise a
+        // typo silently swallows the lint instead of producing it.
+        let s = Suppressions::from_text("x = 1 # @lsp-ignored\n");
+        assert!(!s.is_suppressed(0));
+    }
+
+    #[test]
+    fn typo_nolinter_does_not_suppress() {
+        let s = Suppressions::from_text("x = 1 # nolinter\n");
+        assert!(!s.is_suppressed(0));
     }
 }
