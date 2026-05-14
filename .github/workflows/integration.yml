@@ -16,6 +16,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Sibling job 1: the Rust test suite. Mirrors what `bun test` runs
+  # locally as the first half of `tests/bun/workspace-suite.test.ts`.
+  # Runs in release profile so its `target/` cache lines up with the
+  # release LSP binary that the Mocha suite builds — same cache key
+  # means whichever job finishes first warms the other on subsequent runs.
+  cargo:
+    name: Cargo Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            integration-cargo-${{ runner.os }}-
+
+      - name: Run cargo tests (release)
+        run: cargo test --release -p raven
+
+  # Sibling job 2: the VS Code Mocha integration suite — runs the
+  # extension under a real Electron host via `vscode-test`. Mirrors
+  # the second half of the local `workspace-suite` invocation.
   vscode-mocha:
     name: VS Code Mocha Suite
     runs-on: ubuntu-latest
@@ -33,9 +65,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: vscode-integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            vscode-integration-cargo-${{ runner.os }}-
+            integration-cargo-${{ runner.os }}-
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
