@@ -7,7 +7,8 @@
 //! Scope:
 //! * `line_length` — flag lines wider than the configured maximum.
 //! * `trailing_whitespace` — trailing spaces/tabs at end of line.
-//! * `no_tab` — leading or interior tab characters.
+//! * `no_tab` — one diagnostic per line that contains a tab, anchored at
+//!   the first tab on that line.
 //! * `trailing_blank_lines` — blank lines at the very end of the file.
 //! * `assignment_operator` — enforce `<-` (or `=`) for top-level assignment.
 //!

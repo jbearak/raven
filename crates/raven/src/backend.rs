@@ -3736,12 +3736,13 @@ impl LanguageServer for Backend {
             // for the filesystem watcher). Diagnostic content is unaffected,
             // so don't force every open document to revalidate.
             //
-            // Future-proof: compare the entire config with watch fields
-            // reverted so any new diagnostic-affecting field is automatically
-            // covered without maintaining a manual exclusion list.
-            // Lint config affects diagnostic output, so a lint-config change
-            // must trigger a republish even if the watcher-only optimization
-            // would otherwise skip it.
+            // Coverage is automatic for every field on `CrossFileConfig`: we
+            // compare the entire struct with the watch fields reverted, so
+            // any new diagnostic-affecting field added to `CrossFileConfig`
+            // is picked up without touching this site. Config structs that
+            // live OUTSIDE `CrossFileConfig` (e.g. `LintConfig`) still need
+            // an explicit `*_changed` guard below — extend the chain when
+            // adding another such struct.
             let lint_config_changed = new_lint_config
                 .as_ref()
                 .map(|c| c != &state.lint_config)
