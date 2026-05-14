@@ -87,7 +87,13 @@ jobs:
       # `ubuntu-latest` image. The `*t64` package names target Ubuntu 24.04
       # (current `ubuntu-latest`); they Provide the legacy names so this
       # block also works if the image rolls back to 22.04.
-      - name: Install Xvfb and Electron runtime deps
+      #
+      # R goes alongside so suites that drive the live R session (help,
+      # send-to-r, future knit / rmarkdown coverage) can run instead of
+      # skipping. `r-base-core` is the minimal install; tests that need
+      # specific packages (e.g. `arrow` for the data-viewer suite) still
+      # skip themselves when those packages aren't installed.
+      - name: Install Xvfb, Electron runtime deps, and R
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -101,7 +107,8 @@ jobs:
             libxkbcommon-x11-0 \
             libgbm1 \
             libsecret-1-0 \
-            xdg-utils
+            xdg-utils \
+            r-base-core
 
       - name: Build LSP binary (release)
         run: cargo build --release -p raven
