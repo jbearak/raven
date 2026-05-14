@@ -82,6 +82,16 @@ export interface RavenInitializationOptions {
     indentation?: {
         style?: "rstudio" | "rstudio-minus" | "off";
     };
+    linting?: {
+        enabled?: boolean;
+        lineLength?: number;
+        assignmentOperator?: "<-" | "=";
+        lineLengthSeverity?: SeverityLevel;
+        trailingWhitespaceSeverity?: SeverityLevel;
+        noTabSeverity?: SeverityLevel;
+        trailingBlankLinesSeverity?: SeverityLevel;
+        assignmentOperatorSeverity?: SeverityLevel;
+    };
     helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
 
@@ -317,6 +327,22 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     if (indentationStyle !== undefined) {
         options.indentation = { style: indentationStyle };
     }
+
+    // Linting settings: always emit the full section using each setting's
+    // package.json default. Otherwise, resetting an explicitly-configured key
+    // (e.g. via VS Code's "Reset Setting") would omit it from the payload,
+    // and the server treats absent keys as "preserve current value" — so the
+    // previous state would persist until restart.
+    options.linting = {
+        enabled: config.get<boolean>('linting.enabled', false),
+        lineLength: config.get<number>('linting.lineLength', 80),
+        assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
+        lineLengthSeverity: config.get<SeverityLevel>('linting.lineLengthSeverity', 'hint'),
+        trailingWhitespaceSeverity: config.get<SeverityLevel>('linting.trailingWhitespaceSeverity', 'hint'),
+        noTabSeverity: config.get<SeverityLevel>('linting.noTabSeverity', 'hint'),
+        trailingBlankLinesSeverity: config.get<SeverityLevel>('linting.trailingBlankLinesSeverity', 'hint'),
+        assignmentOperatorSeverity: config.get<SeverityLevel>('linting.assignmentOperatorSeverity', 'hint'),
+    };
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');
     if (helpViewerColumn !== undefined) {

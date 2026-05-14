@@ -24,7 +24,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Go-to-definition](docs/go-to-definition.md)** — Jump to definitions across file boundaries
 - **[Find references](docs/find-references.md)** — Locate all usages of a symbol across your project
 - **[Hover](docs/hover.md)** — Symbol info including source file and package origin
-- **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
+- **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages, plus opt-in style/lint rules (line length, trailing whitespace, tabs, assignment operator)
 - **[Document outline](docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths

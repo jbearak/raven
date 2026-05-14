@@ -945,6 +945,126 @@
           "minimum": 0,
           "maximum": 15,
           "description": "Initial digits used by the data viewer's Format toggle."
+        },
+        "raven.linting.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable native style/lint diagnostics. When on, Raven reports a small set of lintr-equivalent rules (line length, trailing whitespace, tabs, assignment operator, trailing blank lines) directly from its tree-sitter AST — no R or lintr install required. Individual rules can still be disabled via their per-rule severity settings."
+        },
+        "raven.linting.lineLength": {
+          "type": "integer",
+          "default": 80,
+          "minimum": 20,
+          "maximum": 10000,
+          "description": "Maximum allowed line length for the line-length lint. Width is measured in UTF-16 code units. Set raven.linting.lineLengthSeverity to \"off\" to disable the rule without affecting other lints."
+        },
+        "raven.linting.assignmentOperator": {
+          "type": "string",
+          "default": "<-",
+          "enum": [
+            "<-",
+            "="
+          ],
+          "enumDescriptions": [
+            "Require `<-` for assignment; flag top-level `=` assignments.",
+            "Require `=` for assignment; flag top-level `<-` assignments."
+          ],
+          "description": "Preferred assignment operator. The lint never flags `=` inside argument lists (named arguments)."
+        },
+        "raven.linting.lineLengthSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report long lines as errors",
+            "Report long lines as warnings",
+            "Report long lines as information",
+            "Report long lines as hints",
+            "Disable the line-length lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the line-length lint. Set to \"off\" to disable the rule."
+        },
+        "raven.linting.trailingWhitespaceSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report trailing whitespace as errors",
+            "Report trailing whitespace as warnings",
+            "Report trailing whitespace as information",
+            "Report trailing whitespace as hints",
+            "Disable the trailing-whitespace lint"
+          ],
+          "default": "hint",
+          "description": "Severity for trailing whitespace at end of line. Set to \"off\" to disable the rule."
+        },
+        "raven.linting.noTabSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report tab characters as errors",
+            "Report tab characters as warnings",
+            "Report tab characters as information",
+            "Report tab characters as hints",
+            "Disable the no-tab lint"
+          ],
+          "default": "hint",
+          "description": "Severity for tab characters in source. Set to \"off\" to disable the rule."
+        },
+        "raven.linting.trailingBlankLinesSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report trailing blank lines as errors",
+            "Report trailing blank lines as warnings",
+            "Report trailing blank lines as information",
+            "Report trailing blank lines as hints",
+            "Disable the trailing-blank-lines lint"
+          ],
+          "default": "hint",
+          "description": "Severity for trailing blank lines and missing final newline at end of file. Set to \"off\" to disable the rule."
+        },
+        "raven.linting.assignmentOperatorSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report mismatched assignment operator as errors",
+            "Report mismatched assignment operator as warnings",
+            "Report mismatched assignment operator as information",
+            "Report mismatched assignment operator as hints",
+            "Disable the assignment-operator lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the assignment-operator lint. Set to \"off\" to disable the rule."
         }
       }
     }

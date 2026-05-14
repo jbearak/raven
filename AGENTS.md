@@ -28,6 +28,7 @@ Maintainer/internal:
 Code (authoritative for behavior):
 - Cross-file: `crates/raven/src/cross_file/` — see module docs in `scope.rs`, `revalidation.rs`, `dependency.rs` for `ScopeEvent`, `ScopeStream`, `ParentPrefixCache`, `compute_interface_hash`, `compute_affected_dependents_after_edit`, etc.
 - Indentation: `crates/raven/src/indentation/`
+- Linting (style/lint diagnostics): `crates/raven/src/linting/` — opt-in lintr-equivalent rules in Rust, gated by `state.lint_config`. Honors `# nolint` / `# nolint start/end` and `# @lsp-ignore` / `# @lsp-ignore-next`.
 - Packages: `crates/raven/src/package_library.rs`, `crates/raven/src/r_subprocess.rs`
 - Diagnostic collectors: `crates/raven/src/handlers.rs` — `is_structural_non_reference` predicate is the single source of truth for "structural identifier; not a reference".
 

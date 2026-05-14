@@ -90,6 +90,7 @@ pub(crate) struct DiagnosticsSnapshot {
     // Cross-file state (pre-collected)
     pub directive_meta: crate::cross_file::CrossFileMetadata,
     pub cross_file_config: crate::cross_file::config::CrossFileConfig,
+    pub lint_config: crate::linting::LintConfig,
     /// Trimmed dependency subgraph for the queried URI's neighborhood.
     /// Stored as `Arc` so concurrent fan-out revalidations share allocation
     /// instead of each cloning the trimmed graph from the cache payload.
@@ -240,6 +241,7 @@ impl DiagnosticsSnapshot {
             text,
             directive_meta,
             cross_file_config: state.cross_file_config.clone(),
+            lint_config: state.lint_config.clone(),
             cross_file_graph: trimmed_graph,
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
@@ -326,6 +328,14 @@ pub(crate) fn diagnostics_from_snapshot(
     // Fast collectors (no scope resolution needed)
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+
+    // Style/lint diagnostics. Native Rust rules driven by `lint_config`; no R
+    // subprocess. `run_lints` short-circuits when the master switch is off.
+    diagnostics.extend(crate::linting::run_lints(
+        &snapshot.text,
+        snapshot.tree.root_node(),
+        &snapshot.lint_config,
+    ));
 
     // Cycle detection (uses pre-computed result from full graph, not trimmed subgraph)
     if let Some(severity) = snapshot.cross_file_config.circular_dependency_severity {
