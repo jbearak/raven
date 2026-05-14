@@ -144,13 +144,7 @@ fn check_assignment(
         SymbolKind::Variable
     };
 
-    let style = match kind {
-        SymbolKind::Function => styles.function,
-        SymbolKind::Variable => styles.variable,
-        SymbolKind::Argument => unreachable!(),
-    };
-
-    report_if_bad(target, name, kind, style, text, severity, suppressions, out);
+    report_if_bad(target, name, kind, style_for(kind, styles), text, severity, suppressions, out);
 }
 
 /// Check formal arguments of a `function_definition` node.
@@ -200,7 +194,7 @@ fn check_parameters(
                 ident,
                 name,
                 SymbolKind::Argument,
-                styles.argument,
+                style_for(SymbolKind::Argument, styles),
                 text,
                 severity,
                 suppressions,
@@ -253,6 +247,15 @@ fn report_if_bad(
         message: format!("{kind_label} name `{name}` does not match the {scheme_label} naming style."),
         ..Default::default()
     });
+}
+
+/// Look up the configured style for a given symbol kind.
+fn style_for(kind: SymbolKind, styles: ObjectNameStyles) -> ObjectNameStyle {
+    match kind {
+        SymbolKind::Function => styles.function,
+        SymbolKind::Variable => styles.variable,
+        SymbolKind::Argument => styles.argument,
+    }
 }
 
 /// Names that should be skipped regardless of the configured scheme.
