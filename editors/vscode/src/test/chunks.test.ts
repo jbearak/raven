@@ -142,41 +142,55 @@ async function dispose_any_cached_r_terminal(): Promise<void> {
 }
 
 /**
- * Replace `vscode.window.createTerminal` so the next call returns a
- * recording terminal. The bundled extension's `get_or_create_r_terminal`
- * caches the terminal in-process via module-level state, so the FIRST
- * call after stubbing is what we capture — subsequent tests in the same
- * suite will reuse that same recording terminal. The stub also records
- * `sendText` calls when the cached terminal is reused.
+ * Replace `vscode.window.createTerminal` so the bundled extension's
+ * `get_or_create_r_terminal` returns a recording terminal. The extension
+ * caches the terminal in-process via module-level state, so the FIRST call
+ * after stubbing is what stays — subsequent stub installs in the same suite
+ * reuse that same cached terminal.
+ *
+ * To make the recorded sends reliable across tests, the fake terminal's
+ * `sendText` delegates to a module-level recorder. Each `stub_create_terminal`
+ * call:
+ *   1. resets the recorder to a fresh empty array
+ *   2. returns a `TerminalStub` whose `sent` reflects the live state of
+ *      `RECORDED_SENT` (so writes via the cached fake terminal land in this
+ *      stub's view).
+ *
+ * The cached fake terminal stays installed across tests — only the recorder
+ * target rotates. `restore` is still provided for the `vscode.window.createTerminal`
+ * override; the fake terminal itself is intentionally sticky.
  */
-function stub_create_terminal(): TerminalStub {
-    const sent: string[] = [];
-    const recorder = (text: string, _addNewLine?: boolean) => {
-        sent.push(text);
-    };
+let RECORDED_SENT: string[] = [];
+const CACHED_FAKE_TERMINAL = {
+    name: 'R (Raven test stub)',
+    sendText: (text: string, _addNewLine?: boolean) => {
+        RECORDED_SENT.push(text);
+    },
+    show: () => undefined,
+    dispose: () => undefined,
+    processId: Promise.resolve(undefined),
+    creationOptions: { name: 'R (Raven test stub)' },
+    exitStatus: undefined,
+    state: { isInteractedWith: false },
     // Cast through `unknown` because the VS Code TerminalState/shell-integration
     // interfaces churn across `@types/vscode` versions and the test only needs
     // `sendText` / `show` to be callable.
-    const fake_terminal = {
-        name: 'R (Raven test stub)',
-        sendText: recorder,
-        show: () => undefined,
-        dispose: () => undefined,
-        processId: Promise.resolve(undefined),
-        creationOptions: { name: 'R (Raven test stub)' },
-        exitStatus: undefined,
-        state: { isInteractedWith: false },
-    } as unknown as vscode.Terminal;
+} as unknown as vscode.Terminal;
+
+function stub_create_terminal(): TerminalStub {
+    RECORDED_SENT = [];
     const original = vscode.window.createTerminal;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (vscode.window as any).createTerminal = (..._args: unknown[]) => fake_terminal;
+    (vscode.window as any).createTerminal = (..._args: unknown[]) => CACHED_FAKE_TERMINAL;
     return {
-        sent,
+        get sent() {
+            return RECORDED_SENT;
+        },
         restore: () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (vscode.window as any).createTerminal = original;
         },
-    };
+    } as TerminalStub;
 }
 
 suite('chunk commands: registration and behavior', () => {
