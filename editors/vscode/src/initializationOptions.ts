@@ -5,6 +5,18 @@
 export type SeverityLevel = "error" | "warning" | "information" | "hint" | "off";
 
 /**
+ * Naming scheme for the object-name lint. `any` disables the check for the
+ * corresponding symbol kind without disabling the rule entirely.
+ */
+export type ObjectNameStyle =
+    | "snake_case"
+    | "camelCase"
+    | "dotted.case"
+    | "UPPER_CASE"
+    | "lowercase"
+    | "any";
+
+/**
  * Subset of VS Code's configuration inspection result used when building
  * initialization options.
  */
@@ -86,11 +98,15 @@ export interface RavenInitializationOptions {
         enabled?: boolean;
         lineLength?: number;
         assignmentOperator?: "<-" | "=";
+        objectNameStyleFunction?: ObjectNameStyle;
+        objectNameStyleVariable?: ObjectNameStyle;
+        objectNameStyleArgument?: ObjectNameStyle;
         lineLengthSeverity?: SeverityLevel;
         trailingWhitespaceSeverity?: SeverityLevel;
         noTabSeverity?: SeverityLevel;
         trailingBlankLinesSeverity?: SeverityLevel;
         assignmentOperatorSeverity?: SeverityLevel;
+        objectNameSeverity?: SeverityLevel;
     };
     helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
@@ -337,11 +353,15 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         enabled: config.get<boolean>('linting.enabled', false),
         lineLength: config.get<number>('linting.lineLength', 80),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
+        objectNameStyleFunction: config.get<ObjectNameStyle>('linting.objectNameStyleFunction', 'snake_case'),
+        objectNameStyleVariable: config.get<ObjectNameStyle>('linting.objectNameStyleVariable', 'snake_case'),
+        objectNameStyleArgument: config.get<ObjectNameStyle>('linting.objectNameStyleArgument', 'snake_case'),
         lineLengthSeverity: config.get<SeverityLevel>('linting.lineLengthSeverity', 'hint'),
         trailingWhitespaceSeverity: config.get<SeverityLevel>('linting.trailingWhitespaceSeverity', 'hint'),
         noTabSeverity: config.get<SeverityLevel>('linting.noTabSeverity', 'hint'),
         trailingBlankLinesSeverity: config.get<SeverityLevel>('linting.trailingBlankLinesSeverity', 'hint'),
         assignmentOperatorSeverity: config.get<SeverityLevel>('linting.assignmentOperatorSeverity', 'hint'),
+        objectNameSeverity: config.get<SeverityLevel>('linting.objectNameSeverity', 'hint'),
     };
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');

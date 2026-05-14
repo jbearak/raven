@@ -59,8 +59,11 @@ Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-li
 | Tab character | hint | Tab character anywhere in source |
 | Trailing blank lines | hint | Blank lines at end of file, or missing final newline |
 | Assignment operator | hint | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
+| Object name | hint | Function, variable, or argument name doesn't match the configured naming scheme (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*`) |
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
+
+The object-name lint has independent style settings for **functions**, **variables**, and **arguments**. Each accepts `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any` (which disables that specific kind without disabling the rule entirely). Names that look like S3 method dispatch (e.g. `print.MyClass`, `format.Date` — function names whose suffix after the first dot starts with an uppercase letter) are exempt. Backtick-quoted names (e.g. `` `with spaces` <- 1 ``, operator overloads like `` `+.MyClass` <- function(x, y) ... ``) and non-ASCII identifiers are also skipped.
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 

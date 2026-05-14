@@ -127,8 +127,12 @@ Native style/lint diagnostics. Off by default; opt in with `raven.linting.enable
 | `raven.linting.noTabSeverity` | `"hint"` | Severity for tab characters |
 | `raven.linting.trailingBlankLinesSeverity` | `"hint"` | Severity for blank lines or missing newline at end of file |
 | `raven.linting.assignmentOperatorSeverity` | `"hint"` | Severity for mismatched assignment operator |
+| `raven.linting.objectNameStyleFunction` | `"snake_case"` | Naming scheme for functions (`"snake_case" \| "camelCase" \| "dotted.case" \| "UPPER_CASE" \| "lowercase" \| "any"`) |
+| `raven.linting.objectNameStyleVariable` | `"snake_case"` | Naming scheme for variables (same enum as above) |
+| `raven.linting.objectNameStyleArgument` | `"snake_case"` | Naming scheme for function formal arguments (same enum as above) |
+| `raven.linting.objectNameSeverity` | `"hint"` | Severity for the object-name lint (set to `"off"` to disable entirely; set a specific style to `"any"` to disable just that kind) |
 
-To disable an individual rule while leaving the rest enabled, set its severity to `"off"`.
+To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also set any of the three style settings to `"any"` to disable just that symbol kind while keeping the others active.
 
 ## Server Settings
 

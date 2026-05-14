@@ -131,6 +131,10 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.objectNameStyleFunction', jsonPath: ['linting', 'objectNameStyleFunction'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameStyleVariable', jsonPath: ['linting', 'objectNameStyleVariable'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameStyleArgument', jsonPath: ['linting', 'objectNameStyleArgument'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameSeverity', jsonPath: ['linting', 'objectNameSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     // Help viewer settings
     { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];
@@ -353,11 +357,15 @@ suite('Settings Transmission Property Tests', () => {
                 enabled: false,
                 lineLength: 80,
                 assignmentOperator: '<-',
+                objectNameStyleFunction: 'snake_case',
+                objectNameStyleVariable: 'snake_case',
+                objectNameStyleArgument: 'snake_case',
                 lineLengthSeverity: 'hint',
                 trailingWhitespaceSeverity: 'hint',
                 noTabSeverity: 'hint',
                 trailingBlankLinesSeverity: 'hint',
                 assignmentOperatorSeverity: 'hint',
+                objectNameSeverity: 'hint',
             },
         }, 'Empty configuration should produce only runtime defaults');
 
@@ -499,11 +507,15 @@ suite('Settings Transmission Unit Tests', () => {
             enabled: false,
             lineLength: 80,
             assignmentOperator: '<-',
+            objectNameStyleFunction: 'snake_case',
+            objectNameStyleVariable: 'snake_case',
+            objectNameStyleArgument: 'snake_case',
             lineLengthSeverity: 'hint',
             trailingWhitespaceSeverity: 'hint',
             noTabSeverity: 'hint',
             trailingBlankLinesSeverity: 'hint',
             assignmentOperatorSeverity: 'hint',
+            objectNameSeverity: 'hint',
         });
     });
 
@@ -514,6 +526,9 @@ suite('Settings Transmission Unit Tests', () => {
             ['linting.assignmentOperator', '='],
             ['linting.lineLengthSeverity', 'warning'],
             ['linting.assignmentOperatorSeverity', 'off'],
+            ['linting.objectNameStyleFunction', 'camelCase'],
+            ['linting.objectNameStyleVariable', 'any'],
+            ['linting.objectNameSeverity', 'warning'],
         ]);
         const mockConfig = createMockConfig(configuredSettings);
         const options = getInitializationOptions(mockConfig);
@@ -522,8 +537,12 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.linting?.assignmentOperator, '=');
         assert.strictEqual(options.linting?.lineLengthSeverity, 'warning');
         assert.strictEqual(options.linting?.assignmentOperatorSeverity, 'off');
+        assert.strictEqual(options.linting?.objectNameStyleFunction, 'camelCase');
+        assert.strictEqual(options.linting?.objectNameStyleVariable, 'any');
+        assert.strictEqual(options.linting?.objectNameSeverity, 'warning');
         // Untouched keys still emit their defaults.
         assert.strictEqual(options.linting?.trailingWhitespaceSeverity, 'hint');
+        assert.strictEqual(options.linting?.objectNameStyleArgument, 'snake_case');
     });
 
     /**

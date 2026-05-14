@@ -1,0 +1,453 @@
+//! Enforce a naming scheme on user-defined symbols.
+//!
+//! Walks the tree-sitter AST and flags assignment targets and function
+//! parameters whose names don't match the configured [`ObjectNameStyle`].
+//! Mirrors `lintr::object_name_linter` with three per-kind settings:
+//! `function`, `variable`, and `argument`. Each kind defaults to `snake_case`
+//! and can be independently disabled by setting its style to [`ObjectNameStyle::Any`].
+//!
+//! Carve-outs:
+//!
+//! * **Backtick-quoted names** (`` `with spaces` <- 1 ``, operator overloads
+//!   like `` `+.foo` <- function(x, y) ... ``) are skipped, matching lintr.
+//! * **S3 method dispatch**: when a function definition's name contains a `.`
+//!   and the suffix after the *first* dot starts with an uppercase letter, it
+//!   is treated as S3 method dispatch (`print.MyClass`, `format.Date`) and
+//!   exempted. Names that are entirely lowercase-with-dots are still checked
+//!   normally (they pass under `dotted.case` and fail under `snake_case`).
+//! * **Non-ASCII identifiers** are skipped — case is locale-dependent and a
+//!   simple regex can't classify them.
+//! * **Named-argument `=`** (`f(name = value)`) is never an assignment target,
+//!   so it isn't checked.
+//! * **Compound LHS** (`obj$field <- ...`, `obj[[i]] <- ...`) is skipped: the
+//!   assignment doesn't introduce a new symbol name.
+
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tree_sitter::Node;
+
+use crate::linting::config::ObjectNameStyle;
+use crate::linting::nolint::Suppressions;
+use crate::linting::LINT_SOURCE;
+use crate::utf16::byte_offset_to_utf16_column;
+
+/// Per-kind style configuration for the rule.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ObjectNameStyles {
+    pub function: ObjectNameStyle,
+    pub variable: ObjectNameStyle,
+    pub argument: ObjectNameStyle,
+}
+
+pub(crate) fn collect(
+    text: &str,
+    root: Node<'_>,
+    styles: ObjectNameStyles,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    visit(root, text, styles, severity, suppressions, out);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolKind {
+    Function,
+    Variable,
+    Argument,
+}
+
+fn visit(
+    node: Node<'_>,
+    text: &str,
+    styles: ObjectNameStyles,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    match node.kind() {
+        "binary_operator" => check_assignment(node, text, styles, severity, suppressions, out),
+        "function_definition" => {
+            check_parameters(node, text, styles, severity, suppressions, out)
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit(child, text, styles, severity, suppressions, out);
+    }
+}
+
+/// Check the assignment target of a `binary_operator` node.
+fn check_assignment(
+    node: Node<'_>,
+    text: &str,
+    styles: ObjectNameStyles,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    let op_node = match node.child_by_field_name("operator") {
+        Some(n) => n,
+        None => return,
+    };
+    let op_text = node_text(op_node, text);
+
+    let (target_node, value_node) = match op_text {
+        "<-" | "<<-" | "=" => {
+            let lhs = node.child_by_field_name("lhs");
+            let rhs = node.child_by_field_name("rhs");
+            (lhs, rhs)
+        }
+        "->" | "->>" => {
+            let lhs = node.child_by_field_name("lhs");
+            let rhs = node.child_by_field_name("rhs");
+            (rhs, lhs)
+        }
+        _ => return,
+    };
+
+    let target = match target_node {
+        Some(t) => t,
+        None => return,
+    };
+
+    // `=` inside an argument list is a named argument, not an assignment.
+    if op_text == "=" && node.parent().is_some_and(|p| p.kind() == "argument") {
+        return;
+    }
+
+    if target.kind() != "identifier" {
+        return;
+    }
+
+    let name = node_text(target, text);
+    if name.is_empty() {
+        return;
+    }
+
+    let kind = if value_node
+        .map(|v| is_function_definition_after_parens(v))
+        .unwrap_or(false)
+    {
+        SymbolKind::Function
+    } else {
+        SymbolKind::Variable
+    };
+
+    let style = match kind {
+        SymbolKind::Function => styles.function,
+        SymbolKind::Variable => styles.variable,
+        SymbolKind::Argument => unreachable!(),
+    };
+
+    report_if_bad(target, name, kind, style, text, severity, suppressions, out);
+}
+
+/// Check formal arguments of a `function_definition` node.
+fn check_parameters(
+    node: Node<'_>,
+    text: &str,
+    styles: ObjectNameStyles,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    if styles.argument == ObjectNameStyle::Any {
+        return;
+    }
+    let params_node = node.child_by_field_name("parameters").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|c| c.is_named() && c.kind() == "parameters")
+    });
+    let params_node = match params_node {
+        Some(n) => n,
+        None => return,
+    };
+
+    let mut cursor = params_node.walk();
+    for child in params_node.children(&mut cursor) {
+        let ident = match child.kind() {
+            "parameter" | "default_parameter" => {
+                let mut name_node = None;
+                for sub in child.children(&mut child.walk()) {
+                    if sub.kind() == "identifier" {
+                        name_node = Some(sub);
+                        break;
+                    }
+                }
+                name_node
+            }
+            "identifier" => Some(child),
+            // `dots` (`...`) is a literal token, not a user-chosen name.
+            _ => None,
+        };
+        if let Some(ident) = ident {
+            let name = node_text(ident, text);
+            if name.is_empty() {
+                continue;
+            }
+            report_if_bad(
+                ident,
+                name,
+                SymbolKind::Argument,
+                styles.argument,
+                text,
+                severity,
+                suppressions,
+                out,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_if_bad(
+    name_node: Node<'_>,
+    name: &str,
+    kind: SymbolKind,
+    style: ObjectNameStyle,
+    text: &str,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    if style == ObjectNameStyle::Any {
+        return;
+    }
+    if should_skip_name(name, kind) {
+        return;
+    }
+    if matches_scheme(name, style) {
+        return;
+    }
+    let line_no = name_node.start_position().row as u32;
+    if suppressions.is_suppressed(line_no) {
+        return;
+    }
+    let line_text = text.lines().nth(line_no as usize).unwrap_or("");
+    let start_col = byte_offset_to_utf16_column(line_text, name_node.start_position().column);
+    let end_col = byte_offset_to_utf16_column(line_text, name_node.end_position().column);
+    let kind_label = match kind {
+        SymbolKind::Function => "Function",
+        SymbolKind::Variable => "Variable",
+        SymbolKind::Argument => "Argument",
+    };
+    let scheme_label = scheme_label(style);
+    out.push(Diagnostic {
+        range: Range {
+            start: Position::new(line_no, start_col),
+            end: Position::new(name_node.end_position().row as u32, end_col),
+        },
+        severity: Some(severity),
+        source: Some(LINT_SOURCE.to_string()),
+        message: format!("{kind_label} name `{name}` does not match the {scheme_label} naming style."),
+        ..Default::default()
+    });
+}
+
+/// Names that should be skipped regardless of the configured scheme.
+fn should_skip_name(name: &str, kind: SymbolKind) -> bool {
+    // Backtick-quoted identifiers (operator overloads, names with spaces).
+    if name.starts_with('`') {
+        return true;
+    }
+    // Non-ASCII identifiers can't be classified by simple ASCII regex.
+    if !name.is_ascii() {
+        return true;
+    }
+    // S3 method dispatch: only relevant for function definitions. A name like
+    // `print.MyClass` is `<generic>.<ClassName>` — the convention is that the
+    // class portion starts with an uppercase letter (`Date`, `POSIXct`,
+    // user-defined S3 classes). Names like `my.var.name` are still checked.
+    if kind == SymbolKind::Function {
+        if let Some(dot) = name.find('.') {
+            let suffix = &name[dot + 1..];
+            if let Some(first) = suffix.chars().next() {
+                if first.is_ascii_uppercase() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
+    if !name.is_ascii() {
+        // Should already be handled by `should_skip_name`, but be defensive.
+        return true;
+    }
+    match style {
+        ObjectNameStyle::Any => true,
+        ObjectNameStyle::SnakeCase => is_snake_case(name),
+        ObjectNameStyle::CamelCase => is_camel_case(name),
+        ObjectNameStyle::DottedCase => is_dotted_case(name),
+        ObjectNameStyle::UpperCase => is_upper_case(name),
+        ObjectNameStyle::Lowercase => is_lowercase(name),
+    }
+}
+
+fn is_snake_case(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+fn is_camel_case(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.iter().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_dotted_case(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.')
+}
+
+fn is_upper_case(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_uppercase())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+fn is_lowercase(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+fn scheme_label(style: ObjectNameStyle) -> &'static str {
+    match style {
+        ObjectNameStyle::SnakeCase => "snake_case",
+        ObjectNameStyle::CamelCase => "camelCase",
+        ObjectNameStyle::DottedCase => "dotted.case",
+        ObjectNameStyle::UpperCase => "UPPER_CASE",
+        ObjectNameStyle::Lowercase => "lowercase",
+        ObjectNameStyle::Any => "any",
+    }
+}
+
+/// Walk through `parenthesized_expression` wrappers and report whether the
+/// inner node is a `function_definition`. Mirrors the helper in
+/// `cross_file/scope.rs` so paren-wrapped functions still classify as such
+/// for naming purposes: `foo <- (function() 1)` is still a function.
+fn is_function_definition_after_parens(node: Node<'_>) -> bool {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "function_definition" => return true,
+            "parenthesized_expression" => {
+                let mut inner = None;
+                for child in current.children(&mut current.walk()) {
+                    if child.is_named() {
+                        inner = Some(child);
+                        break;
+                    }
+                }
+                match inner {
+                    Some(c) => current = c,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn node_text<'a>(node: Node<'_>, text: &'a str) -> &'a str {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    text.get(start..end).unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snake_case_classifier_accepts_common_names() {
+        assert!(is_snake_case("foo"));
+        assert!(is_snake_case("foo_bar"));
+        assert!(is_snake_case("foo_bar_2"));
+        assert!(is_snake_case("x"));
+    }
+
+    #[test]
+    fn snake_case_classifier_rejects_other_styles() {
+        assert!(!is_snake_case("FooBar"));
+        assert!(!is_snake_case("fooBar"));
+        assert!(!is_snake_case("foo.bar"));
+        assert!(!is_snake_case("FOO"));
+        assert!(!is_snake_case("_foo"));
+        assert!(!is_snake_case(""));
+        assert!(!is_snake_case("2foo"));
+    }
+
+    #[test]
+    fn camel_case_classifier() {
+        assert!(is_camel_case("fooBar"));
+        assert!(is_camel_case("parseURL"));
+        assert!(is_camel_case("foo2"));
+        assert!(!is_camel_case("foo_bar"));
+        assert!(!is_camel_case("FooBar"));
+        assert!(!is_camel_case("foo.bar"));
+    }
+
+    #[test]
+    fn dotted_case_classifier() {
+        assert!(is_dotted_case("foo.bar"));
+        assert!(is_dotted_case("data.frame"));
+        assert!(!is_dotted_case("fooBar"));
+        assert!(!is_dotted_case("foo_bar"));
+    }
+
+    #[test]
+    fn upper_case_classifier() {
+        assert!(is_upper_case("FOO"));
+        assert!(is_upper_case("FOO_BAR"));
+        assert!(is_upper_case("PI2"));
+        assert!(!is_upper_case("Foo"));
+        assert!(!is_upper_case("foo"));
+    }
+
+    #[test]
+    fn s3_method_detected_for_function_kind_only() {
+        assert!(should_skip_name("print.MyClass", SymbolKind::Function));
+        assert!(should_skip_name("format.Date", SymbolKind::Function));
+        // For variables, dotted names are checked normally.
+        assert!(!should_skip_name("print.MyClass", SymbolKind::Variable));
+        // All-lowercase dotted name is still checked, even for functions.
+        assert!(!should_skip_name("my.func", SymbolKind::Function));
+    }
+
+    #[test]
+    fn backtick_quoted_names_are_skipped() {
+        assert!(should_skip_name("`with spaces`", SymbolKind::Variable));
+        assert!(should_skip_name("`+.foo`", SymbolKind::Function));
+    }
+
+    #[test]
+    fn non_ascii_names_are_skipped() {
+        assert!(should_skip_name("\u{03b1}", SymbolKind::Variable));
+    }
+}

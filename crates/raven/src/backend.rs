@@ -441,6 +441,11 @@ pub(crate) fn parse_cross_file_config(
 /// * `enabled` (bool) — master switch.
 /// * `lineLength` (number) — max line length; clamped to `[20, 10_000]`.
 /// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
+/// * `objectNameStyleFunction`, `objectNameStyleVariable`,
+///   `objectNameStyleArgument` (string, one of `"snake_case" | "camelCase" |
+///   "dotted.case" | "UPPER_CASE" | "lowercase" | "any"`) — naming scheme
+///   for each symbol kind. `"any"` disables that kind without disabling the
+///   rule entirely.
 /// * Per-rule severities (string, `"error" | "warning" | "information" |
 ///   "hint" | "off"`):
 ///   - `lineLengthSeverity`
@@ -448,6 +453,7 @@ pub(crate) fn parse_cross_file_config(
 ///   - `noTabSeverity`
 ///   - `trailingBlankLinesSeverity`
 ///   - `assignmentOperatorSeverity`
+///   - `objectNameSeverity`
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
 ) -> Option<crate::linting::LintConfig> {
@@ -505,6 +511,27 @@ pub(crate) fn parse_lint_config(
     {
         config.assignment_operator_severity = parse_severity(sev);
     }
+    if let Some(style) = linting
+        .get("objectNameStyleFunction")
+        .and_then(|v| v.as_str())
+    {
+        config.object_name_style_function = parse_object_name_style(style, "objectNameStyleFunction");
+    }
+    if let Some(style) = linting
+        .get("objectNameStyleVariable")
+        .and_then(|v| v.as_str())
+    {
+        config.object_name_style_variable = parse_object_name_style(style, "objectNameStyleVariable");
+    }
+    if let Some(style) = linting
+        .get("objectNameStyleArgument")
+        .and_then(|v| v.as_str())
+    {
+        config.object_name_style_argument = parse_object_name_style(style, "objectNameStyleArgument");
+    }
+    if let Some(sev) = linting.get("objectNameSeverity").and_then(|v| v.as_str()) {
+        config.object_name_severity = parse_severity(sev);
+    }
 
     log::info!("Linting configuration loaded from LSP settings:");
     log::info!("  enabled: {}", config.enabled);
@@ -514,12 +541,19 @@ pub(crate) fn parse_lint_config(
         config.assignment_operator_style
     );
     log::info!(
-        "  severities: line={:?} ws={:?} tab={:?} blank={:?} assign={:?}",
+        "  severities: line={:?} ws={:?} tab={:?} blank={:?} assign={:?} obj_name={:?}",
         config.line_length_severity,
         config.trailing_whitespace_severity,
         config.no_tab_severity,
         config.trailing_blank_lines_severity,
-        config.assignment_operator_severity
+        config.assignment_operator_severity,
+        config.object_name_severity
+    );
+    log::info!(
+        "  object_name styles: fn={:?} var={:?} arg={:?}",
+        config.object_name_style_function,
+        config.object_name_style_variable,
+        config.object_name_style_argument,
     );
 
     Some(config)
@@ -568,6 +602,30 @@ pub(crate) fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
         "information" | "info" => Some(DiagnosticSeverity::INFORMATION),
         "hint" => Some(DiagnosticSeverity::HINT),
         _ => Some(DiagnosticSeverity::WARNING),
+    }
+}
+
+/// Parse an [`ObjectNameStyle`](crate::linting::ObjectNameStyle) string.
+///
+/// Returns [`ObjectNameStyle::Any`] (the "disabled" sentinel for an individual
+/// kind) on unrecognised values so a misconfigured setting falls back to "no
+/// check" rather than a surprising default. `setting_name` is included in the
+/// warning so the user can find the offending setting in their config.
+fn parse_object_name_style(value: &str, setting_name: &str) -> crate::linting::ObjectNameStyle {
+    use crate::linting::ObjectNameStyle;
+    match value {
+        "snake_case" => ObjectNameStyle::SnakeCase,
+        "camelCase" => ObjectNameStyle::CamelCase,
+        "dotted.case" => ObjectNameStyle::DottedCase,
+        "UPPER_CASE" => ObjectNameStyle::UpperCase,
+        "lowercase" => ObjectNameStyle::Lowercase,
+        "any" => ObjectNameStyle::Any,
+        other => {
+            log::warn!(
+                "Unrecognised linting.{setting_name} '{other}', disabling this kind (treating as 'any')."
+            );
+            ObjectNameStyle::Any
+        }
     }
 }
 
@@ -7407,7 +7465,8 @@ mod tests {
                     "trailingWhitespaceSeverity": "off",
                     "noTabSeverity": "off",
                     "trailingBlankLinesSeverity": "off",
-                    "assignmentOperatorSeverity": "off"
+                    "assignmentOperatorSeverity": "off",
+                    "objectNameSeverity": "off"
                 }
             });
             let cfg = crate::backend::parse_lint_config(&settings).unwrap();
@@ -7416,6 +7475,33 @@ mod tests {
             assert_eq!(cfg.no_tab_severity, None);
             assert_eq!(cfg.trailing_blank_lines_severity, None);
             assert_eq!(cfg.assignment_operator_severity, None);
+            assert_eq!(cfg.object_name_severity, None);
+        }
+
+        #[test]
+        fn parse_lint_config_reads_object_name_styles() {
+            use crate::linting::ObjectNameStyle;
+            let settings = json!({
+                "linting": {
+                    "objectNameStyleFunction": "camelCase",
+                    "objectNameStyleVariable": "UPPER_CASE",
+                    "objectNameStyleArgument": "any"
+                }
+            });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.object_name_style_function, ObjectNameStyle::CamelCase);
+            assert_eq!(cfg.object_name_style_variable, ObjectNameStyle::UpperCase);
+            assert_eq!(cfg.object_name_style_argument, ObjectNameStyle::Any);
+        }
+
+        #[test]
+        fn parse_lint_config_unrecognized_object_name_style_falls_back_to_any() {
+            use crate::linting::ObjectNameStyle;
+            let settings = json!({
+                "linting": { "objectNameStyleFunction": "kebab-case" }
+            });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.object_name_style_function, ObjectNameStyle::Any);
         }
 
         #[test]

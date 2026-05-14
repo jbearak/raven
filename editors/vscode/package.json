@@ -1065,6 +1065,88 @@
           ],
           "default": "hint",
           "description": "Severity for the assignment-operator lint. Set to \"off\" to disable the rule."
+        },
+        "raven.linting.objectNameStyleFunction": {
+          "type": "string",
+          "enum": [
+            "snake_case",
+            "camelCase",
+            "dotted.case",
+            "UPPER_CASE",
+            "lowercase",
+            "any"
+          ],
+          "enumDescriptions": [
+            "Require lowercase words separated by underscores (e.g. my_function)",
+            "Require lowercase first letter, capitalized subsequent words (e.g. myFunction)",
+            "Require lowercase words separated by dots (e.g. my.function)",
+            "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
+            "Require a single all-lowercase word (e.g. mything)",
+            "Disable the function-name check (variable and argument checks may still run)"
+          ],
+          "default": "snake_case",
+          "description": "Required naming scheme for functions (assignments whose value is a function definition). Names that look like S3 method dispatch (e.g. print.MyClass) are exempted automatically."
+        },
+        "raven.linting.objectNameStyleVariable": {
+          "type": "string",
+          "enum": [
+            "snake_case",
+            "camelCase",
+            "dotted.case",
+            "UPPER_CASE",
+            "lowercase",
+            "any"
+          ],
+          "enumDescriptions": [
+            "Require lowercase words separated by underscores (e.g. my_variable)",
+            "Require lowercase first letter, capitalized subsequent words (e.g. myVariable)",
+            "Require lowercase words separated by dots (e.g. my.variable)",
+            "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
+            "Require a single all-lowercase word (e.g. myvar)",
+            "Disable the variable-name check (function and argument checks may still run)"
+          ],
+          "default": "snake_case",
+          "description": "Required naming scheme for variables (assignments whose value is not a function definition)."
+        },
+        "raven.linting.objectNameStyleArgument": {
+          "type": "string",
+          "enum": [
+            "snake_case",
+            "camelCase",
+            "dotted.case",
+            "UPPER_CASE",
+            "lowercase",
+            "any"
+          ],
+          "enumDescriptions": [
+            "Require lowercase words separated by underscores (e.g. my_arg)",
+            "Require lowercase first letter, capitalized subsequent words (e.g. myArg)",
+            "Require lowercase words separated by dots (e.g. my.arg)",
+            "Require uppercase words separated by underscores (e.g. MY_ARG)",
+            "Require a single all-lowercase word (e.g. arg)",
+            "Disable the argument-name check (function and variable checks may still run)"
+          ],
+          "default": "snake_case",
+          "description": "Required naming scheme for function formal arguments."
+        },
+        "raven.linting.objectNameSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report object-name violations as errors",
+            "Report object-name violations as warnings",
+            "Report object-name violations as information",
+            "Report object-name violations as hints",
+            "Disable the object-name lint entirely"
+          ],
+          "default": "hint",
+          "description": "Severity for the object-name lint. Set to \"off\" to disable the rule entirely, or set individual styles to \"any\" to disable specific symbol kinds."
         }
       }
     }

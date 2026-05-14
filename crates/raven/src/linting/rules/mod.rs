@@ -7,5 +7,6 @@
 pub(crate) mod assignment_operator;
 pub(crate) mod line_length;
 pub(crate) mod no_tab;
+pub(crate) mod object_name;
 pub(crate) mod trailing_blank_lines;
 pub(crate) mod trailing_whitespace;
