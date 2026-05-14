@@ -486,6 +486,46 @@ mod tests {
     }
 
     #[test]
+    fn object_name_respects_lsp_ignore_marker() {
+        let config = object_name_only_config();
+        // Same-line `# @lsp-ignore` and next-line `# @lsp-ignore-next`
+        // markers must suppress object-name diagnostics, same as `# nolint`.
+        // Sanity check that the new rule is wired through the shared
+        // `Suppressions` infrastructure.
+        let diags = lint(
+            "BadOne <- 1 # @lsp-ignore\n# @lsp-ignore-next\nBadTwo <- 2\nBadThree <- 3\n",
+            &config,
+        );
+        let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
+        assert!(!lines.contains(&0), "@lsp-ignore should suppress line 0: {:?}", diags);
+        assert!(!lines.contains(&2), "@lsp-ignore-next should suppress line 2: {:?}", diags);
+        assert!(lines.contains(&3), "unsuppressed line 3 should still flag: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_exempts_methods_of_dotted_generics() {
+        let config = object_name_only_config();
+        // Regression test for the unreachable-GENERICS bug: methods of
+        // generics that themselves contain dots (`as.Date`, `is.numeric`,
+        // `all.equal`, `fitted.values`) must be exempt. Previously the
+        // prefix-before-first-dot lookup yielded `"as"` / `"is"` / `"all"`
+        // (none in the allowlist), false-flagging legitimate S3 methods.
+        let src = "\
+as.Date.character <- function(x, ...) NULL
+as.numeric.MyClass <- function(x) NULL
+is.character.foo <- function(x) NULL
+all.equal.MyModel <- function(target, current, ...) NULL
+print.data.frame <- function(x, ...) NULL
+";
+        let diags = lint(src, &config);
+        assert!(
+            diags.is_empty(),
+            "methods of dotted/multi-part generics must be exempt: {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn object_name_severity_off_disables_rule() {
         let mut config = object_name_only_config();
         config.object_name_severity = None;

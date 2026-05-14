@@ -10,15 +10,24 @@
 //!
 //! * **Backtick-quoted names** (`` `with spaces` <- 1 ``, operator overloads
 //!   like `` `+.foo` <- function(x, y) ... ``) are skipped, matching lintr.
-//! * **S3 method dispatch**: when a function definition's name contains a `.`
-//!   and the suffix after the *first* dot starts with an uppercase letter, it
-//!   is treated as S3 method dispatch (`print.MyClass`, `format.Date`) and
-//!   exempted. Names that are entirely lowercase-with-dots are still checked
-//!   normally (they pass under `dotted.case` and fail under `snake_case`).
+//! * **S3 method dispatch**: a function definition whose name has the shape
+//!   `<generic>.<class>` is exempt when `<generic>` is a known base R S3
+//!   generic (see [`is_known_s3_generic`]). Every dot is tried as a possible
+//!   split point so methods of generics that themselves contain dots
+//!   (`as.Date.character`, `is.numeric.foo`) match; class names that contain
+//!   dots (`print.data.frame`) also match because the leftmost generic wins.
+//!   A leading `.` (hidden identifier convention) is stripped before the
+//!   lookup so hidden methods like `.print.MyClass` are still recognized.
+//!   Names with no recognized generic in any prefix (e.g. `foo.Bar`,
+//!   `my.func`) are checked normally.
+//! * **Leading-dot "hidden" names** (`.foo`, `.my_helper`, `.onLoad`) are
+//!   accepted under every scheme — an optional leading dot is stripped before
+//!   scheme classification, mirroring lintr.
 //! * **Non-ASCII identifiers** are skipped — case is locale-dependent and a
 //!   simple regex can't classify them.
 //! * **Named-argument `=`** (`f(name = value)`) is never an assignment target,
-//!   so it isn't checked.
+//!   so it isn't checked. `=` elsewhere (top level, function bodies, braced
+//!   blocks) *is* treated as assignment and the LHS is checked.
 //! * **Compound LHS** (`obj$field <- ...`, `obj[[i]] <- ...`) is skipped: the
 //!   assignment doesn't introduce a new symbol name.
 
@@ -257,16 +266,29 @@ fn should_skip_name(name: &str, kind: SymbolKind) -> bool {
         return true;
     }
     // S3 method dispatch: only relevant for function definitions. A name like
-    // `print.MyClass` is `<generic>.<ClassName>` — exempt when the part before
-    // the first dot is a *known* base R S3 generic (see [`is_known_s3_generic`]).
-    // Names whose prefix isn't a recognized generic (e.g. `foo.Bar`) are still
-    // checked: there's no signal that they're actually method dispatch rather
-    // than a quirky dotted name, and lintr similarly requires evidence (a
-    // `UseMethod` call or a known generic) before exempting.
+    // `print.MyClass` is `<generic>.<ClassName>` — exempt when some prefix
+    // ending at a dot is a *known* base R S3 generic (see
+    // [`is_known_s3_generic`]). Names whose prefix isn't a recognized generic
+    // (e.g. `foo.Bar`) are still checked: there's no signal that they're
+    // actually method dispatch rather than a quirky dotted name, and lintr
+    // similarly requires evidence (a `UseMethod` call or a known generic)
+    // before exempting.
+    //
+    // We scan *every* dot position rather than just the first because both
+    // generics and class names can themselves contain dots:
+    //
+    //   * `as.Date.character` — method of generic `as.Date` for `character`.
+    //     The first dot gives `as` (not a generic); the second gives the
+    //     match.
+    //   * `print.data.frame` — method of generic `print` for `data.frame`.
+    //     The first dot gives `print` (match), so we exit early.
+    //
+    // We also strip an optional leading `.` so hidden S3 methods like
+    // `.print.MyClass` resolve through `print`.
     if kind == SymbolKind::Function {
-        if let Some(dot) = name.find('.') {
-            let prefix = &name[..dot];
-            if is_known_s3_generic(prefix) {
+        let body = name.strip_prefix('.').unwrap_or(name);
+        for (i, c) in body.char_indices() {
+            if c == '.' && is_known_s3_generic(&body[..i]) {
                 return true;
             }
         }
@@ -495,6 +517,37 @@ mod tests {
         // Unknown prefix + capitalized suffix (regression for over-broad
         // exemption): `foo` is not a known generic, so `foo.Bar` is checked.
         assert!(!should_skip_name("foo.Bar", SymbolKind::Function));
+    }
+
+    #[test]
+    fn s3_method_detection_handles_dotted_generics() {
+        // Regression: `as.Date.character` is a method of generic `as.Date`
+        // for class `character`. Previously the prefix-before-first-dot
+        // lookup gave `"as"` (not in the list), so the method was wrongly
+        // flagged. The progressive-prefix scan tries `as`, then `as.Date`,
+        // and exempts on the second.
+        assert!(should_skip_name("as.Date.character", SymbolKind::Function));
+        assert!(should_skip_name("as.numeric.foo", SymbolKind::Function));
+        assert!(should_skip_name("is.character.MyClass", SymbolKind::Function));
+        assert!(should_skip_name("all.equal.default", SymbolKind::Function));
+        assert!(should_skip_name("fitted.values.MyModel", SymbolKind::Function));
+        // Class names containing dots also work because the leftmost matching
+        // generic wins.
+        assert!(should_skip_name("print.data.frame", SymbolKind::Function));
+        // Generic name itself (no class suffix) still requires at least one
+        // dot to be considered S3 — bare `as.Date` defining the generic is
+        // checked by the scheme (and would pass `dotted.case`).
+    }
+
+    #[test]
+    fn s3_method_detection_handles_hidden_methods() {
+        // Hidden S3 methods (`.print.MyClass`) — a leading `.` is stripped
+        // before the generic lookup, so `.print.MyClass` still resolves
+        // through `print`.
+        assert!(should_skip_name(".print.MyClass", SymbolKind::Function));
+        assert!(should_skip_name(".as.Date.character", SymbolKind::Function));
+        // `.foo.Bar` — `foo` is not a generic, so still flagged.
+        assert!(!should_skip_name(".foo.Bar", SymbolKind::Function));
     }
 
     #[test]
