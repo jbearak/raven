@@ -221,13 +221,13 @@
         "command": "raven.sourceFile",
         "key": "shift+ctrl+enter",
         "mac": "shift+cmd+enter",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)"
       },
       {
         "command": "raven.runCurrentChunk",
         "key": "ctrl+shift+enter",
         "mac": "cmd+shift+enter",
-        "when": "editorTextFocus && (editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+        "when": "editorTextFocus && raven.rConsoleEnabled && (editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/))"
       },
       {
         "command": "raven.runAboveChunks",
