@@ -382,6 +382,31 @@ mod tests {
     }
 
     #[test]
+    fn object_name_flags_dotted_function_with_unknown_generic_prefix() {
+        let config = object_name_only_config();
+        // `foo` is not a known base R S3 generic, so `foo.Bar` is *not*
+        // auto-exempted — the user gets a snake_case violation instead of a
+        // silent pass. Regression for the original over-broad heuristic that
+        // exempted any function name with an uppercase post-dot suffix.
+        let diags = lint("foo.Bar <- function() 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("Function name `foo.Bar`"));
+    }
+
+    #[test]
+    fn object_name_accepts_leading_dot_hidden_names() {
+        let config = object_name_only_config();
+        // R uses a leading `.` to mark "hidden" identifiers; lintr accepts
+        // it as decorative on every scheme. Don't flag `.foo`, `.my_var`, or
+        // `.helper <- function(...)`.
+        let diags = lint(
+            ".hidden_var <- 1\n.another_var <- 2\n.helper <- function(x_arg) x_arg\n",
+            &config,
+        );
+        assert!(diags.is_empty(), "leading-dot names should be allowed: {:?}", diags);
+    }
+
+    #[test]
     fn object_name_still_flags_non_dispatch_dotted_function() {
         let config = object_name_only_config();
         // All-lowercase dotted name is *not* method dispatch; under snake_case

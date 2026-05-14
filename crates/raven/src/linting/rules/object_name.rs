@@ -257,20 +257,60 @@ fn should_skip_name(name: &str, kind: SymbolKind) -> bool {
         return true;
     }
     // S3 method dispatch: only relevant for function definitions. A name like
-    // `print.MyClass` is `<generic>.<ClassName>` — the convention is that the
-    // class portion starts with an uppercase letter (`Date`, `POSIXct`,
-    // user-defined S3 classes). Names like `my.var.name` are still checked.
+    // `print.MyClass` is `<generic>.<ClassName>` — exempt when the part before
+    // the first dot is a *known* base R S3 generic (see [`is_known_s3_generic`]).
+    // Names whose prefix isn't a recognized generic (e.g. `foo.Bar`) are still
+    // checked: there's no signal that they're actually method dispatch rather
+    // than a quirky dotted name, and lintr similarly requires evidence (a
+    // `UseMethod` call or a known generic) before exempting.
     if kind == SymbolKind::Function {
         if let Some(dot) = name.find('.') {
-            let suffix = &name[dot + 1..];
-            if let Some(first) = suffix.chars().next() {
-                if first.is_ascii_uppercase() {
-                    return true;
-                }
+            let prefix = &name[..dot];
+            if is_known_s3_generic(prefix) {
+                return true;
             }
         }
     }
     false
+}
+
+/// Base R S3 generics whose `<generic>.<class>` methods are conventionally
+/// exempt from naming-style enforcement. The list is intentionally finite — if
+/// users define their own generic and want methods exempt, they can suppress
+/// the line with `# nolint` or `# @lsp-ignore`.
+///
+/// Sourced from base R's documented generics across `methods("...")` output
+/// for typical interactive sessions: print/format/summary family,
+/// statistical model accessors, coercion (`as.*`)/predicate (`is.*`) families,
+/// the group generics (`Ops`, `Math`, `Summary`, `Complex`), and a handful of
+/// commonly-extended utilities.
+fn is_known_s3_generic(name: &str) -> bool {
+    // Sorted alphabetically so `binary_search` works.
+    const GENERICS: &[&str] = &[
+        "AIC", "BIC", "Complex", "Math", "Ops", "Summary",
+        "all.equal", "anova", "as.Date", "as.POSIXct", "as.POSIXlt",
+        "as.character", "as.data.frame", "as.double", "as.environment",
+        "as.factor", "as.function", "as.integer", "as.list", "as.logical",
+        "as.matrix", "as.numeric", "as.vector",
+        "c", "cbind", "coef", "coefficients", "confint",
+        "deviance", "dim", "dimnames",
+        "fitted", "fitted.values", "format", "formula",
+        "head",
+        "is.character", "is.data.frame", "is.double", "is.environment",
+        "is.factor", "is.function", "is.integer", "is.list", "is.logical",
+        "is.matrix", "is.numeric", "is.vector",
+        "labels", "length", "levels", "logLik",
+        "mean", "merge",
+        "names", "nobs",
+        "plot", "predict", "print",
+        "range", "rbind", "residuals", "rev",
+        "simulate", "sort", "split", "str", "subset", "summary",
+        "t", "tail", "terms", "toString", "transform",
+        "unique",
+        "vcov",
+        "with", "within",
+    ];
+    GENERICS.binary_search(&name).is_ok()
 }
 
 fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
@@ -278,18 +318,29 @@ fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
         // Should already be handled by `should_skip_name`, but be defensive.
         return true;
     }
+    // R treats a leading dot as the "hidden identifier" marker (e.g. `.foo`).
+    // lintr accepts an optional leading dot for every scheme — match that so
+    // common idioms like `.my_helper` aren't flagged as snake_case violations.
+    // The body after the dot must still match the scheme's normal pattern,
+    // and we reject a bare `.` or `..something` to avoid swallowing the
+    // dots-in-name case.
+    let body = match name.strip_prefix('.') {
+        Some(rest) if !rest.starts_with('.') && !rest.is_empty() => rest,
+        Some(_) => return false,
+        None => name,
+    };
     match style {
         ObjectNameStyle::Any => true,
-        ObjectNameStyle::SnakeCase => is_snake_case(name),
-        ObjectNameStyle::CamelCase => is_camel_case(name),
-        ObjectNameStyle::DottedCase => is_dotted_case(name),
-        ObjectNameStyle::UpperCase => is_upper_case(name),
-        ObjectNameStyle::Lowercase => is_lowercase(name),
+        ObjectNameStyle::SnakeCase => is_snake_case(body),
+        ObjectNameStyle::CamelCase => is_camel_case(body),
+        ObjectNameStyle::DottedCase => is_dotted_case(body),
+        ObjectNameStyle::UpperCase => is_upper_case(body),
+        ObjectNameStyle::Lowercase => is_lowercase(body),
     }
 }
 
-fn is_snake_case(name: &str) -> bool {
-    let bytes = name.as_bytes();
+fn is_snake_case(body: &str) -> bool {
+    let bytes = body.as_bytes();
     bytes
         .first()
         .is_some_and(|b| b.is_ascii_lowercase())
@@ -298,16 +349,16 @@ fn is_snake_case(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
 }
 
-fn is_camel_case(name: &str) -> bool {
-    let bytes = name.as_bytes();
+fn is_camel_case(body: &str) -> bool {
+    let bytes = body.as_bytes();
     bytes
         .first()
         .is_some_and(|b| b.is_ascii_lowercase())
         && bytes.iter().all(|b| b.is_ascii_alphanumeric())
 }
 
-fn is_dotted_case(name: &str) -> bool {
-    let bytes = name.as_bytes();
+fn is_dotted_case(body: &str) -> bool {
+    let bytes = body.as_bytes();
     bytes
         .first()
         .is_some_and(|b| b.is_ascii_lowercase())
@@ -316,8 +367,8 @@ fn is_dotted_case(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.')
 }
 
-fn is_upper_case(name: &str) -> bool {
-    let bytes = name.as_bytes();
+fn is_upper_case(body: &str) -> bool {
+    let bytes = body.as_bytes();
     bytes
         .first()
         .is_some_and(|b| b.is_ascii_uppercase())
@@ -326,8 +377,8 @@ fn is_upper_case(name: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
 }
 
-fn is_lowercase(name: &str) -> bool {
-    let bytes = name.as_bytes();
+fn is_lowercase(body: &str) -> bool {
+    let bytes = body.as_bytes();
     bytes
         .first()
         .is_some_and(|b| b.is_ascii_lowercase())
@@ -432,12 +483,44 @@ mod tests {
 
     #[test]
     fn s3_method_detected_for_function_kind_only() {
+        // Prefix is a known base R generic — exempt.
         assert!(should_skip_name("print.MyClass", SymbolKind::Function));
         assert!(should_skip_name("format.Date", SymbolKind::Function));
-        // For variables, dotted names are checked normally.
+        assert!(should_skip_name("summary.lm", SymbolKind::Function));
+        // For variables, dotted names are checked normally — `print.MyClass`
+        // isn't a method definition when bound to a non-function value.
         assert!(!should_skip_name("print.MyClass", SymbolKind::Variable));
-        // All-lowercase dotted name is still checked, even for functions.
+        // All-lowercase dotted name with unknown prefix is still checked.
         assert!(!should_skip_name("my.func", SymbolKind::Function));
+        // Unknown prefix + capitalized suffix (regression for over-broad
+        // exemption): `foo` is not a known generic, so `foo.Bar` is checked.
+        assert!(!should_skip_name("foo.Bar", SymbolKind::Function));
+    }
+
+    #[test]
+    fn known_s3_generic_recognizes_base_r_generics() {
+        assert!(is_known_s3_generic("print"));
+        assert!(is_known_s3_generic("format"));
+        assert!(is_known_s3_generic("as.Date"));
+        assert!(is_known_s3_generic("Ops"));
+        assert!(!is_known_s3_generic("foo"));
+        assert!(!is_known_s3_generic(""));
+    }
+
+    #[test]
+    fn matches_scheme_accepts_leading_dot() {
+        // R's "hidden identifier" convention: a single leading dot is
+        // decorative, and the remainder must still match the scheme.
+        assert!(matches_scheme(".foo", ObjectNameStyle::SnakeCase));
+        assert!(matches_scheme(".foo_bar", ObjectNameStyle::SnakeCase));
+        assert!(matches_scheme(".fooBar", ObjectNameStyle::CamelCase));
+        assert!(matches_scheme(".FOO_BAR", ObjectNameStyle::UpperCase));
+        // Body after the dot still must match — `.FooBar` is not snake_case.
+        assert!(!matches_scheme(".FooBar", ObjectNameStyle::SnakeCase));
+        // Two leading dots (or more) is not the hidden convention; reject so
+        // we don't accidentally swallow ill-formed names.
+        assert!(!matches_scheme("..foo", ObjectNameStyle::SnakeCase));
+        assert!(!matches_scheme(".", ObjectNameStyle::SnakeCase));
     }
 
     #[test]
