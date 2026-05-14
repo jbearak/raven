@@ -12,14 +12,18 @@ import {
  *
  * Non-R chunks (e.g. `{python}`, `{bash}`) are skipped — they aren't executable
  * via the R console.
+ *
+ * Lens invalidation is left to VS Code: the editor automatically re-calls
+ * `provideCodeLenses` (with internal debouncing) after document edits, visible-
+ * range changes, and selector-matching scope shifts. Because our lenses depend
+ * only on the document text, we don't fire `onDidChangeCodeLenses` ourselves —
+ * doing so on every keystroke would bypass VS Code's coalescing and trigger an
+ * immediate recompute per edit. The optional event is declared (and disposed)
+ * to keep the provider future-proof for cases that need external invalidation.
  */
 class ChunkCodeLensProvider implements vscode.CodeLensProvider {
     private readonly _on_did_change = new vscode.EventEmitter<void>();
     readonly onDidChangeCodeLenses = this._on_did_change.event;
-
-    refresh(): void {
-        this._on_did_change.fire();
-    }
 
     dispose(): void {
         this._on_did_change.dispose();
@@ -73,11 +77,6 @@ export function register_chunk_codelens(context: vscode.ExtensionContext): Chunk
             provider,
         ),
         provider,
-    );
-    // Refresh lenses on document edits so they track newly added chunks.
-    // VS Code already coalesces CodeLens recomputation; we just fire the event.
-    context.subscriptions.push(
-        vscode.workspace.onDidChangeTextDocument(() => provider.refresh()),
     );
     return provider;
 }
