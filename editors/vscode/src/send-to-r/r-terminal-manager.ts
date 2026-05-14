@@ -90,6 +90,23 @@ export async function _clear_validation_state_for_test(): Promise<void> {
     }
 }
 
+/**
+ * Test-only: forget any cached terminal so the next `get_or_create_r_terminal()`
+ * goes through the full creation path. Used by integration suites that follow
+ * a suite which stubbed `vscode.window.createTerminal` and left the bundled
+ * extension caching a fake terminal whose `dispose()` is a no-op and which is
+ * invisible to `vscode.window.onDidCloseTerminal`. Without this hook the cache
+ * survives forever and downstream tests that need a real R session fail with
+ * a 60-second timeout because their `sendText` lands in the dead stub.
+ */
+export function _dispose_cached_r_terminal_for_test(): void {
+    profile_terminals.clear();
+    last_active_terminal = null;
+    creation_in_flight = null;
+    pending_profile_creation_count = 0;
+    pending_profile_session_ids.length = 0;
+}
+
 // Probes for the program in the user's interactive-login shell, where rc-file
 // PATH additions (conda, pyenv, asdf, homebrew shellenv) are visible — unlike
 // the extension host's process.env.PATH. Returns false on missing/timeout.

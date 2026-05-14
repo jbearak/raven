@@ -21,7 +21,7 @@ import { activate, sleep } from './helper';
 async function pollForPanel(
     api: RavenExtensionApi,
     panelName: string,
-    timeoutMs = 60000,
+    timeoutMs = 10000,
 ): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -63,6 +63,13 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         if (!ext.isActive) await ext.activate();
         api = ext.exports as RavenExtensionApi;
 
+        // Earlier suites (notably chunks.test.ts) stub `vscode.window.createTerminal`
+        // to return a recording fake. The bundled extension caches the first
+        // terminal it sees and never re-creates, and the fake is invisible to
+        // `onDidCloseTerminal`, so without resetting here every `sendToRTerminal`
+        // below would land in the dead stub and no panel would ever appear.
+        api._disposeCachedRTerminalForTest();
+
         // Small wait for the async data-viewer setup (mkdir + stale sweep) that
         // runs after activate() returns.
         await sleep(500);
@@ -76,7 +83,7 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         await api.sendToRTerminal('View(mtcars)');
 
         const appeared = await pollForPanel(api, 'mtcars');
-        assert.ok(appeared, 'data viewer panel "mtcars" did not appear within 60 s');
+        assert.ok(appeared, 'data viewer panel "mtcars" did not appear');
 
         const cols = api.getDataViewerPanelColumnNames('mtcars');
         assert.ok(Array.isArray(cols), 'expected column names array for "mtcars" panel');

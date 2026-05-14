@@ -26,6 +26,7 @@ import {
     register_send_to_r_commands,
     register_inspection_commands,
     get_or_create_r_terminal,
+    _dispose_cached_r_terminal_for_test,
 } from './send-to-r';
 import { register_build_commands } from './build-commands';
 import {
@@ -129,6 +130,14 @@ export interface RavenExtensionApi {
     getDataViewerPanelNames(): string[];
     /** Column names for a named data viewer panel. Used by integration tests. */
     getDataViewerPanelColumnNames(panelName: string): string[] | undefined;
+    /**
+     * Test-only: forget the bundled extension's cached R terminal so the next
+     * `sendToRTerminal` recreates it through the real `createTerminal` path.
+     * Needed by integration suites that follow another suite which stubbed
+     * `vscode.window.createTerminal` — that stub's fake terminal is invisible
+     * to `onDidCloseTerminal` and would otherwise be reused indefinitely.
+     */
+    _disposeCachedRTerminalForTest(): void;
 }
 
 export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
@@ -352,6 +361,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         getDataViewerPanelNames: () => data_viewer_manager?.getPanelNames() ?? [],
         getDataViewerPanelColumnNames: (panelName: string) =>
             data_viewer_manager?.getPanelColumnNames(panelName),
+        _disposeCachedRTerminalForTest: () => _dispose_cached_r_terminal_for_test(),
     };
 }
 
