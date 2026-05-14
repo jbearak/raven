@@ -277,6 +277,116 @@ describe('detect_chunks — .R cell markers', () => {
         expect(chunks[0].header_line).toBe(0);
         expect(chunks[0].end_line).toBe(0);
     });
+
+    test('section divider line ends the current cell (cell-end only, not cell-start)', () => {
+        const src = lines([
+            '# %% one',
+            'x <- 1',
+            '# Section ====',
+            'y <- 2',
+            '# %% two',
+            'z <- 3',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(2);
+        // Cell 1 ends at the section divider line itself (line 2).
+        expect(chunks[0].header_line).toBe(0);
+        expect(chunks[0].end_line).toBe(2);
+        // Cell 2 starts at its own # %% header. The orphan `y <- 2` line between
+        // the section divider and `# %% two` is NOT part of any cell.
+        expect(chunks[1].header_line).toBe(4);
+        expect(chunks[1].end_line).toBe(5);
+    });
+
+    test('section divider with dashes ends the cell, orphan content between is excluded', () => {
+        const src = lines([
+            '# %% Load',
+            'library(dplyr)',
+            '# Setup ----',
+            'helper <- 1',
+            '# %% Transform',
+            'x <- 1',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(2);
+        expect(chunks[0].header_line).toBe(0);
+        // Cell 1 ends at the divider on line 2; `helper <- 1` is orphan.
+        expect(chunks[0].end_line).toBe(2);
+        expect(chunks[1].header_line).toBe(4);
+        expect(chunks[1].end_line).toBe(5);
+    });
+
+    test('section divider with hashes ends the cell, orphan content between is excluded', () => {
+        const src = lines([
+            '# %% First',
+            'a <- 1',
+            '## Section #####',
+            'orphan <- 1',
+            '# %% Second',
+            'b <- 2',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(2);
+        expect(chunks[0].end_line).toBe(2);
+        expect(chunks[1].header_line).toBe(4);
+        expect(chunks[1].end_line).toBe(5);
+    });
+
+    test('section divider before any # %% is not a chunk by itself', () => {
+        const src = lines([
+            '# Setup ----',
+            'x <- 1',
+            '# %% main',
+            'y <- 2',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        // Section divider doesn't start a cell; the only cell is `# %% main`.
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].header_line).toBe(2);
+        expect(chunks[0].end_line).toBe(3);
+    });
+
+    test('line that matches both # %% and section divider is treated as cell marker', () => {
+        // `# %% ====` matches both regexes; cell marker takes priority so it
+        // becomes a new cell header, not a cell-end of the prior cell.
+        const src = lines([
+            '# %% one',
+            'x <- 1',
+            '# %% ====',
+            'y <- 2',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(2);
+        expect(chunks[0].header_line).toBe(0);
+        expect(chunks[0].end_line).toBe(1);
+        expect(chunks[1].header_line).toBe(2);
+        expect(chunks[1].end_line).toBe(3);
+    });
+
+    test('section divider requires at least 4 boundary characters', () => {
+        // `# Title ===` has only 3 `=` — not a section divider.
+        const src = lines([
+            '# %% one',
+            '# Title ===',
+            'x <- 1',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(1);
+        // The `# Title ===` line is part of cell 1, not a boundary.
+        expect(chunks[0].end_line).toBe(2);
+    });
+
+    test('section divider on the last line ends the cell at EOF', () => {
+        const src = lines([
+            '# %% one',
+            'x <- 1',
+            '# End ====',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].header_line).toBe(0);
+        expect(chunks[0].end_line).toBe(2);
+    });
 });
 
 describe('find_chunk_at_line', () => {
