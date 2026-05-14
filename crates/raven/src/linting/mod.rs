@@ -11,6 +11,8 @@
 //!   the first tab on that line.
 //! * `trailing_blank_lines` — blank lines at the very end of the file.
 //! * `assignment_operator` — enforce `<-` (or `=`) for top-level assignment.
+//! * `object_name` — enforce a naming scheme (snake_case, camelCase, etc.)
+//!   on assignment targets and function arguments.
 //!
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
@@ -25,7 +27,7 @@ mod rules;
 use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 
-pub use self::config::{AssignmentOperatorStyle, LintConfig};
+pub use self::config::{AssignmentOperatorStyle, LintConfig, ObjectNameStyle};
 
 /// Source identifier set on every diagnostic produced by this module.
 ///
@@ -63,6 +65,20 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
             text,
             tree_root,
             config.assignment_operator_style,
+            sev,
+            &suppressions,
+            &mut out,
+        );
+    }
+    if let Some(sev) = config.object_name_severity {
+        rules::object_name::collect(
+            text,
+            tree_root,
+            rules::object_name::ObjectNameStyles {
+                function: config.object_name_style_function,
+                variable: config.object_name_style_variable,
+                argument: config.object_name_style_argument,
+            },
             sev,
             &suppressions,
             &mut out,
@@ -303,6 +319,218 @@ mod tests {
         assert!(!lines.contains(&2));
         assert!(!lines.contains(&3));
         assert!(lines.contains(&5));
+    }
+
+    fn object_name_only_config() -> LintConfig {
+        LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            assignment_operator_severity: None,
+            ..enabled_config()
+        }
+    }
+
+    #[test]
+    fn object_name_flags_camelcase_variable_under_snake_case() {
+        let config = object_name_only_config();
+        let diags = lint("myVar <- 1\n", &config);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {:?}", diags);
+        assert!(diags[0].message.contains("Variable name `myVar`"));
+        assert!(diags[0].message.contains("snake_case"));
+    }
+
+    #[test]
+    fn object_name_accepts_snake_case() {
+        let config = object_name_only_config();
+        let diags = lint("my_var <- 1\nmy_func <- function(x_arg, y_arg) x_arg + y_arg\n", &config);
+        assert!(diags.is_empty(), "snake_case names should pass: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_flags_function_name() {
+        let config = object_name_only_config();
+        let diags = lint("MyFunc <- function() 1\n", &config);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("Function name `MyFunc`"));
+    }
+
+    #[test]
+    fn object_name_flags_argument_names() {
+        let config = object_name_only_config();
+        let diags = lint("f <- function(badArg, goodArg, other) 1\n", &config);
+        // Two camelCase args should be flagged; `other` is fine.
+        let arg_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Argument name"))
+            .collect();
+        assert_eq!(arg_diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_exempts_s3_method_dispatch() {
+        let config = object_name_only_config();
+        // `print.MyClass <- function(x, ...) ...` is S3 dispatch; the function
+        // name must not be flagged even though it isn't snake_case.
+        let diags = lint("print.MyClass <- function(x, ...) NULL\n", &config);
+        let fn_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Function name"))
+            .collect();
+        assert!(fn_diags.is_empty(), "S3 method should be exempt: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_flags_dotted_function_with_unknown_generic_prefix() {
+        let config = object_name_only_config();
+        // `foo` is not a known base R S3 generic, so `foo.Bar` is *not*
+        // auto-exempted — the user gets a snake_case violation instead of a
+        // silent pass. Regression for the original over-broad heuristic that
+        // exempted any function name with an uppercase post-dot suffix.
+        let diags = lint("foo.Bar <- function() 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("Function name `foo.Bar`"));
+    }
+
+    #[test]
+    fn object_name_accepts_leading_dot_hidden_names() {
+        let config = object_name_only_config();
+        // R uses a leading `.` to mark "hidden" identifiers; lintr accepts
+        // it as decorative on every scheme. Don't flag `.foo`, `.my_var`, or
+        // `.helper <- function(...)`.
+        let diags = lint(
+            ".hidden_var <- 1\n.another_var <- 2\n.helper <- function(x_arg) x_arg\n",
+            &config,
+        );
+        assert!(diags.is_empty(), "leading-dot names should be allowed: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_still_flags_non_dispatch_dotted_function() {
+        let config = object_name_only_config();
+        // All-lowercase dotted name is *not* method dispatch; under snake_case
+        // it's still a violation (the dot is not a snake_case separator).
+        let diags = lint("my.func <- function() 1\n", &config);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("Function name `my.func`"));
+    }
+
+    #[test]
+    fn object_name_skips_named_arguments() {
+        let config = object_name_only_config();
+        // `myArg` is a parameter name (flag), and `someArg = 1` inside the
+        // function call is a named argument (no flag). Net: one diagnostic.
+        let diags = lint("f <- function(myArg) g(someArg = 1)\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("Argument name `myArg`"));
+    }
+
+    #[test]
+    fn object_name_skips_compound_lhs() {
+        let config = object_name_only_config();
+        // `obj$badName <- 1` doesn't introduce a new symbol — just updates a
+        // field. Should not flag.
+        let diags = lint("obj$badName <- 1\n", &config);
+        assert!(diags.is_empty(), "compound LHS should be skipped: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_skips_backtick_quoted_names() {
+        let config = object_name_only_config();
+        let diags = lint("`with spaces` <- 1\n", &config);
+        assert!(diags.is_empty(), "backtick names should be skipped: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_camel_case_style_flags_snake_case() {
+        let mut config = object_name_only_config();
+        config.object_name_style_variable = ObjectNameStyle::CamelCase;
+        let diags = lint("my_var <- 1\n", &config);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("camelCase"));
+    }
+
+    #[test]
+    fn object_name_any_disables_specific_kind() {
+        let mut config = object_name_only_config();
+        config.object_name_style_function = ObjectNameStyle::Any;
+        // Variable is still checked, function is not.
+        let diags = lint("BadName <- function() badVar <- 1\n", &config);
+        // BadName (function): exempt; badVar (variable inside function): flagged.
+        let fn_diags = diags
+            .iter()
+            .filter(|d| d.message.contains("Function name"))
+            .count();
+        let var_diags = diags
+            .iter()
+            .filter(|d| d.message.contains("Variable name"))
+            .count();
+        assert_eq!(fn_diags, 0);
+        assert_eq!(var_diags, 1);
+    }
+
+    #[test]
+    fn object_name_respects_arrow_right_assignment() {
+        let config = object_name_only_config();
+        let diags = lint("1 -> BadName\n", &config);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("Variable name `BadName`"));
+    }
+
+    #[test]
+    fn object_name_respects_nolint_marker() {
+        let config = object_name_only_config();
+        let diags = lint("BadName <- 1 # nolint\n", &config);
+        assert!(diags.is_empty(), "nolint should suppress: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_respects_lsp_ignore_marker() {
+        let config = object_name_only_config();
+        // Same-line `# @lsp-ignore` and next-line `# @lsp-ignore-next`
+        // markers must suppress object-name diagnostics, same as `# nolint`.
+        // Sanity check that the new rule is wired through the shared
+        // `Suppressions` infrastructure.
+        let diags = lint(
+            "BadOne <- 1 # @lsp-ignore\n# @lsp-ignore-next\nBadTwo <- 2\nBadThree <- 3\n",
+            &config,
+        );
+        let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
+        assert!(!lines.contains(&0), "@lsp-ignore should suppress line 0: {:?}", diags);
+        assert!(!lines.contains(&2), "@lsp-ignore-next should suppress line 2: {:?}", diags);
+        assert!(lines.contains(&3), "unsuppressed line 3 should still flag: {:?}", diags);
+    }
+
+    #[test]
+    fn object_name_exempts_methods_of_dotted_generics() {
+        let config = object_name_only_config();
+        // Regression test for the unreachable-GENERICS bug: methods of
+        // generics that themselves contain dots (`as.Date`, `is.numeric`,
+        // `all.equal`, `fitted.values`) must be exempt. Previously the
+        // prefix-before-first-dot lookup yielded `"as"` / `"is"` / `"all"`
+        // (none in the allowlist), false-flagging legitimate S3 methods.
+        let src = "\
+as.Date.character <- function(x, ...) NULL
+as.numeric.MyClass <- function(x) NULL
+is.character.foo <- function(x) NULL
+all.equal.MyModel <- function(target, current, ...) NULL
+print.data.frame <- function(x, ...) NULL
+";
+        let diags = lint(src, &config);
+        assert!(
+            diags.is_empty(),
+            "methods of dotted/multi-part generics must be exempt: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn object_name_severity_off_disables_rule() {
+        let mut config = object_name_only_config();
+        config.object_name_severity = None;
+        let diags = lint("BadName <- 1\n", &config);
+        assert!(diags.is_empty());
     }
 
     #[test]

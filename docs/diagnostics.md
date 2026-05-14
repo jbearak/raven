@@ -59,8 +59,11 @@ Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-li
 | Tab character | hint | Tab character anywhere in source |
 | Trailing blank lines | hint | Blank lines at end of file, or missing final newline |
 | Assignment operator | hint | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
+| Object name | hint | Function, variable, or argument name doesn't match the configured naming scheme (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*`) |
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
+
+The object-name lint has independent style settings for **functions**, **variables**, and **arguments**. Each accepts `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any` (which disables that specific kind without disabling the rule entirely). An optional leading `.` (R's "hidden identifier" convention — e.g. `.helper`, `.config`) is accepted under every scheme; the body after the dot must still match. Function definitions whose name has the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic — this includes methods of single-word generics (`print.MyClass`, `format.Date`, `summary.lm`) as well as methods of generics that themselves contain a dot (`as.Date.character`, `is.numeric.foo`, `all.equal.default`); class names with dots (`print.data.frame`) also match. For less-common generics, use `# nolint` or `# @lsp-ignore` on the definition. Backtick-quoted names (e.g. `` `with spaces` <- 1 ``, operator overloads like `` `+.MyClass` <- function(x, y) ... ``) and non-ASCII identifiers are also skipped.
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 
