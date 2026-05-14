@@ -93,6 +93,13 @@ jobs:
       # skipping. `r-base-core` is the minimal install; tests that need
       # specific packages (e.g. `arrow` for the data-viewer suite) still
       # skip themselves when those packages aren't installed.
+      #
+      # `r-cran-plyr` is needed by the cross-file LSP test
+      # (`lsp.test.ts: cross-file: sibling package propagation …`): the
+      # LSP's libpath scan must know `plyr` exports `ddply` before it can
+      # suppress the undefined-variable diagnostic that the test asserts
+      # against. Other widely-used CRAN packages can be added here as
+      # the suite grows.
       - name: Install Xvfb, Electron runtime deps, and R
         run: |
           sudo apt-get update
@@ -108,7 +115,8 @@ jobs:
             libgbm1 \
             libsecret-1-0 \
             xdg-utils \
-            r-base-core
+            r-base-core \
+            r-cran-plyr
 
       - name: Build LSP binary (release)
         run: cargo build --release -p raven
