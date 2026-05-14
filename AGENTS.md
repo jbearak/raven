@@ -15,6 +15,7 @@ User-facing:
 - `docs/indentation.md`
 - `docs/syntax-highlighting.md`
 - `docs/r-console.md`
+- `docs/chunks.md`
 - `docs/plot-viewer.md`
 - `docs/data-viewer.md`
 - `docs/help-viewer.md`
