@@ -1344,7 +1344,7 @@
     "compile": "bun run bundle",
     "compile:test": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "bun run compile:test",
+    "pretest": "bun run compile:test && bun run bundle",
     "test": "vscode-test",
     "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
     "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
