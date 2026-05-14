@@ -63,7 +63,13 @@ Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-li
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
 
-The object-name lint has independent style settings for **functions**, **variables**, and **arguments**. Each accepts `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any` (which disables that specific kind without disabling the rule entirely). An optional leading `.` (R's "hidden identifier" convention — e.g. `.helper`, `.config`) is accepted under every scheme; the body after the dot must still match. Function definitions whose name has the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic — this includes methods of single-word generics (`print.MyClass`, `format.Date`, `summary.lm`) as well as methods of generics that themselves contain a dot (`as.Date.character`, `is.numeric.foo`, `all.equal.default`); class names with dots (`print.data.frame`) also match. For less-common generics, use `# nolint` or `# @lsp-ignore` on the definition. Backtick-quoted names (e.g. `` `with spaces` <- 1 ``, operator overloads like `` `+.MyClass` <- function(x, y) ... ``) and non-ASCII identifiers are also skipped.
+The object-name lint has independent style settings for **functions** (`objectNameStyleFunction`), **variables** (`objectNameStyleVariable`), and **arguments** (`objectNameStyleArgument`). Each accepts `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Using `any` accepts all names for that kind — since the three are checked independently, you can enforce a style on two while opting out of the third.
+
+> [!NOTE]
+> Some names are always accepted regardless of the configured style:
+> - An optional leading `.` is always valid; the rest of the name must still match (e.g. `.helper` under `snake_case` is fine, `.myHelper` is not).
+> - Function definitions with the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic (`print.MyClass`, `as.Date.character`, `print.data.frame`, etc.). For less-common generics, use `# nolint` or `# @lsp-ignore`.
+> - Backtick-quoted names (e.g. `` `with spaces` ``, `` `+.MyClass` ``) and non-ASCII identifiers are skipped entirely.
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 
