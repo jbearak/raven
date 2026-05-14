@@ -8,6 +8,13 @@ export interface InspectionCommand {
     wrap: (expr: string) => string;
 }
 
+// Languages where the quick-inspect commands are available. R Markdown and
+// Quarto are included because R chunks inside them contain ordinary R
+// identifiers — the cursor-word path lets users inspect a variable without
+// hopping to a `.R` file. Outside a chunk the wrapped expression will
+// usually fail in R, which is acceptable user-responsibility.
+const INSPECTION_LANGUAGES: ReadonlySet<string> = new Set(['r', 'rmd', 'quarto']);
+
 export const INSPECTION_COMMANDS: InspectionCommand[] = [
     {
         id: 'raven.inspect.nrow',
@@ -60,9 +67,9 @@ export function register_inspection_commands(
         context.subscriptions.push(
             vscode.commands.registerCommand(cmd.id, async () => {
                 const editor = vscode.window.activeTextEditor;
-                if (!editor || editor.document.languageId !== 'r') {
+                if (!editor || !INSPECTION_LANGUAGES.has(editor.document.languageId)) {
                     vscode.window.showInformationMessage(
-                        'Open an R file to use quick inspection commands.'
+                        'Open an R, R Markdown, or Quarto file to use quick inspection commands.'
                     );
                     return;
                 }

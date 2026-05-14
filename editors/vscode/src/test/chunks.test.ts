@@ -56,17 +56,16 @@ const TEMP_FIXTURE_FILES: string[] = [];
 
 /**
  * Open a document with the supplied content for the chunk detector:
- *   - `'rmd'` (default) — RMarkdown / Quarto fenced-block mode. Written
- *     to a temp `.rmd` file so the chunk classifier's URI-extension path
- *     reliably classifies it as `'rmd'`. An untitled buffer with
- *     `language: 'rmd'` would also work in principle (the classifier
- *     accepts the `'rmd'` languageId), but VS Code does not always
- *     preserve unregistered languageIds across platforms — the extension
- *     only contributes `'r'`, and on Linux VS Code 1.120 the languageId
- *     gets coerced away from `'rmd'`, breaking classification.
+ *   - `'rmd'` (default) — R Markdown / Quarto fenced-block mode. Written
+ *     to a temp `.rmd` file so the URI-extension path of the classifier
+ *     fires reliably. The extension now contributes the `'rmd'` language
+ *     ID natively (so the languageId path would work too), but a real
+ *     `.rmd` file exercises both paths and sidesteps a Linux VS Code
+ *     1.120 quirk where untitled buffers can drop a freshly-contributed
+ *     languageId when the extension host hasn't loaded yet.
  *   - `'r'` — plain R / `# %%` cell-marker mode. Uses an untitled buffer
- *     because the extension registers the `'r'` languageId, so it
- *     survives the round-trip.
+ *     because `'r'` has been a registered languageId since day one and
+ *     reliably survives the round-trip.
  */
 async function open_doc(
     content: string,
@@ -113,6 +112,29 @@ function stub_information_message(): MessageStub {
 interface TerminalStub {
     sent: string[];
     restore(): void;
+}
+
+/**
+ * Names the bundled R terminal uses today (`r-terminal-manager.ts`
+ * `TERMINAL_NAME`). We dispose any pre-existing terminal with this name
+ * before installing the recording stub so the bundled extension's
+ * module-level cache doesn't hold a real terminal created by an earlier
+ * test suite (e.g. the data-viewer smoke tests).
+ */
+const RAVEN_R_TERMINAL_NAME = 'R (Raven)';
+
+async function dispose_any_cached_r_terminal(): Promise<void> {
+    const stale = vscode.window.terminals.filter(
+        (t) => t.name === RAVEN_R_TERMINAL_NAME,
+    );
+    if (stale.length === 0) return;
+    for (const t of stale) {
+        t.dispose();
+    }
+    // `dispose()` resolves before `onDidCloseTerminal` fires inside the
+    // bundled extension and clears its `last_active_terminal` cache, so
+    // wait a tick for that handler to run.
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
 }
 
 /**
@@ -290,6 +312,11 @@ suite('chunk commands: registration and behavior', () => {
         if (r_console_disabled) return;
         const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the "second" R chunk
+        // Dispose any R terminal a preceding test (e.g. data-viewer smoke
+        // tests, which surface `View()` panels and may create an R terminal
+        // in the process) left behind. Otherwise the bundled extension
+        // returns its cached real terminal and the stub never captures.
+        await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
             await vscode.commands.executeCommand('raven.runCurrentChunk');

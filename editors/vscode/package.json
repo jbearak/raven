@@ -18,6 +18,8 @@
   ],
   "activationEvents": [
     "onLanguage:r",
+    "onLanguage:rmd",
+    "onLanguage:quarto",
     "onLanguage:jags",
     "onLanguage:stan",
     "onTerminalProfile:raven.rTerminal"
@@ -213,37 +215,37 @@
         "command": "raven.runLineOrSelection",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
         "command": "raven.sourceFile",
         "key": "shift+ctrl+enter",
         "mac": "shift+cmd+enter",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)"
       },
       {
         "command": "raven.runCurrentChunk",
         "key": "ctrl+shift+enter",
         "mac": "cmd+shift+enter",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/"
+        "when": "editorTextFocus && raven.rConsoleEnabled && (editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/))"
       },
       {
         "command": "raven.runAboveChunks",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
         "command": "raven.goToNextChunk",
         "key": "ctrl+alt+n",
         "mac": "cmd+alt+n",
-        "when": "editorTextFocus && editorLangId == r"
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto)"
       },
       {
         "command": "raven.goToPreviousChunk",
         "key": "ctrl+alt+shift+n",
         "mac": "cmd+alt+shift+n",
-        "when": "editorTextFocus && editorLangId == r"
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto)"
       }
     ],
     "submenus": [
@@ -292,12 +294,12 @@
       "editor/title": [
         {
           "submenu": "raven.sendToR",
-          "when": "editorLangId == r && raven.rConsoleEnabled",
+          "when": "(editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled",
           "group": "navigation"
         },
         {
           "submenu": "raven.build",
-          "when": "editorLangId == r && raven.rConsoleEnabled && raven.isRPackage",
+          "when": "(editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled && raven.isRPackage",
           "group": "navigation"
         }
       ],
@@ -401,10 +403,30 @@
         ],
         "extensions": [
           ".r",
-          ".R",
+          ".R"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "rmd",
+        "aliases": [
+          "R Markdown",
+          "rmd"
+        ],
+        "extensions": [
           ".rmd",
           ".Rmd",
-          ".RMD",
+          ".RMD"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "quarto",
+        "aliases": [
+          "Quarto",
+          "quarto"
+        ],
+        "extensions": [
           ".qmd",
           ".Qmd",
           ".QMD"
@@ -526,8 +548,20 @@
         "path": "./snippets/r.json"
       },
       {
-        "language": "r",
+        "language": "rmd",
+        "path": "./snippets/r.json"
+      },
+      {
+        "language": "rmd",
         "path": "./snippets/rmarkdown.json"
+      },
+      {
+        "language": "quarto",
+        "path": "./snippets/r.json"
+      },
+      {
+        "language": "quarto",
+        "path": "./snippets/quarto.json"
       }
     ],
     "problemMatchers": [
@@ -553,6 +587,12 @@
     ],
     "configurationDefaults": {
       "[r]": {
+        "editor.formatOnType": true
+      },
+      "[rmd]": {
+        "editor.formatOnType": true
+      },
+      "[quarto]": {
         "editor.formatOnType": true
       }
     },

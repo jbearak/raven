@@ -1,33 +1,40 @@
 {
-  "rmarkdown-r-chunk": {
+  "quarto-r-chunk": {
     "prefix": "rchunk",
     "body": [
-      "```{r ${1:label}}",
+      "```{r}",
+      "#| label: ${1:label}",
       "$0",
       "```"
     ],
-    "description": "R code chunk (R Markdown)"
+    "description": "R code chunk (Quarto)"
   },
-  "rmarkdown-r-chunk-opts": {
+  "quarto-r-chunk-opts": {
     "prefix": "rchunkopts",
     "body": [
-      "```{r ${1:label}, echo = ${2:FALSE}, message = ${3:FALSE}, warning = ${4:FALSE}}",
+      "```{r}",
+      "#| label: ${1:label}",
+      "#| echo: ${2|false,true|}",
+      "#| message: ${3|false,true|}",
+      "#| warning: ${4|false,true|}",
       "$0",
       "```"
     ],
-    "description": "R code chunk with common knitr options"
+    "description": "R code chunk with common Quarto options"
   },
-  "rmarkdown-setup-chunk": {
+  "quarto-setup-chunk": {
     "prefix": "setupchunk",
     "body": [
-      "```{r setup, include = FALSE}",
+      "```{r}",
+      "#| label: setup",
+      "#| include: false",
       "knitr::opts_chunk\\$set(echo = ${1:TRUE})",
       "$0",
       "```"
     ],
-    "description": "knitr setup chunk"
+    "description": "Quarto setup chunk"
   },
-  "rmarkdown-python-chunk": {
+  "quarto-python-chunk": {
     "prefix": "pychunk",
     "body": [
       "```{python}",
@@ -36,7 +43,7 @@
     ],
     "description": "Python code chunk"
   },
-  "rmarkdown-sql-chunk": {
+  "quarto-sql-chunk": {
     "prefix": "sqlchunk",
     "body": [
       "```{sql connection=${1:con}}",
@@ -45,7 +52,7 @@
     ],
     "description": "SQL code chunk"
   },
-  "rmarkdown-bash-chunk": {
+  "quarto-bash-chunk": {
     "prefix": "bashchunk",
     "body": [
       "```{bash}",
@@ -54,30 +61,30 @@
     ],
     "description": "Bash code chunk"
   },
-  "rmarkdown-yaml": {
-    "prefix": "rmdyaml",
+  "quarto-yaml": {
+    "prefix": "qyaml",
     "body": [
       "---",
       "title: \"${1:Title}\"",
       "author: \"${2:Author}\"",
-      "date: \"`r format(Sys.time(), '%Y-%m-%d')`\"",
-      "output: ${3|html_document,pdf_document,word_document|}",
+      "date: today",
+      "format: ${3|html,pdf,docx,revealjs|}",
       "---",
       "$0"
     ],
-    "description": "R Markdown YAML frontmatter"
+    "description": "Quarto YAML frontmatter"
   },
-  "rmarkdown-include-graphics": {
+  "quarto-include-graphics": {
     "prefix": "incgraphics",
     "body": "knitr::include_graphics(${0:\"path/to/img.png\"})",
     "description": "knitr::include_graphics()"
   },
-  "rmarkdown-kable": {
+  "quarto-kable": {
     "prefix": "kable",
     "body": "knitr::kable(${1:df}, caption = ${0:\"Caption\"})",
     "description": "knitr::kable()"
   },
-  "rmarkdown-inline-r": {
+  "quarto-inline-r": {
     "prefix": "inliner",
     "body": "`r ${0:expr}`",
     "description": "Inline R expression"

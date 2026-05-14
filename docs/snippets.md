@@ -14,12 +14,14 @@ For the exact trigger list and expansion bodies, see `editors/vscode/snippets/r.
 
 ## R Markdown and Quarto
 
-Raven registers snippets for VS Code's `r` language ID. Since `.rmd` and `.qmd` files are treated as R documents, both the plain R snippets above and an R Markdown / Quarto set are available in those buffers.
+Raven contributes dedicated `rmd` and `quarto` language IDs for `.Rmd` and `.qmd` files. Both also register the plain-R snippets from `r.json`, so `for` / `fun` / `if` etc. still expand inside `.Rmd` / `.qmd` buffers — typically what you want when the cursor sits inside an R chunk.
 
-The R Markdown / Quarto set covers:
+The R Markdown set (`rmd`) adds:
 
 - Code chunks: `rchunk`, `rchunkopts`, `setupchunk`, `pychunk`, `sqlchunk`, `bashchunk`
-- YAML frontmatter: `rmdyaml`, `qyaml`
+- YAML frontmatter: `rmdyaml`
 - knitr helpers: `kable`, `incgraphics`, `inliner`
 
-For the exact trigger list and expansion bodies, see `editors/vscode/snippets/rmarkdown.json`.
+The Quarto set (`quarto`) covers the same chunk and helper triggers, but `rchunk` / `rchunkopts` / `setupchunk` use the Quarto `#| key: value` option syntax, and the YAML snippet is `qyaml`.
+
+For the exact trigger list and expansion bodies, see `editors/vscode/snippets/rmarkdown.json` and `editors/vscode/snippets/quarto.json`.

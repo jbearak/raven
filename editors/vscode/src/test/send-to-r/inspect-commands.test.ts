@@ -141,8 +141,8 @@ suite('quick inspection commands', () => {
             (vscode.window as any).showInformationMessage = original;
         }
         assert.ok(
-            last_message && last_message.includes('R file'),
-            `expected an info message about opening an R file, got: ${String(last_message)}`
+            last_message && /R Markdown|Quarto|R file|R, /.test(last_message),
+            `expected an info message about opening an R-flavored file, got: ${String(last_message)}`
         );
     });
 });

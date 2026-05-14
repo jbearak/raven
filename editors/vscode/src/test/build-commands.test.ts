@@ -146,7 +146,15 @@ suite('build commands: package.json contributions', () => {
         const when = buildEntry.when ?? '';
         assert.ok(when.includes('raven.isRPackage'), 'submenu must be gated on raven.isRPackage');
         assert.ok(when.includes('raven.rConsoleEnabled'), 'submenu must require r-console activation');
-        assert.ok(when.includes("editorLangId == r"), 'submenu must require an R file');
+        // The submenu surfaces in the title bar for any of the three
+        // R-flavored language IDs (plain R, R Markdown, Quarto) since
+        // package vignettes and READMEs are commonly .Rmd / .qmd files.
+        assert.ok(
+            when.includes('editorLangId == r')
+                && when.includes('editorLangId == rmd')
+                && when.includes('editorLangId == quarto'),
+            `submenu must allow r / rmd / quarto language IDs, got: ${when}`,
+        );
         assert.strictEqual(buildEntry.group, 'navigation');
     });
 

@@ -18,6 +18,12 @@ suite('Extension Helpers', () => {
         assert.strictEqual(isRDocument(makeUntitledDocument('r')), true);
         assert.strictEqual(isRDocument(makeUntitledDocument('jags')), true);
         assert.strictEqual(isRDocument(makeUntitledDocument('stan')), true);
+        // R Markdown and Quarto are tracked under their own language IDs but
+        // the LSP server does not parse them, so they intentionally do NOT
+        // count as "R documents" for activity-tracking / path-completion-
+        // trigger purposes.
+        assert.strictEqual(isRDocument(makeUntitledDocument('rmd')), false);
+        assert.strictEqual(isRDocument(makeUntitledDocument('quarto')), false);
         assert.strictEqual(isRDocument(makeUntitledDocument('plaintext')), false);
     });
 
@@ -31,9 +37,12 @@ suite('Extension Helpers', () => {
         });
 
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/script.R')), true);
-        assert.strictEqual(isRDocument(makeFileDocument('/tmp/report.qmd')), true);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/model.BUGS')), true);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/model.StAn')), true);
+        // `.Rmd` and `.qmd` register under the dedicated `rmd` / `quarto`
+        // languages and are not LSP-tracked.
+        assert.strictEqual(isRDocument(makeFileDocument('/tmp/report.Rmd')), false);
+        assert.strictEqual(isRDocument(makeFileDocument('/tmp/report.qmd')), false);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/notes.txt')), false);
     });
 
