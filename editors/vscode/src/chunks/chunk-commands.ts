@@ -237,8 +237,12 @@ async function run_chunk_at_command(
  *
  * `eval_aware` lenses append a `(eval = FALSE)` suffix to their title when
  * the chunk header sets `eval = FALSE`, matching the existing "Run Chunk"
- * behavior. Multi-chunk lenses (above / below / all) don't add the suffix
- * because the chunk under the lens isn't the one being executed.
+ * behavior. Multi-chunk lenses don't add the suffix: for `above` / `below` /
+ * `previous` / `next` / `all` the chunk under the lens isn't even part of the
+ * execution; for `currentAndBelow` it is, but the suffix would still be
+ * misleading because the chunks after it would still run regardless of this
+ * one's `eval` flag, so the lens's title shouldn't make any single chunk's
+ * eval state look load-bearing.
  */
 export interface ChunkLensCommand {
     /** Command id dispatched by the CodeLens click (positional variant). */
