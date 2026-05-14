@@ -28,7 +28,10 @@ import {
     get_or_create_r_terminal,
 } from './send-to-r';
 import { register_build_commands } from './build-commands';
-import { register_chunks } from './chunks';
+import {
+    register_chunks_navigation_and_highlight,
+    register_chunks_with_terminal,
+} from './chunks';
 import { register_r_package_detection } from './r-package-detection';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
@@ -207,8 +210,13 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_send_to_r_commands(context);
         register_inspection_commands(context);
         register_build_commands(context);
-        register_chunks(context);
+        register_chunks_with_terminal(context);
     }
+
+    // Chunk navigation and highlighting work without an R terminal, so register
+    // them regardless of `raven.rConsole.activation` — REditorSupport / Positron
+    // users still get the visual aids and cursor-motion commands.
+    register_chunks_navigation_and_highlight(context);
 
     // Package-mode context key. The `raven.isRPackage` key gates the
     // Build commands' palette entries and editor-title submenu — every

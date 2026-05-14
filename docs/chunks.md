@@ -5,7 +5,7 @@ Raven recognizes R code chunks in R Markdown / Quarto documents and `# %%`-delim
 This is the daily-driver workflow for `.Rmd` / `.qmd` users coming from RStudio or vscode-R.
 
 > [!NOTE]
-> Chunk commands require Raven's R console — they create or reuse the R terminal Raven manages. If `raven.rConsole.activation` is `disabled` (or `auto` defers to another R extension), the chunk commands are not registered. See [Coexistence](./coexistence.md).
+> Navigation commands (Go to Next/Previous Chunk, Select Current Chunk) and chunk background highlighting work regardless of `raven.rConsole.activation`. The **run** commands (Run Current Chunk, Run Above, Run All) and the `▷ Run Chunk` / `↥ Run Above` CodeLens buttons require Raven's R console because they create or reuse the R terminal Raven manages. If the R console is disabled (or `auto` defers to another R extension), the run commands and CodeLens are not registered. See [Coexistence](./coexistence.md).
 
 ## Chunk forms
 

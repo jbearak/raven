@@ -5,15 +5,37 @@ import { register_chunk_navigation } from './chunk-navigation';
 import { register_chunk_decorations } from './chunk-highlighting';
 
 /**
- * Register every chunk-related contribution: commands, CodeLens provider,
- * navigation commands, and background decorations. Callers must invoke this
- * during extension activation regardless of `raven.rConsole.activation` —
- * navigation and CodeLens still make sense even when there is no R terminal.
- * The run-chunk commands themselves create/reuse the terminal on demand.
+ * Register chunk features that do NOT need an R terminal:
+ *
+ *   - Navigation commands (`raven.goToNextChunk`, `raven.goToPreviousChunk`,
+ *     `raven.selectCurrentChunk`).
+ *   - Background-tint decorations.
+ *
+ * These are safe to enable regardless of `raven.rConsole.activation` so users
+ * who coexist with REditorSupport or Positron still get the visual aids and
+ * cursor-motion commands when reading `.Rmd` / `.qmd` notebooks.
  */
-export function register_chunks(context: vscode.ExtensionContext): void {
-    register_chunk_commands(context);
-    register_chunk_codelens(context);
+export function register_chunks_navigation_and_highlight(
+    context: vscode.ExtensionContext,
+): void {
     register_chunk_navigation(context);
     register_chunk_decorations(context);
+}
+
+/**
+ * Register chunk features that DO need an R terminal:
+ *
+ *   - Run commands (`raven.runCurrentChunk` and friends, plus the positional
+ *     variants the CodeLens invokes).
+ *   - The `▷ Run Chunk` / `↥ Run Above` CodeLens provider.
+ *
+ * Callers must only invoke this when Raven's R console is enabled (i.e. inside
+ * the `r_console_resolved === 'enabled'` branch of `activate()`), otherwise
+ * `get_or_create_r_terminal()` has no terminal manager to consult.
+ */
+export function register_chunks_with_terminal(
+    context: vscode.ExtensionContext,
+): void {
+    register_chunk_commands(context);
+    register_chunk_codelens(context);
 }

@@ -237,13 +237,13 @@
         "command": "raven.goToNextChunk",
         "key": "ctrl+alt+n",
         "mac": "cmd+alt+n",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+        "when": "editorTextFocus && editorLangId == r"
       },
       {
         "command": "raven.goToPreviousChunk",
         "key": "ctrl+alt+shift+n",
         "mac": "cmd+alt+shift+n",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+        "when": "editorTextFocus && editorLangId == r"
       }
     ],
     "submenus": [
