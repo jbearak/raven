@@ -118,6 +118,41 @@
         "category": "Raven"
       },
       {
+        "command": "raven.runCurrentChunk",
+        "title": "Run Current Chunk",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.runCurrentChunkAndMove",
+        "title": "Run Current Chunk and Move",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.runAboveChunks",
+        "title": "Run Above Chunks",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.runAllChunks",
+        "title": "Run All Chunks",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.goToNextChunk",
+        "title": "Go to Next Chunk",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.goToPreviousChunk",
+        "title": "Go to Previous Chunk",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.selectCurrentChunk",
+        "title": "Select Current Chunk",
+        "category": "Raven"
+      },
+      {
         "command": "raven.scaffold.gitignore",
         "title": "Create .gitignore",
         "category": "Raven"
@@ -184,6 +219,30 @@
         "command": "raven.sourceFile",
         "key": "shift+ctrl+enter",
         "mac": "shift+cmd+enter",
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.runCurrentChunk",
+        "key": "ctrl+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && resourceExtname =~ /\\.(rmd|Rmd|qmd|QMD)$/"
+      },
+      {
+        "command": "raven.runAboveChunks",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p",
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.goToNextChunk",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n",
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.goToPreviousChunk",
+        "key": "ctrl+alt+shift+n",
+        "mac": "cmd+alt+shift+n",
         "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled"
       }
     ],
@@ -282,12 +341,28 @@
           "group": "1_run@3"
         },
         {
+          "command": "raven.runCurrentChunk",
+          "group": "2_chunk@1"
+        },
+        {
+          "command": "raven.runCurrentChunkAndMove",
+          "group": "2_chunk@2"
+        },
+        {
+          "command": "raven.runAboveChunks",
+          "group": "2_chunk@3"
+        },
+        {
+          "command": "raven.runAllChunks",
+          "group": "2_chunk@4"
+        },
+        {
           "command": "raven.sourceFile",
-          "group": "2_file@1"
+          "group": "3_file@1"
         },
         {
           "submenu": "raven.sendToR.terminal",
-          "group": "3_terminal"
+          "group": "4_terminal"
         }
       ],
       "raven.sendToR.terminal": [
@@ -478,6 +553,28 @@
         "editor.formatOnType": true
       }
     },
+    "colors": [
+      {
+        "id": "raven.chunk.activeBackground",
+        "description": "Background color for runnable R code chunks in .Rmd / .qmd files and `# %%` cells in .R files.",
+        "defaults": {
+          "dark": "#ffffff0c",
+          "light": "#0000000a",
+          "highContrast": "#ffffff14",
+          "highContrastLight": "#0000001a"
+        }
+      },
+      {
+        "id": "raven.chunk.inactiveBackground",
+        "description": "Background color for R code chunks marked `eval = FALSE` (or `eval = F`). Should be subtler than the active background.",
+        "defaults": {
+          "dark": "#ffffff05",
+          "light": "#00000005",
+          "highContrast": "#ffffff0a",
+          "highContrastLight": "#0000000d"
+        }
+      }
+    ],
     "configuration": {
       "type": "object",
       "title": "Raven",
@@ -1128,6 +1225,11 @@
           ],
           "default": "snake_case",
           "description": "Required naming scheme for function formal arguments."
+        },
+        "raven.chunks.highlight.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight R code chunks in .Rmd / .qmd files (and `# %%` cells in .R files) with a background color. Disable to remove the background entirely."
         },
         "raven.linting.objectNameSeverity": {
           "type": "string",

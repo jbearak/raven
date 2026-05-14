@@ -37,6 +37,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 ### R session integration
 
 - **[R console](docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
+- **[Code chunks](docs/chunks.md)** — R Markdown / Quarto chunk detection with Run Chunk / Run Above / Run All commands, CodeLens buttons, navigation, and background highlighting; `# %%` cell support in `.R` files
 - **[Plot viewer](docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
 - **[Data viewer](docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
 - **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
@@ -62,6 +63,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 **R session integration:**
 
 - [R Console](docs/r-console.md) — Interactive console, send-to-R commands, send method
+- [Code Chunks](docs/chunks.md) — R Markdown / Quarto chunk commands, CodeLens, navigation, highlighting
 - [Plot Viewer](docs/plot-viewer.md) — httpgd-backed plot panel
 - [Data Viewer](docs/data-viewer.md) — Arrow-backed `View()` replacement
 - [Help Viewer](docs/help-viewer.md) — Scope-aware R help

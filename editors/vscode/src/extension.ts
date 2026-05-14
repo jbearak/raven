@@ -28,6 +28,7 @@ import {
     get_or_create_r_terminal,
 } from './send-to-r';
 import { register_build_commands } from './build-commands';
+import { register_chunks } from './chunks';
 import { register_r_package_detection } from './r-package-detection';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
@@ -206,6 +207,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_send_to_r_commands(context);
         register_inspection_commands(context);
         register_build_commands(context);
+        register_chunks(context);
     }
 
     // Package-mode context key. The `raven.isRPackage` key gates the
