@@ -1,4 +1,15 @@
 import { defineConfig } from '@vscode/test-cli';
+import { mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// macOS Unix domain sockets cap path length at 103 chars. When this repo is
+// checked out in a deeply nested worktree (e.g. `.claude/worktrees/<branch>/`)
+// the default `.vscode-test/user-data/<ver>-main.sock` path overflows that
+// limit and VS Code fails to launch. Pin the user-data dir to a short tmp
+// path so the test harness works regardless of repo location.
+const userDataDir = join(tmpdir(), 'raven-vscode-test-ud');
+mkdirSync(userDataDir, { recursive: true });
 
 export default defineConfig({
     files: 'out/test/**/*.test.js',
@@ -9,6 +20,7 @@ export default defineConfig({
     launchArgs: [
         '--disable-gpu',
         '--no-sandbox',
-        '--disable-extensions'
+        '--disable-extensions',
+        `--user-data-dir=${userDataDir}`
     ]
 });
