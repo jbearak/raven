@@ -160,7 +160,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             { scheme: 'untitled', language: 'stan' },
         ],
         synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,RMD,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions,

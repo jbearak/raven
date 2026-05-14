@@ -20,6 +20,10 @@ class ChunkCodeLensProvider implements vscode.CodeLensProvider {
         this._on_did_change.fire();
     }
 
+    dispose(): void {
+        this._on_did_change.dispose();
+    }
+
     provideCodeLenses(
         document: vscode.TextDocument,
         _token: vscode.CancellationToken,
@@ -64,8 +68,10 @@ export function register_chunk_codelens(context: vscode.ExtensionContext): Chunk
             ],
             provider,
         ),
+        provider,
     );
     // Refresh lenses on document edits so they track newly added chunks.
+    // VS Code already coalesces CodeLens recomputation; we just fire the event.
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument(() => provider.refresh()),
     );

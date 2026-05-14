@@ -123,10 +123,15 @@ export function register_chunk_decorations(context: vscode.ExtensionContext): Ch
         vscode.window.onDidChangeActiveTextEditor((editor) => manager.update(editor)),
         vscode.window.onDidChangeVisibleTextEditors(() => manager.update_visible()),
         vscode.workspace.onDidChangeTextDocument((event) => {
-            const active = vscode.window.activeTextEditor;
-            if (active && event.document.uri.toString() === active.document.uri.toString()) {
-                manager.schedule_refresh();
-            }
+            // Refresh whenever the changed document is currently visible — that
+            // covers both the active editor and any split-view panes showing
+            // the same document, so decorations don't go stale when the user
+            // edits via a workspace edit or in another pane.
+            const document_uri = event.document.uri.toString();
+            const is_visible = vscode.window.visibleTextEditors.some(
+                (editor) => editor.document.uri.toString() === document_uri,
+            );
+            if (is_visible) manager.schedule_refresh();
         }),
         vscode.workspace.onDidChangeConfiguration((event) => {
             if (event.affectsConfiguration('raven.chunks.highlight')) {

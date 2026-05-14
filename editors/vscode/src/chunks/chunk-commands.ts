@@ -38,9 +38,14 @@ function combined_code(lines: string[], chunks: Chunk[]): string {
 
 async function send_to_r(code: string): Promise<void> {
     if (code.trim().length === 0) return;
-    const terminal = await get_or_create_r_terminal();
-    terminal.show(true);
-    send_code(terminal, code, get_send_options());
+    try {
+        const terminal = await get_or_create_r_terminal();
+        terminal.show(true);
+        send_code(terminal, code, get_send_options());
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Raven: failed to send chunk to R — ${message}`);
+    }
 }
 
 function find_visible_editor(uri: vscode.Uri): vscode.TextEditor | undefined {
@@ -133,15 +138,21 @@ async function run_chunk_at_command(
     const uri = uri_or_arg instanceof vscode.Uri ? uri_or_arg : null;
     const line = typeof line_arg === 'number' ? line_arg : null;
     if (uri === null || line === null) {
-        // Fall back to active editor when invoked without arguments (e.g. command palette).
+        // Invoked without arguments (e.g. directly from the command palette).
+        // Fall back to the active editor's cursor.
         await run_chunk(mode);
         return;
     }
     let document: vscode.TextDocument;
     try {
         document = await vscode.workspace.openTextDocument(uri);
-    } catch {
-        await run_chunk(mode);
+    } catch (err) {
+        // Stale CodeLens: refuse to silently run a different chunk. Surface the
+        // failure so the user knows the click didn't take effect.
+        const message = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(
+            `Raven: could not open chunk document (${message}). Try reopening the file.`
+        );
         return;
     }
     await run_chunk_at(mode, document, line);

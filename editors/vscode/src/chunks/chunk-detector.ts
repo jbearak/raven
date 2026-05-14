@@ -45,7 +45,11 @@ export interface Chunk {
 
 const FENCE_HEADER_RE = /^(`{3,}|~{3,})\s*\{([A-Za-z0-9_+.\-]+)([^}]*)\}\s*$/;
 const FENCE_CLOSE_RE = /^(`{3,}|~{3,})\s*$/;
-const CELL_MARKER_RE = /^#+\s*%%/;
+// Cell marker: a comment line that starts with `# %%` (any number of leading `#`),
+// followed by end-of-line or whitespace. This avoids matching `# %%%` (three or
+// more `%`) or `# %%inline-text` which are not cell delimiters in VS Code's
+// interactive-cell convention.
+const CELL_MARKER_RE = /^#+\s*%%(?!%)(?:\s.*)?$/;
 
 /**
  * Classify a document path (or URI string) by file extension.
@@ -68,15 +72,22 @@ function parse_header_options(rest: string): { label: string | null; options: Re
     const trimmed = rest.trim();
     if (trimmed.length === 0) return { label, options };
 
-    // Split on commas, but respect simple quoted-string spans so a comma inside
-    // a quoted value doesn't shred the option list.
+    // Split on commas while keeping nested parens/brackets/braces and quoted
+    // strings intact, so values like `fig.dim=c(5, 6)` or `lab="a,b"` survive.
+    // Backslash-escaped quotes inside a quoted span are respected.
     const parts: string[] = [];
     let current = '';
     let in_quote: '"' | "'" | null = null;
+    let depth = 0;
     for (let i = 0; i < trimmed.length; i++) {
         const ch = trimmed[i];
         if (in_quote) {
             current += ch;
+            if (ch === '\\' && i + 1 < trimmed.length) {
+                current += trimmed[i + 1];
+                i++;
+                continue;
+            }
             if (ch === in_quote) in_quote = null;
             continue;
         }
@@ -85,7 +96,17 @@ function parse_header_options(rest: string): { label: string | null; options: Re
             current += ch;
             continue;
         }
-        if (ch === ',') {
+        if (ch === '(' || ch === '[' || ch === '{') {
+            depth++;
+            current += ch;
+            continue;
+        }
+        if (ch === ')' || ch === ']' || ch === '}') {
+            if (depth > 0) depth--;
+            current += ch;
+            continue;
+        }
+        if (ch === ',' && depth === 0) {
             parts.push(current);
             current = '';
             continue;

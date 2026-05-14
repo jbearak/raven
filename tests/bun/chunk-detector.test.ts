@@ -70,6 +70,28 @@ describe('detect_chunks — Rmd/Qmd fenced blocks', () => {
         expect(chunks[0].is_eval_false).toBe(true);
     });
 
+    test('keeps parenthesised vector values intact when splitting options', () => {
+        const src = lines([
+            '```{r, fig.dim=c(5, 6), out.width="80%"}',
+            '1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'rmd');
+        expect(chunks[0].options['fig.dim']).toBe('c(5, 6)');
+        expect(chunks[0].options['out.width']).toBe('80%');
+    });
+
+    test('respects escaped quotes inside option values', () => {
+        const src = lines([
+            '```{r, lab="say \\"hi\\""}',
+            '1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'rmd');
+        // The escape stays in the parsed value — Raven does not interpret R string escapes.
+        expect(chunks[0].options.lab).toBe('say \\"hi\\"');
+    });
+
     test('recognizes eval = F as eval false', () => {
         const src = lines([
             '```{r, eval = F}',
@@ -176,19 +198,21 @@ describe('detect_chunks — Rmd/Qmd fenced blocks', () => {
         expect(detect_chunks(src, 'rmd').length).toBe(0);
     });
 
-    test('skips a chunk header inside another open chunk (no nesting)', () => {
-        // The inner ```{r} should not start a new chunk because we're already
-        // inside one (we close on a matching fence).
+    test('treats a header inside an open chunk as content, not a new chunk', () => {
+        // Outer ```` ```` fence wraps an inner ``` ``` ``` fence header
+        // verbatim. We should see one outer chunk and no inner one — the
+        // detector resumes scanning AFTER the outer closing fence.
         const src = lines([
-            '```{r}',
+            '````{r outer}',
+            '```{r inner}',
             'x <- 1',
             '```',
-            '```{r}',
-            'y <- 2',
-            '```',
+            '````',
         ].join('\n'));
         const chunks = detect_chunks(src, 'rmd');
-        expect(chunks.length).toBe(2);
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].label).toBe('outer');
+        expect(chunks[0].closing_fence_line).toBe(4);
     });
 });
 
@@ -220,6 +244,20 @@ describe('detect_chunks — .R cell markers', () => {
         const chunks = detect_chunks(src, 'r');
         expect(chunks.length).toBe(1);
         expect(chunks[0].header_line).toBe(0);
+    });
+
+    test('does not match `# %%%` or `# %%inline` non-markers', () => {
+        const src = lines([
+            '# %%%',
+            'x <- 1',
+            '# %%not-a-cell',
+            'y <- 2',
+            '# %% real cell',
+            'z <- 3',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].header_line).toBe(4);
     });
 
     test('returns empty for .R with no markers', () => {

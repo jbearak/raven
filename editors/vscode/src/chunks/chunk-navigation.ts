@@ -63,12 +63,19 @@ function select_current(): void {
         );
         return;
     }
-    // Select the content lines only (exclude the header and closing fence).
-    const start_line = Math.min(current.header_line + 1, editor.document.lineCount - 1);
-    const end_line = Math.max(start_line, current.end_line);
-    const start = new vscode.Position(start_line, 0);
-    const end_text = editor.document.lineAt(end_line).text;
-    const end = new vscode.Position(end_line, end_text.length);
+    // Empty chunk (no body lines): collapse the cursor to the end of the header
+    // rather than pretending we selected content. This avoids accidentally
+    // capturing the closing fence (Rmd) or cell-marker line (.R).
+    if (current.end_line <= current.header_line) {
+        const header_text = editor.document.lineAt(current.header_line).text;
+        const pos = new vscode.Position(current.header_line, header_text.length);
+        editor.selection = new vscode.Selection(pos, pos);
+        editor.revealRange(new vscode.Range(pos, pos));
+        return;
+    }
+    const start = new vscode.Position(current.header_line + 1, 0);
+    const end_text = editor.document.lineAt(current.end_line).text;
+    const end = new vscode.Position(current.end_line, end_text.length);
     editor.selection = new vscode.Selection(start, end);
     editor.revealRange(new vscode.Range(start, end));
 }

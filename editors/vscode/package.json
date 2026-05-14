@@ -225,7 +225,7 @@
         "command": "raven.runCurrentChunk",
         "key": "ctrl+shift+enter",
         "mac": "cmd+shift+enter",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && resourceExtname =~ /\\.(rmd|Rmd|qmd|QMD)$/"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/"
       },
       {
         "command": "raven.runAboveChunks",
@@ -404,7 +404,10 @@
           ".R",
           ".rmd",
           ".Rmd",
-          ".qmd"
+          ".RMD",
+          ".qmd",
+          ".Qmd",
+          ".QMD"
         ],
         "configuration": "./language-configuration.json"
       },
