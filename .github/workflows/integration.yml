@@ -1,4 +1,4 @@
-name: VS Code Integration Tests
+name: Integration Tests
 
 on:
   push:
@@ -12,12 +12,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: vscode-integration-${{ github.ref }}
+  group: integration-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  vscode-integration:
-    name: VS Code Integration Tests
+  vscode-mocha:
+    name: VS Code Mocha Suite
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -90,11 +90,15 @@ jobs:
           restore-keys: |
             vscode-test-${{ runner.os }}-
 
-      - name: Place LSP binary for extension
+      # `vscode:prepublish` runs `bundle` (esbuild → `dist/extension.js`, the
+      # extension's `main` entry) and `copy-binary` (places the LSP binary at
+      # `bin/raven`). Both must exist before `vscode-test` activates the
+      # extension; `pretest` (below) only handles the test-side `tsc` build.
+      - name: Bundle extension and place LSP binary
         working-directory: editors/vscode
-        run: bun run copy-binary
+        run: bun run vscode:prepublish
 
-      - name: Compile extension and tests
+      - name: Compile tests
         working-directory: editors/vscode
         run: bun run pretest
 
