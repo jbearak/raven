@@ -549,7 +549,15 @@
       },
       {
         "language": "rmd",
+        "path": "./snippets/r.json"
+      },
+      {
+        "language": "rmd",
         "path": "./snippets/rmarkdown.json"
+      },
+      {
+        "language": "quarto",
+        "path": "./snippets/r.json"
       },
       {
         "language": "quarto",
