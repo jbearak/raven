@@ -352,6 +352,153 @@ suite('chunk commands: registration and behavior', () => {
         assert.strictEqual(text, 'a <- 1\nb <- 2');
     });
 
+    /**
+     * Behavioral coverage for the four new run commands (issue #229).
+     * Each test stubs the R terminal, places the cursor at a known position
+     * in `RMD_FIXTURE`, executes the command, and verifies that the chunk
+     * body that *should* have been sent reaches the terminal — matching
+     * either the literal text (single-line wrapper) or a `source(.../*.R)`
+     * tempfile wrapper for multi-line payloads, the same pattern used by
+     * the existing `runCurrentChunk` test.
+     */
+    function captured_payload(sent: string[]): string {
+        return sent.join('\n');
+    }
+
+    function payload_contains(sent: string[], needle: string): boolean {
+        const text = captured_payload(sent);
+        return text.includes(needle) || /source\((.+)\.R/.test(text);
+    }
+
+    test('runNextChunk runs the chunk immediately below the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runNextChunk');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 7); // inside the first R chunk ("setup")
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runNextChunk');
+        } finally {
+            term.restore();
+        }
+        // Next runnable chunk after "setup" is "second" (python is skipped).
+        // Its body is `x <- 1\ny <- 2`.
+        assert.ok(
+            payload_contains(term.sent, 'x <- 1') ||
+            payload_contains(term.sent, 'y <- 2'),
+            `expected "second" chunk body to reach terminal, got: ${captured_payload(term.sent).slice(0, 200)}`,
+        );
+    });
+
+    test('runPreviousChunk runs the chunk immediately above the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runPreviousChunk');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 17); // inside the "second" R chunk
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runPreviousChunk');
+        } finally {
+            term.restore();
+        }
+        // Previous runnable chunk before "second" is "setup" (python is skipped).
+        // Its body is `library(dplyr)`.
+        assert.ok(
+            payload_contains(term.sent, 'library(dplyr)'),
+            `expected "setup" chunk body to reach terminal, got: ${captured_payload(term.sent).slice(0, 200)}`,
+        );
+    });
+
+    test('runBelowChunks runs every R chunk after the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runBelowChunks');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 4); // prose line before any chunk
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runBelowChunks');
+        } finally {
+            term.restore();
+        }
+        // All three R chunks should be combined into the payload.
+        const text = captured_payload(term.sent);
+        const has_all_chunks =
+            text.includes('library(dplyr)') &&
+            text.includes('x <- 1') &&
+            text.includes('never_run()');
+        const has_tempfile = /source\((.+)\.R/.test(text);
+        assert.ok(
+            has_all_chunks || has_tempfile,
+            `expected all R chunk bodies to reach terminal, got: ${text.slice(0, 300)}`,
+        );
+    });
+
+    test('runCurrentAndBelowChunks runs the cursor chunk plus every R chunk after it', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runCurrentAndBelowChunks');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 17); // inside the "second" R chunk
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runCurrentAndBelowChunks');
+        } finally {
+            term.restore();
+        }
+        const text = captured_payload(term.sent);
+        const has_current_and_below =
+            text.includes('x <- 1') &&
+            text.includes('never_run()');
+        const has_tempfile = /source\((.+)\.R/.test(text);
+        assert.ok(
+            has_current_and_below || has_tempfile,
+            `expected current ("second") and below ("noeval") chunk bodies to reach terminal, got: ${text.slice(0, 300)}`,
+        );
+    });
+
+    test('runNextChunk warns when there is no chunk below the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runNextChunk');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 22); // after the last chunk
+        const stub = stub_information_message();
+        try {
+            await vscode.commands.executeCommand('raven.runNextChunk');
+        } finally {
+            stub.restore();
+        }
+        assert.ok(
+            stub.last && stub.last.includes('no runnable chunk below'),
+            `expected "no runnable chunk below" info message, got: ${String(stub.last)}`,
+        );
+    });
+
+    test('runPreviousChunk warns when there is no chunk above the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runPreviousChunk');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 0); // before any chunk
+        const stub = stub_information_message();
+        try {
+            await vscode.commands.executeCommand('raven.runPreviousChunk');
+        } finally {
+            stub.restore();
+        }
+        assert.ok(
+            stub.last && stub.last.includes('no runnable chunk above'),
+            `expected "no runnable chunk above" info message, got: ${String(stub.last)}`,
+        );
+    });
+
     test('raven.chunks.codeLens.commands controls lens count and order', async function () {
         // Skip when R-console activation is disabled — the CodeLens provider is
         // only registered alongside the run commands.

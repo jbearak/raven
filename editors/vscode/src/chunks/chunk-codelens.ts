@@ -21,8 +21,11 @@ const DEFAULT_LENS_COMMAND_IDS: readonly string[] = [
 
 /**
  * Read the user's `raven.chunks.codeLens.commands` array and filter it down to
- * known command ids in `CHUNK_LENS_COMMANDS`. Returns the defaults when the
- * setting is unset, empty, or contains only unknown ids.
+ * known command ids in `CHUNK_LENS_COMMANDS`. Returns the user's array verbatim
+ * (after dropping unknown ids) — including the empty case, which intentionally
+ * hides every lens. Only falls back to `DEFAULT_LENS_COMMAND_IDS` when the
+ * resolved value isn't an array at all (i.e. corrupt state); the normal "unset"
+ * case is already covered by the `default` declared in `package.json`.
  *
  * Unknown ids are silently dropped — VS Code would surface a "command not
  * found" error per click if we passed them through, and that's worse UX than
@@ -32,10 +35,9 @@ function resolve_lens_command_ids(document: vscode.TextDocument): readonly strin
     const config = vscode.workspace.getConfiguration(undefined, document.uri);
     const raw = config.get<unknown>(CODELENS_COMMANDS_SETTING);
     if (!Array.isArray(raw)) return DEFAULT_LENS_COMMAND_IDS;
-    const filtered = raw.filter(
+    return raw.filter(
         (id): id is string => typeof id === 'string' && id in CHUNK_LENS_COMMANDS,
     );
-    return filtered.length > 0 ? filtered : DEFAULT_LENS_COMMAND_IDS;
 }
 
 /**
