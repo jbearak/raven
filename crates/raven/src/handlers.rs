@@ -3548,11 +3548,10 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
             let extractor = SymbolExtractor::new(&text, tree.root_node());
             let mut raw_symbols = extractor.extract_all();
             // Surface R Markdown / Quarto code chunks and `.R` `# %%` cells
-            // in the outline. Classification is URI-based: `.Rmd`/`.qmd`
-            // files get fenced chunks, anything else gets `# %%` cells (the
-            // detector finds nothing in plain `.R` files without markers).
-            let chunk_kind = crate::chunks::classify_chunk_document(uri.path());
-            raw_symbols.extend(extractor.extract_chunks(chunk_kind));
+            // in the outline. The Document carries the resolved kind so that
+            // untitled buffers (no file extension) still classify correctly
+            // via their `languageId`.
+            raw_symbols.extend(extractor.extract_chunks(doc.chunk_kind));
             raw_symbols
         }
     };
@@ -17464,6 +17463,34 @@ result <- data %>% filter(x > 0)
         state
             .documents
             .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+        let chunk = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
+            .expect("chunk entry");
+        assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
+    fn test_document_symbol_includes_chunks_for_untitled_rmd_buffer() {
+        // Untitled buffers have no extension to inspect. The `languageId`
+        // is the only signal we have for distinguishing Rmd/Quarto from
+        // plain R, so the Document must preserve that classification.
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state.documents.insert(
+            uri.clone(),
+            Document::new_with_language_id(code, None, &uri, Some("rmd")),
+        );
 
         let response = super::document_symbol(&state, &uri).expect("response");
         let symbols = match response {

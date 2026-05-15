@@ -85,6 +85,23 @@ pub fn classify_chunk_document(path_or_uri: &str) -> ChunkKind {
     }
 }
 
+/// Classify a document using its `languageId` first, then its URI path.
+///
+/// Matches the client-side `classify_chunk_document_for_document` helper in
+/// `editors/vscode/src/chunks/chunk-detector.ts` so untitled buffers — which
+/// have no file extension — still classify correctly when the editor passes
+/// `languageId: "rmd" | "quarto"`.
+pub fn classify_chunk_document_for(language_id: Option<&str>, path_or_uri: &str) -> ChunkKind {
+    if let Some(lang) = language_id {
+        match lang.to_ascii_lowercase().as_str() {
+            "rmd" | "quarto" => return ChunkKind::Rmd,
+            "r" => return classify_chunk_document(path_or_uri),
+            _ => {}
+        }
+    }
+    classify_chunk_document(path_or_uri)
+}
+
 /// Detect all chunks in the document, in source order. `kind` controls which
 /// detection path runs.
 pub fn detect_chunks(text: &str, kind: ChunkKind) -> Vec<Chunk> {
@@ -309,6 +326,37 @@ mod tests {
         assert_eq!(classify_chunk_document("/tmp/foo.R"), ChunkKind::R);
         assert_eq!(classify_chunk_document("/tmp/foo.r"), ChunkKind::R);
         assert_eq!(classify_chunk_document("/tmp/foo.txt"), ChunkKind::R);
+    }
+
+    #[test]
+    fn classifies_untitled_buffers_by_language_id() {
+        // Untitled buffers have no extension, so `languageId` is the only
+        // signal we have for distinguishing Rmd/Quarto from plain R.
+        assert_eq!(
+            classify_chunk_document_for(Some("rmd"), "untitled:Untitled-1"),
+            ChunkKind::Rmd
+        );
+        assert_eq!(
+            classify_chunk_document_for(Some("quarto"), "untitled:Untitled-1"),
+            ChunkKind::Rmd
+        );
+        assert_eq!(
+            classify_chunk_document_for(Some("RMD"), "untitled:Untitled-1"),
+            ChunkKind::Rmd
+        );
+        assert_eq!(
+            classify_chunk_document_for(Some("r"), "untitled:Untitled-1"),
+            ChunkKind::R
+        );
+        assert_eq!(
+            classify_chunk_document_for(None, "/tmp/foo.Rmd"),
+            ChunkKind::Rmd
+        );
+        // languageId='r' on a .Rmd URI: trust the URI (matches the TS detector).
+        assert_eq!(
+            classify_chunk_document_for(Some("r"), "/tmp/foo.Rmd"),
+            ChunkKind::Rmd
+        );
     }
 
     #[test]
