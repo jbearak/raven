@@ -153,34 +153,7 @@ Notes:
 - A `# nolint` marker inside a string literal (`x <- "# nolint"`) is not parsed as a marker.
 - A typo like `# nolinter` or `# @lsp-ignored` is intentionally not recognized — better to surface the lint than to silently swallow it.
 - An unterminated `# nolint start` suppresses through end of file (matching `lintr`).
-
-### One known suppression edge case
-
-Raven's suppression parser scans each line left-to-right and treats the **first** `#` (outside any string literal) as the marker comment. A trailing `# nolint` next to real code works fine — there's no earlier `#` on that line — but an inline `# nolint` *inside* a commented-code line does **not** suppress the `commented_code` lint:
-
-```r
-# x <- 1 # nolint
-```
-
-The leading `#` is taken as the marker comment, and its body is `x <- 1 # nolint` — which doesn't start with `nolint` or `@lsp-ignore`, so no suppression is registered. The `commented_code` rule then parses `x <- 1` as R code and flags it.
-
-To suppress the rule on a commented-code line, put the marker on a separate line:
-
-```r
-# @lsp-ignore-next
-# x <- 1
-```
-
-Or use a block:
-
-```r
-# nolint start
-# x <- 1
-# y <- 2
-# nolint end
-```
-
-This is consistent with how `lintr` itself treats a same-line `# nolint` — the marker has to be a *separate* comment, not nested inside another one.
+- A same-line marker nested inside a commented-code line — `# x <- 1 # nolint` — also works. The fallback only fires when the prefix between the outer `#` and the inner `# nolint` parses as real R code, so the same marker buried in prose (`# this is just talking about nolint # nolint`) is left alone.
 
 ## Performance and scope notes
 

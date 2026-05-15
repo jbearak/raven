@@ -17,18 +17,25 @@
 //!   stray spaces around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`).
 //! * `commented_code` — flag standalone comment blocks whose body parses as R
 //!   and contains a call, assignment, operator, or function definition. This
-//!   rule additionally re-parses each candidate comment body via the
-//!   thread-local parser pool; every other rule walks only the
-//!   already-parsed tree.
+//!   rule re-parses each candidate comment body via the thread-local parser
+//!   pool; every other rule walks only the already-parsed tree. The same
+//!   parser pool is also exercised by the suppression parser on the rare
+//!   commented-code line that carries an inline `# nolint` (see below).
 //!
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
 //! * `# nolint start` / `# nolint end` brackets a region.
 //! * `# @lsp-ignore` suppresses the line it appears on.
 //! * `# @lsp-ignore-next` suppresses the *following* source line.
+//!
+//! Same-line markers (`# nolint`, `# nolint start/end`, `# @lsp-ignore`) are
+//! additionally recognised when nested inside a commented-code line — e.g.
+//! `# x <- 1 # nolint` — via a parse-gated fallback. See [`nolint`] for the
+//! full pipeline and limits.
 
 pub mod config;
 mod nolint;
+mod parse_gate;
 mod rules;
 
 use tower_lsp::lsp_types::Diagnostic;
@@ -951,12 +958,43 @@ print.data.frame <- function(x, ...) NULL
     #[test]
     fn commented_code_respects_nolint_block() {
         let config = commented_code_only_config();
-        // For commented-out code, an inline `# nolint` suffix can't suppress
-        // the diagnostic — the `#` of the marker is itself inside the comment
-        // and so the Suppressions parser never sees a fresh `# nolint`. The
-        // supported patterns are bracketed blocks and `# @lsp-ignore-next`.
         let diags = lint("# nolint start\n# x <- 1 + 2\n# nolint end\n", &config);
         assert!(diags.is_empty(), "nolint block must suppress: {:?}", diags);
+    }
+
+    #[test]
+    fn commented_code_respects_inline_nolint_marker() {
+        // Issue #242: a `# nolint` written *inside* a commented-code line
+        // suppresses `commented_code` on that line. The parse-gated fallback
+        // in `Suppressions::from_text` recognises the interior marker because
+        // the prefix `x <- 1 + 2` parses as real R code.
+        let config = commented_code_only_config();
+        let diags = lint("# x <- 1 + 2 # nolint\n", &config);
+        assert!(
+            diags.is_empty(),
+            "inline `# nolint` must suppress commented_code: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_respects_inline_lsp_ignore_marker() {
+        let config = commented_code_only_config();
+        let diags = lint("# x <- 1 + 2 # @lsp-ignore\n", &config);
+        assert!(
+            diags.is_empty(),
+            "inline `# @lsp-ignore` must suppress commented_code: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_inline_marker_inside_string_does_not_suppress() {
+        // The interior `# nolint` is inside a string in the commented-out
+        // code, so the inline-marker fallback must not treat it as a marker.
+        let config = commented_code_only_config();
+        let diags = lint("# x <- \"# nolint\"\n", &config);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {:?}", diags);
     }
 
     #[test]
