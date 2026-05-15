@@ -1042,6 +1042,19 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn commented_code_flags_multi_line_block_when_individual_lines_dont_parse() {
+        let config = commented_code_only_config();
+        // Each individual line is not a complete R expression — only the
+        // joined block parses. The grouping pass should still flag the
+        // block. This is the headline value-add of the contiguous-grouping
+        // logic vs. line-at-a-time evaluation.
+        let diags = lint("# function(x) {\n#   x + 1\n# }\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 0);
+        assert_eq!(diags[0].range.end.line, 2);
+    }
+
+    #[test]
     fn commented_code_still_groups_when_no_skip_lines() {
         let config = commented_code_only_config();
         // Without any skip lines in between, a contiguous block should still
