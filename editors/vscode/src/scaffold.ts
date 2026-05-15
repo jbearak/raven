@@ -275,24 +275,51 @@ function stripTrailingCommas(text: string): string {
 }
 
 /**
- * Parse-with-comments helper that returns the list of top-level
- * `raven.linting.*` keys present in a JSONC text, or `null` if the text
- * has parse errors. An empty file returns an empty array.
+ * Result of parsing JSONC settings text for our purposes:
+ *   - `parseError`: text was not valid JSONC at all (caller should bail).
+ *   - `nonObjectRoot`: parsed fine but the root isn't a JSON object
+ *     (e.g. an array, scalar, or `null`). Can't safely merge into it.
+ *   - `object`: parsed as a JSON object — `keys` lists the top-level
+ *     `raven.linting.*` keys present (may be empty).
  */
-export function detectExistingLintingKeys(text: string): string[] | null {
-    if (text.trim().length === 0) return [];
+type LintingParseResult =
+    | { kind: 'parseError' }
+    | { kind: 'nonObjectRoot' }
+    | { kind: 'object'; keys: string[] };
+
+function parseLintingKeys(text: string): LintingParseResult {
+    if (text.trim().length === 0) return { kind: 'object', keys: [] };
     let parsed: unknown;
     try {
         parsed = JSON.parse(stripTrailingCommas(stripJsoncComments(text)));
     } catch {
-        return null;
+        return { kind: 'parseError' };
     }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return [];
+        return { kind: 'nonObjectRoot' };
     }
-    return Object.keys(parsed as Record<string, unknown>).filter((k) =>
-        k.startsWith('raven.linting.'),
-    );
+    return {
+        kind: 'object',
+        keys: Object.keys(parsed as Record<string, unknown>).filter((k) =>
+            k.startsWith('raven.linting.'),
+        ),
+    };
+}
+
+/**
+ * Parse-with-comments helper that returns the list of top-level
+ * `raven.linting.*` keys present in a JSONC text, or `null` if the text
+ * has parse errors **or** is valid JSON whose root isn't an object.
+ * An empty file returns an empty array.
+ *
+ * Kept in this collapsed shape (string[] | null) because the test suite
+ * uses it as a parse-success signal; the scaffold command path uses
+ * the richer `parseLintingKeys` discriminator to distinguish parse
+ * errors from a non-object root.
+ */
+export function detectExistingLintingKeys(text: string): string[] | null {
+    const result = parseLintingKeys(text);
+    return result.kind === 'object' ? result.keys : null;
 }
 
 /**
@@ -348,26 +375,135 @@ function findOutermostClosingBrace(text: string): number {
 }
 
 /**
+ * Compute the offsets, line by line, at which a given character index
+ * falls. Used by the sentinel walker to map char-positions back to line
+ * indices without re-scanning the whole text per lookup.
+ */
+function computeLineStarts(text: string): number[] {
+    const starts: number[] = [0];
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] === '\n') starts.push(i + 1);
+    }
+    return starts;
+}
+
+function lineIndexOfPos(lineStarts: number[], pos: number): number {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        if (lineStarts[mid] <= pos) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
+}
+
+/**
+ * Find the line indices of our sentinel-begin / sentinel-end markers,
+ * skipping any matches that fall inside a JSONC `/* ... *\/` block
+ * comment (line-comment matches are kept — those are exactly what we
+ * emit). Returns `null` if either marker is missing or appears on the
+ * wrong side of the other.
+ */
+function findSentinelLineRange(text: string): { begin: number; end: number } | null {
+    const lineStarts = computeLineStarts(text);
+    const sentinelLines: { begin: number | null; end: number | null } = {
+        begin: null,
+        end: null,
+    };
+
+    let i = 0;
+    let inString = false;
+    let inBlockComment = false;
+    let lineConsumed = -1; // last line we've already classified
+
+    function maybeRecord(pos: number) {
+        const lineIdx = lineIndexOfPos(lineStarts, pos);
+        if (lineIdx <= lineConsumed) return;
+        const lineStart = lineStarts[lineIdx];
+        const lineEnd =
+            lineIdx + 1 < lineStarts.length ? lineStarts[lineIdx + 1] - 1 : text.length;
+        const lineText = text.slice(lineStart, lineEnd).trim();
+        if (lineText === LINTING_SENTINEL_BEGIN && sentinelLines.begin === null) {
+            sentinelLines.begin = lineIdx;
+        } else if (
+            lineText === LINTING_SENTINEL_END &&
+            sentinelLines.begin !== null &&
+            sentinelLines.end === null &&
+            lineIdx > sentinelLines.begin
+        ) {
+            sentinelLines.end = lineIdx;
+        }
+        lineConsumed = lineIdx;
+    }
+
+    while (i < text.length) {
+        const c = text[i];
+        if (inBlockComment) {
+            if (c === '*' && text[i + 1] === '/') {
+                inBlockComment = false;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (inString) {
+            if (c === '\\' && i + 1 < text.length) {
+                i += 2;
+                continue;
+            }
+            if (c === '"') inString = false;
+            i++;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            i++;
+            continue;
+        }
+        if (c === '/' && text[i + 1] === '/') {
+            // A line comment outside of a block comment — this is where
+            // our sentinels live. Classify the line.
+            maybeRecord(i);
+            while (i < text.length && text[i] !== '\n') i++;
+            continue;
+        }
+        if (c === '/' && text[i + 1] === '*') {
+            inBlockComment = true;
+            i += 2;
+            continue;
+        }
+        i++;
+    }
+
+    if (sentinelLines.begin === null || sentinelLines.end === null) return null;
+    return { begin: sentinelLines.begin, end: sentinelLines.end };
+}
+
+/**
  * Strip the entire sentinel-delimited block we manage, including the
  * inner `// lintr: ...` headers and key lines. If either sentinel is
- * missing, returns the input unchanged. Matches whole-line sentinels
- * after trimming whitespace; a sentinel-shaped string embedded inside a
- * string literal won't be matched (the wrapping `"` survives the trim).
+ * missing — or appears only inside a block comment — returns the input
+ * unchanged.
  */
 function stripSentineledLintingBlock(text: string): string {
+    const range = findSentinelLineRange(text);
+    if (!range) return text;
     const lines = text.split('\n');
-    const begin = lines.findIndex((l) => l.trim() === LINTING_SENTINEL_BEGIN);
-    if (begin === -1) return text;
-    const end = lines.findIndex((l, i) => i > begin && l.trim() === LINTING_SENTINEL_END);
-    if (end === -1) return text;
-    lines.splice(begin, end - begin + 1);
+    lines.splice(range.begin, range.end - range.begin + 1);
     return lines.join('\n');
 }
 
 /**
- * Remove lines whose sole content is a top-level `raven.linting.*` key
- * declaration. `raven.linting.*` values are all scalars (boolean, int,
- * string) so single-line removal is safe.
+ * Remove lines whose sole content is a **top-level** `raven.linting.*`
+ * key declaration. `raven.linting.*` values are all scalars (boolean,
+ * int, string) so single-line removal is safe.
+ *
+ * Walks the text tracking string/comment state and brace/bracket depth
+ * so a nested key (e.g. inside a `[r]` language override block where
+ * the user might write `"[r]": { "raven.linting.lineLength": 120 }`)
+ * is left untouched.
  *
  * Assumes the VS Code convention of one key per line. A user who puts
  * `"editor.tabSize": 4, "raven.linting.foo": true` on a single line
@@ -375,8 +511,161 @@ function stripSentineledLintingBlock(text: string): string {
  * the Settings UI never produce that shape, so we don't try to handle
  * it.
  */
-function stripExistingLintingLines(text: string): string {
-    return text.replace(/^[ \t]*"raven\.linting\.[^"]+"[ \t]*:[^\n]*\n?/gm, '');
+function stripTopLevelLintingLines(text: string): string {
+    const lineStarts = computeLineStarts(text);
+    const linesToStrip = new Set<number>();
+
+    let depth = 0;
+    let inString = false;
+    let inBlockComment = false;
+    let i = 0;
+
+    while (i < text.length) {
+        const c = text[i];
+        if (inBlockComment) {
+            if (c === '*' && text[i + 1] === '/') {
+                inBlockComment = false;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (inString) {
+            if (c === '\\' && i + 1 < text.length) {
+                i += 2;
+                continue;
+            }
+            if (c === '"') inString = false;
+            i++;
+            continue;
+        }
+        if (c === '"') {
+            // String-literal start. If we're at depth 1, this could be a
+            // top-level property key; check whether it matches our pattern
+            // and is followed by `:` (ignoring whitespace/comments).
+            if (depth === 1) {
+                const match = /^"raven\.linting\.[^"\\]+"/.exec(text.slice(i));
+                if (match) {
+                    const afterKey = i + match[0].length;
+                    let j = afterKey;
+                    // Skip whitespace and same-line comments looking for `:`.
+                    while (j < text.length) {
+                        const ch = text[j];
+                        if (ch === ' ' || ch === '\t') {
+                            j++;
+                            continue;
+                        }
+                        if (ch === '/' && text[j + 1] === '/') {
+                            while (j < text.length && text[j] !== '\n') j++;
+                            break;
+                        }
+                        if (ch === '/' && text[j + 1] === '*') {
+                            j += 2;
+                            while (
+                                j + 1 < text.length &&
+                                !(text[j] === '*' && text[j + 1] === '/')
+                            )
+                                j++;
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (j < text.length && text[j] === ':') {
+                        linesToStrip.add(lineIndexOfPos(lineStarts, i));
+                    }
+                }
+            }
+            inString = true;
+            i++;
+            continue;
+        }
+        if (c === '/' && text[i + 1] === '/') {
+            while (i < text.length && text[i] !== '\n') i++;
+            continue;
+        }
+        if (c === '/' && text[i + 1] === '*') {
+            inBlockComment = true;
+            i += 2;
+            continue;
+        }
+        if (c === '{' || c === '[') {
+            depth++;
+            i++;
+            continue;
+        }
+        if (c === '}' || c === ']') {
+            depth--;
+            i++;
+            continue;
+        }
+        i++;
+    }
+
+    if (linesToStrip.size === 0) return text;
+
+    const lines = text.split('\n');
+    const kept: string[] = [];
+    for (let li = 0; li < lines.length; li++) {
+        if (!linesToStrip.has(li)) kept.push(lines[li]);
+    }
+    return kept.join('\n');
+}
+
+/**
+ * Append a `,` after the last non-comment, non-whitespace character of
+ * `text`. If the trailing content is a `//` line comment or a `/* *\/`
+ * block comment, the comma is inserted *before* the comment so the
+ * file remains valid JSONC. No-op if the last significant character is
+ * already `,`, `{`, or `[` (i.e. no separator needed).
+ */
+function appendCommaIfNeeded(text: string): string {
+    let lastSig = -1;
+    let i = 0;
+    let inString = false;
+
+    while (i < text.length) {
+        const c = text[i];
+        if (inString) {
+            if (c === '\\' && i + 1 < text.length) {
+                lastSig = i + 1;
+                i += 2;
+                continue;
+            }
+            lastSig = i;
+            if (c === '"') inString = false;
+            i++;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            lastSig = i;
+            i++;
+            continue;
+        }
+        if (c === '/' && text[i + 1] === '/') {
+            while (i < text.length && text[i] !== '\n') i++;
+            continue;
+        }
+        if (c === '/' && text[i + 1] === '*') {
+            i += 2;
+            while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+            i += 2;
+            continue;
+        }
+        if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+            i++;
+            continue;
+        }
+        lastSig = i;
+        i++;
+    }
+
+    if (lastSig === -1) return text;
+    const lastChar = text[lastSig];
+    if (lastChar === ',' || lastChar === '{' || lastChar === '[') return text;
+    return text.slice(0, lastSig + 1) + ',' + text.slice(lastSig + 1);
 }
 
 /**
@@ -384,40 +673,51 @@ function stripExistingLintingLines(text: string): string {
  * managed block this scaffold owns. Used by the scaffold command to
  * decide whether to prompt: keys inside our block are safe to overwrite
  * silently on a re-run, but keys *outside* it are user-managed and need
- * confirmation.
+ * confirmation. Returns `null` for parse errors or a non-object root.
  */
 export function detectUserManagedLintingKeys(text: string): string[] | null {
     return detectExistingLintingKeys(stripSentineledLintingBlock(text));
 }
 
 /**
+ * Same as `detectUserManagedLintingKeys`, but returns the richer result
+ * shape so callers can distinguish a JSON parse error from a non-object
+ * root (e.g. the file contains `[1, 2, 3]`). The scaffold command path
+ * uses this; tests use the simpler `string[] | null` flavour above.
+ */
+export function classifyUserManagedLintingKeys(text: string): LintingParseResult {
+    return parseLintingKeys(stripSentineledLintingBlock(text));
+}
+
+/**
  * Build the JSONC content to write to `.vscode/settings.json`. If
  * `existing` is `undefined` or whitespace-only, returns the fresh
  * template. Otherwise strips any prior sentinel-managed block and any
- * stray `raven.linting.*` keys, then inserts a freshly formatted block
- * immediately before the outermost closing brace — preserving all
- * unrelated keys and comments.
+ * top-level `raven.linting.*` keys, then inserts a freshly formatted
+ * block immediately before the outermost closing brace — preserving
+ * all unrelated keys and comments.
+ *
+ * Returns `null` if the existing content can't safely be merged into
+ * (parse error, or root isn't a JSON object). Callers must surface
+ * that to the user rather than overwriting their file.
  */
-export function buildLintingSettingsContent(existing: string | undefined): string {
+export function buildLintingSettingsContent(existing: string | undefined): string | null {
     if (existing === undefined || existing.trim().length === 0) {
         return LINTING_SETTINGS_TEMPLATE;
     }
+
     const afterSentinelStrip = stripSentineledLintingBlock(existing);
-    const fullyStripped = stripExistingLintingLines(afterSentinelStrip);
+    const classification = parseLintingKeys(afterSentinelStrip);
+    if (classification.kind !== 'object') return null;
+
+    const fullyStripped = stripTopLevelLintingLines(afterSentinelStrip);
     const closeIdx = findOutermostClosingBrace(fullyStripped);
-    if (closeIdx === -1) {
-        return LINTING_SETTINGS_TEMPLATE;
-    }
+    if (closeIdx === -1) return null;
 
     const before = fullyStripped.slice(0, closeIdx);
     const after = fullyStripped.slice(closeIdx);
     const trimmedBefore = before.replace(/[ \t\n\r]+$/, '');
-
-    const openBraceIdx = trimmedBefore.lastIndexOf('{');
-    const hasExistingProps =
-        openBraceIdx !== -1 && trimmedBefore.slice(openBraceIdx + 1).trim().length > 0;
-    const needsComma = hasExistingProps && !trimmedBefore.endsWith(',');
-    const prefix = trimmedBefore + (needsComma ? ',\n' : '\n');
+    const prefix = appendCommaIfNeeded(trimmedBefore) + '\n';
 
     return `${prefix}${formatLintingBlock('  ')}\n${after}`;
 }
@@ -526,13 +826,20 @@ async function runLintingSettingsScaffold(
         // earlier run of this same scaffold, so it's safe to regenerate
         // them silently. Only user-authored `raven.linting.*` keys
         // (anything outside the sentinel range) trigger the prompt.
-        const userManagedKeys = detectUserManagedLintingKeys(existing);
-        if (userManagedKeys === null) {
+        const classification = classifyUserManagedLintingKeys(existing);
+        if (classification.kind === 'parseError') {
             void vscode.window.showErrorMessage(
                 `Raven: ${displayName} has JSON parse errors; fix them and re-run this command.`,
             );
             return undefined;
         }
+        if (classification.kind === 'nonObjectRoot') {
+            void vscode.window.showErrorMessage(
+                `Raven: ${displayName} is valid JSON but its root isn't a JSON object — refusing to overwrite. Move the file aside (or wrap its contents in \`{}\`) and re-run this command.`,
+            );
+            return undefined;
+        }
+        const userManagedKeys = classification.keys;
         if (userManagedKeys.length > 0) {
             const label =
                 userManagedKeys.length === 1
@@ -550,6 +857,13 @@ async function runLintingSettingsScaffold(
     }
 
     const newContent = buildLintingSettingsContent(existing);
+    if (newContent === null) {
+        // Classification above should have caught this — defensive only.
+        void vscode.window.showErrorMessage(
+            `Raven: could not safely merge into ${displayName}.`,
+        );
+        return undefined;
+    }
 
     try {
         await vscode.workspace.fs.createDirectory(vscodeDir);

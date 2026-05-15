@@ -173,8 +173,14 @@ suite('scaffold linting-settings merge', () => {
         assert.strictEqual(buildLintingSettingsContent('   \n\t\n'), LINTING_SETTINGS_TEMPLATE);
     });
 
+    function mergeOrThrow(input: string | undefined): string {
+        const merged = buildLintingSettingsContent(input);
+        assert.ok(merged !== null, 'buildLintingSettingsContent should not return null for this input');
+        return merged;
+    }
+
     test('inserts block into an empty object preserving formatting', () => {
-        const merged = buildLintingSettingsContent('{\n}\n');
+        const merged = mergeOrThrow('{\n}\n');
         assert.ok(merged.startsWith('{\n'), 'should retain the opening brace line');
         assert.ok(merged.trimEnd().endsWith('}'), 'should retain the closing brace');
         const keys = detectExistingLintingKeys(merged) ?? [];
@@ -189,7 +195,7 @@ suite('scaffold linting-settings merge', () => {
   "files.autoSave": "onFocusChange"
 }
 `;
-        const merged = buildLintingSettingsContent(existing);
+        const merged = mergeOrThrow(existing);
         assert.ok(
             merged.includes('"editor.tabSize": 4'),
             'unrelated key must be preserved',
@@ -215,7 +221,7 @@ suite('scaffold linting-settings merge', () => {
   "editor.tabSize": 2
 }
 `;
-        const merged = buildLintingSettingsContent(existing);
+        const merged = mergeOrThrow(existing);
         const enabledOccurrences = merged.match(/"raven\.linting\.enabled"/g) ?? [];
         assert.strictEqual(
             enabledOccurrences.length,
@@ -242,8 +248,59 @@ suite('scaffold linting-settings merge', () => {
         );
     });
 
+    test('inserts comma before a trailing line comment on the last property', () => {
+        const existing = `{
+  "editor.tabSize": 4 // explanatory comment
+}
+`;
+        const merged = mergeOrThrow(existing);
+        // The new comma must come BEFORE the user's trailing `//` comment so
+        // the file is still valid JSONC (otherwise the comma sits inside
+        // the comment text).
+        assert.ok(
+            /"editor\.tabSize":\s*4,\s*\/\/ explanatory comment/.test(merged),
+            `expected the inserted comma to land before the trailing comment; got:\n${merged}`,
+        );
+        const stripped = merged
+            .replace(/\/\/[^\n]*/g, '')
+            .replace(/,(\s*[}\]])/g, '$1');
+        const parsed = JSON.parse(stripped) as Record<string, unknown>;
+        assert.strictEqual(parsed['editor.tabSize'], 4);
+        assert.strictEqual(parsed['raven.linting.enabled'], true);
+    });
+
+    test('leaves a nested raven.linting.* key inside an [r] override untouched', () => {
+        const existing = `{
+  "editor.tabSize": 2,
+  "[r]": {
+    "raven.linting.lineLength": 100
+  }
+}
+`;
+        const merged = mergeOrThrow(existing);
+        // The nested key under [r] is a language-scoped override; it must
+        // survive the merge intact (top-level keys may be stripped).
+        assert.ok(
+            /"\[r\]"\s*:\s*\{\s*"raven\.linting\.lineLength":\s*100/.test(merged),
+            `expected the nested [r] override to survive; got:\n${merged}`,
+        );
+        // And the top-level block was still inserted.
+        assert.ok(
+            merged.includes('"raven.linting.enabled": true'),
+            'the top-level block must still be inserted',
+        );
+    });
+
+    test('returns null for a non-object root (e.g. array)', () => {
+        assert.strictEqual(buildLintingSettingsContent('[1, 2, 3]'), null);
+    });
+
+    test('returns null for a parse-error file', () => {
+        assert.strictEqual(buildLintingSettingsContent('{ this is not json'), null);
+    });
+
     test('re-running on a sentineled file does not duplicate the block or its lintr comments', () => {
-        const merged = buildLintingSettingsContent(LINTING_SETTINGS_TEMPLATE);
+        const merged = mergeOrThrow(LINTING_SETTINGS_TEMPLATE);
 
         const beginCount = (merged.match(new RegExp(escapeRegex(LINTING_SENTINEL_BEGIN), 'g')) ?? [])
             .length;
@@ -276,7 +333,7 @@ suite('scaffold linting-settings merge', () => {
   "files.autoSave": "onFocusChange"
 }
 `;
-        const merged = buildLintingSettingsContent(previous);
+        const merged = mergeOrThrow(previous);
         assert.ok(merged.includes('"editor.tabSize": 4'), 'unrelated keys must survive');
         assert.ok(
             merged.includes('"files.autoSave": "onFocusChange"'),
@@ -298,6 +355,30 @@ suite('scaffold linting-settings merge', () => {
         );
     });
 
+    test('ignores sentinel-shaped lines that sit inside a block comment', () => {
+        // The sentinels here are inside a /* ... */ block comment, so they
+        // should NOT trigger the sentinel-strip path. The file has no real
+        // raven.linting.* keys, so the merge just appends a fresh block.
+        const existing = `{
+  /*
+   ${LINTING_SENTINEL_BEGIN}
+   ${LINTING_SENTINEL_END}
+   notes about future config
+  */
+  "editor.tabSize": 4
+}
+`;
+        const merged = mergeOrThrow(existing);
+        assert.ok(
+            merged.includes('notes about future config'),
+            'the user-authored block comment must survive',
+        );
+        // The new block adds its own sentinels — exactly one begin/end pair.
+        const beginCount = (merged.match(new RegExp(escapeRegex(LINTING_SENTINEL_BEGIN), 'g')) ?? [])
+            .length;
+        assert.strictEqual(beginCount, 2, 'one sentinel inside the block comment plus one from the new block');
+    });
+
     test('output parses as valid JSON after comment + trailing-comma stripping', () => {
         const existing = `{
   "editor.tabSize": 4,
@@ -305,7 +386,7 @@ suite('scaffold linting-settings merge', () => {
   "raven.linting.enabled": false
 }
 `;
-        const merged = buildLintingSettingsContent(existing);
+        const merged = mergeOrThrow(existing);
         const stripped = merged
             .replace(/\/\/[^\n]*/g, '')
             .replace(/,(\s*[}\]])/g, '$1');
