@@ -609,6 +609,43 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_expression_hanging_indent_passes() {
+        // Plain `(expr)` (parenthesized_expression, not a call) routes through
+        // the same set_bracketed path as call arguments. Inner content hangs
+        // one unit beyond the line of `(`; the inner `a + b` continuation
+        // adds another unit on top of that.
+        let text = "x <- (\n  a +\n    b\n)\n";
+        assert!(lint(text, 2).is_empty(), "got {:?}", lint(text, 2));
+    }
+
+    #[test]
+    fn parenthesized_expression_inner_misindented_flagged() {
+        // `b` continues `a +` and must indent one unit beyond `a`'s line
+        // (line indent 2 → expected 4). Writing it at 2 is wrong.
+        let text = "x <- (\n  a +\n  b\n)\n";
+        let diags = lint(text, 2);
+        assert!(
+            diags.iter().any(|d| d.range.start.line == 2),
+            "expected continuation diagnostic on line 2; got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn parenthesized_expression_closing_paren_aligns_with_opener_line() {
+        // The closing `)` on its own line aligns with the line of the `(`.
+        let aligned = "x <- (\n  a\n)\n";
+        let misaligned = "x <- (\n  a\n  )\n";
+        assert!(lint(aligned, 2).is_empty());
+        let diags = lint(misaligned, 2);
+        assert!(
+            diags.iter().any(|d| d.range.start.line == 2),
+            "expected misalignment diagnostic on line 2; got {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn mixed_pipe_and_arithmetic_chain_accepts_hanging_and_subchain_aligned() {
         // `f() |> g() + y + z` chains across pipe and arithmetic. The
         // hanging form (2) and the chain-start column (which lines up with
