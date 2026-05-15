@@ -160,26 +160,32 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     const outputChannel = vscode.window.createOutputChannel('Raven');
 
     const clientOptions: LanguageClientOptions = {
-        // Deliberate scope: the Rust tree-sitter parser is R-only, so the
-        // selector does NOT include the `rmd` / `quarto` language IDs.
-        // Subscribing to them would surface prose lines as syntax errors and
-        // diagnostics. Chunk-level LSP features inside `.Rmd` / `.qmd` are
-        // tracked as a follow-up to #230 and will need a more targeted flow
-        // (e.g. virtual-document injection per fenced R block).
+        // `rmd` and `quarto` are included so the document outline can surface
+        // chunk entries (issue #227). The server side gates diagnostics for
+        // these documents because the R tree-sitter parser would otherwise
+        // emit syntax errors on prose. Chunk-level LSP features inside R
+        // chunks (hover/completion/go-to-def) are tracked as a follow-up to
+        // #230 and will need a more targeted flow (e.g. virtual-document
+        // injection per fenced R block).
         documentSelector: [
             { scheme: 'file', language: 'r' },
             { scheme: 'untitled', language: 'r' },
+            { scheme: 'file', language: 'rmd' },
+            { scheme: 'untitled', language: 'rmd' },
+            { scheme: 'file', language: 'quarto' },
+            { scheme: 'untitled', language: 'quarto' },
             { scheme: 'file', language: 'jags' },
             { scheme: 'untitled', language: 'jags' },
             { scheme: 'file', language: 'stan' },
             { scheme: 'untitled', language: 'stan' },
         ],
         synchronize: {
-            // Matches the LSP `documentSelector` above: only the file extensions
-            // mapped to the `r` / `jags` / `stan` language IDs. `.Rmd` / `.qmd`
-            // are tracked under `rmd` / `quarto` and the server does not parse
-            // them, so they are intentionally omitted from this glob.
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}'),
+            // Matches the LSP `documentSelector` above. `.Rmd` / `.qmd` are
+            // included so workspace file events for those documents reach the
+            // server too.
+            fileEvents: vscode.workspace.createFileSystemWatcher(
+                '**/*.{r,R,rmd,Rmd,RMD,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}',
+            ),
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions,

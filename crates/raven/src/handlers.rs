@@ -118,6 +118,10 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
+    /// Chunk-detection kind for the document, captured from the document so
+    /// that untitled Rmd/Quarto buffers (no file extension) still classify
+    /// correctly. Used to gate diagnostics for prose-bearing documents.
+    pub chunk_kind: crate::chunks::ChunkKind,
 
     /// STEP 1 (parent walk) cache shared across all `get_scope` calls in this
     /// snapshot's diagnostic pass. STEP 1 is position-invariant within one
@@ -253,6 +257,7 @@ impl DiagnosticsSnapshot {
             cycle_closing_snippet,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
+            chunk_kind: doc.chunk_kind,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             scope_contribution: state.package_state.scope_contribution().clone(),
         })
@@ -320,6 +325,14 @@ pub(crate) fn diagnostics_from_snapshot(
     // Use snapshot.file_type (from document) instead of URI-based detection,
     // so untitled buffers with languageId "jags"/"stan" are correctly identified.
     if snapshot.file_type != FileType::R {
+        return Some(Vec::new());
+    }
+
+    // Suppress diagnostics for R Markdown / Quarto documents. The tree-sitter
+    // R parser sees prose, YAML, and non-R fenced blocks as garbage, so every
+    // non-R line becomes a syntax error. The outline still works (see
+    // `document_symbol`); only the diagnostic noise is gated.
+    if snapshot.chunk_kind == crate::chunks::ChunkKind::Rmd {
         return Some(Vec::new());
     }
 
@@ -4058,6 +4071,13 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     };
 
     if doc.tree.is_none() {
+        return Vec::new();
+    }
+
+    // Suppress diagnostics for R Markdown / Quarto documents — prose lines
+    // would otherwise surface as spurious syntax errors. See the matching
+    // guard in `diagnostics_from_snapshot`.
+    if doc.chunk_kind == crate::chunks::ChunkKind::Rmd {
         return Vec::new();
     }
 
@@ -17474,6 +17494,29 @@ result <- data %>% filter(x > 0)
             .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
             .expect("chunk entry");
         assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
+    fn test_diagnostics_suppressed_for_rmd_documents() {
+        // The R tree-sitter parser sees prose as garbage. Gating prevents
+        // every non-R line from surfacing as a syntax error.
+        use crate::state::{Document, WorldState};
+
+        let prose_with_chunk = "# A heading\n\nSome prose with [a link](url).\n\n```{r}\nx <- 1\n```\n";
+        let uri = Url::parse("file:///doc.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.cross_file_config.diagnostics_enabled = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(prose_with_chunk, None, &uri));
+
+        let diags = super::diagnostics(&state, &uri, &DiagCancelToken::never());
+        assert!(
+            diags.is_empty(),
+            "Rmd documents should produce zero diagnostics, got {} ({:?})",
+            diags.len(),
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
