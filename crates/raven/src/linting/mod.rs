@@ -89,6 +89,9 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
     if let Some(sev) = config.infix_spaces_severity {
         rules::infix_spaces::collect(text, tree_root, sev, &suppressions, &mut out);
     }
+    if let Some(sev) = config.commented_code_severity {
+        rules::commented_code::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
 
     out
 }
@@ -828,6 +831,172 @@ print.data.frame <- function(x, ...) NULL
         config.infix_spaces_severity = None;
         let diags = lint("x<-1\n", &config);
         assert!(diags.is_empty(), "rule must be silent when severity is None: {:?}", diags);
+    }
+
+    fn commented_code_only_config() -> LintConfig {
+        LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            assignment_operator_severity: None,
+            object_name_severity: None,
+            infix_spaces_severity: None,
+            ..enabled_config()
+        }
+    }
+
+    #[test]
+    fn commented_code_flags_obvious_call() {
+        let config = commented_code_only_config();
+        let diags = lint("# foo(bar, baz)\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("Commented code"));
+        assert_eq!(diags[0].range.start.line, 0);
+    }
+
+    #[test]
+    fn commented_code_flags_assignment() {
+        let config = commented_code_only_config();
+        let diags = lint("# x <- 1 + 2\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn commented_code_skips_prose_without_operators() {
+        let config = commented_code_only_config();
+        // Bare identifier — could be a noun in prose. Don't flag.
+        let diags = lint("# foo\n# another comment\n", &config);
+        assert!(diags.is_empty(), "prose must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn commented_code_skips_roxygen() {
+        let config = commented_code_only_config();
+        // Roxygen blocks routinely contain code-shaped examples like
+        // `@param x default 1` — those must not be flagged.
+        let diags = lint("#' @param x default value\n#' foo(bar = 1)\n", &config);
+        assert!(diags.is_empty(), "roxygen must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn commented_code_skips_shebang_on_first_line() {
+        let config = commented_code_only_config();
+        let diags = lint("#!/usr/bin/env Rscript\n", &config);
+        assert!(diags.is_empty(), "shebang must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn commented_code_skips_todo_and_fixme_lines() {
+        let config = commented_code_only_config();
+        let diags = lint(
+            "# TODO: rewrite foo(x, y)\n# FIXME(jmb): fix logger(level)\n# NOTE: see help() below\n",
+            &config,
+        );
+        assert!(
+            diags.is_empty(),
+            "annotation comments must not be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_skips_directive_markers() {
+        let config = commented_code_only_config();
+        // `# nolint`, `# @lsp-source`, etc. must never be flagged — these are
+        // suppression / cross-file directives, not commented-out code.
+        let diags = lint(
+            "# nolint\n# nolint: line_length\n# @lsp-source ../helpers.R\n# @lsp-ignore\n",
+            &config,
+        );
+        assert!(
+            diags.is_empty(),
+            "directive markers must not be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_skips_end_of_line_comments() {
+        let config = commented_code_only_config();
+        // The `# x <- 2` is an end-of-line annotation, not standalone dead
+        // code. Don't flag.
+        let diags = lint("x <- 1 # x <- 2\n", &config);
+        assert!(
+            diags.is_empty(),
+            "end-of-line comment must not be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_groups_contiguous_block() {
+        let config = commented_code_only_config();
+        // Two commented-out code lines that are syntactically valid R when
+        // joined. Should produce *one* diagnostic for the whole block.
+        let diags = lint("# x <- 1\n# y <- x + 2\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        let d = &diags[0];
+        assert_eq!(d.range.start.line, 0);
+        assert_eq!(d.range.end.line, 1);
+    }
+
+    #[test]
+    fn commented_code_respects_nolint_block() {
+        let config = commented_code_only_config();
+        // For commented-out code, an inline `# nolint` suffix can't suppress
+        // the diagnostic — the `#` of the marker is itself inside the comment
+        // and so the Suppressions parser never sees a fresh `# nolint`. The
+        // supported patterns are bracketed blocks and `# @lsp-ignore-next`.
+        let diags = lint("# nolint start\n# x <- 1 + 2\n# nolint end\n", &config);
+        assert!(diags.is_empty(), "nolint block must suppress: {:?}", diags);
+    }
+
+    #[test]
+    fn commented_code_respects_lsp_ignore_next() {
+        let config = commented_code_only_config();
+        let diags = lint("# @lsp-ignore-next\n# x <- 1 + 2\n# y <- 3 + 4\n", &config);
+        // `@lsp-ignore-next` suppresses line 1. Line 2 is also a commented
+        // code line, but it's part of a separate single-line block (the
+        // directive on line 0 itself is a non-code comment, breaking the
+        // group), and it stays in the block.
+        let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
+        assert!(
+            !lines.contains(&1),
+            "@lsp-ignore-next must suppress line 1: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_skips_mode_line() {
+        let config = commented_code_only_config();
+        let diags = lint("# -*- coding: utf-8 -*-\n", &config);
+        assert!(
+            diags.is_empty(),
+            "Emacs mode line must not be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_severity_off_disables_rule() {
+        let mut config = commented_code_only_config();
+        config.commented_code_severity = None;
+        let diags = lint("# x <- 1\n", &config);
+        assert!(
+            diags.is_empty(),
+            "rule must be silent when severity is None: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_diagnostic_carries_lint_source() {
+        let config = commented_code_only_config();
+        let diags = lint("# foo(bar)\n", &config);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].source.as_deref(), Some(LINT_SOURCE));
     }
 }
 

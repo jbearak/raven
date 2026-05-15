@@ -536,6 +536,12 @@ pub(crate) fn parse_lint_config(
     if let Some(sev) = linting.get("infixSpacesSeverity").and_then(|v| v.as_str()) {
         config.infix_spaces_severity = parse_severity(sev);
     }
+    if let Some(sev) = linting
+        .get("commentedCodeSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.commented_code_severity = parse_severity(sev);
+    }
 
     log::info!("Linting configuration loaded from LSP settings:");
     log::info!("  enabled: {}", config.enabled);
@@ -545,14 +551,15 @@ pub(crate) fn parse_lint_config(
         config.assignment_operator_style
     );
     log::info!(
-        "  severities: line={:?} ws={:?} tab={:?} blank={:?} assign={:?} obj_name={:?} infix_spaces={:?}",
+        "  severities: line={:?} ws={:?} tab={:?} blank={:?} assign={:?} obj_name={:?} infix_spaces={:?} commented_code={:?}",
         config.line_length_severity,
         config.trailing_whitespace_severity,
         config.no_tab_severity,
         config.trailing_blank_lines_severity,
         config.assignment_operator_severity,
         config.object_name_severity,
-        config.infix_spaces_severity
+        config.infix_spaces_severity,
+        config.commented_code_severity
     );
     log::info!(
         "  object_name styles: fn={:?} var={:?} arg={:?}",
@@ -7472,7 +7479,8 @@ mod tests {
                     "trailingBlankLinesSeverity": "off",
                     "assignmentOperatorSeverity": "off",
                     "objectNameSeverity": "off",
-                    "infixSpacesSeverity": "off"
+                    "infixSpacesSeverity": "off",
+                    "commentedCodeSeverity": "off"
                 }
             });
             let cfg = crate::backend::parse_lint_config(&settings).unwrap();
@@ -7483,6 +7491,7 @@ mod tests {
             assert_eq!(cfg.assignment_operator_severity, None);
             assert_eq!(cfg.object_name_severity, None);
             assert_eq!(cfg.infix_spaces_severity, None);
+            assert_eq!(cfg.commented_code_severity, None);
         }
 
         #[test]

@@ -1377,6 +1377,25 @@
           ],
           "default": "hint",
           "description": "Severity for the infix-spaces lint. Flags missing spaces around binary operators (`+`, `==`, `<-`, `|>`, `%>%`, etc.) and stray whitespace around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`). Alignment whitespace (multiple spaces) and line-continuations are not flagged."
+        },
+        "raven.linting.commentedCodeSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report commented-out code as errors",
+            "Report commented-out code as warnings",
+            "Report commented-out code as information",
+            "Report commented-out code as hints",
+            "Disable the commented-code lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the commented-code lint. Flags standalone comment blocks whose body parses as R code (calls, assignments, operators). Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, ...), and `# nolint` / `# @lsp-*` directives are never flagged."
         }
       }
     }
