@@ -17,15 +17,21 @@
 //!   stray spaces around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`).
 //! * `commented_code` — flag standalone comment blocks whose body parses as R
 //!   and contains a call, assignment, operator, or function definition. This
-//!   rule additionally re-parses each candidate comment body via the
-//!   thread-local parser pool; every other rule walks only the
-//!   already-parsed tree.
+//!   rule re-parses each candidate comment body via the thread-local parser
+//!   pool; every other rule walks only the already-parsed tree. The same
+//!   parser pool is also exercised by the suppression parser on the rare
+//!   commented-code line that carries an inline `# nolint` (see below).
 //!
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
 //! * `# nolint start` / `# nolint end` brackets a region.
 //! * `# @lsp-ignore` suppresses the line it appears on.
 //! * `# @lsp-ignore-next` suppresses the *following* source line.
+//!
+//! Same-line markers (`# nolint`, `# nolint start/end`, `# @lsp-ignore`) are
+//! additionally recognised when nested inside a commented-code line — e.g.
+//! `# x <- 1 # nolint` — via a parse-gated fallback. See [`nolint`] for the
+//! full pipeline and limits.
 
 pub mod config;
 mod nolint;

@@ -157,7 +157,7 @@ fn first_hash_body(line: &str) -> Option<(usize, &str)> {
 ///    quote bookkeeping as [`first_hash_body`].
 /// 3. **Marker classify** — only treat the inner `#` as a marker if [`classify`]
 ///    recognises what follows it (`nolint`, `nolint start`, `nolint end`,
-///    `@lsp-ignore`, `@lsp-ignore-next`, optionally with a rule filter).
+///    `@lsp-ignore`, optionally with a rule filter).
 /// 4. **Parse-gate** — require the prefix of the outer body (everything
 ///    between the outer `#` and the inner `#`) to parse as real R code. This
 ///    is the same gate `commented_code` uses; reusing it avoids accidentally
@@ -165,6 +165,13 @@ fn first_hash_body(line: &str) -> Option<(usize, &str)> {
 ///
 /// The scan stops at the first inner `#`: a further-nested inner-inner marker
 /// (`# foo # bar # nolint`) is intentionally not honoured.
+///
+/// `# @lsp-ignore-next` in the inline position is **not** honoured: the
+/// fallback exists for same-line suppression on commented-out code, so
+/// silently mapping it to "suppress line N+1" would suppress an unrelated
+/// neighbour while leaving the user's commented-code line still flagged. A
+/// user who really wants next-line semantics should put the marker on its
+/// own line.
 fn find_inline_marker(body: &str) -> Option<NolintMarker> {
     if !body.contains("nolint") && !body.contains("@lsp-ignore") {
         return None;
@@ -186,9 +193,13 @@ fn find_inline_marker(body: &str) -> Option<NolintMarker> {
         } else if !in_double && b == b'\'' {
             in_single = !in_single;
         } else if !in_single && !in_double && b == b'#' {
-            // First candidate inner `#`. Classify what follows, parse-gate
-            // the prefix, then commit — or give up.
-            let marker = classify(&body[i + 1..])?;
+            // First candidate inner `#`. Classify what follows, reject the
+            // `NextLine` variant (see the doc comment above), parse-gate the
+            // prefix, then commit — or give up.
+            let marker = match classify(&body[i + 1..])? {
+                NolintMarker::NextLine => return None,
+                m => m,
+            };
             let prefix = &body[..i];
             let prefix_code = prefix.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
             if looks_like_code(prefix_code) {
@@ -384,5 +395,17 @@ mod tests {
     fn prose_comment_mentioning_nolint_without_inner_hash_does_not_suppress() {
         let s = Suppressions::from_text("# this comment mentions nolint but no second hash\n");
         assert!(!s.is_suppressed(0));
+    }
+
+    #[test]
+    fn inline_lsp_ignore_next_is_not_honoured() {
+        // `@lsp-ignore-next` semantically points at the *following* line.
+        // Honouring it inline would silently suppress a neighbouring line
+        // while leaving the user's commented-code line still flagged — worse
+        // than not honouring it at all. The inline fallback is for same-line
+        // markers only.
+        let s = Suppressions::from_text("# x <- 1 # @lsp-ignore-next\ny <- 2\n");
+        assert!(!s.is_suppressed(0));
+        assert!(!s.is_suppressed(1));
     }
 }
