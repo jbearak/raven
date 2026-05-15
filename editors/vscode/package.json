@@ -1358,6 +1358,25 @@
           ],
           "default": "hint",
           "description": "Severity for the object-name lint. Set to \"off\" to disable the rule entirely, or set individual styles to \"any\" to disable specific symbol kinds."
+        },
+        "raven.linting.infixSpacesSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report infix-spacing violations as errors",
+            "Report infix-spacing violations as warnings",
+            "Report infix-spacing violations as information",
+            "Report infix-spacing violations as hints",
+            "Disable the infix-spaces lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the infix-spaces lint. Flags missing spaces around binary operators (`+`, `==`, `<-`, `|>`, `%>%`, etc.) and stray whitespace around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`). Alignment whitespace (multiple spaces) and line-continuations are not flagged."
         }
       }
     }

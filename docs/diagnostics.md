@@ -60,8 +60,11 @@ Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-li
 | Trailing blank lines | hint | Blank lines at end of file, or missing final newline |
 | Assignment operator | hint | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
 | Object name | hint | Function, variable, or argument name doesn't match the configured naming scheme (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*`) |
+| Infix spaces | hint | Missing space around a binary operator (`a+b`, `x<-1`, `a%>%b`, `if (a<=b)`), or stray space around a tight-binding operator (`obj $ field`, `1 : 10`, unary `- x`) |
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
+
+The infix-spaces lint flags two opposing cases. **Spaces required** on both sides: arithmetic (`+`, `-`, `*`, `/`, `^`), comparison (`<`, `<=`, `==`, `!=`, ...), logical (`&`, `&&`, `|`, `||`), assignment (`<-`, `<<-`, `->`, `->>`, `=`), pipe (`|>`, `%>%`, any `%...%`), and binary formula (`y ~ x`). **No spaces** on either side: sequence (`:`), namespace (`::`, `:::`), member access (`$`, `@`), and unary `-`, `+`, `!`, `?`. The rule is conservative — alignment whitespace (`x   <- 1`) is not flagged, and line-continuation cases (operator at end of line, RHS on the next line) are skipped since the line break supplies the separation.
 
 The object-name lint has independent style settings for **functions** (`objectNameStyleFunction`), **variables** (`objectNameStyleVariable`), and **arguments** (`objectNameStyleArgument`). Each accepts `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Using `any` accepts all names for that kind — since the three are checked independently, you can enforce a style on two while opting out of the third.
 
