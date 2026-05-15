@@ -17519,6 +17519,54 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
+    fn test_r_handlers_suppressed_for_rmd_documents() {
+        // Every R-only handler that was gated in the Rmd routing change
+        // (issue #227) should return an empty/no-op response for Rmd
+        // documents. Diagnostics and completion have their own tests; this
+        // covers the remaining sync handlers in one place.
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose.\n\n```{r}\nfn <- function(x) x\n```\n";
+        let uri = Url::parse("file:///doc.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let pos = Position::new(3, 0);
+
+        assert_eq!(
+            super::folding_range(&state, &uri),
+            Some(Vec::new()),
+            "folding_range"
+        );
+        assert_eq!(
+            super::selection_range(&state, &uri, vec![pos]),
+            Some(Vec::new()),
+            "selection_range"
+        );
+        assert!(
+            super::prepare_signature_help(&state, &uri, pos).is_none(),
+            "prepare_signature_help"
+        );
+        assert!(
+            super::goto_definition_with_cancel(
+                &state,
+                &uri,
+                pos,
+                &crate::handlers::DiagCancelToken::never(),
+            )
+            .is_none(),
+            "goto_definition"
+        );
+        assert_eq!(
+            super::references(&state, &uri, pos),
+            Some(Vec::new()),
+            "references"
+        );
+    }
+
+    #[test]
     fn test_completion_suppressed_for_rmd_documents() {
         use crate::state::{Document, WorldState};
 
