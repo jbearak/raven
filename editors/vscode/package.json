@@ -180,8 +180,8 @@
         "category": "Raven"
       },
       {
-        "command": "raven.scaffold.lintr",
-        "title": "Create .lintr",
+        "command": "raven.scaffold.lintingSettings",
+        "title": "Create linting settings",
         "category": "Raven"
       },
       {

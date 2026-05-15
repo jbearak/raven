@@ -60,7 +60,7 @@ These Command Palette entries write starter R config files to the first workspac
 | Command | File | Contents |
 |---|---|---|
 | `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch dirs, and AI-tool user-local overrides |
-| `Raven: Create .lintr` | `.lintr` | `linters_with_defaults(line_length_linter(120))` |
+| `Raven: Create linting settings` | `.vscode/settings.json` | Every `raven.linting.*` key Raven understands, each prefaced with a `//` comment naming its `lintr` equivalent. Merges into an existing `settings.json` without disturbing unrelated keys or comments; prompts before overwriting an existing `raven.linting.*` block |
 
 ## R Console Activation
 

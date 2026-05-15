@@ -180,7 +180,9 @@ Raven does not read `.lintr` files — its rules are configured per VS Code sett
 
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"hint"` to `"warning"`.
 
-If you'd also like a starter `.lintr` for running `lintr` itself alongside Raven (see [below](#filling-the-gaps-with-lintr-itself)), run the **Raven: Create .lintr** command from the Command Palette ([Configuration § Scaffold Commands](configuration.md#scaffold-commands)). It writes a minimal `linters: linters_with_defaults(line_length_linter(120))` to the workspace root.
+If you'd like a starter `raven.linting.*` block scaffolded into `.vscode/settings.json` — every key Raven understands, each prefaced with a `//` comment naming its `lintr` equivalent — run the **Raven: Create linting settings** command from the Command Palette ([Configuration § Scaffold Commands](configuration.md#scaffold-commands)). It merges into an existing `settings.json` without disturbing unrelated keys or comments, and prompts before overwriting any pre-existing `raven.linting.*` values.
+
+If you also want to run `lintr` itself alongside Raven, see [below](#filling-the-gaps-with-lintr-itself) — that path needs a `.lintr` file, which Raven doesn't generate.
 
 ## Gaps vs `lintr`
 
@@ -201,7 +203,12 @@ The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?it
 
 1. Keep Raven installed and enabled.
 2. Install the REditorSupport (R) extension. Leave `r.lsp.enabled` at its default (`true`).
-3. Place a `.lintr` file at your project root. The **Raven: Create .lintr** command writes a starter (`linters: linters_with_defaults(line_length_linter(120))`).
+3. Place a `.lintr` file at your project root. Raven does not scaffold this file — its format is `lintr`'s own DSL and Raven doesn't read it. A minimal starter that mirrors the `lintr` default rule set with a 120-character line limit is one line:
+
+   ```r
+   linters: linters_with_defaults(line_length_linter(120))
+   ```
+
 4. Install `lintr` in the R session REditorSupport uses (`install.packages("lintr")`).
 
 REditorSupport's LSP will surface `lintr` diagnostics; Raven will continue to surface its own. Both sets will appear in the Problems pane and you can tell them apart by the `source` field (`raven (lint)` for Raven, `lintr` for REditorSupport). See [Coexistence § Language servers](coexistence.md#language-servers-raven-alone-vs-both) for the broader cross-extension model.
