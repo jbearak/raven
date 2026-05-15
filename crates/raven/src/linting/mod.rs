@@ -43,13 +43,17 @@
 //! * `spaces_inside` — flag whitespace immediately inside `(`, `[`, `[[`
 //!   and their closers. Empty groupings and multi-line wrapping are exempt.
 //! * `indentation` — flag lines whose leading whitespace doesn't match the
-//!   expected indent for their AST scope. Lintr's tidy-default hanging indent
-//!   for braced blocks, multi-line argument lists, and continuation lines.
+//!   expected indent for their AST scope. Implements lintr's tidy-default
+//!   hanging indent for braced blocks, multi-line argument lists, and
+//!   continuation lines; also accepts the on-type formatter's aligned style
+//!   for argument lists that carry content on the opener line.
 //!
-//! Implementation note: every rule except `commented_code` and `semicolon`
-//! walks the already-parsed tree directly. `commented_code` re-parses each
-//! candidate comment body; `semicolon` byte-scans the source text using AST
-//! ranges only to skip strings and comments.
+//! Implementation note: most rules walk the already-parsed tree directly.
+//! `commented_code` re-parses each candidate comment body; `semicolon`
+//! byte-scans the source text using AST ranges only to skip strings and
+//! comments. `indentation` walks the tree to compute per-line scope
+//! expectations and also scans line text to count leading whitespace and
+//! detect mixed tabs.
 //!
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
@@ -433,6 +437,7 @@ mod tests {
             assignment_operator_severity: None,
             infix_spaces_severity: None,
             commented_code_severity: None,
+            indentation_severity: None,
             ..enabled_config()
         }
     }
@@ -660,6 +665,7 @@ print.data.frame <- function(x, ...) NULL
             assignment_operator_severity: None,
             object_name_severity: None,
             commented_code_severity: None,
+            indentation_severity: None,
             ..enabled_config()
         }
     }
@@ -939,6 +945,7 @@ print.data.frame <- function(x, ...) NULL
             assignment_operator_severity: None,
             object_name_severity: None,
             infix_spaces_severity: None,
+            indentation_severity: None,
             ..enabled_config()
         }
     }

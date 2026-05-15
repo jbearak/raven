@@ -441,6 +441,8 @@ pub(crate) fn parse_cross_file_config(
 /// * `enabled` (bool) — master switch.
 /// * `lineLength` (number) — max line length; clamped to `[20, 10_000]`.
 /// * `objectLength` (number) — max identifier length; clamped to `[5, 1_000]`.
+/// * `indentationUnit` (number) — spaces per indent level for the
+///   indentation lint; clamped to `[1, 8]`.
 /// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
 /// * `stringDelimiter` (`"\""` or `"'"`) — preferred string delimiter.
 /// * `objectNameStyleFunction`, `objectNameStyleVariable`,
@@ -467,6 +469,7 @@ pub(crate) fn parse_cross_file_config(
 ///   - `vectorLogicSeverity`
 ///   - `functionLeftParenthesesSeverity`
 ///   - `spacesInsideSeverity`
+///   - `indentationSeverity`
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
 ) -> Option<crate::linting::LintConfig> {

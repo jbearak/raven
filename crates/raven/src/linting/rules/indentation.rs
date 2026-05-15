@@ -23,11 +23,15 @@
 //! * `binary_operator` — when the operator's RHS lives on a later line than
 //!   the LHS, those continuation lines indent one [`indent_unit`] beyond the
 //!   line where the LHS starts. The on-type formatter additionally aligns
-//!   such lines with the chain's first non-whitespace column (i.e.
-//!   `node.start_position().column`); when that column is to the right of
-//!   the hanging indent, the linter accepts it as an alternative so its
-//!   verdict doesn't disagree with the formatter's output. Nested binary
-//!   operators may push the expectation deeper (lintr's "tidy" default).
+//!   such lines with the binop's own start column (the column of its
+//!   leftmost token); when that column is to the right of the hanging indent,
+//!   the linter accepts it as an alternative so its verdict doesn't disagree
+//!   with the formatter's output. (The smart-indent provider may walk to a
+//!   sub-chain root for some mixed pipe/arithmetic chains via
+//!   `find_chain_start_from_ast`; the linter currently approximates this
+//!   with `node.start_position().column`, which agrees in the common cases
+//!   exercised by the test suite.) Nested binary operators may push the
+//!   expectation deeper (lintr's "tidy" default).
 //!
 //! Lines skipped without checks:
 //! * Suppressed lines (`# nolint`, `# nolint start/end`, `# @lsp-ignore`,
