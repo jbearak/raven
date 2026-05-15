@@ -13,6 +13,8 @@
 //! * `assignment_operator` — enforce `<-` (or `=`) for top-level assignment.
 //! * `object_name` — enforce a naming scheme (snake_case, camelCase, etc.)
 //!   on assignment targets and function arguments.
+//! * `infix_spaces` — flag missing spaces around binary infix operators and
+//!   stray spaces around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`).
 //!
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
@@ -83,6 +85,9 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
             &suppressions,
             &mut out,
         );
+    }
+    if let Some(sev) = config.infix_spaces_severity {
+        rules::infix_spaces::collect(text, tree_root, sev, &suppressions, &mut out);
     }
 
     out
@@ -328,6 +333,7 @@ mod tests {
             no_tab_severity: None,
             trailing_blank_lines_severity: None,
             assignment_operator_severity: None,
+            infix_spaces_severity: None,
             ..enabled_config()
         }
     }
@@ -544,6 +550,284 @@ print.data.frame <- function(x, ...) NULL
         for d in &diags {
             assert_eq!(d.source.as_deref(), Some(LINT_SOURCE));
         }
+    }
+
+    fn infix_spaces_only_config() -> LintConfig {
+        LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            assignment_operator_severity: None,
+            object_name_severity: None,
+            ..enabled_config()
+        }
+    }
+
+    #[test]
+    fn infix_spaces_flags_missing_spaces_around_plus() {
+        let config = infix_spaces_only_config();
+        let diags = lint("x <- 1+2\n", &config);
+        assert_eq!(diags.len(), 2, "expected 2 diagnostics (before+after), got {:?}", diags);
+        for d in &diags {
+            assert!(d.message.contains("space"), "msg: {}", d.message);
+            assert!(d.message.contains("`+`"), "msg: {}", d.message);
+        }
+    }
+
+    #[test]
+    fn infix_spaces_flags_only_missing_side() {
+        let config = infix_spaces_only_config();
+        let diags = lint("x <- 1 +2\n", &config);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("after"));
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_correct_spacing() {
+        let config = infix_spaces_only_config();
+        let diags = lint("x <- a + b * c / d ^ e\n", &config);
+        assert!(diags.is_empty(), "expected no diagnostics, got {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_alignment_whitespace() {
+        // Multiple spaces around an operator are allowed — alignment is a
+        // common pattern and collapsing it would be more annoying than helpful.
+        let config = infix_spaces_only_config();
+        let diags = lint("x   <-   1\n", &config);
+        assert!(diags.is_empty(), "alignment spaces must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_flags_namespace_op_with_spaces() {
+        let config = infix_spaces_only_config();
+        // `pkg :: fun` shouldn't have spaces around `::`. But tree-sitter-r
+        // only parses `pkg::fun` as `namespace_operator` when the operator is
+        // tight — verify it's a no-op when written that way.
+        let diags = lint("x <- pkg::fun()\n", &config);
+        assert!(diags.is_empty(), "tight `::` must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_flags_extract_op_with_spaces() {
+        let config = infix_spaces_only_config();
+        // `obj $ field` has stray whitespace around `$`. tree-sitter-r still
+        // recognises this as `extract_operator`.
+        let diags = lint("x <- obj $ field\n", &config);
+        assert!(!diags.is_empty(), "stray space around `$` must be flagged");
+        assert!(diags.iter().all(|d| d.message.contains("`$`")));
+    }
+
+    #[test]
+    fn infix_spaces_flags_at_op_with_spaces() {
+        let config = infix_spaces_only_config();
+        // `obj @ slot` (S4 slot access) is also `extract_operator`.
+        let diags = lint("x <- obj @ slot\n", &config);
+        assert!(!diags.is_empty(), "stray space around `@` must be flagged");
+        assert!(diags.iter().all(|d| d.message.contains("`@`")));
+    }
+
+    #[test]
+    fn infix_spaces_flags_unary_not_with_space() {
+        let config = infix_spaces_only_config();
+        // Unary `!` should be tight against its operand.
+        let diags = lint("y <- ! x\n", &config);
+        let unary_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("unary") && d.message.contains("`!`"))
+            .collect();
+        assert_eq!(unary_diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_flags_sequence_op_with_spaces() {
+        let config = infix_spaces_only_config();
+        // `1 : 10` — spaces around `:` are wrong for the sequence operator.
+        let diags = lint("xs <- 1 : 10\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+        assert!(diags.iter().all(|d| d.message.contains("`:`")));
+    }
+
+    #[test]
+    fn infix_spaces_tight_sequence_is_ok() {
+        let config = infix_spaces_only_config();
+        let diags = lint("xs <- 1:10\n", &config);
+        assert!(diags.is_empty(), "tight `:` must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_flags_unary_minus_with_space() {
+        let config = infix_spaces_only_config();
+        // `- x` has a space after the unary minus — should be flagged.
+        let diags = lint("y <- - x\n", &config);
+        let unary_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("unary"))
+            .collect();
+        assert_eq!(unary_diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_tight_unary_minus_is_ok() {
+        let config = infix_spaces_only_config();
+        let diags = lint("y <- -x\n", &config);
+        assert!(diags.is_empty(), "tight unary `-` must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_binary_minus() {
+        let config = infix_spaces_only_config();
+        // `a - b` with binary minus and spaces — fine.
+        let diags = lint("y <- a - b\n", &config);
+        assert!(diags.is_empty(), "binary `-` with spaces must pass: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_named_argument() {
+        let config = infix_spaces_only_config();
+        // tree-sitter-r parses `name=value` inside a call as an `argument`
+        // node, never a `binary_operator`. The infix-spaces rule must never
+        // touch named arguments — they are an unrelated syntactic form.
+        let diags = lint("f(name=value)\n", &config);
+        assert!(diags.is_empty(), "named arguments must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_function_default_argument() {
+        let config = infix_spaces_only_config();
+        // tree-sitter-r parses formal-parameter defaults like `x=1` as a
+        // `parameter` node (operator `=` is a direct child), not as a
+        // `binary_operator`. The rule must therefore leave both spaced and
+        // unspaced defaults alone.
+        let no_space = lint("f <- function(x=1) x\n", &config);
+        let with_space = lint("f <- function(x = 1) x\n", &config);
+        assert!(
+            no_space.is_empty(),
+            "function(x=1) defaults must not be flagged: {:?}",
+            no_space
+        );
+        assert!(
+            with_space.is_empty(),
+            "function(x = 1) defaults must not be flagged: {:?}",
+            with_space
+        );
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_line_continuation() {
+        let config = infix_spaces_only_config();
+        // Operator at end of line, RHS on the next line — the newline supplies
+        // the separation, so neither side should be flagged.
+        let diags = lint("x <- a +\n  b\n", &config);
+        assert!(diags.is_empty(), "line-continuation `+` must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_handles_comment_before_operand() {
+        // Regression: ensures `child_by_field_name("rhs")` (rather than
+        // positional walking) picks the real operand even when a comment
+        // node intervenes between the operator and its operand.
+        let config = infix_spaces_only_config();
+        // A comment between `<-` and `1` is uncommon but legal R. The rule
+        // should still be able to evaluate the gap consistently — and since
+        // the comment forces a newline before `1`, `gap_text` returns `None`
+        // (line-continuation case), so no diagnostic should be produced.
+        let diags = lint("x <- # comment\n  1\n", &config);
+        assert!(
+            diags.is_empty(),
+            "comment-then-newline gap must not produce diagnostics: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn infix_spaces_flags_custom_percent_op_with_missing_spaces() {
+        let config = infix_spaces_only_config();
+        let diags = lint("x <- a%>%b\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+        assert!(diags.iter().all(|d| d.message.contains("`%>%`")));
+    }
+
+    #[test]
+    fn infix_spaces_flags_assignment_without_spaces() {
+        let config = infix_spaces_only_config();
+        let diags = lint("x<-1\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+        assert!(diags.iter().all(|d| d.message.contains("`<-`")));
+    }
+
+    #[test]
+    fn infix_spaces_flags_comparison_without_spaces() {
+        let config = infix_spaces_only_config();
+        let diags = lint("if (a<=b) NULL\n", &config);
+        assert_eq!(diags.len(), 2);
+        assert!(diags.iter().all(|d| d.message.contains("`<=`")));
+    }
+
+    #[test]
+    fn infix_spaces_flags_logical_without_spaces() {
+        let config = infix_spaces_only_config();
+        let diags = lint("if (a&&b) NULL\n", &config);
+        assert_eq!(diags.len(), 2);
+        assert!(diags.iter().all(|d| d.message.contains("`&&`")));
+    }
+
+    #[test]
+    fn infix_spaces_flags_formula_without_spaces() {
+        let config = infix_spaces_only_config();
+        let diags = lint("m <- lm(y~x)\n", &config);
+        let tilde_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("`~`"))
+            .collect();
+        assert_eq!(tilde_diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_unary_formula() {
+        let config = infix_spaces_only_config();
+        // `~ x` and `~x` are both acceptable formula-head forms. The rule
+        // should not touch unary `~` either way.
+        let no_space = lint("f(~x)\n", &config);
+        let with_space = lint("f(~ x)\n", &config);
+        assert!(no_space.is_empty(), "unary `~x` must pass: {:?}", no_space);
+        assert!(
+            with_space.is_empty(),
+            "unary `~ x` must pass: {:?}",
+            with_space
+        );
+    }
+
+    #[test]
+    fn infix_spaces_does_not_flag_pipe_with_spaces() {
+        let config = infix_spaces_only_config();
+        let diags = lint("xs |> length()\n", &config);
+        assert!(diags.is_empty(), "pipe with spaces must pass: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_respects_nolint() {
+        let config = infix_spaces_only_config();
+        let diags = lint("x <- 1+2 # nolint\n", &config);
+        assert!(diags.is_empty(), "nolint must suppress: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_respects_lsp_ignore_next() {
+        let config = infix_spaces_only_config();
+        let diags = lint("# @lsp-ignore-next\nx <- 1+2\ny <- 3+4\n", &config);
+        let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
+        assert!(!lines.contains(&1), "@lsp-ignore-next must suppress line 1: {:?}", diags);
+        assert!(lines.contains(&2), "unsuppressed line 2 must still flag: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_severity_off_disables_rule() {
+        let mut config = infix_spaces_only_config();
+        config.infix_spaces_severity = None;
+        let diags = lint("x<-1\n", &config);
+        assert!(diags.is_empty(), "rule must be silent when severity is None: {:?}", diags);
     }
 }
 

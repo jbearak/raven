@@ -80,6 +80,8 @@ pub struct LintConfig {
     /// Severity for the object-name rule. `None` disables the rule entirely;
     /// per-kind `Any` styles disable individual checks while still running.
     pub object_name_severity: Option<DiagnosticSeverity>,
+    /// Severity for the infix-spaces rule. `None` disables the rule.
+    pub infix_spaces_severity: Option<DiagnosticSeverity>,
 }
 
 impl Default for LintConfig {
@@ -100,6 +102,7 @@ impl Default for LintConfig {
             trailing_blank_lines_severity: Some(DiagnosticSeverity::HINT),
             assignment_operator_severity: Some(DiagnosticSeverity::HINT),
             object_name_severity: Some(DiagnosticSeverity::HINT),
+            infix_spaces_severity: Some(DiagnosticSeverity::HINT),
         }
     }
 }

@@ -135,6 +135,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.objectNameStyleVariable', jsonPath: ['linting', 'objectNameStyleVariable'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
     { vsCodeKey: 'linting.objectNameStyleArgument', jsonPath: ['linting', 'objectNameStyleArgument'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
     { vsCodeKey: 'linting.objectNameSeverity', jsonPath: ['linting', 'objectNameSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.infixSpacesSeverity', jsonPath: ['linting', 'infixSpacesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     // Help viewer settings
     { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];
@@ -366,6 +367,7 @@ suite('Settings Transmission Property Tests', () => {
                 trailingBlankLinesSeverity: 'hint',
                 assignmentOperatorSeverity: 'hint',
                 objectNameSeverity: 'hint',
+                infixSpacesSeverity: 'hint',
             },
         }, 'Empty configuration should produce only runtime defaults');
 
@@ -516,6 +518,7 @@ suite('Settings Transmission Unit Tests', () => {
             trailingBlankLinesSeverity: 'hint',
             assignmentOperatorSeverity: 'hint',
             objectNameSeverity: 'hint',
+            infixSpacesSeverity: 'hint',
         });
     });
 
@@ -529,6 +532,7 @@ suite('Settings Transmission Unit Tests', () => {
             ['linting.objectNameStyleFunction', 'camelCase'],
             ['linting.objectNameStyleVariable', 'any'],
             ['linting.objectNameSeverity', 'warning'],
+            ['linting.infixSpacesSeverity', 'off'],
         ]);
         const mockConfig = createMockConfig(configuredSettings);
         const options = getInitializationOptions(mockConfig);
@@ -540,6 +544,7 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.linting?.objectNameStyleFunction, 'camelCase');
         assert.strictEqual(options.linting?.objectNameStyleVariable, 'any');
         assert.strictEqual(options.linting?.objectNameSeverity, 'warning');
+        assert.strictEqual(options.linting?.infixSpacesSeverity, 'off');
         // Untouched keys still emit their defaults.
         assert.strictEqual(options.linting?.trailingWhitespaceSeverity, 'hint');
         assert.strictEqual(options.linting?.objectNameStyleArgument, 'snake_case');

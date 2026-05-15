@@ -107,6 +107,7 @@ export interface RavenInitializationOptions {
         trailingBlankLinesSeverity?: SeverityLevel;
         assignmentOperatorSeverity?: SeverityLevel;
         objectNameSeverity?: SeverityLevel;
+        infixSpacesSeverity?: SeverityLevel;
     };
     helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
@@ -362,6 +363,7 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         trailingBlankLinesSeverity: config.get<SeverityLevel>('linting.trailingBlankLinesSeverity', 'hint'),
         assignmentOperatorSeverity: config.get<SeverityLevel>('linting.assignmentOperatorSeverity', 'hint'),
         objectNameSeverity: config.get<SeverityLevel>('linting.objectNameSeverity', 'hint'),
+        infixSpacesSeverity: config.get<SeverityLevel>('linting.infixSpacesSeverity', 'hint'),
     };
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');
