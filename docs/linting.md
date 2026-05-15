@@ -84,7 +84,7 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 - **Raven:** `raven.linting.infixSpacesSeverity` (default `"hint"`).
 - **`lintr` equivalent:** `lintr::infix_spaces_linter()`.
-- Spaces required on both sides of arithmetic, comparison, logical, assignment, pipe, and binary `~`. No spaces on either side of `:`, `::`, `:::`, `$`, `@`, and unary `-`, `+`, `!`, `?`. Alignment whitespace (`x   <- 1`) is allowed; operator-at-end-of-line line continuations are skipped.
+- Spaces required on both sides of arithmetic, comparison, logical, assignment, pipe (`|>`, `%>%`, and any `%...%` user-defined operator), and binary `~`. No spaces on either side of `:`, `::`, `:::`, `$`, `@`, and unary `-`, `+`, `!`, `?`. Alignment whitespace (`x   <- 1`) is allowed; operator-at-end-of-line line continuations are skipped.
 
 ### Commented code
 
@@ -156,13 +156,13 @@ Notes:
 
 ### One known suppression edge case
 
-Raven's suppression parser keys off the **first** `#` on the line, not the last. That means an inline `# nolint` *inside* a commented-code line does **not** suppress the `commented_code` lint:
+Raven's suppression parser scans each line left-to-right and treats the **first** `#` (outside any string literal) as the marker comment. A trailing `# nolint` next to real code works fine — there's no earlier `#` on that line — but an inline `# nolint` *inside* a commented-code line does **not** suppress the `commented_code` lint:
 
 ```r
 # x <- 1 # nolint
 ```
 
-The first `#` opens the comment, so the parser sees the body as `x <- 1 # nolint` — not as a `nolint` marker. The `commented_code` rule still parses `x <- 1` as code and flags it.
+The leading `#` is taken as the marker comment, and its body is `x <- 1 # nolint` — which doesn't start with `nolint` or `@lsp-ignore`, so no suppression is registered. The `commented_code` rule then parses `x <- 1` as R code and flags it.
 
 To suppress the rule on a commented-code line, put the marker on a separate line:
 
