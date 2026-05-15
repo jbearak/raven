@@ -337,6 +337,36 @@ suite('scaffold linting-settings merge', () => {
         );
     });
 
+    test('removes a raven.linting.* key written in comma-before style', () => {
+        // Comma-before JSONC: `, "key": value` at the start of each line
+        // after the first. The leading comma belongs to the property
+        // logically, so we have to absorb it when the property is removed.
+        const existing = `{
+  "editor.tabSize": 2
+  , "raven.linting.enabled": false
+  , "files.autoSave": "onFocusChange"
+}
+`;
+        const merged = mergeOrThrow(existing);
+        assert.ok(merged.includes('"editor.tabSize": 2'), 'editor.tabSize survives');
+        assert.ok(
+            merged.includes('"files.autoSave": "onFocusChange"'),
+            'files.autoSave survives',
+        );
+        assert.ok(
+            !merged.includes('"raven.linting.enabled": false'),
+            'old value is gone',
+        );
+        // No orphan separator: stripping comments + trailing commas yields valid JSON.
+        const stripped = merged
+            .replace(/\/\/[^\n]*/g, '')
+            .replace(/,(\s*[}\]])/g, '$1');
+        const parsed = JSON.parse(stripped) as Record<string, unknown>;
+        assert.strictEqual(parsed['editor.tabSize'], 2);
+        assert.strictEqual(parsed['files.autoSave'], 'onFocusChange');
+        assert.strictEqual(parsed['raven.linting.enabled'], true);
+    });
+
     test('removes a raven.linting.* key that shares its line with neighbouring keys', () => {
         // Whole-line splicing would have removed the neighbours too.
         // The property-range splice keeps them.

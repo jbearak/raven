@@ -432,28 +432,45 @@ function removeTopLevelLintingKeys(text: string): string {
         let removeStart = propNode.offset;
         let removeEnd = propNode.offset + propNode.length;
 
-        // If only whitespace separates the property from a preceding
-        // newline, the property is alone on its line — extend the
-        // removal to absorb that leading whitespace. Otherwise (the
-        // property shares a line with `{` or another key) leave the
-        // line structure intact.
-        let i = removeStart - 1;
-        while (i >= 0 && (current[i] === ' ' || current[i] === '\t')) i--;
-        if (i >= 0 && current[i] === '\n') {
-            removeStart = i + 1;
+        // Phase 1: try to absorb a trailing `,` (standard "comma-after"
+        // style) — skipping intermediate whitespace and tabs.
+        let trailingCommaAbsorbed = false;
+        {
+            let j = removeEnd;
+            while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+            if (current[j] === ',') {
+                removeEnd = j + 1;
+                trailingCommaAbsorbed = true;
+            }
         }
 
-        // Walk past optional trailing whitespace, then an optional `,`,
-        // then more whitespace, and finally an optional newline. This
-        // keeps trailing-comma-only files (`{ "raven.linting.x": v, }`)
-        // and multi-keys-on-same-line files (`{ "a": 1, "raven.linting.x": v, "b": 3 }`)
-        // both reducing to valid JSONC after the splice.
-        let j = removeEnd;
-        while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
-        if (current[j] === ',') j++;
-        while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
-        if (current[j] === '\n') j++;
-        removeEnd = j;
+        // Phase 2: if there was no trailing `,` to absorb, the file might
+        // be using comma-before style (`"a": 1\n  , "raven.linting.x": v`).
+        // Walk backward over whitespace looking for a leading `,` and
+        // absorb it too — otherwise we'd leave an orphan separator.
+        if (!trailingCommaAbsorbed) {
+            let i = removeStart - 1;
+            while (i >= 0 && (current[i] === ' ' || current[i] === '\t')) i--;
+            if (i >= 0 && current[i] === ',') {
+                removeStart = i;
+            }
+        }
+
+        // Phase 3: if the (possibly-extended) removal range is alone on
+        // its physical line, also take the leading whitespace, the
+        // preceding newline, and a trailing newline so the line vanishes
+        // cleanly. When the range shares a line with `{`, `}`, or a
+        // neighbour key, we leave the surrounding line structure alone.
+        let i = removeStart - 1;
+        while (i >= 0 && (current[i] === ' ' || current[i] === '\t')) i--;
+        const ownLine = i < 0 || current[i] === '\n';
+        if (ownLine) {
+            if (i >= 0) removeStart = i + 1;
+            let j = removeEnd;
+            while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+            if (current[j] === '\n') j++;
+            removeEnd = j;
+        }
 
         current = current.slice(0, removeStart) + current.slice(removeEnd);
     }
