@@ -1,7 +1,5 @@
 import * as vscode from 'vscode';
 import {
-    applyEdits,
-    modify,
     parseTree,
     visit,
     type Node,
@@ -255,10 +253,6 @@ type LintingClassification =
     | { kind: 'unsupportedValue'; key: string }
     | { kind: 'object'; userManagedKeys: string[] };
 
-const JSONC_FORMAT = {
-    formattingOptions: { tabSize: 2, insertSpaces: true } as const,
-};
-
 /**
  * Find the line indices of our sentinel-begin / sentinel-end markers.
  * Uses jsonc-parser's `visit` so a sentinel-shaped substring inside a
@@ -393,25 +387,75 @@ export function detectUserManagedLintingKeys(text: string): string[] | null {
 }
 
 /**
- * Remove every top-level `raven.linting.*` key from `text` via
- * `jsonc-parser`'s `modify` + `applyEdits`. Returns the new text. Each
- * call re-parses (since offsets shift after every edit) so we always
- * operate on a consistent tree.
+ * Remove every top-level `raven.linting.*` key from `text`. Uses
+ * `jsonc-parser`'s `parseTree` to identify each key's property node
+ * (so nested keys under e.g. a `[r]` language override are left
+ * untouched), then splices the property's own range out of the text.
+ *
+ * Why not `modify` + `applyEdits`? `jsonc-parser`'s `modify`-for-removal
+ * has two edge-case bugs we hit:
+ *   1. If the input has a trailing comma after the key being removed
+ *      (`{ "raven.linting.x": 1, }`), `modify` produces `{ , }` —
+ *      orphan comma, invalid JSONC.
+ *   2. If a neighbour key has an inline `//` comment on the SAME
+ *      physical line *before* our key (`"editor.tabSize": 4, // keep
+ *      me\n"raven.linting.x": false`), `modify` consumes the comment
+ *      as trailing content of the removed range and silently drops it.
+ *
+ * The splice removes the property + an optional trailing `,` + any
+ * surrounding whitespace, plus the leading whitespace on the property's
+ * line and the trailing newline *if* the property is alone on its line.
+ * When the property shares a line with `{`, `}`, or other keys, we
+ * leave the surrounding line structure intact and just take out our
+ * key's range.
  */
 function removeTopLevelLintingKeys(text: string): string {
     let current = text;
     // Hard cap matches the schema's `raven.linting.*` key count.
     for (let safety = 0; safety < 200; safety++) {
         const root = parseTree(current, undefined, { allowTrailingComma: true });
-        if (!root || root.type !== 'object') break;
-        let nextKey: string | null = null;
-        for (const { key } of iterateLintingProperties(root)) {
-            nextKey = key;
-            break;
+        if (!root || root.type !== 'object' || !root.children) break;
+
+        let propNode: Node | null = null;
+        for (const prop of root.children) {
+            if (prop.type !== 'property' || !prop.children || prop.children.length < 2) {
+                continue;
+            }
+            const key = prop.children[0].value;
+            if (typeof key === 'string' && key.startsWith('raven.linting.')) {
+                propNode = prop;
+                break;
+            }
         }
-        if (!nextKey) break;
-        const edits = modify(current, [nextKey], undefined, JSONC_FORMAT);
-        current = applyEdits(current, edits);
+        if (!propNode) break;
+
+        let removeStart = propNode.offset;
+        let removeEnd = propNode.offset + propNode.length;
+
+        // If only whitespace separates the property from a preceding
+        // newline, the property is alone on its line — extend the
+        // removal to absorb that leading whitespace. Otherwise (the
+        // property shares a line with `{` or another key) leave the
+        // line structure intact.
+        let i = removeStart - 1;
+        while (i >= 0 && (current[i] === ' ' || current[i] === '\t')) i--;
+        if (i >= 0 && current[i] === '\n') {
+            removeStart = i + 1;
+        }
+
+        // Walk past optional trailing whitespace, then an optional `,`,
+        // then more whitespace, and finally an optional newline. This
+        // keeps trailing-comma-only files (`{ "raven.linting.x": v, }`)
+        // and multi-keys-on-same-line files (`{ "a": 1, "raven.linting.x": v, "b": 3 }`)
+        // both reducing to valid JSONC after the splice.
+        let j = removeEnd;
+        while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+        if (current[j] === ',') j++;
+        while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+        if (current[j] === '\n') j++;
+        removeEnd = j;
+
+        current = current.slice(0, removeStart) + current.slice(removeEnd);
     }
     return current;
 }
