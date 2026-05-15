@@ -538,7 +538,7 @@ function stripSentineledLintingBlock(text: string): string {
  * `"editor.tabSize": 4, "raven.linting.foo": true` on a single line
  * would lose the unrelated key here, but VS Code's own formatters and
  * the Settings UI never produce that shape, so we don't try to handle
- * it.
+ * it. Tracked as a known limitation in https://github.com/jbearak/raven/issues/250.
  */
 function stripTopLevelLintingLines(text: string): string {
     const lineStarts = computeLineStarts(text);
