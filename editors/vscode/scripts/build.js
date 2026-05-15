@@ -9,6 +9,18 @@ const sveltePreprocess = require('svelte-preprocess').default ?? require('svelte
 const root = path.resolve(__dirname, '..');
 const dist = path.join(root, 'dist');
 
+// `jsonc-parser` ships both a UMD `main` (`./lib/umd/main.js`) and an ESM
+// `module` (`./lib/esm/main.js`). esbuild's Node platform defaults to
+// `mainFields = ['main']`, which picks the UMD build — whose wrapper uses
+// dynamic `require("./impl/format")` / `./impl/edit` / etc. calls that
+// esbuild can't statically follow. The bundle compiles but throws
+// "Cannot find module './impl/format'" at activation time. Aliasing
+// `jsonc-parser` directly to its ESM entry gives esbuild plain `import`
+// statements it can inline, and keeps the fix scoped — resolution for
+// every other runtime dependency (apache-arrow, vscode-languageclient,
+// …) stays on its default `main` field.
+const jsoncParserEsmEntry = require.resolve('jsonc-parser/lib/esm/main.js');
+
 async function buildExtension() {
     await esbuild.build({
         entryPoints: [path.join(root, 'src', 'extension.ts')],
@@ -20,14 +32,7 @@ async function buildExtension() {
         sourcemap: true,
         outfile: path.join(dist, 'extension.js'),
         logLevel: 'info',
-        // Prefer ESM entry points where a package ships both. Node's default
-        // `mainFields = ['main']` picks UMD builds for packages like
-        // `jsonc-parser`, whose UMD wrapper uses dynamic `require("./impl/...")`
-        // calls that esbuild can't statically follow — the bundle compiles but
-        // throws "Cannot find module './impl/format'" at runtime. Selecting
-        // the ESM build (`module` field) gives esbuild plain `import`
-        // statements it can resolve and inline.
-        mainFields: ['module', 'main'],
+        alias: { 'jsonc-parser': jsoncParserEsmEntry },
     });
 }
 

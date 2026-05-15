@@ -272,25 +272,32 @@ function findSentinelLineRange(text: string): { begin: number; end: number } | n
     let beginOffset = -1;
     let endLine: number | null = null;
 
-    visit(text, {
-        onComment: (offset, length, startLine) => {
-            // Restrict to `//` line comments — `/* ... */` block comments
-            // arrive whole, and our sentinels are line-shaped.
-            if (!text.startsWith('//', offset)) return;
-            const commentText = text.slice(offset, offset + length).trim();
-            if (commentText === LINTING_SENTINEL_BEGIN && beginLine === null) {
-                beginLine = startLine;
-                beginOffset = offset;
-            } else if (
-                commentText === LINTING_SENTINEL_END &&
-                beginLine !== null &&
-                endLine === null &&
-                offset > beginOffset
-            ) {
-                endLine = startLine;
-            }
+    visit(
+        text,
+        {
+            onComment: (offset, length, startLine) => {
+                // Restrict to `//` line comments — `/* ... */` block comments
+                // arrive whole, and our sentinels are line-shaped.
+                if (!text.startsWith('//', offset)) return;
+                const commentText = text.slice(offset, offset + length).trim();
+                if (commentText === LINTING_SENTINEL_BEGIN && beginLine === null) {
+                    beginLine = startLine;
+                    beginOffset = offset;
+                } else if (
+                    commentText === LINTING_SENTINEL_END &&
+                    beginLine !== null &&
+                    endLine === null &&
+                    offset > beginOffset
+                ) {
+                    endLine = startLine;
+                }
+            },
         },
-    });
+        // VS Code settings.json conventionally allows trailing commas; tell
+        // the visitor so a trailing-comma error doesn't suppress later
+        // `onComment` callbacks via jsonc-parser's error-recovery path.
+        { allowTrailingComma: true },
+    );
 
     if (beginLine === null || endLine === null) return null;
     return { begin: beginLine, end: endLine };
@@ -395,7 +402,7 @@ function removeTopLevelLintingKeys(text: string): string {
     let current = text;
     // Hard cap matches the schema's `raven.linting.*` key count.
     for (let safety = 0; safety < 200; safety++) {
-        const root = parseTree(current);
+        const root = parseTree(current, undefined, { allowTrailingComma: true });
         if (!root || root.type !== 'object') break;
         let nextKey: string | null = null;
         for (const { key } of iterateLintingProperties(root)) {
@@ -414,6 +421,13 @@ function removeTopLevelLintingKeys(text: string): string {
  * and return `true` if the first significant character is `,`. Used to
  * decide whether the last property in a root object already has a
  * trailing comma (in which case we don't add another one).
+ *
+ * A block comment that opens inside the scan window but whose `*\/`
+ * lies at or past `before` can't happen for valid JSONC (a `/* ... *\/`
+ * straddling the root's closing brace would make the file unparseable
+ * and we'd have bailed already in `classifyExisting`). The defensive
+ * `unterminatedBlockComment` short-circuit treats that case as "no
+ * comma" anyway — the worst we'd do is insert a redundant comma.
  */
 function hasCommaBetween(text: string, after: number, before: number): boolean {
     let i = after;
@@ -430,7 +444,15 @@ function hasCommaBetween(text: string, after: number, before: number): boolean {
         }
         if (c === '/' && text[i + 1] === '*') {
             i += 2;
-            while (i + 1 < before && !(text[i] === '*' && text[i + 1] === '/')) i++;
+            let closed = false;
+            while (i + 1 < before) {
+                if (text[i] === '*' && text[i + 1] === '/') {
+                    closed = true;
+                    break;
+                }
+                i++;
+            }
+            if (!closed) return false;
             i += 2;
             continue;
         }
@@ -476,7 +498,7 @@ export function buildLintingSettingsContent(existing: string | undefined): strin
 
     const withoutLintingKeys = removeTopLevelLintingKeys(afterSentinelStrip);
 
-    const root = parseTree(withoutLintingKeys);
+    const root = parseTree(withoutLintingKeys, undefined, { allowTrailingComma: true });
     if (!root || root.type !== 'object') return null;
 
     // `parseTree` reports `root.offset` = position of `{` and
