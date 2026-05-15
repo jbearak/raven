@@ -121,7 +121,9 @@ Native style/lint diagnostics. Off by default; opt in with `raven.linting.enable
 |---|---|---|
 | `raven.linting.enabled` | `false` | Master switch for all lint diagnostics |
 | `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
+| `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
 | `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
+| `raven.linting.stringDelimiter` | `"\""` | Preferred string-literal delimiter (`"\""` or `"'"`); used by the quotes lint |
 | `raven.linting.lineLengthSeverity` | `"hint"` | Severity for over-long lines (or `"off"`) |
 | `raven.linting.trailingWhitespaceSeverity` | `"hint"` | Severity for trailing whitespace |
 | `raven.linting.noTabSeverity` | `"hint"` | Severity for tab characters |
@@ -133,6 +135,15 @@ Native style/lint diagnostics. Off by default; opt in with `raven.linting.enable
 | `raven.linting.objectNameSeverity` | `"hint"` | Severity for the object-name lint (set to `"off"` to disable entirely; set a specific style to `"any"` to disable just that kind) |
 | `raven.linting.infixSpacesSeverity` | `"hint"` | Severity for the infix-spaces lint (whitespace around operators) |
 | `raven.linting.commentedCodeSeverity` | `"hint"` | Severity for the commented-code lint (standalone comments whose body parses as R code) |
+| `raven.linting.quotesSeverity` | `"hint"` | Severity for the quotes lint (string-literal delimiter style) |
+| `raven.linting.commasSeverity` | `"hint"` | Severity for the commas lint (spacing around `,`) |
+| `raven.linting.tAndFSymbolSeverity` | `"hint"` | Severity for the T/F-symbol lint (bare `T` / `F` used as `TRUE` / `FALSE`) |
+| `raven.linting.semicolonSeverity` | `"hint"` | Severity for the semicolon lint (`;` separators in source) |
+| `raven.linting.equalsNaSeverity` | `"hint"` | Severity for the equals-NA lint (`x == NA`, `x != NA`, typed-`NA` variants) |
+| `raven.linting.objectLengthSeverity` | `"hint"` | Severity for the object-length lint |
+| `raven.linting.vectorLogicSeverity` | `"hint"` | Severity for the vector-logic lint (`&` / `|` in `if` / `while` conditions) |
+| `raven.linting.functionLeftParenthesesSeverity` | `"hint"` | Severity for the function-left-parentheses lint (whitespace between `function` and `(`) |
+| `raven.linting.spacesInsideSeverity` | `"hint"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
 
 To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also set any of the three style settings to `"any"` to disable just that symbol kind while keeping the others active.
 

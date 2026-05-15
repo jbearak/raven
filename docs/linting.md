@@ -92,6 +92,60 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 - **`lintr` equivalent:** `lintr::commented_code_linter()`.
 - Flags a standalone comment block (consecutive `#` lines) whose body parses as R and contains a call, assignment, operator, or function definition. Roxygen (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines, and `# nolint` / `# @lsp-…` directives are skipped. End-of-line comments next to real code (`x <- 1 # explain`) are never flagged.
 
+### Quotes
+
+- **Raven:** `raven.linting.stringDelimiter` (default `"\""`, alternative `"'"`), `raven.linting.quotesSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::quotes_linter()` / `lintr::single_quotes_linter()` (the two map to the two settings above).
+- Raw strings (`r"(...)"`, `R'(...)'`, `r"---(...)---"`) are exempt — the outer quote is constrained by the body.
+
+### Commas
+
+- **Raven:** `raven.linting.commasSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::commas_linter()`.
+- Flags whitespace before `,` and missing whitespace after `,`. A newline after a comma is fine, so multi-line argument lists are not flagged. Matches `lintr`'s default `allow_trailing = FALSE` — a comma directly against a closing bracket (`a[1,]`) is still flagged.
+
+### T / F symbol
+
+- **Raven:** `raven.linting.tAndFSymbolSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::T_and_F_symbol_linter()`.
+- Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets (`T <- 0`), named arguments (`foo(T = TRUE)`), formal parameters (`function(T) ...`), and `$` / `@` field names (`obj$T`) are exempt — those positions don't read the boolean.
+
+### Semicolon
+
+- **Raven:** `raven.linting.semicolonSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::semicolon_linter()`.
+- Flags `;` separators in source. `;` inside string literals or comments is left alone. One diagnostic per `;`.
+
+### Equals NA
+
+- **Raven:** `raven.linting.equalsNaSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::equals_na_linter()`.
+- Flags `x == NA`, `x != NA`, and the typed variants (`NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`) on either side. The comparison always returns `NA`; use `is.na(x)` instead.
+
+### Object length
+
+- **Raven:** `raven.linting.objectLength` (default `30`), `raven.linting.objectLengthSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::object_length_linter(length = 30)`.
+- Flags assignment targets and formal parameters whose names exceed the configured length. An optional leading `.` (hidden identifier convention) is not counted. Backtick-quoted and non-ASCII names are exempt, matching `object_name`'s carve-outs.
+
+### Vector logic
+
+- **Raven:** `raven.linting.vectorLogicSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::vector_logic_linter()`.
+- Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar short-circuit form). The scan recurses through nested logical operators but stops at call boundaries — `if (any(x & y))` is left alone because the `&` is evaluated on a vector inside `any()`.
+
+### Function left parentheses
+
+- **Raven:** `raven.linting.functionLeftParenthesesSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::function_left_parentheses_linter()`.
+- Flags whitespace between `function` (or the `\` lambda shorthand) and the parameter `(`. The community convention is tight: `function(x)` and `\(x)`.
+
+### Spaces inside
+
+- **Raven:** `raven.linting.spacesInsideSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::spaces_inside_linter()`.
+- Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`). Empty groupings (`f()`, `f( )`, `mat[]`) and multi-line wrapping are exempt — only single-line interior whitespace is flagged.
+
 ## Migrating from `.lintr`
 
 Raven does not read `.lintr` files — its rules are configured per VS Code settings instead. The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
@@ -106,6 +160,15 @@ Raven does not read `.lintr` files — its rules are configured per VS Code sett
 | `object_name_linter(styles = c("snake_case"))` | `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument`, `raven.linting.objectNameSeverity` |
 | `infix_spaces_linter()` | `raven.linting.infixSpacesSeverity` |
 | `commented_code_linter()` | `raven.linting.commentedCodeSeverity` |
+| `quotes_linter()` / `single_quotes_linter()` | `raven.linting.stringDelimiter`, `raven.linting.quotesSeverity` |
+| `commas_linter()` | `raven.linting.commasSeverity` |
+| `T_and_F_symbol_linter()` | `raven.linting.tAndFSymbolSeverity` |
+| `semicolon_linter()` | `raven.linting.semicolonSeverity` |
+| `equals_na_linter()` | `raven.linting.equalsNaSeverity` |
+| `object_length_linter(length = N)` | `raven.linting.objectLength = N`, `raven.linting.objectLengthSeverity` |
+| `vector_logic_linter()` | `raven.linting.vectorLogicSeverity` |
+| `function_left_parentheses_linter()` | `raven.linting.functionLeftParenthesesSeverity` |
+| `spaces_inside_linter()` | `raven.linting.spacesInsideSeverity` |
 
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"hint"` to `"warning"`.
 
@@ -113,15 +176,14 @@ If you'd also like a starter `.lintr` for running `lintr` itself alongside Raven
 
 ## Gaps vs `lintr`
 
-`lintr` ships several dozen linters. Raven implements the eight in the table above. Common `lintr` linters that have **no Raven equivalent** include (non-exhaustive):
+`lintr` ships several dozen linters. Raven implements the ones in the table above. Common `lintr` linters that have **no Raven equivalent** include (non-exhaustive):
 
 - `object_usage_linter` — flags undefined globals inside function bodies via `codetools::checkUsage()`. Raven's [Undefined variable diagnostic](diagnostics.md#undefined-variables) covers similar ground at the file and `source()`-chain level (via static cross-file scope), but with different semantics: Raven's check is scope- and position-aware across `source()` chains, while `object_usage_linter` runs inside individual function bodies via R's own analyzer.
 - `cyclocomp_linter` — cyclomatic complexity.
-- `T_and_F_symbol_linter`, `quotes_linter`, `single_quotes_linter`.
-- `semicolon_linter`, `seq_linter`, `vector_logic_linter`, `equals_na_linter`.
-- `brace_linter`, `paren_body_linter`, `indentation_linter`, `function_left_parentheses_linter`, `spaces_inside_linter`, `spaces_left_parentheses_linter`, `commas_linter`.
+- `seq_linter`.
+- `brace_linter`, `paren_body_linter`, `indentation_linter`, `spaces_left_parentheses_linter`.
 - `pipe_continuation_linter`, `pipe_call_linter`.
-- `absolute_path_linter`, `object_length_linter`.
+- `absolute_path_linter`.
 
 If you rely on any of these, the recommended setup is to run `lintr` via the `REditorSupport (R)` extension alongside Raven — Raven's language server is designed to coexist with REditorSupport. See [below](#filling-the-gaps-with-lintr-itself).
 

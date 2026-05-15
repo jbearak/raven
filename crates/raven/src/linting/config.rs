@@ -16,6 +16,17 @@ pub enum AssignmentOperatorStyle {
     Equals,
 }
 
+/// Preferred string-literal delimiter. Mirrors `lintr::quotes_linter` /
+/// `lintr::single_quotes_linter` — the two map to the two enum variants here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StringDelimiter {
+    /// Require `"..."` for string literals; flag `'...'`. Default.
+    #[default]
+    Double,
+    /// Require `'...'` for string literals; flag `"..."`.
+    Single,
+}
+
 /// Naming scheme used by the `object_name` lint.
 ///
 /// Mirrors `lintr::object_name_linter` styles. `Any` disables the check for a
@@ -52,8 +63,13 @@ pub struct LintConfig {
     /// Maximum allowed line length, measured in UTF-16 code units to align
     /// with how LSP positions are reported.
     pub line_length: u32,
+    /// Maximum allowed identifier length (object-length rule). Identifiers
+    /// longer than this are flagged. Measured in characters of the name.
+    pub object_length: u32,
     /// Preferred assignment operator style.
     pub assignment_operator_style: AssignmentOperatorStyle,
+    /// Preferred string-literal delimiter (used by the `quotes` rule).
+    pub string_delimiter: StringDelimiter,
     /// Required naming scheme for top-level functions (assignments whose RHS
     /// is a `function() ...` expression). Set to [`ObjectNameStyle::Any`] to
     /// disable just the function-name check while keeping variable and
@@ -84,6 +100,25 @@ pub struct LintConfig {
     pub infix_spaces_severity: Option<DiagnosticSeverity>,
     /// Severity for the commented-code rule. `None` disables the rule.
     pub commented_code_severity: Option<DiagnosticSeverity>,
+    /// Severity for the quotes rule (`lintr::quotes_linter`). `None` disables.
+    pub quotes_severity: Option<DiagnosticSeverity>,
+    /// Severity for the commas rule (`lintr::commas_linter`). `None` disables.
+    pub commas_severity: Option<DiagnosticSeverity>,
+    /// Severity for the `T`/`F` symbol rule (`lintr::T_and_F_symbol_linter`).
+    pub t_and_f_symbol_severity: Option<DiagnosticSeverity>,
+    /// Severity for the semicolon rule (`lintr::semicolon_linter`).
+    pub semicolon_severity: Option<DiagnosticSeverity>,
+    /// Severity for the `== NA` / `!= NA` rule (`lintr::equals_na_linter`).
+    pub equals_na_severity: Option<DiagnosticSeverity>,
+    /// Severity for the object-length rule (`lintr::object_length_linter`).
+    pub object_length_severity: Option<DiagnosticSeverity>,
+    /// Severity for the vector-logic rule (`lintr::vector_logic_linter`).
+    pub vector_logic_severity: Option<DiagnosticSeverity>,
+    /// Severity for the function-left-parentheses rule
+    /// (`lintr::function_left_parentheses_linter`).
+    pub function_left_parentheses_severity: Option<DiagnosticSeverity>,
+    /// Severity for the spaces-inside rule (`lintr::spaces_inside_linter`).
+    pub spaces_inside_severity: Option<DiagnosticSeverity>,
 }
 
 impl Default for LintConfig {
@@ -92,7 +127,9 @@ impl Default for LintConfig {
             // Conservative default: feature is opt-in until it stabilizes.
             enabled: false,
             line_length: 80,
+            object_length: 30,
             assignment_operator_style: AssignmentOperatorStyle::default(),
+            string_delimiter: StringDelimiter::default(),
             object_name_style_function: ObjectNameStyle::SnakeCase,
             object_name_style_variable: ObjectNameStyle::SnakeCase,
             object_name_style_argument: ObjectNameStyle::SnakeCase,
@@ -106,6 +143,15 @@ impl Default for LintConfig {
             object_name_severity: Some(DiagnosticSeverity::HINT),
             infix_spaces_severity: Some(DiagnosticSeverity::HINT),
             commented_code_severity: Some(DiagnosticSeverity::HINT),
+            quotes_severity: Some(DiagnosticSeverity::HINT),
+            commas_severity: Some(DiagnosticSeverity::HINT),
+            t_and_f_symbol_severity: Some(DiagnosticSeverity::HINT),
+            semicolon_severity: Some(DiagnosticSeverity::HINT),
+            equals_na_severity: Some(DiagnosticSeverity::HINT),
+            object_length_severity: Some(DiagnosticSeverity::HINT),
+            vector_logic_severity: Some(DiagnosticSeverity::HINT),
+            function_left_parentheses_severity: Some(DiagnosticSeverity::HINT),
+            spaces_inside_severity: Some(DiagnosticSeverity::HINT),
         }
     }
 }

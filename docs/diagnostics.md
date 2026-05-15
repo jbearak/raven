@@ -60,8 +60,17 @@ Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-li
 | Trailing blank lines | hint | Blank lines at end of file, or missing final newline |
 | Assignment operator | hint | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
 | Object name | hint | Function, variable, or argument name doesn't match the configured naming scheme (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*`) |
+| Object length | hint | Identifier name exceeds `raven.linting.objectLength` characters (default 30; leading `.` not counted) |
 | Infix spaces | hint | Missing space around a binary operator (`a+b`, `x<-1`, `a%>%b`, `if (a<=b)`), or stray space around a tight-binding operator (`obj $ field`, `1 : 10`, unary `- x`) |
 | Commented code | hint | A standalone comment whose body parses as R and contains a call, assignment, or operator (`# foo(bar)`, `# x <- 1 + 2`) |
+| Quotes | hint | String literal not using the preferred delimiter (`raven.linting.stringDelimiter`; default `"`). Raw strings are exempt |
+| Commas | hint | Whitespace before `,` (`a , b`) or missing whitespace after `,` (`c(1,2)`). Newline after comma is fine |
+| `T` / `F` symbol | hint | Bare `T` / `F` used in reference position (use `TRUE` / `FALSE`). Skipped at assignment targets, named arguments, formal parameters, and `$`/`@` field names |
+| Semicolon | hint | `;` separator outside strings/comments (`a; b`, trailing `a;`) |
+| Equals NA | hint | `x == NA`, `x != NA`, or any typed-`NA` variant on either side. Use `is.na(x)` |
+| Vector logic | hint | `&` or `|` in an `if` / `while` condition (use `&&` / `||` for scalars). Scan stops at call boundaries |
+| Function left parentheses | hint | Whitespace between `function` (or `\`) and `(` (`function (x) ...`, `\ (x) ...`) |
+| Spaces inside | hint | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are exempt |
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
 

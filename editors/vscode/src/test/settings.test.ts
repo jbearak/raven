@@ -125,7 +125,9 @@ const SETTINGS_MAPPING: Array<{
     // stale state active. Defaults below mirror package.json.
     { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'boolean', defaultWhenUnconfigured: false },
     { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number', defaultWhenUnconfigured: 80 },
+    { vsCodeKey: 'linting.objectLength', jsonPath: ['linting', 'objectLength'], type: 'number', defaultWhenUnconfigured: 30 },
     { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const, defaultWhenUnconfigured: '<-' },
+    { vsCodeKey: 'linting.stringDelimiter', jsonPath: ['linting', 'stringDelimiter'], type: 'enum', enumValues: ['"', "'"] as const, defaultWhenUnconfigured: '"' },
     { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.trailingWhitespaceSeverity', jsonPath: ['linting', 'trailingWhitespaceSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
@@ -137,6 +139,15 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.objectNameSeverity', jsonPath: ['linting', 'objectNameSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.infixSpacesSeverity', jsonPath: ['linting', 'infixSpacesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.commentedCodeSeverity', jsonPath: ['linting', 'commentedCodeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.quotesSeverity', jsonPath: ['linting', 'quotesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.commasSeverity', jsonPath: ['linting', 'commasSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.tAndFSymbolSeverity', jsonPath: ['linting', 'tAndFSymbolSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.semicolonSeverity', jsonPath: ['linting', 'semicolonSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.equalsNaSeverity', jsonPath: ['linting', 'equalsNaSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.objectLengthSeverity', jsonPath: ['linting', 'objectLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.vectorLogicSeverity', jsonPath: ['linting', 'vectorLogicSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.functionLeftParenthesesSeverity', jsonPath: ['linting', 'functionLeftParenthesesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.spacesInsideSeverity', jsonPath: ['linting', 'spacesInsideSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     // Help viewer settings
     { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];
@@ -358,7 +369,9 @@ suite('Settings Transmission Property Tests', () => {
             linting: {
                 enabled: false,
                 lineLength: 80,
+                objectLength: 30,
                 assignmentOperator: '<-',
+                stringDelimiter: '"',
                 objectNameStyleFunction: 'snake_case',
                 objectNameStyleVariable: 'snake_case',
                 objectNameStyleArgument: 'snake_case',
@@ -370,6 +383,15 @@ suite('Settings Transmission Property Tests', () => {
                 objectNameSeverity: 'hint',
                 infixSpacesSeverity: 'hint',
                 commentedCodeSeverity: 'hint',
+                quotesSeverity: 'hint',
+                commasSeverity: 'hint',
+                tAndFSymbolSeverity: 'hint',
+                semicolonSeverity: 'hint',
+                equalsNaSeverity: 'hint',
+                objectLengthSeverity: 'hint',
+                vectorLogicSeverity: 'hint',
+                functionLeftParenthesesSeverity: 'hint',
+                spacesInsideSeverity: 'hint',
             },
         }, 'Empty configuration should produce only runtime defaults');
 
@@ -510,7 +532,9 @@ suite('Settings Transmission Unit Tests', () => {
         assert.deepStrictEqual(options.linting, {
             enabled: false,
             lineLength: 80,
+            objectLength: 30,
             assignmentOperator: '<-',
+            stringDelimiter: '"',
             objectNameStyleFunction: 'snake_case',
             objectNameStyleVariable: 'snake_case',
             objectNameStyleArgument: 'snake_case',
@@ -522,6 +546,15 @@ suite('Settings Transmission Unit Tests', () => {
             objectNameSeverity: 'hint',
             infixSpacesSeverity: 'hint',
             commentedCodeSeverity: 'hint',
+            quotesSeverity: 'hint',
+            commasSeverity: 'hint',
+            tAndFSymbolSeverity: 'hint',
+            semicolonSeverity: 'hint',
+            equalsNaSeverity: 'hint',
+            objectLengthSeverity: 'hint',
+            vectorLogicSeverity: 'hint',
+            functionLeftParenthesesSeverity: 'hint',
+            spacesInsideSeverity: 'hint',
         });
     });
 

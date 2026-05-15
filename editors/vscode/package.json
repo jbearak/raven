@@ -1396,6 +1396,197 @@
           ],
           "default": "hint",
           "description": "Severity for the commented-code lint. Flags standalone comment blocks whose body parses as R code (calls, assignments, operators). Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, ...), and `# nolint` / `# @lsp-*` directives are never flagged."
+        },
+        "raven.linting.stringDelimiter": {
+          "type": "string",
+          "default": "\"",
+          "enum": [
+            "\"",
+            "'"
+          ],
+          "enumDescriptions": [
+            "Require double quotes (\"...\") for string literals.",
+            "Require single quotes ('...') for string literals."
+          ],
+          "description": "Preferred string-literal delimiter. Used by the quotes lint. Raw strings (r\"(...)\") are exempt."
+        },
+        "raven.linting.quotesSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report quote-style violations as errors",
+            "Report quote-style violations as warnings",
+            "Report quote-style violations as information",
+            "Report quote-style violations as hints",
+            "Disable the quotes lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the quotes lint. Flags string literals not using the configured `raven.linting.stringDelimiter`. Raw strings are exempt."
+        },
+        "raven.linting.commasSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report comma-spacing violations as errors",
+            "Report comma-spacing violations as warnings",
+            "Report comma-spacing violations as information",
+            "Report comma-spacing violations as hints",
+            "Disable the commas lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the commas lint. Flags whitespace before `,` and missing whitespace after `,`. A newline after `,` is fine."
+        },
+        "raven.linting.tAndFSymbolSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report `T`/`F` usage as errors",
+            "Report `T`/`F` usage as warnings",
+            "Report `T`/`F` usage as information",
+            "Report `T`/`F` usage as hints",
+            "Disable the T/F symbol lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the T/F-symbol lint. Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets, named arguments, formal parameters, and `$`/`@` field names are exempt."
+        },
+        "raven.linting.semicolonSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report `;` separators as errors",
+            "Report `;` separators as warnings",
+            "Report `;` separators as information",
+            "Report `;` separators as hints",
+            "Disable the semicolon lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the semicolon lint. Flags `;` statement separators in source (outside strings and comments)."
+        },
+        "raven.linting.equalsNaSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report `== NA` / `!= NA` as errors",
+            "Report `== NA` / `!= NA` as warnings",
+            "Report `== NA` / `!= NA` as information",
+            "Report `== NA` / `!= NA` as hints",
+            "Disable the equals-NA lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the equals-NA lint. Flags `x == NA`, `x != NA` (and the typed `NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_` variants). Use `is.na(x)` instead."
+        },
+        "raven.linting.objectLength": {
+          "type": "integer",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 1000,
+          "description": "Maximum allowed identifier length for the object-length lint. The leading `.` of hidden-identifier names is not counted; backtick-quoted and non-ASCII names are exempt."
+        },
+        "raven.linting.objectLengthSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report overlong identifiers as errors",
+            "Report overlong identifiers as warnings",
+            "Report overlong identifiers as information",
+            "Report overlong identifiers as hints",
+            "Disable the object-length lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the object-length lint. Flags assignment targets and formal parameters whose names exceed `raven.linting.objectLength` characters."
+        },
+        "raven.linting.vectorLogicSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report `&`/`|` in `if`/`while` conditions as errors",
+            "Report `&`/`|` in `if`/`while` conditions as warnings",
+            "Report `&`/`|` in `if`/`while` conditions as information",
+            "Report `&`/`|` in `if`/`while` conditions as hints",
+            "Disable the vector-logic lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the vector-logic lint. Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar form). Function-call boundaries stop the scan, so `if (any(x & y))` is left alone."
+        },
+        "raven.linting.functionLeftParenthesesSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report space between `function` and `(` as errors",
+            "Report space between `function` and `(` as warnings",
+            "Report space between `function` and `(` as information",
+            "Report space between `function` and `(` as hints",
+            "Disable the function-left-parens lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the function-left-parentheses lint. Flags whitespace between `function` (or `\\`) and the parameter `(`."
+        },
+        "raven.linting.spacesInsideSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report whitespace inside brackets as errors",
+            "Report whitespace inside brackets as warnings",
+            "Report whitespace inside brackets as information",
+            "Report whitespace inside brackets as hints",
+            "Disable the spaces-inside lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are left alone."
         }
       }
     }

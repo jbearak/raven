@@ -41,7 +41,7 @@ mod rules;
 use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 
-pub use self::config::{AssignmentOperatorStyle, LintConfig, ObjectNameStyle};
+pub use self::config::{AssignmentOperatorStyle, LintConfig, ObjectNameStyle, StringDelimiter};
 
 /// Source identifier set on every diagnostic produced by this module.
 ///
@@ -103,6 +103,47 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
     }
     if let Some(sev) = config.commented_code_severity {
         rules::commented_code::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.quotes_severity {
+        rules::quotes::collect(
+            text,
+            tree_root,
+            config.string_delimiter,
+            sev,
+            &suppressions,
+            &mut out,
+        );
+    }
+    if let Some(sev) = config.commas_severity {
+        rules::commas::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.t_and_f_symbol_severity {
+        rules::t_and_f_symbol::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.semicolon_severity {
+        rules::semicolon::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.equals_na_severity {
+        rules::equals_na::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.object_length_severity {
+        rules::object_length::collect(
+            text,
+            tree_root,
+            config.object_length,
+            sev,
+            &suppressions,
+            &mut out,
+        );
+    }
+    if let Some(sev) = config.vector_logic_severity {
+        rules::vector_logic::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.function_left_parentheses_severity {
+        rules::function_left_parentheses::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.spaces_inside_severity {
+        rules::spaces_inside::collect(text, tree_root, sev, &suppressions, &mut out);
     }
 
     out
@@ -245,12 +286,15 @@ mod tests {
             trailing_whitespace_severity: None,
             no_tab_severity: None,
             trailing_blank_lines_severity: None,
+            semicolon_severity: None,
             ..enabled_config()
         };
         // `y = x` inside the function body is a real assignment, not a named
         // argument — even though it lives transitively under an arguments
         // list. Regression: an earlier draft propagated a sticky
         // `inside_call_args` flag through descendants and suppressed this.
+        // Semicolon-severity is disabled in this fixture so the assertion can
+        // focus on the assignment-operator rule.
         let diags = lint("lapply(xs, function(x) { y = x; y })\n", &config);
         assert_eq!(
             diags.len(),
@@ -1133,6 +1177,533 @@ print.data.frame <- function(x, ...) NULL
         let diags = lint("# foo(bar)\n", &config);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].source.as_deref(), Some(LINT_SOURCE));
+    }
+
+    /// Builds a config with every existing rule disabled, leaving only the
+    /// rule under test enabled. Used by the per-rule sub-tests below — each
+    /// rule sets its own severity back on top of this baseline.
+    fn solo_config() -> LintConfig {
+        LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            assignment_operator_severity: None,
+            object_name_severity: None,
+            infix_spaces_severity: None,
+            commented_code_severity: None,
+            quotes_severity: None,
+            commas_severity: None,
+            t_and_f_symbol_severity: None,
+            semicolon_severity: None,
+            equals_na_severity: None,
+            object_length_severity: None,
+            vector_logic_severity: None,
+            function_left_parentheses_severity: None,
+            spaces_inside_severity: None,
+            ..enabled_config()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // quotes
+    // ------------------------------------------------------------------
+
+    fn quotes_only_config() -> LintConfig {
+        LintConfig {
+            quotes_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn quotes_flags_single_when_double_preferred() {
+        let config = quotes_only_config();
+        let diags = lint("x <- 'hi'\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("`'`"));
+        assert!(diags[0].message.contains("`\"`"));
+    }
+
+    #[test]
+    fn quotes_accepts_double() {
+        let config = quotes_only_config();
+        let diags = lint("x <- \"hi\"\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn quotes_skips_raw_strings() {
+        let config = quotes_only_config();
+        // Raw strings — both quote types are common because the body picks.
+        let diags = lint("x <- r'(hi)'\n", &config);
+        assert!(diags.is_empty(), "raw strings must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn quotes_single_mode_flags_double() {
+        let mut config = quotes_only_config();
+        config.string_delimiter = StringDelimiter::Single;
+        let diags = lint("x <- \"hi\"\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("`\"`"));
+        assert!(diags[0].message.contains("`'`"));
+    }
+
+    #[test]
+    fn quotes_respects_nolint() {
+        let config = quotes_only_config();
+        let diags = lint("x <- 'hi' # nolint\n", &config);
+        assert!(diags.is_empty(), "nolint must suppress: {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // commas
+    // ------------------------------------------------------------------
+
+    fn commas_only_config() -> LintConfig {
+        LintConfig {
+            commas_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn commas_flags_space_before() {
+        let config = commas_only_config();
+        let diags = lint("c(1 , 2)\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("before"));
+    }
+
+    #[test]
+    fn commas_flags_missing_space_after() {
+        let config = commas_only_config();
+        let diags = lint("c(1,2)\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("after"));
+    }
+
+    #[test]
+    fn commas_accepts_clean_spacing() {
+        let config = commas_only_config();
+        let diags = lint("c(1, 2, 3)\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn commas_allows_newline_after() {
+        let config = commas_only_config();
+        // A newline after the comma is fine — multi-line argument lists are
+        // common and shouldn't be reformatted.
+        let diags = lint("c(\n  1,\n  2\n)\n", &config);
+        assert!(diags.is_empty(), "newline-after-comma must pass: {:?}", diags);
+    }
+
+    #[test]
+    fn commas_flags_trailing_comma_before_close() {
+        // Matches `lintr::commas_linter(allow_trailing = FALSE)` — `a[1,]`
+        // has no whitespace after `,` so it's still flagged.
+        let config = commas_only_config();
+        let diags = lint("a[1,]\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn commas_in_parameters_are_also_checked() {
+        let config = commas_only_config();
+        // Tree-sitter treats `parameter` commas the same way; the rule walks
+        // them too.
+        let diags = lint("f <- function(a,b) a + b\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // T_and_F_symbol
+    // ------------------------------------------------------------------
+
+    fn t_and_f_only_config() -> LintConfig {
+        LintConfig {
+            t_and_f_symbol_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn t_and_f_flags_bare_t() {
+        let config = t_and_f_only_config();
+        let diags = lint("if (T) 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("TRUE"));
+    }
+
+    #[test]
+    fn t_and_f_flags_bare_f() {
+        let config = t_and_f_only_config();
+        let diags = lint("x <- F\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("FALSE"));
+    }
+
+    #[test]
+    fn t_and_f_accepts_true_false() {
+        let config = t_and_f_only_config();
+        let diags = lint("if (TRUE) 1\nx <- FALSE\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn t_and_f_skips_assignment_target() {
+        let config = t_and_f_only_config();
+        // `T <- 0` — the LHS itself is the assignment target, not a read.
+        let diags = lint("T <- 0\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn t_and_f_skips_named_argument() {
+        let config = t_and_f_only_config();
+        // `foo(T = TRUE)` — the `T` is a parameter label.
+        let diags = lint("foo(T = TRUE)\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn t_and_f_skips_extract_rhs() {
+        let config = t_and_f_only_config();
+        // `obj$T` — `T` is a field name on `obj`.
+        let diags = lint("x <- obj$T\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn t_and_f_flags_extract_lhs() {
+        let config = t_and_f_only_config();
+        // `T$foo` — `T` on the LHS *is* a read of the boolean.
+        let diags = lint("x <- T$foo\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn t_and_f_skips_formal_parameter() {
+        let config = t_and_f_only_config();
+        // `function(T) ...` — declaration of `T` as a parameter, not a read.
+        let diags = lint("f <- function(T) T + 1\n", &config);
+        // Only the *use* of `T` in the body is a read.
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // semicolon
+    // ------------------------------------------------------------------
+
+    fn semicolon_only_config() -> LintConfig {
+        LintConfig {
+            semicolon_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn semicolon_flags_separator() {
+        let config = semicolon_only_config();
+        let diags = lint("a; b\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.character, 1);
+    }
+
+    #[test]
+    fn semicolon_flags_trailing() {
+        let config = semicolon_only_config();
+        let diags = lint("a;\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn semicolon_flags_multiple_per_line() {
+        let config = semicolon_only_config();
+        let diags = lint("a; b; c\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
+    fn semicolon_ignores_strings_and_comments() {
+        let config = semicolon_only_config();
+        // `;` inside a string or comment is not a separator.
+        let diags = lint(
+            "x <- \"a;b\"\ny <- 1 # ;\n",
+            &config,
+        );
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // equals_na
+    // ------------------------------------------------------------------
+
+    fn equals_na_only_config() -> LintConfig {
+        LintConfig {
+            equals_na_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn equals_na_flags_x_eq_na() {
+        let config = equals_na_only_config();
+        let diags = lint("x == NA\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("is.na"));
+    }
+
+    #[test]
+    fn equals_na_flags_na_eq_x() {
+        let config = equals_na_only_config();
+        let diags = lint("NA == x\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn equals_na_flags_neq() {
+        let config = equals_na_only_config();
+        let diags = lint("x != NA\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn equals_na_flags_typed_na_variants() {
+        let config = equals_na_only_config();
+        let diags = lint(
+            "x == NA_integer_\nx == NA_real_\nx == NA_character_\nx == NA_complex_\n",
+            &config,
+        );
+        assert_eq!(diags.len(), 4, "got {:?}", diags);
+    }
+
+    #[test]
+    fn equals_na_does_not_flag_is_na() {
+        let config = equals_na_only_config();
+        let diags = lint("is.na(x)\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // object_length
+    // ------------------------------------------------------------------
+
+    fn object_length_only_config(max: u32) -> LintConfig {
+        LintConfig {
+            object_length: max,
+            object_length_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn object_length_flags_overlong_assignment_target() {
+        let config = object_length_only_config(5);
+        let diags = lint("longer_name <- 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("longer_name"));
+        assert!(diags[0].message.contains("11"));
+    }
+
+    #[test]
+    fn object_length_accepts_short_name() {
+        let config = object_length_only_config(5);
+        let diags = lint("ok <- 1\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn object_length_flags_overlong_parameter() {
+        let config = object_length_only_config(5);
+        let diags = lint("f <- function(longer_arg) 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("longer_arg"));
+    }
+
+    #[test]
+    fn object_length_does_not_count_leading_dot() {
+        // `.foo_bar` body is 7 chars; under max=7 a flagged-without-stripping
+        // implementation would mis-count `.foo_bar` as 8. We strip the dot,
+        // so `.foo_bar` is exactly the maximum and passes.
+        let config = object_length_only_config(7);
+        let diags = lint(".foo_bar <- 1\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn object_length_skips_backtick_names() {
+        let config = object_length_only_config(5);
+        let diags = lint("`a very long backtick name` <- 1\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn object_length_skips_compound_lhs() {
+        let config = object_length_only_config(5);
+        // `obj$longer_field <- 1` — assignment doesn't introduce a new symbol.
+        let diags = lint("obj$longer_field <- 1\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // vector_logic
+    // ------------------------------------------------------------------
+
+    fn vector_logic_only_config() -> LintConfig {
+        LintConfig {
+            vector_logic_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn vector_logic_flags_amp_in_if() {
+        let config = vector_logic_only_config();
+        let diags = lint("if (a & b) 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("&&"));
+    }
+
+    #[test]
+    fn vector_logic_flags_pipe_in_while() {
+        let config = vector_logic_only_config();
+        let diags = lint("while (a | b) 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("||"));
+    }
+
+    #[test]
+    fn vector_logic_accepts_double_operators() {
+        let config = vector_logic_only_config();
+        let diags = lint("if (a && b) 1\nwhile (a || b) 1\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn vector_logic_skips_inside_function_call() {
+        // `if (any(x & y))` — the `&` is evaluated inside `any()` on a
+        // vector, not on the condition itself.
+        let config = vector_logic_only_config();
+        let diags = lint("if (any(x & y)) 1\n", &config);
+        assert!(diags.is_empty(), "call boundary must stop scan: {:?}", diags);
+    }
+
+    #[test]
+    fn vector_logic_recurses_through_logical_operators() {
+        // `if (a & b || c)` — the `&` deep inside the condition is still
+        // flagged because the scan recurses through binary operators.
+        let config = vector_logic_only_config();
+        let diags = lint("if (a & b || c) 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // function_left_parentheses
+    // ------------------------------------------------------------------
+
+    fn flp_only_config() -> LintConfig {
+        LintConfig {
+            function_left_parentheses_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn flp_flags_space_after_function() {
+        let config = flp_only_config();
+        let diags = lint("f <- function (x) x\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("function"));
+    }
+
+    #[test]
+    fn flp_accepts_tight() {
+        let config = flp_only_config();
+        let diags = lint("f <- function(x) x\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn flp_flags_lambda_with_space() {
+        let config = flp_only_config();
+        let diags = lint("f <- \\ (x) x\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("\\"));
+    }
+
+    #[test]
+    fn flp_accepts_tight_lambda() {
+        let config = flp_only_config();
+        let diags = lint("f <- \\(x) x\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // spaces_inside
+    // ------------------------------------------------------------------
+
+    fn spaces_inside_only_config() -> LintConfig {
+        LintConfig {
+            spaces_inside_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn spaces_inside_flags_call_with_spaces() {
+        let config = spaces_inside_only_config();
+        let diags = lint("f( x )\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_accepts_tight_call() {
+        let config = spaces_inside_only_config();
+        let diags = lint("f(x)\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_allows_empty_call() {
+        let config = spaces_inside_only_config();
+        // `f()` and `f( )` are both fine — empty groupings are exempt.
+        let diags_empty = lint("f()\n", &config);
+        let diags_padded = lint("f(  )\n", &config);
+        assert!(diags_empty.is_empty(), "got {:?}", diags_empty);
+        assert!(diags_padded.is_empty(), "got {:?}", diags_padded);
+    }
+
+    #[test]
+    fn spaces_inside_flags_subset() {
+        let config = spaces_inside_only_config();
+        let diags = lint("a[ 1 ]\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_flags_subset2() {
+        let config = spaces_inside_only_config();
+        let diags = lint("a[[ 1 ]]\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_allows_multiline_wrapping() {
+        let config = spaces_inside_only_config();
+        // Multi-line argument layout — the leading/trailing newlines are not
+        // single-line whitespace, so no diagnostic.
+        let diags = lint("f(\n  1,\n  2\n)\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_flags_parenthesized_expression() {
+        let config = spaces_inside_only_config();
+        let diags = lint("x <- ( 1 + 2 )\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
     }
 }
 

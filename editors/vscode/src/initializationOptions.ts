@@ -97,7 +97,9 @@ export interface RavenInitializationOptions {
     linting?: {
         enabled?: boolean;
         lineLength?: number;
+        objectLength?: number;
         assignmentOperator?: "<-" | "=";
+        stringDelimiter?: "\"" | "'";
         objectNameStyleFunction?: ObjectNameStyle;
         objectNameStyleVariable?: ObjectNameStyle;
         objectNameStyleArgument?: ObjectNameStyle;
@@ -109,6 +111,15 @@ export interface RavenInitializationOptions {
         objectNameSeverity?: SeverityLevel;
         infixSpacesSeverity?: SeverityLevel;
         commentedCodeSeverity?: SeverityLevel;
+        quotesSeverity?: SeverityLevel;
+        commasSeverity?: SeverityLevel;
+        tAndFSymbolSeverity?: SeverityLevel;
+        semicolonSeverity?: SeverityLevel;
+        equalsNaSeverity?: SeverityLevel;
+        objectLengthSeverity?: SeverityLevel;
+        vectorLogicSeverity?: SeverityLevel;
+        functionLeftParenthesesSeverity?: SeverityLevel;
+        spacesInsideSeverity?: SeverityLevel;
     };
     helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
@@ -354,7 +365,9 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     options.linting = {
         enabled: config.get<boolean>('linting.enabled', false),
         lineLength: config.get<number>('linting.lineLength', 80),
+        objectLength: config.get<number>('linting.objectLength', 30),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
+        stringDelimiter: config.get<"\"" | "'">('linting.stringDelimiter', '"'),
         objectNameStyleFunction: config.get<ObjectNameStyle>('linting.objectNameStyleFunction', 'snake_case'),
         objectNameStyleVariable: config.get<ObjectNameStyle>('linting.objectNameStyleVariable', 'snake_case'),
         objectNameStyleArgument: config.get<ObjectNameStyle>('linting.objectNameStyleArgument', 'snake_case'),
@@ -366,6 +379,15 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         objectNameSeverity: config.get<SeverityLevel>('linting.objectNameSeverity', 'hint'),
         infixSpacesSeverity: config.get<SeverityLevel>('linting.infixSpacesSeverity', 'hint'),
         commentedCodeSeverity: config.get<SeverityLevel>('linting.commentedCodeSeverity', 'hint'),
+        quotesSeverity: config.get<SeverityLevel>('linting.quotesSeverity', 'hint'),
+        commasSeverity: config.get<SeverityLevel>('linting.commasSeverity', 'hint'),
+        tAndFSymbolSeverity: config.get<SeverityLevel>('linting.tAndFSymbolSeverity', 'hint'),
+        semicolonSeverity: config.get<SeverityLevel>('linting.semicolonSeverity', 'hint'),
+        equalsNaSeverity: config.get<SeverityLevel>('linting.equalsNaSeverity', 'hint'),
+        objectLengthSeverity: config.get<SeverityLevel>('linting.objectLengthSeverity', 'hint'),
+        vectorLogicSeverity: config.get<SeverityLevel>('linting.vectorLogicSeverity', 'hint'),
+        functionLeftParenthesesSeverity: config.get<SeverityLevel>('linting.functionLeftParenthesesSeverity', 'hint'),
+        spacesInsideSeverity: config.get<SeverityLevel>('linting.spacesInsideSeverity', 'hint'),
     };
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');

@@ -440,7 +440,9 @@ pub(crate) fn parse_cross_file_config(
 /// Recognised keys:
 /// * `enabled` (bool) — master switch.
 /// * `lineLength` (number) — max line length; clamped to `[20, 10_000]`.
+/// * `objectLength` (number) — max identifier length; clamped to `[5, 1_000]`.
 /// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
+/// * `stringDelimiter` (`"\""` or `"'"`) — preferred string delimiter.
 /// * `objectNameStyleFunction`, `objectNameStyleVariable`,
 ///   `objectNameStyleArgument` (string, one of `"snake_case" | "camelCase" |
 ///   "dotted.case" | "UPPER_CASE" | "lowercase" | "any"`) — naming scheme
@@ -456,6 +458,15 @@ pub(crate) fn parse_cross_file_config(
 ///   - `objectNameSeverity`
 ///   - `infixSpacesSeverity`
 ///   - `commentedCodeSeverity`
+///   - `quotesSeverity`
+///   - `commasSeverity`
+///   - `tAndFSymbolSeverity`
+///   - `semicolonSeverity`
+///   - `equalsNaSeverity`
+///   - `objectLengthSeverity`
+///   - `vectorLogicSeverity`
+///   - `functionLeftParenthesesSeverity`
+///   - `spacesInsideSeverity`
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
 ) -> Option<crate::linting::LintConfig> {
@@ -477,6 +488,11 @@ pub(crate) fn parse_lint_config(
         // is well below u32::MAX so the post-clamp cast is lossless.
         config.line_length = v.clamp(20, 10_000) as u32;
     }
+    if let Some(v) = linting.get("objectLength").and_then(|v| v.as_u64()) {
+        // Same clamp-first pattern as `lineLength`. The floor of 5 keeps
+        // single-letter conventions usable; the ceiling is well below u32::MAX.
+        config.object_length = v.clamp(5, 1_000) as u32;
+    }
     if let Some(op) = linting.get("assignmentOperator").and_then(|v| v.as_str()) {
         config.assignment_operator_style = match op {
             "=" => crate::linting::AssignmentOperatorStyle::Equals,
@@ -486,6 +502,18 @@ pub(crate) fn parse_lint_config(
                     "Unrecognised linting.assignmentOperator '{other}', defaulting to '<-'."
                 );
                 crate::linting::AssignmentOperatorStyle::LeftArrow
+            }
+        };
+    }
+    if let Some(d) = linting.get("stringDelimiter").and_then(|v| v.as_str()) {
+        config.string_delimiter = match d {
+            "\"" => crate::linting::StringDelimiter::Double,
+            "'" => crate::linting::StringDelimiter::Single,
+            other => {
+                log::warn!(
+                    "Unrecognised linting.stringDelimiter '{other}', defaulting to '\"'."
+                );
+                crate::linting::StringDelimiter::Double
             }
         };
     }
@@ -543,14 +571,55 @@ pub(crate) fn parse_lint_config(
     {
         config.commented_code_severity = parse_severity(sev);
     }
+    if let Some(sev) = linting.get("quotesSeverity").and_then(|v| v.as_str()) {
+        config.quotes_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting.get("commasSeverity").and_then(|v| v.as_str()) {
+        config.commas_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting
+        .get("tAndFSymbolSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.t_and_f_symbol_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting.get("semicolonSeverity").and_then(|v| v.as_str()) {
+        config.semicolon_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting.get("equalsNaSeverity").and_then(|v| v.as_str()) {
+        config.equals_na_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting
+        .get("objectLengthSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.object_length_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting.get("vectorLogicSeverity").and_then(|v| v.as_str()) {
+        config.vector_logic_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting
+        .get("functionLeftParenthesesSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.function_left_parentheses_severity = parse_severity(sev);
+    }
+    if let Some(sev) = linting
+        .get("spacesInsideSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.spaces_inside_severity = parse_severity(sev);
+    }
 
     log::info!("Linting configuration loaded from LSP settings:");
     log::info!("  enabled: {}", config.enabled);
     log::info!("  line_length: {}", config.line_length);
+    log::info!("  object_length: {}", config.object_length);
     log::info!(
         "  assignment_operator_style: {:?}",
         config.assignment_operator_style
     );
+    log::info!("  string_delimiter: {:?}", config.string_delimiter);
     log::info!(
         "  severities: line={:?} ws={:?} tab={:?} blank={:?} assign={:?} obj_name={:?} infix_spaces={:?} commented_code={:?}",
         config.line_length_severity,
@@ -561,6 +630,18 @@ pub(crate) fn parse_lint_config(
         config.object_name_severity,
         config.infix_spaces_severity,
         config.commented_code_severity
+    );
+    log::info!(
+        "  severities: quotes={:?} commas={:?} t_and_f={:?} semicolon={:?} equals_na={:?} object_length={:?} vector_logic={:?} function_left_paren={:?} spaces_inside={:?}",
+        config.quotes_severity,
+        config.commas_severity,
+        config.t_and_f_symbol_severity,
+        config.semicolon_severity,
+        config.equals_na_severity,
+        config.object_length_severity,
+        config.vector_logic_severity,
+        config.function_left_parentheses_severity,
+        config.spaces_inside_severity,
     );
     log::info!(
         "  object_name styles: fn={:?} var={:?} arg={:?}",
