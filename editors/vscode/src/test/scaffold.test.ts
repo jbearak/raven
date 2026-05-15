@@ -6,10 +6,13 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import {
     GITIGNORE_TEMPLATE,
+    LINTING_SENTINEL_BEGIN,
+    LINTING_SENTINEL_END,
     LINTING_SETTINGS_TEMPLATE,
     buildLintingSettingsContent,
     createScaffoldFile,
     detectExistingLintingKeys,
+    detectUserManagedLintingKeys,
 } from '../scaffold';
 import { activate } from './helper';
 
@@ -31,6 +34,10 @@ function loadCommandContributions(): CommandContribution[] {
         contributes?: { commands?: CommandContribution[] };
     };
     return pkg.contributes?.commands ?? [];
+}
+
+function escapeRegex(input: string): string {
+    return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function loadLintingSettingKeys(): string[] {
@@ -109,6 +116,22 @@ suite('scaffold templates', () => {
             present,
             declared,
             'every raven.linting.* configuration key must appear in the scaffold template',
+        );
+    });
+
+    test('linting-settings template wraps the block in sentinel comments', () => {
+        assert.ok(
+            LINTING_SETTINGS_TEMPLATE.includes(LINTING_SENTINEL_BEGIN),
+            'template must include the begin sentinel for safe re-run stripping',
+        );
+        assert.ok(
+            LINTING_SETTINGS_TEMPLATE.includes(LINTING_SENTINEL_END),
+            'template must include the end sentinel for safe re-run stripping',
+        );
+        assert.ok(
+            LINTING_SETTINGS_TEMPLATE.indexOf(LINTING_SENTINEL_BEGIN) <
+                LINTING_SETTINGS_TEMPLATE.indexOf(LINTING_SENTINEL_END),
+            'begin sentinel must come before the end sentinel',
         );
     });
 
@@ -219,6 +242,62 @@ suite('scaffold linting-settings merge', () => {
         );
     });
 
+    test('re-running on a sentineled file does not duplicate the block or its lintr comments', () => {
+        const merged = buildLintingSettingsContent(LINTING_SETTINGS_TEMPLATE);
+
+        const beginCount = (merged.match(new RegExp(escapeRegex(LINTING_SENTINEL_BEGIN), 'g')) ?? [])
+            .length;
+        const endCount = (merged.match(new RegExp(escapeRegex(LINTING_SENTINEL_END), 'g')) ?? [])
+            .length;
+        assert.strictEqual(beginCount, 1, 'begin sentinel must appear exactly once after re-run');
+        assert.strictEqual(endCount, 1, 'end sentinel must appear exactly once after re-run');
+
+        const lintrHeaderCount = (merged.match(/\/\/ lintr: line_length_linter/g) ?? []).length;
+        assert.strictEqual(
+            lintrHeaderCount,
+            1,
+            'lintr header comments must not accumulate across re-runs',
+        );
+
+        const enabledCount = (merged.match(/"raven\.linting\.enabled"/g) ?? []).length;
+        assert.strictEqual(enabledCount, 1, 'each raven.linting.* key must appear exactly once');
+    });
+
+    test('re-run strips a previous sentinel block while keeping unrelated keys', () => {
+        const previous = `{
+  // a comment the user wrote
+  "editor.tabSize": 4,
+  ${LINTING_SENTINEL_BEGIN}
+  // Raven native style/lint diagnostics.
+  // lintr: line_length_linter(length = N)
+  "raven.linting.enabled": false,
+  "raven.linting.lineLength": 200,
+  ${LINTING_SENTINEL_END}
+  "files.autoSave": "onFocusChange"
+}
+`;
+        const merged = buildLintingSettingsContent(previous);
+        assert.ok(merged.includes('"editor.tabSize": 4'), 'unrelated keys must survive');
+        assert.ok(
+            merged.includes('"files.autoSave": "onFocusChange"'),
+            'unrelated keys after the old block must survive',
+        );
+        assert.ok(
+            merged.includes('// a comment the user wrote'),
+            'unrelated comments must survive',
+        );
+        const enabledCount = (merged.match(/"raven\.linting\.enabled"/g) ?? []).length;
+        assert.strictEqual(enabledCount, 1, 'no duplicate raven.linting.enabled');
+        assert.ok(
+            merged.includes('"raven.linting.enabled": true'),
+            'value must reflect the scaffold default (true), not the prior false',
+        );
+        assert.ok(
+            merged.includes('"raven.linting.lineLength": 120'),
+            'value must reflect the scaffold default (120), not the prior 200',
+        );
+    });
+
     test('output parses as valid JSON after comment + trailing-comma stripping', () => {
         const existing = `{
   "editor.tabSize": 4,
@@ -233,6 +312,41 @@ suite('scaffold linting-settings merge', () => {
         const parsed = JSON.parse(stripped) as Record<string, unknown>;
         assert.strictEqual(parsed['editor.tabSize'], 4);
         assert.strictEqual(parsed['raven.linting.enabled'], true);
+    });
+});
+
+suite('detectUserManagedLintingKeys', () => {
+    test('returns an empty array when all keys are inside the sentinel block', () => {
+        const text = `{
+  ${LINTING_SENTINEL_BEGIN}
+  "raven.linting.enabled": true,
+  "raven.linting.lineLength": 120,
+  ${LINTING_SENTINEL_END}
+}`;
+        assert.deepStrictEqual(detectUserManagedLintingKeys(text), []);
+    });
+
+    test('returns only user-managed keys (outside the sentinel block)', () => {
+        const text = `{
+  "raven.linting.objectLength": 50,
+  ${LINTING_SENTINEL_BEGIN}
+  "raven.linting.enabled": true,
+  ${LINTING_SENTINEL_END}
+}`;
+        assert.deepStrictEqual(detectUserManagedLintingKeys(text), [
+            'raven.linting.objectLength',
+        ]);
+    });
+
+    test('falls back to the full key list when no sentinels are present', () => {
+        const text = `{
+  "raven.linting.enabled": true,
+  "raven.linting.lineLength": 120
+}`;
+        assert.deepStrictEqual((detectUserManagedLintingKeys(text) ?? []).sort(), [
+            'raven.linting.enabled',
+            'raven.linting.lineLength',
+        ]);
     });
 });
 

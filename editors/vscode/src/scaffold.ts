@@ -174,32 +174,43 @@ const LINTING_BLOCK_HEADER =
     'the lintr linter it mirrors. See docs/linting.md for details.';
 
 /**
- * Format the linting-settings block (header + groups) at the given
- * indentation, without surrounding braces. The final entry uses the
- * supplied `trailingPunctuation` so the caller can distinguish the
- * fresh-file case (no trailing comma — last property in the object)
- * from the merge case (trailing comma — more properties may follow).
+ * Sentinel markers that delimit the block this scaffold manages. A
+ * re-run of the scaffold strips the full sentinel range (including the
+ * per-group `// lintr: ...` headers) before inserting a fresh block, so
+ * a previously scaffolded file stays clean instead of accumulating
+ * orphaned header comments. The markers are intentionally long and
+ * stable so an accidental match against a user-authored comment is
+ * unlikely.
  */
-function formatLintingBlock(indent: string, trailingPunctuation: '' | ','): string {
+export const LINTING_SENTINEL_BEGIN =
+    '// >>> raven.linting.* (managed by "Raven: Create linting settings")';
+export const LINTING_SENTINEL_END = '// <<< raven.linting.*';
+
+/**
+ * Format the linting-settings block (sentinels + header + groups) at
+ * the given indentation, without surrounding braces. Every entry — even
+ * the last one — emits a trailing comma; the sentinel-end comment line
+ * (and possibly more existing keys after our block in the merge case)
+ * follows, so the comma is always correct in JSONC.
+ */
+function formatLintingBlock(indent: string): string {
     const lines: string[] = [];
+    lines.push(`${indent}${LINTING_SENTINEL_BEGIN}`);
     for (const headerLine of LINTING_BLOCK_HEADER.split('\n')) {
         lines.push(`${indent}// ${headerLine}`);
     }
 
-    LINTING_GROUPS.forEach((group, groupIdx) => {
+    for (const group of LINTING_GROUPS) {
         lines.push('');
         lines.push(`${indent}// ${group.comment}`);
-        group.entries.forEach((entry, entryIdx) => {
-            const isLastEntryOfBlock =
-                groupIdx === LINTING_GROUPS.length - 1 &&
-                entryIdx === group.entries.length - 1;
-            const sep = isLastEntryOfBlock ? trailingPunctuation : ',';
+        for (const entry of group.entries) {
             lines.push(
-                `${indent}${JSON.stringify(entry.key)}: ${JSON.stringify(entry.value)}${sep}`,
+                `${indent}${JSON.stringify(entry.key)}: ${JSON.stringify(entry.value)},`,
             );
-        });
-    });
+        }
+    }
 
+    lines.push(`${indent}${LINTING_SENTINEL_END}`);
     return lines.join('\n');
 }
 
@@ -209,7 +220,7 @@ function formatLintingBlock(indent: string, trailingPunctuation: '' | ','): stri
  * builds this via `buildLintingSettingsContent` so an existing file is
  * merged rather than clobbered.
  */
-export const LINTING_SETTINGS_TEMPLATE = `{\n${formatLintingBlock('  ', '')}\n}\n`;
+export const LINTING_SETTINGS_TEMPLATE = `{\n${formatLintingBlock('  ')}\n}\n`;
 
 /**
  * Strip `//` line comments and `/* ... *\/` block comments from JSONC
@@ -337,51 +348,78 @@ function findOutermostClosingBrace(text: string): number {
 }
 
 /**
+ * Strip the entire sentinel-delimited block we manage, including the
+ * inner `// lintr: ...` headers and key lines. If either sentinel is
+ * missing, returns the input unchanged. Matches whole-line sentinels
+ * after trimming whitespace; a sentinel-shaped string embedded inside a
+ * string literal won't be matched (the wrapping `"` survives the trim).
+ */
+function stripSentineledLintingBlock(text: string): string {
+    const lines = text.split('\n');
+    const begin = lines.findIndex((l) => l.trim() === LINTING_SENTINEL_BEGIN);
+    if (begin === -1) return text;
+    const end = lines.findIndex((l, i) => i > begin && l.trim() === LINTING_SENTINEL_END);
+    if (end === -1) return text;
+    lines.splice(begin, end - begin + 1);
+    return lines.join('\n');
+}
+
+/**
  * Remove lines whose sole content is a top-level `raven.linting.*` key
  * declaration. `raven.linting.*` values are all scalars (boolean, int,
  * string) so single-line removal is safe.
+ *
+ * Assumes the VS Code convention of one key per line. A user who puts
+ * `"editor.tabSize": 4, "raven.linting.foo": true` on a single line
+ * would lose the unrelated key here, but VS Code's own formatters and
+ * the Settings UI never produce that shape, so we don't try to handle
+ * it.
  */
 function stripExistingLintingLines(text: string): string {
     return text.replace(/^[ \t]*"raven\.linting\.[^"]+"[ \t]*:[^\n]*\n?/gm, '');
 }
 
 /**
+ * Like `detectExistingLintingKeys`, but ignores keys inside the sentinel-
+ * managed block this scaffold owns. Used by the scaffold command to
+ * decide whether to prompt: keys inside our block are safe to overwrite
+ * silently on a re-run, but keys *outside* it are user-managed and need
+ * confirmation.
+ */
+export function detectUserManagedLintingKeys(text: string): string[] | null {
+    return detectExistingLintingKeys(stripSentineledLintingBlock(text));
+}
+
+/**
  * Build the JSONC content to write to `.vscode/settings.json`. If
  * `existing` is `undefined` or whitespace-only, returns the fresh
- * template. Otherwise removes any prior `raven.linting.*` keys and
- * inserts a freshly formatted block immediately before the outermost
- * closing brace, preserving all unrelated keys and comments.
+ * template. Otherwise strips any prior sentinel-managed block and any
+ * stray `raven.linting.*` keys, then inserts a freshly formatted block
+ * immediately before the outermost closing brace — preserving all
+ * unrelated keys and comments.
  */
 export function buildLintingSettingsContent(existing: string | undefined): string {
     if (existing === undefined || existing.trim().length === 0) {
         return LINTING_SETTINGS_TEMPLATE;
     }
-    const withoutLinting = stripExistingLintingLines(existing);
-    const closeIdx = findOutermostClosingBrace(withoutLinting);
+    const afterSentinelStrip = stripSentineledLintingBlock(existing);
+    const fullyStripped = stripExistingLintingLines(afterSentinelStrip);
+    const closeIdx = findOutermostClosingBrace(fullyStripped);
     if (closeIdx === -1) {
         return LINTING_SETTINGS_TEMPLATE;
     }
 
-    const before = withoutLinting.slice(0, closeIdx);
-    const after = withoutLinting.slice(closeIdx);
+    const before = fullyStripped.slice(0, closeIdx);
+    const after = fullyStripped.slice(closeIdx);
     const trimmedBefore = before.replace(/[ \t\n\r]+$/, '');
 
     const openBraceIdx = trimmedBefore.lastIndexOf('{');
     const hasExistingProps =
         openBraceIdx !== -1 && trimmedBefore.slice(openBraceIdx + 1).trim().length > 0;
-    const endsWithComma = trimmedBefore.endsWith(',');
+    const needsComma = hasExistingProps && !trimmedBefore.endsWith(',');
+    const prefix = trimmedBefore + (needsComma ? ',\n' : '\n');
 
-    let prefix: string;
-    if (!hasExistingProps) {
-        prefix = trimmedBefore + '\n';
-    } else if (endsWithComma) {
-        prefix = trimmedBefore + '\n';
-    } else {
-        prefix = trimmedBefore + ',\n';
-    }
-
-    const block = formatLintingBlock('  ', '');
-    return `${prefix}${block}\n${after}`;
+    return `${prefix}${formatLintingBlock('  ')}\n${after}`;
 }
 
 /**
@@ -484,18 +522,22 @@ async function runLintingSettingsScaffold(
     }
 
     if (existing !== undefined) {
-        const existingKeys = detectExistingLintingKeys(existing);
-        if (existingKeys === null) {
+        // Keys inside our sentinel-managed block were produced by an
+        // earlier run of this same scaffold, so it's safe to regenerate
+        // them silently. Only user-authored `raven.linting.*` keys
+        // (anything outside the sentinel range) trigger the prompt.
+        const userManagedKeys = detectUserManagedLintingKeys(existing);
+        if (userManagedKeys === null) {
             void vscode.window.showErrorMessage(
                 `Raven: ${displayName} has JSON parse errors; fix them and re-run this command.`,
             );
             return undefined;
         }
-        if (existingKeys.length > 0) {
+        if (userManagedKeys.length > 0) {
             const label =
-                existingKeys.length === 1
+                userManagedKeys.length === 1
                     ? '1 raven.linting.* setting'
-                    : `${existingKeys.length} raven.linting.* settings`;
+                    : `${userManagedKeys.length} raven.linting.* settings`;
             const choice = await vscode.window.showWarningMessage(
                 `${label} already in ${displayName}. Overwrite the raven.linting.* block? Other keys and comments will be preserved.`,
                 { modal: true },
