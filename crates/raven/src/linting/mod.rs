@@ -620,6 +620,27 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn infix_spaces_flags_at_op_with_spaces() {
+        let config = infix_spaces_only_config();
+        // `obj @ slot` (S4 slot access) is also `extract_operator`.
+        let diags = lint("x <- obj @ slot\n", &config);
+        assert!(!diags.is_empty(), "stray space around `@` must be flagged");
+        assert!(diags.iter().all(|d| d.message.contains("`@`")));
+    }
+
+    #[test]
+    fn infix_spaces_flags_unary_not_with_space() {
+        let config = infix_spaces_only_config();
+        // Unary `!` should be tight against its operand.
+        let diags = lint("y <- ! x\n", &config);
+        let unary_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("unary") && d.message.contains("`!`"))
+            .collect();
+        assert_eq!(unary_diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
     fn infix_spaces_flags_sequence_op_with_spaces() {
         let config = infix_spaces_only_config();
         // `1 : 10` — spaces around `:` are wrong for the sequence operator.
