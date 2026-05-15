@@ -68,7 +68,7 @@ Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-li
 | `T` / `F` symbol | hint | Bare `T` / `F` used in reference position (use `TRUE` / `FALSE`). Skipped at assignment targets, named arguments, formal parameters, and `$`/`@` field names |
 | Semicolon | hint | `;` separator outside strings/comments (`a; b`, trailing `a;`) |
 | Equals NA | hint | `x == NA`, `x != NA`, or any typed-`NA` variant on either side. Use `is.na(x)` |
-| Vector logic | hint | `&` or `|` in an `if` / `while` condition (use `&&` / `||` for scalars). Scan stops at call boundaries |
+| Vector logic | hint | `&` or `\|` in an `if` / `while` condition (use `&&` / `\|\|` for scalars). Scan stops at call boundaries |
 | Function left parentheses | hint | Whitespace between `function` (or `\`) and `(` (`function (x) ...`, `\ (x) ...`) |
 | Spaces inside | hint | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are exempt |
 

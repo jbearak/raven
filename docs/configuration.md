@@ -141,7 +141,7 @@ Native style/lint diagnostics. Off by default; opt in with `raven.linting.enable
 | `raven.linting.semicolonSeverity` | `"hint"` | Severity for the semicolon lint (`;` separators in source) |
 | `raven.linting.equalsNaSeverity` | `"hint"` | Severity for the equals-NA lint (`x == NA`, `x != NA`, typed-`NA` variants) |
 | `raven.linting.objectLengthSeverity` | `"hint"` | Severity for the object-length lint |
-| `raven.linting.vectorLogicSeverity` | `"hint"` | Severity for the vector-logic lint (`&` / `|` in `if` / `while` conditions) |
+| `raven.linting.vectorLogicSeverity` | `"hint"` | Severity for the vector-logic lint (`&` / `\|` in `if` / `while` conditions) |
 | `raven.linting.functionLeftParenthesesSeverity` | `"hint"` | Severity for the function-left-parentheses lint (whitespace between `function` and `(`) |
 | `raven.linting.spacesInsideSeverity` | `"hint"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
 
