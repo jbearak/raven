@@ -127,7 +127,7 @@ Set `raven.chunks.highlight.enabled` to `false` to turn the background off entir
 A line matching `# %%`, `## %%`, `### %%`, … starts a new cell. The cell extends until **whichever comes first**:
 
 1. The next `# %%` marker.
-2. An RStudio-style section divider (a comment line ending in 4+ `-`, `#`, `+`, `=`, or `*` characters — for example `# Title ====`, `# Setup ----`, `# Section #####`).
+2. An RStudio-style section divider (a comment line ending in 4+ `-`, `#`, `+`, `=`, or `*` characters — for example `# Title ====`, `# Setup ----`, `# Section #####`). Roxygen doc-comment lines (`#'`) are excluded, so a line like `#' @param x A value -----` does not end a cell.
 3. End of file.
 
 This matches VS Code's native interactive-cell convention used by the Jupyter extension and brings parity with vscode-R's section dividers.

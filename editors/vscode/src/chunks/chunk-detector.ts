@@ -48,7 +48,8 @@ const FENCE_CLOSE_RE = /^(`{3,}|~{3,})\s*$/;
 // Cell marker: a comment line that starts with `# %%` (any number of leading `#`),
 // followed by end-of-line or whitespace. This avoids matching `# %%%` (three or
 // more `%`) or `# %%inline-text` which are not cell delimiters in VS Code's
-// interactive-cell convention.
+// interactive-cell convention. Note: `# %%----` (no space) is NOT a cell marker —
+// it falls through to SECTION_DIVIDER_RE and acts as a cell-end boundary instead.
 const CELL_MARKER_RE = /^#+\s*%%(?!%)(?:\s.*)?$/;
 // RStudio-style section divider: a comment line ending in 4+ consecutive
 // boundary characters from the set { - # + = * }, with optional title text

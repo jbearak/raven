@@ -529,7 +529,7 @@ Refs #228."
 
 Find the `## Plain \`.R\` cell mode` section (around line 125) and update it to:
 
-```markdown
+````markdown
 ## Plain `.R` cell mode
 
 A line matching `# %%`, `## %%`, `### %%`, … starts a new cell. The cell extends until **whichever comes first**:
@@ -571,7 +571,7 @@ In the example above the `load` cell ends at `# Setup ----`. The `helper <- func
 ### Active-cell border
 
 The cell containing the cursor gets a top and bottom border so you can see at a glance which cell `Run Current Chunk` will run. Turn it off with `raven.chunks.activeCellIndicator: false`. The colors are themable via `raven.chunk.activeCellBorderTop` and `raven.chunk.activeCellBorderBottom`.
-```
+````
 
 - [ ] **Step 2: Commit**
 

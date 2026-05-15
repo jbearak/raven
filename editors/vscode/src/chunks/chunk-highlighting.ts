@@ -3,6 +3,7 @@ import {
     Chunk,
     classify_chunk_document_for_document,
     detect_chunks,
+    find_chunk_at_line,
     has_chunk_anchor,
     is_runnable_chunk,
 } from './chunk-detector';
@@ -136,10 +137,11 @@ function active_cell_indicator_enabled(): boolean {
 class ChunkActiveCellIndicator {
     private top_border: vscode.TextEditorDecorationType;
     private bottom_border: vscode.TextEditorDecorationType;
+    private debounce_handle: NodeJS.Timeout | undefined;
     // Per-document chunk cache keyed by URI string. Avoids re-scanning the
     // entire file on every cursor move — onDidChangeTextEditorSelection
     // fires on every keystroke and arrow press, so the unmodified-file path
-    // must be O(log n) rather than O(n).
+    // must be O(1) rather than O(n).
     private chunks_cache: Map<string, { version: number; chunks: Chunk[] }> = new Map();
 
     constructor() {
@@ -194,13 +196,7 @@ class ChunkActiveCellIndicator {
             return;
         }
         const cursor_line = editor.selection.active.line;
-        let active_chunk: Chunk | null = null;
-        for (const c of chunks) {
-            if (cursor_line >= c.header_line && cursor_line <= c.end_line) {
-                active_chunk = c;
-                break;
-            }
-        }
+        const active_chunk = find_chunk_at_line(chunks, cursor_line);
         if (active_chunk === null) {
             this.clear(editor);
             return;
@@ -217,6 +213,16 @@ class ChunkActiveCellIndicator {
         }
     }
 
+    schedule_refresh(): void {
+        if (this.debounce_handle !== undefined) {
+            clearTimeout(this.debounce_handle);
+        }
+        this.debounce_handle = setTimeout(() => {
+            this.debounce_handle = undefined;
+            this.update_visible();
+        }, 75);
+    }
+
     /**
      * Drop the cached chunks for a closed document so the map doesn't grow
      * unbounded over a long editing session.
@@ -229,6 +235,7 @@ class ChunkActiveCellIndicator {
         if (!active_cell_indicator_enabled()) return false;
         // Only `.R` cell mode — Rmd/Qmd fences already provide clear boundaries.
         if (classify_chunk_document_for_document(editor.document) !== 'r') return false;
+        // Belt-and-suspenders: bail if another extension overrode the languageId.
         if (editor.document.languageId.toLowerCase() !== 'r') return false;
         return true;
     }
@@ -242,6 +249,7 @@ class ChunkActiveCellIndicator {
     }
 
     dispose(): void {
+        if (this.debounce_handle !== undefined) clearTimeout(this.debounce_handle);
         this.top_border.dispose();
         this.bottom_border.dispose();
         this.chunks_cache.clear();
@@ -291,10 +299,7 @@ export function register_chunk_decorations(context: vscode.ExtensionContext): Ch
             );
             if (is_visible) {
                 manager.schedule_refresh();
-                // The active-cell border may shift if the edit changed chunk
-                // boundaries. Recompute right away — there's no per-line scan
-                // when `has_chunk_anchor` is false.
-                indicator.update_visible();
+                indicator.schedule_refresh();
             }
         }),
         vscode.workspace.onDidCloseTextDocument((document) => {
