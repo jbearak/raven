@@ -18,6 +18,8 @@ Fenced blocks may use either backticks or tildes, and four-or-more-character fen
 
 Only **R** chunks are sent to the R console. Chunks tagged with other languages (`{python}`, `{bash}`, `{julia}`, …) are still recognized for navigation and outline but not for execution.
 
+Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct symbol kind, separate from section headers — see [Document Outline](./document-outline.md#r-markdown--quarto-chunks).
+
 ## Keyboard shortcuts
 
 | Mac | Windows/Linux | Action |

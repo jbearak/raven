@@ -7,6 +7,7 @@
 
 mod backend;
 mod builtins;
+mod chunks;
 mod cli;
 mod completion_context;
 mod content_provider;
