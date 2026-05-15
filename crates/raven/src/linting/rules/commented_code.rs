@@ -51,65 +51,85 @@ pub(crate) fn collect(
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
+    let lines: Vec<&str> = text.lines().collect();
+
     // Collect every standalone comment node — comments where the only thing
     // preceding the `#` on its line is whitespace. End-of-line comments next
     // to code (`x <- 1 # explain`) are intentionally left alone.
     let mut standalone: Vec<StandaloneComment> = Vec::new();
-    collect_standalone(root, text, &mut standalone);
+    collect_standalone(root, &lines, &mut standalone);
 
     // Group consecutive standalone comments (adjacent lines, nothing else in
-    // between) so a multi-line block is parsed and reported as one unit.
+    // between), then *split* each group on any line that is itself a skip
+    // marker (roxygen, shebang on line 0, directive, annotation, mode line)
+    // or that the suppression infrastructure has marked. Splitting (rather
+    // than discarding the whole group) keeps unrelated commented-out code on
+    // adjacent lines from being silently swallowed by a single nearby
+    // directive — e.g. `# @lsp-ignore-next\n# x <- 1\n# y <- 2` must still
+    // flag line 2.
     let groups = group_contiguous(&standalone);
 
-    let lines: Vec<&str> = text.lines().collect();
+    for raw_group in groups {
+        for sub in split_on_skip_lines(&raw_group, &lines, suppressions) {
+            let first = sub.first().expect("sub-group is non-empty");
+            let last = sub.last().expect("sub-group is non-empty");
 
-    for group in groups {
-        let first_line_idx = group.first().expect("group is non-empty").line as usize;
-        let last_line_idx = group.last().expect("group is non-empty").line as usize;
+            let sub_lines: Vec<&str> = sub
+                .iter()
+                .map(|c| lines.get(c.line as usize).copied().unwrap_or(""))
+                .collect();
 
-        // Suppressions on the first or last comment line of the group cover
-        // the whole block — easier than asking "did the user mean to suppress
-        // an arbitrary middle line".
-        if suppressions.is_suppressed(first_line_idx as u32)
-            || suppressions.is_suppressed(last_line_idx as u32)
-        {
-            continue;
+            let stripped = strip_and_join(&sub_lines);
+            if !looks_like_code(&stripped) {
+                continue;
+            }
+
+            let start_line_text = lines.get(first.line as usize).copied().unwrap_or("");
+            let end_line_text = lines.get(last.line as usize).copied().unwrap_or("");
+            let start_col = byte_offset_to_utf16_column(start_line_text, first.start_byte_on_line);
+            let end_col = byte_offset_to_utf16_column(end_line_text, end_line_text.len());
+
+            out.push(Diagnostic {
+                range: Range {
+                    start: Position::new(first.line, start_col),
+                    end: Position::new(last.line, end_col),
+                },
+                severity: Some(severity),
+                source: Some(LINT_SOURCE.to_string()),
+                message: "Commented code should be removed.".to_string(),
+                ..Default::default()
+            });
         }
-
-        let group_lines: Vec<&str> = group
-            .iter()
-            .map(|c| lines.get(c.line as usize).copied().unwrap_or(""))
-            .collect();
-
-        if should_skip(&group_lines, first_line_idx == 0) {
-            continue;
-        }
-
-        let stripped = strip_and_join(&group_lines);
-        if !looks_like_code(&stripped) {
-            continue;
-        }
-
-        // Build the diagnostic range from the first character of the first
-        // comment line to the end of the last comment line.
-        let first = &group[0];
-        let last = &group[group.len() - 1];
-        let start_line_text = lines.get(first.line as usize).copied().unwrap_or("");
-        let end_line_text = lines.get(last.line as usize).copied().unwrap_or("");
-        let start_col = byte_offset_to_utf16_column(start_line_text, first.start_byte_on_line);
-        let end_col = byte_offset_to_utf16_column(end_line_text, end_line_text.len());
-
-        out.push(Diagnostic {
-            range: Range {
-                start: Position::new(first.line, start_col),
-                end: Position::new(last.line, end_col),
-            },
-            severity: Some(severity),
-            source: Some(LINT_SOURCE.to_string()),
-            message: "Commented code should be removed.".to_string(),
-            ..Default::default()
-        });
     }
+}
+
+/// Split a contiguous comment group at every line that is itself a skip
+/// marker (roxygen, directive, annotation, mode line, shebang on line 0) or
+/// a suppressed line. Returns the remaining runs of standalone comment lines
+/// that should be try-parsed as code.
+fn split_on_skip_lines<'a>(
+    group: &'a [StandaloneComment],
+    lines: &[&str],
+    suppressions: &Suppressions,
+) -> Vec<&'a [StandaloneComment]> {
+    let mut out: Vec<&'a [StandaloneComment]> = Vec::new();
+    let mut start = 0usize;
+    for (idx, c) in group.iter().enumerate() {
+        let line_text = lines.get(c.line as usize).copied().unwrap_or("");
+        let is_first_line = c.line == 0;
+        let skip = is_skip_line(line_text, is_first_line)
+            || suppressions.is_suppressed(c.line);
+        if skip {
+            if idx > start {
+                out.push(&group[start..idx]);
+            }
+            start = idx + 1;
+        }
+    }
+    if start < group.len() {
+        out.push(&group[start..]);
+    }
+    out
 }
 
 /// Comment node that is the only non-whitespace content on its line.
@@ -121,13 +141,13 @@ struct StandaloneComment {
     start_byte_on_line: usize,
 }
 
-fn collect_standalone<'a>(node: Node<'a>, text: &str, out: &mut Vec<StandaloneComment>) {
+fn collect_standalone<'a>(node: Node<'a>, lines: &[&str], out: &mut Vec<StandaloneComment>) {
     if node.kind() == "comment" {
         let start = node.start_position();
         let line_idx = start.row;
-        // Locate the line in `text` and check that everything before the
-        // comment is whitespace.
-        if let Some(line) = nth_line(text, line_idx) {
+        // O(1) line lookup against the materialized slice. Comments can be
+        // nested anywhere in the tree, so we still walk every node.
+        if let Some(line) = lines.get(line_idx).copied() {
             let col_bytes = start.column;
             if col_bytes <= line.len()
                 && line[..col_bytes].bytes().all(|b| b == b' ' || b == b'\t')
@@ -142,13 +162,8 @@ fn collect_standalone<'a>(node: Node<'a>, text: &str, out: &mut Vec<StandaloneCo
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_standalone(child, text, out);
+        collect_standalone(child, lines, out);
     }
-}
-
-/// Borrow the `line_idx`-th line of `text` (zero-indexed) without allocating.
-fn nth_line(text: &str, line_idx: usize) -> Option<&str> {
-    text.lines().nth(line_idx)
 }
 
 /// Group standalone comments that occupy consecutive lines.
@@ -167,29 +182,26 @@ fn group_contiguous(comments: &[StandaloneComment]) -> Vec<Vec<StandaloneComment
     groups
 }
 
-/// Decide whether a comment block should be skipped before we try to parse it
-/// as code.
-fn should_skip(lines: &[&str], is_first_block: bool) -> bool {
-    if is_first_block {
-        if let Some(first) = lines.first() {
-            if first.trim_start().starts_with("#!") {
-                return true;
-            }
-        }
+/// Decide whether a single comment line should be excluded from try-parsing.
+///
+/// Used by [`split_on_skip_lines`] to break a contiguous group at each
+/// skip-line boundary, so that one stray `# TODO:` or `# @lsp-source ...`
+/// doesn't silently swallow neighbouring commented-out code.
+fn is_skip_line(line: &str, is_first_line_of_file: bool) -> bool {
+    let trimmed = line.trim_start();
+    if is_first_line_of_file && trimmed.starts_with("#!") {
+        return true;
     }
-    lines.iter().any(|line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("#'") {
-            return true;
-        }
-        if is_directive_marker(trimmed) {
-            return true;
-        }
-        if is_mode_line(trimmed) {
-            return true;
-        }
-        is_annotation_comment(trimmed)
-    })
+    if trimmed.starts_with("#'") {
+        return true;
+    }
+    if is_directive_marker(trimmed) {
+        return true;
+    }
+    if is_mode_line(trimmed) {
+        return true;
+    }
+    is_annotation_comment(trimmed)
 }
 
 /// `# nolint`, `# nolint start`, `# nolint end`, `# nolint: rule`, and any

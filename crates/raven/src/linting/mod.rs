@@ -956,16 +956,94 @@ print.data.frame <- function(x, ...) NULL
     fn commented_code_respects_lsp_ignore_next() {
         let config = commented_code_only_config();
         let diags = lint("# @lsp-ignore-next\n# x <- 1 + 2\n# y <- 3 + 4\n", &config);
-        // `@lsp-ignore-next` suppresses line 1. Line 2 is also a commented
-        // code line, but it's part of a separate single-line block (the
-        // directive on line 0 itself is a non-code comment, breaking the
-        // group), and it stays in the block.
+        // `@lsp-ignore-next` suppresses line 1. Line 2 is also commented
+        // code, and it must STILL be flagged — the contiguous block is split
+        // at the directive line and at the suppressed line, leaving line 2
+        // as its own sub-group that the rule evaluates independently.
         let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
         assert!(
             !lines.contains(&1),
             "@lsp-ignore-next must suppress line 1: {:?}",
             diags
         );
+        assert!(
+            lines.contains(&2),
+            "unsuppressed line 2 must still be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_splits_block_at_directive_line() {
+        let config = commented_code_only_config();
+        // A `# @lsp-source` directive sandwiched between two real commented
+        // code lines must NOT swallow them. The block should split into two
+        // single-line sub-groups; each parses as code and is reported.
+        let diags = lint(
+            "# x <- 1\n# @lsp-source ../helpers.R\n# y <- 2\n",
+            &config,
+        );
+        let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
+        assert!(
+            lines.contains(&0),
+            "line 0 commented code must still flag: {:?}",
+            diags
+        );
+        assert!(
+            lines.contains(&2),
+            "line 2 commented code must still flag: {:?}",
+            diags
+        );
+        assert!(
+            !lines.contains(&1),
+            "directive line itself must not be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_splits_block_at_shebang_line() {
+        let config = commented_code_only_config();
+        // Shebang on line 0 plus commented code on line 1 must not silently
+        // skip the commented code as part of the same block.
+        let diags = lint("#!/usr/bin/env Rscript\n# x <- 1\n", &config);
+        let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
+        assert!(
+            lines.contains(&1),
+            "commented code adjacent to shebang must flag: {:?}",
+            diags
+        );
+        assert!(
+            !lines.contains(&0),
+            "shebang itself must not be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn commented_code_splits_block_at_todo_line() {
+        let config = commented_code_only_config();
+        // Same idea with an annotation comment in the middle.
+        let diags = lint(
+            "# x <- 1\n# TODO: revisit\n# y <- 2\n",
+            &config,
+        );
+        let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
+        assert!(lines.contains(&0));
+        assert!(lines.contains(&2));
+        assert!(!lines.contains(&1));
+    }
+
+    #[test]
+    fn commented_code_still_groups_when_no_skip_lines() {
+        let config = commented_code_only_config();
+        // Without any skip lines in between, a contiguous block should still
+        // join as one diagnostic — Codex's regression case must not break
+        // the original grouping behaviour.
+        let diags = lint("# x <- 1\n# y <- x + 2\n# z <- y * 3\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 0);
+        assert_eq!(diags[0].range.end.line, 2);
     }
 
     #[test]
