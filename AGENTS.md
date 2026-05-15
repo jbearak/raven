@@ -12,6 +12,7 @@ User-facing:
 - `docs/r-package-dev.md`
 - `docs/directives.md`
 - `docs/diagnostics.md`
+- `docs/linting.md`
 - `docs/indentation.md`
 - `docs/syntax-highlighting.md`
 - `docs/r-console.md`

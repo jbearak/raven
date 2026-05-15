@@ -50,7 +50,7 @@ Raven checks whether each symbol reference has a visible definition — either i
 
 ### Style Lints
 
-Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Off by default; enable with `raven.linting.enabled` and tune per rule via the `raven.linting.*` severities. All rules default to severity `hint` so they don't crowd the Problems pane.
+Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Off by default; enable with `raven.linting.enabled` and tune per rule via the `raven.linting.*` severities. All rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|

@@ -115,7 +115,7 @@ See [Smart Indentation](indentation.md) for details.
 
 ## Linting Settings
 
-Native style/lint diagnostics. Off by default; opt in with `raven.linting.enabled`. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions.
+Native style/lint diagnostics. Off by default; opt in with `raven.linting.enabled`. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for a user-facing guide that covers quick-start configuration, mapping from a `.lintr` file, gaps vs `lintr`, and the suppression matrix.
 
 | Setting | Default | Description |
 |---|---|---|
