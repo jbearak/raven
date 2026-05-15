@@ -636,6 +636,26 @@
           "highContrast": "#ffffff0a",
           "highContrastLight": "#0000000d"
         }
+      },
+      {
+        "id": "raven.chunk.activeCellBorderTop",
+        "description": "Top border color drawn above the active `# %%` cell in .R cell mode. Mirrors VS Code's interactive-cell selected-cell indicator.",
+        "defaults": {
+          "dark": "#3794ff",
+          "light": "#0066bf",
+          "highContrast": "#3794ff",
+          "highContrastLight": "#0066bf"
+        }
+      },
+      {
+        "id": "raven.chunk.activeCellBorderBottom",
+        "description": "Bottom border color drawn below the active `# %%` cell in .R cell mode.",
+        "defaults": {
+          "dark": "#3794ff",
+          "light": "#0066bf",
+          "highContrast": "#3794ff",
+          "highContrastLight": "#0066bf"
+        }
       }
     ],
     "configuration": {
@@ -1293,6 +1313,11 @@
           "type": "boolean",
           "default": true,
           "description": "Highlight R code chunks in .Rmd / .qmd files (and `# %%` cells in .R files) with a background color. Disable to remove the background entirely."
+        },
+        "raven.chunks.activeCellIndicator": {
+          "type": "boolean",
+          "default": true,
+          "description": "In `.R` files using `# %%` cell mode, draw a top and bottom border around the cell containing the cursor (Jupyter-style). Disable to hide the border."
         },
         "raven.chunks.codeLens.commands": {
           "type": "array",

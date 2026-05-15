@@ -48,8 +48,20 @@ const FENCE_CLOSE_RE = /^(`{3,}|~{3,})\s*$/;
 // Cell marker: a comment line that starts with `# %%` (any number of leading `#`),
 // followed by end-of-line or whitespace. This avoids matching `# %%%` (three or
 // more `%`) or `# %%inline-text` which are not cell delimiters in VS Code's
-// interactive-cell convention.
+// interactive-cell convention. Note: `# %%----` (no space) is NOT a cell marker —
+// it falls through to SECTION_DIVIDER_RE and acts as a cell-end boundary instead.
 const CELL_MARKER_RE = /^#+\s*%%(?!%)(?:\s.*)?$/;
+// RStudio-style section divider: a comment line ending in 4+ consecutive
+// boundary characters from the set { - # + = * }, with optional title text
+// in between. Examples: "# Title ====", "# Setup ----", "## Section #####".
+// Recognized as a cell-END marker only when mixing with `# %%` cells in `.R`
+// files (parity with vscode-R). A line that matches both `CELL_MARKER_RE` and
+// this regex is treated as a cell marker — `CELL_MARKER_RE` is tested first.
+//
+// The `(?!')` negative lookahead excludes roxygen doc comments (which begin
+// with `#'`), so a line like `#' @param x A value -----` doesn't accidentally
+// terminate the surrounding cell.
+const SECTION_DIVIDER_RE = /^#+(?!')\s*.*[-#+=*]{4,}\s*$/;
 
 /**
  * Classify a document path (or URI string) by file extension.
@@ -228,17 +240,39 @@ function detect_rmd_chunks(lines: string[]): Chunk[] {
 
 function detect_r_cells(lines: string[]): Chunk[] {
     const chunks: Chunk[] = [];
+
+    // Pass 1: enumerate cell markers (cell-START lines) and section dividers
+    // (cell-END-only lines). A line that matches CELL_MARKER_RE is always a
+    // marker even if it would also match SECTION_DIVIDER_RE — that lets users
+    // write headers like `# %% ====` without losing the cell-start meaning.
     const marker_lines: number[] = [];
+    const divider_lines = new Set<number>();
     for (let i = 0; i < lines.length; i++) {
-        if (CELL_MARKER_RE.test(lines[i])) marker_lines.push(i);
+        if (CELL_MARKER_RE.test(lines[i])) {
+            marker_lines.push(i);
+        } else if (SECTION_DIVIDER_RE.test(lines[i])) {
+            divider_lines.add(i);
+        }
     }
+
+    // Pass 2: for each cell marker, find the cell end — whichever comes
+    // first: the next cell marker, a section divider, or EOF. When a section
+    // divider closes the cell, the divider line itself is the last line of
+    // the cell (end_line === divider_line). Content between a divider and
+    // the next `# %%` is not part of any cell.
     for (let m = 0; m < marker_lines.length; m++) {
         const header_line = marker_lines[m];
         const next_marker = m + 1 < marker_lines.length ? marker_lines[m + 1] : lines.length;
-        const end_line = Math.max(next_marker - 1, header_line);
+        let end_line = next_marker - 1;
+        for (let i = header_line + 1; i < next_marker; i++) {
+            if (divider_lines.has(i)) {
+                end_line = i;
+                break;
+            }
+        }
         chunks.push({
             header_line,
-            end_line,
+            end_line: Math.max(end_line, header_line),
             closing_fence_line: null,
             language: 'r',
             label: null,

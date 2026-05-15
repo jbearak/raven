@@ -124,7 +124,13 @@ Set `raven.chunks.highlight.enabled` to `false` to turn the background off entir
 
 ## Plain `.R` cell mode
 
-A line matching `# %%`, `## %%`, `### %%`, … starts a new cell. The cell extends until the next marker (or end of file). This matches VS Code's native interactive-cell convention used by the Jupyter extension and several R notebook plugins.
+A line matching `# %%`, `## %%`, `### %%`, … starts a new cell. The cell extends until **whichever comes first**:
+
+1. The next `# %%` marker.
+2. An RStudio-style section divider (a comment line ending in 4+ `-`, `#`, `+`, `=`, or `*` characters — for example `# Title ====`, `# Setup ----`, `# Section #####`). Roxygen doc-comment lines (`#'`) are excluded, so a line like `#' @param x A value -----` does not end a cell.
+3. End of file.
+
+This matches VS Code's native interactive-cell convention used by the Jupyter extension and brings parity with vscode-R's section dividers.
 
 ```r
 # %% Load
@@ -137,6 +143,26 @@ mtcars |>
 ```
 
 Run Current Chunk on any line inside a cell sends that cell to the R console.
+
+### Section dividers as cell boundaries
+
+When you mix `# %%` cells with RStudio section dividers, the divider terminates the surrounding cell. The divider line itself stays in the prior cell; any code between the divider and the next `# %%` is **not** part of a cell and won't be sent by `Run Current Chunk`.
+
+```r
+# %% load
+library(dplyr)
+
+# Setup ----
+helper <- function() 1
+# %% transform
+mtcars |> mutate(x = helper())
+```
+
+In the example above the `load` cell ends at `# Setup ----`. The `helper <- function() 1` line is orphan — it belongs to neither cell. A line that matches both forms (for example `# %% ====`) is treated as a cell marker, so you can still use section-style decoration on a cell header without losing the cell-start meaning.
+
+### Active-cell border
+
+The cell containing the cursor gets a top and bottom border so you can see at a glance which cell `Run Current Chunk` will run. Turn it off with `raven.chunks.activeCellIndicator: false`. The colors are themable via `raven.chunk.activeCellBorderTop` and `raven.chunk.activeCellBorderBottom`.
 
 ## Limitations
 
