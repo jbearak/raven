@@ -56,7 +56,11 @@ const CELL_MARKER_RE = /^#+\s*%%(?!%)(?:\s.*)?$/;
 // Recognized as a cell-END marker only when mixing with `# %%` cells in `.R`
 // files (parity with vscode-R). A line that matches both `CELL_MARKER_RE` and
 // this regex is treated as a cell marker — `CELL_MARKER_RE` is tested first.
-const SECTION_DIVIDER_RE = /^#+\s*.*[-#+=*]{4,}\s*$/;
+//
+// The `(?!')` negative lookahead excludes roxygen doc comments (which begin
+// with `#'`), so a line like `#' @param x A value -----` doesn't accidentally
+// terminate the surrounding cell.
+const SECTION_DIVIDER_RE = /^#+(?!')\s*.*[-#+=*]{4,}\s*$/;
 
 /**
  * Classify a document path (or URI string) by file extension.

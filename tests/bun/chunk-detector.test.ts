@@ -387,6 +387,26 @@ describe('detect_chunks — .R cell markers', () => {
         expect(chunks[0].header_line).toBe(0);
         expect(chunks[0].end_line).toBe(2);
     });
+
+    test("roxygen #' lines do not act as section dividers", () => {
+        // Roxygen doc comments start with `#'` and sometimes use trailing
+        // dashes for visual emphasis. They are NOT RStudio section dividers
+        // and must not terminate the surrounding cell.
+        const src = lines([
+            '# %% docs',
+            "#' @param x A value -----------",
+            "#' @return numeric ============",
+            'f <- function(x) x',
+            '# %% next',
+            'g <- 1',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'r');
+        expect(chunks.length).toBe(2);
+        // Cell 1 spans from `# %% docs` (line 0) all the way to `f <- function(x) x` (line 3).
+        expect(chunks[0].header_line).toBe(0);
+        expect(chunks[0].end_line).toBe(3);
+        expect(chunks[1].header_line).toBe(4);
+    });
 });
 
 describe('find_chunk_at_line', () => {
