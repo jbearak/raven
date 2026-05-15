@@ -17452,6 +17452,32 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
+    fn test_document_symbol_includes_chunks_for_qmd_uri() {
+        // Mirrors the .Rmd integration test for the `.qmd` branch of
+        // `classify_chunk_document`.
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
+        let uri = Url::parse("file:///test.qmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+        let chunk = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
+            .expect("chunk entry");
+        assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
     fn test_document_symbol_includes_cells_for_r_uri() {
         use crate::state::{Document, WorldState};
 

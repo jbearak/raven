@@ -67,7 +67,10 @@ fn section_divider_re() -> &'static Regex {
     // Acts as a cell-END boundary when mixed with `# %%` cells.
     // Excludes roxygen `#'` lines.
     RE.get_or_init(|| {
-        Regex::new(r"^#+[^']?.*[-#+=*]{4,}\s*$").expect("section divider regex")
+        // `[^']` (mandatory, not `[^']?`) — without it, the character class
+        // could match zero chars and a roxygen line like `#' Title ----`
+        // would be misread as a divider.
+        Regex::new(r"^#+[^'].*[-#+=*]{4,}\s*$").expect("section divider regex")
     })
 }
 
@@ -390,6 +393,19 @@ mod tests {
         let chunks = detect(src, ChunkKind::R);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].label, None);
+    }
+
+    #[test]
+    fn roxygen_line_does_not_end_cell() {
+        // A `#' @param x A value -----` line inside a cell must NOT be
+        // mistaken for a section divider — the divider regex must require a
+        // non-quote character right after the leading hashes.
+        let src = "# %% Setup\n#' @param x A value -----\nlibrary(x)\n# %% Next\ny <- 2";
+        let chunks = detect(src, ChunkKind::R);
+        assert_eq!(chunks.len(), 2);
+        // First cell should extend through line 2 (`library(x)`), not be
+        // truncated at the roxygen line.
+        assert_eq!(chunks[0].end_line, 2);
     }
 
     #[test]

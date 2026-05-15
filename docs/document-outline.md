@@ -103,7 +103,7 @@ These patterns are **not** recognized as sections:
 
 For `.Rmd` and `.qmd` files, every fenced code chunk gets its own outline entry. The label, if present, becomes the entry name; unlabeled chunks fall back to `Chunk #N` numbered in source order across the whole document. For non-R chunks (`{python}`, `{julia}`, ...) the language tag appears in the detail field.
 
-```rmd
+````rmd
 ```{r setup, include=FALSE}
 library(dplyr)
 ```
@@ -115,7 +115,7 @@ analysis(data)
 ```{python}
 print("hi")
 ```
-```
+````
 
 Outline view shows:
 
