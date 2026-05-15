@@ -71,6 +71,7 @@ Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-li
 | Vector logic | hint | `&` or `\|` in an `if` / `while` condition (use `&&` / `\|\|` for scalars). Scan stops at call boundaries |
 | Function left parentheses | hint | Whitespace between `function` (or `\`) and `(` (`function (x) ...`, `\ (x) ...`) |
 | Spaces inside | hint | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are exempt |
+| Indentation | hint | Leading whitespace doesn't match the expected indent for the line's AST scope (braced blocks, multi-line argument lists, continuation lines). Configurable indent unit via `raven.linting.indentationUnit` (default 2) |
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
 

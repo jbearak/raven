@@ -9,6 +9,7 @@ pub(crate) mod commas;
 pub(crate) mod commented_code;
 pub(crate) mod equals_na;
 pub(crate) mod function_left_parentheses;
+pub(crate) mod indentation;
 pub(crate) mod infix_spaces;
 pub(crate) mod line_length;
 pub(crate) mod no_tab;

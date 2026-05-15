@@ -1587,6 +1587,32 @@
           ],
           "default": "hint",
           "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are left alone."
+        },
+        "raven.linting.indentationUnit": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Number of spaces per indent level used by the indentation lint. Mirrors `lintr::indentation_linter()`'s `indent` parameter."
+        },
+        "raven.linting.indentationSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report mis-indented lines as errors",
+            "Report mis-indented lines as warnings",
+            "Report mis-indented lines as information",
+            "Report mis-indented lines as hints",
+            "Disable the indentation lint"
+          ],
+          "default": "hint",
+          "description": "Severity for the indentation lint. Flags lines whose leading whitespace doesn't match the expected indent given their AST scope (braced blocks, multi-line argument lists, continuation lines)."
         }
       }
     }

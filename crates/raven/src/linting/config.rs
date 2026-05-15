@@ -66,6 +66,9 @@ pub struct LintConfig {
     /// Maximum allowed identifier length (object-length rule). Identifiers
     /// longer than this are flagged. Measured in characters of the name.
     pub object_length: u32,
+    /// Number of spaces per indentation level used by the indentation rule
+    /// (`lintr::indentation_linter`). Defaults to 2 to match `lintr`.
+    pub indentation_unit: u32,
     /// Preferred assignment operator style.
     pub assignment_operator_style: AssignmentOperatorStyle,
     /// Preferred string-literal delimiter (used by the `quotes` rule).
@@ -119,6 +122,8 @@ pub struct LintConfig {
     pub function_left_parentheses_severity: Option<DiagnosticSeverity>,
     /// Severity for the spaces-inside rule (`lintr::spaces_inside_linter`).
     pub spaces_inside_severity: Option<DiagnosticSeverity>,
+    /// Severity for the indentation rule (`lintr::indentation_linter`).
+    pub indentation_severity: Option<DiagnosticSeverity>,
 }
 
 impl Default for LintConfig {
@@ -128,6 +133,7 @@ impl Default for LintConfig {
             enabled: false,
             line_length: 80,
             object_length: 30,
+            indentation_unit: 2,
             assignment_operator_style: AssignmentOperatorStyle::default(),
             string_delimiter: StringDelimiter::default(),
             object_name_style_function: ObjectNameStyle::SnakeCase,
@@ -152,6 +158,7 @@ impl Default for LintConfig {
             vector_logic_severity: Some(DiagnosticSeverity::HINT),
             function_left_parentheses_severity: Some(DiagnosticSeverity::HINT),
             spaces_inside_severity: Some(DiagnosticSeverity::HINT),
+            indentation_severity: Some(DiagnosticSeverity::HINT),
         }
     }
 }

@@ -126,6 +126,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'boolean', defaultWhenUnconfigured: false },
     { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number', defaultWhenUnconfigured: 80 },
     { vsCodeKey: 'linting.objectLength', jsonPath: ['linting', 'objectLength'], type: 'number', defaultWhenUnconfigured: 30 },
+    { vsCodeKey: 'linting.indentationUnit', jsonPath: ['linting', 'indentationUnit'], type: 'number', defaultWhenUnconfigured: 2 },
     { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const, defaultWhenUnconfigured: '<-' },
     { vsCodeKey: 'linting.stringDelimiter', jsonPath: ['linting', 'stringDelimiter'], type: 'enum', enumValues: ['"', "'"] as const, defaultWhenUnconfigured: '"' },
     { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
@@ -148,6 +149,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.vectorLogicSeverity', jsonPath: ['linting', 'vectorLogicSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.functionLeftParenthesesSeverity', jsonPath: ['linting', 'functionLeftParenthesesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.spacesInsideSeverity', jsonPath: ['linting', 'spacesInsideSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'linting.indentationSeverity', jsonPath: ['linting', 'indentationSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     // Help viewer settings
     { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];
@@ -370,6 +372,7 @@ suite('Settings Transmission Property Tests', () => {
                 enabled: false,
                 lineLength: 80,
                 objectLength: 30,
+                indentationUnit: 2,
                 assignmentOperator: '<-',
                 stringDelimiter: '"',
                 objectNameStyleFunction: 'snake_case',
@@ -392,6 +395,7 @@ suite('Settings Transmission Property Tests', () => {
                 vectorLogicSeverity: 'hint',
                 functionLeftParenthesesSeverity: 'hint',
                 spacesInsideSeverity: 'hint',
+                indentationSeverity: 'hint',
             },
         }, 'Empty configuration should produce only runtime defaults');
 
@@ -533,6 +537,7 @@ suite('Settings Transmission Unit Tests', () => {
             enabled: false,
             lineLength: 80,
             objectLength: 30,
+            indentationUnit: 2,
             assignmentOperator: '<-',
             stringDelimiter: '"',
             objectNameStyleFunction: 'snake_case',
@@ -555,6 +560,7 @@ suite('Settings Transmission Unit Tests', () => {
             vectorLogicSeverity: 'hint',
             functionLeftParenthesesSeverity: 'hint',
             spacesInsideSeverity: 'hint',
+            indentationSeverity: 'hint',
         });
     });
 

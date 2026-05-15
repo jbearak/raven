@@ -122,6 +122,7 @@ Native style/lint diagnostics. Off by default; opt in with `raven.linting.enable
 | `raven.linting.enabled` | `false` | Master switch for all lint diagnostics |
 | `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
+| `raven.linting.indentationUnit` | `2` | Spaces per indent level used by the indentation lint (clamped to `1..=8`) |
 | `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
 | `raven.linting.stringDelimiter` | `"\""` | Preferred string-literal delimiter (`"\""` or `"'"`); used by the quotes lint |
 | `raven.linting.lineLengthSeverity` | `"hint"` | Severity for over-long lines (or `"off"`) |
@@ -144,6 +145,7 @@ Native style/lint diagnostics. Off by default; opt in with `raven.linting.enable
 | `raven.linting.vectorLogicSeverity` | `"hint"` | Severity for the vector-logic lint (`&` / `\|` in `if` / `while` conditions) |
 | `raven.linting.functionLeftParenthesesSeverity` | `"hint"` | Severity for the function-left-parentheses lint (whitespace between `function` and `(`) |
 | `raven.linting.spacesInsideSeverity` | `"hint"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
+| `raven.linting.indentationSeverity` | `"hint"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the expected indent for their AST scope) |
 
 To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also set any of the three style settings to `"any"` to disable just that symbol kind while keeping the others active.
 

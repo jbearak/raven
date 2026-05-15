@@ -493,6 +493,12 @@ pub(crate) fn parse_lint_config(
         // single-letter conventions usable; the ceiling is well below u32::MAX.
         config.object_length = v.clamp(5, 1_000) as u32;
     }
+    if let Some(v) = linting.get("indentationUnit").and_then(|v| v.as_u64()) {
+        // Same clamp-first pattern. Floors at 1 because zero-space indents
+        // wouldn't be visually distinguishable; ceiling matches the `tab_size`
+        // bound used by the on-type indentation provider.
+        config.indentation_unit = v.clamp(1, 8) as u32;
+    }
     if let Some(op) = linting.get("assignmentOperator").and_then(|v| v.as_str()) {
         config.assignment_operator_style = match op {
             "=" => crate::linting::AssignmentOperatorStyle::Equals,
@@ -610,6 +616,12 @@ pub(crate) fn parse_lint_config(
     {
         config.spaces_inside_severity = parse_severity(sev);
     }
+    if let Some(sev) = linting
+        .get("indentationSeverity")
+        .and_then(|v| v.as_str())
+    {
+        config.indentation_severity = parse_severity(sev);
+    }
 
     log::info!("Linting configuration loaded from LSP settings:");
     log::info!("  enabled: {}", config.enabled);
@@ -632,7 +644,7 @@ pub(crate) fn parse_lint_config(
         config.commented_code_severity
     );
     log::info!(
-        "  severities: quotes={:?} commas={:?} t_and_f={:?} semicolon={:?} equals_na={:?} object_length={:?} vector_logic={:?} function_left_paren={:?} spaces_inside={:?}",
+        "  severities: quotes={:?} commas={:?} t_and_f={:?} semicolon={:?} equals_na={:?} object_length={:?} vector_logic={:?} function_left_paren={:?} spaces_inside={:?} indentation={:?}",
         config.quotes_severity,
         config.commas_severity,
         config.t_and_f_symbol_severity,
@@ -642,7 +654,9 @@ pub(crate) fn parse_lint_config(
         config.vector_logic_severity,
         config.function_left_parentheses_severity,
         config.spaces_inside_severity,
+        config.indentation_severity,
     );
+    log::info!("  indentation_unit: {}", config.indentation_unit);
     log::info!(
         "  object_name styles: fn={:?} var={:?} arg={:?}",
         config.object_name_style_function,
@@ -7580,7 +7594,8 @@ mod tests {
                     "assignmentOperatorSeverity": "off",
                     "objectNameSeverity": "off",
                     "infixSpacesSeverity": "off",
-                    "commentedCodeSeverity": "off"
+                    "commentedCodeSeverity": "off",
+                    "indentationSeverity": "off"
                 }
             });
             let cfg = crate::backend::parse_lint_config(&settings).unwrap();
@@ -7592,6 +7607,24 @@ mod tests {
             assert_eq!(cfg.object_name_severity, None);
             assert_eq!(cfg.infix_spaces_severity, None);
             assert_eq!(cfg.commented_code_severity, None);
+            assert_eq!(cfg.indentation_severity, None);
+        }
+
+        #[test]
+        fn parse_lint_config_reads_indentation_unit_and_clamps() {
+            let settings = json!({ "linting": { "indentationUnit": 4 } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.indentation_unit, 4);
+
+            // Above the ceiling is clamped down to 8.
+            let settings = json!({ "linting": { "indentationUnit": 99 } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.indentation_unit, 8);
+
+            // Zero is clamped up to 1 (the floor).
+            let settings = json!({ "linting": { "indentationUnit": 0 } });
+            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            assert_eq!(cfg.indentation_unit, 1);
         }
 
         #[test]

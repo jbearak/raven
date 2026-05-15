@@ -146,6 +146,13 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 - **`lintr` equivalent:** `lintr::spaces_inside_linter()`.
 - Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`). Empty groupings (`f()`, `f( )`, `mat[]`) and multi-line wrapping are exempt — only single-line interior whitespace is flagged.
 
+### Indentation
+
+- **Raven:** `raven.linting.indentationUnit` (default `2`, clamped to `1..=8`), `raven.linting.indentationSeverity` (default `"hint"`).
+- **`lintr` equivalent:** `lintr::indentation_linter()` with its tidy-default hanging style.
+- Flags lines whose leading whitespace doesn't match the indent expected by the AST scope the line sits in: braced blocks (one unit deeper than the line of `{`); multi-line argument lists (either aligned with the column after the opener — `foo(a,\n    b)` — or hanging one unit deeper than the opener's line); continuation lines under a binary operator (one unit deeper than the line where the chain starts). A closing delimiter (`)`, `]`, `]]`, `}`) that begins its own line aligns with the line of its opener.
+- Skipped without checks: blank lines, lines whose leading whitespace contains any tab (left to the `no_tab` rule), and lines that start strictly inside a multi-line string. Suppression markers behave as on every other rule.
+
 ## Migrating from `.lintr`
 
 Raven does not read `.lintr` files — its rules are configured per VS Code settings instead. The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
@@ -169,6 +176,7 @@ Raven does not read `.lintr` files — its rules are configured per VS Code sett
 | `vector_logic_linter()` | `raven.linting.vectorLogicSeverity` |
 | `function_left_parentheses_linter()` | `raven.linting.functionLeftParenthesesSeverity` |
 | `spaces_inside_linter()` | `raven.linting.spacesInsideSeverity` |
+| `indentation_linter(indent = N)` | `raven.linting.indentationUnit = N`, `raven.linting.indentationSeverity` |
 
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"hint"` to `"warning"`.
 
@@ -181,7 +189,7 @@ If you'd also like a starter `.lintr` for running `lintr` itself alongside Raven
 - `object_usage_linter` — flags undefined globals inside function bodies via `codetools::checkUsage()`. Raven's [Undefined variable diagnostic](diagnostics.md#undefined-variables) covers similar ground at the file and `source()`-chain level (via static cross-file scope), but with different semantics: Raven's check is scope- and position-aware across `source()` chains, while `object_usage_linter` runs inside individual function bodies via R's own analyzer.
 - `cyclocomp_linter` — cyclomatic complexity.
 - `seq_linter`.
-- `brace_linter`, `paren_body_linter`, `indentation_linter`, `spaces_left_parentheses_linter`.
+- `brace_linter`, `paren_body_linter`, `spaces_left_parentheses_linter`.
 - `pipe_continuation_linter`, `pipe_call_linter`.
 - `absolute_path_linter`.
 

@@ -42,6 +42,9 @@
 //!   (or `\`) and `(`.
 //! * `spaces_inside` — flag whitespace immediately inside `(`, `[`, `[[`
 //!   and their closers. Empty groupings and multi-line wrapping are exempt.
+//! * `indentation` — flag lines whose leading whitespace doesn't match the
+//!   expected indent for their AST scope. Lintr's tidy-default hanging indent
+//!   for braced blocks, multi-line argument lists, and continuation lines.
 //!
 //! Implementation note: every rule except `commented_code` and `semicolon`
 //! walks the already-parsed tree directly. `commented_code` re-parses each
@@ -170,6 +173,16 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
     }
     if let Some(sev) = config.spaces_inside_severity {
         rules::spaces_inside::collect(text, tree_root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = config.indentation_severity {
+        rules::indentation::collect(
+            text,
+            tree_root,
+            config.indentation_unit,
+            sev,
+            &suppressions,
+            &mut out,
+        );
     }
 
     out
@@ -1227,6 +1240,7 @@ print.data.frame <- function(x, ...) NULL
             vector_logic_severity: None,
             function_left_parentheses_severity: None,
             spaces_inside_severity: None,
+            indentation_severity: None,
             ..enabled_config()
         }
     }
@@ -1730,6 +1744,39 @@ print.data.frame <- function(x, ...) NULL
         let config = spaces_inside_only_config();
         let diags = lint("x <- ( 1 + 2 )\n", &config);
         assert_eq!(diags.len(), 2, "got {:?}", diags);
+    }
+
+    // ------------------------------------------------------------------
+    // indentation
+    // ------------------------------------------------------------------
+
+    fn indentation_only_config() -> LintConfig {
+        LintConfig {
+            indentation_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        }
+    }
+
+    #[test]
+    fn indentation_dispatcher_flags_misindented_block_line() {
+        let config = indentation_only_config();
+        let diags = lint("f <- function() {\nx <- 1\n}\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 1);
+        assert!(diags[0].message.contains("should be 2 spaces"));
+    }
+
+    #[test]
+    fn indentation_dispatcher_honors_configured_unit() {
+        let config = LintConfig {
+            indentation_unit: 4,
+            ..indentation_only_config()
+        };
+        // 4 spaces is correct under indent_unit=4; 2 spaces is wrong.
+        assert!(lint("f <- function() {\n    x <- 1\n}\n", &config).is_empty());
+        let diags = lint("f <- function() {\n  x <- 1\n}\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("should be 4 spaces"));
     }
 }
 

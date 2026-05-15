@@ -98,6 +98,7 @@ export interface RavenInitializationOptions {
         enabled?: boolean;
         lineLength?: number;
         objectLength?: number;
+        indentationUnit?: number;
         assignmentOperator?: "<-" | "=";
         stringDelimiter?: "\"" | "'";
         objectNameStyleFunction?: ObjectNameStyle;
@@ -120,6 +121,7 @@ export interface RavenInitializationOptions {
         vectorLogicSeverity?: SeverityLevel;
         functionLeftParenthesesSeverity?: SeverityLevel;
         spacesInsideSeverity?: SeverityLevel;
+        indentationSeverity?: SeverityLevel;
     };
     helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
@@ -366,6 +368,7 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         enabled: config.get<boolean>('linting.enabled', false),
         lineLength: config.get<number>('linting.lineLength', 80),
         objectLength: config.get<number>('linting.objectLength', 30),
+        indentationUnit: config.get<number>('linting.indentationUnit', 2),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
         stringDelimiter: config.get<"\"" | "'">('linting.stringDelimiter', '"'),
         objectNameStyleFunction: config.get<ObjectNameStyle>('linting.objectNameStyleFunction', 'snake_case'),
@@ -388,6 +391,7 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         vectorLogicSeverity: config.get<SeverityLevel>('linting.vectorLogicSeverity', 'hint'),
         functionLeftParenthesesSeverity: config.get<SeverityLevel>('linting.functionLeftParenthesesSeverity', 'hint'),
         spacesInsideSeverity: config.get<SeverityLevel>('linting.spacesInsideSeverity', 'hint'),
+        indentationSeverity: config.get<SeverityLevel>('linting.indentationSeverity', 'hint'),
     };
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');
