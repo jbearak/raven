@@ -102,7 +102,7 @@ fn check_binary(
         None => return,
     };
     let style = classify_binary(op_text);
-    let Some((lhs, rhs)) = lhs_and_rhs(node, op) else {
+    let Some((lhs, rhs)) = lhs_and_rhs(node) else {
         return;
     };
 
@@ -144,7 +144,7 @@ fn check_tight_binary(
         Some(s) => s,
         None => return,
     };
-    let Some((lhs, rhs)) = lhs_and_rhs(node, op) else {
+    let Some((lhs, rhs)) = lhs_and_rhs(node) else {
         return;
     };
 
@@ -196,7 +196,7 @@ fn check_unary(
     if !matches!(op_text, "-" | "+" | "!" | "?") {
         return;
     }
-    let Some(operand) = unary_operand(node, op) else {
+    let Some(operand) = node.child_by_field_name("rhs") else {
         return;
     };
     let gap = gap_text(text, op.end_byte(), operand.start_byte());
@@ -227,31 +227,13 @@ fn gap_text(text: &str, start: usize, end: usize) -> Option<&str> {
 }
 
 /// Resolve the left- and right-hand-side nodes of a `binary_operator`,
-/// `namespace_operator`, or `extract_operator` by finding the non-extra
-/// children flanking the operator token.
-fn lhs_and_rhs<'tree>(
-    node: Node<'tree>,
-    op: Node<'tree>,
-) -> Option<(Node<'tree>, Node<'tree>)> {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node
-        .children(&mut cursor)
-        .filter(|c| c.is_named() || c.id() == op.id())
-        .collect();
-    let idx = children.iter().position(|c| c.id() == op.id())?;
-    let lhs = children.get(idx.checked_sub(1)?)?;
-    let rhs = children.get(idx + 1)?;
-    Some((*lhs, *rhs))
-}
-
-/// Resolve the operand node of a `unary_operator` (the named sibling that
-/// follows the operator token).
-fn unary_operand<'tree>(node: Node<'tree>, op: Node<'tree>) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    let found = node
-        .children(&mut cursor)
-        .find(|child| child.is_named() && child.id() != op.id() && child.start_byte() >= op.end_byte());
-    found
+/// `namespace_operator`, or `extract_operator`. Tree-sitter-r exposes both as
+/// the `lhs` and `rhs` fields, matching the pattern used elsewhere in the
+/// codebase (`object_name.rs`, `extract_op.rs`, `qualified_resolve.rs`).
+fn lhs_and_rhs<'tree>(node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    let lhs = node.child_by_field_name("lhs")?;
+    let rhs = node.child_by_field_name("rhs")?;
+    Some((lhs, rhs))
 }
 
 #[allow(clippy::too_many_arguments)]

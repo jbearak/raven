@@ -333,6 +333,7 @@ mod tests {
             no_tab_severity: None,
             trailing_blank_lines_severity: None,
             assignment_operator_severity: None,
+            infix_spaces_severity: None,
             ..enabled_config()
         }
     }
@@ -672,12 +673,51 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn infix_spaces_does_not_flag_function_default_argument() {
+        let config = infix_spaces_only_config();
+        // tree-sitter-r parses formal-parameter defaults like `x=1` as a
+        // `parameter` node (operator `=` is a direct child), not as a
+        // `binary_operator`. The rule must therefore leave both spaced and
+        // unspaced defaults alone.
+        let no_space = lint("f <- function(x=1) x\n", &config);
+        let with_space = lint("f <- function(x = 1) x\n", &config);
+        assert!(
+            no_space.is_empty(),
+            "function(x=1) defaults must not be flagged: {:?}",
+            no_space
+        );
+        assert!(
+            with_space.is_empty(),
+            "function(x = 1) defaults must not be flagged: {:?}",
+            with_space
+        );
+    }
+
+    #[test]
     fn infix_spaces_does_not_flag_line_continuation() {
         let config = infix_spaces_only_config();
         // Operator at end of line, RHS on the next line — the newline supplies
         // the separation, so neither side should be flagged.
         let diags = lint("x <- a +\n  b\n", &config);
         assert!(diags.is_empty(), "line-continuation `+` must not be flagged: {:?}", diags);
+    }
+
+    #[test]
+    fn infix_spaces_handles_comment_before_operand() {
+        // Regression: ensures `child_by_field_name("rhs")` (rather than
+        // positional walking) picks the real operand even when a comment
+        // node intervenes between the operator and its operand.
+        let config = infix_spaces_only_config();
+        // A comment between `<-` and `1` is uncommon but legal R. The rule
+        // should still be able to evaluate the gap consistently — and since
+        // the comment forces a newline before `1`, `gap_text` returns `None`
+        // (line-continuation case), so no diagnostic should be produced.
+        let diags = lint("x <- # comment\n  1\n", &config);
+        assert!(
+            diags.is_empty(),
+            "comment-then-newline gap must not produce diagnostics: {:?}",
+            diags
+        );
     }
 
     #[test]
