@@ -75,7 +75,7 @@ fn is_excluded_position(ident: Node<'_>) -> bool {
                 .child_by_field_name("name")
                 .is_some_and(|name| name.id() == ident.id())
         }
-        "parameter" | "default_parameter" => {
+        "parameter" => {
             // Formal parameter name: `function(T) ...` — declaring, not reading.
             parent
                 .child_by_field_name("name")

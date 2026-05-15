@@ -66,10 +66,9 @@ fn check_assignment(
         "->" | "->>" => node.child_by_field_name("rhs"),
         _ => return,
     };
-    // `=` inside an argument list is a named argument, not assignment.
-    if op_text == "=" && node.parent().is_some_and(|p| p.kind() == "argument") {
-        return;
-    }
+    // Note: tree-sitter-r parses `f(name = value)` as an `argument` node
+    // whose `=` is an internal token, not as a `binary_operator`. So named
+    // arguments never reach this branch and need no explicit guard.
     let Some(target) = target else {
         return;
     };
@@ -93,11 +92,13 @@ fn check_parameters(
     };
     let mut cursor = params.walk();
     for child in params.children(&mut cursor) {
-        let ident = match child.kind() {
-            "parameter" | "default_parameter" => child.child_by_field_name("name"),
-            _ => continue,
-        };
-        let Some(ident) = ident else {
+        // Tree-sitter-r exposes formal parameters as `parameter` nodes (whether
+        // or not they carry a default value), so this is the only kind we
+        // need to match. The `dots` token (`...`) is not a user-chosen name.
+        if child.kind() != "parameter" {
+            continue;
+        }
+        let Some(ident) = child.child_by_field_name("name") else {
             continue;
         };
         if ident.kind() != "identifier" {

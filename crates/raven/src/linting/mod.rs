@@ -18,9 +18,35 @@
 //! * `commented_code` — flag standalone comment blocks whose body parses as R
 //!   and contains a call, assignment, operator, or function definition. This
 //!   rule re-parses each candidate comment body via the thread-local parser
-//!   pool; every other rule walks only the already-parsed tree. The same
-//!   parser pool is also exercised by the suppression parser on the rare
-//!   commented-code line that carries an inline `# nolint` (see below).
+//!   pool. The same parser pool is also exercised by the suppression parser
+//!   on the rare commented-code line that carries an inline `# nolint` (see
+//!   below).
+//! * `quotes` — flag string literals not using the configured delimiter (`"`
+//!   or `'`). Raw strings are exempt.
+//! * `commas` — flag whitespace before `,` and missing whitespace after `,`
+//!   (newline after is fine).
+//! * `t_and_f_symbol` — flag bare `T` / `F` identifiers used as references to
+//!   `TRUE` / `FALSE`. Assignment targets, named arguments, formal
+//!   parameters, and `$` / `@` field names are exempt.
+//! * `semicolon` — flag `;` statement separators in source. Unlike the other
+//!   rules, this one byte-scans the raw source (skipping ranges that the AST
+//!   marks as `string` or `comment`) because tree-sitter-r does not emit `;`
+//!   as a node.
+//! * `equals_na` — flag `x == NA`, `x != NA`, and the typed `NA_*` variants
+//!   on either side.
+//! * `object_length` — flag identifier names longer than the configured
+//!   maximum length.
+//! * `vector_logic` — flag `&` / `|` in `if` / `while` conditions; call
+//!   boundaries stop the scan so `if (any(x & y))` is left alone.
+//! * `function_left_parentheses` — flag whitespace between `function`
+//!   (or `\`) and `(`.
+//! * `spaces_inside` — flag whitespace immediately inside `(`, `[`, `[[`
+//!   and their closers. Empty groupings and multi-line wrapping are exempt.
+//!
+//! Implementation note: every rule except `commented_code` and `semicolon`
+//! walks the already-parsed tree directly. `commented_code` re-parses each
+//! candidate comment body; `semicolon` byte-scans the source text using AST
+//! ranges only to skip strings and comments.
 //!
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
