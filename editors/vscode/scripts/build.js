@@ -20,6 +20,14 @@ async function buildExtension() {
         sourcemap: true,
         outfile: path.join(dist, 'extension.js'),
         logLevel: 'info',
+        // Prefer ESM entry points where a package ships both. Node's default
+        // `mainFields = ['main']` picks UMD builds for packages like
+        // `jsonc-parser`, whose UMD wrapper uses dynamic `require("./impl/...")`
+        // calls that esbuild can't statically follow — the bundle compiles but
+        // throws "Cannot find module './impl/format'" at runtime. Selecting
+        // the ESM build (`module` field) gives esbuild plain `import`
+        // statements it can resolve and inline.
+        mainFields: ['module', 'main'],
     });
 }
 
