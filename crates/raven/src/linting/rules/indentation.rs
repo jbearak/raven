@@ -605,6 +605,18 @@ mod tests {
     }
 
     #[test]
+    fn mixed_pipe_and_arithmetic_chain_accepts_hanging_and_subchain_aligned() {
+        // `f() |> g() + y + z` chains across pipe and arithmetic. The
+        // hanging form (2) and the chain-start column (which lines up with
+        // `f()` because the binop node spans from there) must both be
+        // accepted to avoid disagreeing with the on-type formatter.
+        let hanging = "x <- f() |>\n  g() + y +\n  z\n";
+        let aligned = "x <- f() |>\n     g() + y +\n     z\n";
+        assert!(lint(hanging, 2).is_empty(), "hanging style should pass");
+        assert!(lint(aligned, 2).is_empty(), "subchain-aligned style should pass");
+    }
+
+    #[test]
     fn function_definition_parameters_closing_paren_aligns_with_function() {
         // The closing `)` of the parameter list sits on its own line and
         // should align with the line of the `function` keyword.
