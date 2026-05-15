@@ -15,6 +15,11 @@
 //!   on assignment targets and function arguments.
 //! * `infix_spaces` — flag missing spaces around binary infix operators and
 //!   stray spaces around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`).
+//! * `commented_code` — flag standalone comment blocks whose body parses as R
+//!   and contains a call, assignment, operator, or function definition. This
+//!   rule additionally re-parses each candidate comment body via the
+//!   thread-local parser pool; every other rule walks only the
+//!   already-parsed tree.
 //!
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
@@ -337,6 +342,7 @@ mod tests {
             trailing_blank_lines_severity: None,
             assignment_operator_severity: None,
             infix_spaces_severity: None,
+            commented_code_severity: None,
             ..enabled_config()
         }
     }
@@ -563,6 +569,7 @@ print.data.frame <- function(x, ...) NULL
             trailing_blank_lines_severity: None,
             assignment_operator_severity: None,
             object_name_severity: None,
+            commented_code_severity: None,
             ..enabled_config()
         }
     }

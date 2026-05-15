@@ -245,10 +245,13 @@ fn is_annotation_comment(trimmed_line: &str) -> bool {
         None => return false,
     };
     for prefix in ANNOTATION_PREFIXES {
-        if body.len() < prefix.len() {
-            continue;
-        }
-        let head = &body[..prefix.len()];
+        // `str::get` is char-boundary-safe — a multibyte character whose
+        // bytes straddle `prefix.len()` returns `None` instead of panicking
+        // like a plain `&body[..prefix.len()]` would.
+        let head = match body.get(..prefix.len()) {
+            Some(h) => h,
+            None => continue,
+        };
         if !head.eq_ignore_ascii_case(prefix) {
             continue;
         }
@@ -372,6 +375,19 @@ mod tests {
         // Not annotations:
         assert!(!is_annotation_comment("# todoist <- list()"));
         assert!(!is_annotation_comment("# x <- 1"));
+    }
+
+    #[test]
+    fn annotation_detector_safe_on_multibyte_prefix() {
+        // `body.get(prefix.len()..)` (boundary-safe) must replace any naked
+        // `&body[..prefix.len()]` slice — otherwise comments whose body
+        // starts with a multibyte UTF-8 character whose bytes straddle a
+        // prefix-length boundary will panic at runtime.
+        assert!(!is_annotation_comment("# €€ note"));
+        assert!(!is_annotation_comment("# ö€: foo"));
+        // Non-ASCII inside the prefix slot must not match an ASCII annotation
+        // keyword — and must not panic.
+        assert!(!is_annotation_comment("# TÖDO"));
     }
 
     #[test]
