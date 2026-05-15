@@ -227,8 +227,14 @@ export const LINTING_SETTINGS_TEMPLATE = `{\n${formatLintingBlock('  ')}\n}\n`;
  * text, preserving string contents and newlines (so line numbers in
  * any downstream parse errors still line up). Trailing-comma stripping
  * is left to the caller; this function only removes comments.
+ *
+ * Returns `null` if the input contains an unterminated block comment.
+ * Without this guard, the comment-stripper would silently drop the
+ * rest of the file and any subsequent `JSON.parse` would succeed on
+ * the truncated prefix — leading the scaffold to write back invalid
+ * JSONC (a `/*` with nothing closing it).
  */
-function stripJsoncComments(text: string): string {
+function stripJsoncComments(text: string): string | null {
     let out = '';
     let i = 0;
     let inString = false;
@@ -257,10 +263,16 @@ function stripJsoncComments(text: string): string {
         }
         if (c === '/' && text[i + 1] === '*') {
             i += 2;
-            while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
+            let closed = false;
+            while (i + 1 < text.length) {
+                if (text[i] === '*' && text[i + 1] === '/') {
+                    closed = true;
+                    break;
+                }
                 if (text[i] === '\n') out += '\n';
                 i++;
             }
+            if (!closed) return null;
             i += 2;
             continue;
         }
@@ -289,9 +301,11 @@ type LintingParseResult =
 
 function parseLintingKeys(text: string): LintingParseResult {
     if (text.trim().length === 0) return { kind: 'object', keys: [] };
+    const stripped = stripJsoncComments(text);
+    if (stripped === null) return { kind: 'parseError' };
     let parsed: unknown;
     try {
-        parsed = JSON.parse(stripTrailingCommas(stripJsoncComments(text)));
+        parsed = JSON.parse(stripTrailingCommas(stripped));
     } catch {
         return { kind: 'parseError' };
     }

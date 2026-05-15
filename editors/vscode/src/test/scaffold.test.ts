@@ -299,6 +299,13 @@ suite('scaffold linting-settings merge', () => {
         assert.strictEqual(buildLintingSettingsContent('{ this is not json'), null);
     });
 
+    test('returns null for an unterminated block comment', () => {
+        // An unterminated `/*` used to slip through the comment stripper
+        // silently, producing apparently-valid JSON and an invalid output.
+        assert.strictEqual(buildLintingSettingsContent('{} /*'), null);
+        assert.strictEqual(buildLintingSettingsContent('{ "a": 1 } /* unfinished'), null);
+    });
+
     test('re-running on a sentineled file does not duplicate the block or its lintr comments', () => {
         const merged = mergeOrThrow(LINTING_SETTINGS_TEMPLATE);
 
