@@ -108,6 +108,7 @@ export interface RavenInitializationOptions {
         assignmentOperatorSeverity?: SeverityLevel;
         objectNameSeverity?: SeverityLevel;
         infixSpacesSeverity?: SeverityLevel;
+        commentedCodeSeverity?: SeverityLevel;
     };
     helpViewer?: { viewColumn?: 'active' | 'beside' };
 }
@@ -364,6 +365,7 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         assignmentOperatorSeverity: config.get<SeverityLevel>('linting.assignmentOperatorSeverity', 'hint'),
         objectNameSeverity: config.get<SeverityLevel>('linting.objectNameSeverity', 'hint'),
         infixSpacesSeverity: config.get<SeverityLevel>('linting.infixSpacesSeverity', 'hint'),
+        commentedCodeSeverity: config.get<SeverityLevel>('linting.commentedCodeSeverity', 'hint'),
     };
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');

@@ -82,6 +82,8 @@ pub struct LintConfig {
     pub object_name_severity: Option<DiagnosticSeverity>,
     /// Severity for the infix-spaces rule. `None` disables the rule.
     pub infix_spaces_severity: Option<DiagnosticSeverity>,
+    /// Severity for the commented-code rule. `None` disables the rule.
+    pub commented_code_severity: Option<DiagnosticSeverity>,
 }
 
 impl Default for LintConfig {
@@ -103,6 +105,7 @@ impl Default for LintConfig {
             assignment_operator_severity: Some(DiagnosticSeverity::HINT),
             object_name_severity: Some(DiagnosticSeverity::HINT),
             infix_spaces_severity: Some(DiagnosticSeverity::HINT),
+            commented_code_severity: Some(DiagnosticSeverity::HINT),
         }
     }
 }
