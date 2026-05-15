@@ -299,6 +299,27 @@ suite('scaffold linting-settings merge', () => {
         assert.strictEqual(buildLintingSettingsContent('{ this is not json'), null);
     });
 
+    test('returns null when a raven.linting.* key has a non-scalar (object) value', () => {
+        // raven.linting.* values are scalars; an object value would span
+        // multiple lines, and the line-based stripper can't safely delete
+        // a multi-line value. We refuse to merge instead.
+        const existing = `{
+  "raven.linting.foo": {
+    "nested": 1
+  }
+}
+`;
+        assert.strictEqual(buildLintingSettingsContent(existing), null);
+    });
+
+    test('returns null when a raven.linting.* key has a non-scalar (array) value', () => {
+        const existing = `{
+  "raven.linting.bar": [1, 2, 3]
+}
+`;
+        assert.strictEqual(buildLintingSettingsContent(existing), null);
+    });
+
     test('returns null for an unterminated block comment', () => {
         // An unterminated `/*` used to slip through the comment stripper
         // silently, producing apparently-valid JSON and an invalid output.

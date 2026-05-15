@@ -291,12 +291,18 @@ function stripTrailingCommas(text: string): string {
  *   - `parseError`: text was not valid JSONC at all (caller should bail).
  *   - `nonObjectRoot`: parsed fine but the root isn't a JSON object
  *     (e.g. an array, scalar, or `null`). Can't safely merge into it.
+ *   - `unsupportedValue`: a top-level `raven.linting.*` key has a non-
+ *     scalar value (object or array). All declared `raven.linting.*`
+ *     settings are scalars (`boolean | number | string`); a non-scalar
+ *     value would likely span multiple lines, and the line-based
+ *     stripper isn't equipped to delete a multi-line value cleanly.
  *   - `object`: parsed as a JSON object — `keys` lists the top-level
  *     `raven.linting.*` keys present (may be empty).
  */
 type LintingParseResult =
     | { kind: 'parseError' }
     | { kind: 'nonObjectRoot' }
+    | { kind: 'unsupportedValue'; key: string }
     | { kind: 'object'; keys: string[] };
 
 function parseLintingKeys(text: string): LintingParseResult {
@@ -312,12 +318,21 @@ function parseLintingKeys(text: string): LintingParseResult {
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
         return { kind: 'nonObjectRoot' };
     }
-    return {
-        kind: 'object',
-        keys: Object.keys(parsed as Record<string, unknown>).filter((k) =>
-            k.startsWith('raven.linting.'),
-        ),
-    };
+    const obj = parsed as Record<string, unknown>;
+    const keys: string[] = [];
+    for (const k of Object.keys(obj)) {
+        if (!k.startsWith('raven.linting.')) continue;
+        const v = obj[k];
+        // raven.linting.* values are scalars (`boolean | number | string`).
+        // If the user wrote an object/array there, `stripTopLevelLintingLines`
+        // — which deletes a single physical line per key — would orphan the
+        // continuation lines and corrupt the file. Refuse to merge.
+        if (v !== null && typeof v === 'object') {
+            return { kind: 'unsupportedValue', key: k };
+        }
+        keys.push(k);
+    }
+    return { kind: 'object', keys };
 }
 
 /**
@@ -850,6 +865,12 @@ async function runLintingSettingsScaffold(
         if (classification.kind === 'nonObjectRoot') {
             void vscode.window.showErrorMessage(
                 `Raven: ${displayName} is valid JSON but its root isn't a JSON object — refusing to overwrite. Move the file aside (or wrap its contents in \`{}\`) and re-run this command.`,
+            );
+            return undefined;
+        }
+        if (classification.kind === 'unsupportedValue') {
+            void vscode.window.showErrorMessage(
+                `Raven: ${displayName} sets ${classification.key} to a non-scalar value (object or array). All raven.linting.* settings are scalars (boolean, number, or string); please correct the value before re-running this command.`,
             );
             return undefined;
         }
