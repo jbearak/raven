@@ -4155,6 +4155,17 @@ impl LanguageServer for Backend {
                     continue;
                 }
 
+                // Skip Rmd/Quarto files: they're routed to the LSP for the
+                // document outline (issue #227), but their prose/YAML would
+                // pollute the cross-file index if parsed as R. The workspace
+                // startup scan already excludes them via
+                // `is_stat_model_extension`; this keeps the watcher consistent.
+                let lower_path = uri.path().to_ascii_lowercase();
+                if lower_path.ends_with(".rmd") || lower_path.ends_with(".qmd") {
+                    log::trace!("Skipping watched Rmd/Quarto file change: {}", uri);
+                    continue;
+                }
+
                 match change.typ {
                     FileChangeType::CREATED | FileChangeType::CHANGED => {
                         // Invalidate disk-backed caches
@@ -4795,7 +4806,7 @@ impl LanguageServer for Backend {
                 Some(doc) => doc,
                 None => return Ok(None),
             };
-            if doc.file_type != crate::file_type::FileType::R {
+            if doc.file_type != crate::file_type::FileType::R || doc.is_rmd_document() {
                 return Ok(None);
             }
             let tree = match &doc.tree {
@@ -5024,6 +5035,13 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
         };
+
+        // Skip Rmd/Quarto: indentation rules designed for R syntax would
+        // produce surprising edits on prose, YAML, or non-R chunk content.
+        if doc.is_rmd_document() {
+            log::trace!("on_type_formatting: skipping Rmd/Quarto document {}", uri);
+            return Ok(None);
+        }
 
         // Get tree-sitter AST
         let tree = match doc.tree.as_ref() {

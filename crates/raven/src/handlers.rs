@@ -3157,6 +3157,11 @@ fn cross_file_base_exports(state: &WorldState) -> Arc<HashSet<String>> {
 
 pub fn folding_range(state: &WorldState, uri: &Url) -> Option<Vec<FoldingRange>> {
     let doc = state.get_document(uri)?;
+    // Folding on prose/YAML would surface garbage AST regions; chunk-aware
+    // folding for Rmd/Quarto is a future feature.
+    if doc.is_rmd_document() {
+        return Some(Vec::new());
+    }
     let tree = doc.tree.as_ref()?;
     let mut ranges = Vec::new();
 
@@ -3202,6 +3207,9 @@ pub fn selection_range(
     positions: Vec<Position>,
 ) -> Option<Vec<SelectionRange>> {
     let doc = state.get_document(uri)?;
+    if doc.is_rmd_document() {
+        return Some(Vec::new());
+    }
     let tree = doc.tree.as_ref()?;
 
     let text = doc.text();
@@ -9240,6 +9248,11 @@ pub fn completion(
     context: Option<CompletionContext>,
 ) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
+    // Suppress R-style completions on prose/YAML lines in Rmd/Quarto.
+    // Chunk-aware completion inside fenced R blocks is a follow-up to #230.
+    if doc.is_rmd_document() {
+        return None;
+    }
     let text = doc.text();
 
     // JAGS/Stan completion filtering
@@ -10350,7 +10363,7 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
-    if doc.file_type != FileType::R {
+    if doc.file_type != FileType::R || doc.is_rmd_document() {
         return None;
     }
     let tree = doc.tree.as_ref()?;
@@ -11112,6 +11125,9 @@ pub fn prepare_signature_help(
     position: Position,
 ) -> Option<SignatureHelpContext> {
     let doc = state.get_document(uri)?;
+    if doc.is_rmd_document() {
+        return None;
+    }
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
@@ -11347,6 +11363,9 @@ pub fn goto_definition_with_cancel(
     let doc = state
         .get_document(uri)
         .or_else(|| state.workspace_index.get(uri))?;
+    if doc.is_rmd_document() {
+        return None;
+    }
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
@@ -11691,6 +11710,9 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let doc = state
         .get_document(uri)
         .or_else(|| state.workspace_index.get(uri))?;
+    if doc.is_rmd_document() {
+        return Some(Vec::new());
+    }
     let text = doc.text();
 
     if doc.file_type == FileType::Stan {
@@ -17494,6 +17516,22 @@ result <- data %>% filter(x > 0)
             .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
             .expect("chunk entry");
         assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
+    fn test_completion_suppressed_for_rmd_documents() {
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose with `library(`\n\n```{r}\nx <-\n```\n";
+        let uri = Url::parse("file:///doc.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        // Position 0, char 25 — inside the prose `library(` fragment.
+        let result = super::completion(&state, &uri, Position::new(0, 25), None);
+        assert!(result.is_none(), "Rmd should yield no R completions on prose");
     }
 
     #[test]

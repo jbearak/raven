@@ -241,6 +241,17 @@ impl Document {
     pub fn text(&self) -> String {
         self.contents.to_string()
     }
+
+    /// True when the document is an R Markdown / Quarto document. The R
+    /// tree-sitter parser sees the prose/YAML/non-R portions as syntax
+    /// errors, so handlers that don't understand chunks should treat the
+    /// document as off-limits and return empty results.
+    ///
+    /// The document outline (`document_symbol`) is the exception — it
+    /// intentionally processes chunk markers via the text-based detector.
+    pub fn is_rmd_document(&self) -> bool {
+        self.chunk_kind == ChunkKind::Rmd
+    }
 }
 
 fn utf16_offset_to_char_offset(line_text: &str, utf16_offset: usize) -> usize {
