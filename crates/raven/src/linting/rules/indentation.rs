@@ -11,17 +11,23 @@
 //!   line of the opening `{`. A `}` that starts its own line aligns with the
 //!   opening `{`'s line; a `}` trailing other code is left to the inner-line
 //!   rule.
-//! * Bracketed groups (`call` / `subset` / `subset2` arguments, and
-//!   `parenthesized_expression`) — when the opener is followed by content on
-//!   the same line (e.g. `foo(a,`), continuation lines may either align with
-//!   the column after the opener (`opener_col + 1`) or hang one
-//!   [`indent_unit`] below the opener's line; both are accepted to match the
-//!   community-common aligned style. When the opener stands alone at end of
-//!   line (`foo(`), only the hanging form is accepted.
+//! * Bracketed groups (`call` / `subset` / `subset2` arguments,
+//!   `parenthesized_expression`, and `function_definition` parameter lists)
+//!   — when the opener is followed by code on the same line (e.g. `foo(a,`),
+//!   continuation lines may either align with the column after the opener
+//!   (`opener_col + 1`) or hang one [`indent_unit`] below the opener's line;
+//!   both are accepted to match the community-common aligned style. A
+//!   trailing `#` comment after the opener doesn't count as content (so
+//!   `foo( # note` is treated like `foo(`, hanging-only). When the opener
+//!   stands alone at end of line, only the hanging form is accepted.
 //! * `binary_operator` — when the operator's RHS lives on a later line than
-//!   the LHS, those continuation lines must indent one [`indent_unit`] beyond
-//!   the line where the LHS starts. Nested binary operators may push that
-//!   expectation deeper (lintr's "tidy" hanging-indent default).
+//!   the LHS, those continuation lines indent one [`indent_unit`] beyond the
+//!   line where the LHS starts. The on-type formatter additionally aligns
+//!   such lines with the chain's first non-whitespace column (i.e.
+//!   `node.start_position().column`); when that column is to the right of
+//!   the hanging indent, the linter accepts it as an alternative so its
+//!   verdict doesn't disagree with the formatter's output. Nested binary
+//!   operators may push the expectation deeper (lintr's "tidy" default).
 //!
 //! Lines skipped without checks:
 //! * Suppressed lines (`# nolint`, `# nolint start/end`, `# @lsp-ignore`,
@@ -174,6 +180,11 @@ fn set_expectations(
                 set_bracketed(args, lines, indent_unit, out);
             }
         }
+        "function_definition" => {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                set_bracketed(params, lines, indent_unit, out);
+            }
+        }
         "parenthesized_expression" => set_bracketed(node, lines, indent_unit, out),
         "binary_operator" => set_binary_operator(node, lines, indent_unit, out),
         _ => {}
@@ -245,7 +256,14 @@ fn set_bracketed(
     let after_opener = opener_line_text
         .get(opener_end_col as usize..)
         .unwrap_or("");
-    let has_content_after_opener = after_opener.chars().any(|c| !c.is_whitespace());
+    // A trailing `# comment` after the opener doesn't count as "content on
+    // the same line" — `foo( # note` is morally the same as `foo(`, so only
+    // the hanging form should be accepted. The smart-indent provider strips
+    // comments before making the same decision; do likewise here so we don't
+    // silently accept aligned-style indent in code where the opener carries
+    // no code argument.
+    let has_content_after_opener =
+        first_non_whitespace_is_code(after_opener);
 
     let primary = opener_indent.saturating_add(indent_unit);
     let aligned = opener_end_col;
@@ -278,7 +296,20 @@ fn set_binary_operator(
     }
 
     let opener_indent = leading_whitespace_count(line_text(lines, start_line));
-    let expected = Expected::single(opener_indent.saturating_add(indent_unit));
+    let hanging = opener_indent.saturating_add(indent_unit);
+    // The on-type formatter (see `calculate_indentation` for
+    // `AfterContinuationOperator`) places continuation lines at
+    // `max(chain_start_col, line_indent + tab_size)`. When the chain start
+    // column (the leftmost column of the binop's LHS) sits to the right of
+    // the hanging indent — typically because the chain is the RHS of a
+    // wider assignment such as `result <- foo() +` — we accept both forms
+    // so the linter doesn't disagree with the formatter's output.
+    let chain_start_col = node.start_position().column as u32;
+    let expected = if chain_start_col > hanging {
+        Expected::with_alternative(hanging, chain_start_col)
+    } else {
+        Expected::single(hanging)
+    };
 
     for line in (start_line + 1)..=end_line {
         out.insert(line, expected.clone());
@@ -320,6 +351,18 @@ fn has_tab_in_leading(line: &str) -> bool {
     line.chars()
         .take_while(|c| c.is_whitespace())
         .any(|c| c == '\t')
+}
+
+/// True when the first non-whitespace character in `s` is a code token rather
+/// than a `#` that starts a comment. Used to decide whether the opener of a
+/// bracketed group carries real content on its line — `foo( # note` should
+/// be treated as `foo(`, not as `foo(a`.
+fn first_non_whitespace_is_code(s: &str) -> bool {
+    match s.chars().find(|c| !c.is_whitespace()) {
+        None => false,
+        Some('#') => false,
+        Some(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -519,5 +562,60 @@ mod tests {
         let diags = lint(wrong, 4);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("should be 4 spaces"));
+    }
+
+    #[test]
+    fn chain_start_col_accepted_as_alternative() {
+        // The on-type formatter aligns `bar()` with `foo()` (column 10 —
+        // `result <- ` is 10 chars wide) because the chain starts there.
+        // The linter must also accept the hanging indent (2). Both must
+        // pass without diagnostics.
+        let aligned = "result <- foo() +\n          bar()\n";
+        let hanging = "result <- foo() +\n  bar()\n";
+        assert!(lint(aligned, 2).is_empty(), "aligned style should pass");
+        assert!(lint(hanging, 2).is_empty(), "hanging style should pass");
+    }
+
+    #[test]
+    fn comment_after_opener_does_not_unlock_aligned_style() {
+        // `foo( # note` opens like `foo(` — only the hanging form (2) is
+        // allowed; alignment to column after the opener (5) is not, because
+        // there's no code argument on the opener line to align to.
+        let hanging_ok = "foo( # note\n  a\n)\n";
+        let aligned_bad = "foo( # note\n     a\n)\n";
+        assert!(lint(hanging_ok, 2).is_empty());
+        let diags = lint(aligned_bad, 2);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn function_definition_parameters_hanging_indent() {
+        let text = "f <- function(\n  x,\n  y\n) {\n  x + y\n}\n";
+        assert!(lint(text, 2).is_empty());
+    }
+
+    #[test]
+    fn function_definition_parameters_misindented_flagged() {
+        let text = "f <- function(\nx,\n  y\n) {\n  x + y\n}\n";
+        let diags = lint(text, 2);
+        // Only the `x,` line is mis-indented (0 instead of 2).
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn function_definition_parameters_closing_paren_aligns_with_function() {
+        // The closing `)` of the parameter list sits on its own line and
+        // should align with the line of the `function` keyword.
+        let aligned = "f <- function(\n  x\n) {\n  x\n}\n";
+        let misaligned = "f <- function(\n  x\n  ) {\n  x\n}\n";
+        assert!(lint(aligned, 2).is_empty());
+        let diags = lint(misaligned, 2);
+        assert!(
+            diags.iter().any(|d| d.range.start.line == 2),
+            "expected diagnostic on line 2 (the misindented `)`); got {:?}",
+            diags
+        );
     }
 }
