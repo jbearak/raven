@@ -136,6 +136,11 @@ function active_cell_indicator_enabled(): boolean {
 class ChunkActiveCellIndicator {
     private top_border: vscode.TextEditorDecorationType;
     private bottom_border: vscode.TextEditorDecorationType;
+    // Per-document chunk cache keyed by URI string. Avoids re-scanning the
+    // entire file on every cursor move — onDidChangeTextEditorSelection
+    // fires on every keystroke and arrow press, so the unmodified-file path
+    // must be O(log n) rather than O(n).
+    private chunks_cache: Map<string, { version: number; chunks: Chunk[] }> = new Map();
 
     constructor() {
         this.top_border = this.create_border('top');
@@ -154,23 +159,40 @@ class ChunkActiveCellIndicator {
         });
     }
 
-    update(editor: vscode.TextEditor | undefined): void {
-        if (!editor) return;
-        if (!this.should_decorate(editor)) {
-            editor.setDecorations(this.top_border, []);
-            editor.setDecorations(this.bottom_border, []);
-            return;
-        }
-        const text = editor.document.getText();
+    private clear(editor: vscode.TextEditor): void {
+        editor.setDecorations(this.top_border, []);
+        editor.setDecorations(this.bottom_border, []);
+    }
+
+    private get_chunks(editor: vscode.TextEditor): Chunk[] {
+        const uri = editor.document.uri.toString();
+        const version = editor.document.version;
+        const cached = this.chunks_cache.get(uri);
+        if (cached && cached.version === version) return cached.chunks;
         // Fast path: skip the line scan if there are no `%%` anchors at all.
+        const text = editor.document.getText();
         if (!has_chunk_anchor(text, 'r')) {
-            editor.setDecorations(this.top_border, []);
-            editor.setDecorations(this.bottom_border, []);
-            return;
+            this.chunks_cache.set(uri, { version, chunks: [] });
+            return [];
         }
         const lines: string[] = [];
         for (let i = 0; i < editor.document.lineCount; i++) lines.push(editor.document.lineAt(i).text);
         const chunks = detect_chunks(lines, 'r');
+        this.chunks_cache.set(uri, { version, chunks });
+        return chunks;
+    }
+
+    update(editor: vscode.TextEditor | undefined): void {
+        if (!editor) return;
+        if (!this.should_decorate(editor)) {
+            this.clear(editor);
+            return;
+        }
+        const chunks = this.get_chunks(editor);
+        if (chunks.length === 0) {
+            this.clear(editor);
+            return;
+        }
         const cursor_line = editor.selection.active.line;
         let active_chunk: Chunk | null = null;
         for (const c of chunks) {
@@ -180,8 +202,7 @@ class ChunkActiveCellIndicator {
             }
         }
         if (active_chunk === null) {
-            editor.setDecorations(this.top_border, []);
-            editor.setDecorations(this.bottom_border, []);
+            this.clear(editor);
             return;
         }
         const top = new vscode.Range(active_chunk.header_line, 0, active_chunk.header_line, 0);
@@ -194,6 +215,14 @@ class ChunkActiveCellIndicator {
         for (const editor of vscode.window.visibleTextEditors) {
             this.update(editor);
         }
+    }
+
+    /**
+     * Drop the cached chunks for a closed document so the map doesn't grow
+     * unbounded over a long editing session.
+     */
+    forget(uri: vscode.Uri): void {
+        this.chunks_cache.delete(uri.toString());
     }
 
     private should_decorate(editor: vscode.TextEditor): boolean {
@@ -215,6 +244,7 @@ class ChunkActiveCellIndicator {
     dispose(): void {
         this.top_border.dispose();
         this.bottom_border.dispose();
+        this.chunks_cache.clear();
     }
 }
 
@@ -266,6 +296,9 @@ export function register_chunk_decorations(context: vscode.ExtensionContext): Ch
                 // when `has_chunk_anchor` is false.
                 indicator.update_visible();
             }
+        }),
+        vscode.workspace.onDidCloseTextDocument((document) => {
+            indicator.forget(document.uri);
         }),
         vscode.workspace.onDidChangeConfiguration((event) => {
             if (event.affectsConfiguration('raven.chunks.highlight')) {
