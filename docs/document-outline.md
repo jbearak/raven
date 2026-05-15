@@ -8,6 +8,7 @@ The document outline appears in VS Code's **Outline** view (usually in the Explo
 
 - **Hierarchical symbol tree** - See nested functions, variables within sections, and class methods
 - **R code sections** - Organize your code with collapsible section headers (`# Section ----`)
+- **R Markdown / Quarto chunks** - Each ```` ```{r ...} ```` block (and `# %%` cell in plain `.R` files) appears as its own outline entry, distinct from section headers
 - **Rich symbol types** - Distinguish functions, constants, classes, and methods with distinct icons
 - **Quick navigation** - Click any symbol to jump to its definition
 - **JAGS/Stan model structure** - Navigate JAGS and Stan model files with blocks, decorative comment headings, and `for` loops
@@ -97,6 +98,48 @@ These patterns are **not** recognized as sections:
 # ----                (no text content)
 # Section --          (only 2 delimiters, need 4+)
 ```
+
+## R Markdown / Quarto Chunks
+
+For `.Rmd` and `.qmd` files, every fenced code chunk gets its own outline entry. The label, if present, becomes the entry name; unlabeled chunks fall back to `Chunk #N` numbered in source order across the whole document. For non-R chunks (`{python}`, `{julia}`, ...) the language tag appears in the detail field.
+
+````rmd
+```{r setup, include=FALSE}
+library(dplyr)
+```
+
+```{r}
+analysis(data)
+```
+
+```{python}
+print("hi")
+```
+````
+
+Outline view shows:
+
+```text
+setup
+Chunk #2
+Chunk #3        {python}
+```
+
+Chunks use a distinct symbol kind (`OBJECT`) so the outline filter can include or exclude them separately from section headers.
+
+### `# %%` cells in `.R` files
+
+Plain `.R` files use the VS Code interactive-cell convention: a `# %%` line starts a new cell that runs until the next marker, a section divider, or end of file. Any text after the marker is used as the label:
+
+```r
+# %% Setup
+library(dplyr)
+
+# %% Analysis
+fit_model(data)
+```
+
+Cells with no trailing text fall back to `Chunk #N`.
 
 ## Symbol Types
 
@@ -432,7 +475,7 @@ model <- fit_model(processed_data)
 
 ### Outline view is empty
 
-1. Verify the file extension is `.R`, `.jags`, `.bugs`, or `.stan`
+1. Verify the file extension is `.R`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, or `.stan`
 2. Check that Raven is running (status bar shows "Raven")
 3. Reload VS Code: **Ctrl+Shift+P** → "Developer: Reload Window"
 

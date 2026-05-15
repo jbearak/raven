@@ -118,6 +118,10 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
+    /// Chunk-detection kind for the document, captured from the document so
+    /// that untitled Rmd/Quarto buffers (no file extension) still classify
+    /// correctly. Used to gate diagnostics for prose-bearing documents.
+    pub chunk_kind: crate::chunks::ChunkKind,
 
     /// STEP 1 (parent walk) cache shared across all `get_scope` calls in this
     /// snapshot's diagnostic pass. STEP 1 is position-invariant within one
@@ -253,6 +257,7 @@ impl DiagnosticsSnapshot {
             cycle_closing_snippet,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
+            chunk_kind: doc.chunk_kind,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             scope_contribution: state.package_state.scope_contribution().clone(),
         })
@@ -320,6 +325,14 @@ pub(crate) fn diagnostics_from_snapshot(
     // Use snapshot.file_type (from document) instead of URI-based detection,
     // so untitled buffers with languageId "jags"/"stan" are correctly identified.
     if snapshot.file_type != FileType::R {
+        return Some(Vec::new());
+    }
+
+    // Suppress diagnostics for R Markdown / Quarto documents. The tree-sitter
+    // R parser sees prose, YAML, and non-R fenced blocks as garbage, so every
+    // non-R line becomes a syntax error. The outline still works (see
+    // `document_symbol`); only the diagnostic noise is gated.
+    if snapshot.chunk_kind == crate::chunks::ChunkKind::Rmd {
         return Some(Vec::new());
     }
 
@@ -1038,6 +1051,12 @@ pub enum DocumentSymbolKind {
     Interface,
     /// R code section comment (SymbolKind::MODULE)
     Module,
+    /// R Markdown / Quarto code chunk or `# %%` cell (SymbolKind::OBJECT).
+    ///
+    /// Kept distinct from `Module` so the outline filter (and clients that map
+    /// symbol kinds to icons) can include or exclude chunks separately from
+    /// section headers.
+    Chunk,
 }
 
 impl DocumentSymbolKind {
@@ -1072,6 +1091,7 @@ impl DocumentSymbolKind {
             Self::Method => SymbolKind::METHOD,
             Self::Interface => SymbolKind::INTERFACE,
             Self::Module => SymbolKind::MODULE,
+            Self::Chunk => SymbolKind::OBJECT,
         }
     }
 }
@@ -2081,6 +2101,81 @@ impl<'a> SymbolExtractor<'a> {
         sections
     }
 
+    /// Extract R Markdown / Quarto chunks (or `# %%` cells) as outline entries.
+    ///
+    /// Each chunk becomes a `RawSymbol` with:
+    /// - `name`: the chunk label if present (e.g. `setup` for `{r setup}` or
+    ///   the trailing text for `# %% Setup`), otherwise `Chunk #N` numbered by
+    ///   source order across the whole document.
+    /// - `detail`: the bracketed language tag for non-R chunks (e.g. `{python}`),
+    ///   `None` for R chunks and for `# %%` cells.
+    /// - `kind`: [`DocumentSymbolKind::Chunk`] (maps to `SymbolKind::OBJECT`),
+    ///   distinct from sections so the outline filter can include or exclude
+    ///   them separately.
+    /// - `range`: header line through the last content line of the chunk
+    ///   (closing fence line, when present, for Rmd chunks).
+    /// - `selection_range`: the header line itself.
+    pub fn extract_chunks(&self, kind: crate::chunks::ChunkKind) -> Vec<RawSymbol> {
+        let chunks = crate::chunks::detect_chunks(self.text, kind);
+        let lines: Vec<&str> = self.text.lines().collect();
+        let mut symbols = Vec::with_capacity(chunks.len());
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let header_idx = chunk.header_line as usize;
+            let header_text = lines.get(header_idx).copied().unwrap_or("");
+            let header_end_utf16 = utf16_len(header_text);
+
+            // Range end is the closing fence (Rmd) or the last content line.
+            let range_end_line = chunk.closing_fence_line.unwrap_or(chunk.end_line);
+            let range_end_idx = range_end_line as usize;
+            let range_end_text = lines.get(range_end_idx).copied().unwrap_or("");
+            let range_end_char = utf16_len(range_end_text);
+
+            let range = Range {
+                start: Position {
+                    line: chunk.header_line,
+                    character: 0,
+                },
+                end: Position {
+                    line: range_end_line,
+                    character: range_end_char,
+                },
+            };
+            let selection_range = Range {
+                start: Position {
+                    line: chunk.header_line,
+                    character: 0,
+                },
+                end: Position {
+                    line: chunk.header_line,
+                    character: header_end_utf16,
+                },
+            };
+
+            let name = chunk
+                .label
+                .clone()
+                .unwrap_or_else(|| format!("Chunk #{}", idx + 1));
+            let detail = if chunk.language == "r" || chunk.language.is_empty() {
+                None
+            } else {
+                Some(format!("{{{}}}", chunk.language))
+            };
+
+            symbols.push(RawSymbol {
+                name,
+                kind: DocumentSymbolKind::Chunk,
+                range,
+                selection_range,
+                detail,
+                section_level: None,
+                children: Vec::new(),
+            });
+        }
+
+        symbols
+    }
+
     /// Extract decorative banner and inline headings for JAGS and Stan files.
     fn extract_decorative_sections(&self, style: ModelCommentStyle) -> Vec<RawSymbol> {
         let mut sections = Vec::new();
@@ -3062,6 +3157,11 @@ fn cross_file_base_exports(state: &WorldState) -> Arc<HashSet<String>> {
 
 pub fn folding_range(state: &WorldState, uri: &Url) -> Option<Vec<FoldingRange>> {
     let doc = state.get_document(uri)?;
+    // Folding on prose/YAML would surface garbage AST regions; chunk-aware
+    // folding for Rmd/Quarto is a future feature.
+    if doc.is_rmd_document() {
+        return Some(Vec::new());
+    }
     let tree = doc.tree.as_ref()?;
     let mut ranges = Vec::new();
 
@@ -3107,6 +3207,9 @@ pub fn selection_range(
     positions: Vec<Position>,
 ) -> Option<Vec<SelectionRange>> {
     let doc = state.get_document(uri)?;
+    if doc.is_rmd_document() {
+        return Some(Vec::new());
+    }
     let tree = doc.tree.as_ref()?;
 
     let text = doc.text();
@@ -3464,7 +3567,12 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
         }
         FileType::R => {
             let extractor = SymbolExtractor::new(&text, tree.root_node());
-            let raw_symbols = extractor.extract_all();
+            let mut raw_symbols = extractor.extract_all();
+            // Surface R Markdown / Quarto code chunks and `.R` `# %%` cells
+            // in the outline. The Document carries the resolved kind so that
+            // untitled buffers (no file extension) still classify correctly
+            // via their `languageId`.
+            raw_symbols.extend(extractor.extract_chunks(doc.chunk_kind));
             raw_symbols
         }
     };
@@ -3971,6 +4079,13 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     };
 
     if doc.tree.is_none() {
+        return Vec::new();
+    }
+
+    // Suppress diagnostics for R Markdown / Quarto documents — prose lines
+    // would otherwise surface as spurious syntax errors. See the matching
+    // guard in `diagnostics_from_snapshot`.
+    if doc.chunk_kind == crate::chunks::ChunkKind::Rmd {
         return Vec::new();
     }
 
@@ -9133,6 +9248,11 @@ pub fn completion(
     context: Option<CompletionContext>,
 ) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
+    // Suppress R-style completions on prose/YAML lines in Rmd/Quarto.
+    // Chunk-aware completion inside fenced R blocks is a follow-up to #230.
+    if doc.is_rmd_document() {
+        return None;
+    }
     let text = doc.text();
 
     // JAGS/Stan completion filtering
@@ -10243,7 +10363,7 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
-    if doc.file_type != FileType::R {
+    if doc.file_type != FileType::R || doc.is_rmd_document() {
         return None;
     }
     let tree = doc.tree.as_ref()?;
@@ -11005,6 +11125,9 @@ pub fn prepare_signature_help(
     position: Position,
 ) -> Option<SignatureHelpContext> {
     let doc = state.get_document(uri)?;
+    if doc.is_rmd_document() {
+        return None;
+    }
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
@@ -11240,6 +11363,9 @@ pub fn goto_definition_with_cancel(
     let doc = state
         .get_document(uri)
         .or_else(|| state.workspace_index.get(uri))?;
+    if doc.is_rmd_document() {
+        return None;
+    }
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
@@ -11584,6 +11710,9 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let doc = state
         .get_document(uri)
         .or_else(|| state.workspace_index.get(uri))?;
+    if doc.is_rmd_document() {
+        return Some(Vec::new());
+    }
     let text = doc.text();
 
     if doc.file_type == FileType::Stan {
@@ -17222,6 +17351,313 @@ result <- data %>% filter(x > 0)
 
         let section = symbols.iter().find(|s| s.name == "my_section").unwrap();
         assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    // ========================================================================
+    // extract_chunks() unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_chunks_rmd_basic() {
+        let code = "Some prose.\n\n```{r}\nx <- 1\n```\n";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::Rmd);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].name, "Chunk #1");
+        assert_eq!(chunks[0].detail, None);
+        assert!(matches!(chunks[0].kind, DocumentSymbolKind::Chunk));
+        // Range covers the fenced block from opener through the closing fence.
+        assert_eq!(chunks[0].range.start.line, 2);
+        assert_eq!(chunks[0].range.end.line, 4);
+        // Selection range is the header line only.
+        assert_eq!(chunks[0].selection_range.start.line, 2);
+        assert_eq!(chunks[0].selection_range.end.line, 2);
+    }
+
+    #[test]
+    fn test_extract_chunks_uses_label_when_present() {
+        let code = "```{r setup, eval=FALSE}\nlibrary(dplyr)\n```";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::Rmd);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].name, "setup");
+    }
+
+    #[test]
+    fn test_extract_chunks_non_r_language_in_detail() {
+        let code = "```{python}\nprint('hi')\n```\n\n```{julia}\n1+1\n```";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::Rmd);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].detail.as_deref(), Some("{python}"));
+        assert_eq!(chunks[1].detail.as_deref(), Some("{julia}"));
+    }
+
+    #[test]
+    fn test_extract_chunks_r_chunk_has_no_detail() {
+        // R chunks (and R cells) should not duplicate the language tag in
+        // detail — the outline's symbol kind already conveys "this is a chunk".
+        let code = "```{r setup}\n1\n```";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::Rmd);
+        assert_eq!(chunks[0].detail, None);
+    }
+
+    #[test]
+    fn test_extract_chunks_auto_numbers_unlabeled() {
+        let code = "```{r}\n1\n```\n\n```{r}\n2\n```\n\n```{r named}\n3\n```";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::Rmd);
+        assert_eq!(chunks.len(), 3);
+        // Auto-numbering counts every chunk, not just unlabeled ones, so the
+        // third labeled chunk doesn't reset the counter.
+        assert_eq!(chunks[0].name, "Chunk #1");
+        assert_eq!(chunks[1].name, "Chunk #2");
+        assert_eq!(chunks[2].name, "named");
+    }
+
+    #[test]
+    fn test_extract_chunks_r_cells() {
+        let code = "# %% Setup\nlibrary(x)\n\n# %% Analysis\ny <- 2";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::R);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].name, "Setup");
+        assert_eq!(chunks[1].name, "Analysis");
+        // Cells never have a language detail since they're always R.
+        assert!(chunks.iter().all(|c| c.detail.is_none()));
+    }
+
+    #[test]
+    fn test_extract_chunks_unlabeled_cell_uses_chunk_n() {
+        let code = "# %%\nx <- 1\n# %%\ny <- 2";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::R);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].name, "Chunk #1");
+        assert_eq!(chunks[1].name, "Chunk #2");
+    }
+
+    #[test]
+    fn test_extract_chunks_unclosed_runs_to_eof() {
+        let code = "```{r}\nx <- 1\nprint(x)";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let chunks = extractor.extract_chunks(crate::chunks::ChunkKind::Rmd);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].range.start.line, 0);
+        // Without a closing fence, the range extends to the last content line.
+        assert_eq!(chunks[0].range.end.line, 2);
+    }
+
+    #[test]
+    fn test_chunk_lsp_kind_is_object() {
+        // Distinct from sections (MODULE) so clients can filter independently.
+        assert_eq!(DocumentSymbolKind::Chunk.to_lsp_kind(), SymbolKind::OBJECT);
+    }
+
+    #[test]
+    fn test_document_symbol_includes_chunks_for_rmd_uri() {
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
+        let uri = Url::parse("file:///test.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+
+        // The outline should include both the `x` assignment (R-parsed) and
+        // the `setup` chunk (text-detected). We don't pin the count because
+        // the parser may or may not surface `x` depending on how the prose
+        // confuses tree-sitter-r; the chunk entry is the contract.
+        let chunk = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
+            .expect("chunk entry");
+        assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
+    fn test_document_symbol_includes_chunks_for_qmd_uri() {
+        // Mirrors the .Rmd integration test for the `.qmd` branch of
+        // `classify_chunk_document`.
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
+        let uri = Url::parse("file:///test.qmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+        let chunk = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
+            .expect("chunk entry");
+        assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
+    fn test_r_handlers_suppressed_for_rmd_documents() {
+        // Every R-only handler that was gated in the Rmd routing change
+        // (issue #227) should return an empty/no-op response for Rmd
+        // documents. Diagnostics and completion have their own tests; this
+        // covers the remaining sync handlers in one place.
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose.\n\n```{r}\nfn <- function(x) x\n```\n";
+        let uri = Url::parse("file:///doc.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let pos = Position::new(3, 0);
+
+        assert_eq!(
+            super::folding_range(&state, &uri),
+            Some(Vec::new()),
+            "folding_range"
+        );
+        assert_eq!(
+            super::selection_range(&state, &uri, vec![pos]),
+            Some(Vec::new()),
+            "selection_range"
+        );
+        assert!(
+            super::prepare_signature_help(&state, &uri, pos).is_none(),
+            "prepare_signature_help"
+        );
+        assert!(
+            super::goto_definition_with_cancel(
+                &state,
+                &uri,
+                pos,
+                &crate::handlers::DiagCancelToken::never(),
+            )
+            .is_none(),
+            "goto_definition"
+        );
+        assert_eq!(
+            super::references(&state, &uri, pos),
+            Some(Vec::new()),
+            "references"
+        );
+    }
+
+    #[test]
+    fn test_completion_suppressed_for_rmd_documents() {
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose with `library(`\n\n```{r}\nx <-\n```\n";
+        let uri = Url::parse("file:///doc.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        // Position 0, char 25 — inside the prose `library(` fragment.
+        let result = super::completion(&state, &uri, Position::new(0, 25), None);
+        assert!(result.is_none(), "Rmd should yield no R completions on prose");
+    }
+
+    #[test]
+    fn test_diagnostics_suppressed_for_rmd_documents() {
+        // The R tree-sitter parser sees prose as garbage. Gating prevents
+        // every non-R line from surfacing as a syntax error.
+        use crate::state::{Document, WorldState};
+
+        let prose_with_chunk = "# A heading\n\nSome prose with [a link](url).\n\n```{r}\nx <- 1\n```\n";
+        let uri = Url::parse("file:///doc.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.cross_file_config.diagnostics_enabled = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(prose_with_chunk, None, &uri));
+
+        let diags = super::diagnostics(&state, &uri, &DiagCancelToken::never());
+        assert!(
+            diags.is_empty(),
+            "Rmd documents should produce zero diagnostics, got {} ({:?})",
+            diags.len(),
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_document_symbol_includes_chunks_for_untitled_rmd_buffer() {
+        // Untitled buffers have no extension to inspect. The `languageId`
+        // is the only signal we have for distinguishing Rmd/Quarto from
+        // plain R, so the Document must preserve that classification.
+        use crate::state::{Document, WorldState};
+
+        let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state.documents.insert(
+            uri.clone(),
+            Document::new_with_language_id(code, None, &uri, Some("rmd")),
+        );
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+        let chunk = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
+            .expect("chunk entry");
+        assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
+    fn test_document_symbol_includes_cells_for_r_uri() {
+        use crate::state::{Document, WorldState};
+
+        let code = "# %% Setup\nlibrary(x)\n\n# %% Analysis\ny <- 2";
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+
+        let cell_names: Vec<&str> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::OBJECT)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(cell_names.contains(&"Setup"));
+        assert!(cell_names.contains(&"Analysis"));
     }
 
     // ========================================================================

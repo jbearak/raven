@@ -138,6 +138,7 @@ use crate::cross_file::{
     CrossFileActivityState, CrossFileConfig, CrossFileFileCache, CrossFileRevalidationState,
     CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
 };
+use crate::chunks::{classify_chunk_document, classify_chunk_document_for, ChunkKind};
 use crate::document_store::DocumentStore;
 use crate::file_type::{file_type_from_language_id_or_uri, file_type_from_uri, FileType};
 use crate::package_library::PackageLibrary;
@@ -150,6 +151,11 @@ pub struct Document {
     pub tree: Option<Tree>,
     pub loaded_packages: Vec<String>,
     pub file_type: FileType,
+    /// Chunk-detection kind for the outline: `Rmd` for `.Rmd`/`.qmd` documents
+    /// and for untitled buffers whose `languageId` is `rmd`/`quarto`; `R`
+    /// (i.e. `# %%` cells) otherwise. Mirrors the client-side classifier in
+    /// `editors/vscode/src/chunks/chunk-detector.ts`.
+    pub chunk_kind: ChunkKind,
     pub version: Option<i32>,
     pub revision: u64,
 }
@@ -161,7 +167,9 @@ impl Document {
     }
 
     pub fn new_with_uri(text: &str, version: Option<i32>, uri: &Url) -> Self {
-        Self::new_with_file_type(text, version, file_type_from_uri(uri))
+        let mut doc = Self::new_with_file_type(text, version, file_type_from_uri(uri));
+        doc.chunk_kind = classify_chunk_document(uri.path());
+        doc
     }
 
     pub fn new_with_language_id(
@@ -170,11 +178,13 @@ impl Document {
         uri: &Url,
         language_id: Option<&str>,
     ) -> Self {
-        Self::new_with_file_type(
+        let mut doc = Self::new_with_file_type(
             text,
             version,
             file_type_from_language_id_or_uri(language_id, uri),
-        )
+        );
+        doc.chunk_kind = classify_chunk_document_for(language_id, uri.path());
+        doc
     }
 
     pub fn new_with_file_type(text: &str, version: Option<i32>, file_type: FileType) -> Self {
@@ -186,6 +196,9 @@ impl Document {
             tree,
             loaded_packages,
             file_type,
+            // Default to `# %%` cell detection; URI/languageId-aware
+            // constructors override this above.
+            chunk_kind: ChunkKind::R,
             version,
             revision: 0,
         }
@@ -227,6 +240,17 @@ impl Document {
 
     pub fn text(&self) -> String {
         self.contents.to_string()
+    }
+
+    /// True when the document is an R Markdown / Quarto document. The R
+    /// tree-sitter parser sees the prose/YAML/non-R portions as syntax
+    /// errors, so handlers that don't understand chunks should treat the
+    /// document as off-limits and return empty results.
+    ///
+    /// The document outline (`document_symbol`) is the exception — it
+    /// intentionally processes chunk markers via the text-based detector.
+    pub fn is_rmd_document(&self) -> bool {
+        self.chunk_kind == ChunkKind::Rmd
     }
 }
 
