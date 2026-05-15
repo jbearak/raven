@@ -2,7 +2,7 @@
 
 Raven ships an opt-in, native style linter that re-implements a small subset of [`lintr`](https://lintr.r-lib.org/) rules in Rust against the tree-sitter AST. No R session or `lintr` install is needed — rules run on the parse tree Raven already builds for completions and diagnostics.
 
-This page is the landing point for users coming from `lintr` or `REditorSupport`. The full per-rule trigger details live in [Diagnostics § Style Lints](diagnostics.md#style-lints); per-key configuration reference lives in [Configuration § Linting Settings](configuration.md#linting-settings). This page ties them together.
+This page is the landing point for users coming from `lintr` or `REditorSupport`. For these rules alongside Raven's other diagnostic categories, see [Diagnostics § Style Lints](diagnostics.md#style-lints); the per-key configuration reference lives in [Configuration § Linting Settings](configuration.md#linting-settings).
 
 ## Quick start
 
@@ -42,7 +42,7 @@ Lint diagnostics carry the `source` field `raven (lint)`, so they're easy to fil
 
 ## Settings reference by rule
 
-Each rule lists the Raven settings that control it and the `lintr` linter it mirrors. Severities accept `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`. See [Diagnostics § Style Lints](diagnostics.md#style-lints) for the exact trigger of each rule.
+Each rule lists the Raven settings that control it and the `lintr` linter it mirrors. Severities accept `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`. See [Diagnostics § Style Lints](diagnostics.md#style-lints) to see these rules in context with Raven's other diagnostic categories.
 
 ### Line length
 
@@ -191,7 +191,7 @@ This is consistent with how `lintr` itself treats a same-line `# nolint` — the
 
 ## See also
 
-- [Diagnostics § Style Lints](diagnostics.md#style-lints) — full trigger list and rule details.
+- [Diagnostics § Style Lints](diagnostics.md#style-lints) — these rules alongside Raven's other diagnostic categories.
 - [Configuration § Linting Settings](configuration.md#linting-settings) — every `raven.linting.*` key.
 - [Coexistence § Language servers](coexistence.md#language-servers-raven-alone-vs-both) — running Raven and REditorSupport together.
 - [Comparison](comparison.md) — how Raven differs from REditorSupport, Positron/Ark, and RStudio.
