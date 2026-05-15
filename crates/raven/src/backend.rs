@@ -455,6 +455,7 @@ pub(crate) fn parse_cross_file_config(
 ///   - `assignmentOperatorSeverity`
 ///   - `objectNameSeverity`
 ///   - `infixSpacesSeverity`
+///   - `commentedCodeSeverity`
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
 ) -> Option<crate::linting::LintConfig> {
