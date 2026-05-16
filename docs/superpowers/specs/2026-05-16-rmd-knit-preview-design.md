@@ -135,7 +135,41 @@ These nags **do not** promise raven preview/render features. They promise gramma
 
 1. **Install `quarto.quarto`** for `.qmd` and live preview support — links to marketplace.
 2. **Install `REditorSupport.r-syntax`** (or the full `REditorSupport.r`) for `.Rmd` grammar — links to marketplace.
-3. **Try Raven: Knit** — opens a sample `.Rmd` from raven's assets and invokes `raven.knit`. (The walkthrough sample is a `.Rmd`, not a `.qmd`, so step 3 cannot route the user into a deferral.)
+3. **Create a sample `.Rmd` and run Raven: Knit** — button: "Create sample.Rmd".
+
+#### How step 3 materializes the sample
+
+The `[Create sample.Rmd]` button invokes a `raven.walkthrough.createSampleRmd` command which:
+
+1. Picks a target directory: the first workspace folder if one exists, otherwise `os.tmpdir()`.
+2. Picks a filename: `raven-sample.Rmd`, or `raven-sample-2.Rmd`, ... if the name is taken.
+3. Writes a minimal sample via `vscode.workspace.fs.writeFile(targetUri, content)` — using the FS API (not `fs.writeFileSync`) so the write routes through VS Code's remote-extension-host correctly for SSH / WSL / Codespaces / dev containers.
+4. Opens the document with `vscode.window.showTextDocument(targetUri)`.
+5. Surfaces an info toast "Sample created. Press the command palette and run **Raven: Knit**." (We intentionally don't auto-invoke knit; the user should see the file first and understand what they're knitting.)
+
+This guarantees `raven.knit` runs against a real file-backed URI that the R subprocess can resolve — both locally and in remote-extension-host setups, because the file lives in the workspace's filesystem rather than in raven's extension-installation directory.
+
+If no workspace is open and we fall back to `os.tmpdir()`, the sample uri uses the `file://` scheme on the **extension host** side. In a remote workspace with no folder open, this is the remote host's tmpdir, which is reachable by the R subprocess (also spawned on the remote host). In a local workspace with no folder open, it's the local tmpdir. Either way, the R subprocess sees a normal local path.
+
+Sample content (~15 lines):
+
+```rmarkdown
+---
+title: "Sample R Markdown"
+output: html_document
+---
+
+# Hello from Raven
+
+This is a tiny R Markdown document. Run **Raven: Knit** from the command
+palette (Cmd/Ctrl+Shift+P) to render it.
+
+```{r}
+plot(1:10, main = "Example plot")
+```
+```
+
+(The fence inside the example is a backtick block; the spec markdown uses indentation to escape it.)
 
 ## Data flow
 
@@ -148,6 +182,10 @@ User: raven.knit on foo.Rmd
  [1] Gate check
    - context key raven.rmdKnit.enabled is true? If not, info: "Raven knit is disabled. See `raven.rConsole.activation`."
    - Workspace is trusted? If not, info: "Workspace is not trusted." with [Manage Workspace Trust] button.
+   - Document is file-backed? Reject untitled / non-file URIs (scheme !== 'file' and scheme !== 'vscode-remote')
+     with info: "Save the file to disk before running Raven: Knit." rmarkdown::render() requires a path
+     on disk; we never attempt to materialize untitled buffers to a temp file silently — the user's
+     "where did the output go?" expectation depends on the file having a known location.
         │
         ▼
  [2] Parse YAML front matter
@@ -190,6 +228,7 @@ User: raven.knit on foo.Rmd
         │
         ▼
  [5] Resolve working directory (raven.knit.workingDirectory)
+   The file-backed check in [1] guarantees docUri has a meaningful fsPath; we don't re-check here.
    - document (default): path.dirname(docUri.fsPath)
    - project:            workspace folder that contains docUri.fsPath. If the document is outside all
                          workspace folders, error: "Cannot resolve project root: document is outside the
@@ -202,14 +241,31 @@ User: raven.knit on foo.Rmd
  [6] Build R expression (r-expression.buildKnitExpression)
    - Inputs: filePath, format, knitRootDir
    - Output: a single R expression string passed to `R -e <expr>`
-   - String safety: each interpolated path goes through escapeRString() which:
-       1. Validates the input is a single string (no array-like values).
-       2. Escapes backslash → \\\\ and single-quote → \\'.
-       3. Wraps in single quotes.
-     This produces a literal R character vector with one element. Resulting expression:
+   - Pre-validation (validatePathForRExpression): EACH interpolated string passes through a strict
+     check before escaping. Reject (throw, caught by [9] error handler with a clear toast) any input
+     containing:
+       • NUL byte (0x00) — un-representable in argv on every platform; in R, embedded NUL inside a
+         string literal terminates the C string and produces a value that does NOT equal the original.
+         This is an immediate refusal, not a sanitization.
+       • Other ASCII control characters in the range 0x01–0x1F EXCEPT 0x09 (tab) — these can mangle
+         the R expression's diagnostic output and have no legitimate place in a filesystem path or
+         format identifier. Includes CR (0x0D), LF (0x0A), FF (0x0C), etc.
+       • DEL (0x7F).
+     Bidi-override / other non-printable Unicode characters are NOT pre-rejected; they are exotic but
+     legitimate in some filesystems. They round-trip through escapeRString correctly.
+   - Format identifier additionally validated: must match /^[A-Za-z0-9_:.-]+$/ (covers
+     "html_document", "pdf_document", "bookdown::pdf_document2", "all", and "default"; rejects
+     anything stranger). YAML provides this so the input is normally trustworthy; the regex is a
+     defense-in-depth check.
+   - escapeRString() (only runs after pre-validation passes):
+       1. Validate input is a single non-empty string.
+       2. Escape backslash → \\\\ and single-quote → \\'.
+       3. Wrap in single quotes.
+     Produces a literal R character vector of length one. Resulting expression:
        rmarkdown::render(input = 'foo.Rmd', output_format = 'html_document', knit_root_dir = '/path/to')
    - This is R-literal-injection prevention, not shell-injection (we use child_process.spawn with an
-     argv array; no shell parses anything).
+     argv array; no shell parses anything). The pre-validation step is what guards against the small
+     set of inputs that escaping alone cannot make safe.
         │
         ▼
  [7] Spawn subprocess
@@ -244,7 +300,16 @@ User: raven.knit on foo.Rmd
 
 ### Output path parsing
 
-`rmarkdown::render` prints `Output created: <path>` on success. Regex: `/^\s*Output created:\s*(.+?)\s*$/m`. Multiple matches are possible if a single `rmarkdown::render` call produces multiple outputs (rare in practice, but `output_format = "all"` triggers it). We return all matches; UI handles 0 / 1 / >1.
+**Best-effort parsing.** `rmarkdown::render` prints `Output created: <path>` on the R console at the end of a successful render. The exact line comes from `rmarkdown:::render_print` (see `rmarkdown/R/render.R` in the rmarkdown source tree). We match it with `/^\s*Output created:\s*(.+?)\s*$/m`.
+
+Caveats we accept:
+
+- The string is **not localized** in current rmarkdown (the source emits it as a literal English message via `message()`), but rmarkdown could localize in the future. If parsing fails, we still show "Knit succeeded (output path unknown)" — never a false-success or false-failure on the user's screen.
+- `output_format = "all"` (or a multi-output knit hook) produces one `Output created:` line per format. We capture all matches; UI shows the first with `[Show All]` to surface the rest.
+- Quiet modes (`quiet = TRUE`, or `--quiet` via R startup) may suppress the message. We treat a clean exit with no captured path as "succeeded, unknown path."
+- The exit code from `rmarkdown::render` (which propagates from R) is the ground truth for success/failure. Output-path parsing is purely a UX nicety.
+
+Tier 1's implementation pins this with a fixture file (`tests/fixtures/rmarkdown-stdout/*.txt`) captured from real `rmarkdown::render` runs across the supported output formats (html_document, pdf_document, word_document, github_document). If rmarkdown changes the message in a future release, the fixture test catches it and we tighten the regex or accept the new format.
 
 ### Output reveal
 
@@ -318,6 +383,8 @@ No keybindings in Tier 1; users invoke via command palette or context menu. RStu
 | Custom YAML `knit:` field | Info: "Tier 1 doesn't honor custom hooks" + `[Copy command]` |
 | `runtime: shiny` / `server: shiny` | Info: "Shiny documents not supported in Tier 1" + `[Copy command]` |
 | `site:` field present | Info: "Site projects not supported in Tier 1" + `[Copy command]` |
+| Document is untitled / non-file URI | Info: "Save the file to disk before running Raven: Knit." |
+| Path contains NUL or rejected control character | Toast: "File path contains an unsupported character" + focus output channel with details |
 | Working dir `project` with file outside workspace folders | Toast: "Cannot resolve project root: document is outside the workspace" |
 | Subprocess exits non-zero | Toast: "Knit failed" + focus output channel |
 | Subprocess timeout | Toast: "Knit timed out" + focus output channel; kill subprocess |
@@ -330,7 +397,7 @@ No keybindings in Tier 1; users invoke via command palette or context menu. RStu
 
 - `yaml-frontmatter.test.ts` — parses standard YAML, detects `knit:`, `runtime`, `site`, `params`, multi-output; handles malformed YAML, BOMs, missing front matter.
 - `output-path.test.ts` — extracts single, multiple, and zero output paths from rmarkdown stdout fixtures.
-- `r-expression.test.ts` — escapes single quotes, backslashes, embedded `${}` (R doesn't interpolate, but verify no shell interaction). Properties: round-trips arbitrary paths; never produces shell-active characters at command-argv level.
+- `r-expression.test.ts` — covers `validatePathForRExpression` and `escapeRString`. **Rejection tests**: NUL bytes (0x00), CR/LF/FF/other 0x01–0x1F controls except tab, DEL (0x7F) — each rejected with a `ValidatePathError`. **Property test**: for inputs drawn from "safe" code-point range (printable Unicode + tab + bidi-override chars), `escapeRString` round-trips through R such that `parse(text = expr)` recovers the original string byte-for-byte. **Format-identifier tests**: accepts "html_document", "pdf_document", "bookdown::pdf_document2", "default", "all"; rejects backtick / quote / paren / semicolon variants.
 - `gate-resolution.test.ts` — `raven.rConsole.activation` resolves correctly with each combination of sibling extensions.
 - `nag-state.test.ts` — globalState persistence; "don't show again" doesn't re-fire.
 
