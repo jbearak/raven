@@ -242,10 +242,13 @@ impl DiagnosticsSnapshot {
 
         // Resolve the effective `LintConfig` for this URI by layering any
         // matching `[[linting.overrides]]` patches over the base
-        // `state.lint_config`. The merge+resolve runs once per snapshot build;
-        // this is intentionally per-document because overrides may match
-        // different files.
-        let lint_config = {
+        // `state.lint_config`. Fast path: when no overrides are configured
+        // (the common case), skip the merge + section-clone work entirely.
+        // The merge+resolve only runs once per snapshot build, but a project
+        // with many open documents and zero overrides shouldn't pay for it.
+        let lint_config = if state.lint_overrides.is_empty() {
+            state.lint_config.clone()
+        } else {
             let merged = crate::config_file::merge_settings(
                 &state.raw_client_settings,
                 state.raw_project_settings.as_ref(),
