@@ -1867,15 +1867,16 @@ impl LanguageServer for Backend {
         }
 
         // Second lock window: store raw layers, recompute parsed configs,
-        // compile overrides. No I/O in this scope.
-        let loaded_path = {
+        // compile overrides. No I/O in this scope. The discovered path
+        // (if any) is now read back from `state.project_config_path` in
+        // `initialized()` — sending the notification from here would
+        // violate the LSP spec (see note above).
+        {
             let mut state = self.state.write().await;
             state.raw_client_settings = raw_client;
-            let mut loaded_path: Option<std::path::PathBuf> = None;
             if let Some((p, settings)) = loaded_project {
                 state.raw_project_settings = Some(settings);
-                state.project_config_path = Some(p.clone());
-                loaded_path = Some(p);
+                state.project_config_path = Some(p);
             }
             crate::config_file::recompute_parsed_configs(&mut state);
             if let Some(root) = &project_root {
@@ -1887,16 +1888,17 @@ impl LanguageServer for Backend {
                 );
                 state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
             }
-            loaded_path
-        };
-
-        // Notify client when a project config is in effect. Skipped at
-        // initialize-time when no config was found — the watched-files
-        // reload path emits the cleared-config form (`path: null`) once
-        // the user actually removes the file.
-        if let Some(path) = &loaded_path {
-            self.notify_project_config_loaded(Some(path.as_path()));
         }
+
+        // NOTE: the `raven/projectConfigLoaded` notification is NOT sent
+        // from here. Per the LSP spec, the server MUST NOT send any
+        // requests or notifications to the client before responding to
+        // `initialize` (only `window/showMessage`, `window/logMessage`,
+        // `telemetry/event`, `window/showMessageRequest`, and
+        // `$/progress` are allowed during the initialization phase).
+        // The matching emit lives in `initialized()` below — by then
+        // the handshake is guaranteed to be complete and the client
+        // will reliably route the custom notification.
 
         // Detect client capability for hierarchical document symbols
         // Requirements 1.1, 1.2: Response type selection based on client capability
@@ -1977,6 +1979,17 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
         let init_start = std::time::Instant::now();
+
+        // Emit the project-config-loaded notification deferred from
+        // `initialize()` (LSP requires the handshake to complete before
+        // any custom notifications). Skipped here when no config was
+        // discovered; the watched-files reload path emits the
+        // cleared-config form (`path: null`) once the user actually
+        // removes the file.
+        let loaded_path = self.state.read().await.project_config_path.clone();
+        if let Some(path) = &loaded_path {
+            self.notify_project_config_loaded(Some(path.as_path()));
+        }
 
         // Get workspace folders and config under brief lock
         let (
