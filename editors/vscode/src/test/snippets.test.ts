@@ -80,6 +80,27 @@ suite('Snippet contributions', () => {
         );
     });
 
+    test('r.json is NOT statically registered for rmd / quarto', () => {
+        // r.json overlaps with REditorSupport's snippet contributions inside
+        // fenced R chunks. The static package.json entries were removed in
+        // favor of programmatic registration inside the R-console-activation
+        // gate (see registerRSnippetCompletionsForRmdAndQuarto). This test
+        // protects against regressions that would re-introduce duplicate
+        // completions for coexistence users.
+        const contributions = loadSnippetContributions();
+        const offending = contributions.filter(
+            (e) =>
+                (e.language === 'rmd' || e.language === 'quarto') &&
+                e.path.endsWith('r.json'),
+        );
+        assert.deepStrictEqual(
+            offending,
+            [],
+            'r.json must not be statically registered for rmd / quarto — '
+            + 'it is registered programmatically inside the R-console gate.',
+        );
+    });
+
     test('every registered snippets path resolves to an existing file', () => {
         for (const entry of loadSnippetContributions()) {
             const resolvedPath = path.resolve(vscodeRoot, entry.path);

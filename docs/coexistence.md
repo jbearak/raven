@@ -8,6 +8,13 @@ Raven's **language server** and **help viewer** always activate — they don't o
 
 Raven's **R console**, **plot viewer**, and **data viewer** are the features that can overlap with another extension's R-session integration. The plot and data viewers are reached *through* Raven's R console: the R console boots a profile that overrides `View()` (data viewer) and starts httpgd (plot viewer). When Raven's R console isn't activated, neither of those viewers is wired up — `View(df)` and `plot(...)` go to whatever R session your other extension manages.
 
+Several editor surfaces that overlap with REditorSupport's R Markdown / Quarto tooling are gated behind the same R-console-activation switch:
+
+- **Chunk navigation** commands and keybindings (`raven.goToNextChunk`, `raven.goToPreviousChunk`, `raven.selectCurrentChunk`).
+- **Chunk background highlighting** and the **active-cell indicator** in `.Rmd` / `.qmd` documents.
+- **`.R` cell mode** support: `# %%` cell markers and RStudio-style `# Section ----` dividers used for chunk navigation / highlighting in plain `.R` files.
+- **R-language snippets in `.Rmd` / `.qmd` fenced chunks** — Raven's `r.json` snippets (`if`, `fun`, `for`, etc.) are registered for `rmd` / `quarto` only when Raven's R console is active. R-Markdown- and Quarto-specific snippets that scaffold new chunks (`rchunk`, `setupchunk`, ...) always register, since REditorSupport doesn't ship equivalents.
+
 ## Who benefits from Raven's R console?
 
 Raven's R console, plot viewer, and data viewer overlap with [REditorSupport (R)](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r)'s equivalents. Whether Raven's versions help you depends on your workflow:

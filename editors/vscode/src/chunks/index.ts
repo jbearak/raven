@@ -9,11 +9,12 @@ import { register_chunk_decorations } from './chunk-highlighting';
  *
  *   - Navigation commands (`raven.goToNextChunk`, `raven.goToPreviousChunk`,
  *     `raven.selectCurrentChunk`).
- *   - Background-tint decorations.
+ *   - Background-tint decorations and the active-cell indicator.
  *
- * These are safe to enable regardless of `raven.rConsole.activation` so users
- * who coexist with REditorSupport or Positron still get the visual aids and
- * cursor-motion commands when reading `.Rmd` / `.qmd` notebooks.
+ * Although these surfaces don't strictly require an R terminal, they overlap
+ * with REditorSupport's chunk navigation and visuals. Callers gate them
+ * behind `raven.rConsole.activation` (only register when resolved to
+ * `enabled`) so coexistence users don't get duplicate behaviour.
  */
 export function register_chunks_navigation_and_highlight(
     context: vscode.ExtensionContext,
