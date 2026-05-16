@@ -470,6 +470,17 @@ pub(crate) fn parse_cross_file_config(
 ///   - `functionLeftParenthesesSeverity`
 ///   - `spacesInsideSeverity`
 ///   - `indentationSeverity`
+/// Variant of `parse_lint_config` that takes the `[linting]` section directly
+/// (not wrapped in a top-level object). Used by per-document override resolution
+/// where we've already extracted the section.
+pub(crate) fn parse_lint_config_from_section(
+    section: &serde_json::Value,
+) -> Option<crate::linting::LintConfig> {
+    // Wrap into the shape `parse_lint_config` expects and delegate.
+    let wrapped = serde_json::json!({ "linting": section });
+    parse_lint_config(&wrapped)
+}
+
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
 ) -> Option<crate::linting::LintConfig> {
