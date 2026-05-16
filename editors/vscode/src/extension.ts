@@ -134,6 +134,16 @@ export interface RavenExtensionApi {
     getDataViewerPanelNames(): string[];
     /** Column names for a named data viewer panel. Used by integration tests. */
     getDataViewerPanelColumnNames(panelName: string): string[] | undefined;
+    /** Latest visible-row range for a data viewer panel, or undefined if
+     *  none has arrived yet. Used by integration tests to verify scroll
+     *  position. */
+    getDataViewerPanelVisibleRange(panelName: string):
+        { start: number; end: number } | undefined;
+    /** Test-only: dispatch a synthetic key event in a data viewer panel.
+     *  Used by integration tests to drive End / Home / PageDown / PageUp.
+     *  Awaiting waits for the message to be queued; poll
+     *  getDataViewerPanelVisibleRange to observe the result. */
+    pressDataViewerKey(panelName: string, key: string): Promise<void>;
     /**
      * Test-only: forget the bundled extension's cached R terminal so the next
      * `sendToRTerminal` recreates it through the real `createTerminal` path.
@@ -394,6 +404,11 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         getDataViewerPanelNames: () => data_viewer_manager?.getPanelNames() ?? [],
         getDataViewerPanelColumnNames: (panelName: string) =>
             data_viewer_manager?.getPanelColumnNames(panelName),
+        getDataViewerPanelVisibleRange: (panelName: string) =>
+            data_viewer_manager?.getPanelVisibleRange(panelName),
+        pressDataViewerKey: async (panelName: string, key: string) => {
+            await data_viewer_manager?.pressKeyOnPanel(panelName, key);
+        },
         _disposeCachedRTerminalForTest: () => _dispose_cached_r_terminal_for_test(),
     };
 }

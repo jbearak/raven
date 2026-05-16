@@ -70,6 +70,20 @@ export class DataViewerManager {
         return this.panels.get(panelName)?.getColumnNames();
     }
 
+    /** Latest visible-row range for a named panel — used by the test
+     *  harness to verify scroll position. */
+    getPanelVisibleRange(panelName: string): { start: number; end: number } | undefined {
+        return this.panels.get(panelName)?.getVisibleRange();
+    }
+
+    /** Test-only: dispatch a synthetic key event in a named panel's
+     *  webview. Awaiting waits for the message to be queued, not for any
+     *  reply; tests should poll `getPanelVisibleRange()` to observe
+     *  results. */
+    async pressKeyOnPanel(panelName: string, key: string): Promise<void> {
+        await this.panels.get(panelName)?.pressKey(key);
+    }
+
     /** For tests + activation; delegates to {@link sweep_stale}. */
     static sweepStale = sweep_stale;
 }
