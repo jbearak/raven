@@ -10,6 +10,7 @@ mod builtins;
 mod chunks;
 mod cli;
 mod completion_context;
+mod config_file;
 mod content_provider;
 mod cross_file;
 mod document_store;

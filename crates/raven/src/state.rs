@@ -558,6 +558,24 @@ pub struct WorldState {
     /// Style/lint configuration.
     /// Master switch defaults to off; opt in via `raven.linting.enabled`.
     pub lint_config: crate::linting::LintConfig,
+
+    /// Last-seen client-supplied settings: LSP `initializationOptions` at
+    /// startup, then the latest `did_change_configuration` payload. Stored
+    /// raw so we can re-merge with the project file on either side changing.
+    pub raw_client_settings: serde_json::Value,
+
+    /// Last-loaded `raven.toml` (or `.lintr`-derived JSON), or `None` if no
+    /// project config file is present. Stored raw for the same reason.
+    pub raw_project_settings: Option<serde_json::Value>,
+
+    /// Resolved path of the project config currently in effect, if any.
+    /// Reported via `raven/projectConfigLoaded` to the client.
+    pub project_config_path: Option<std::path::PathBuf>,
+
+    /// Compiled `[[linting.overrides]]` entries. Empty when no overrides
+    /// are configured. Per-document resolution scans this list.
+    pub lint_overrides: Vec<crate::config_file::CompiledLintOverride>,
+
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_revalidation: CrossFileRevalidationState,
@@ -685,6 +703,10 @@ impl WorldState {
             completion_config: CompletionConfig::default(),
             indentation_config: IndentationSettings::default(),
             lint_config: crate::linting::LintConfig::default(),
+            raw_client_settings: serde_json::Value::Object(serde_json::Map::new()),
+            raw_project_settings: None,
+            project_config_path: None,
+            lint_overrides: Vec::new(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),
