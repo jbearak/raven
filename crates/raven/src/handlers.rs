@@ -341,6 +341,11 @@ pub(crate) fn diagnostics_from_snapshot(
     // Fast collectors (no scope resolution needed)
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+    collect_invalid_assignment_targets(
+        snapshot.tree.root_node(),
+        &snapshot.text,
+        &mut diagnostics,
+    );
 
     // Style/lint diagnostics. Native Rust rules driven by `lint_config`; no R
     // subprocess. `run_lints` short-circuits when the master switch is off.
@@ -7727,6 +7732,245 @@ mod syntax_error_range_tests {
     }
 }
 
+#[cfg(test)]
+mod invalid_assignment_target_tests {
+    use super::collect_invalid_assignment_targets;
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+
+    fn parse_r(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn collect(code: &str) -> Vec<Diagnostic> {
+        let tree = parse_r(code);
+        let mut diagnostics = Vec::new();
+        collect_invalid_assignment_targets(tree.root_node(), code, &mut diagnostics);
+        diagnostics
+    }
+
+    #[track_caller]
+    fn assert_one(code: &str, expect_substr: &str) {
+        let diags = collect(code);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic for `{code}`, got {diags:?}"
+        );
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diags[0].message.contains(expect_substr),
+            "message `{}` did not contain `{}`",
+            diags[0].message,
+            expect_substr
+        );
+    }
+
+    #[track_caller]
+    fn assert_none(code: &str) {
+        let diags = collect(code);
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics for `{code}`, got {diags:?}"
+        );
+    }
+
+    // ---- LHS literals on `<-` ------------------------------------------------
+
+    #[test]
+    fn left_arrow_logical_true_flagged() {
+        assert_one("TRUE <- 5", "logical literal `TRUE`");
+    }
+
+    #[test]
+    fn left_arrow_logical_false_flagged() {
+        assert_one("FALSE <- 5", "logical literal `FALSE`");
+    }
+
+    #[test]
+    fn left_arrow_null_flagged() {
+        assert_one("NULL <- 1", "Cannot assign to `NULL`");
+    }
+
+    #[test]
+    fn left_arrow_na_variants_flagged() {
+        for case in [
+            "NA <- 1",
+            "NA_integer_ <- 1",
+            "NA_real_ <- 1",
+            "NA_complex_ <- 1",
+            "NA_character_ <- 1",
+        ] {
+            let diags = collect(case);
+            assert_eq!(diags.len(), 1, "expected one diagnostic for `{case}`");
+            assert!(
+                diags[0].message.contains("Cannot assign to `NA"),
+                "message `{}` should mention NA",
+                diags[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn left_arrow_inf_flagged() {
+        assert_one("Inf <- 1", "special constant `Inf`");
+    }
+
+    #[test]
+    fn left_arrow_nan_flagged() {
+        assert_one("NaN <- 1", "special constant `NaN`");
+    }
+
+    #[test]
+    fn left_arrow_numeric_literals_flagged() {
+        assert_one("1 <- \"x\"", "numeric literal `1`");
+        assert_one("1.5 <- 2", "numeric literal `1.5`");
+        assert_one("1L <- 2", "numeric literal `1L`");
+    }
+
+    #[test]
+    fn left_arrow_string_literal_flagged() {
+        assert_one("\"foo\" <- 1", "string literal");
+        assert_one("'foo' <- 1", "string literal");
+    }
+
+    #[test]
+    fn left_arrow_reserved_word_else_flagged() {
+        assert_one("else <- 1", "reserved word `else`");
+    }
+
+    #[test]
+    fn left_arrow_reserved_word_in_flagged() {
+        assert_one("in <- 1", "reserved word `in`");
+    }
+
+    #[test]
+    fn left_arrow_next_break_flagged() {
+        assert_one("next <- 1", "reserved word `next`");
+        assert_one("break <- 1", "reserved word `break`");
+    }
+
+    // ---- Other assignment operators -----------------------------------------
+
+    #[test]
+    fn super_assign_flagged() {
+        assert_one("TRUE <<- 1", "logical literal `TRUE`");
+        assert_one("1 <<- 2", "numeric literal `1`");
+    }
+
+    #[test]
+    fn equals_at_top_level_flagged() {
+        assert_one("TRUE = 1", "logical literal `TRUE`");
+        assert_one("1 = 2", "numeric literal `1`");
+    }
+
+    #[test]
+    fn right_arrow_targets_rhs() {
+        assert_one("1 -> TRUE", "logical literal `TRUE`");
+        assert_one("\"foo\" -> NULL", "Cannot assign to `NULL`");
+    }
+
+    #[test]
+    fn super_right_arrow_targets_rhs() {
+        assert_one("5 ->> TRUE", "logical literal `TRUE`");
+    }
+
+    // ---- Negative cases -----------------------------------------------------
+
+    #[test]
+    fn valid_assignment_not_flagged() {
+        assert_none("x <- 1");
+        assert_none("data <- 5");
+        assert_none("my_var <<- 1");
+        assert_none("1 -> x");
+        assert_none("5 ->> y");
+    }
+
+    #[test]
+    fn t_and_f_not_flagged() {
+        // `T` and `F` are ordinary bindings, not reserved words; R accepts the
+        // assignment at the REPL. The issue note explicitly excludes these.
+        assert_none("T <- FALSE");
+        assert_none("F <- TRUE");
+    }
+
+    #[test]
+    fn named_argument_equals_not_flagged() {
+        assert_none("f(x = 1)");
+        assert_none("plot(x = 1, y = 2)");
+    }
+
+    #[test]
+    fn function_parameter_default_not_flagged() {
+        // `function(x = TRUE) {}` — `=` inside formal parameters is parameter
+        // syntax, not assignment. tree-sitter-r doesn't wrap it as a
+        // `binary_operator`, so it's naturally ignored.
+        assert_none("function(x = TRUE) NULL");
+        assert_none("function(x = 1, y = \"a\") x");
+    }
+
+    #[test]
+    fn error_targets_skipped() {
+        // `if <- 1`, `for <- 1`, `while <- 1`, `function <- 1` parse with the
+        // LHS as an `ERROR` node. `collect_syntax_errors` already reports them;
+        // our collector deliberately stays silent to avoid duplicates.
+        for code in ["if <- 1", "for <- 1", "while <- 1", "function <- 1"] {
+            let diags = collect(code);
+            assert!(
+                diags.is_empty(),
+                "expected no diagnostics from this collector for `{code}` (ERROR case is owned by collect_syntax_errors): got {diags:?}"
+            );
+        }
+    }
+
+    // ---- Multi-site, nesting, position --------------------------------------
+
+    #[test]
+    fn multiple_in_one_file() {
+        let code = "TRUE <- 1\nNULL <- 2\n\"x\" <- 3\n";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 3, "got {diags:?}");
+    }
+
+    #[test]
+    fn nested_assignment_flagged() {
+        // The outer assignment is valid; the inner is not.
+        let code = "x <- (TRUE <- 5)";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(diags[0].message.contains("logical literal `TRUE`"));
+    }
+
+    #[test]
+    fn diagnostic_range_points_at_target_not_operator() {
+        // `TRUE <- 5` — diagnostic range should cover `TRUE`, not the operator.
+        let diags = collect("TRUE <- 5");
+        assert_eq!(diags.len(), 1);
+        let r = diags[0].range;
+        assert_eq!(r.start.line, 0);
+        assert_eq!(r.start.character, 0);
+        assert_eq!(r.end.line, 0);
+        assert_eq!(r.end.character, 4); // "TRUE" is 4 columns
+    }
+
+    #[test]
+    fn diagnostic_range_handles_utf16_columns() {
+        // Leading non-ASCII characters shift the column count. UTF-16 width
+        // counts surrogate-pair code units, but for BMP characters (like ø)
+        // it matches the character count. Ensure column math is via the
+        // utf16 helper.
+        let code = "ø <- (TRUE <- 5)"; // ø is 1 UTF-16 unit
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        // `TRUE` starts at column 6 in UTF-16: ø(1) + " <- ("(5) = 6
+        assert_eq!(diags[0].range.start.character, 6);
+        assert_eq!(diags[0].range.end.character, 10);
+    }
+}
+
 /// Detect and report diagnostics for `else` keywords that appear on a new line
 /// after the closing brace of an `if` block.
 ///
@@ -7898,6 +8142,135 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
     }
 
     last_brace_line
+}
+
+/// Emit diagnostics for assignments whose target is something R rejects.
+///
+/// Covers the LHS of `<-`, `<<-`, `=` and the RHS of `->`, `->>`. Flagged
+/// targets are literals (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`,
+/// numeric, string) and reserved-word identifiers tree-sitter still parses
+/// as `binary_operator` (`else <- 1`, `in <- 1`, `next <- 1`, `break <- 1`).
+///
+/// Cases that tree-sitter reports as an `ERROR` node (`if <- 1`, `for <- 1`,
+/// `while <- 1`, `function <- 1`) are intentionally left alone — they already
+/// surface through [`collect_syntax_errors`], and we don't want duplicate
+/// diagnostics. Named-argument `=` inside a call (`f(name = value)`) is also
+/// skipped, matching the existing assignment-operator lint's logic.
+///
+/// Severity is `ERROR`: every case here is code R refuses to evaluate. The
+/// issue note explicitly excludes REPL-tolerated bindings like `T <- FALSE`,
+/// since `T`/`F` are ordinary identifiers that happen to default to logical
+/// values — those flow through `invalid_target_kind` as plain identifiers and
+/// are not flagged.
+fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    if node.kind() == "binary_operator" {
+        check_invalid_assignment_target(node, text, diagnostics);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_invalid_assignment_targets(child, text, diagnostics);
+    }
+}
+
+fn check_invalid_assignment_target(
+    binop: Node,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(op) = binop.child_by_field_name("operator") else {
+        return;
+    };
+    let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
+    let target = match op_text {
+        "<-" | "<<-" => binop.child_by_field_name("lhs"),
+        "=" => {
+            // Named-argument `f(name = value)` — tree-sitter-r wraps each
+            // call argument in an `argument` node, so a direct-parent
+            // `argument` means we're in named-arg position, not assignment.
+            if binop.parent().is_some_and(|p| p.kind() == "argument") {
+                return;
+            }
+            binop.child_by_field_name("lhs")
+        }
+        "->" | "->>" => binop.child_by_field_name("rhs"),
+        _ => return,
+    };
+    let Some(target) = target else {
+        return;
+    };
+
+    // Tree-sitter ERROR / MISSING in the target subtree means
+    // `collect_syntax_errors` will already report something. Stay out of its
+    // way to avoid duplicate diagnostics.
+    if target.is_error() || target.is_missing() || target.has_error() {
+        return;
+    }
+
+    let Some(label) = invalid_target_kind(target, text) else {
+        return;
+    };
+
+    let row = target.start_position().row as u32;
+    let line_text = text.lines().nth(row as usize).unwrap_or("");
+    let start_col = crate::cross_file::types::byte_offset_to_utf16_column(
+        line_text,
+        target.start_position().column,
+    );
+    let end_row = target.end_position().row as u32;
+    let end_line_text = text.lines().nth(end_row as usize).unwrap_or("");
+    let end_col = crate::cross_file::types::byte_offset_to_utf16_column(
+        end_line_text,
+        target.end_position().column,
+    );
+    let target_text = text
+        .get(target.start_byte()..target.end_byte())
+        .unwrap_or("");
+    let message = format_invalid_target_message(label, target_text);
+    diagnostics.push(Diagnostic {
+        range: Range {
+            start: Position::new(row, start_col),
+            end: Position::new(end_row, end_col),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        message,
+        ..Default::default()
+    });
+}
+
+/// Classify an assignment-target node. Returns `Some(label)` when the target
+/// is something R will always reject.
+///
+/// Identifiers are flagged only when their text is a reserved word per
+/// [`crate::reserved_words::is_reserved_word`] — this is what distinguishes
+/// `else <- 1` (flagged) from `T <- FALSE` (not flagged: `T` is a regular
+/// binding, not a reserved word).
+fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
+    match node.kind() {
+        "true" | "false" => Some("logical literal"),
+        "null" => Some("NULL"),
+        "na" => Some("NA"),
+        "inf" | "nan" => Some("special constant"),
+        "float" | "integer" | "complex" => Some("numeric literal"),
+        "string" => Some("string literal"),
+        "next" | "break" => Some("reserved word"),
+        "identifier" => {
+            let t = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
+            if is_reserved_word(t) {
+                Some("reserved word")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn format_invalid_target_message(label: &str, target_text: &str) -> String {
+    match label {
+        // NULL / NA are self-descriptive — don't repeat the kind name.
+        "NULL" | "NA" => format!("Cannot assign to `{target_text}`."),
+        _ => format!("Cannot assign to {label} `{target_text}`."),
+    }
 }
 
 /// True when an identifier is textually followed by `(` (ignoring whitespace),

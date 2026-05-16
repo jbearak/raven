@@ -48,6 +48,20 @@ Raven checks whether each symbol reference has a visible definition — either i
 | Ambiguous parent | warning | Multiple parents source this file and auto-inference can't determine which to use |
 | Redundant directive | hint | `@lsp-source` directive for a file already sourced via `source()` on the same line |
 
+### Invalid Assignment Targets
+
+| Diagnostic | Default Severity | Trigger |
+|---|---|---|
+| Invalid assignment target | error | The target of an assignment is a value R can't bind to: a literal (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`, a number, a string) or a reserved word (`else`, `in`, `next`, `break`) |
+
+Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators (`->`, `->>`) the target is the right-hand side; for the others it's the left-hand side. Always on whenever diagnostics are enabled; not configurable per rule (these are R errors, not stylistic preferences).
+
+**Not flagged:**
+- `T <- FALSE` / `F <- TRUE` — `T` and `F` are ordinary bindings that default to `TRUE`/`FALSE`; R accepts the assignment. Use the [`T` / `F` symbol](#style-lints) style lint if you want these reported.
+- `f(name = value)` — named-argument syntax inside a call, not assignment.
+- `function(x = TRUE)` — default values in formal parameters, not assignment.
+- `if <- 1`, `for <- 1`, `while <- 1`, `function <- 1` — tree-sitter reports these as syntax errors directly, so the same code surfaces only one diagnostic.
+
 ### Style Lints
 
 Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Off by default; enable with `raven.linting.enabled` and tune per rule via the `raven.linting.*` severities. All rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
