@@ -7980,8 +7980,23 @@ mod invalid_assignment_target_tests {
 
     #[test]
     fn named_argument_equals_not_flagged() {
+        // Valid named arguments — tree-sitter parses these as
+        // `argument name: value:` with no `binary_operator` at all, so
+        // there's nothing for the collector to look at.
         assert_none("f(x = 1)");
         assert_none("plot(x = 1, y = 2)");
+    }
+
+    #[test]
+    fn invalid_named_argument_flagged() {
+        // R rejects `f(TRUE = 1)` / `f(1 = 2)` as parse errors (only
+        // identifiers and strings are valid argument names). tree-sitter
+        // recovers by wrapping the `=` as a `binary_operator` inside the
+        // argument's `value:` field — perfect for us to catch.
+        assert_one("f(TRUE = 1)", "logical literal `TRUE`");
+        assert_one("f(1 = 2)", "numeric literal `1`");
+        assert_one("list(TRUE = 1)", "logical literal `TRUE`");
+        assert_one("list(1 = 2)", "numeric literal `1`");
     }
 
     #[test]
@@ -8288,19 +8303,19 @@ fn check_invalid_assignment_target(
     };
     let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
     let target = match op_text {
-        "<-" | "<<-" => binop.child_by_field_name("lhs"),
-        "=" => {
-            // Named-argument `f(name = value)` — tree-sitter-r wraps each
-            // call argument in an `argument` node, so a direct-parent
-            // `argument` means we're in named-arg position, not assignment.
-            if binop.parent().is_some_and(|p| p.kind() == "argument") {
-                return;
-            }
-            binop.child_by_field_name("lhs")
-        }
+        "<-" | "<<-" | "=" => binop.child_by_field_name("lhs"),
         "->" | "->>" => binop.child_by_field_name("rhs"),
         _ => return,
     };
+    // No special case for named-argument `=`: tree-sitter-r parses a valid
+    // `f(x = 1)` as `argument name: value:` (no `binary_operator` at all),
+    // while an invalid name like `f(TRUE = 1)` falls back to wrapping the
+    // `=` as `argument value: (binary_operator …)`. We want to flag the
+    // second case, so simply rely on `binary_operator` being absent for the
+    // valid one.
+    //
+    // Parameter defaults (`function(x = TRUE)`) similarly parse as
+    // `parameter name: default:` without producing a `binary_operator`.
     let Some(target) = target else {
         return;
     };
