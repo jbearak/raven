@@ -1746,33 +1746,32 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         log::info!("Initializing ark-lsp");
 
-        let mut state = self.state.write().await;
-
-        if let Some(folders) = params.workspace_folders {
-            for folder in folders {
-                log::info!("Adding workspace folder: {}", folder.uri);
-                state.workspace_folders.push(folder.uri);
+        // First lock window: register workspace folders, snapshot the root for
+        // off-lock discovery + I/O.
+        let project_root: Option<std::path::PathBuf> = {
+            let mut state = self.state.write().await;
+            if let Some(folders) = params.workspace_folders.clone() {
+                for folder in folders {
+                    log::info!("Adding workspace folder: {}", folder.uri);
+                    state.workspace_folders.push(folder.uri);
+                }
+            } else if let Some(root_uri) = params.root_uri.clone() {
+                log::info!("Adding root URI as workspace folder: {}", root_uri);
+                state.workspace_folders.push(root_uri);
             }
-        } else if let Some(root_uri) = params.root_uri {
-            log::info!("Adding root URI as workspace folder: {}", root_uri);
-            state.workspace_folders.push(root_uri);
-        }
+            state
+                .workspace_folders
+                .first()
+                .and_then(|u| u.to_file_path().ok())
+        };
 
-        // Store the raw init options on state and run the project-config
-        // discovery walk against the first workspace folder. The merged result
-        // feeds the existing parse_*_config functions via recompute.
+        // OFF-LOCK: filesystem walk + TOML read. Holding the write lock across
+        // file I/O violates the locking-discipline invariant in CLAUDE.md.
         let raw_client = params
             .initialization_options
             .clone()
             .unwrap_or(serde_json::Value::Null);
-        state.raw_client_settings = raw_client;
-
-        let project_root: Option<std::path::PathBuf> = state
-            .workspace_folders
-            .first()
-            .and_then(|u| u.to_file_path().ok());
-
-        let mut loaded_path: Option<std::path::PathBuf> = None;
+        let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
         if let Some(root) = &project_root {
             match crate::config_file::find_config(root) {
                 crate::config_file::DiscoveredConfig::RavenToml(p) => {
@@ -1780,29 +1779,41 @@ impl LanguageServer for Backend {
                         for w in &loaded.warnings {
                             log::warn!("{w}");
                         }
-                        state.raw_project_settings = Some(loaded.settings);
-                        state.project_config_path = Some(p.clone());
-                        loaded_path = Some(p);
+                        loaded_project = Some((p, loaded.settings));
                     }
                 }
                 crate::config_file::DiscoveredConfig::Lintr(_p) => {
-                    // .lintr loader lands in Task 10. For now, skip and warn.
-                    log::warn!("found .lintr but loader not yet wired in initialize; using defaults");
+                    // .lintr loader lands in Task 10. For now, skip with an
+                    // info log (this is expected, not a problem to report).
+                    log::info!(".lintr discovered but its loader is not wired in initialize yet; using defaults");
                 }
                 crate::config_file::DiscoveredConfig::None => {}
             }
         }
 
-        crate::config_file::recompute_parsed_configs(&mut state);
-
-        // Compile any [[linting.overrides]] from the now-merged settings.
-        if let Some(root) = &project_root {
-            let merged = crate::config_file::merge_settings(
-                &state.raw_client_settings,
-                state.raw_project_settings.as_ref(),
-            );
-            state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
-        }
+        // Second lock window: store raw layers, recompute parsed configs,
+        // compile overrides. No I/O in this scope.
+        let loaded_path = {
+            let mut state = self.state.write().await;
+            state.raw_client_settings = raw_client;
+            let mut loaded_path: Option<std::path::PathBuf> = None;
+            if let Some((p, settings)) = loaded_project {
+                state.raw_project_settings = Some(settings);
+                state.project_config_path = Some(p.clone());
+                loaded_path = Some(p);
+            }
+            crate::config_file::recompute_parsed_configs(&mut state);
+            if let Some(root) = &project_root {
+                // Compute the merged value once; recompute_parsed_configs already
+                // performed the same merge but its result isn't returned.
+                let merged = crate::config_file::merge_settings(
+                    &state.raw_client_settings,
+                    state.raw_project_settings.as_ref(),
+                );
+                state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
+            }
+            loaded_path
+        };
 
         // Notify client when a project config is in effect.
         if let Some(path) = loaded_path {
@@ -1830,16 +1841,18 @@ impl LanguageServer for Backend {
             .and_then(|ds| ds.hierarchical_document_symbol_support)
             .unwrap_or(false);
 
-        state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
         log::info!(
             "Client hierarchicalDocumentSymbolSupport: {}",
             hierarchical_support
         );
 
-        // Extract completion settings before dropping state lock
-        let trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
-
-        drop(state);
+        // Third lock window: store the hierarchical-support flag and read the
+        // completion trigger setting. Short and lock-only — no I/O.
+        let trigger_on_open_paren = {
+            let mut state = self.state.write().await;
+            state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
+            state.completion_config.trigger_on_open_paren
+        };
 
         let completion_trigger_chars = build_completion_trigger_chars(trigger_on_open_paren);
 
