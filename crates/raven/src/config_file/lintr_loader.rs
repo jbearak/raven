@@ -293,7 +293,7 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
         match c {
             '"' | '\'' => in_str = Some(c),
             '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1).max(0),
             ',' if depth == 0 => {
                 out.push(&input[start..i]);
                 start = i + 1;

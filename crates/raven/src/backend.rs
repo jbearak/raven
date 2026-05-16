@@ -4276,10 +4276,8 @@ impl LanguageServer for Backend {
                 let Ok(p) = c.uri.to_file_path() else {
                     return false;
                 };
-                matches!(
-                    p.file_name().and_then(|n| n.to_str()),
-                    Some("raven.toml") | Some(".lintr")
-                )
+                let Some(name) = p.file_name() else { return false };
+                name == std::ffi::OsStr::new("raven.toml") || name == std::ffi::OsStr::new(".lintr")
             })
             .cloned()
             .collect();
