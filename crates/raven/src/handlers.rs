@@ -4010,12 +4010,26 @@ fn collect_workspace_symbols_from_artifacts(
 // ============================================================================
 
 /// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
-/// pipeline. Retained as a `pub` entry point for bench harnesses
+/// pipeline.
+///
+/// # ⚠️ Lock discipline — do not call from production publish paths
+///
+/// This convenience wrapper builds the snapshot AND runs
+/// `diagnostics_from_snapshot` (scope resolution) in a single call.
+/// Production callers that hold `WorldState::state.read().await` would
+/// therefore hold the read lock across the entire scope-resolution
+/// pass — violating the CLAUDE.md "Locking discipline in cross-file
+/// work" invariant and starving concurrent `did_change` writers.
+///
+/// The production publish path in `backend.rs::publish_diagnostics_inner`
+/// splits this into a brief lock window that builds the snapshot, a
+/// lock release, and an unlocked `diagnostics_from_snapshot` call. New
+/// production code should follow that pattern, not this wrapper.
+///
+/// Retained for the bench harness
 /// (`crates/raven/benches/lsp_operations.rs`) and the inline tests in
-/// this module; the production publish path in `backend.rs` now
-/// inlines an equivalent flow so it can release the read lock between
-/// the snapshot build and `diagnostics_from_snapshot` to match the
-/// snapshot-pattern's lock-discipline contract.
+/// this module, which build their own short-lived `WorldState` and do
+/// not contend for the lock.
 #[allow(dead_code)]
 pub fn diagnostics_via_snapshot(
     state: &WorldState,
@@ -4090,11 +4104,24 @@ pub fn diagnostics_via_snapshot_profile(
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
 ///
+/// # ⚠️ Lock discipline — do not call from production publish paths
+///
+/// This is a convenience wrapper that builds a `DiagnosticsSnapshot`
+/// AND runs `diagnostics_from_snapshot` (scope resolution) in one
+/// call. Calling it from inside a `WorldState::state.read().await`
+/// guard holds the read lock across the entire scope-resolution
+/// pass — violating the CLAUDE.md "Locking discipline in cross-file
+/// work" invariant and starving concurrent `did_change` writers.
+///
+/// The production publish path in `backend.rs::publish_diagnostics_inner`
+/// splits the work: build the snapshot under a brief read lock,
+/// release the lock, then run `diagnostics_from_snapshot` on the
+/// snapshot. New production code should follow that pattern, not
+/// reach for this wrapper.
+///
 /// Retained as a `pub` entry point for bench harnesses
-/// (`crates/raven/benches/lsp_operations.rs`) and downstream consumers.
-/// The production publish path in `backend.rs` now inlines an
-/// equivalent flow so it can release the read lock between
-/// `DiagnosticsSnapshot::build` and `diagnostics_from_snapshot`.
+/// (`crates/raven/benches/lsp_operations.rs`) and downstream consumers
+/// that have their own lock strategy.
 #[allow(dead_code)]
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
