@@ -1,5 +1,6 @@
 # Demonstration of out-of-scope (forward reference) warning
-# @lsp-sourced-by 04_orchestrator.R
+# This file is standalone — no parent sources it.
+# Raven flags variables used before they are defined at top level.
 
 # Variable used before it's defined — forward reference warning
 result <- total_count + 10
