@@ -16,7 +16,7 @@ Per-key. For each setting, project values win over the LSP client's `initializat
 
 ### Schema
 
-The TOML mirrors the LSP `initializationOptions` shape 1:1. The reference table below lists every key; the same key in `raven.toml` is at the path indicated.
+The TOML mirrors the LSP `initializationOptions` shape 1:1. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of VS Code-only settings whose behavior is most useful to document alongside them (R-console activation, plot/help viewer columns, the word-separator opt-in, and the server-binary override). Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
 
 ```toml
 [linting]
@@ -29,7 +29,7 @@ files = ["tests/**/*.R"]
 lineLength = 120
 
 [crossFile]
-maxChainDepth = 10
+maxChainDepth = 30
 
 [packages]
 enabled = true
@@ -69,6 +69,25 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rPath`
 | `raven.crossFile.revalidationDebounceMs` | `200` | Debounce delay for dependent file diagnostics (ms) |
 | `raven.crossFile.editedFileDebounceMs` | `50` | Debounce delay for the actively-edited file (ms). *LSP init-only — not exposed in the VS Code Settings UI.* |
 
+### Background indexing
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.crossFile.onDemandIndexing.enabled` | `true` | Index files referenced by `source()` / directives that aren't currently open, so cross-file features work without opening every dependency |
+| `raven.crossFile.onDemandIndexing.maxTransitiveDepth` | `2` | How deep to follow transitive dependencies (files sourced by sourced files) when indexing in the background |
+| `raven.crossFile.onDemandIndexing.maxQueueSize` | `50` | Cap on files queued for background indexing at once |
+
+### Cache sizes
+
+LRU-evicted; raise these if you have a very large workspace and see repeated re-indexing, lower them to reduce memory. The minimums quoted below are the lower bounds enforced by the VS Code Settings UI; the server itself only clamps each cache to a minimum of `1`, so `raven.toml` and other LSP clients can go lower if they really want to.
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.crossFile.cache.metadataMaxEntries` | `1000` | Parsed file metadata (directives, source calls). VS Code UI minimum `100`. |
+| `raven.crossFile.cache.fileContentMaxEntries` | `500` | Full file text used during resolution. VS Code UI minimum `50`. |
+| `raven.crossFile.cache.existenceMaxEntries` | `2000` | Cached `Path::exists` results for resolved references. VS Code UI minimum `100`. |
+| `raven.crossFile.cache.workspaceIndexMaxEntries` | `5000` | Closed-file entries in the cross-file workspace index (parsed metadata + scope artifacts). VS Code UI minimum `100`. |
+
 ## Diagnostic Severity Settings
 
 Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
@@ -80,8 +99,10 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | `raven.crossFile.circularDependencySeverity` | `"error"` | Circular dependency detected |
 | `raven.crossFile.maxChainDepthSeverity` | `"warning"` | Source chain exceeds max depth |
 | `raven.crossFile.outOfScopeSeverity` | `"warning"` | Symbol used before it's in scope |
-| `raven.crossFile.ambiguousParentSeverity` | `"warning"` | Multiple parents, can't determine which to use |
-| `raven.crossFile.redundantDirectiveSeverity` | `"hint"` | Redundant @lsp-source directive |
+| `raven.crossFile.ambiguousParentSeverity` | `"warning"` | **Reserved.** Parsed for backwards compatibility but no diagnostic is currently emitted under this key. |
+| `raven.crossFile.redundantDirectiveSeverity` | `"hint"` | Redundant `@lsp-source` directive |
+| `raven.diagnostics.mixedLogicalSeverity` | `"warning"` | `\|` / `\|\|` whose immediate operand is a bare `&` / `&&` (not wrapped in parentheses). Since `&` binds tighter than `\|` in R, the grouping is silent — the rule asks for explicit parentheses. Applies everywhere, not just inside `if` / `while` conditions. |
+| `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | Binary `=` used directly inside an `if` / `while` condition (likely `==` intended). |
 
 ## Package Settings
 
@@ -194,6 +215,12 @@ Native style/lint diagnostics. Off by default; opt in with `raven.linting.enable
 | `raven.linting.indentationSeverity` | `"hint"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the expected indent for their AST scope) |
 
 To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also set any of the three style settings to `"any"` to disable just that symbol kind while keeping the others active.
+
+## Editor Integration Settings (VS Code only)
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.editor.dotInWordSeparators` | `"ask"` | Whether to treat `.` as part of words (rather than a word separator) in R and JAGS files. `"ask"` prompts on first use, `"yes"` applies the override to `editor.wordSeparators` for `[r]` / `[jags]`, `"no"` never applies it. |
 
 ## Server Settings
 

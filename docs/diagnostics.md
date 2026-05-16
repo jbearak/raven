@@ -16,15 +16,15 @@ Diagnostics are deferred until the workspace scan completes (in `auto` backward 
 
 ### Parse Errors
 
-Raven surfaces parse errors from the tree-sitter R grammar whenever the document cannot be parsed as valid R. These diagnostics are always on and not configurable. Where possible Raven provides a specific, actionable message rather than a generic "Syntax error":
+Raven surfaces parse errors from the tree-sitter R grammar whenever the document cannot be parsed as valid R. There's no per-rule severity knob, but the master switch `raven.diagnostics.enabled` suppresses them along with every other diagnostic. Where possible Raven provides a specific, actionable message rather than a generic "Syntax error":
 
 | Message | Trigger |
 |---|---|
 | `Unclosed string literal` | An opening `"` or `'` has no matching closing delimiter |
-| `Consecutive pipe \|>`: expected an expression before this operator | Two pipe operators appear back-to-back without an intervening expression (`x \|> \|> y`) |
-| `Mismatched brackets: \`(\` opened here; close with \`)\` not \`]`` | A bracket opened with `(`, `[`, or `[[` is closed with a non-matching bracket (`c(1, 2]`) |
-| `Missing \`)`` / `Missing \`]`` / etc. | A delimiter was opened but never closed (`library(`) |
-| In R, `else` must appear on the same line as the closing `}` of the if block | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
+| ``Consecutive pipe `\|>`: expected an expression before this operator.`` | Two pipe operators appear back-to-back without an intervening expression (`x \|> \|> y`) |
+| ``Mismatched brackets: `(` opened here; close with `)` not `]`.`` | A bracket opened with `(`, `[`, or `[[` is closed with a non-matching bracket (`c(1, 2]`) |
+| `Missing )` / `Missing ]` / etc. | A delimiter was opened but never closed (`library(`) |
+| `In R, 'else' must appear on the same line as the closing '}' of the if block` | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
 | `Syntax error` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
 
 ### Undefined Variables
@@ -58,8 +58,7 @@ Raven checks whether each symbol reference has a visible definition — either i
 | Circular dependency | error | Two files source each other (directly or transitively) |
 | Max chain depth exceeded | warning | Source chain exceeds configured maximum depth |
 | Out-of-scope symbol | warning | Symbol from a sourced file used before the `source()` call |
-| Ambiguous parent | warning | Multiple parents source this file and auto-inference can't determine which to use |
-| Redundant directive | hint | `@lsp-source` directive for a file already sourced via `source()` on the same line |
+| Redundant directive | hint | `@lsp-source` directive for a file already brought in by an earlier `source()` call |
 
 ### Assignment Targets
 
