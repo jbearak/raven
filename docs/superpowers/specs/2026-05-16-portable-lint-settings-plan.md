@@ -1782,7 +1782,7 @@ In `crates/raven/src/backend.rs`, find `async fn did_change_watched_files(&self,
         if !config_file_changes.is_empty() {
             // Snapshot prev configs (for downstream rebuild gating), reload,
             // recompute, then drop the lock before any I/O.
-            let (open_uris, package_settings_changed, watch_settings_changed) = {
+            let (open_uris, package_settings_changed, watch_settings_changed, package_mode_changed) = {
                 let mut state = self.state.write().await;
                 let project_root = state
                     .workspace_folders
@@ -1842,29 +1842,45 @@ In `crates/raven/src/backend.rs`, find `async fn did_change_watched_files(&self,
                     != prev_cross_file.packages_watch_library_paths
                     || state.cross_file_config.packages_watch_debounce_ms
                         != prev_cross_file.packages_watch_debounce_ms;
+                let package_mode_changed =
+                    state.cross_file_config.package_mode != prev_cross_file.package_mode;
 
                 let open: Vec<Url> = state.documents.keys().cloned().collect();
                 state.diagnostics_gate.mark_force_republish_many(open.iter());
-                (open, package_settings_changed, watch_settings_changed)
+                (open, package_settings_changed, watch_settings_changed, package_mode_changed)
             };
 
-            // If package settings or watcher knobs changed, mirror the
-            // post-recompute reconciliation that did_change_configuration
-            // already performs. Synthesize an equivalent settings payload
-            // and route through that handler — its package-library rebuild
-            // and watcher-restart logic is non-trivial and not worth
-            // duplicating inline.
-            if package_settings_changed || watch_settings_changed {
-                let synthesized = {
-                    let state = self.state.read().await;
-                    crate::config_file::merge_settings(
-                        &state.raw_client_settings,
-                        state.raw_project_settings.as_ref(),
-                    )
-                };
-                self.did_change_configuration(DidChangeConfigurationParams {
-                    settings: synthesized,
-                }).await;
+            // v1 scope note: settings whose rebuild lives in
+            // `did_change_configuration` (package_library rebuild via R
+            // subprocess, libpath watcher restart, packageMode mode switch)
+            // are NOT auto-applied here. Detecting them and calling
+            // `did_change_configuration` ourselves would either (a) corrupt
+            // the raw layer split (synthesizing the merged result into
+            // `raw_client_settings` makes stale project keys outlive a
+            // raven.toml deletion) or (b) require extracting a
+            // post-recompute reconciliation helper from
+            // `did_change_configuration` — bigger than this PR.
+            //
+            // Issue a one-time warning so the user knows to restart if they
+            // changed one of these keys. Linting / cross-file thresholds /
+            // diagnostics / indentation / symbols / completion all reload
+            // live; the warning calls out the gap explicitly.
+            if package_settings_changed || watch_settings_changed || package_mode_changed {
+                log::warn!(
+                    "raven.toml: package settings, packageMode, or watcher knobs changed; \
+                     restart Raven to pick them up. \
+                     (Live-reload is scoped to non-rebuild settings in this version.)"
+                );
+                // Surface to the user via `window/showMessage` so editors
+                // that don't tail the server log still see it.
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    use tower_lsp::lsp_types::MessageType;
+                    client.show_message(
+                        MessageType::WARNING,
+                        "raven.toml: package-related settings changed; restart Raven to pick them up.",
+                    ).await;
+                });
             }
 
             // Re-publish diagnostics for every open document. The existing
@@ -3342,6 +3358,12 @@ undefinedVariableSeverity = "warning"
 ### Per-file overrides
 
 `[[linting.overrides]]` is an array of glob → patch entries. Globs are anchored at the project root. Order matters: later entries win on conflicts. Setting `enabled = false` in an override skips matching files entirely.
+
+### Live reload
+
+Edits to `raven.toml` are picked up live for: every `[linting]` key (including `overrides`), `[crossFile]` (except `packageMode`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. Open documents re-publish diagnostics automatically.
+
+Changes to `[packages]` (any key), `[crossFile].packageMode`, or the package-watcher knobs (`packagesWatchLibraryPaths`, `packagesWatchDebounceMs`) currently require restarting Raven; the server surfaces a warning when it detects such a change so the user knows. This v1 scope keeps the live-reload path narrow — rebuilding the package library involves an R subprocess and the watcher restart is non-trivial to wire safely. A follow-up will lift the restriction once the post-recompute reconciliation logic in `did_change_configuration` is extracted into a shared helper.
 ```
 
 - [ ] **Step 3: Update `docs/linting.md`**

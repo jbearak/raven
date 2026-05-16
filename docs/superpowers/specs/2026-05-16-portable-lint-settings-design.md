@@ -314,6 +314,8 @@ On a watched-file event for the project config:
 3. Call `recompute_parsed_configs(&mut state)`.
 4. Force-republish diagnostics for every open document via `CrossFileDiagnosticsGate::mark_force_republish`.
 
+**v1 reload scope:** Live reload covers every key except `[packages].*`, `[crossFile].packageMode`, and the package-watcher knobs (`packagesWatchLibraryPaths`, `packagesWatchDebounceMs`). These require an R-subprocess rebuild and a libpath-watcher restart whose logic lives inside `did_change_configuration`; folding it into `did_change_watched_files` would either duplicate that logic or corrupt the raw-layer split. v1 detects such changes and surfaces a `window/showMessage` warning telling the user to restart Raven. A follow-up will extract the post-recompute reconciliation into a shared helper used by both call sites.
+
 ### `did_change_configuration` (`backend.rs:3817`)
 
 Same shape, simpler body:
