@@ -1878,16 +1878,10 @@ impl LanguageServer for Backend {
                 state.raw_project_settings = Some(settings);
                 state.project_config_path = Some(p);
             }
+            // `recompute_parsed_configs` now also recompiles
+            // `state.lint_overrides` — callers no longer need a
+            // separate `compile_lint_overrides` step.
             crate::config_file::recompute_parsed_configs(&mut state);
-            if let Some(root) = &project_root {
-                // Compute the merged value once; recompute_parsed_configs already
-                // performed the same merge but its result isn't returned.
-                let merged = crate::config_file::merge_settings(
-                    &state.raw_client_settings,
-                    state.raw_project_settings.as_ref(),
-                );
-                state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
-            }
         }
 
         // NOTE: the `raven/projectConfigLoaded` notification is NOT sent
@@ -4014,20 +4008,9 @@ impl LanguageServer for Backend {
             // file (if any). recompute_parsed_configs() overwrites every
             // parsed config; absent sections reset to defaults.
             state.raw_client_settings = params.settings.clone();
+            // `recompute_parsed_configs` now also recompiles
+            // `state.lint_overrides` from the merged settings.
             crate::config_file::recompute_parsed_configs(&mut state);
-
-            // Refresh compiled overrides from the merged settings.
-            let project_root = state
-                .workspace_folders
-                .first()
-                .and_then(|u| u.to_file_path().ok());
-            if let Some(root) = &project_root {
-                let merged = crate::config_file::merge_settings(
-                    &state.raw_client_settings,
-                    state.raw_project_settings.as_ref(),
-                );
-                state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
-            }
 
             prev
         };
@@ -4123,16 +4106,9 @@ impl LanguageServer for Backend {
                     state.project_config_path = Some(p);
                 }
 
+                // `recompute_parsed_configs` now also recompiles
+                // `state.lint_overrides` from the merged settings.
                 crate::config_file::recompute_parsed_configs(&mut state);
-
-                if let Some(root) = &project_root {
-                    let merged = crate::config_file::merge_settings(
-                        &state.raw_client_settings,
-                        state.raw_project_settings.as_ref(),
-                    );
-                    state.lint_overrides =
-                        crate::config_file::compile_lint_overrides(&merged, root);
-                }
 
                 prev
             };
@@ -5324,11 +5300,9 @@ impl Backend {
     ///      (`raw_client_settings` for `did_change_configuration`;
     ///      `raw_project_settings` + `project_config_path` for
     ///      `did_change_watched_files`).
-    ///   3. Called [`crate::config_file::recompute_parsed_configs`].
-    ///   4. Compiled `lint_overrides` against the merged settings via
-    ///      [`crate::config_file::compile_lint_overrides`]. The helper
-    ///      does NOT re-compile these.
-    ///   5. Released the write lock before calling this helper.
+    ///   3. Called [`crate::config_file::recompute_parsed_configs`],
+    ///      which now also recompiles `state.lint_overrides`.
+    ///   4. Released the write lock before calling this helper.
     ///
     /// The helper acquires its own brief write lock to:
     ///   - restore `symbol_config.hierarchical_document_symbol_support`

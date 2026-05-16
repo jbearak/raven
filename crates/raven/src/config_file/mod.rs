@@ -56,4 +56,21 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     state.indentation_config =
         crate::backend::parse_indentation_config(&merged).unwrap_or_default();
     state.lint_config = crate::backend::parse_lint_config(&merged).unwrap_or_default();
+
+    // Recompile per-document lint overrides as part of the centralized
+    // recompute. Splitting this into a separate caller step (as earlier
+    // versions did) was error-prone — a future caller could call
+    // `recompute_parsed_configs` and forget to recompile overrides,
+    // leaving them stale relative to the new merged settings. Tying
+    // them together here is the per-CLAUDE.md invariant: this function
+    // is the only place that writes any parsed config field after a
+    // settings change.
+    if let Some(root) = state.workspace_folders.first().and_then(|u| u.to_file_path().ok()) {
+        state.lint_overrides = compile_lint_overrides(&merged, &root);
+    } else {
+        // No workspace root yet — clear any stale overrides so we don't
+        // resolve against patches whose globs were computed against a
+        // since-removed root.
+        state.lint_overrides = Vec::new();
+    }
 }
