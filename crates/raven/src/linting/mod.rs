@@ -38,6 +38,14 @@
 //!   maximum length.
 //! * `vector_logic` — flag `&` / `|` in `if` / `while` conditions; call
 //!   boundaries stop the scan so `if (any(x & y))` is left alone.
+//! * `mixed_logical` — flag `|` / `||` whose immediate operand is a bare
+//!   `&` / `&&` (without parentheses), e.g. `a & b | c`. `&` binds tighter
+//!   than `|` in R, making the grouping easy to mis-read; adding parentheses
+//!   makes the intent explicit.
+//! * `condition_assignment` — flag `=` used as a binary operator directly
+//!   inside an `if` or `while` condition. R rejects `if (x = 1)` as a
+//!   syntax error at runtime but tree-sitter-r accepts it silently; use `==`
+//!   for equality tests and `<-` for assignment.
 //! * `function_left_parentheses` — flag whitespace between `function`
 //!   (or `\`) and `(`.
 //! * `spaces_inside` — flag whitespace immediately inside `(`, `[`, `[[`
@@ -193,6 +201,32 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
     out
 }
 
+/// Runs the always-on semantic checks that flag likely-wrong code regardless of
+/// whether the style-lint master switch (`LintConfig::enabled`) is on.
+///
+/// These rules detect precedence bugs and runtime errors, not style preferences,
+/// and belong in the main diagnostic pipeline. Callers should pass severity
+/// values from `CrossFileConfig`.
+pub fn run_semantic_checks(
+    text: &str,
+    root: Node<'_>,
+    mixed_logical_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+    condition_assignment_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+) -> Vec<Diagnostic> {
+    if mixed_logical_severity.is_none() && condition_assignment_severity.is_none() {
+        return Vec::new();
+    }
+    let suppressions = nolint::Suppressions::from_text(text);
+    let mut out = Vec::new();
+    if let Some(sev) = mixed_logical_severity {
+        rules::mixed_logical::collect(text, root, sev, &suppressions, &mut out);
+    }
+    if let Some(sev) = condition_assignment_severity {
+        rules::condition_assignment::collect(text, root, sev, &suppressions, &mut out);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +243,15 @@ mod tests {
     fn lint(text: &str, config: &LintConfig) -> Vec<Diagnostic> {
         let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
         run_lints(text, tree.root_node(), config)
+    }
+
+    fn lint_semantic(
+        text: &str,
+        mixed_sev: Option<DiagnosticSeverity>,
+        cond_sev: Option<DiagnosticSeverity>,
+    ) -> Vec<Diagnostic> {
+        let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
+        run_semantic_checks(text, tree.root_node(), mixed_sev, cond_sev)
     }
 
     #[test]
@@ -1649,6 +1692,193 @@ print.data.frame <- function(x, ...) NULL
     }
 
     // ------------------------------------------------------------------
+    // mixed_logical  (semantic check — uses lint_semantic, not lint)
+    // ------------------------------------------------------------------
+
+    const ML_WARN: Option<DiagnosticSeverity> = Some(DiagnosticSeverity::WARNING);
+
+    #[test]
+    fn mixed_logical_flags_and_inside_or() {
+        let diags = lint_semantic("x <- a & b | c\n", ML_WARN, None);
+        assert!(!diags.is_empty(), "expected diagnostic, got none");
+        assert!(diags[0].message.contains("parentheses"), "got: {:?}", diags[0].message);
+    }
+
+    #[test]
+    fn mixed_logical_flags_or_inside_and() {
+        // tree-sitter parses `a | b & c` as `a | (b & c)`; `|` is outer.
+        let diags = lint_semantic("x <- a | b & c\n", ML_WARN, None);
+        assert!(!diags.is_empty(), "expected diagnostic, got none");
+    }
+
+    #[test]
+    fn mixed_logical_flags_double_operators() {
+        let diags = lint_semantic("x <- a && b || c\n", ML_WARN, None);
+        assert!(!diags.is_empty(), "expected diagnostic, got none");
+        assert!(diags[0].message.contains("&&"), "got: {:?}", diags[0].message);
+    }
+
+    #[test]
+    fn mixed_logical_accepts_explicit_parens_left() {
+        let diags = lint_semantic("x <- (a & b) | c\n", ML_WARN, None);
+        assert!(diags.is_empty(), "expected no diagnostic, got {:?}", diags);
+    }
+
+    #[test]
+    fn mixed_logical_accepts_explicit_parens_right() {
+        let diags = lint_semantic("x <- a & (b | c)\n", ML_WARN, None);
+        assert!(diags.is_empty(), "expected no diagnostic, got {:?}", diags);
+    }
+
+    #[test]
+    fn mixed_logical_accepts_pure_and() {
+        let diags = lint_semantic("x <- a & b & c\n", ML_WARN, None);
+        assert!(diags.is_empty(), "pure `&` should not be flagged, got {:?}", diags);
+    }
+
+    #[test]
+    fn mixed_logical_accepts_pure_or() {
+        let diags = lint_semantic("x <- a | b | c\n", ML_WARN, None);
+        assert!(diags.is_empty(), "pure `|` should not be flagged, got {:?}", diags);
+    }
+
+    #[test]
+    fn mixed_logical_flags_in_if_condition() {
+        let diags = lint_semantic("if (a & b | c) x\n", ML_WARN, None);
+        assert!(!diags.is_empty(), "should flag mixed operators in condition");
+    }
+
+    #[test]
+    fn mixed_logical_flags_cross_family_or_then_double_and() {
+        let diags = lint_semantic("x <- a | b && c\n", ML_WARN, None);
+        assert!(!diags.is_empty(), "a | b && c should be flagged, got {:?}", diags);
+    }
+
+    #[test]
+    fn mixed_logical_flags_cross_family_double_or_then_and() {
+        let diags = lint_semantic("x <- a || b & c\n", ML_WARN, None);
+        assert!(!diags.is_empty(), "a || b & c should be flagged, got {:?}", diags);
+    }
+
+    #[test]
+    fn mixed_logical_skips_inside_call() {
+        let diags = lint_semantic("filter(df, a | b & c)\n", ML_WARN, None);
+        assert!(
+            diags.is_empty(),
+            "mixed operators inside a call should not be flagged, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn mixed_logical_skips_inside_subset() {
+        let diags = lint_semantic("df[a | b & c, ]\n", ML_WARN, None);
+        assert!(
+            diags.is_empty(),
+            "mixed operators inside subset should not be flagged, got {:?}",
+            diags
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // condition_assignment  (semantic check — uses lint_semantic, not lint)
+    // ------------------------------------------------------------------
+
+    const CA_WARN: Option<DiagnosticSeverity> = Some(DiagnosticSeverity::WARNING);
+
+    #[test]
+    fn condition_assignment_flags_equals_in_if() {
+        let diags = lint_semantic("if (x = 1) x\n", None, CA_WARN);
+        assert!(!diags.is_empty(), "expected diagnostic, got none");
+        assert!(diags[0].message.contains("=="), "got: {:?}", diags[0].message);
+    }
+
+    #[test]
+    fn condition_assignment_flags_equals_in_while() {
+        let diags = lint_semantic("while (done = FALSE) x\n", None, CA_WARN);
+        assert!(!diags.is_empty(), "expected diagnostic for = in while condition");
+    }
+
+    #[test]
+    fn condition_assignment_accepts_double_equals() {
+        let diags = lint_semantic("if (x == 1) x\n", None, CA_WARN);
+        assert!(diags.is_empty(), "`==` should not be flagged, got {:?}", diags);
+    }
+
+    #[test]
+    fn condition_assignment_accepts_left_arrow() {
+        let diags = lint_semantic("if (x <- 1) x\n", None, CA_WARN);
+        assert!(
+            diags.is_empty(),
+            "`<-` in condition should not be flagged, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn condition_assignment_skips_named_arg_inside_call() {
+        let diags = lint_semantic("if (identical(x = 1, 1)) x\n", None, CA_WARN);
+        assert!(
+            diags.is_empty(),
+            "named-arg `=` inside a call should not be flagged, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn condition_assignment_accepts_top_level_equals() {
+        let diags = lint_semantic("x = 1\n", None, CA_WARN);
+        assert!(diags.is_empty(), "top-level `=` should not be flagged, got {:?}", diags);
+    }
+
+    #[test]
+    fn condition_assignment_skips_parenthesized_condition() {
+        let diags = lint_semantic("if ((x = 1)) x\n", None, CA_WARN);
+        assert!(
+            diags.is_empty(),
+            "`=` inside parenthesized_expression should not be flagged, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn condition_assignment_skips_braced_condition() {
+        let diags = lint_semantic("if ({ x = 1; x > 0 }) x\n", None, CA_WARN);
+        assert!(
+            diags.is_empty(),
+            "`=` inside braced_expression should not be flagged, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn condition_assignment_no_duplicate_with_assignment_operator() {
+        // `if (x = 1)` — condition_assignment fires; assignment_operator must
+        // NOT also fire (contradictory advice).
+        let semantic = lint_semantic("if (x = 1) x\n", None, CA_WARN);
+        let style = lint(
+            "if (x = 1) x\n",
+            &LintConfig {
+                assignment_operator_severity: Some(DiagnosticSeverity::HINT),
+                ..solo_config()
+            },
+        );
+        let mut all = semantic;
+        all.extend(style);
+        assert_eq!(
+            all.len(),
+            1,
+            "expected exactly one diagnostic for `if (x = 1)`, got {:?}",
+            all
+        );
+        assert!(
+            all[0].message.contains("=="),
+            "expected condition_assignment message, got {:?}",
+            all[0].message
+        );
+    }
+
+    // ------------------------------------------------------------------
     // function_left_parentheses
     // ------------------------------------------------------------------
 
@@ -1801,6 +2031,15 @@ mod code_field_tests {
         }
     }
 
+    fn lint_semantic(
+        text: &str,
+        mixed_sev: Option<DiagnosticSeverity>,
+        cond_sev: Option<DiagnosticSeverity>,
+    ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
+        run_semantic_checks(text, tree.root_node(), mixed_sev, cond_sev)
+    }
+
     fn run_one(
         text: &str,
         configure: impl FnOnce(&mut LintConfig),
@@ -1933,6 +2172,24 @@ mod code_field_tests {
                 diags
             );
         }
+    }
+
+    #[test]
+    fn semantic_rules_emit_their_ids() {
+        use super::rule_ids::*;
+        let sev = Some(DiagnosticSeverity::WARNING);
+        let ml = lint_semantic("x <- a & b | c\n", sev, None);
+        assert!(
+            ml.iter().any(|d| rule_id_of(d) == Some(MIXED_LOGICAL)),
+            "mixed_logical rule emitted unexpected ids: {:?}",
+            ml
+        );
+        let ca = lint_semantic("if (x = 1) x\n", None, sev);
+        assert!(
+            ca.iter().any(|d| rule_id_of(d) == Some(CONDITION_ASSIGNMENT)),
+            "condition_assignment rule emitted unexpected ids: {:?}",
+            ca
+        );
     }
 }
 

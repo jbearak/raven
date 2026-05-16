@@ -93,7 +93,8 @@ const KNOWN_LINTING_KEYS: &[&str] = &[
     "trailingBlankLinesSeverity", "assignmentOperatorSeverity", "objectNameSeverity",
     "infixSpacesSeverity", "commentedCodeSeverity", "quotesSeverity", "commasSeverity",
     "tAndFSymbolSeverity", "semicolonSeverity", "equalsNaSeverity", "objectLengthSeverity",
-    "vectorLogicSeverity", "functionLeftParenthesesSeverity", "spacesInsideSeverity",
+    "vectorLogicSeverity",
+    "functionLeftParenthesesSeverity", "spacesInsideSeverity",
     "indentationSeverity", "overrides",
 ];
 

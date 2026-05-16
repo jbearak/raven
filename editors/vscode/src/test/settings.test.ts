@@ -147,6 +147,8 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.equalsNaSeverity', jsonPath: ['linting', 'equalsNaSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.objectLengthSeverity', jsonPath: ['linting', 'objectLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.vectorLogicSeverity', jsonPath: ['linting', 'vectorLogicSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
+    { vsCodeKey: 'diagnostics.mixedLogicalSeverity', jsonPath: ['diagnostics', 'mixedLogicalSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'diagnostics.conditionAssignmentSeverity', jsonPath: ['diagnostics', 'conditionAssignmentSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'linting.functionLeftParenthesesSeverity', jsonPath: ['linting', 'functionLeftParenthesesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.spacesInsideSeverity', jsonPath: ['linting', 'spacesInsideSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },
     { vsCodeKey: 'linting.indentationSeverity', jsonPath: ['linting', 'indentationSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'hint' },

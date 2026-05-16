@@ -1028,6 +1028,44 @@
           "default": "warning",
           "description": "Severity level for diagnostics when a variable is used but not defined in the current scope, sourced files, or loaded packages. Set to \"off\" to suppress undefined variable diagnostics if they produce too many false positives in your workflow."
         },
+        "raven.diagnostics.mixedLogicalSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report mixed `&`/`|` without parentheses as errors",
+            "Report mixed `&`/`|` without parentheses as warnings",
+            "Report mixed `&`/`|` without parentheses as information",
+            "Report mixed `&`/`|` without parentheses as hints",
+            "Disable the mixed-logical diagnostic"
+          ],
+          "default": "warning",
+          "description": "Severity for the mixed-logical diagnostic. Flags `|`/`||` whose immediate operand is a bare `&`/`&&` (without explicit parentheses), e.g. `a & b | c`. Because `&` binds more tightly than `|` in R, the grouping is easy to mis-read. Stops at call/subset boundaries so vectorized data-mask patterns are not flagged."
+        },
+        "raven.diagnostics.conditionAssignmentSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report `=` in conditions as errors",
+            "Report `=` in conditions as warnings",
+            "Report `=` in conditions as information",
+            "Report `=` in conditions as hints",
+            "Disable the condition-assignment diagnostic"
+          ],
+          "default": "warning",
+          "description": "Severity for the condition-assignment diagnostic. Flags `=` used as a binary operator directly inside an `if` or `while` condition. R rejects `if (x = 1)` as a syntax error at runtime but tree-sitter-r accepts it silently. Named-argument `=` inside function calls within the condition is not flagged."
+        },
         "raven.packages.enabled": {
           "type": "boolean",
           "default": true,

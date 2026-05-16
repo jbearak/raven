@@ -14,6 +14,19 @@ Diagnostics are deferred until the workspace scan completes (in `auto` backward 
 
 ## Diagnostic Categories
 
+### Parse Errors
+
+Raven surfaces parse errors from the tree-sitter R grammar whenever the document cannot be parsed as valid R. These diagnostics are always on and not configurable. Where possible Raven provides a specific, actionable message rather than a generic "Syntax error":
+
+| Message | Trigger |
+|---|---|
+| `Unclosed string literal` | An opening `"` or `'` has no matching closing delimiter |
+| `Consecutive pipe \|>`: expected an expression before this operator | Two pipe operators appear back-to-back without an intervening expression (`x \|> \|> y`) |
+| `Mismatched brackets: \`(\` opened here; close with \`)\` not \`]`` | A bracket opened with `(`, `[`, or `[[` is closed with a non-matching bracket (`c(1, 2]`) |
+| `Missing \`)`` / `Missing \`]`` / etc. | A delimiter was opened but never closed (`library(`) |
+| In R, `else` must appear on the same line as the closing `}` of the if block | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
+| `Syntax error` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
+
 ### Undefined Variables
 
 | Diagnostic | Default Severity | Trigger |
@@ -44,7 +57,7 @@ Raven checks whether each symbol reference has a visible definition — either i
 | Missing file | warning | `source()` or directive references a file that doesn't exist |
 | Circular dependency | error | Two files source each other (directly or transitively) |
 | Max chain depth exceeded | warning | Source chain exceeds configured maximum depth |
-| Out-of-scope symbol | warning | Symbol from a sourced file used before the source() call |
+| Out-of-scope symbol | warning | Symbol from a sourced file used before the `source()` call |
 | Ambiguous parent | warning | Multiple parents source this file and auto-inference can't determine which to use |
 | Redundant directive | hint | `@lsp-source` directive for a file already sourced via `source()` on the same line |
 
@@ -63,9 +76,22 @@ Always on whenever diagnostics are enabled; not configurable per rule. Applies t
 - `function(x = TRUE)` — default values in formal parameters, not assignment.
 - `if <- 1`, `for <- 1`, `while <- 1`, `function <- 1`, `repeat <- 1` — tree-sitter reports these as syntax errors directly, so the same code surfaces only one diagnostic.
 
+### Semantic Warnings
+
+Always-on diagnostics that flag likely-wrong code — not style preferences. Active as long as `raven.diagnostics.enabled` is true. Configurable severity via `raven.diagnostics.*`; honor `# @lsp-ignore` / `# @lsp-ignore-next` and `# nolint`.
+
+| Diagnostic | Default Severity | Trigger |
+|---|---|---|
+| Mixed logical operators | warning | `\|` / `\|\|` whose immediate operand is a bare `&` / `&&` (no parentheses), e.g. `a & b \| c`. `&` binds more tightly than `\|` in R, making the grouping easy to mis-read. Stops at call/subset boundaries |
+| Condition assignment | warning | `=` used as a binary operator directly inside an `if` / `while` condition (`if (x = 1)`). R rejects this as a syntax error at runtime; tree-sitter-r accepts it silently. Stops at call, parenthesized-expression, and braced-expression boundaries |
+
+**Suppression:** `# @lsp-ignore` on the line, `# @lsp-ignore-next` on the line above, or `# nolint` (with optional rule names `mixed_logical`, `condition_assignment`).
+
+**Settings:** `raven.diagnostics.mixedLogicalSeverity` (default `"warning"`), `raven.diagnostics.conditionAssignmentSeverity` (default `"warning"`).
+
 ### Style Lints
 
-Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Off by default; enable with `raven.linting.enabled` and tune per rule via the `raven.linting.*` severities. All rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
+Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Off by default; enable with `raven.linting.enabled` and tune per rule via the `raven.linting.*` severities. All style lint rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|

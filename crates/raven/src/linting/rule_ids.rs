@@ -22,6 +22,8 @@ pub const VECTOR_LOGIC: &str = "vector_logic";
 pub const FUNCTION_LEFT_PARENTHESES: &str = "function_left_parentheses";
 pub const SPACES_INSIDE: &str = "spaces_inside";
 pub const INDENTATION: &str = "indentation";
+pub const MIXED_LOGICAL: &str = "mixed_logical";
+pub const CONDITION_ASSIGNMENT: &str = "condition_assignment";
 
 #[cfg(test)]
 mod tests {
@@ -34,7 +36,7 @@ mod tests {
             ASSIGNMENT_OPERATOR, OBJECT_NAME, INFIX_SPACES, COMMENTED_CODE,
             QUOTES, COMMAS, T_AND_F_SYMBOL, SEMICOLON, EQUALS_NA,
             OBJECT_LENGTH, VECTOR_LOGIC, FUNCTION_LEFT_PARENTHESES,
-            SPACES_INSIDE, INDENTATION,
+            SPACES_INSIDE, INDENTATION, MIXED_LOGICAL, CONDITION_ASSIGNMENT,
         ];
         for id in ids {
             assert!(!id.is_empty(), "rule id must be non-empty");

@@ -14,7 +14,7 @@ The linter is off by default. The minimum `settings.json` to turn it on with def
 }
 ```
 
-All rules default to severity `hint` so they don't crowd the Problems pane. To raise a rule (e.g. line length) to `warning`, or to disable an individual rule, set its severity:
+All style lint rules default to severity `hint` so they don't crowd the Problems pane. To raise a rule (e.g. line length) to `warning`, or to disable an individual rule, set its severity:
 
 ```json
 {
@@ -181,6 +181,8 @@ The recommended path is to configure Raven via `raven.toml` at the project root 
 | `indentation_linter(indent = N)` | `raven.linting.indentationUnit = N`, `raven.linting.indentationSeverity` |
 
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"hint"` to `"warning"`.
+
+> **Note:** `mixed_logical` and `condition_assignment` are not in this table because they have no `lintr` equivalent and are not style lints — they are always-on semantic warnings configured under `raven.diagnostics.mixedLogicalSeverity` and `raven.diagnostics.conditionAssignmentSeverity`. See [Diagnostics § Semantic Warnings](diagnostics.md#semantic-warnings).
 
 If you'd like a starter `raven.linting.*` block scaffolded into `.vscode/settings.json` — every key Raven understands, each prefaced with a `//` comment naming its `lintr` equivalent — run the **Raven: Create linting settings** command from the Command Palette ([Configuration § Scaffold Commands](configuration.md#scaffold-commands)). It merges into an existing `settings.json` without disturbing unrelated keys or comments, and prompts before overwriting any pre-existing `raven.linting.*` values.
 

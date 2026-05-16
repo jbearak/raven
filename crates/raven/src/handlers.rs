@@ -369,6 +369,15 @@ pub(crate) fn diagnostics_from_snapshot(
         &mut diagnostics,
     );
 
+    // Semantic checks: always-on rules that flag likely-wrong code regardless
+    // of the style-lint master switch.
+    diagnostics.extend(crate::linting::run_semantic_checks(
+        &snapshot.text,
+        snapshot.tree.root_node(),
+        snapshot.cross_file_config.mixed_logical_severity,
+        snapshot.cross_file_config.condition_assignment_severity,
+    ));
+
     // Style/lint diagnostics. Native Rust rules driven by `lint_config`; no R
     // subprocess. `run_lints` short-circuits when the master switch is off.
     diagnostics.extend(crate::linting::run_lints(
@@ -6113,11 +6122,7 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     if node.is_error() {
-        let message = if has_unclosed_quote_child(node) {
-            "Unclosed string literal".to_string()
-        } else {
-            "Syntax error".to_string()
-        };
+        let message = classify_error(node, text);
         diagnostics.push(Diagnostic {
             range: minimize_error_range(node, text),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -6175,6 +6180,95 @@ fn has_unclosed_quote_child(node: Node) -> bool {
         }
     }
     false
+}
+
+/// Classify an ERROR node into a specific, actionable message where possible,
+/// falling back to the generic "Syntax error" for unrecognised patterns.
+///
+/// Checks (in priority order):
+/// 1. Unclosed string literal — lone `"` / `'` as a direct child.
+/// 2. Consecutive pipe — only meaningful child is `|>` / `%>%`.
+/// 3. Mismatched bracket — opens with `(`, `[`, or `[[` but closes with a
+///    non-matching bracket (detected through a nested ERROR child).
+fn classify_error(node: Node, text: &str) -> String {
+    if has_unclosed_quote_child(node) {
+        return "Unclosed string literal".to_string();
+    }
+    if let Some(msg) = detect_consecutive_pipe(node, text) {
+        return msg;
+    }
+    if let Some(msg) = detect_mismatched_bracket(node, text) {
+        return msg;
+    }
+    "Syntax error".to_string()
+}
+
+/// Returns a diagnostic message if `node` is an ERROR whose only non-trivial
+/// direct child is a pipe operator (`|>`, `%>%`, or `%|>%`). This pattern
+/// arises from code like `x |> |> y` where a second pipe appears where an
+/// expression is expected.
+fn detect_consecutive_pipe(node: Node, text: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    // Collect direct children, skipping anonymous whitespace/comment tokens
+    // that tree-sitter may inject.
+    let named_children: Vec<_> = node
+        .children(&mut cursor)
+        .filter(|n| !n.is_extra())
+        .collect();
+    if named_children.len() == 1 {
+        let child = &named_children[0];
+        let child_text = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+        if matches!(child_text, "|>" | "%>%" | "%|>%") {
+            return Some(format!(
+                "Consecutive pipe `{child_text}`: expected an expression before this operator."
+            ));
+        }
+    }
+    None
+}
+
+/// Returns a diagnostic message if `node` is an ERROR that opens with a
+/// bracket (`(`, `[`, `[[`) and contains a nested ERROR child that is a
+/// non-matching closing bracket. Catches patterns like `c(1, 2]` where the
+/// programmer used the wrong closing delimiter.
+fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+
+    // Find the first bracket-opener among direct children.
+    let opener = children.iter().find_map(|n| {
+        let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
+        if matches!(t, "(" | "[" | "[[") {
+            Some(t)
+        } else {
+            None
+        }
+    })?;
+
+    let expected_closer = match opener {
+        "(" => ")",
+        "[" => "]",
+        "[[" => "]]",
+        _ => return None,
+    };
+
+    // Look for a wrong closer token inside a nested ERROR child.
+    for child in &children {
+        if !child.is_error() {
+            continue;
+        }
+        let child_text = text
+            .get(child.start_byte()..child.end_byte())
+            .unwrap_or("")
+            .trim();
+        if matches!(child_text, ")" | "]" | "]]") && child_text != expected_closer {
+            return Some(format!(
+                "Mismatched brackets: `{opener}` opened here; \
+                 close with `{expected_closer}` not `{child_text}`."
+            ));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -6913,6 +7007,50 @@ mod syntax_error_range_tests {
                 .iter()
                 .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
             "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    // ========================================================================
+    // Specific-message tests for classify_error patterns
+    // ========================================================================
+
+    #[test]
+    fn consecutive_pipe_emits_descriptive_message() {
+        // `x |> |> y` — a second pipe where an expression is expected.
+        let code = "x |> |> y";
+        let diags = collect(code);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("Consecutive pipe")),
+            "should emit 'Consecutive pipe' message, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mismatched_bracket_emits_descriptive_message() {
+        // `c(1, 2]` — opened with `(` but closed with `]`.
+        let code = "c(1, 2]";
+        let diags = collect(code);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("Mismatched brackets")),
+            "should emit 'Mismatched brackets' message, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn well_matched_brackets_no_mismatch_message() {
+        // `c(1, 2)` — correctly matched, no diagnostic expected.
+        let code = "c(1, 2)";
+        let diags = collect(code);
+        assert!(
+            diags.is_empty(),
+            "well-matched brackets should produce no diagnostics, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
@@ -8227,6 +8365,58 @@ mod invalid_assignment_target_tests {
         // `TRUE` starts at column 7 in UTF-16: 🦀(2) + " <- ("(5) = 7.
         assert_eq!(diags[0].range.start.character, 7);
         assert_eq!(diags[0].range.end.character, 11);
+    }
+}
+
+/// Regression guard: semantic-warning rules must fire through `diagnostics_from_snapshot`
+/// even when the style-lint master switch (`LintConfig::enabled`) is off.
+///
+/// These rules live in the always-on diagnostic pipeline (`CrossFileConfig`), not in the
+/// opt-in lint pipeline (`LintConfig`). A future refactor that accidentally moved them
+/// behind `run_lints` would silently suppress them for any user with linting disabled.
+#[cfg(test)]
+mod semantic_warning_pipeline_tests {
+    use super::{diagnostics_from_snapshot, DiagCancelToken, DiagnosticsSnapshot};
+    use crate::linting::LintConfig;
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::Url;
+
+    fn build_snapshot_with_lint_disabled(code: &str) -> (DiagnosticsSnapshot, Url) {
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        // Disable the opt-in lint master switch — semantic rules must still fire.
+        state.lint_config = LintConfig {
+            enabled: false,
+            ..LintConfig::default()
+        };
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        (snapshot, uri)
+    }
+
+    #[test]
+    fn mixed_logical_fires_when_linting_disabled() {
+        let (snapshot, uri) = build_snapshot_with_lint_disabled("x <- a & b | c\n");
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            diags.iter().any(|d| d.message.contains("parentheses")),
+            "mixed_logical must fire regardless of LintConfig::enabled; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn condition_assignment_fires_when_linting_disabled() {
+        let (snapshot, uri) = build_snapshot_with_lint_disabled("if (x = 1) x\n");
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            diags.iter().any(|d| d.message.contains("==")),
+            "condition_assignment must fire regardless of LintConfig::enabled; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -43367,3 +43557,4 @@ mod issue_149_utf16_handlers {
         assert_eq!(parsed, vec!["`weird name`".to_string(), "pkg".to_string()]);
     }
 }
+
