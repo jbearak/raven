@@ -906,25 +906,6 @@
           "default": "warning",
           "description": "Severity level for diagnostics when symbols are used before they are available in scope. This can occur when referencing symbols from a sourced file before the source() call."
         },
-        "raven.crossFile.ambiguousParentSeverity": {
-          "type": "string",
-          "enum": [
-            "error",
-            "warning",
-            "information",
-            "hint",
-            "off"
-          ],
-          "enumDescriptions": [
-            "Report ambiguous parent resolution as errors",
-            "Report ambiguous parent resolution as warnings",
-            "Report ambiguous parent resolution as information",
-            "Report ambiguous parent resolution as hints",
-            "Disable ambiguous parent diagnostics"
-          ],
-          "default": "warning",
-          "description": "Severity level for diagnostics when a file's parent cannot be unambiguously determined. This occurs when multiple files source the same child file and the call site cannot be resolved."
-        },
         "raven.crossFile.maxChainDepthSeverity": {
           "type": "string",
           "enum": [

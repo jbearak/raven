@@ -100,7 +100,6 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | `raven.crossFile.circularDependencySeverity` | `"error"` | Circular dependency detected |
 | `raven.crossFile.maxChainDepthSeverity` | `"warning"` | Source chain exceeds max depth |
 | `raven.crossFile.outOfScopeSeverity` | `"warning"` | Symbol used before it's in scope |
-| `raven.crossFile.ambiguousParentSeverity` | `"warning"` | **Reserved.** Parsed for backwards compatibility but no diagnostic is currently emitted under this key. |
 | `raven.crossFile.redundantDirectiveSeverity` | `"hint"` | Redundant `@lsp-source` directive |
 | `raven.diagnostics.mixedLogicalSeverity` | `"warning"` | `\|` / `\|\|` whose immediate operand is a bare `&` / `&&` (not wrapped in parentheses). Since `&` binds tighter than `\|` in R, the grouping is silent — the rule asks for explicit parentheses. Applies everywhere, not just inside `if` / `while` conditions. |
 | `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | Binary `=` used directly inside an `if` / `while` condition (likely `==` intended). |

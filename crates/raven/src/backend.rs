@@ -208,12 +208,6 @@ pub(crate) fn parse_cross_file_config(
             config.out_of_scope_severity = parse_severity(sev);
         }
         if let Some(sev) = cross_file
-            .get("ambiguousParentSeverity")
-            .and_then(|v| v.as_str())
-        {
-            config.ambiguous_parent_severity = parse_severity(sev);
-        }
-        if let Some(sev) = cross_file
             .get("maxChainDepthSeverity")
             .and_then(|v| v.as_str())
         {
@@ -405,10 +399,6 @@ pub(crate) fn parse_cross_file_config(
         config.circular_dependency_severity
     );
     log::info!("    out_of_scope: {:?}", config.out_of_scope_severity);
-    log::info!(
-        "    ambiguous_parent: {:?}",
-        config.ambiguous_parent_severity
-    );
     log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
     log::info!(
         "    redundant_directive: {:?}",
