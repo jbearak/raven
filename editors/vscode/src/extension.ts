@@ -33,6 +33,7 @@ import {
     register_chunks_navigation_and_highlight,
     register_chunks_with_terminal,
 } from './chunks';
+import { registerRSnippetCompletionsForRmdAndQuarto } from './rSnippetProvider';
 import { register_r_package_detection } from './r-package-detection';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
@@ -236,12 +237,19 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_inspection_commands(context);
         register_build_commands(context);
         register_chunks_with_terminal(context);
-    }
 
-    // Chunk navigation and highlighting work without an R terminal, so register
-    // them regardless of `raven.rConsole.activation` — REditorSupport / Positron
-    // users still get the visual aids and cursor-motion commands.
-    register_chunks_navigation_and_highlight(context);
+        // Chunk navigation and highlighting overlap with REditorSupport's
+        // chunk surfaces, so they're gated behind R-console activation. With
+        // REditorSupport / Positron handling chunks, Raven steps aside.
+        register_chunks_navigation_and_highlight(context);
+
+        // R snippets for `rmd` / `quarto` are registered programmatically here
+        // (rather than statically in package.json) so they only appear when
+        // Raven's R-console is active. The static `language: "r"` registration
+        // in package.json continues to provide them in `.R` files. See
+        // docs/coexistence.md.
+        registerRSnippetCompletionsForRmdAndQuarto(context);
+    }
 
     // Package-mode context key. The `raven.isRPackage` key gates the
     // Build commands' palette entries and editor-title submenu — every

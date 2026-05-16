@@ -259,13 +259,13 @@
         "command": "raven.goToNextChunk",
         "key": "ctrl+alt+n",
         "mac": "cmd+alt+n",
-        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto)"
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
         "command": "raven.goToPreviousChunk",
         "key": "ctrl+alt+shift+n",
         "mac": "cmd+alt+shift+n",
-        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto)"
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       }
     ],
     "submenus": [
@@ -286,6 +286,18 @@
     ],
     "menus": {
       "commandPalette": [
+        {
+          "command": "raven.goToNextChunk",
+          "when": "raven.rConsoleEnabled"
+        },
+        {
+          "command": "raven.goToPreviousChunk",
+          "when": "raven.rConsoleEnabled"
+        },
+        {
+          "command": "raven.selectCurrentChunk",
+          "when": "raven.rConsoleEnabled"
+        },
         {
           "command": "raven.build.loadAll",
           "when": "raven.rConsoleEnabled && raven.isRPackage"
@@ -569,15 +581,7 @@
       },
       {
         "language": "rmd",
-        "path": "./snippets/r.json"
-      },
-      {
-        "language": "rmd",
         "path": "./snippets/rmarkdown.json"
-      },
-      {
-        "language": "quarto",
-        "path": "./snippets/r.json"
       },
       {
         "language": "quarto",

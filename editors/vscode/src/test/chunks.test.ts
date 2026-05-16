@@ -231,14 +231,22 @@ suite('chunk commands: registration and behavior', () => {
 
     test('every chunk command is registered in VS Code', async () => {
         // Skip when R-console activation is disabled (REditorSupport / Positron):
-        // the run / CodeLens-positional commands aren't registered then. The
-        // three navigation commands always are.
+        // chunk navigation, decorations, and run / CodeLens-positional commands
+        // are all gated together so coexistence users don't get duplicate
+        // surfaces. The assertion still validates the package.json declarations
+        // in the next test, which run unconditionally.
         const all = new Set(await vscode.commands.getCommands(true));
         const r_console_disabled = !all.has('raven.runLineOrSelection');
-        const expected = r_console_disabled
-            ? ['raven.goToNextChunk', 'raven.goToPreviousChunk', 'raven.selectCurrentChunk']
-            : CHUNK_COMMANDS;
-        for (const cmd of expected) {
+        if (r_console_disabled) {
+            for (const cmd of CHUNK_COMMANDS) {
+                assert.ok(
+                    !all.has(cmd),
+                    `expected chunk command "${cmd}" to be absent when R-console is disabled`,
+                );
+            }
+            return;
+        }
+        for (const cmd of CHUNK_COMMANDS) {
             assert.ok(
                 all.has(cmd),
                 `expected chunk command "${cmd}" to be registered`,
@@ -267,7 +275,47 @@ suite('chunk commands: registration and behavior', () => {
         }
     });
 
+    test('chunk navigation surfaces are gated behind raven.rConsoleEnabled', () => {
+        // The navigation commands, their keybindings, and their command-palette
+        // entries must all require `raven.rConsoleEnabled` — REditorSupport /
+        // Positron ship equivalent chunk navigation, so coexistence users
+        // should not see duplicates. See `docs/coexistence.md`.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const pkg = require('../../package.json') as {
+            contributes: {
+                keybindings: Array<{ command: string; when?: string }>;
+                menus: { commandPalette: Array<{ command: string; when?: string }> };
+            };
+        };
+        const NAV = ['raven.goToNextChunk', 'raven.goToPreviousChunk', 'raven.selectCurrentChunk'];
+
+        for (const cmd of NAV) {
+            const palette = pkg.contributes.menus.commandPalette.find(
+                (entry) => entry.command === cmd,
+            );
+            assert.ok(palette, `command palette must gate ${cmd}`);
+            assert.ok(
+                palette.when?.includes('raven.rConsoleEnabled'),
+                `${cmd} command palette entry must require raven.rConsoleEnabled`,
+            );
+        }
+
+        for (const cmd of ['raven.goToNextChunk', 'raven.goToPreviousChunk']) {
+            const binding = pkg.contributes.keybindings.find(
+                (entry) => entry.command === cmd,
+            );
+            assert.ok(binding, `${cmd} should have a keybinding`);
+            assert.ok(
+                binding.when?.includes('raven.rConsoleEnabled'),
+                `${cmd} keybinding must require raven.rConsoleEnabled`,
+            );
+        }
+    });
+
     test('goToNextChunk places cursor inside the next R chunk body', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.goToNextChunk');
+        if (r_console_disabled) return; // command not registered in this env
         const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 0); // before any chunk
         await vscode.commands.executeCommand('raven.goToNextChunk');
@@ -283,6 +331,9 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('goToPreviousChunk walks chunks in reverse', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.goToPreviousChunk');
+        if (r_console_disabled) return;
         const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the second R chunk body
         await vscode.commands.executeCommand('raven.goToPreviousChunk');
@@ -291,6 +342,9 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('selectCurrentChunk selects only the body of the chunk under the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.selectCurrentChunk');
+        if (r_console_disabled) return;
         const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the "second" R chunk
         await vscode.commands.executeCommand('raven.selectCurrentChunk');
@@ -387,6 +441,9 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('# %% cell mode in .R: selectCurrentChunk grabs the cell body', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.selectCurrentChunk');
+        if (r_console_disabled) return;
         const editor = await open_doc(R_CELL_FIXTURE, 'r');
         place_cursor(editor, 1); // inside cell "one"
         await vscode.commands.executeCommand('raven.selectCurrentChunk');
