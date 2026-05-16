@@ -497,6 +497,38 @@
             closeContextMenu();
             return;
         }
+        // Plain (no-modifier) navigation keys — added for issue #183.
+        // We deliberately ignore any modifier so platform shortcuts
+        // (Shift+End to extend selection, Cmd+End in some apps to jump-
+        // and-extend) fall through to the browser/OS unchanged. The
+        // viewportEl null guard handles the brief window between mount
+        // and the bind:this assignment.
+        if (!meta && !e.shiftKey && !e.altKey && viewportEl) {
+            switch (e.key) {
+                case 'End':
+                    e.preventDefault();
+                    // scrollHeight - clientHeight is the canonical
+                    // browser-clamped maximum. The inner .grid div is
+                    // height-capped at MAX_SCROLL_PX + ROW_HEIGHT, so
+                    // this lands at or near the model's maxPhysical;
+                    // logicalScrollTop's clamp absorbs any DOM-vs-model
+                    // rounding mismatch.
+                    viewportEl.scrollTop = viewportEl.scrollHeight - viewportEl.clientHeight;
+                    return;
+                case 'Home':
+                    e.preventDefault();
+                    viewportEl.scrollTop = 0;
+                    return;
+                case 'PageDown':
+                    e.preventDefault();
+                    viewportEl.scrollTop += viewportEl.clientHeight;
+                    return;
+                case 'PageUp':
+                    e.preventDefault();
+                    viewportEl.scrollTop -= viewportEl.clientHeight;
+                    return;
+            }
+        }
         if (meta && (e.key === 'a' || e.key === 'A')) {
             e.preventDefault();
             selection.selectAll(nrow, visibleCols);

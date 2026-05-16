@@ -31,6 +31,25 @@ async function pollForPanel(
     return false;
 }
 
+/** Poll a predicate at 100 ms intervals until it returns a truthy value or
+ *  the deadline elapses. Returns the truthy value on success or `undefined`
+ *  on timeout (caller asserts). */
+async function pollFor<T>(
+    predicate: () => T | undefined,
+    timeoutMs: number,
+    intervalMs = 100,
+): Promise<T | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const value = predicate();
+        if (value !== undefined && value !== null && value !== false) {
+            return value as T;
+        }
+        await sleep(intervalMs);
+    }
+    return undefined;
+}
+
 suite('data-viewer smoke tests', function (this: Mocha.Suite) {
     // Each test may need to wait for R startup + arrow write + HTTP round-trip.
     this.timeout(120000);
@@ -150,5 +169,52 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             after.includes('mtcars'),
             `"mtcars" panel must still be open after replace; panels: ${JSON.stringify(after)}`,
         );
+    });
+
+    test('End key reaches the last row in a 700K-row data frame', async function () {
+        // Smallest size that engages the cap (700_000 × 24 = 16.8 M >
+        // MAX_SCROLL_PX of 15 M) — exactly the failure mode from #183.
+        const N = 700_000;
+
+        await api.sendToRTerminal(
+            `big <- as.data.frame(matrix(rnorm(${N} * 5), `
+            + `nrow = ${N}, ncol = 5)); View(big)`,
+        );
+
+        // Wait for the panel to exist. R startup + matrix rnorm + Arrow
+        // write can take several seconds on a cold runner.
+        const panelAppeared = await pollForPanel(api, 'big', 60000);
+        assert.ok(panelAppeared, 'panel "big" did not appear within 60 s');
+
+        // Reset scroll to the top. A previous --watch run could have left
+        // the same-shape panel scrolled to the bottom; applyInitOrReplace's
+        // sameDataset branch intentionally preserves visibleRangeStart, so
+        // an unconditional 'end < N/2' gate would deadlock on that.
+        // Press Home as a deterministic reset (this also exercises Home
+        // as a bonus side check).
+        await api.pressDataViewerKey('big', 'Home');
+
+        // Wait for the Home reset to land AND rows for the top of the
+        // grid to be fetched. A mount/init lifecycle reports
+        // {start: 0, end: 0}, which would satisfy 'end < N/2' alone — so
+        // require end > 0 too.
+        const topRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            return r && r.end > 0 && r.end < N / 2 ? r : undefined;
+        }, 30000);
+        assert.ok(topRange,
+            `Home reset did not land at the top within 30 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
+
+        // Drive End and wait for the bottom-row fetch to land.
+        await api.pressDataViewerKey('big', 'End');
+
+        const bottomRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            return r && r.end === N ? r : undefined;
+        }, 30000);
+        assert.ok(bottomRange,
+            `End key did not reach the last row within 30 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
     });
 });
