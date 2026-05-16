@@ -8533,87 +8533,59 @@ mod semantic_warning_pipeline_tests {
     }
 }
 
-/// Detect and report diagnostics for `else` keywords that appear on a new line
-/// after the closing brace of an `if` block.
+/// Detect and report diagnostics for `else` keywords that R rejects but
+/// tree-sitter-r accepts silently. Covers two related shapes:
 ///
-/// In R, `else` must appear on the same line as the closing `}` of the `if` block.
-/// When `else` is on a new line, R treats the `if` as complete and `else` becomes
-/// an unexpected token.
+/// 1. `else` on a new line after an `if` block — R requires `else` on the
+///    same line as the closing `}`. tree-sitter-r parses the trailing `else`
+///    as a bare `identifier`, so it never appears as an ERROR node.
+/// 2. Orphan `else` at statement level with no preceding `if` body (issue
+///    #258): e.g. `else { 1 }`, `foo()\nelse { 1 }`, or `else` as the first
+///    expression inside a `{ … }` block.
 ///
-/// # Implementation Note
+/// Both shapes parse to an `identifier` whose text is `"else"`. The two cases
+/// share traversal and range emission, but get different messages so the
+/// suggested fix matches the actual mistake.
 ///
-/// When `else` appears on a new line after an `if` block, tree-sitter-r parses it
-/// as an `identifier` node (not an `"else"` keyword node) that is a sibling of the
-/// `if_statement` in the parent node. This function detects this pattern by:
-/// 1. Finding `identifier` nodes with text "else"
-/// 2. Checking if the preceding sibling is an `if_statement`
-/// 3. Comparing line numbers to determine if `else` is on a new line
-///
-/// # Arguments
-/// * `node` - The root AST node to traverse
-/// * `text` - The source text for extracting node content
-/// * `diagnostics` - Vector to append diagnostics to
-///
-/// # Examples
-///
-/// Invalid (emits diagnostic):
-/// ```r
-/// if (cond) { body }
-/// else { body2 }
-/// ```
-///
-/// Valid (no diagnostic):
-/// ```r
-/// if (cond) { body } else { body2 }
-/// ```
-///
-/// **Validates: Requirements 1.1, 1.2, 1.3, 4.2**
+/// Out of scope: `else` inside an expression context (e.g. `x <- else`,
+/// `f(else)`) — parent kind is not `program`/`braced_expression` there, and a
+/// different rule should describe the right fix.
 fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
-    // Case 1: Check if this node is an identifier with text "else"
-    // When else is on a new line at the top level, tree-sitter parses it as an identifier
-    if node.kind() == "identifier" {
-        let node_text_str = node_text(node, text);
-        if node_text_str == "else" {
-            // Skip if this node is already marked as an error by tree-sitter
-            // to avoid duplicate diagnostics (Requirement 4.2)
-            if node.is_error() {
-                // Already handled by collect_syntax_errors
-            } else if let Some(parent) = node.parent() {
-                if parent.is_error() {
-                    // Parent is error, skip to avoid duplicate
-                } else {
-                    // Check if there's a preceding if_statement (skipping over comments)
-                    // This indicates an orphaned else on a new line
-                    // Validates: Requirement 5.3 - comments between `}` and `else` should not
-                    // prevent detection when else is on a new line
-                    let mut prev = node.prev_sibling();
-                    while let Some(sibling) = prev {
-                        if sibling.kind() == "comment" {
-                            // Skip comments and continue looking
-                            prev = sibling.prev_sibling();
-                        } else if sibling.kind() == "if_statement" {
-                            // Found the preceding if_statement
+    // Case 1: identifier `else` at statement level. tree-sitter-r parses an
+    // orphan `else` as a regular identifier; this branch covers both the
+    // "newline after `if {…}`" pattern and the "no preceding `if` at all"
+    // pattern from issue #258. Only statement-level parents (`program` and
+    // `braced_expression`) are considered — `f(else)` / `x <- else` etc. have
+    // a different parent kind and live outside the scope of this rule.
+    if node.kind() == "identifier" && node_text(node, text) == "else" && !node.is_error() {
+        if let Some(parent) = node.parent() {
+            let parent_is_stmt_level = matches!(parent.kind(), "program" | "braced_expression");
+            if parent_is_stmt_level && !parent.is_error() {
+                // Look back through preceding siblings (skipping comments) for
+                // an `if_statement`. If found and the `else` is on a later
+                // line than the closing `}`, emit the "same-line" diagnostic.
+                // Otherwise (no preceding `if` at all, or some other prior
+                // sibling), emit the orphan-else diagnostic.
+                let mut prev = node.prev_sibling();
+                let mut handled = false;
+                while let Some(sibling) = prev {
+                    match sibling.kind() {
+                        "comment" => prev = sibling.prev_sibling(),
+                        "if_statement" => {
                             let brace_line = find_closing_brace_line(&sibling, text);
                             let else_start_line = node.start_position().row;
-
-                            if let Some(brace_line) = brace_line {
-                                // If else is on a different line than the closing brace, emit diagnostic
-                                if else_start_line > brace_line {
-                                    emit_else_newline_diagnostic(node, diagnostics);
-                                }
-                            } else {
-                                // Fallback: use the end line of the if_statement
-                                let if_end_line = sibling.end_position().row;
-                                if else_start_line > if_end_line {
-                                    emit_else_newline_diagnostic(node, diagnostics);
-                                }
+                            let ref_line = brace_line.unwrap_or_else(|| sibling.end_position().row);
+                            if else_start_line > ref_line {
+                                emit_else_newline_diagnostic(node, diagnostics);
                             }
-                            break;
-                        } else {
-                            // Found something other than comment or if_statement, stop looking
+                            handled = true;
                             break;
                         }
+                        _ => break,
                     }
+                }
+                if !handled {
+                    emit_orphan_else_diagnostic(node, diagnostics);
                 }
             }
         }
@@ -8670,6 +8642,28 @@ fn emit_else_newline_diagnostic(node: Node, diagnostics: &mut Vec<Diagnostic>) {
         },
         severity: Some(DiagnosticSeverity::ERROR),
         message: "In R, 'else' must appear on the same line as the closing '}' of the if block"
+            .to_string(),
+        ..Default::default()
+    });
+}
+
+/// Emit a diagnostic for a statement-level `else` with no preceding `if` body.
+/// Distinct from `emit_else_newline_diagnostic` so users see the right hint:
+/// here the fix is to add the missing `if`, not to move `else` up a line.
+fn emit_orphan_else_diagnostic(node: Node, diagnostics: &mut Vec<Diagnostic>) {
+    diagnostics.push(Diagnostic {
+        range: Range {
+            start: Position::new(
+                node.start_position().row as u32,
+                node.start_position().column as u32,
+            ),
+            end: Position::new(
+                node.end_position().row as u32,
+                node.end_position().column as u32,
+            ),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: "'else' without a preceding 'if' body: in R, 'else' must follow `if (...) {...}` on the same line"
             .to_string(),
         ..Default::default()
     });
@@ -16292,20 +16286,28 @@ clean_data <- function(x) {
     /// Test that standalone `else` without preceding `if` does NOT emit a duplicate diagnostic.
     /// Tree-sitter handles this as a general syntax error, so we should not emit our
     /// newline-specific diagnostic to avoid duplicates.
-    /// Validates: Requirement 5.1 - standalone else should not emit newline-specific diagnostic
+    /// Validates: Requirement 5.1 — standalone `else` should emit exactly one
+    /// orphan-else diagnostic (not the "same line" variant intended for the
+    /// `if {…}\nelse` pattern). Issue #258: tree-sitter-r does NOT flag
+    /// `else {z}` itself, so this collector is the only thing that does.
     #[test]
-    fn test_else_newline_standalone_else_no_duplicate() {
+    fn test_else_newline_standalone_else_emits_orphan_diagnostic() {
         let code = "else {z}";
         let tree = parse_r_code(code);
         let mut diagnostics = Vec::new();
         super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
 
-        // The standalone else is a syntax error handled by tree-sitter.
-        // Our detector should NOT emit a diagnostic for this case to avoid duplicates.
         assert_eq!(
             diagnostics.len(),
-            0,
-            "Should NOT emit newline-specific diagnostic for standalone else (tree-sitter handles this)"
+            1,
+            "Standalone `else` must emit exactly one orphan-else diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diagnostics[0].message.contains("without a preceding"),
+            "should use the orphan-else (not the same-line) message, got: {}",
+            diagnostics[0].message
         );
     }
 
@@ -16490,6 +16492,105 @@ clean_data <- function(x) {
         assert!(
             message.contains("if"),
             "Requirement 3.3: Message should mention 'if'"
+        );
+    }
+
+    // ========================================================================
+    // Orphan-else (issue #258) — `else` at statement level with no preceding
+    // `if` body. tree-sitter-r parses bare `else` as an identifier, so without
+    // a dedicated check Raven only emits a confusing "undefined variable" or
+    // nothing at all.
+    // ========================================================================
+
+    /// `else { 1 }` at the top of a file — no preceding `if` at all.
+    /// Should still emit an orphan-else diagnostic.
+    #[test]
+    fn test_orphan_else_at_program_top_level() {
+        let code = "else { 1 }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "Standalone `else` at program top level should emit one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diagnostics[0].message.contains("else"),
+            "message should mention `else`, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// `foo()\nelse { 1 }` — preceding sibling is a call, not an if_statement.
+    /// The existing detector skips this; orphan-else handling must cover it.
+    #[test]
+    fn test_orphan_else_after_non_if_statement() {
+        let code = "foo()\nelse { 1 }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`else` after a non-if statement should emit one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    /// `function() { else { 1 } }` — orphan `else` inside a brace_list, with
+    /// no preceding `if`. Should emit a diagnostic.
+    #[test]
+    fn test_orphan_else_inside_brace_list() {
+        let code = "function() { else { 1 } }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`else` inside a brace_list with no preceding if should emit one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    /// `` `else` <- 1 `` — backtick-quoted `else` is a legal R identifier, not
+    /// the `else` keyword. Must NOT trigger the orphan-else diagnostic.
+    #[test]
+    fn test_orphan_else_backtick_quoted_is_ignored() {
+        let code = "`else` <- 1";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert!(
+            diagnostics.is_empty(),
+            "Backtick-quoted `else` must not trigger orphan-else, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `\"else\" <- 1` — using `else` as a string literal (e.g. an assign())
+    /// target). The string is not an identifier so the orphan-else detector
+    /// must not fire.
+    #[test]
+    fn test_orphan_else_inside_string_literal_is_ignored() {
+        let code = "x <- \"else\"";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+
+        assert!(
+            diagnostics.is_empty(),
+            "`else` inside a string literal must not trigger orphan-else, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
