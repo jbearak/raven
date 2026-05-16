@@ -155,7 +155,9 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 ## Migrating from `.lintr`
 
-Raven does not read `.lintr` files — its rules are configured per VS Code settings instead. The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
+The recommended path is to configure Raven via `raven.toml` at the project root (see [Configuration § Project config](configuration.md#project-config-ravenstoml)). The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
+
+> **Runtime support:** When no `raven.toml` is present at the project root, Raven reads a documented subset of `.lintr` at startup. The mapping table below is the supported surface. Forms outside the supported subset log a single batch warning and are otherwise ignored.
 
 | `.lintr` linter | Raven settings |
 |---|---|

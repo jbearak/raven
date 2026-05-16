@@ -2,6 +2,52 @@
 
 Most settings are exposed as VS Code settings — search for "raven" in Settings (Cmd/Ctrl-,). A handful of advanced server-side knobs are only available via LSP initialization options; those are noted in the tables below.
 
+## Project config: `raven.toml`
+
+The recommended way to configure Raven is a `raven.toml` file at the project root. Every editor and the `raven lint` CLI read this file, so a single committed config governs both interactive editing and CI.
+
+### Discovery
+
+Raven walks upward from each workspace folder looking for `raven.toml`. If none is found, `.lintr` is read for linting settings only (subset; see [Linting](linting.md#migrating-from-lintr)).
+
+### Precedence
+
+Per-key. For each setting, project values win over the LSP client's `initializationOptions` / `did_change_configuration` payload. Keys not pinned by the project file continue to come from client settings (or Raven's defaults if neither layer specifies them).
+
+### Schema
+
+The TOML mirrors the LSP `initializationOptions` shape 1:1. The reference table below lists every key; the same key in `raven.toml` is at the path indicated.
+
+```toml
+[linting]
+enabled = true
+lineLength = 100
+lineLengthSeverity = "warning"
+
+[[linting.overrides]]
+files = ["tests/**/*.R"]
+lineLength = 120
+
+[crossFile]
+maxChainDepth = 10
+
+[packages]
+enabled = true
+
+[diagnostics]
+undefinedVariableSeverity = "warning"
+```
+
+### Per-file overrides
+
+`[[linting.overrides]]` is an array of glob → patch entries. Globs are anchored at the project root. Order matters: later entries win on conflicts. Setting `enabled = false` in an override skips matching files entirely.
+
+### Live reload
+
+Edits to `raven.toml` are picked up live for: every `[linting]` key (including `overrides`), `[crossFile]` (except `packageMode`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. Open documents re-publish diagnostics automatically.
+
+Changes to `[packages]` (any key), `[crossFile].packageMode`, or the package-watcher knobs (`packagesWatchLibraryPaths`, `packagesWatchDebounceMs`) currently require restarting Raven; the server surfaces a warning when it detects such a change so the user knows. This v1 scope keeps the live-reload path narrow — rebuilding the package library involves an R subprocess and the watcher restart is non-trivial to wire safely. A follow-up will lift the restriction once the post-recompute reconciliation logic in `did_change_configuration` is extracted into a shared helper.
+
 ## Diagnostics
 
 | Setting | Default | Description |
