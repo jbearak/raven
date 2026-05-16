@@ -6216,12 +6216,25 @@ impl Backend {
 /// rather than borrowing `&Backend`.
 ///
 /// Concurrency: safe to invoke from multiple tasks for distinct URIs.
-/// All `state` and `diagnostics_gate` accesses use brief read locks
-/// scoped to the URI's gate entry; the monotonic publish predicate is
-/// atomically committed via
-/// [`crate::cross_file::CrossFileDiagnosticsGate::try_consume_publish`].
-/// The gate uses per-URI `HashMap` entries so concurrent calls for
-/// different URIs do not interfere.
+/// The monotonic publish predicate is atomically committed via
+/// [`crate::cross_file::CrossFileDiagnosticsGate::try_consume_publish`],
+/// which writes to per-URI `HashMap` entries — concurrent commits for
+/// different URIs touch disjoint state, contending only on the briefly
+/// held global `RwLock<HashMap<Url, _>>` write lock around the
+/// `HashMap::get`/`HashMap::insert` call.
+///
+/// Known caveat (pre-existing, NOT introduced by parallelizing): the
+/// initial `state.read().await` window covers `handlers::diagnostics`,
+/// which builds a `DiagnosticsSnapshot` AND runs
+/// `diagnostics_from_snapshot` under the same lock. The snapshot pattern
+/// is designed to release the lock between those two phases, but the
+/// convenience wrapper used here keeps both phases under the lock. This
+/// limits the contention drop from parallelization for the in-lock
+/// phase; the async missing-file checks and the LSP send (the dominant
+/// async I/O) still overlap freely. Splitting `handlers::diagnostics`
+/// into a snapshot-build + lock-release + snapshot-use sequence is a
+/// separate refactor — see the locking-discipline note in
+/// `CLAUDE.md`.
 pub(crate) async fn publish_diagnostics_inner(
     state_arc: &Arc<RwLock<WorldState>>,
     client: &Client,
@@ -9799,11 +9812,19 @@ mod project_config_initialize_tests {
     }
 
     /// A live reload of `raven.toml` must reapply `packages.enabled` —
-    /// flipping it `false` should rebuild `PackageLibrary` to the empty
-    /// instance and drop `package_library_ready` without requiring a
-    /// server restart. The pre-extraction code path warned the user to
-    /// restart instead; the shared reconciliation helper now drives the
-    /// rebuild from both call sites.
+    /// flipping it `false` should drive the package-rebuild path
+    /// (replacing `state.package_library` with a fresh empty instance)
+    /// without requiring a server restart. The pre-extraction code path
+    /// warned the user to restart instead; the shared reconciliation
+    /// helper now drives the rebuild from both call sites.
+    ///
+    /// `package_library_ready` defaults to `false` and stays false until
+    /// `rebuild_package_library` runs successfully against an R
+    /// subprocess (which we don't have in unit tests). So instead of
+    /// asserting on that flag, we capture the `package_library` Arc's
+    /// raw pointer before and after the reload — a different pointer is
+    /// proof the rebuild path replaced the instance, which is the
+    /// specific behavior this PR adds to the watched-files branch.
     #[tokio::test]
     async fn watched_files_reload_disables_packages_live() {
         use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
@@ -9830,6 +9851,10 @@ mod project_config_initialize_tests {
             .unwrap();
         // Sanity: project file initially enables packages.
         assert!(backend.state.read().await.cross_file_config.packages_enabled);
+        // Capture the package_library Arc identity so we can prove the
+        // reload's rebuild path replaced the instance.
+        let library_before =
+            std::sync::Arc::as_ptr(&backend.state.read().await.package_library);
 
         // Edit raven.toml to disable packages on disk.
         fs::write(
@@ -9847,12 +9872,17 @@ mod project_config_initialize_tests {
             })
             .await;
 
-        // Effective config now reflects the new value (live reload), and
-        // the package_library_ready flag has been dropped — confirming the
-        // reconciliation helper ran the rebuild path rather than just
-        // warning the user.
+        // Effective config reflects the new value (live reload) AND the
+        // package_library Arc was replaced — proof the rebuild path ran
+        // rather than the prior warn-only behavior.
         let state = backend.state.read().await;
         assert!(!state.cross_file_config.packages_enabled);
+        let library_after = std::sync::Arc::as_ptr(&state.package_library);
+        assert!(
+            !std::ptr::eq(library_before, library_after),
+            "expected package_library to be replaced by the reload's rebuild path"
+        );
+        assert!(state.package_library.lib_paths().is_empty());
         assert!(!state.package_library_ready);
     }
 
@@ -9920,9 +9950,18 @@ mod project_config_initialize_tests {
     /// driver, all spawned publish tasks must be joined before the
     /// handler returns — otherwise a later `did_change` could race a
     /// still-running reload publish and corrupt monotonic-version
-    /// ordering. This test exercises 12 open `.R` files (above the
-    /// concurrency cap of 8) and asserts that all of them end up with
-    /// their `last_published_version` advanced.
+    /// ordering.
+    ///
+    /// We exercise 12 open `.R` files (above the concurrency cap of 8).
+    /// The reload's reconciliation helper marks every open URI for
+    /// force-republish (counter increment); a successful publish
+    /// decrements that counter via `try_consume_publish`. Asserting that
+    /// every URI's `force_republish_count_for_test == 0` after the
+    /// handler returns is a stronger signal than checking
+    /// `last_published_version` — the gate's prior-publish state from
+    /// `did_open` would already make `can_publish(uri, 1)` return
+    /// false, so that observable could pass without the reload doing
+    /// anything.
     #[tokio::test]
     async fn watched_files_reload_publishes_all_open_documents_in_parallel() {
         use tower_lsp::lsp_types::{
@@ -9969,6 +10008,20 @@ mod project_config_initialize_tests {
             uris.push(uri);
         }
 
+        // Sanity: pre-reload, no outstanding force-republish markers — the
+        // reload is the only path under test that will mark and then
+        // consume them.
+        {
+            let state = backend.state.read().await;
+            for uri in &uris {
+                assert_eq!(
+                    state.diagnostics_gate.force_republish_count_for_test(uri),
+                    0,
+                    "unexpected pre-reload force-republish marker for {uri}"
+                );
+            }
+        }
+
         // Edit raven.toml and trigger a reload.
         fs::write(
             tmp.path().join("raven.toml"),
@@ -9984,15 +10037,16 @@ mod project_config_initialize_tests {
             })
             .await;
 
-        // Every open URI's gate should have advanced to version 1 — that's
-        // proof every spawned publish task ran to completion (a stuck or
-        // un-awaited task would leave its URI's `last_published_version`
-        // unset).
+        // After the handler returns, every URI's force-republish marker
+        // (set by the reconciliation helper) must have been consumed by
+        // a successful `try_consume_publish` — a stuck or un-awaited
+        // task would leave its URI's counter at 1.
         let state = backend.state.read().await;
         for uri in &uris {
-            assert!(
-                !state.diagnostics_gate.can_publish(uri, 1),
-                "publish_diagnostics did not commit gate for {uri}"
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(uri),
+                0,
+                "reload's parallel publish driver left an outstanding force-republish marker for {uri}",
             );
         }
     }
@@ -10000,17 +10054,27 @@ mod project_config_initialize_tests {
     /// The `raven/projectConfigLoaded` payload schema is a contract with
     /// the VS Code extension. Lock it down: `path: string` ⇒
     /// `source: "raven.toml" | ".lintr"`; `path: None` ⇒ both fields
-    /// JSON `null`.
+    /// JSON `null`. The `path` field uses `Path::display()`, which is
+    /// platform-dependent — build the test paths from a tempdir so the
+    /// assertion stays correct on both Unix and Windows.
     #[test]
     fn project_config_loaded_payload_shape() {
-        let raven_toml = std::path::Path::new("/proj/raven.toml");
-        let payload = super::build_project_config_loaded_payload(Some(raven_toml));
-        assert_eq!(payload["path"].as_str(), Some("/proj/raven.toml"));
+        let tmp = TempDir::new().unwrap();
+
+        let raven_toml = tmp.path().join("raven.toml");
+        let payload = super::build_project_config_loaded_payload(Some(&raven_toml));
+        assert_eq!(
+            payload["path"].as_str(),
+            Some(raven_toml.display().to_string().as_str())
+        );
         assert_eq!(payload["source"].as_str(), Some("raven.toml"));
 
-        let lintr = std::path::Path::new("/proj/.lintr");
-        let payload = super::build_project_config_loaded_payload(Some(lintr));
-        assert_eq!(payload["path"].as_str(), Some("/proj/.lintr"));
+        let lintr = tmp.path().join(".lintr");
+        let payload = super::build_project_config_loaded_payload(Some(&lintr));
+        assert_eq!(
+            payload["path"].as_str(),
+            Some(lintr.display().to_string().as_str())
+        );
         assert_eq!(payload["source"].as_str(), Some(".lintr"));
 
         let payload = super::build_project_config_loaded_payload(None);
