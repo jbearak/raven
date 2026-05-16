@@ -4010,9 +4010,13 @@ fn collect_workspace_symbols_from_artifacts(
 // ============================================================================
 
 /// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
-/// pipeline. This is the production entry point for sync diagnostic
-/// computation (called by `pub fn diagnostics`), and is also the bench
-/// harness target for `crates/raven/benches/lsp_operations.rs`.
+/// pipeline. Retained as a `pub` entry point for bench harnesses
+/// (`crates/raven/benches/lsp_operations.rs`) and the inline tests in
+/// this module; the production publish path in `backend.rs` now
+/// inlines an equivalent flow so it can release the read lock between
+/// the snapshot build and `diagnostics_from_snapshot` to match the
+/// snapshot-pattern's lock-discipline contract.
+#[allow(dead_code)]
 pub fn diagnostics_via_snapshot(
     state: &WorldState,
     uri: &Url,
@@ -4085,6 +4089,13 @@ pub fn diagnostics_via_snapshot_profile(
 /// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
+///
+/// Retained as a `pub` entry point for bench harnesses
+/// (`crates/raven/benches/lsp_operations.rs`) and downstream consumers.
+/// The production publish path in `backend.rs` now inlines an
+/// equivalent flow so it can release the read lock between
+/// `DiagnosticsSnapshot::build` and `diagnostics_from_snapshot`.
+#[allow(dead_code)]
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
@@ -8161,6 +8172,7 @@ fn is_package_export(
     package_library.is_symbol_from_loaded_packages(name, loaded_packages)
 }
 
+#[allow(dead_code)]
 fn document_file_type(state: &WorldState, uri: &Url) -> FileType {
     state
         .get_document(uri)

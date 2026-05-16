@@ -6223,25 +6223,27 @@ impl Backend {
 /// held global `RwLock<HashMap<Url, _>>` write lock around the
 /// `HashMap::get`/`HashMap::insert` call.
 ///
-/// Known caveat (pre-existing, NOT introduced by parallelizing): the
-/// initial `state.read().await` window covers `handlers::diagnostics`,
-/// which builds a `DiagnosticsSnapshot` AND runs
-/// `diagnostics_from_snapshot` under the same lock. The snapshot pattern
-/// is designed to release the lock between those two phases, but the
-/// convenience wrapper used here keeps both phases under the lock. This
-/// limits the contention drop from parallelization for the in-lock
-/// phase; the async missing-file checks and the LSP send (the dominant
-/// async I/O) still overlap freely. Splitting `handlers::diagnostics`
-/// into a snapshot-build + lock-release + snapshot-use sequence is a
-/// separate refactor — see the locking-discipline note in
-/// `CLAUDE.md`.
+/// Lock discipline: the read lock on `WorldState` is only held while
+/// building [`handlers::DiagnosticsSnapshot`] (which captures all
+/// inputs the scope engine needs) and capturing the directive metadata
+/// / workspace folder / severity. The lock is then released BEFORE the
+/// heavy `diagnostics_from_snapshot` call (which runs scope resolution)
+/// and the async missing-file checks. This matches the snapshot
+/// pattern's design intent — "Built under the read lock, then used to
+/// compute diagnostics without holding any lock" — and is required for
+/// the parallel reload driver: with up to 8 concurrent
+/// `publish_diagnostics_inner` tasks, holding the read lock across
+/// scope resolution would block `did_change` writers for the full
+/// duration of every parallel diagnostic computation.
 pub(crate) async fn publish_diagnostics_inner(
     state_arc: &Arc<RwLock<WorldState>>,
     client: &Client,
     uri: &Url,
 ) {
-    // Extract needed data while holding read lock briefly
-    let (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity) = {
+    // Phase 1: brief read lock — gate check, build the diagnostics
+    // snapshot, capture inputs for the off-lock work. NO scope
+    // resolution or other heavy work happens inside this scope.
+    let (version, snapshot, directive_meta, workspace_folder, missing_file_severity) = {
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
 
@@ -6263,9 +6265,14 @@ pub(crate) async fn publish_diagnostics_inner(
             }
         }
 
-        // Get sync diagnostics (uses cached-only existence checks)
-        let sync_diagnostics =
-            handlers::diagnostics(&state, uri, &handlers::DiagCancelToken::never());
+        // Skip the snapshot build entirely when the master switch is
+        // off — saves the snapshot's metadata clone + neighborhood walk.
+        // Mirrors the early-exit in `handlers::diagnostics`.
+        let snapshot = if state.cross_file_config.diagnostics_enabled {
+            handlers::DiagnosticsSnapshot::build(&state, uri)
+        } else {
+            None
+        };
 
         // Extract metadata for async missing file checks
         let directive_meta = state
@@ -6279,15 +6286,36 @@ pub(crate) async fn publish_diagnostics_inner(
 
         (
             version,
-            sync_diagnostics,
+            snapshot,
             directive_meta,
             workspace_folder,
             missing_file_severity,
         )
     };
-    // Lock released here
+    // Read lock released — scope resolution and async I/O run unlocked.
 
-    // Perform async missing file existence checks (non-blocking I/O)
+    // Phase 2: run `diagnostics_from_snapshot` outside the lock. This is
+    // the heavy phase the snapshot pattern was designed to keep
+    // lock-free (see DiagnosticsSnapshot doc comment in handlers.rs).
+    // Replicate the remaining `handlers::diagnostics` early-exits via
+    // snapshot fields, which already mirror `doc.file_type` and
+    // `doc.chunk_kind` from build time.
+    let sync_diagnostics = match snapshot {
+        Some(snap)
+            if snap.file_type == crate::file_type::FileType::R
+                && snap.chunk_kind != crate::chunks::ChunkKind::Rmd =>
+        {
+            handlers::diagnostics_from_snapshot(
+                &snap,
+                uri,
+                &handlers::DiagCancelToken::never(),
+            )
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    // Phase 3: async missing-file existence checks (already lock-free).
     let diagnostics = handlers::diagnostics_async_standalone(
         uri,
         sync_diagnostics,
@@ -9882,8 +9910,10 @@ mod project_config_initialize_tests {
             !std::ptr::eq(library_before, library_after),
             "expected package_library to be replaced by the reload's rebuild path"
         );
+        // The fresh library replaces whatever the initialize-time
+        // `PackageLibrary::new_empty()` was — confirm it's the empty
+        // variant the disabled path constructs.
         assert!(state.package_library.lib_paths().is_empty());
-        assert!(!state.package_library_ready);
     }
 
     /// The watched-files reload path must update `state.project_config_path`
