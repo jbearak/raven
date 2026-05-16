@@ -397,9 +397,15 @@ async function showBlocker(blocker: Blocker, fsPath: string): Promise<void> {
     // placeholder. Substitute the actual path as a properly escaped R
     // literal so Windows backslashes and paths containing apostrophes
     // stay valid R syntax.
-    const filledCommand = blocker.copyCommand.includes("'FILENAME'")
-        ? blocker.copyCommand.replace("'FILENAME'", escapeRString(fsPath))
-        : blocker.copyCommand;
+    // Replace every `'FILENAME'` placeholder. We use a string-splitting
+    // join rather than `String.prototype.replaceAll` to keep
+    // compatibility with the project's pre-ES2021 lib target. The
+    // placeholder is single-quoted so `escapeRString` (also
+    // single-quoted) is a drop-in substitution that stays valid R when
+    // the path contains backslashes or apostrophes.
+    const filledCommand = blocker.copyCommand
+        .split("'FILENAME'")
+        .join(escapeRString(fsPath));
     const choice = await vscode.window.showInformationMessage(
         blocker.message,
         { modal: false },
