@@ -3873,6 +3873,13 @@ impl LanguageServer for Backend {
         // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
         log::trace!("Configuration changed, parsing new config and scheduling revalidation");
 
+        // Surface cross-file validation errors as a VS Code toast (matches
+        // pre-Task-7 behavior). Recompute below also logs the same error via
+        // log::warn!, so we don't need the value — only the side effect.
+        if let Err(err) = parse_cross_file_config(&params.settings) {
+            self.client.show_message(MessageType::WARNING, err).await;
+        }
+
         let (
             open_uris,
             scope_changed,
