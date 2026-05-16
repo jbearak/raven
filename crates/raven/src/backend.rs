@@ -9651,4 +9651,90 @@ mod project_config_initialize_tests {
 
         assert_eq!(backend.state.read().await.lint_config.line_length, 140);
     }
+
+    /// `DiagnosticsSnapshot::build` (the snapshot site in `handlers.rs` that
+    /// every diagnostics pass takes) must apply per-document
+    /// `[[linting.overrides]]` patches when computing the effective
+    /// `LintConfig`. This exercises the handlers-site refactor: two files
+    /// under the same project produce snapshots with different
+    /// `lint_config.line_length` values depending on which override globs
+    /// they match.
+    #[tokio::test]
+    async fn published_diagnostics_use_per_file_override() {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            r#"
+[linting]
+enabled = true
+lineLength = 30
+lineLengthSeverity = "warning"
+
+[[linting.overrides]]
+files = ["tests/**/*.R"]
+lineLength = 200
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        let r_path = tmp.path().join("R/a.R");
+        let test_path = tmp.path().join("tests/test-a.R");
+        // 80-column line: triggers in R/ (line_length = 30), not in tests/ (200).
+        let long_line =
+            "x_long_identifier <- 'sample value with a longer literal string' ; cat('hi')\n";
+        fs::write(&r_path, long_line).unwrap();
+        fs::write(&test_path, long_line).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let r_uri = Url::from_file_path(&r_path).unwrap();
+        let test_uri = Url::from_file_path(&test_path).unwrap();
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: r_uri.clone(),
+                    language_id: "r".into(),
+                    version: 1,
+                    text: long_line.into(),
+                },
+            })
+            .await;
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: test_uri.clone(),
+                    language_id: "r".into(),
+                    version: 1,
+                    text: long_line.into(),
+                },
+            })
+            .await;
+
+        // Build the snapshots that handlers.rs would build for each URI and
+        // assert their effective LintConfig. This is the same struct +
+        // build path that `handlers.rs:DiagnosticsSnapshot::build` takes
+        // during a diagnostics pass.
+        let state = backend.state.read().await;
+        let r_snap = crate::handlers::DiagnosticsSnapshot::build(&state, &r_uri)
+            .expect("snapshot built for R/a.R");
+        let test_snap = crate::handlers::DiagnosticsSnapshot::build(&state, &test_uri)
+            .expect("snapshot built for tests/test-a.R");
+        assert_eq!(r_snap.lint_config.line_length, 30);
+        assert_eq!(test_snap.lint_config.line_length, 200);
+    }
 }

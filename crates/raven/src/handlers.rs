@@ -240,12 +240,31 @@ impl DiagnosticsSnapshot {
             total_elapsed,
         );
 
+        // Resolve the effective `LintConfig` for this URI by layering any
+        // matching `[[linting.overrides]]` patches over the base
+        // `state.lint_config`. The merge+resolve runs once per snapshot build;
+        // this is intentionally per-document because overrides may match
+        // different files.
+        let lint_config = {
+            let merged = crate::config_file::merge_settings(
+                &state.raw_client_settings,
+                state.raw_project_settings.as_ref(),
+            );
+            let section = merged.get("linting").cloned().unwrap_or(serde_json::json!({}));
+            crate::config_file::resolve_lint_for_document(
+                &state.lint_config,
+                &section,
+                &state.lint_overrides,
+                uri,
+            )
+        };
+
         Some(DiagnosticsSnapshot {
             tree,
             text,
             directive_meta,
             cross_file_config: state.cross_file_config.clone(),
-            lint_config: state.lint_config.clone(),
+            lint_config,
             cross_file_graph: trimmed_graph,
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
