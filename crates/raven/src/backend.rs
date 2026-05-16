@@ -4145,9 +4145,30 @@ impl LanguageServer for Backend {
             // force-republish markers set by the helper ensure
             // `publish_diagnostics` actually emits (rather than being
             // short-circuited by an unchanged-version check).
-            for uri in &to_publish {
-                self.publish_diagnostics(uri).await;
+            //
+            // Per-URI publishes are independent: each takes brief read
+            // locks on `state` and the `diagnostics_gate`'s per-URI
+            // `HashMap` entries, then releases before doing the async
+            // missing-file checks and the `client.publish_diagnostics`
+            // send. Running them in parallel — bounded — avoids N×
+            // latency on workspaces with many open files. The
+            // monotonic-publish invariant still holds: distinct URIs
+            // commit to distinct gate entries, and every spawned task is
+            // joined before this handler returns so a later `did_change`
+            // can't race a still-running reload publish.
+            const MAX_CONCURRENT_PUBLISHES: usize = 8;
+            let mut join_set = tokio::task::JoinSet::new();
+            for uri in to_publish {
+                while join_set.len() >= MAX_CONCURRENT_PUBLISHES {
+                    join_set.join_next().await;
+                }
+                let state_arc = self.state.clone();
+                let client = self.client.clone();
+                join_set.spawn(async move {
+                    publish_diagnostics_inner(&state_arc, &client, &uri).await;
+                });
             }
+            while join_set.join_next().await.is_some() {}
         }
 
         // If every change was a config file, the source-file flow below has
@@ -6163,92 +6184,7 @@ impl Backend {
     }
 
     async fn publish_diagnostics(&self, uri: &Url) {
-        // Extract needed data while holding read lock briefly
-        let (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity) = {
-            let state = self.state.read().await;
-            let version = state.documents.get(uri).and_then(|d| d.version);
-
-            // Check if we can publish (monotonic gate)
-            if let Some(ver) = version {
-                if !state.diagnostics_gate.can_publish(uri, ver) {
-                    log::trace!(
-                        "Skipping diagnostics for {}: monotonic gate (version={})",
-                        uri,
-                        ver
-                    );
-                    return;
-                } else {
-                    log::trace!(
-                        "Publishing diagnostics for {}: monotonic gate allows (version={})",
-                        uri,
-                        ver
-                    );
-                }
-            }
-
-            // Get sync diagnostics (uses cached-only existence checks)
-            let sync_diagnostics =
-                handlers::diagnostics(&state, uri, &handlers::DiagCancelToken::never());
-
-            // Extract metadata for async missing file checks
-            let directive_meta = state
-                .documents
-                .get(uri)
-                .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
-                .unwrap_or_default();
-
-            let workspace_folder = state.workspace_folders.first().cloned();
-            let missing_file_severity = state.cross_file_config.missing_file_severity;
-
-            (
-                version,
-                sync_diagnostics,
-                directive_meta,
-                workspace_folder,
-                missing_file_severity,
-            )
-        };
-        // Lock released here
-
-        // Perform async missing file existence checks (non-blocking I/O)
-        let diagnostics = handlers::diagnostics_async_standalone(
-            uri,
-            sync_diagnostics,
-            &directive_meta,
-            workspace_folder.as_ref(),
-            missing_file_severity,
-        )
-        .await;
-
-        // Re-check freshness after async work, atomically commit gate state, before publishing.
-        // try_consume_publish replaces the racy can_publish + record_publish pair.
-        {
-            let state = self.state.read().await;
-            if let Some(ver) = version {
-                let current_version = state.documents.get(uri).and_then(|d| d.version);
-                if current_version != Some(ver) {
-                    log::trace!(
-                        "Skipping diagnostics for {}: version changed (was {:?}, now {:?})",
-                        uri,
-                        version,
-                        current_version
-                    );
-                    return;
-                }
-                if !state.diagnostics_gate.try_consume_publish(uri, ver) {
-                    log::trace!(
-                        "Skipping diagnostics for {}: monotonic gate after async (version={})",
-                        uri,
-                        ver
-                    );
-                    return;
-                }
-            }
-        }
-
-        self.client
-            .publish_diagnostics(uri.clone(), diagnostics, None)
-            .await;
+        publish_diagnostics_inner(&self.state, &self.client, uri).await
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -6272,6 +6208,111 @@ impl Backend {
             .cross_file_activity
             .update(active_uri, visible_uris, params.timestamp_ms);
     }
+}
+
+/// Body of [`Backend::publish_diagnostics`], factored out so that
+/// parallel publish drivers (e.g. the `did_change_watched_files` reload
+/// path) can spawn tasks that own clones of `state_arc` + `client`
+/// rather than borrowing `&Backend`.
+///
+/// Concurrency: safe to invoke from multiple tasks for distinct URIs.
+/// All `state` and `diagnostics_gate` accesses use brief read locks
+/// scoped to the URI's gate entry; the monotonic publish predicate is
+/// atomically committed via
+/// [`crate::cross_file::CrossFileDiagnosticsGate::try_consume_publish`].
+/// The gate uses per-URI `HashMap` entries so concurrent calls for
+/// different URIs do not interfere.
+pub(crate) async fn publish_diagnostics_inner(
+    state_arc: &Arc<RwLock<WorldState>>,
+    client: &Client,
+    uri: &Url,
+) {
+    // Extract needed data while holding read lock briefly
+    let (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity) = {
+        let state = state_arc.read().await;
+        let version = state.documents.get(uri).and_then(|d| d.version);
+
+        // Check if we can publish (monotonic gate)
+        if let Some(ver) = version {
+            if !state.diagnostics_gate.can_publish(uri, ver) {
+                log::trace!(
+                    "Skipping diagnostics for {}: monotonic gate (version={})",
+                    uri,
+                    ver
+                );
+                return;
+            } else {
+                log::trace!(
+                    "Publishing diagnostics for {}: monotonic gate allows (version={})",
+                    uri,
+                    ver
+                );
+            }
+        }
+
+        // Get sync diagnostics (uses cached-only existence checks)
+        let sync_diagnostics =
+            handlers::diagnostics(&state, uri, &handlers::DiagCancelToken::never());
+
+        // Extract metadata for async missing file checks
+        let directive_meta = state
+            .documents
+            .get(uri)
+            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+            .unwrap_or_default();
+
+        let workspace_folder = state.workspace_folders.first().cloned();
+        let missing_file_severity = state.cross_file_config.missing_file_severity;
+
+        (
+            version,
+            sync_diagnostics,
+            directive_meta,
+            workspace_folder,
+            missing_file_severity,
+        )
+    };
+    // Lock released here
+
+    // Perform async missing file existence checks (non-blocking I/O)
+    let diagnostics = handlers::diagnostics_async_standalone(
+        uri,
+        sync_diagnostics,
+        &directive_meta,
+        workspace_folder.as_ref(),
+        missing_file_severity,
+    )
+    .await;
+
+    // Re-check freshness after async work, atomically commit gate state, before publishing.
+    // try_consume_publish replaces the racy can_publish + record_publish pair.
+    {
+        let state = state_arc.read().await;
+        if let Some(ver) = version {
+            let current_version = state.documents.get(uri).and_then(|d| d.version);
+            if current_version != Some(ver) {
+                log::trace!(
+                    "Skipping diagnostics for {}: version changed (was {:?}, now {:?})",
+                    uri,
+                    version,
+                    current_version
+                );
+                return;
+            }
+            if !state.diagnostics_gate.try_consume_publish(uri, ver) {
+                log::trace!(
+                    "Skipping diagnostics for {}: monotonic gate after async (version={})",
+                    uri,
+                    ver
+                );
+                return;
+            }
+        }
+    }
+
+    client
+        .publish_diagnostics(uri.clone(), diagnostics, None)
+        .await;
 }
 
 pub async fn start_lsp() -> anyhow::Result<()> {
@@ -9872,6 +9913,88 @@ mod project_config_initialize_tests {
             })
             .await;
         assert!(backend.state.read().await.project_config_path.is_none());
+    }
+
+    /// `did_change_watched_files` publishes diagnostics for every open
+    /// document on a `raven.toml` reload. With the parallel JoinSet
+    /// driver, all spawned publish tasks must be joined before the
+    /// handler returns — otherwise a later `did_change` could race a
+    /// still-running reload publish and corrupt monotonic-version
+    /// ordering. This test exercises 12 open `.R` files (above the
+    /// concurrency cap of 8) and asserts that all of them end up with
+    /// their `last_published_version` advanced.
+    #[tokio::test]
+    async fn watched_files_reload_publishes_all_open_documents_in_parallel() {
+        use tower_lsp::lsp_types::{
+            DidChangeWatchedFilesParams, DidOpenTextDocumentParams, FileChangeType, FileEvent,
+            TextDocumentItem,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 100\n",
+        )
+        .unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        const N: usize = 12;
+        let mut uris: Vec<Url> = Vec::with_capacity(N);
+        for i in 0..N {
+            let p = tmp.path().join(format!("file_{i}.R"));
+            fs::write(&p, "x <- 1\n").unwrap();
+            let uri = Url::from_file_path(&p).unwrap();
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: "x <- 1\n".into(),
+                    },
+                })
+                .await;
+            uris.push(uri);
+        }
+
+        // Edit raven.toml and trigger a reload.
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 140\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // Every open URI's gate should have advanced to version 1 — that's
+        // proof every spawned publish task ran to completion (a stuck or
+        // un-awaited task would leave its URI's `last_published_version`
+        // unset).
+        let state = backend.state.read().await;
+        for uri in &uris {
+            assert!(
+                !state.diagnostics_gate.can_publish(uri, 1),
+                "publish_diagnostics did not commit gate for {uri}"
+            );
+        }
     }
 
     /// The `raven/projectConfigLoaded` payload schema is a contract with
