@@ -7778,6 +7778,7 @@ mod invalid_assignment_target_tests {
         );
     }
 
+
     // ---- LHS literals on `<-` ------------------------------------------------
 
     #[test]
@@ -7851,6 +7852,16 @@ mod invalid_assignment_target_tests {
     fn left_arrow_next_break_flagged() {
         assert_one("next <- 1", "reserved word `next`");
         assert_one("break <- 1", "reserved word `break`");
+    }
+
+    #[test]
+    fn left_arrow_dots_flagged() {
+        // `...` and `..N` are part of R's reserved special-argument syntax,
+        // not user-defined names; R rejects every assignment to them.
+        assert_one("... <- 1", "reserved word `...`");
+        assert_one("..1 <- 1", "reserved word `..1`");
+        assert_one("..2 <- 1", "reserved word `..2`");
+        assert_one("..10 <- 1", "reserved word `..10`");
     }
 
     // ---- Other assignment operators -----------------------------------------
@@ -8253,6 +8264,10 @@ fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
         "float" | "integer" | "complex" => Some("numeric literal"),
         "string" => Some("string literal"),
         "next" | "break" => Some("reserved word"),
+        // tree-sitter-r gives `...` and `..1`/`..2`/... their own kinds.
+        // R rejects assignments like `... <- 1` and `..1 <- 1` outright; they
+        // are part of the reserved special-argument syntax, not user names.
+        "dots" | "dot_dot_i" => Some("reserved word"),
         "identifier" => {
             let t = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
             if is_reserved_word(t) {

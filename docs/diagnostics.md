@@ -52,7 +52,7 @@ Raven checks whether each symbol reference has a visible definition — either i
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
-| Invalid assignment target | error | The target of an assignment is a value R can't bind to: a literal (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`, a number, a string) or a reserved word (`else`, `in`, `next`, `break`) |
+| Invalid assignment target | error | The target of an assignment is a value R can't bind to: a literal (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`, a number, a string), a reserved word (`else`, `in`, `next`, `break`), or `...` / `..N` (dots arguments) |
 
 Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators (`->`, `->>`) the target is the right-hand side; for the others it's the left-hand side. Always on whenever diagnostics are enabled; not configurable per rule (these are R errors, not stylistic preferences).
 
