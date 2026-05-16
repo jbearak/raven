@@ -8575,15 +8575,27 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
                 // diagnostic. Otherwise emit the orphan-else diagnostic.
                 let mut prev = anchor.prev_sibling();
                 let mut handled = false;
+                // The anchor IS the identifier only when no wrapping
+                // expression sits between `else` and the statement-level
+                // block. If the user wrapped `else` in something else
+                // (`(else)`, `else |> f()`, `else()`, …), the "move else to
+                // the same line" hint doesn't apply — they didn't write a
+                // misplaced `else` for the preceding `if`; they wrote a
+                // standalone expression that happens to start with `else`.
+                let anchor_is_bare_else = anchor.start_byte() == node.start_byte()
+                    && anchor.end_byte() == node.end_byte();
                 while let Some(sibling) = prev {
                     match sibling.kind() {
                         "comment" => prev = sibling.prev_sibling(),
                         "if_statement" => {
-                            if if_statement_has_else(sibling) {
-                                // The preceding `if` already has an `else`
-                                // branch consumed (`if (a) {b} else {c} else
-                                // {d}`); the trailing `else` is fully orphan,
-                                // not a misplaced `else` for this `if`.
+                            let if_already_has_else = if_statement_has_else(sibling);
+                            if if_already_has_else || !anchor_is_bare_else {
+                                // Either the preceding `if` already has an
+                                // `else` (`if (a) {b} else {c} else {d}`), or
+                                // the `else` is part of a larger expression
+                                // (`if (a) {b}\n(else)`). In both cases the
+                                // "move else to same line" message would
+                                // mislead — use the orphan message.
                                 emit_orphan_else_diagnostic(node, text, diagnostics);
                             } else {
                                 let brace_line = find_closing_brace_line(&sibling, text);
@@ -16564,6 +16576,47 @@ clean_data <- function(x) {
     // a dedicated check Raven only emits a confusing "undefined variable" or
     // nothing at all.
     // ========================================================================
+
+    /// `if (x) { y } (else)` on a single line — tree-sitter parses the
+    /// `{y} (else)` portion as a function call (`{y}` as callable, `(else)`
+    /// as the argument list with `else` as an argument). `else` is therefore
+    /// inside `argument`/`arguments`/`call`, not statement-leading. Out of
+    /// scope per the issue; must NOT fire.
+    #[test]
+    fn test_orphan_else_paren_after_if_same_line_is_call() {
+        let code = "if (x) { y } (else)";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert!(
+            diagnostics.is_empty(),
+            "single-line `if (x) {{y}} (else)` parses as a call; no orphan-else, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `if (x) { y }\n(else)` — newline forces this to parse as two top-level
+    /// expressions: a complete `if_statement` and a `parenthesized_expression`
+    /// containing orphan `else`. The user clearly typed parens, so the "move
+    /// else to same line" message is misleading — the orphan message fits.
+    #[test]
+    fn test_orphan_else_paren_after_if_newline_uses_orphan_message() {
+        let code = "if (x) { y }\n(else)";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            diagnostics[0].message.contains("without a preceding"),
+            "wrapped orphan-else should use the orphan message, not the same-line message; got: {}",
+            diagnostics[0].message
+        );
+    }
 
     /// `else { 1 }` at the top of a file — no preceding `if` at all.
     /// Should still emit an orphan-else diagnostic.
