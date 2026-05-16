@@ -1127,7 +1127,7 @@ pub fn is_skipped_by_overrides(
 }
 
 fn merge_in_place(dst: &mut Value, src: &Value) {
-    crate::config_file::merge::merge_in_place_pub(dst, src);
+    crate::config_file::merge::merge_into(dst, src);
 }
 ```
 
@@ -1148,14 +1148,7 @@ pub(crate) fn parse_lint_config_from_section(
 }
 ```
 
-And in `crates/raven/src/config_file/merge.rs`, expose the internal in-place merge so `overrides.rs` can use it without duplicating logic:
-
-```rust
-/// In-place variant used by callers that already own a mutable destination.
-pub fn merge_in_place_pub(dst: &mut Value, src: &Value) {
-    merge_into(dst, src);
-}
-```
+Task 4 already exposed `pub fn merge_into(dst: &mut Value, src: &Value)` in `crates/raven/src/config_file/merge.rs` — `overrides.rs` reuses it as `crate::config_file::merge::merge_into(...)`. No new merge helper is needed in this task.
 
 - [ ] **Step 3: Test the resolver**
 

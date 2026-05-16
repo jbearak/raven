@@ -18,11 +18,8 @@ pub fn merge(client: &Value, project: Option<&Value>) -> Value {
 }
 
 /// In-place variant used by callers that already own a mutable destination.
-pub fn merge_in_place_pub(dst: &mut Value, src: &Value) {
-    merge_into(dst, src);
-}
-
-fn merge_into(dst: &mut Value, src: &Value) {
+/// `src` wins at leaves; objects merge recursively; arrays/scalars replace.
+pub fn merge_into(dst: &mut Value, src: &Value) {
     match (dst, src) {
         (Value::Object(dst_map), Value::Object(src_map)) => {
             for (k, v) in src_map {
