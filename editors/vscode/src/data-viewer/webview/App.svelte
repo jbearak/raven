@@ -11,11 +11,13 @@
     import {
         visibleRange, coalesceScroll,
         cappedScrollHeight, logicalScrollTop, visualOffsetPx,
+        MAX_SCROLL_PX, HORIZONTAL_GUTTER_PX,
     } from './grid-model';
     import { RowCache } from './row-cache';
     import { Selection } from './selection-model';
     import { formatCell } from './cell-render';
     import Toolbar from './Toolbar.svelte';
+    import CustomScrollbar from './CustomScrollbar.svelte';
     type PersistedState = {
         panelGeneration: number;
         nrow: number;
@@ -103,6 +105,7 @@
             .filter(i => !hiddenSet.has(i)),
     );
     const totalGridHeight = $derived(nrow * ROW_HEIGHT);
+    const useCustomScrollbar = $derived(totalGridHeight > MAX_SCROLL_PX);
     /** Width of the sticky row-number column, sized to fit the widest row number. */
     const rowColWidth = $derived(`calc(${String(Math.max(1, nrow)).length}ch + 16px)`);
 
@@ -854,20 +857,22 @@
     {#if copyStatus !== ''}
         <div class="toast toast-{copyStatus}">{copyStatusMsg}</div>
     {/if}
-    <div class="viewport"
-         role="grid"
-         aria-rowcount={nrow}
-         bind:this={viewportEl}
-         onscroll={onScroll}
-         tabindex="0">
-        <div class="grid" style="height: {cappedScrollHeight(totalGridHeight) + ROW_HEIGHT}px;">
-            <!-- Header row (sticky top) -->
-            <div class="header-row">
-                <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div class="cell header rowname-col corner-cell"
-                     style="width: {rowColWidth};"
-                     title="Select all"
-                     onpointerdown={onCornerPointerDown}>#</div>
+    <div class="viewport-wrapper">
+        <div class="viewport"
+             class:using-custom-scrollbar={useCustomScrollbar}
+             role="grid"
+             aria-rowcount={nrow}
+             bind:this={viewportEl}
+             onscroll={onScroll}
+             tabindex="0">
+            <div class="grid" style="height: {cappedScrollHeight(totalGridHeight) + ROW_HEIGHT}px;">
+                <!-- Header row (sticky top) -->
+                <div class="header-row">
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <div class="cell header rowname-col corner-cell"
+                         style="width: {rowColWidth};"
+                         title="Select all"
+                         onpointerdown={onCornerPointerDown}>#</div>
                 {#each visibleCols as colIdx (colIdx)}
                     {@const col = columns[colIdx]}
                     <div class="cell header col-header
@@ -937,6 +942,19 @@
                 {/each}
             </div>
         </div>
+    </div>
+    {#if useCustomScrollbar}
+        <CustomScrollbar
+            trackHeight={Math.max(0, viewportHeight - HORIZONTAL_GUTTER_PX)}
+            scrollTop={scrollTop}
+            nrow={nrow}
+            rowHeight={ROW_HEIGHT}
+            maxPhysical={MAX_SCROLL_PX + ROW_HEIGHT - viewportHeight}
+            onScrollTo={(newScrollTop) => {
+                if (viewportEl) viewportEl.scrollTop = newScrollTop;
+            }}
+        />
+    {/if}
     </div>
     {#if contextMenu}
         <div class="context-menu"

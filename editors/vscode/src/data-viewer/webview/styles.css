@@ -376,3 +376,71 @@ html, body, #root {
     color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #fff));
     outline: none;
 }
+
+
+/* ---------- Custom scrollbar (issue #183) ----------
+ * Engaged only when totalGridHeight > MAX_SCROLL_PX, via the
+ * `using-custom-scrollbar` class on `.viewport`. Below the cap we leave
+ * the native scrollbar alone. */
+
+.viewport-wrapper {
+    /* Wraps the viewport so the custom scrollbar overlay (sibling, not
+     * descendant) is laid out in the wrapper's coordinate space rather
+     * than the viewport's scroll-content coordinate space. min-height:
+     * 0 + min-width: 0 are required so flex shrink-to-fit allows the
+     * inner viewport to scroll its own content rather than growing the
+     * wrapper to the inner grid's intrinsic height. */
+    position: relative;
+    flex: 1 1 auto;
+    display: flex;
+    min-height: 0;
+    min-width: 0;
+}
+.viewport-wrapper > .viewport {
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+}
+
+.viewport.using-custom-scrollbar {
+    /* Reserve a 12 px lane for the overlay so grid content doesn't
+     * extend under it. Without this, hiding the native scrollbar via
+     * ::-webkit-scrollbar:vertical { display: none } collapses the
+     * gutter and the rightmost cells/resize handles are obscured. */
+    padding-right: 12px;
+}
+
+.viewport.using-custom-scrollbar::-webkit-scrollbar:vertical {
+    display: none;
+}
+
+.custom-scrollbar-track {
+    position: absolute;
+    right: 0;
+    top: 0;
+    /* HORIZONTAL_GUTTER_PX = 12 px reserved at the bottom for the native
+     * horizontal scrollbar when present. The math layer takes
+     * trackHeight = viewportHeight - 12 to match (see grid-model.ts). */
+    bottom: 12px;
+    width: 12px;
+    background: transparent;
+    z-index: 3;  /* above sticky header (z-index: 2) */
+    user-select: none;
+}
+
+.custom-scrollbar-thumb {
+    position: absolute;
+    left: 2px;
+    right: 2px;
+    background: var(--vscode-scrollbarSlider-background, rgba(121, 121, 121, 0.4));
+    border-radius: 4px;
+    cursor: default;
+}
+
+.custom-scrollbar-thumb:hover {
+    background: var(--vscode-scrollbarSlider-hoverBackground, rgba(100, 100, 100, 0.7));
+}
+
+.custom-scrollbar-thumb.dragging {
+    background: var(--vscode-scrollbarSlider-activeBackground, rgba(191, 191, 191, 0.4));
+}
