@@ -111,16 +111,11 @@ fn apply_linters(
         if entry.is_empty() {
             continue;
         }
-        if let Some((name, rhs)) = entry.split_once('=') {
-            let name = name.trim();
-            let rhs = rhs.trim();
-            if rhs == "NULL" {
-                disable_rule(name, linting, warnings);
-                continue;
-            }
-            *unrecognized_constructs += 1;
-            continue;
-        }
+        // Recognize the function-call shape FIRST so that named-arg linter
+        // calls like `assignment_linter(operator = "<-")` aren't
+        // misclassified as `name = rhs` and silently dropped. Only when
+        // the entry isn't a `name(args)` call do we fall through to the
+        // `name = NULL` (rule-disable) shape.
         if let Some(paren_idx) = entry.find('(') {
             if !entry.ends_with(')') {
                 *unrecognized_constructs += 1;
@@ -129,6 +124,16 @@ fn apply_linters(
             let name = entry[..paren_idx].trim();
             let args = &entry[paren_idx + 1..entry.len() - 1];
             apply_linter_call(name, args, linting, warnings, unrecognized_constructs);
+            continue;
+        }
+        if let Some((name, rhs)) = entry.split_once('=') {
+            let name = name.trim();
+            let rhs = rhs.trim();
+            if rhs == "NULL" {
+                disable_rule(name, linting, warnings);
+                continue;
+            }
+            *unrecognized_constructs += 1;
             continue;
         }
         // Bare name with no parens and no `= NULL`: not a known shape.
@@ -317,9 +322,14 @@ fn parse_positional_int(args: &str) -> Option<u64> {
 
 fn parse_named_int(args: &str, name: &str) -> Option<u64> {
     for part in split_top_level_commas(args) {
-        let (lhs, rhs) = part.split_once('=')?;
-        if lhs.trim() == name {
-            return rhs.trim().parse::<u64>().ok();
+        // `if let Some(...)` rather than `?` so a positional argument
+        // earlier in the list (e.g. `indentation_linter(2, indent = 4)`)
+        // doesn't short-circuit the whole search — mirrors the
+        // `parse_named_string` / `parse_named_string_vec` shape.
+        if let Some((lhs, rhs)) = part.split_once('=') {
+            if lhs.trim() == name {
+                return rhs.trim().parse::<u64>().ok();
+            }
         }
     }
     None
