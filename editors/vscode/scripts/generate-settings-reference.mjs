@@ -80,7 +80,13 @@ const DOC_LINKS = {
 };
 
 function escapeCell(text) {
-  return text.replace(/\|/g, "\\|").replace(/\r?\n+/g, " ");
+  // Escape backslashes first so the pipe-escape pass doesn't double up an
+  // already-escaped sequence (`\|` → `\\|`). Then normalize newlines so a
+  // multi-line description still fits in one table row.
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n+/g, " ");
 }
 
 function inlineCode(text) {
