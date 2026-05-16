@@ -1,0 +1,11 @@
+[linting]
+enabled = true
+lineLength = 80
+lineLengthSeverity = "warning"
+trailingWhitespaceSeverity = "warning"
+assignmentOperator = "<-"
+assignmentOperatorSeverity = "warning"
+objectNameStyleVariable = "snake_case"
+objectNameSeverity = "warning"
+tAndFSymbolSeverity = "warning"
+infixSpacesSeverity = "warning"

@@ -1,0 +1,8 @@
+linters: linters_with_defaults(
+    line_length_linter(80),
+    trailing_whitespace_linter(),
+    assignment_linter(),
+    object_name_linter(styles = "snake_case"),
+    T_and_F_symbol_linter(),
+    infix_spaces_linter()
+  )

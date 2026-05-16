@@ -1,0 +1,5 @@
+Package: demopackage
+Title: Demo Package for Raven Smoke Tests
+Version: 0.1.0
+Description: Demonstrates Raven's package mode mutual visibility.
+License: MIT

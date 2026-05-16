@@ -1,0 +1,32 @@
+---
+title: "Demo Quarto Document"
+format: html
+---
+
+## Introduction
+
+This document demonstrates Raven's Quarto chunk detection.
+
+```{r}
+#| label: setup
+#| include: false
+library(dplyr)
+```
+
+## Data Processing
+
+```{r}
+#| label: transform
+result <- mtcars |>
+  filter(cyl == 6) |>
+  summarise(mean_mpg = mean(mpg))
+result
+```
+
+Some prose between chunks.
+
+```{r}
+#| label: output
+#| echo: true
+print(result)
+```

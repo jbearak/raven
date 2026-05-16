@@ -1,0 +1,8 @@
+[linting]
+enabled = true
+lineLengthSeverity = "warning"
+trailingWhitespaceSeverity = "warning"
+assignmentOperatorSeverity = "warning"
+objectNameSeverity = "warning"
+tAndFSymbolSeverity = "warning"
+infixSpacesSeverity = "warning"
