@@ -1723,6 +1723,33 @@ impl tower_lsp::lsp_types::notification::Notification for RavenProjectConfigLoad
     const METHOD: &'static str = "raven/projectConfigLoaded";
 }
 
+/// Build the `raven/projectConfigLoaded` payload. Pure function so it can
+/// be unit-tested without spinning up an LSP service. The notification
+/// payload schema is:
+///   - `path: string | null` — absolute path of the active project
+///     config, or `null` when no config is in effect.
+///   - `source: "raven.toml" | ".lintr" | null` — discriminator derived
+///     from the file name; `null` when `path` is `null`.
+fn build_project_config_loaded_payload(path: Option<&std::path::Path>) -> serde_json::Value {
+    match path {
+        Some(p) => {
+            let source = if p.file_name() == Some(std::ffi::OsStr::new(".lintr")) {
+                ".lintr"
+            } else {
+                "raven.toml"
+            };
+            serde_json::json!({
+                "path": p.display().to_string(),
+                "source": source,
+            })
+        }
+        None => serde_json::json!({
+            "path": serde_json::Value::Null,
+            "source": serde_json::Value::Null,
+        }),
+    }
+}
+
 /// Pre-recompute snapshot of the parsed configs that drive change-detection
 /// inside [`Backend::reconcile_after_config_recompute`].
 ///
@@ -1863,24 +1890,12 @@ impl LanguageServer for Backend {
             loaded_path
         };
 
-        // Notify client when a project config is in effect.
-        if let Some(path) = loaded_path {
-            let client = self.client.clone();
-            let source = if path.file_name() == Some(std::ffi::OsStr::new(".lintr")) {
-                ".lintr"
-            } else {
-                "raven.toml"
-            };
-            let path_str = path.display().to_string();
-            tokio::spawn(async move {
-                let payload = serde_json::json!({
-                    "path": path_str,
-                    "source": source,
-                });
-                let _ = client
-                    .send_notification::<RavenProjectConfigLoaded>(payload)
-                    .await;
-            });
+        // Notify client when a project config is in effect. Skipped at
+        // initialize-time when no config was found — the watched-files
+        // reload path emits the cleared-config form (`path: null`) once
+        // the user actually removes the file.
+        if let Some(path) = &loaded_path {
+            self.notify_project_config_loaded(Some(path.as_path()));
         }
 
         // Detect client capability for hierarchical document symbols
@@ -4116,6 +4131,16 @@ impl LanguageServer for Backend {
             // diagnostic-affecting moved).
             let to_publish = self.reconcile_after_config_recompute(snapshot).await;
 
+            // Re-emit `raven/projectConfigLoaded` so clients (the VS Code
+            // status bar in particular) see the new state without a
+            // window reload. The notification fires unconditionally for
+            // every reload event — even when the new path matches the
+            // old — so consumers can treat it as the authoritative
+            // "what's in effect now" signal. `path: null` means the
+            // config file was removed.
+            let new_path = self.state.read().await.project_config_path.clone();
+            self.notify_project_config_loaded(new_path.as_deref());
+
             // Re-publish diagnostics for every open document. The
             // force-republish markers set by the helper ensure
             // `publish_diagnostics` actually emits (rather than being
@@ -5234,6 +5259,26 @@ fn help_html_to_json(
 }
 
 impl Backend {
+    /// Send the `raven/projectConfigLoaded` notification reflecting the
+    /// current project-config state.
+    ///
+    /// Fires from both [`initialize`] and the `did_change_watched_files`
+    /// `raven.toml` / `.lintr` reload branch — so clients see a fresh
+    /// payload every time the on-disk config is re-discovered (created,
+    /// edited, or deleted), not just at session start.
+    ///
+    /// Spawns the send on a detached tokio task so callers never hold a
+    /// state lock across `client.send_notification`.
+    fn notify_project_config_loaded(&self, path: Option<&std::path::Path>) {
+        let client = self.client.clone();
+        let payload = build_project_config_loaded_payload(path);
+        tokio::spawn(async move {
+            let _ = client
+                .send_notification::<RavenProjectConfigLoaded>(payload)
+                .await;
+        });
+    }
+
     /// Drive every downstream action that depends on which parsed-config
     /// field moved during a configuration reload.
     ///
@@ -9768,6 +9813,86 @@ mod project_config_initialize_tests {
         let state = backend.state.read().await;
         assert!(!state.cross_file_config.packages_enabled);
         assert!(!state.package_library_ready);
+    }
+
+    /// The watched-files reload path must update `state.project_config_path`
+    /// so the subsequent `raven/projectConfigLoaded` notification carries
+    /// the live value (rather than the path captured at initialize time).
+    /// This complements the initialize-time test
+    /// `initialize_loads_raven_toml_from_workspace_root`.
+    #[tokio::test]
+    async fn watched_files_reload_updates_project_config_path_for_notification() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // No config at initialize time.
+        assert!(backend.state.read().await.project_config_path.is_none());
+
+        // Create raven.toml; watched_files reload should pick it up and
+        // populate project_config_path so the notification helper has a
+        // fresh value to emit.
+        let toml_path = tmp.path().join("raven.toml");
+        fs::write(&toml_path, "[linting]\nenabled = true\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+        assert_eq!(
+            backend.state.read().await.project_config_path.as_deref(),
+            Some(toml_path.as_path())
+        );
+
+        // Delete raven.toml; watched_files reload should clear the path
+        // so the notification helper emits the cleared form (`path: null`).
+        std::fs::remove_file(&toml_path).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        assert!(backend.state.read().await.project_config_path.is_none());
+    }
+
+    /// The `raven/projectConfigLoaded` payload schema is a contract with
+    /// the VS Code extension. Lock it down: `path: string` ⇒
+    /// `source: "raven.toml" | ".lintr"`; `path: None` ⇒ both fields
+    /// JSON `null`.
+    #[test]
+    fn project_config_loaded_payload_shape() {
+        let raven_toml = std::path::Path::new("/proj/raven.toml");
+        let payload = super::build_project_config_loaded_payload(Some(raven_toml));
+        assert_eq!(payload["path"].as_str(), Some("/proj/raven.toml"));
+        assert_eq!(payload["source"].as_str(), Some("raven.toml"));
+
+        let lintr = std::path::Path::new("/proj/.lintr");
+        let payload = super::build_project_config_loaded_payload(Some(lintr));
+        assert_eq!(payload["path"].as_str(), Some("/proj/.lintr"));
+        assert_eq!(payload["source"].as_str(), Some(".lintr"));
+
+        let payload = super::build_project_config_loaded_payload(None);
+        assert!(payload["path"].is_null());
+        assert!(payload["source"].is_null());
     }
 
     /// `DiagnosticsSnapshot::build` (the snapshot site in `handlers.rs` that
