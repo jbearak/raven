@@ -145,3 +145,47 @@ describe('detectBlockers', () => {
         expect(detectBlockers({ output: { html_document: {}, pdf_document: {} } })).toEqual([]);
     });
 });
+
+describe('parseFrontmatter -> detectBlockers integration', () => {
+    test('knit: null in YAML parses as JS null and does not blocker', () => {
+        const parsed = parseFrontmatter('knit: null\n');
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        expect(parsed.value).toEqual({ knit: null });
+        expect(detectBlockers(parsed.value)).toEqual([]);
+    });
+
+    test('knit: ~ (YAML null shorthand) does not blocker', () => {
+        const parsed = parseFrontmatter('knit: ~\n');
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        expect(detectBlockers(parsed.value)).toEqual([]);
+    });
+
+    test('custom knit: hook still blockers when present', () => {
+        const parsed = parseFrontmatter(
+            "knit: (function(input, ...) bookdown::render_book(input, ...))\n",
+        );
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        const blockers = detectBlockers(parsed.value);
+        expect(blockers).toHaveLength(1);
+        expect(blockers[0].kind).toBe('knit-hook');
+    });
+
+    test('runtime: shiny via YAML triggers shiny blocker', () => {
+        const parsed = parseFrontmatter('runtime: shiny\n');
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        const blockers = detectBlockers(parsed.value);
+        expect(blockers).toHaveLength(1);
+        expect(blockers[0].kind).toBe('shiny');
+    });
+
+    test('numbers and booleans are preserved (JSON schema, not failsafe)', () => {
+        const parsed = parseFrontmatter('params:\n  n: 3\n  flag: true\n');
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        expect(parsed.value).toEqual({ params: { n: 3, flag: true } });
+    });
+});

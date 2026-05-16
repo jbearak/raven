@@ -56,19 +56,25 @@ export function extractFrontmatter(text: string): string | null {
 }
 
 /**
- * Parse a front-matter body. Uses js-yaml's SAFE schema, which forbids
- * dangerous tags (`!!js/function`, etc.). Returns `{ ok: false, error }`
- * on parse failure so the caller can surface the message in the knit
- * output channel.
+ * Parse a front-matter body. Uses js-yaml's JSON schema, which:
+ *   - Preserves YAML `null`, booleans, numbers, and strings as their
+ *     JS equivalents (`FAILSAFE_SCHEMA` would stringify `null` as
+ *     `"null"`, breaking the "`knit: null` is not a blocker" rule).
+ *   - Excludes the YAML 1.1 octal-with-leading-zero / `yes`-as-true
+ *     extensions of DEFAULT_SCHEMA, which are confusing in YAML
+ *     frontmatter.
+ *   - Refuses dangerous tags (`!!js/function`, etc.).
+ *
+ * Returns `{ ok: false, error }` on parse failure so the caller can
+ * surface the message in the knit output channel.
  */
 export function parseFrontmatter(body: string): ParseResult {
     if (body.trim() === '') return { ok: true, value: {} };
     try {
-        const loaded = yaml.load(body, { schema: yaml.FAILSAFE_SCHEMA });
-        // FAILSAFE preserves strings/sequences/maps and refuses tags like
-        // `!!js/function`. Top-level non-map results (e.g. a bare scalar
-        // document) coerce to an empty object — front matter shouldn't be
-        // a scalar, and downstream code only ever expects a map.
+        const loaded = yaml.load(body, { schema: yaml.JSON_SCHEMA });
+        // Top-level non-map results (e.g. a bare scalar document)
+        // coerce to an empty object — front matter shouldn't be a
+        // scalar, and downstream code only ever expects a map.
         if (loaded === null || loaded === undefined) return { ok: true, value: {} };
         if (typeof loaded !== 'object' || Array.isArray(loaded)) return { ok: true, value: {} };
         return { ok: true, value: loaded as FrontmatterDoc };
