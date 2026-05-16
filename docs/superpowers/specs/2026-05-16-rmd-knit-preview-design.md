@@ -153,7 +153,7 @@ If no workspace is open and we fall back to `os.tmpdir()`, the sample uri uses t
 
 Sample content (~15 lines):
 
-```rmarkdown
+````rmarkdown
 ---
 title: "Sample R Markdown"
 output: html_document
@@ -167,9 +167,7 @@ palette (Cmd/Ctrl+Shift+P) to render it.
 ```{r}
 plot(1:10, main = "Example plot")
 ```
-```
-
-(The fence inside the example is a backtick block; the spec markdown uses indentation to escape it.)
+````
 
 ## Data flow
 
