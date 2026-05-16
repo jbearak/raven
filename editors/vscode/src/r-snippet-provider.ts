@@ -19,13 +19,11 @@ import * as vscode from 'vscode';
 export function registerRSnippetCompletionsForRmdAndQuarto(
     context: vscode.ExtensionContext,
 ): void {
-    const snippets = loadRSnippetsFromDisk(context.extensionPath);
-    if (snippets.length === 0) return;
+    const items = loadRSnippetCompletionItems(context.extensionPath);
+    if (items.length === 0) return;
 
     const provider: vscode.CompletionItemProvider = {
-        provideCompletionItems(): vscode.CompletionItem[] {
-            return snippets.map(buildCompletionItem);
-        },
+        provideCompletionItems: () => items,
     };
 
     for (const language of ['rmd', 'quarto']) {
@@ -38,37 +36,32 @@ export function registerRSnippetCompletionsForRmdAndQuarto(
     }
 }
 
-interface SnippetDefinition {
-    name: string;
-    prefix: string;
-    body: string;
-    description: string;
-}
-
 interface RawSnippet {
     prefix: string | string[];
     body: string | string[];
     description?: string;
 }
 
-function loadRSnippetsFromDisk(extensionPath: string): SnippetDefinition[] {
+function loadRSnippetCompletionItems(extensionPath: string): vscode.CompletionItem[] {
     const file = path.join(extensionPath, 'snippets', 'r.json');
     let raw: string;
     try {
         raw = fs.readFileSync(file, 'utf8');
-    } catch {
+    } catch (err) {
+        console.error(`raven: failed to read ${file}:`, err);
         return [];
     }
 
     let parsed: Record<string, RawSnippet>;
     try {
         parsed = JSON.parse(raw) as Record<string, RawSnippet>;
-    } catch {
+    } catch (err) {
+        console.error(`raven: failed to parse ${file}:`, err);
         return [];
     }
 
-    const out: SnippetDefinition[] = [];
-    for (const [name, snippet] of Object.entries(parsed)) {
+    const items: vscode.CompletionItem[] = [];
+    for (const snippet of Object.values(parsed)) {
         const prefixes = Array.isArray(snippet.prefix)
             ? snippet.prefix
             : [snippet.prefix];
@@ -77,16 +70,20 @@ function loadRSnippetsFromDisk(extensionPath: string): SnippetDefinition[] {
             : snippet.body;
         const description = snippet.description ?? '';
         for (const prefix of prefixes) {
-            out.push({ name, prefix, body, description });
+            items.push(buildCompletionItem(prefix, body, description));
         }
     }
-    return out;
+    return items;
 }
 
-function buildCompletionItem(s: SnippetDefinition): vscode.CompletionItem {
-    const item = new vscode.CompletionItem(s.prefix, vscode.CompletionItemKind.Snippet);
-    item.insertText = new vscode.SnippetString(s.body);
-    item.detail = s.description;
-    item.documentation = new vscode.MarkdownString().appendCodeblock(s.body, 'r');
+function buildCompletionItem(
+    prefix: string,
+    body: string,
+    description: string,
+): vscode.CompletionItem {
+    const item = new vscode.CompletionItem(prefix, vscode.CompletionItemKind.Snippet);
+    item.insertText = new vscode.SnippetString(body);
+    item.detail = description;
+    item.documentation = new vscode.MarkdownString().appendCodeblock(body, 'r');
     return item;
 }

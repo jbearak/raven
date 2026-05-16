@@ -33,7 +33,7 @@ import {
     register_chunks_navigation_and_highlight,
     register_chunks_with_terminal,
 } from './chunks';
-import { registerRSnippetCompletionsForRmdAndQuarto } from './rSnippetProvider';
+import { registerRSnippetCompletionsForRmdAndQuarto } from './r-snippet-provider';
 import { register_r_package_detection } from './r-package-detection';
 import { PlotServices } from './plot';
 import { registerDataViewer, dataViewerDirOf } from './data-viewer';
