@@ -193,12 +193,17 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         const panelAppeared = await pollForPanel(api, 'big', 90000);
         assert.ok(panelAppeared, 'panel "big" did not appear within 90 s');
 
-        // Reset scroll to the top. A previous --watch run could have left
-        // the same-shape panel scrolled to the bottom; applyInitOrReplace's
-        // sameDataset branch intentionally preserves visibleRangeStart, so
-        // an unconditional 'end < N/2' gate would deadlock on that.
-        // Press Home as a deterministic reset (this also exercises Home
-        // as a bonus side check).
+        // Reset scroll to the top before the End test. A previous --watch
+        // run could have left the same-shape panel scrolled to the bottom;
+        // applyInitOrReplace's sameDataset branch intentionally preserves
+        // visibleRangeStart, so an unconditional 'end < N/2' gate would
+        // deadlock on that. Pressing Home first makes the readiness gate
+        // robust regardless of prior state.
+        //
+        // Note: this is NOT a positive test for Home — a fresh panel's
+        // initial fetch lands at the top regardless of whether Home does
+        // anything, so the gate below is satisfied either way. It's
+        // strictly a deterministic-reset step for the End test.
         await api.pressDataViewerKey('big', 'Home');
 
         // Wait for the Home reset to land AND rows for the top of the

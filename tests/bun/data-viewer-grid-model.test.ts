@@ -133,6 +133,15 @@ describe('scroll height capping', () => {
         expect(logicalScrollTop(-50, SMALL, VH, RH)).toBe(0);
     });
 
+    test('logicalScrollTop: clamps positive overshoot in small data to maxLogicalSmall', () => {
+        // The small-data branch also clamps overshoot. macOS rubber-band
+        // can briefly push scrollTop above maxLogicalSmall; without the
+        // clamp, visibleRange would read past the end of the dataset.
+        const maxLogicalSmall = SMALL + RH - VH;
+        expect(logicalScrollTop(maxLogicalSmall * 1.1, SMALL, VH, RH))
+            .toBe(maxLogicalSmall);
+    });
+
     test('visibleRange after clamped overshoot still includes the last row', () => {
         const nrow = 10_000_000;
         const totalGridHeight = nrow * RH;

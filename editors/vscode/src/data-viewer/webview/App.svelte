@@ -503,7 +503,21 @@
         // and-extend) fall through to the browser/OS unchanged. The
         // viewportEl null guard handles the brief window between mount
         // and the bind:this assignment.
-        if (!meta && !e.shiftKey && !e.altKey && viewportEl) {
+        //
+        // Skip when focus is on a form control: <select>, <input>,
+        // <textarea>, or a contenteditable element have their own native
+        // Home/End/PageUp/PageDown semantics (e.g. <select> jumps to the
+        // first/last option) that we'd otherwise hijack. The toolbar's
+        // digits <select> and the column-popover checkboxes are concrete
+        // examples.
+        const target = e.target;
+        const onFormControl = target instanceof HTMLElement && (
+            target.tagName === 'INPUT'
+            || target.tagName === 'SELECT'
+            || target.tagName === 'TEXTAREA'
+            || target.isContentEditable
+        );
+        if (!meta && !e.shiftKey && !e.altKey && !onFormControl && viewportEl) {
             switch (e.key) {
                 case 'End':
                     e.preventDefault();
