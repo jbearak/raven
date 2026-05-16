@@ -57,7 +57,7 @@ Raven checks whether each symbol reference has a visible definition — either i
 | Missing file | warning | `source()` or directive references a file that doesn't exist |
 | Circular dependency | error | Two files source each other (directly or transitively) |
 | Max chain depth exceeded | warning | Source chain exceeds configured maximum depth |
-| Out-of-scope symbol | warning | Symbol from a sourced file used before the source() call |
+| `'x' is used before it's available (sourced on line N)` | warning | Symbol from a sourced file used before the `source()` call |
 | Ambiguous parent | warning | Multiple parents source this file and auto-inference can't determine which to use |
 | Redundant directive | hint | `@lsp-source` directive for a file already sourced via `source()` on the same line |
 
