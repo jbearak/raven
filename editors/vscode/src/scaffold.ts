@@ -487,7 +487,7 @@ function removeTopLevelLintingKeys(text: string): string {
  * lies at or past `before` can't happen for valid JSONC (a `/* ... *\/`
  * straddling the root's closing brace would make the file unparseable
  * and we'd have bailed already in `classifyExisting`). The defensive
- * `unterminatedBlockComment` short-circuit treats that case as "no
+ * `if (!closed) return false;` branch below treats that case as "no
  * comma" anyway — the worst we'd do is insert a redundant comma.
  */
 function hasCommaBetween(text: string, after: number, before: number): boolean {
@@ -534,8 +534,10 @@ function hasCommaBetween(text: string, after: number, before: number): boolean {
  *   2. Classify the rest via `jsonc-parser` (parse errors / non-object
  *      root / non-scalar `raven.linting.*` value all return `null`).
  *   3. Remove every remaining top-level `raven.linting.*` key via
- *      `modify` + `applyEdits` — that's the only safe way to delete a
- *      key together with its trailing comma and any inline comment.
+ *      `removeTopLevelLintingKeys`'s `parseTree`-driven line splice —
+ *      `jsonc-parser`'s `modify` + `applyEdits` looked tempting here
+ *      but has two edge-case bugs we hit (see that function's doc
+ *      comment for why we don't use it).
  *   4. Use `parseTree` to find the closing `}` and the last property's
  *      value-end, then splice the formatted block in.
  *
