@@ -82,6 +82,14 @@ jobs:
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
+      # Fail fast on drift between `editors/vscode/package.json` (single
+      # source of truth for `raven.*` settings) and the generated
+      # `docs/settings-reference.md`. Cheap to run and independent of the
+      # rest of this job, so it catches doc-only PRs that miss the
+      # regeneration step before the heavier Electron build kicks off.
+      - name: Check settings reference is up to date
+        run: bun editors/vscode/scripts/generate-settings-reference.mjs --check
+
       # Electron (the runtime VS Code uses for integration tests) needs an
       # X server plus a handful of native libs that aren't in the default
       # `ubuntu-latest` image. The `*t64` package names target Ubuntu 24.04
