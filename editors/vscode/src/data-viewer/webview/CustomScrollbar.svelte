@@ -32,9 +32,6 @@
     let dragOffset: number | null = $state(null);
     /** Captured pointer id, for safe release on cleanup paths. */
     let dragPointerId: number | null = null;
-    /** getBoundingClientRect().top of the track at drag start. Cached so
-     *  pointermove doesn't re-measure on every frame. */
-    let dragTrackTop = 0;
 
     const thumbHeight = $derived(customThumbHeight(trackHeight, rowHeight, nrow));
     const thumbTop = $derived(customThumbTop(scrollTop, trackHeight, thumbHeight, maxPhysical));
@@ -45,8 +42,8 @@
         e.preventDefault();
         e.stopPropagation();   // don't also trigger track-paging
         dragPointerId = e.pointerId;
-        dragTrackTop = trackEl.getBoundingClientRect().top;
-        dragOffset = e.clientY - (dragTrackTop + thumbTop);
+        const trackTopAbsolute = trackEl.getBoundingClientRect().top;
+        dragOffset = e.clientY - (trackTopAbsolute + thumbTop);
         // Synthetic events from the test seam may not be eligible for
         // capture in all browsers; real user events always succeed.
         try {
@@ -58,7 +55,11 @@
 
     function onThumbPointerMove(e: PointerEvent): void {
         if (dragOffset === null) return;
-        const rawThumbTop = e.clientY - dragTrackTop - dragOffset;
+        if (!trackEl) return;
+        // Re-measure trackTop on every move so a viewport resize during
+        // a drag doesn't desynchronize pointer Y from track Y.
+        const trackTopAbsolute = trackEl.getBoundingClientRect().top;
+        const rawThumbTop = e.clientY - trackTopAbsolute - dragOffset;
         const clampedThumbTop = Math.max(0, Math.min(trackHeight - thumbHeight, rawThumbTop));
         onScrollTo(customScrollTopFromThumbTop(clampedThumbTop, trackHeight, thumbHeight, maxPhysical));
     }
@@ -84,9 +85,16 @@
     function onTrackPointerDown(e: PointerEvent): void {
         if (e.button !== 0) return;
         if (!trackEl) return;
-        // Page up if click is above the thumb, down if below.
         const trackTop = trackEl.getBoundingClientRect().top;
         const clickY = e.clientY - trackTop;
+        // Skip if the click landed on the thumb area. The thumb's hit
+        // target is narrower than the visual track due to its 2 px side
+        // insets, so a click 1-2 px to the side of the visual thumb at
+        // the same Y reaches *this* (track) handler — without the
+        // skip-check, that click would page instead of being a no-op as
+        // the user expects.
+        if (clickY >= thumbTop && clickY <= thumbTop + thumbHeight) return;
+        // Page up if click is above the thumb, down if below.
         const direction = clickY < thumbTop ? -1 : 1;
         onScrollTo(scrollTop + direction * trackHeight);
     }

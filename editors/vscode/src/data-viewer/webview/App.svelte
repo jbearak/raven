@@ -178,6 +178,7 @@
                     // end-to-end. pointerId 999 avoids colliding with
                     // any real mouse pointer (Chromium primary mouse is
                     // pointerId 1).
+                    const fraction = Math.max(0, Math.min(1, m.fraction));
                     const thumb = document.querySelector('[data-test-id="custom-scrollbar-thumb"]');
                     if (!(thumb instanceof HTMLElement)) return;
                     const trackEl = thumb.parentElement;
@@ -192,7 +193,7 @@
                     // Target thumb-top, then target Y for the pointer
                     // (we want the pointer to end up such that thumb's
                     // top lands at fraction*(trackHeight - thumbHeight)).
-                    const targetThumbTop = m.fraction * Math.max(0, trackHeight - thumbHeightPx);
+                    const targetThumbTop = fraction * Math.max(0, trackHeight - thumbHeightPx);
                     const targetY = trackRect.top + targetThumbTop + thumbHeightPx / 2;
                     const opts = {
                         pointerId: 999,
