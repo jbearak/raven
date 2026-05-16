@@ -299,6 +299,118 @@ suite('scaffold linting-settings merge', () => {
         assert.strictEqual(buildLintingSettingsContent('{ this is not json'), null);
     });
 
+    test('cleanly removes a raven.linting.* key followed by a JSONC trailing comma', () => {
+        // `jsonc-parser`'s `modify`-for-removal turns `{ "raven.linting.x": v, }`
+        // into `{ , }` (orphan comma, invalid JSONC). Line-splicing instead
+        // removes the whole line, leaving a clean `{}` (or `{ }`).
+        const existing = `{
+  "raven.linting.enabled": false,
+}
+`;
+        const merged = mergeOrThrow(existing);
+        // No orphan comma; valid JSONC after the standard strip.
+        const stripped = merged
+            .replace(/\/\/[^\n]*/g, '')
+            .replace(/,(\s*[}\]])/g, '$1');
+        const parsed = JSON.parse(stripped) as Record<string, unknown>;
+        assert.strictEqual(parsed['raven.linting.enabled'], true);
+        // The prior `false` got replaced, not duplicated.
+        const enabledCount = (merged.match(/"raven\.linting\.enabled"/g) ?? []).length;
+        assert.strictEqual(enabledCount, 1);
+    });
+
+    test('removes a raven.linting.* key that shares its line with the opening/closing braces', () => {
+        // Whole-line splicing would have removed the `{`/`}` here too.
+        // The property-range splice must leave the braces intact.
+        const existing = `{ "raven.linting.enabled": false }`;
+        const merged = mergeOrThrow(existing);
+        const stripped = merged
+            .replace(/\/\/[^\n]*/g, '')
+            .replace(/,(\s*[}\]])/g, '$1');
+        const parsed = JSON.parse(stripped) as Record<string, unknown>;
+        assert.strictEqual(parsed['raven.linting.enabled'], true);
+        // The original property's value (`false`) is gone; only the
+        // scaffold's value (`true`) survives.
+        assert.ok(
+            !merged.includes('"raven.linting.enabled": false'),
+            `prior value should be removed; got:\n${merged}`,
+        );
+    });
+
+    test('removes a raven.linting.* key written in comma-before style', () => {
+        // Comma-before JSONC: `, "key": value` at the start of each line
+        // after the first. The leading comma belongs to the property
+        // logically, so we have to absorb it when the property is removed.
+        const existing = `{
+  "editor.tabSize": 2
+  , "raven.linting.enabled": false
+  , "files.autoSave": "onFocusChange"
+}
+`;
+        const merged = mergeOrThrow(existing);
+        assert.ok(merged.includes('"editor.tabSize": 2'), 'editor.tabSize survives');
+        assert.ok(
+            merged.includes('"files.autoSave": "onFocusChange"'),
+            'files.autoSave survives',
+        );
+        assert.ok(
+            !merged.includes('"raven.linting.enabled": false'),
+            'old value is gone',
+        );
+        // No orphan separator: stripping comments + trailing commas yields valid JSON.
+        const stripped = merged
+            .replace(/\/\/[^\n]*/g, '')
+            .replace(/,(\s*[}\]])/g, '$1');
+        const parsed = JSON.parse(stripped) as Record<string, unknown>;
+        assert.strictEqual(parsed['editor.tabSize'], 2);
+        assert.strictEqual(parsed['files.autoSave'], 'onFocusChange');
+        assert.strictEqual(parsed['raven.linting.enabled'], true);
+    });
+
+    test('removes a raven.linting.* key that shares its line with neighbouring keys', () => {
+        // Whole-line splicing would have removed the neighbours too.
+        // The property-range splice keeps them.
+        const existing = `{ "editor.tabSize": 2, "raven.linting.enabled": false, "files.autoSave": "onFocusChange" }`;
+        const merged = mergeOrThrow(existing);
+        assert.ok(
+            merged.includes('"editor.tabSize": 2'),
+            `neighbouring key "editor.tabSize" must survive; got:\n${merged}`,
+        );
+        assert.ok(
+            merged.includes('"files.autoSave": "onFocusChange"'),
+            `neighbouring key "files.autoSave" must survive; got:\n${merged}`,
+        );
+        assert.ok(
+            !merged.includes('"raven.linting.enabled": false'),
+            `prior value should be removed; got:\n${merged}`,
+        );
+        // The output is still valid JSONC after the standard strip.
+        const stripped = merged
+            .replace(/\/\/[^\n]*/g, '')
+            .replace(/,(\s*[}\]])/g, '$1');
+        const parsed = JSON.parse(stripped) as Record<string, unknown>;
+        assert.strictEqual(parsed['editor.tabSize'], 2);
+        assert.strictEqual(parsed['files.autoSave'], 'onFocusChange');
+        assert.strictEqual(parsed['raven.linting.enabled'], true);
+    });
+
+    test("preserves a previous key's inline comment when removing a raven.linting.* neighbour", () => {
+        // `jsonc-parser`'s `modify`-for-removal would treat the prior
+        // line's `// keep me` as trailing content of the removed range
+        // and silently drop it. Line-splicing leaves the prior line —
+        // including its inline comment — alone.
+        const existing = `{
+  "editor.tabSize": 4, // keep me
+  "raven.linting.enabled": false
+}
+`;
+        const merged = mergeOrThrow(existing);
+        assert.ok(
+            merged.includes('"editor.tabSize": 4, // keep me'),
+            `expected the previous key's inline comment to survive; got:\n${merged}`,
+        );
+    });
+
     test('returns null when a raven.linting.* key has a non-scalar (object) value', () => {
         // raven.linting.* values are scalars; an object value would span
         // multiple lines, and the line-based stripper can't safely delete

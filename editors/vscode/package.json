@@ -1632,6 +1632,7 @@
   },
   "dependencies": {
     "apache-arrow": "^21.1.0",
+    "jsonc-parser": "^3.3.1",
     "vscode-languageclient": "^9.0.1"
   },
   "overrides": {

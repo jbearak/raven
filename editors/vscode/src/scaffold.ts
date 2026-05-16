@@ -1,4 +1,10 @@
 import * as vscode from 'vscode';
+import {
+    parseTree,
+    visit,
+    type Node,
+    type ParseError,
+} from 'jsonc-parser';
 
 /**
  * Templates and commands that scaffold R-specific workspace files
@@ -223,298 +229,79 @@ function formatLintingBlock(indent: string): string {
 export const LINTING_SETTINGS_TEMPLATE = `{\n${formatLintingBlock('  ')}\n}\n`;
 
 /**
- * Strip `//` line comments and `/* ... *\/` block comments from JSONC
- * text, preserving string contents and newlines (so line numbers in
- * any downstream parse errors still line up). Trailing-comma stripping
- * is left to the caller; this function only removes comments.
- *
- * Returns `null` if the input contains an unterminated block comment.
- * Without this guard, the comment-stripper would silently drop the
- * rest of the file and any subsequent `JSON.parse` would succeed on
- * the truncated prefix — leading the scaffold to write back invalid
- * JSONC (a `/*` with nothing closing it).
+ * Result of classifying the existing `.vscode/settings.json` for the
+ * scaffold's merge step:
+ *   - `empty`: file missing or whitespace-only — caller uses the fresh template.
+ *   - `parseError`: text contains JSONC parse errors (including unterminated
+ *     comments). `jsonc-parser` reports any error it finds; we surface them
+ *     all the same way and refuse to merge.
+ *   - `nonObjectRoot`: parsed fine but root isn't a JSON object (e.g. an
+ *     array, scalar, or `null`). Can't safely merge into it.
+ *   - `unsupportedValue`: a top-level `raven.linting.*` key has a non-scalar
+ *     value (object or array). All declared `raven.linting.*` settings are
+ *     scalars; a non-scalar value would span multiple lines and the per-key
+ *     remover (which targets the single key/value range jsonc-parser identifies)
+ *     can't migrate the surrounding context cleanly.
+ *   - `object`: parsed as an object. `userManagedKeys` lists the top-level
+ *     `raven.linting.*` keys whose values are scalars — these are the keys the
+ *     scaffold prompts about before overwriting.
  */
-function stripJsoncComments(text: string): string | null {
-    let out = '';
-    let i = 0;
-    let inString = false;
-    while (i < text.length) {
-        const c = text[i];
-        if (inString) {
-            out += c;
-            if (c === '\\' && i + 1 < text.length) {
-                out += text[i + 1];
-                i += 2;
-                continue;
-            }
-            if (c === '"') inString = false;
-            i++;
-            continue;
-        }
-        if (c === '"') {
-            inString = true;
-            out += c;
-            i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '/') {
-            while (i < text.length && text[i] !== '\n') i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '*') {
-            i += 2;
-            let closed = false;
-            while (i + 1 < text.length) {
-                if (text[i] === '*' && text[i + 1] === '/') {
-                    closed = true;
-                    break;
-                }
-                if (text[i] === '\n') out += '\n';
-                i++;
-            }
-            if (!closed) return null;
-            i += 2;
-            continue;
-        }
-        out += c;
-        i++;
-    }
-    return out;
-}
-
-function stripTrailingCommas(text: string): string {
-    return text.replace(/,(\s*[}\]])/g, '$1');
-}
-
-/**
- * Result of parsing JSONC settings text for our purposes:
- *   - `parseError`: text was not valid JSONC at all (caller should bail).
- *   - `nonObjectRoot`: parsed fine but the root isn't a JSON object
- *     (e.g. an array, scalar, or `null`). Can't safely merge into it.
- *   - `unsupportedValue`: a top-level `raven.linting.*` key has a non-
- *     scalar value (object or array). All declared `raven.linting.*`
- *     settings are scalars (`boolean | number | string`); a non-scalar
- *     value would likely span multiple lines, and the line-based
- *     stripper isn't equipped to delete a multi-line value cleanly.
- *   - `object`: parsed as a JSON object — `keys` lists the top-level
- *     `raven.linting.*` keys present (may be empty).
- */
-type LintingParseResult =
+type LintingClassification =
+    | { kind: 'empty' }
     | { kind: 'parseError' }
     | { kind: 'nonObjectRoot' }
     | { kind: 'unsupportedValue'; key: string }
-    | { kind: 'object'; keys: string[] };
-
-function parseLintingKeys(text: string): LintingParseResult {
-    if (text.trim().length === 0) return { kind: 'object', keys: [] };
-    const stripped = stripJsoncComments(text);
-    if (stripped === null) return { kind: 'parseError' };
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(stripTrailingCommas(stripped));
-    } catch {
-        return { kind: 'parseError' };
-    }
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return { kind: 'nonObjectRoot' };
-    }
-    const obj = parsed as Record<string, unknown>;
-    const keys: string[] = [];
-    for (const k of Object.keys(obj)) {
-        if (!k.startsWith('raven.linting.')) continue;
-        const v = obj[k];
-        // raven.linting.* values are scalars (`boolean | number | string`).
-        // If the user wrote an object/array there, `stripTopLevelLintingLines`
-        // — which deletes a single physical line per key — would orphan the
-        // continuation lines and corrupt the file. Refuse to merge.
-        if (v !== null && typeof v === 'object') {
-            return { kind: 'unsupportedValue', key: k };
-        }
-        keys.push(k);
-    }
-    return { kind: 'object', keys };
-}
+    | { kind: 'object'; userManagedKeys: string[] };
 
 /**
- * Parse-with-comments helper that returns the list of top-level
- * `raven.linting.*` keys present in a JSONC text, or `null` if the text
- * has parse errors **or** is valid JSON whose root isn't an object.
- * An empty file returns an empty array.
- *
- * Kept in this collapsed shape (string[] | null) because the test suite
- * uses it as a parse-success signal; the scaffold command path uses
- * the richer `parseLintingKeys` discriminator to distinguish parse
- * errors from a non-object root.
- */
-export function detectExistingLintingKeys(text: string): string[] | null {
-    const result = parseLintingKeys(text);
-    return result.kind === 'object' ? result.keys : null;
-}
-
-/**
- * Walk JSONC text and return the index of the `}` that closes the
- * outermost object, or `-1` if none was found. Skips braces inside
- * strings and comments.
- */
-function findOutermostClosingBrace(text: string): number {
-    let depth = 0;
-    let inString = false;
-    let close = -1;
-    let i = 0;
-    while (i < text.length) {
-        const c = text[i];
-        if (inString) {
-            if (c === '\\' && i + 1 < text.length) {
-                i += 2;
-                continue;
-            }
-            if (c === '"') inString = false;
-            i++;
-            continue;
-        }
-        if (c === '"') {
-            inString = true;
-            i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '/') {
-            while (i < text.length && text[i] !== '\n') i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '*') {
-            i += 2;
-            while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
-            i += 2;
-            continue;
-        }
-        if (c === '{') {
-            depth++;
-            i++;
-            continue;
-        }
-        if (c === '}') {
-            depth--;
-            if (depth === 0) close = i;
-            i++;
-            continue;
-        }
-        i++;
-    }
-    return close;
-}
-
-/**
- * Compute the offsets, line by line, at which a given character index
- * falls. Used by the sentinel walker to map char-positions back to line
- * indices without re-scanning the whole text per lookup.
- */
-function computeLineStarts(text: string): number[] {
-    const starts: number[] = [0];
-    for (let i = 0; i < text.length; i++) {
-        if (text[i] === '\n') starts.push(i + 1);
-    }
-    return starts;
-}
-
-function lineIndexOfPos(lineStarts: number[], pos: number): number {
-    let lo = 0;
-    let hi = lineStarts.length - 1;
-    while (lo < hi) {
-        const mid = (lo + hi + 1) >>> 1;
-        if (lineStarts[mid] <= pos) lo = mid;
-        else hi = mid - 1;
-    }
-    return lo;
-}
-
-/**
- * Find the line indices of our sentinel-begin / sentinel-end markers,
- * skipping any matches that fall inside a JSONC `/* ... *\/` block
- * comment (line-comment matches are kept — those are exactly what we
- * emit). Returns `null` if either marker is missing or appears on the
- * wrong side of the other.
+ * Find the line indices of our sentinel-begin / sentinel-end markers.
+ * Uses jsonc-parser's `visit` so a sentinel-shaped substring inside a
+ * `/* ... *\/` block comment or string literal is correctly ignored:
+ * `onComment` fires once per *whole* comment, so embedded `//` text
+ * inside a block comment is not separately reported. Returns `null` if
+ * either marker is missing or out of order.
  */
 function findSentinelLineRange(text: string): { begin: number; end: number } | null {
-    const lineStarts = computeLineStarts(text);
-    const sentinelLines: { begin: number | null; end: number | null } = {
-        begin: null,
-        end: null,
-    };
+    let beginLine: number | null = null;
+    let beginOffset = -1;
+    let endLine: number | null = null;
 
-    let i = 0;
-    let inString = false;
-    let inBlockComment = false;
-    let lineConsumed = -1; // last line we've already classified
+    visit(
+        text,
+        {
+            onComment: (offset, length, startLine) => {
+                // Restrict to `//` line comments — `/* ... */` block comments
+                // arrive whole, and our sentinels are line-shaped.
+                if (!text.startsWith('//', offset)) return;
+                const commentText = text.slice(offset, offset + length).trim();
+                if (commentText === LINTING_SENTINEL_BEGIN && beginLine === null) {
+                    beginLine = startLine;
+                    beginOffset = offset;
+                } else if (
+                    commentText === LINTING_SENTINEL_END &&
+                    beginLine !== null &&
+                    endLine === null &&
+                    offset > beginOffset
+                ) {
+                    endLine = startLine;
+                }
+            },
+        },
+        // VS Code settings.json conventionally allows trailing commas; tell
+        // the visitor so a trailing-comma error doesn't suppress later
+        // `onComment` callbacks via jsonc-parser's error-recovery path.
+        { allowTrailingComma: true },
+    );
 
-    function maybeRecord(pos: number) {
-        const lineIdx = lineIndexOfPos(lineStarts, pos);
-        if (lineIdx <= lineConsumed) return;
-        const lineStart = lineStarts[lineIdx];
-        const lineEnd =
-            lineIdx + 1 < lineStarts.length ? lineStarts[lineIdx + 1] - 1 : text.length;
-        const lineText = text.slice(lineStart, lineEnd).trim();
-        if (lineText === LINTING_SENTINEL_BEGIN && sentinelLines.begin === null) {
-            sentinelLines.begin = lineIdx;
-        } else if (
-            lineText === LINTING_SENTINEL_END &&
-            sentinelLines.begin !== null &&
-            sentinelLines.end === null &&
-            lineIdx > sentinelLines.begin
-        ) {
-            sentinelLines.end = lineIdx;
-        }
-        lineConsumed = lineIdx;
-    }
-
-    while (i < text.length) {
-        const c = text[i];
-        if (inBlockComment) {
-            if (c === '*' && text[i + 1] === '/') {
-                inBlockComment = false;
-                i += 2;
-                continue;
-            }
-            i++;
-            continue;
-        }
-        if (inString) {
-            if (c === '\\' && i + 1 < text.length) {
-                i += 2;
-                continue;
-            }
-            if (c === '"') inString = false;
-            i++;
-            continue;
-        }
-        if (c === '"') {
-            inString = true;
-            i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '/') {
-            // A line comment outside of a block comment — this is where
-            // our sentinels live. Classify the line.
-            maybeRecord(i);
-            while (i < text.length && text[i] !== '\n') i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '*') {
-            inBlockComment = true;
-            i += 2;
-            continue;
-        }
-        i++;
-    }
-
-    if (sentinelLines.begin === null || sentinelLines.end === null) return null;
-    return { begin: sentinelLines.begin, end: sentinelLines.end };
+    if (beginLine === null || endLine === null) return null;
+    return { begin: beginLine, end: endLine };
 }
 
 /**
- * Strip the entire sentinel-delimited block we manage, including the
- * inner `// lintr: ...` headers and key lines. If either sentinel is
- * missing — or appears only inside a block comment — returns the input
- * unchanged.
+ * Strip our sentinel-delimited block (sentinels + per-group `// lintr: ...`
+ * headers + keys) out of `text`. Leaves everything else — including any
+ * user-authored comments outside the sentinel range — untouched. No-op
+ * when either sentinel is missing.
  */
 function stripSentineledLintingBlock(text: string): string {
     const range = findSentinelLineRange(text);
@@ -525,210 +312,242 @@ function stripSentineledLintingBlock(text: string): string {
 }
 
 /**
- * Remove lines whose sole content is a **top-level** `raven.linting.*`
- * key declaration. `raven.linting.*` values are all scalars (boolean,
- * int, string) so single-line removal is safe.
- *
- * Walks the text tracking string/comment state and brace/bracket depth
- * so a nested key (e.g. inside a `[r]` language override block where
- * the user might write `"[r]": { "raven.linting.lineLength": 120 }`)
- * is left untouched.
- *
- * Assumes the VS Code convention of one key per line. A user who puts
- * `"editor.tabSize": 4, "raven.linting.foo": true` on a single line
- * would lose the unrelated key here, but VS Code's own formatters and
- * the Settings UI never produce that shape, so we don't try to handle
- * it. Tracked as a known limitation in https://github.com/jbearak/raven/issues/250.
+ * Iterate the top-level properties of a parsed `jsonc-parser` object node,
+ * yielding `{ key, valueNode }` pairs for `raven.linting.*` keys only.
+ * Skips malformed property nodes defensively.
  */
-function stripTopLevelLintingLines(text: string): string {
-    const lineStarts = computeLineStarts(text);
-    const linesToStrip = new Set<number>();
-
-    let depth = 0;
-    let inString = false;
-    let inBlockComment = false;
-    let i = 0;
-
-    while (i < text.length) {
-        const c = text[i];
-        if (inBlockComment) {
-            if (c === '*' && text[i + 1] === '/') {
-                inBlockComment = false;
-                i += 2;
-                continue;
-            }
-            i++;
-            continue;
-        }
-        if (inString) {
-            if (c === '\\' && i + 1 < text.length) {
-                i += 2;
-                continue;
-            }
-            if (c === '"') inString = false;
-            i++;
-            continue;
-        }
-        if (c === '"') {
-            // String-literal start. If we're at depth 1, this could be a
-            // top-level property key; check whether it matches our pattern
-            // and is followed by `:` (ignoring whitespace/comments).
-            if (depth === 1) {
-                const match = /^"raven\.linting\.[^"\\]+"/.exec(text.slice(i));
-                if (match) {
-                    const afterKey = i + match[0].length;
-                    let j = afterKey;
-                    // Skip whitespace and same-line comments looking for `:`.
-                    while (j < text.length) {
-                        const ch = text[j];
-                        if (ch === ' ' || ch === '\t') {
-                            j++;
-                            continue;
-                        }
-                        if (ch === '/' && text[j + 1] === '/') {
-                            while (j < text.length && text[j] !== '\n') j++;
-                            break;
-                        }
-                        if (ch === '/' && text[j + 1] === '*') {
-                            j += 2;
-                            while (
-                                j + 1 < text.length &&
-                                !(text[j] === '*' && text[j + 1] === '/')
-                            )
-                                j++;
-                            j += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    if (j < text.length && text[j] === ':') {
-                        linesToStrip.add(lineIndexOfPos(lineStarts, i));
-                    }
-                }
-            }
-            inString = true;
-            i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '/') {
-            while (i < text.length && text[i] !== '\n') i++;
-            continue;
-        }
-        if (c === '/' && text[i + 1] === '*') {
-            inBlockComment = true;
-            i += 2;
-            continue;
-        }
-        if (c === '{' || c === '[') {
-            depth++;
-            i++;
-            continue;
-        }
-        if (c === '}' || c === ']') {
-            depth--;
-            i++;
-            continue;
-        }
-        i++;
+function* iterateLintingProperties(
+    root: Node,
+): Generator<{ key: string; valueNode: Node }> {
+    if (root.type !== 'object' || !root.children) return;
+    for (const prop of root.children) {
+        if (prop.type !== 'property' || !prop.children || prop.children.length < 2) continue;
+        const keyNode = prop.children[0];
+        const valueNode = prop.children[1];
+        if (typeof keyNode.value !== 'string') continue;
+        if (!keyNode.value.startsWith('raven.linting.')) continue;
+        yield { key: keyNode.value, valueNode };
     }
-
-    if (linesToStrip.size === 0) return text;
-
-    const lines = text.split('\n');
-    const kept: string[] = [];
-    for (let li = 0; li < lines.length; li++) {
-        if (!linesToStrip.has(li)) kept.push(lines[li]);
-    }
-    return kept.join('\n');
 }
 
 /**
- * Append a `,` after the last non-comment, non-whitespace character of
- * `text`. If the trailing content is a `//` line comment or a `/* *\/`
- * block comment, the comma is inserted *before* the comment so the
- * file remains valid JSONC. No-op if the last significant character is
- * already `,`, `{`, or `[` (i.e. no separator needed).
+ * Classify `text` for the scaffold's merge step. Wraps `jsonc-parser`'s
+ * `parseTree` and adds the project-specific checks (non-object root,
+ * non-scalar `raven.linting.*` value).
  */
-function appendCommaIfNeeded(text: string): string {
-    let lastSig = -1;
-    let i = 0;
-    let inString = false;
+function classifyExisting(text: string): LintingClassification {
+    if (text.trim().length === 0) return { kind: 'empty' };
+    const errors: ParseError[] = [];
+    const root = parseTree(text, errors, { allowTrailingComma: true });
+    if (errors.length > 0) return { kind: 'parseError' };
+    if (!root || root.type !== 'object') return { kind: 'nonObjectRoot' };
+    const userManagedKeys: string[] = [];
+    for (const { key, valueNode } of iterateLintingProperties(root)) {
+        if (valueNode.type === 'object' || valueNode.type === 'array') {
+            return { kind: 'unsupportedValue', key };
+        }
+        userManagedKeys.push(key);
+    }
+    return { kind: 'object', userManagedKeys };
+}
 
-    while (i < text.length) {
-        const c = text[i];
-        if (inString) {
-            if (c === '\\' && i + 1 < text.length) {
-                lastSig = i + 1;
-                i += 2;
+/**
+ * Same as `classifyExisting`, but applied to the post-sentinel-strip text
+ * so callers only see *user-managed* `raven.linting.*` keys (everything
+ * inside our sentinel block was our own and is silently regenerable).
+ */
+export function classifyUserManagedLintingKeys(text: string): LintingClassification {
+    return classifyExisting(stripSentineledLintingBlock(text));
+}
+
+/**
+ * The shape kept around for the test suite as a parse-success signal:
+ * top-level `raven.linting.*` keys, or `null` if classification rejected
+ * the input for any reason. An empty file is a parse-success with zero
+ * keys (not a rejection).
+ */
+export function detectExistingLintingKeys(text: string): string[] | null {
+    const result = classifyExisting(text);
+    if (result.kind === 'empty') return [];
+    if (result.kind === 'object') return result.userManagedKeys;
+    return null;
+}
+
+/**
+ * Same as `detectExistingLintingKeys`, but ignores keys inside our sentinel-
+ * managed block. A re-run of the scaffold should only prompt the user about
+ * keys they wrote themselves (outside the sentinels), not ones a prior
+ * scaffold run put there.
+ */
+export function detectUserManagedLintingKeys(text: string): string[] | null {
+    const result = classifyUserManagedLintingKeys(text);
+    if (result.kind === 'empty') return [];
+    if (result.kind === 'object') return result.userManagedKeys;
+    return null;
+}
+
+/**
+ * Remove every top-level `raven.linting.*` key from `text`. Uses
+ * `jsonc-parser`'s `parseTree` to identify each key's property node
+ * (so nested keys under e.g. a `[r]` language override are left
+ * untouched), then splices the property's own range out of the text.
+ *
+ * Why not `modify` + `applyEdits`? `jsonc-parser`'s `modify`-for-removal
+ * has two edge-case bugs we hit:
+ *   1. If the input has a trailing comma after the key being removed
+ *      (`{ "raven.linting.x": 1, }`), `modify` produces `{ , }` —
+ *      orphan comma, invalid JSONC.
+ *   2. If a neighbour key has an inline `//` comment on the SAME
+ *      physical line *before* our key (`"editor.tabSize": 4, // keep
+ *      me\n"raven.linting.x": false`), `modify` consumes the comment
+ *      as trailing content of the removed range and silently drops it.
+ *
+ * The splice removes the property + an optional trailing `,` + any
+ * surrounding whitespace, plus the leading whitespace on the property's
+ * line and the trailing newline *if* the property is alone on its line.
+ * When the property shares a line with `{`, `}`, or other keys, we
+ * leave the surrounding line structure intact and just take out our
+ * key's range.
+ */
+function removeTopLevelLintingKeys(text: string): string {
+    let current = text;
+    // Hard cap matches the schema's `raven.linting.*` key count.
+    for (let safety = 0; safety < 200; safety++) {
+        const root = parseTree(current, undefined, { allowTrailingComma: true });
+        if (!root || root.type !== 'object' || !root.children) break;
+
+        let propNode: Node | null = null;
+        for (const prop of root.children) {
+            if (prop.type !== 'property' || !prop.children || prop.children.length < 2) {
                 continue;
             }
-            lastSig = i;
-            if (c === '"') inString = false;
-            i++;
-            continue;
+            const key = prop.children[0].value;
+            if (typeof key === 'string' && key.startsWith('raven.linting.')) {
+                propNode = prop;
+                break;
+            }
         }
-        if (c === '"') {
-            inString = true;
-            lastSig = i;
-            i++;
-            continue;
+        if (!propNode) break;
+
+        let removeStart = propNode.offset;
+        let removeEnd = propNode.offset + propNode.length;
+
+        // Phase 1: try to absorb a trailing `,` (standard "comma-after"
+        // style) — skipping intermediate whitespace and tabs.
+        let trailingCommaAbsorbed = false;
+        {
+            let j = removeEnd;
+            while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+            if (current[j] === ',') {
+                removeEnd = j + 1;
+                trailingCommaAbsorbed = true;
+            }
         }
-        if (c === '/' && text[i + 1] === '/') {
-            while (i < text.length && text[i] !== '\n') i++;
-            continue;
+
+        // Phase 2: if there was no trailing `,` to absorb, the file might
+        // be using comma-before style (`"a": 1\n  , "raven.linting.x": v`).
+        // Walk backward over whitespace looking for a leading `,` and
+        // absorb it too — otherwise we'd leave an orphan separator.
+        if (!trailingCommaAbsorbed) {
+            let i = removeStart - 1;
+            while (i >= 0 && (current[i] === ' ' || current[i] === '\t')) i--;
+            if (i >= 0 && current[i] === ',') {
+                removeStart = i;
+            }
         }
-        if (c === '/' && text[i + 1] === '*') {
-            i += 2;
-            while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
-            i += 2;
-            continue;
+
+        // Phase 3: if the (possibly-extended) removal range is alone on
+        // its physical line, also take the leading whitespace, the
+        // preceding newline, and a trailing newline so the line vanishes
+        // cleanly. When the range shares a line with `{`, `}`, or a
+        // neighbour key, we leave the surrounding line structure alone.
+        let i = removeStart - 1;
+        while (i >= 0 && (current[i] === ' ' || current[i] === '\t')) i--;
+        const ownLine = i < 0 || current[i] === '\n';
+        if (ownLine) {
+            if (i >= 0) removeStart = i + 1;
+            let j = removeEnd;
+            while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+            if (current[j] === '\n') j++;
+            removeEnd = j;
         }
+
+        current = current.slice(0, removeStart) + current.slice(removeEnd);
+    }
+    return current;
+}
+
+/**
+ * Walk `text[after..before)` skipping JSONC whitespace and comments,
+ * and return `true` if the first significant character is `,`. Used to
+ * decide whether the last property in a root object already has a
+ * trailing comma (in which case we don't add another one).
+ *
+ * A block comment that opens inside the scan window but whose `*\/`
+ * lies at or past `before` can't happen for valid JSONC (a `/* ... *\/`
+ * straddling the root's closing brace would make the file unparseable
+ * and we'd have bailed already in `classifyExisting`). The defensive
+ * `if (!closed) return false;` branch below treats that case as "no
+ * comma" anyway — the worst we'd do is insert a redundant comma.
+ */
+function hasCommaBetween(text: string, after: number, before: number): boolean {
+    let i = after;
+    while (i < before) {
+        const c = text[i];
+        if (c === ',') return true;
         if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
             i++;
             continue;
         }
-        lastSig = i;
-        i++;
+        if (c === '/' && text[i + 1] === '/') {
+            while (i < before && text[i] !== '\n') i++;
+            continue;
+        }
+        if (c === '/' && text[i + 1] === '*') {
+            i += 2;
+            let closed = false;
+            while (i + 1 < before) {
+                if (text[i] === '*' && text[i + 1] === '/') {
+                    closed = true;
+                    break;
+                }
+                i++;
+            }
+            if (!closed) return false;
+            i += 2;
+            continue;
+        }
+        // Any other significant char shouldn't appear in valid JSONC
+        // between a property value and the closing brace — treat as
+        // "no comma" and let the caller deal with it.
+        return false;
     }
-
-    if (lastSig === -1) return text;
-    const lastChar = text[lastSig];
-    if (lastChar === ',' || lastChar === '{' || lastChar === '[') return text;
-    return text.slice(0, lastSig + 1) + ',' + text.slice(lastSig + 1);
-}
-
-/**
- * Like `detectExistingLintingKeys`, but ignores keys inside the sentinel-
- * managed block this scaffold owns. Used by the scaffold command to
- * decide whether to prompt: keys inside our block are safe to overwrite
- * silently on a re-run, but keys *outside* it are user-managed and need
- * confirmation. Returns `null` for parse errors or a non-object root.
- */
-export function detectUserManagedLintingKeys(text: string): string[] | null {
-    return detectExistingLintingKeys(stripSentineledLintingBlock(text));
-}
-
-/**
- * Same as `detectUserManagedLintingKeys`, but returns the richer result
- * shape so callers can distinguish a JSON parse error from a non-object
- * root (e.g. the file contains `[1, 2, 3]`). The scaffold command path
- * uses this; tests use the simpler `string[] | null` flavour above.
- */
-export function classifyUserManagedLintingKeys(text: string): LintingParseResult {
-    return parseLintingKeys(stripSentineledLintingBlock(text));
+    return false;
 }
 
 /**
  * Build the JSONC content to write to `.vscode/settings.json`. If
  * `existing` is `undefined` or whitespace-only, returns the fresh
- * template. Otherwise strips any prior sentinel-managed block and any
- * top-level `raven.linting.*` keys, then inserts a freshly formatted
- * block immediately before the outermost closing brace — preserving
- * all unrelated keys and comments.
+ * template. Otherwise:
  *
- * Returns `null` if the existing content can't safely be merged into
- * (parse error, or root isn't a JSON object). Callers must surface
- * that to the user rather than overwriting their file.
+ *   1. Strip any prior sentinel-managed block we wrote.
+ *   2. Classify the rest via `jsonc-parser` (parse errors / non-object
+ *      root / non-scalar `raven.linting.*` value all return `null`).
+ *   3. Remove every remaining top-level `raven.linting.*` key via
+ *      `removeTopLevelLintingKeys`'s `parseTree`-driven line splice —
+ *      `jsonc-parser`'s `modify` + `applyEdits` looked tempting here
+ *      but has two edge-case bugs we hit (see that function's doc
+ *      comment for why we don't use it).
+ *   4. Use `parseTree` to find the closing `}` and the last property's
+ *      value-end, then splice the formatted block in.
+ *
+ * Comma handling for the last existing property uses a small
+ * comment-aware scan via `hasCommaBetween`: if the last property
+ * already has a trailing comma we leave it, otherwise we insert one
+ * right after the value (before any inline `//` comment on that line),
+ * which is what `jsonc-parser.modify` would do for a fresh insertion
+ * except `modify` also migrates the inline comment onto the new key's
+ * line — surprising UX we'd rather avoid.
  */
 export function buildLintingSettingsContent(existing: string | undefined): string | null {
     if (existing === undefined || existing.trim().length === 0) {
@@ -736,19 +555,44 @@ export function buildLintingSettingsContent(existing: string | undefined): strin
     }
 
     const afterSentinelStrip = stripSentineledLintingBlock(existing);
-    const classification = parseLintingKeys(afterSentinelStrip);
+    const classification = classifyExisting(afterSentinelStrip);
+    if (classification.kind === 'empty') return LINTING_SETTINGS_TEMPLATE;
     if (classification.kind !== 'object') return null;
 
-    const fullyStripped = stripTopLevelLintingLines(afterSentinelStrip);
-    const closeIdx = findOutermostClosingBrace(fullyStripped);
-    if (closeIdx === -1) return null;
+    const withoutLintingKeys = removeTopLevelLintingKeys(afterSentinelStrip);
 
-    const before = fullyStripped.slice(0, closeIdx);
-    const after = fullyStripped.slice(closeIdx);
-    const trimmedBefore = before.replace(/[ \t\n\r]+$/, '');
-    const prefix = appendCommaIfNeeded(trimmedBefore) + '\n';
+    const root = parseTree(withoutLintingKeys, undefined, { allowTrailingComma: true });
+    if (!root || root.type !== 'object') return null;
 
-    return `${prefix}${formatLintingBlock('  ')}\n${after}`;
+    // `parseTree` reports `root.offset` = position of `{` and
+    // `root.length` spans through the closing `}` — so the `}` itself
+    // sits at `root.offset + root.length - 1`.
+    const closingBracePos = root.offset + root.length - 1;
+    if (withoutLintingKeys[closingBracePos] !== '}') return null;
+
+    const hasChildren = (root.children?.length ?? 0) > 0;
+
+    let beforeInsertion: string;
+    if (!hasChildren) {
+        beforeInsertion = withoutLintingKeys.slice(0, closingBracePos);
+    } else {
+        const lastChild = root.children![root.children!.length - 1];
+        const lastChildEnd = lastChild.offset + lastChild.length;
+        const alreadyHasComma = hasCommaBetween(
+            withoutLintingKeys,
+            lastChildEnd,
+            closingBracePos,
+        );
+        beforeInsertion = alreadyHasComma
+            ? withoutLintingKeys.slice(0, closingBracePos)
+            : withoutLintingKeys.slice(0, lastChildEnd) +
+              ',' +
+              withoutLintingKeys.slice(lastChildEnd, closingBracePos);
+    }
+
+    const trimmedBefore = beforeInsertion.replace(/[ \t\n\r]+$/, '');
+    const after = withoutLintingKeys.slice(closingBracePos);
+    return `${trimmedBefore}\n${formatLintingBlock('  ')}\n${after}`;
 }
 
 /**
@@ -874,7 +718,8 @@ async function runLintingSettingsScaffold(
             );
             return undefined;
         }
-        const userManagedKeys = classification.keys;
+        const userManagedKeys =
+            classification.kind === 'object' ? classification.userManagedKeys : [];
         if (userManagedKeys.length > 0) {
             const label =
                 userManagedKeys.length === 1
