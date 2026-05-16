@@ -112,6 +112,42 @@ describe('scroll height capping', () => {
         });
         expect(range.end).toBe(nrow);
     });
+
+    test('logicalScrollTop: clamps overshoot above maxPhysical to maxLogical (large)', () => {
+        // macOS rubber-band can briefly push scrollTop above maxPhysical.
+        // Without the clamp, the scaled value exceeds maxLogical and
+        // visibleRange would return an empty window.
+        expect(logicalScrollTop(maxPhysical * 1.1, LARGE, VH, RH))
+            .toBe(maxLogicalLarge);
+    });
+
+    test('logicalScrollTop: clamps negative scrollTop to 0 (large)', () => {
+        // Defensive: Chromium shouldn't report negative scrollTop, but the
+        // clamp removes the assumption.
+        expect(logicalScrollTop(-50, LARGE, VH, RH)).toBe(0);
+    });
+
+    test('logicalScrollTop: clamps negative scrollTop to 0 (small)', () => {
+        // The small-data fast path also clamps now, so a stray negative
+        // scrollTop never propagates to visibleRange's floor() math.
+        expect(logicalScrollTop(-50, SMALL, VH, RH)).toBe(0);
+    });
+
+    test('visibleRange after clamped overshoot still includes the last row', () => {
+        const nrow = 10_000_000;
+        const totalGridHeight = nrow * RH;
+        // Simulate rubber-band overshoot: scrollTop 10% past maxPhysical.
+        const logical = logicalScrollTop(maxPhysical * 1.1, totalGridHeight, VH, RH);
+        const range = visibleRange({
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 8,
+        });
+        // Without the clamp, logical exceeds maxLogical, range.start exceeds
+        // nrow, and range.end (clamped at nrow) ends up < range.start — an
+        // empty window that blanks the grid. The clamp keeps start < end.
+        expect(range.start).toBeLessThan(range.end);
+        expect(range.end).toBe(nrow);
+    });
 });
 
 describe('coalesceScroll', () => {

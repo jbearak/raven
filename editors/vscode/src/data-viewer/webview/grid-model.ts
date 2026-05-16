@@ -14,23 +14,34 @@ export function cappedScrollHeight(totalGridHeight: number): number {
 }
 
 /** Map a physical scrollTop (in the capped container) to the logical
- *  scrollTop that visibleRange() expects. Identity when content fits.
+ *  scrollTop that visibleRange() expects. Identity-shaped when content fits.
  *
  *  The physical scroll range is [0, MAX_SCROLL_PX + rowHeight - viewportHeight]
  *  and the logical scroll range is [0, totalGridHeight + rowHeight - viewportHeight],
  *  so we scale between those two maxima (not between MAX_SCROLL_PX and
- *  totalGridHeight) to reach the very last row when scrolled to the bottom. */
+ *  totalGridHeight) to reach the very last row when scrolled to the bottom.
+ *
+ *  Both branches clamp to [0, maxLogical]. macOS rubber-band can briefly
+ *  push scrollTop above maxPhysical; without the clamp the scaled value
+ *  exceeds maxLogical, visibleRange's floor() math gives start > nrow,
+ *  and the resulting empty range blanks the grid until the bounce
+ *  resolves. The negative clamp is defensive against hypothetical
+ *  Chromium oddities; in practice scrollTop should never be negative. */
 export function logicalScrollTop(
     scrollTop: number,
     totalGridHeight: number,
     viewportHeight: number,
     rowHeight: number,
 ): number {
-    if (totalGridHeight <= MAX_SCROLL_PX) return scrollTop;
+    if (totalGridHeight <= MAX_SCROLL_PX) {
+        const maxLogicalSmall = Math.max(0, totalGridHeight + rowHeight - viewportHeight);
+        return Math.max(0, Math.min(maxLogicalSmall, scrollTop));
+    }
     const maxPhysical = MAX_SCROLL_PX + rowHeight - viewportHeight;
     if (maxPhysical <= 0) return 0;
     const maxLogical = totalGridHeight + rowHeight - viewportHeight;
-    return (scrollTop / maxPhysical) * maxLogical;
+    const scaled = (scrollTop / maxPhysical) * maxLogical;
+    return Math.max(0, Math.min(maxLogical, scaled));
 }
 
 /** Map a logical pixel offset (visibleRangeStart × rowHeight) back to a
