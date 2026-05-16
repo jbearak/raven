@@ -9,10 +9,11 @@
 //! appears on. We emit one diagnostic per `;` so a line with two semicolons
 //! produces two.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -105,6 +106,7 @@ fn scan(
             },
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
+            code: Some(NumberOrString::String(rule_ids::SEMICOLON.to_string())),
             message: "Avoid `;`; put each statement on its own line.".to_string(),
             ..Default::default()
         });

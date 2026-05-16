@@ -19,10 +19,11 @@
 //!   (`function(T) ...`). The `T` here is a name in the local syntax, not a
 //!   reference to the boolean.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -122,6 +123,7 @@ fn emit(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(rule_ids::T_AND_F_SYMBOL.to_string())),
         message: format!("Use `{preferred}` instead of the symbol `{name}`."),
         ..Default::default()
     });

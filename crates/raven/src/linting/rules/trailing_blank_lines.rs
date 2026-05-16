@@ -4,9 +4,10 @@
 //! doesn't end with `\n` is reported, and so is one with one-or-more blank
 //! lines after the last non-blank line.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 
 pub(crate) fn collect(
@@ -32,6 +33,7 @@ pub(crate) fn collect(
                 },
                 severity: Some(severity),
                 source: Some(LINT_SOURCE.to_string()),
+                code: Some(NumberOrString::String(rule_ids::TRAILING_BLANK_LINES.to_string())),
                 message: "File should end with a newline.".to_string(),
                 ..Default::default()
             });
@@ -64,6 +66,7 @@ pub(crate) fn collect(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(rule_ids::TRAILING_BLANK_LINES.to_string())),
         message: if trailing == 1 {
             "Trailing blank line at end of file.".to_string()
         } else {

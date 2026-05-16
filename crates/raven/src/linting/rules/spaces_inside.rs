@@ -12,10 +12,11 @@
 //! non-whitespace child, and between the last non-whitespace child and
 //! `close`.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -148,6 +149,7 @@ fn emit_after_open(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(rule_ids::SPACES_INSIDE.to_string())),
         message: format!("Remove whitespace after `{open_text}`."),
         ..Default::default()
     });
@@ -178,6 +180,7 @@ fn emit_before_close(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(rule_ids::SPACES_INSIDE.to_string())),
         message: format!("Remove whitespace before `{close_text}`."),
         ..Default::default()
     });

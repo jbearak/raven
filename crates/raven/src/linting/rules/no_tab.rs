@@ -4,9 +4,10 @@
 //! tab on that line. The diagnostic range covers the contiguous run of tabs
 //! so that "fix" actions or selection-aware tooling can target it cleanly.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -38,6 +39,7 @@ pub(crate) fn collect(
             },
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
+            code: Some(NumberOrString::String(rule_ids::NO_TAB.to_string())),
             message: "Tab character; use spaces.".to_string(),
             ..Default::default()
         });

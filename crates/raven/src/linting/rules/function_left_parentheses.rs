@@ -6,10 +6,11 @@
 //! `function_definition` with a `name` field holding the `function` keyword
 //! (or `\`) and a `parameters` field holding the `(...)` block.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -88,6 +89,9 @@ fn check(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(
+            rule_ids::FUNCTION_LEFT_PARENTHESES.to_string(),
+        )),
         message: format!("Remove whitespace between `{keyword}` and `(`."),
         ..Default::default()
     });
