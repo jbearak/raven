@@ -4384,9 +4384,13 @@ impl LanguageServer for Backend {
             // diagnostics / indentation / symbols / completion all reload
             // live; the warning calls out the gap explicitly.
             if package_settings_changed || watch_settings_changed || package_mode_changed {
+                let mut classes = Vec::with_capacity(3);
+                if package_settings_changed { classes.push("packages.*"); }
+                if package_mode_changed { classes.push("packageMode"); }
+                if watch_settings_changed { classes.push("packagesWatch*"); }
+                let detail = classes.join(", ");
                 log::warn!(
-                    "raven.toml: package settings, packageMode, or watcher knobs changed; \
-                     restart Raven to pick them up. \
+                    "raven.toml: {detail} changed; restart Raven to pick them up. \
                      (Live-reload is scoped to non-rebuild settings in this version.)"
                 );
                 // Surface to the user via `window/showMessage` so editors
@@ -4397,7 +4401,7 @@ impl LanguageServer for Backend {
                     client
                         .show_message(
                             MessageType::WARNING,
-                            "raven.toml: package-related settings changed; restart Raven to pick them up.",
+                            format!("raven.toml: {detail} changed; restart Raven to pick them up."),
                         )
                         .await;
                 });
