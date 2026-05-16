@@ -19,13 +19,13 @@ Raven therefore ships **one command** — `Raven: Knit` for `.Rmd` — and defer
 
 1. Provide `Raven: Knit` for `.Rmd` files: runs `rmarkdown::render` in a fresh R subprocess and reveals the rendered output.
 2. Detect missing prerequisites (R, workspace trust) cleanly with actionable error messages.
-3. Refuse `.Rmd` files that need Tier-2 features (`runtime: shiny`, custom YAML `knit:` hook) with a copy-paste command the user can run manually.
+3. Refuse `.Rmd` files that need deferred features (`runtime: shiny`, custom YAML `knit:` hook) with a copy-paste command the user can run manually.
 4. Nudge users toward `quarto.quarto` for preview and toward `REditorSupport.r-syntax` (or `REditorSupport.r`) for `.Rmd` grammar, via one-time install info messages and a walkthrough.
 5. Avoid duplicating UI surfaces that sibling extensions already provide.
 
 ## Non-goals
 
-The following are explicitly out of scope. They belong to `quarto.quarto`, vscode-R, or a future Tier 2 raven feature:
+The following are explicitly out of scope. They belong to `quarto.quarto`, vscode-R, or potential future work (not currently tracked — see the "Potential future work" section below):
 
 | Capability | Where it lives instead |
 |---|---|
@@ -33,12 +33,12 @@ The following are explicitly out of scope. They belong to `quarto.quarto`, vscod
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` command |
 | `.qmd` syntax / grammar / LSP | `quarto.quarto` |
 | `.Rmd` syntax / grammar | `REditorSupport.r-syntax` or `REditorSupport.r` |
-| `.Rmd` knit dropdown (Knit to HTML / PDF / Word picker) | Tier 2 |
-| Custom YAML `knit:` hook dispatch (bookdown / xaringan / pkgdown) | Tier 2 |
-| Knit-with-Parameters dialog | Tier 2 |
-| `runtime: shiny` / `server: shiny` documents | Tier 2 (raven Tier 1 detects and refuses with copyable command) |
-| `rmarkdown::render_site` | Tier 2 |
-| Knit in raven's active R console (vs. fresh subprocess) | Tier 2, opt-in setting |
+| `.Rmd` knit dropdown (Knit to HTML / PDF / Word picker) | Use `quarto render foo.Rmd --to <fmt>` via Quarto CLI |
+| Custom YAML `knit:` hook dispatch (bookdown / xaringan / pkgdown) | Run the hook function manually in the R console (deferral message includes copyable command) |
+| Knit-with-Parameters dialog | Edit YAML defaults and re-knit, or `rmarkdown::render(params = list(...))` programmatically |
+| `runtime: shiny` / `server: shiny` documents | `rmarkdown::run('foo.Rmd')` in the R console; or use Quarto's `server: shiny` |
+| `rmarkdown::render_site` | `rmarkdown::render_site()` in the R console; or migrate to Quarto Websites |
+| Knit in raven's active R console (vs. fresh subprocess) | Potential future opt-in setting; manual `rmarkdown::render(...)` in console for now |
 
 ## Architecture
 
@@ -49,7 +49,7 @@ User: raven.knit on foo.Rmd
         │
         ▼
  [1] Workspace trust check
- [2] YAML front matter parse + Tier-2-blocker detection
+ [2] YAML front matter parse + deferred-feature-blocker detection
  [3] Format detection (first `output:` entry, else "html_document")
  [4] Resolve working directory
  [5] R subprocess: child_process.spawn("R", ["--no-save", "--no-restore", "-e", "<expr>"])
@@ -65,7 +65,7 @@ User: raven.knit on foo.Rmd
 - Easy cancellation via signal.
 - Doesn't require raven's R console to be active. `raven.knit` works whenever R is on PATH, regardless of whether the user has the R console enabled.
 
-Trade-off: users with slow-loading packages pay cold-start cost on every knit. Tier 2 adds an opt-in `raven.knit.useActiveRConsole` for that case.
+Trade-off: users with slow-loading packages pay cold-start cost on every knit. An opt-in `raven.knit.useActiveRConsole` setting could address this in a future enhancement; not in scope here.
 
 ### Why no `.qmd` knit
 
@@ -193,32 +193,34 @@ User: raven.knit on foo.Rmd
    - On parse error: toast "YAML front matter is malformed; see Raven: Knit output" + open output channel with the parse error.
         │
         ▼
- [3] Detect Tier-2 blockers (yaml-frontmatter.detectTier2Blockers)
-   The detection is intentionally permissive — when in doubt, bail. Anything more permissive risks silent
-   misbehavior on a feature we don't yet implement.
+ [3] Detect deferred-feature blockers (yaml-frontmatter.detectBlockers)
+   The detection is intentionally conservative — when in doubt, bail. Anything more permissive risks silent
+   misbehavior on a feature this design doesn't implement.
 
-   Bail conditions, each with [Copy command] and [Learn more] buttons:
+   Bail conditions, each with [Copy command] button:
 
    - `knit:` field present (any non-null value):
-       message: "This document specifies a custom knit hook. Raven Tier 1 doesn't honor custom hooks. Run
+       message: "This document specifies a custom knit hook. Raven doesn't honor custom hooks. Run
                 the equivalent in the R console."
        copyable command: "rmarkdown::render('foo.Rmd')" or, if the knit: value is a recognizable R
                 function call, the inferred call.
 
    - `runtime: shiny` or `server: shiny`:
-       message: "Shiny documents aren't supported in Raven Tier 1."
+       message: "Shiny documents aren't supported by Raven: Knit."
        copyable command: "rmarkdown::run('foo.Rmd')"
 
    - `site:` field present (rmarkdown::render_site / bookdown::bookdown_site):
-       message: "Site projects aren't supported in Raven Tier 1."
+       message: "Site projects aren't supported by Raven: Knit."
        copyable command: "rmarkdown::render_site()" or "bookdown::serve_book()" depending on site: value.
 
    - `params:` field present:
-       message: NOT a blocker. Render proceeds with defaults defined in the YAML. If the user wants
-                the interactive params dialog, that's Tier 2.
+       message: NOT a blocker. Render proceeds with defaults defined in the YAML. Interactive params
+                dialog is potential future work; users who want it pass `params = list(...)`
+                programmatically.
 
    - `output:` with multiple top-level entries:
-       NOT a blocker. We pick the first and proceed; multi-format Knit dropdown is Tier 2.
+       NOT a blocker. We pick the first and proceed. Multi-format picker is potential future work;
+       users who need it shell out to `quarto render foo.Rmd --to <fmt>`.
         │
         ▼
  [4] Format detection (yaml-frontmatter.detectFormat)
@@ -310,7 +312,7 @@ Caveats we accept:
 - Quiet modes (`quiet = TRUE`, or `--quiet` via R startup) may suppress the message. We treat a clean exit with no captured path as "succeeded, unknown path."
 - The exit code from `rmarkdown::render` (which propagates from R) is the ground truth for success/failure. Output-path parsing is purely a UX nicety.
 
-Tier 1's implementation pins this with a fixture file (`tests/fixtures/rmarkdown-stdout/*.txt`) captured from real `rmarkdown::render` runs across the supported output formats (html_document, pdf_document, word_document, github_document). If rmarkdown changes the message in a future release, the fixture test catches it and we tighten the regex or accept the new format.
+This implementation pins the regex with a fixture file (`tests/fixtures/rmarkdown-stdout/*.txt`) captured from real `rmarkdown::render` runs across the supported output formats (html_document, pdf_document, word_document, github_document). If rmarkdown changes the message in a future release, the fixture test catches it and we tighten the regex or accept the new format.
 
 ### Output reveal
 
@@ -371,7 +373,7 @@ Removed from the original issue body:
 | `raven.knit` | Raven: Knit | `raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd\|Rmd)/` |
 | `raven.knit.openOutputChannel` | Raven: Show Knit Output | always |
 
-No keybindings in Tier 1; users invoke via command palette or context menu. RStudio's `Cmd+Shift+K` is not bound, both to keep scope tight and to avoid colliding with other extensions users might have configured.
+No keybinding in this design; users invoke via command palette or context menu. RStudio's `Cmd+Shift+K` is not bound, both to keep scope tight and to avoid colliding with other extensions users might have configured.
 
 ## Error handling matrix
 
@@ -381,9 +383,9 @@ No keybindings in Tier 1; users invoke via command palette or context menu. RStu
 | Workspace untrusted | Info: "Trust the workspace to enable" + `[Manage Workspace Trust]` |
 | R missing on PATH | Toast: "R not found; set `raven.r.executablePath`" |
 | YAML parse error | Toast: "YAML front matter is malformed" + focus output channel with the parse error |
-| Custom YAML `knit:` field | Info: "Tier 1 doesn't honor custom hooks" + `[Copy command]` |
-| `runtime: shiny` / `server: shiny` | Info: "Shiny documents not supported in Tier 1" + `[Copy command]` |
-| `site:` field present | Info: "Site projects not supported in Tier 1" + `[Copy command]` |
+| Custom YAML `knit:` field | Info: "Raven doesn't honor custom knit hooks" + `[Copy command]` |
+| `runtime: shiny` / `server: shiny` | Info: "Shiny documents not supported" + `[Copy command]` |
+| `site:` field present | Info: "Site projects not supported" + `[Copy command]` |
 | Document is untitled / non-file URI | Info: "Save the file to disk before running Raven: Knit." |
 | Path contains NUL or rejected control character | Toast: "File path contains an unsupported character" + focus output channel with details |
 | Working dir `project` with file outside workspace folders | Toast: "Cannot resolve project root: document is outside the workspace" |
@@ -420,20 +422,20 @@ Documented in `docs/development.md`:
 - Knit in an untrusted workspace: verify trust message.
 - Cancel a long-running knit: verify SIGINT then SIGKILL.
 
-## Out of scope — Tier 2 issue body (preview)
+## Potential future work (not tracked)
 
-Title: **R Markdown Tier 2 — advanced knit features**
+These features are recorded for institutional memory but are **not** tracked in a separate GitHub issue. If demand emerges for any one of them, file a focused issue at that time. Most are largely covered by `quarto.quarto` when the user has Quarto CLI installed; this list represents the small surface area where `quarto.quarto` does not cover the workflow.
 
-Scope:
+| Feature | Why it's deferred / dropped |
+|---|---|
+| RStudio-style Knit dropdown (HTML / PDF / Word picker) | `quarto render foo.Rmd --to <fmt>` covers this for users with Quarto CLI. Building our own dropdown adds little. |
+| Custom YAML `knit:` hook dispatch (bookdown / xaringan / pkgdown) | Only genuinely uncovered item. bookdown / xaringan / pkgdown users currently invoke `bookdown::serve_book()` etc. in the R console directly. A "Knit button" honoring the YAML `knit:` field would be a workflow nicety, not a blocker. File a focused issue if a user asks. |
+| Knit-with-Parameters dialog (`params: "ask"`) | Users can edit YAML defaults and re-knit, or pass `params = list(...)` programmatically. Niche UI feature. |
+| `runtime: shiny` / `rmarkdown::run` | Legacy rmarkdown Shiny; superseded by Quarto's `server: shiny`. Declining usage. |
+| `rmarkdown::render_site` / `site:` field | Superseded by Quarto Websites. Near-zero new usage in 2026. |
+| `raven.knit.useActiveRConsole` opt-in setting | Trades subprocess isolation for cold-start cost; helps users with slow-loading packages. Small implementation if anyone asks. |
 
-- RStudio-style Knit dropdown (Knit to HTML / PDF / Word picker; multi-format from YAML).
-- Custom YAML `knit:` hook dispatch (bookdown::render_book, xaringan::inf_mr, pkgdown).
-- Knit-with-Parameters dialog (`params: "ask"` flow).
-- `runtime: shiny` / `server: shiny` interactive document handling via `rmarkdown::run`.
-- `rmarkdown::render_site` and `site:` YAML field.
-- `raven.knit.useActiveRConsole` opt-in setting (knit in raven's R terminal for users with slow-loading packages).
-
-Tier 2 implementation reuses Tier 1's `yaml-frontmatter.parseFrontmatter`, `r-expression.escapeRString`, and `output-path.parseRenderedOutputPath`. The Knit-dropdown picker reads from the same YAML structure Tier 1 already parses. New `KnitEngine` implementations (e.g., `CustomKnitHookEngine`, `ShinyRuntimeEngine`) plug in alongside Tier 1's `RmarkdownRenderEngine`. None of Tier 2's additions require modifying Tier 1's hot paths.
+If implemented later, all of these can plug into this design's existing seams: `yaml-frontmatter.parseFrontmatter`, `r-expression.escapeRString`, `output-path.parseRenderedOutputPath`, and new `KnitEngine` implementations alongside `RmarkdownRenderEngine`. No invasive changes to this design's hot paths required.
 
 ## References
 
