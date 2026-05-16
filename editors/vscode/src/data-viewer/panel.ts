@@ -433,6 +433,21 @@ export class DataViewerPanel {
         await this.webviewPanel.webview.postMessage(msg);
     }
 
+    /** Test-only: post a `testScrollbarDrag` message to the webview so
+     *  it dispatches synthetic pointer events on the thumb element.
+     *  fraction=0 jumps to top, fraction=1 jumps to bottom. Awaiting
+     *  waits for the message to be queued, not for any reply; tests
+     *  should poll `getVisibleRange()` to observe the result. */
+    async dragScrollbar(fraction: number): Promise<void> {
+        if (this.disposed) return;
+        const msg: ExtensionToWebview = {
+            type: 'testScrollbarDrag',
+            panelGeneration: this.generation,
+            fraction,
+        };
+        await this.webviewPanel.webview.postMessage(msg);
+    }
+
     /** Column names in schema order — used by the test harness. */
     getColumnNames(): string[] {
         return this.columns.map(c => c.name);

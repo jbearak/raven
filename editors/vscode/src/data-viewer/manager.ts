@@ -84,6 +84,14 @@ export class DataViewerManager {
         await this.panels.get(panelName)?.pressKey(key);
     }
 
+    /** Test-only: drive a custom-scrollbar drag in the named panel.
+     *  fraction=0 jumps to top, fraction=1 jumps to bottom. Awaiting
+     *  waits for message queuing; tests should poll
+     *  `getPanelVisibleRange()` to observe results. */
+    async dragScrollbarOnPanel(panelName: string, fraction: number): Promise<void> {
+        await this.panels.get(panelName)?.dragScrollbar(fraction);
+    }
+
     /** For tests + activation; delegates to {@link sweep_stale}. */
     static sweepStale = sweep_stale;
 }

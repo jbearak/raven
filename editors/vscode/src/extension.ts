@@ -144,6 +144,12 @@ export interface RavenExtensionApi {
      *  Awaiting waits for the message to be queued; poll
      *  getDataViewerPanelVisibleRange to observe the result. */
     pressDataViewerKey(panelName: string, key: string): Promise<void>;
+    /** Test-only: drive a custom-scrollbar drag in a data viewer panel.
+     *  fraction=0 jumps to top, fraction=1 jumps to bottom. Used by
+     *  integration tests to exercise the drag math + scroll pipeline.
+     *  Awaiting waits for the message to be queued; poll
+     *  getDataViewerPanelVisibleRange to observe the result. */
+    dragDataViewerScrollbar(panelName: string, fraction: number): Promise<void>;
     /**
      * Test-only: forget the bundled extension's cached R terminal so the next
      * `sendToRTerminal` recreates it through the real `createTerminal` path.
@@ -408,6 +414,9 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             data_viewer_manager?.getPanelVisibleRange(panelName),
         pressDataViewerKey: async (panelName: string, key: string) => {
             await data_viewer_manager?.pressKeyOnPanel(panelName, key);
+        },
+        dragDataViewerScrollbar: async (panelName: string, fraction: number) => {
+            await data_viewer_manager?.dragScrollbarOnPanel(panelName, fraction);
         },
         _disposeCachedRTerminalForTest: () => _dispose_cached_r_terminal_for_test(),
     };

@@ -171,6 +171,47 @@
                         cancelable: true,
                     }));
                     return;
+                case 'testScrollbarDrag': {
+                    // Test-only: dispatch synthetic pointerdown/move/up
+                    // events on the thumb element so the same drag
+                    // handlers a real user pointer would invoke run
+                    // end-to-end. pointerId 999 avoids colliding with
+                    // any real mouse pointer (Chromium primary mouse is
+                    // pointerId 1).
+                    const thumb = document.querySelector('[data-test-id="custom-scrollbar-thumb"]');
+                    if (!(thumb instanceof HTMLElement)) return;
+                    const trackEl = thumb.parentElement;
+                    if (!(trackEl instanceof HTMLElement)) return;
+                    const trackHeight = Math.max(0, viewportHeight - HORIZONTAL_GUTTER_PX);
+                    const thumbRect = thumb.getBoundingClientRect();
+                    const trackRect = trackEl.getBoundingClientRect();
+                    const thumbHeightPx = thumbRect.height;
+                    // Current thumb center.
+                    const centerX = thumbRect.left + thumbRect.width / 2;
+                    const startY = thumbRect.top + thumbRect.height / 2;
+                    // Target thumb-top, then target Y for the pointer
+                    // (we want the pointer to end up such that thumb's
+                    // top lands at fraction*(trackHeight - thumbHeight)).
+                    const targetThumbTop = m.fraction * Math.max(0, trackHeight - thumbHeightPx);
+                    const targetY = trackRect.top + targetThumbTop + thumbHeightPx / 2;
+                    const opts = {
+                        pointerId: 999,
+                        pointerType: 'mouse',
+                        bubbles: true,
+                        cancelable: true,
+                        button: 0,
+                    } as const;
+                    thumb.dispatchEvent(new PointerEvent('pointerdown', {
+                        ...opts, clientX: centerX, clientY: startY,
+                    }));
+                    thumb.dispatchEvent(new PointerEvent('pointermove', {
+                        ...opts, clientX: centerX, clientY: targetY,
+                    }));
+                    thumb.dispatchEvent(new PointerEvent('pointerup', {
+                        ...opts, clientX: centerX, clientY: targetY,
+                    }));
+                    return;
+                }
             }
         };
         window.addEventListener('message', handler);
