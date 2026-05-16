@@ -1780,12 +1780,18 @@ In `crates/raven/src/backend.rs`, find `async fn did_change_watched_files(&self,
             .collect();
 
         if !config_file_changes.is_empty() {
-            let open_uris: Vec<Url> = {
+            // Snapshot prev configs (for downstream rebuild gating), reload,
+            // recompute, then drop the lock before any I/O.
+            let (open_uris, package_settings_changed, watch_settings_changed) = {
                 let mut state = self.state.write().await;
                 let project_root = state
                     .workspace_folders
                     .first()
                     .and_then(|u| u.to_file_path().ok());
+
+                let prev_cross_file = state.cross_file_config.clone();
+                let prev_hier_support =
+                    state.symbol_config.hierarchical_document_symbol_support;
 
                 // Re-run discovery from the workspace root. Order matters:
                 // raven.toml beats .lintr (DiscoveredConfig embodies that).
@@ -1812,6 +1818,11 @@ In `crates/raven/src/backend.rs`, find `async fn did_change_watched_files(&self,
                 }
 
                 crate::config_file::recompute_parsed_configs(&mut state);
+
+                // Recompute resets symbol_config; restore the hierarchical
+                // capability flag set from client capabilities at init time.
+                state.symbol_config.hierarchical_document_symbol_support = prev_hier_support;
+
                 if let Some(root) = &project_root {
                     let merged = crate::config_file::merge_settings(
                         &state.raw_client_settings,
@@ -1821,18 +1832,48 @@ In `crates/raven/src/backend.rs`, find `async fn did_change_watched_files(&self,
                         crate::config_file::compile_lint_overrides(&merged, root);
                 }
 
+                let package_settings_changed =
+                    state.cross_file_config.packages_enabled != prev_cross_file.packages_enabled
+                        || state.cross_file_config.packages_r_path
+                            != prev_cross_file.packages_r_path
+                        || state.cross_file_config.packages_additional_library_paths
+                            != prev_cross_file.packages_additional_library_paths;
+                let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
+                    != prev_cross_file.packages_watch_library_paths
+                    || state.cross_file_config.packages_watch_debounce_ms
+                        != prev_cross_file.packages_watch_debounce_ms;
+
                 let open: Vec<Url> = state.documents.keys().cloned().collect();
                 state.diagnostics_gate.mark_force_republish_many(open.iter());
-                open
+                (open, package_settings_changed, watch_settings_changed)
             };
 
+            // If package settings or watcher knobs changed, mirror the
+            // post-recompute reconciliation that did_change_configuration
+            // already performs. Synthesize an equivalent settings payload
+            // and route through that handler — its package-library rebuild
+            // and watcher-restart logic is non-trivial and not worth
+            // duplicating inline.
+            if package_settings_changed || watch_settings_changed {
+                let synthesized = {
+                    let state = self.state.read().await;
+                    crate::config_file::merge_settings(
+                        &state.raw_client_settings,
+                        state.raw_project_settings.as_ref(),
+                    )
+                };
+                self.did_change_configuration(DidChangeConfigurationParams {
+                    settings: synthesized,
+                }).await;
+            }
+
             // Re-publish diagnostics for every open document. The existing
-            // revalidation pipeline picks up the force-republish marker on
-            // the next `validate_and_publish` call for each URI; we trigger
-            // those here. `compute_and_publish_diagnostics` is the canonical
-            // single-URI republish (see e.g. backend.rs:6203).
+            // single-URI entry point is `publish_diagnostics` at
+            // `backend.rs:5834`; the force-republish marker we set above
+            // ensures it actually emits (rather than being short-circuited
+            // by an unchanged-version check).
             for uri in &open_uris {
-                self.compute_and_publish_diagnostics(uri.clone()).await;
+                self.publish_diagnostics(&uri).await;
             }
         }
 
@@ -1936,9 +1977,9 @@ Find the existing snapshot-build site (around line 243-249). Replace the `lint_c
 
 (`uri` is the parameter the snapshot-build function already receives — confirm by reading the surrounding signature in `handlers.rs`.)
 
-- [ ] **Step 2: Test override resolution end-to-end through the snapshot path**
+- [ ] **Step 2: Test override resolution at the snapshot-build site**
 
-Append to backend tests. The test opens two documents (one in `R/`, one in `tests/`) via `did_open`, then triggers the diagnostics flow and verifies the published diagnostics reflect different effective `lineLength` values. This actually exercises the `handlers.rs` site, not just the pure resolver.
+Append to backend tests. The test opens two documents (one in `R/`, one in `tests/`) via `did_open`, then constructs each document's `DiagnosticsSnapshot` — the same struct `handlers.rs:243-249` builds during a diagnostics pass — and asserts that each snapshot's `lint_config.line_length` reflects the matching override. This exercises the handlers-site refactor directly.
 
 ```rust
 #[tokio::test]
@@ -2008,7 +2049,7 @@ lineLength = 200
 
 - [ ] **Step 3: Run the test**
 
-Run: `cargo test -p raven open_document_in_tests_dir`
+Run: `cargo test -p raven published_diagnostics_use_per_file_override`
 Expected: passes.
 
 - [ ] **Step 4: Run full crate tests**
@@ -2701,6 +2742,15 @@ fn walk(
     operator_error: &mut bool,
 ) {
     if path.is_file() {
+        if is_chunk_file(path) {
+            // Design requires a one-line note; the file otherwise contributes
+            // nothing to JSON / SARIF output.
+            eprintln!(
+                "raven lint: skipping {} (chunk-bearing file; lint is R-only — see docs/cli.md)",
+                path.display()
+            );
+            return;
+        }
         if !is_r_file(path) { return; }
         let rel = path.strip_prefix(root).unwrap_or(path);
         if crate::config_file::is_skipped_by_overrides(base_section, overrides, rel) {
@@ -2719,9 +2769,10 @@ fn walk(
                 return;
             }
         };
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
-        let tree = match parser.parse(&text, None) {
+        // Use the same thread-local parser pool the LSP uses; avoids
+        // per-file Parser construction.
+        let parse_result = crate::parser_pool::with_parser(|p| p.parse(&text, None));
+        let tree = match parse_result {
             Some(t) => t,
             None => {
                 eprintln!("raven lint: parse failed for {}", path.display());
@@ -2754,6 +2805,13 @@ fn walk(
 
 fn is_r_file(p: &Path) -> bool {
     matches!(p.extension().and_then(|s| s.to_str()), Some("R") | Some("r"))
+}
+
+fn is_chunk_file(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|s| s.to_str()),
+        Some("Rmd") | Some("rmd") | Some("RMD") | Some("qmd") | Some("Qmd") | Some("QMD")
+    )
 }
 
 fn print_text(
