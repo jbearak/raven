@@ -74,7 +74,11 @@ mocha test (extension host)               webview (App.svelte)
 api.pressDataViewerKey('big','End')  →    msg handler dispatches synthetic
                                           KeyboardEvent on window
                                           → onKeyDown('End')
-                                          → viewportEl.scrollTop = maxPhysical
+                                          → viewportEl.scrollTop =
+                                              scrollHeight - clientHeight
+                                              (≈ maxPhysical; clamp in
+                                              logicalScrollTop absorbs
+                                              any rounding mismatch)
                                           → onScroll → scheduleFetchVisible
                                           → getRows
                                           ← rows
@@ -97,9 +101,12 @@ api.getDataViewerPanelVisibleRange  →     poll until end === nrow
 Add Home / End / PageUp / PageDown branches to `onKeyDown`, **before** the
 existing Cmd-A / Cmd-C branches. Each branch fires only when no modifier is
 pressed (`!e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey`) so platform
-shortcuts like `Cmd-End` (extend selection in some apps) don't get hijacked
-into "scroll to last row" — that combination falls through unchanged for the
-browser/OS to handle:
+shortcuts like `Shift-End` (extend selection in spreadsheets) and
+`Cmd-Shift-End` (jump-and-extend) don't get hijacked into a plain "scroll to
+last row" — those combinations fall through unchanged for the browser/OS to
+handle. Selection-extension while scrolling is intentionally **not** wired
+in this PR (see non-goals); a future PR can add it by widening the
+key-handler branches and integrating with the existing `Selection` model:
 
 - `End` → `viewportEl.scrollTop = viewportEl.scrollHeight - viewportEl.clientHeight`
 - `Home` → `viewportEl.scrollTop = 0`
@@ -306,10 +313,14 @@ test('End key reaches the last row in a 700K-row data frame', async () => {
         `big <- as.data.frame(matrix(rnorm(${N} * 5), nrow = ${N}, ncol = 5)); View(big)`
     );
     // poll until panel "big" exists
-    // poll until lastVisibleRange has end > start AND end < N (the
-    //   initial fetch landed for rows near the top, and the panel has
-    //   reached steady state — not just a mount/init lifecycle with
-    //   visibleRows === 0)
+    // explicitly reset scroll to the top so the test is independent of any
+    //   retained scroll state from a prior --watch run that re-View()s the
+    //   same dataset (a same-shape replace doesn't reset visibleRangeStart
+    //   inside applyInitOrReplace)
+    await api.pressDataViewerKey('big', 'Home');
+    // poll until lastVisibleRange.end < N / 2 (the Home reset has landed
+    //   AND the rows for the top of the grid have been fetched —
+    //   distinguishes 'panel exists' from 'panel reached steady state')
     await api.pressDataViewerKey('big', 'End');
     // poll until lastVisibleRange.end === N (the bottom-row fetch arrived)
 });
@@ -322,12 +333,13 @@ The suite already runs at a 120 s timeout. The test inherits the same
 R-availability and `arrow`-package-availability skips the existing tests
 use.
 
-The readiness gate ("end > start AND end < N") deliberately distinguishes
-the post-init steady state (rows fetched near the top) from the
-post-`End` state (rows fetched near the bottom). Without this gate the
-test could observe `lastVisibleRange` from the very first lifecycle event
-posted by the `init` handler, where `visibleRows.length === 0` — and the
-subsequent `End` key would race the initial row fetch.
+The Home-then-poll pre-step makes the test robust to retained scroll state.
+A `View(big)` after a previous `View(big)` with the same shape goes through
+`applyInitOrReplace`'s `sameDataset` branch, which intentionally preserves
+`visibleRangeStart` so the user's scroll position survives a refresh — but
+that means an unconditional "wait for end < N" gate could observe a stale
+near-bottom range. Pressing `Home` first is cheap, deterministic, and tests
+that the new `Home` key works as a side benefit.
 
 ### Bun unit tests
 
