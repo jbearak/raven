@@ -50,18 +50,18 @@ Raven checks whether each symbol reference has a visible definition — either i
 
 ### Assignment Targets
 
-Always on whenever diagnostics are enabled; not configurable per rule. Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators the target is the right-hand side; for the others it's the left-hand side.
+Always on whenever diagnostics are enabled; not configurable per rule. Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators the target is the right-hand side; for the others it's the left-hand side. Both tiers honor `# @lsp-ignore` / `# @lsp-ignore-next` on the affected line.
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
 | Invalid assignment target | error | Target is a value R rejects outright: a literal (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`, a number including signed `-1`/`+1.5`) or a reserved word (`else`, `in`, `next`, `break`) |
-| Suspicious assignment target | warning | Target is something R technically accepts, but the binding is almost always unintended: a string literal (`"foo" <- 1` — R binds the value to a variable named `foo`) or a dots argument (`... <- 1`, `..1 <- 1` — R creates a binding the standard `...` / `..N` accessors can't reach). Suppress with `# @lsp-ignore` when intentional |
+| Suspicious assignment target | warning | Target is something R technically accepts, but the binding is almost always unintended: a string literal (`"foo" <- 1` — R binds the value to a variable named `foo`) or a dots argument (`... <- 1`, `..1 <- 1` — R creates a binding the standard `...` / `..N` accessors can't reach) |
 
 **Not flagged:**
 - `T <- FALSE` / `F <- TRUE` — `T` and `F` are ordinary bindings that default to `TRUE`/`FALSE`; R accepts the assignment. Use the [`T` / `F` symbol](#style-lints) style lint if you want these reported.
 - `f(name = value)` — named-argument syntax inside a call, not assignment.
 - `function(x = TRUE)` — default values in formal parameters, not assignment.
-- `if <- 1`, `for <- 1`, `while <- 1`, `function <- 1` — tree-sitter reports these as syntax errors directly, so the same code surfaces only one diagnostic.
+- `if <- 1`, `for <- 1`, `while <- 1`, `function <- 1`, `repeat <- 1` — tree-sitter reports these as syntax errors directly, so the same code surfaces only one diagnostic.
 
 ### Style Lints
 

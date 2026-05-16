@@ -8064,16 +8064,16 @@ mod invalid_assignment_target_tests {
 
     #[test]
     fn diagnostic_range_handles_utf16_columns() {
-        // Leading non-ASCII characters shift the column count. UTF-16 width
-        // counts surrogate-pair code units, but for BMP characters (like ø)
-        // it matches the character count. Ensure column math is via the
-        // utf16 helper.
-        let code = "ø <- (TRUE <- 5)"; // ø is 1 UTF-16 unit
+        // Use a non-BMP character (`🦀`, U+1F980) to actually exercise the
+        // gap between UTF-16 code units and Unicode scalars: 🦀 is 4 UTF-8
+        // bytes / 2 UTF-16 units / 1 scalar. A BMP test input would pass
+        // even if the helper miscounted scalars.
+        let code = "🦀 <- (TRUE <- 5)";
         let diags = collect(code);
         assert_eq!(diags.len(), 1, "got {diags:?}");
-        // `TRUE` starts at column 6 in UTF-16: ø(1) + " <- ("(5) = 6
-        assert_eq!(diags[0].range.start.character, 6);
-        assert_eq!(diags[0].range.end.character, 10);
+        // `TRUE` starts at column 7 in UTF-16: 🦀(2) + " <- ("(5) = 7.
+        assert_eq!(diags[0].range.start.character, 7);
+        assert_eq!(diags[0].range.end.character, 11);
     }
 }
 
@@ -8418,17 +8418,10 @@ fn classify_target(node: Node, text: &str) -> Option<TargetClassification> {
 /// `else <- 1` (flagged) from `T <- FALSE` (not flagged: `T` is a regular
 /// binding, not a reserved word).
 fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
-    // Only flag targets R itself rejects at parse or eval time.
-    //
-    // Deliberately NOT flagged, despite appearing in early drafts of #34:
-    //   - `"foo" <- 1` / `'foo' <- 1` — R accepts string LHS as a name (it
-    //     binds the value to the variable named `foo`).
-    //   - `... <- 1` and `..1 <- 1` — R accepts these too (the binding
-    //     itself is allowed; the name is just unusable later). Confirmed
-    //     against R 4.6.0.
-    //
-    // The issue's guidance "target cases that are truly invalid" wins over
-    // the literal bullet list.
+    // ERROR tier only: targets R itself rejects at parse or eval time.
+    // Cases R technically accepts but the binding is almost certainly
+    // unintended (`"foo" <- 1`, `... <- 1`, `..1 <- 1`) are handled by
+    // [`suspicious_target_kind`] at WARNING severity.
     match node.kind() {
         "true" | "false" => Some("logical literal"),
         "null" => Some("NULL"),
@@ -8450,6 +8443,11 @@ fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
             let operand = node.child_by_field_name("rhs")?;
             invalid_target_kind(operand, text)
         }
+        // tree-sitter-r parses `TRUE`/`FALSE`/`NULL`/`Inf`/`NaN`/`NA*` as
+        // their own node kinds (above), so this branch only fires for
+        // reserved words that lex as identifiers — `else <- 1`, `in <- 1`.
+        // Other reserved words like `if`/`for`/`while`/`function`/`repeat`
+        // produce ERROR / `repeat_statement` parents and never reach here.
         "identifier" => {
             let t = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
             if is_reserved_word(t) {
