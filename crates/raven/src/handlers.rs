@@ -7779,6 +7779,7 @@ mod invalid_assignment_target_tests {
     }
 
 
+
     // ---- LHS literals on `<-` ------------------------------------------------
 
     #[test]
@@ -7852,6 +7853,38 @@ mod invalid_assignment_target_tests {
     fn left_arrow_next_break_flagged() {
         assert_one("next <- 1", "reserved word `next`");
         assert_one("break <- 1", "reserved word `break`");
+    }
+
+    #[test]
+    fn left_arrow_signed_numeric_flagged() {
+        assert_one("-1 <- 2", "numeric literal `-1`");
+        assert_one("+1 <- 2", "numeric literal `+1`");
+        assert_one("-1.5 <- 2", "numeric literal `-1.5`");
+        assert_one("-1L <- 2", "numeric literal `-1L`");
+    }
+
+    #[test]
+    fn right_arrow_signed_numeric_target_flagged() {
+        assert_one("5 -> -1", "numeric literal `-1`");
+    }
+
+    #[test]
+    fn unary_on_identifier_not_flagged() {
+        // `-x <- 1` is rejected by R, but the issue scope is literals and
+        // reserved words. The lhs's operand is an ordinary identifier, so we
+        // leave it alone — flagging arbitrary unary-on-identifier targets
+        // would expand scope beyond the spec.
+        assert_none("-x <- 1");
+        assert_none("+y <- 1");
+    }
+
+    #[test]
+    fn other_unary_operators_not_flagged() {
+        // `!`, `~`, `?` on the LHS are not in scope for this diagnostic. R
+        // does reject them, but they don't match the issue's literal /
+        // reserved-word framing — keeping the predicate tight.
+        assert_none("!TRUE <- 1");
+        assert_none("~x <- 1");
     }
 
     #[test]
@@ -8159,8 +8192,9 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 ///
 /// Covers the LHS of `<-`, `<<-`, `=` and the RHS of `->`, `->>`. Flagged
 /// targets are literals (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`,
-/// numeric, string) and reserved-word identifiers tree-sitter still parses
-/// as `binary_operator` (`else <- 1`, `in <- 1`, `next <- 1`, `break <- 1`).
+/// numeric incl. signed `-1`/`+1.5`, string) and reserved-word identifiers
+/// tree-sitter still parses as `binary_operator` (`else <- 1`, `in <- 1`,
+/// `next <- 1`, `break <- 1`, `... <- 1`, `..1 <- 1`).
 ///
 /// Cases that tree-sitter reports as an `ERROR` node (`if <- 1`, `for <- 1`,
 /// `while <- 1`, `function <- 1`) are intentionally left alone — they already
@@ -8268,6 +8302,20 @@ fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
         // R rejects assignments like `... <- 1` and `..1 <- 1` outright; they
         // are part of the reserved special-argument syntax, not user names.
         "dots" | "dot_dot_i" => Some("reserved word"),
+        // Signed numeric literals: `-1 <- 2`, `+1.5 <- 2`, `5 -> -1`.
+        // tree-sitter-r wraps these as `unary_operator` with the sign as an
+        // anonymous child token and the numeric value on the `rhs` field.
+        // Recurse to classify the operand so `-x <- 1` (where `x` is a
+        // regular identifier) is correctly NOT flagged — the issue scope is
+        // literals and reserved words, not arbitrary expressions.
+        "unary_operator" => {
+            let op = unary_operator_text(node, text)?;
+            if op != "-" && op != "+" {
+                return None;
+            }
+            let operand = node.child_by_field_name("rhs")?;
+            invalid_target_kind(operand, text)
+        }
         "identifier" => {
             let t = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
             if is_reserved_word(t) {
@@ -8278,6 +8326,23 @@ fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+/// Return the operator-token text of a `unary_operator` node. tree-sitter-r
+/// does not expose the operator as a named field, so we scan anonymous
+/// children for the sign / prefix token.
+fn unary_operator_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            continue;
+        }
+        let t = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+        if matches!(t, "-" | "+" | "!" | "~" | "?") {
+            return Some(t);
+        }
+    }
+    None
 }
 
 fn format_invalid_target_message(label: &str, target_text: &str) -> String {
