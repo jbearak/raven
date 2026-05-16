@@ -123,7 +123,11 @@ The horizontal native scrollbar is unchanged on every code path.
 
 ## Math additions to `grid-model.ts`
 
-Three new pure functions, all unit-testable under Bun:
+Three new pure functions plus a shared constant for the bottom reservation,
+all unit-testable under Bun. The CSS layout and the math share `HORIZONTAL_GUTTER_PX`
+as a single source of truth — earlier drafts had them disagree (CSS used
+`bottom: 12 px` while math used full `viewportHeight`, so a drag to
+fraction 1 would overshoot the visible track by 12 px).
 
 ```typescript
 /** Minimum pixel height for the custom scrollbar thumb. Below this the
@@ -131,39 +135,53 @@ Three new pure functions, all unit-testable under Bun:
  *  visible, draggable thumb. */
 export const MIN_THUMB_PX = 30;
 
+/** Pixel reservation at the bottom of the custom scrollbar track for the
+ *  native horizontal scrollbar, when present. The CSS rule sets the
+ *  track's `bottom: HORIZONTAL_GUTTER_PX`, and the math takes
+ *  `trackHeight = viewportHeight - HORIZONTAL_GUTTER_PX`. Sharing the
+ *  constant guarantees the math + layout agree.
+ *
+ *  Always reserved, regardless of whether the horizontal scrollbar is
+ *  actually present. The visual cost when absent is the thumb stopping
+ *  ~12 px shy of the viewport bottom (negligible). The alternative —
+ *  measuring dynamically — adds layout-thrash on every render with
+ *  little benefit. */
+export const HORIZONTAL_GUTTER_PX = 12;
+
 /** Pixel height of the custom scrollbar thumb. The thumb represents the
  *  fraction of the dataset currently visible (visibleCount / nrow), with
  *  a hard minimum so even a single visible row in a 10 M-row dataset
  *  produces a draggable thumb. The minimum is itself capped at the
- *  viewport height — for tiny viewports (< MIN_THUMB_PX), the thumb
- *  fills the track rather than overflowing it. */
+ *  track height — for tiny tracks (< MIN_THUMB_PX), the thumb fills the
+ *  track rather than overflowing it.
+ *
+ *  Note `trackHeight`, not `viewportHeight`: the track is shorter than
+ *  the viewport by HORIZONTAL_GUTTER_PX (see above). */
 export function customThumbHeight(
-    viewportHeight: number,
+    trackHeight: number,
     rowHeight: number,
     nrow: number,
 ): number {
-    if (viewportHeight <= 0) return 0;
-    if (nrow <= 0 || rowHeight <= 0) return viewportHeight;
-    const visibleCount = Math.max(1, Math.ceil(viewportHeight / rowHeight));
-    if (visibleCount >= nrow) return viewportHeight;
-    const proportional = viewportHeight * (visibleCount / nrow);
-    // Apply MIN_THUMB_PX floor first, then clamp to viewportHeight ceiling
-    // — this ordering means a tiny viewport (< MIN_THUMB_PX) gets a
-    // full-track thumb rather than an over-tall one.
-    return Math.min(viewportHeight, Math.max(MIN_THUMB_PX, proportional));
+    if (trackHeight <= 0) return 0;
+    if (nrow <= 0 || rowHeight <= 0) return trackHeight;
+    const visibleCount = Math.max(1, Math.ceil(trackHeight / rowHeight));
+    if (visibleCount >= nrow) return trackHeight;
+    const proportional = trackHeight * (visibleCount / nrow);
+    return Math.min(trackHeight, Math.max(MIN_THUMB_PX, proportional));
 }
 
-/** Pixel offset of the thumb's top from the top of the track. The track
- *  height equals the viewport height; the thumb's top can range from 0
- *  to (viewportHeight - thumbHeight). The mapping is linear in the
- *  *physical* scrollTop so the thumb tracks user scrolling exactly. */
+/** Pixel offset of the thumb's top from the top of the track. Track
+ *  height is `viewportHeight - HORIZONTAL_GUTTER_PX`; the thumb's top
+ *  can range from 0 to (trackHeight - thumbHeight). The mapping is
+ *  linear in the *physical* scrollTop so the thumb tracks user
+ *  scrolling exactly. */
 export function customThumbTop(
     scrollTop: number,
-    viewportHeight: number,
+    trackHeight: number,
     thumbHeight: number,
     maxPhysical: number,
 ): number {
-    const trackUsable = Math.max(0, viewportHeight - thumbHeight);
+    const trackUsable = Math.max(0, trackHeight - thumbHeight);
     if (maxPhysical <= 0 || trackUsable <= 0) return 0;
     const fraction = Math.max(0, Math.min(1, scrollTop / maxPhysical));
     return fraction * trackUsable;
@@ -175,11 +193,11 @@ export function customThumbTop(
  *  scheduleFetchVisible pipeline does the rest. */
 export function customScrollTopFromThumbTop(
     thumbTop: number,
-    viewportHeight: number,
+    trackHeight: number,
     thumbHeight: number,
     maxPhysical: number,
 ): number {
-    const trackUsable = Math.max(0, viewportHeight - thumbHeight);
+    const trackUsable = Math.max(0, trackHeight - thumbHeight);
     if (trackUsable <= 0 || maxPhysical <= 0) return 0;
     const fraction = Math.max(0, Math.min(1, thumbTop / trackUsable));
     return fraction * maxPhysical;
@@ -196,14 +214,15 @@ unit-testable.
 ### Imports
 
 `MAX_SCROLL_PX` is currently used only inside `grid-model.ts`. App.svelte
-needs to import it for the gate and for the `maxPhysical` prop on
-`<CustomScrollbar />`. Add to the existing import:
+needs to import it (and the new `HORIZONTAL_GUTTER_PX`) for the gate and
+for the `trackHeight` / `maxPhysical` props on `<CustomScrollbar />`.
+Add to the existing import:
 
 ```typescript
 import {
     visibleRange, coalesceScroll,
     cappedScrollHeight, logicalScrollTop, visualOffsetPx,
-    MAX_SCROLL_PX,
+    MAX_SCROLL_PX, HORIZONTAL_GUTTER_PX,
 } from './grid-model';
 ```
 
@@ -236,9 +255,9 @@ Two new classes, prefixed and named for their role:
     position: absolute;
     right: 0;
     top: 0;
-    /* 12 px reserved at the bottom for the native horizontal scrollbar
-     * when present. If absent, the overlay just stops 12 px shy of the
-     * viewport bottom. */
+    /* HORIZONTAL_GUTTER_PX = 12 px reserved at the bottom for the native
+     * horizontal scrollbar when present. The math layer takes
+     * trackHeight = viewportHeight - 12 to match. */
     bottom: 12px;
     width: 12px;
     background: transparent;
@@ -286,7 +305,7 @@ content:
     </div>
     {#if useCustomScrollbar}
         <CustomScrollbar
-            viewportHeight={viewportHeight}
+            trackHeight={Math.max(0, viewportHeight - HORIZONTAL_GUTTER_PX)}
             scrollTop={scrollTop}
             nrow={nrow}
             rowHeight={ROW_HEIGHT}
@@ -304,12 +323,19 @@ content:
     position: relative;
     flex: 1 1 auto;
     display: flex;
-    /* The viewport inside us takes the full wrapper area; the overlay,
-     * if present, sits on the right edge in absolute coordinates. */
+    /* Required so the inner viewport can shrink-to-fit and scroll its
+     * own content. Default `min-height/width: auto` on flex items would
+     * make the wrapper grow to the inner grid's intrinsic height
+     * (potentially MAX_SCROLL_PX!), defeating the overlay-as-fixed-to-
+     * scrollport premise. */
+    min-height: 0;
+    min-width: 0;
 }
 
 .viewport-wrapper > .viewport {
     flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
 }
 ```
 
@@ -324,7 +350,7 @@ the widget reaches back via a callback to set `viewportEl.scrollTop`.
 
 ```text
 Props:
-- viewportHeight: number
+- trackHeight: number   (= viewportHeight - HORIZONTAL_GUTTER_PX)
 - scrollTop: number
 - nrow: number
 - rowHeight: number
@@ -337,6 +363,9 @@ Internal state:
   thumb's top. `null` when not dragging.
 - `pointerId: number | null` — captured pointer id, used to release
   capture safely on cleanup paths.
+- `dragTrackTop: number` — `getBoundingClientRect().top` of the track,
+  cached at drag start so `pointermove` doesn't have to re-measure each
+  frame.
 
 Visual structure (the widget is the track; thumb is its child):
 
@@ -351,23 +380,30 @@ Pointer event flow:
 
 - `pointerdown` on `.custom-scrollbar-thumb`:
   - Record `pointerId = e.pointerId`, `dragOffset = e.clientY -
-    thumbTopAbsolute`.
-  - `(e.target as Element).setPointerCapture(e.pointerId)`.
+    thumbTopAbsolute`, `dragTrackTop = trackEl.getBoundingClientRect().top`.
+  - `try { (e.target as Element).setPointerCapture(e.pointerId); }
+    catch { /* ignore — synthetic events from the test seam may not be
+    eligible for capture */ }`. Real user events always succeed.
   - `e.preventDefault()` and `e.stopPropagation()` — the latter so the
     track-paging handler below doesn't also fire.
-- `pointermove` on `.custom-scrollbar-thumb` (only while dragging):
-  - Compute `thumbTop = e.clientY - trackTopAbsolute - dragOffset`,
-    clamp to `[0, viewportHeight - thumbHeight]`.
-  - `onScrollTo(customScrollTopFromThumbTop(thumbTop, viewportHeight,
+- `pointermove` on `.custom-scrollbar-thumb` (only while
+  `dragOffset !== null`):
+  - Compute `thumbTop = e.clientY - dragTrackTop - dragOffset`,
+    clamp to `[0, trackHeight - thumbHeight]`.
+  - `onScrollTo(customScrollTopFromThumbTop(thumbTop, trackHeight,
     thumbHeight, maxPhysical))`.
-- `pointerup` / `pointercancel` / `lostpointercapture`: cleanup. Clear
-  `dragOffset` and `pointerId`. Release capture *only* when
-  `hasPointerCapture(pointerId)` returns true — calling
-  `releasePointerCapture` on a pointer that's already been released
-  (e.g. by `lostpointercapture`) throws in some browsers.
+- `pointerup` / `pointercancel` / `lostpointercapture`: cleanup.
+  - `if (pointerId !== null && (e.target as Element).hasPointerCapture(pointerId)) {
+       (e.target as Element).releasePointerCapture(pointerId);
+     }`
+  - Clear `dragOffset` and `pointerId`.
+  - The `hasPointerCapture` guard is required because
+    `lostpointercapture` fires *after* the browser has already released
+    the capture; calling `releasePointerCapture` on an already-released
+    pointer throws in some browsers.
 - `pointerdown` on the track (not on the thumb): page up or down
   depending on whether the click is above or below the current thumb
-  position. `onScrollTo(scrollTop ± viewportHeight)`. The browser
+  position. `onScrollTo(scrollTop ± trackHeight)`. The browser
   clamps the assignment to `viewportEl.scrollTop` at `[0, maxPhysical]`.
 
 The widget does **not** capture wheel or keyboard events; those continue
@@ -375,11 +411,6 @@ to flow through the native scroll mechanism (the vertical scrollbar is
 hidden but the viewport is still `overflow: auto` and accepts wheel /
 keyboard scroll natively, which fires `onScroll` and updates the thumb
 position via the derived state).
-
-`trackTopAbsolute` is computed via `track.getBoundingClientRect().top`
-at the start of each drag and cached in `dragOffset`'s sibling state —
-recomputing it on every `pointermove` is fine but unnecessary, and we
-avoid getBoundingClientRect's small layout-thrash cost in the hot path.
 
 ## Test surface
 
@@ -407,19 +438,25 @@ The webview's `testScrollbarDrag` handler:
 1. Grabs the thumb element via the same internal `bind:this` ref the
    widget uses for itself (or via a `data-test-id="custom-scrollbar-thumb"`
    attribute looked up with `document.querySelector`).
-2. Computes `thumbHeight`, current `thumbTop`, and target
-   `thumbTop = fraction * (viewportHeight - thumbHeight)`.
+2. Computes `trackHeight = viewportHeight - HORIZONTAL_GUTTER_PX`,
+   `thumbHeight = customThumbHeight(trackHeight, ROW_HEIGHT, nrow)`, current
+   `thumbTop`, and target `thumbTop = fraction * (trackHeight - thumbHeight)`.
 3. Dispatches a `pointerdown` on the thumb at its current position with
-   `pointerId: 1, clientX: thumbCenterX, clientY: thumbCenterY,
-   bubbles: true, cancelable: true`.
+   `pointerId: 999, pointerType: 'mouse', clientX: thumbCenterX,
+   clientY: thumbCenterY, bubbles: true, cancelable: true`. The
+   `pointerId: 999` is chosen high enough to avoid colliding with any
+   real mouse pointer (Chromium uses `1` for the primary mouse), and
+   the handler's `setPointerCapture` is wrapped in try/catch so a
+   synthetic-event capture failure doesn't break the test.
 4. Dispatches a `pointermove` at the target position with the same
    pointerId so the drag handler computes the move delta.
 5. Dispatches a `pointerup` to terminate the drag.
 
 Because the same thumb-element listener handles all three events, the
-real pointer-event glue (capture/move/up cleanup, `lostpointercapture`
-guard) is exercised — not just the underlying math. This addresses the
-codex review's concern that math-only tests miss the pointer wiring.
+real pointer-event glue (move/up cleanup, `lostpointercapture` guard,
+`hasPointerCapture` defensive release) is exercised — not just the
+underlying math. The `setPointerCapture` call may be a no-op in the
+synthetic case, but the rest of the drag pipeline runs end-to-end.
 
 A new method on `RavenExtensionApi`:
 
