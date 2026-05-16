@@ -8121,6 +8121,19 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn at_lsp_ignore_inside_multiline_string_does_not_suppress() {
+        // The `# @lsp-ignore-next` is inside a multi-line string literal.
+        // Driving suppression off `comment` AST nodes (not raw line text)
+        // means this is never mistaken for a directive.
+        let code = "x <- \"abc\n# @lsp-ignore-next\"\nTRUE <- 1";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "expected diagnostic for TRUE <- 1, got {diags:?}"
+        );
+    }
+
+    #[test]
     fn nolint_does_not_suppress_diagnostic() {
         // `# nolint` belongs to the opt-in lint pipeline. R rejects
         // `TRUE <- 1` outright; an unrelated style suppression like
@@ -8345,7 +8358,7 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// assignment-operator lint's logic. `T <- FALSE` is **not** flagged: `T`
 /// and `F` are regular bindings, not reserved words.
 fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
-    let ignored = lsp_ignored_lines(text);
+    let ignored = lsp_ignored_lines_from_tree(node, text);
     collect_invalid_assignment_targets_inner(node, text, &ignored, diagnostics);
 }
 
@@ -8365,49 +8378,87 @@ fn collect_invalid_assignment_targets_inner(
 }
 
 /// Lines suppressed by `# @lsp-ignore` (on the same line) or
-/// `# @lsp-ignore-next` (on the preceding line).
+/// `# @lsp-ignore-next` (on the preceding line), discovered by walking the
+/// tree-sitter AST for `comment` nodes.
 ///
-/// We deliberately do **not** reuse `crate::linting::nolint::Suppressions`
-/// here: that parser also honors `# nolint` / `# nolint start...end`, which
+/// Driving this off the AST rather than line-scanning the raw text means
+/// we automatically respect every nuance of where `#` characters open
+/// comments: inside string literals, inside raw strings, inside multi-line
+/// strings, inside backtick-quoted identifiers — none of those are
+/// comment nodes, so they're never mistaken for directives.
+///
+/// We deliberately do **not** reuse `crate::linting::nolint::Suppressions`:
+/// that parser also honors `# nolint` / `# nolint start...end`, which
 /// belong to the opt-in lint pipeline. Silencing an ERROR-tier diagnostic
 /// for code R itself rejects (e.g. `TRUE <- 1`) because the user wrote
 /// `# nolint: line_length` for an unrelated style lint would be a
 /// surprise; restricting to `@lsp-ignore` keeps the suppression channel
 /// the same one the rest of `handlers.rs` uses.
-///
-/// The parser is string-literal-aware (a `#` inside `"…"` or `'…'` doesn't
-/// open a comment) and uses word-boundary matching so spurious tokens like
-/// `@lsp-ignored` or `@lsp-ignore-suffix` don't match.
-fn lsp_ignored_lines(text: &str) -> std::collections::HashSet<u32> {
+fn lsp_ignored_lines_from_tree(
+    root: Node<'_>,
+    text: &str,
+) -> std::collections::HashSet<u32> {
     let mut out = std::collections::HashSet::new();
-    for (idx, line) in text.lines().enumerate() {
-        let Some(comment_start) = find_unquoted_hash(line) else {
-            continue;
-        };
-        let after_hash = &line[comment_start + 1..];
-        let prefix_trim = line[..comment_start].trim();
-        match classify_lsp_ignore_marker(after_hash) {
-            Some(LspIgnoreKind::SameLine) => {
-                // Inline `# @lsp-ignore` suppresses *this* line — but only
-                // when there's code before the marker. A standalone
-                // `# @lsp-ignore` comment is meaningless on its own.
-                if !prefix_trim.is_empty() {
-                    out.insert(idx as u32);
-                }
-            }
-            Some(LspIgnoreKind::NextLine) => {
-                // `@lsp-ignore-next` only applies when standalone (matching
-                // the directive parser in `cross_file/directive.rs`). A
-                // trailing `x <- 1 # @lsp-ignore-next` does NOT suppress
-                // the next line.
-                if prefix_trim.is_empty() {
-                    out.insert((idx as u32).saturating_add(1));
-                }
-            }
-            None => {}
-        }
-    }
+    visit_comments_for_ignore(root, text, &mut out);
     out
+}
+
+fn visit_comments_for_ignore(
+    node: Node<'_>,
+    text: &str,
+    out: &mut std::collections::HashSet<u32>,
+) {
+    if node.kind() == "comment" {
+        classify_comment_for_ignore(node, text, out);
+        // Comments have no AST children we care about.
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_comments_for_ignore(child, text, out);
+    }
+}
+
+fn classify_comment_for_ignore(
+    comment: Node<'_>,
+    text: &str,
+    out: &mut std::collections::HashSet<u32>,
+) {
+    let raw = text
+        .get(comment.start_byte()..comment.end_byte())
+        .unwrap_or("");
+    // tree-sitter-r includes the leading `#` in the comment node's text.
+    let body = raw.trim_start_matches('#');
+    let row = comment.start_position().row as u32;
+    let start_col = comment.start_position().column;
+    // Was there any non-whitespace code on the same line before the `#`?
+    // Use the underlying line text rather than the AST; cheaper and exact.
+    let line_text = text.lines().nth(row as usize).unwrap_or("");
+    let prefix = line_text.get(..start_col).unwrap_or("");
+    let standalone = prefix.trim().is_empty();
+
+    match classify_lsp_ignore_marker(body) {
+        Some(LspIgnoreKind::SameLine) => {
+            // Inline `# @lsp-ignore` suppresses *this* line — but only
+            // when there's code before the marker. A standalone
+            // `# @lsp-ignore` on its own line has nothing to suppress
+            // (use `# @lsp-ignore-next` instead).
+            if !standalone {
+                out.insert(row);
+            }
+        }
+        Some(LspIgnoreKind::NextLine) => {
+            // `@lsp-ignore-next` only applies when the comment is on its
+            // own line, matching the directive parser in
+            // `cross_file/directive.rs`. A trailing
+            // `x <- 1 # @lsp-ignore-next` does NOT suppress the next
+            // line.
+            if standalone {
+                out.insert(row.saturating_add(1));
+            }
+        }
+        None => {}
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8442,34 +8493,6 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
     }
 }
 
-/// Return the byte index of the first `#` in `line` that is not inside a
-/// string or backtick-quoted identifier. Tracks `"…"`, `'…'`, and `` `…` ``
-/// with `\`-escapes inside quotes.
-fn find_unquoted_hash(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'\\' && (in_single || in_double) {
-            i += 2;
-            continue;
-        }
-        if !in_single && !in_backtick && b == b'"' {
-            in_double = !in_double;
-        } else if !in_double && !in_backtick && b == b'\'' {
-            in_single = !in_single;
-        } else if !in_single && !in_double && b == b'`' {
-            in_backtick = !in_backtick;
-        } else if !in_single && !in_double && !in_backtick && b == b'#' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
 
 fn check_invalid_assignment_target(
     binop: Node,
