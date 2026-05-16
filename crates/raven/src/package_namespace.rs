@@ -730,6 +730,7 @@ S3method(print, myclass)
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn namespace_model_importClassesFrom_adds_to_imports() {
         // S4 class imports are semantically equivalent to `importFrom` for
         // diagnostic suppression and completion. Without this, S4-heavy
@@ -754,6 +755,7 @@ S3method(print, myclass)
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn namespace_model_importMethodsFrom_adds_to_imports() {
         // S4 method imports — same treatment as importFrom.
         let content = "importMethodsFrom(methods, show, initialize)\n";
@@ -775,6 +777,7 @@ S3method(print, myclass)
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn namespace_model_importFrom_backtick_quoted_symbol() {
         // Non-syntactic names in NAMESPACE are typically backtick-quoted,
         // e.g. `importFrom(magrittr, \`%>%\`)`. Previously the backticks were

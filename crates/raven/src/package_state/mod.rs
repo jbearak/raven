@@ -174,6 +174,7 @@ mod path_tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)]
     fn r_source_path_recognizes_R_dir() {
         assert_eq!(
             is_r_source_path(Path::new("/work/pkg/R/utils.R"), Path::new("/work/pkg")),
@@ -193,6 +194,7 @@ mod path_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn r_source_path_rejects_non_R_files() {
         let root = Path::new("/work/pkg");
         assert_eq!(
@@ -218,6 +220,7 @@ mod path_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn r_source_path_recognizes_subdirs_in_R() {
         assert_eq!(
             is_r_source_path(

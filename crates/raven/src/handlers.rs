@@ -15554,6 +15554,7 @@ clean_data <- function(x) {
     /// parent set short-circuit the diagnostic loop before it reaches the
     /// `ScopeStream` fast path. This test pins that end-to-end behavior.
     #[tokio::test]
+    #[allow(non_snake_case)]
     async fn test_diagnostic_suppresses_importFrom_in_package_file() {
         use crate::package_state::PackageScopeContribution;
         use crate::state::{Document, WorldState};
@@ -15639,6 +15640,7 @@ clean_data <- function(x) {
     /// Package-internal symbols from `r_internal_symbols` must also suppress
     /// the undefined-variable diagnostic in the hot ScopeStream path.
     #[tokio::test]
+    #[allow(non_snake_case)]
     async fn test_diagnostic_suppresses_package_internal_in_R_file() {
         use crate::package_state::PackageScopeContribution;
         use crate::state::{Document, WorldState};
