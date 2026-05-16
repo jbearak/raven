@@ -7895,6 +7895,29 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn parenthesized_literal_target_flagged() {
+        // R rejects `(TRUE) <- 1`, `(1) <- 2`, etc. for the same reason as
+        // the bare forms. Unwrap parens and classify the inner node.
+        assert_one("(TRUE) <- 1", "logical literal `(TRUE)`");
+        assert_one("(1) <- 2", "numeric literal `(1)`");
+        assert_one("5 -> (NULL)", "Cannot assign to `(NULL)`");
+        // Warning tier propagates through parens too.
+        assert_one_with_severity(
+            "(\"foo\") <- 1",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+    }
+
+    #[test]
+    fn parenthesized_identifier_not_flagged() {
+        // `(x) <- 1` is unusual but R accepts it and the issue scope is
+        // literals/reserved words.
+        assert_none("(x) <- 1");
+        assert_none("(my_var) <- 1");
+    }
+
+    #[test]
     fn unary_on_identifier_not_flagged() {
         // `-x <- 1` is rejected by R, but the issue scope is literals and
         // reserved words. The lhs's operand is an ordinary identifier, so we
@@ -8588,6 +8611,15 @@ fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
             let operand = node.child_by_field_name("rhs")?;
             invalid_target_kind(operand, text)
         }
+        // Parenthesized literal targets: `(TRUE) <- 1`, `(1) <- 2`,
+        // `5 -> (NULL)`. R rejects these for the same reason as the bare
+        // form; tree-sitter just keeps the parens in a wrapper node.
+        // Recurse so `(x) <- 1` (parenthesized identifier — not a literal)
+        // stays unflagged.
+        "parenthesized_expression" => {
+            let inner = node.child_by_field_name("body")?;
+            invalid_target_kind(inner, text)
+        }
         // tree-sitter-r parses `TRUE`/`FALSE`/`NULL`/`Inf`/`NaN`/`NA*` as
         // their own node kinds (above), so this branch only fires for
         // reserved words that lex as identifiers — `else <- 1`, `in <- 1`.
@@ -8625,11 +8657,17 @@ fn unary_operator_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
 /// Classify an assignment-target node as suspicious (R accepts, but the
 /// binding is almost certainly unintended). Returns `Some(label)` for cases
 /// like `"foo" <- 1`, `... <- 1`, `..N <- 1`.
-fn suspicious_target_kind(node: Node, _text: &str) -> Option<&'static str> {
+fn suspicious_target_kind(node: Node, text: &str) -> Option<&'static str> {
     match node.kind() {
         "string" => Some("string literal"),
         "dots" => Some("dots"),
         "dot_dot_i" => Some("dot-dot-N"),
+        // Mirror the parenthesis-unwrap from `invalid_target_kind` so
+        // `("foo") <- 1` and `(... ) <- 1` keep getting the WARNING tier.
+        "parenthesized_expression" => {
+            let inner = node.child_by_field_name("body")?;
+            suspicious_target_kind(inner, text)
+        }
         _ => None,
     }
 }
