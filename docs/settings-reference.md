@@ -7,7 +7,7 @@
 
 # Settings reference
 
-Every `raven.*` setting the VS Code extension exposes, in one alphabetical table. For narrative explanations of each surface, follow the **Docs** link on a row. For how `raven.toml` layering works, see [Configuration](configuration.md).
+Every `raven.*` setting Raven reads, in one alphabetical table. Most are exposed through the VS Code Settings UI; a handful of advanced server-side knobs are LSP-init-only (still readable from `raven.toml`). For narrative explanations of each surface, follow the **Docs** link on a row. For how `raven.toml` layering works, see [Configuration](configuration.md).
 
 The **`raven.toml` path** column shows where to set a key in a project's `raven.toml`. A `—` means the setting is VS Code-client-only and is not read from `raven.toml`.
 
@@ -24,6 +24,8 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.crossFile.cache.metadataMaxEntries` | `1000` | number (≥100) | `crossFile.cache.metadataMaxEntries` | [cross-file](cross-file.md) | Maximum entries in the metadata cache. |
 | `raven.crossFile.cache.workspaceIndexMaxEntries` | `5000` | number (≥100) | `crossFile.cache.workspaceIndexMaxEntries` | [cross-file](cross-file.md) | Maximum closed files in the cross-file workspace index. |
 | `raven.crossFile.circularDependencySeverity` | `"error"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `crossFile.circularDependencySeverity` | [cross-file](cross-file.md) | Severity level for diagnostics when circular dependencies are detected between files. |
+| `raven.crossFile.editedFileDebounceMs` | `50` | number (≥0) | `crossFile.editedFileDebounceMs` | [cross-file](cross-file.md) | Debounce delay (ms) for re-running diagnostics on the actively-edited file. |
+| `raven.crossFile.hoistGlobalsInFunctions` | `true` | boolean | `crossFile.hoistGlobalsInFunctions` | [cross-file](cross-file.md) | Hoist global definitions inside function bodies so callers see late-binding semantics across files. |
 | `raven.crossFile.indexWorkspace` | `true` | boolean | `crossFile.indexWorkspace` | [cross-file](cross-file.md) | Enable workspace indexing for cross-file awareness. |
 | `raven.crossFile.maxBackwardDepth` | `10` | number (≥1) | `crossFile.maxBackwardDepth` | [cross-file](cross-file.md) | Maximum depth for backward traversal when resolving cross-file dependencies. |
 | `raven.crossFile.maxChainDepth` | `20` | number (≥1) | `crossFile.maxChainDepth` | [cross-file](cross-file.md) | Maximum total chain depth for cross-file dependency resolution. |

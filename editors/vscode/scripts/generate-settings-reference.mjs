@@ -29,6 +29,33 @@ const TOML_SECTIONS = new Set([
   "completion",
 ]);
 
+// Server-side knobs the language server reads from `initializationOptions` /
+// `raven.toml` but the VS Code extension deliberately doesn't surface in the
+// Settings UI (typically because they're advanced / rarely-tuned). They are
+// still real `raven.*` keys, so the alphabetical index covers them — values
+// here mirror the defaults baked into the corresponding Rust config struct.
+//
+// When you add or rename one of these, update this list AND the parser in
+// `crates/raven/src/backend.rs` (`parse_cross_file_config`, etc.). The drift
+// test in `tests/bun/settings-reference.test.ts` only catches `package.json` ↔
+// docs drift, not Rust ↔ this list drift; keep these descriptions short and
+// link out to the narrative doc for nuance.
+const LSP_INIT_ONLY_SETTINGS = {
+  "raven.crossFile.hoistGlobalsInFunctions": {
+    type: "boolean",
+    default: true,
+    description:
+      "Hoist global definitions inside function bodies so callers see late-binding semantics across files.",
+  },
+  "raven.crossFile.editedFileDebounceMs": {
+    type: "number",
+    default: 50,
+    minimum: 0,
+    description:
+      "Debounce delay (ms) for re-running diagnostics on the actively-edited file.",
+  },
+};
+
 // First path segment (after `raven.`) → feature doc. The narrative pages
 // under `docs/` already cover each surface; this table just points at them.
 const DOC_LINKS = {
@@ -163,7 +190,9 @@ function buildMarkdown(properties) {
   lines.push("# Settings reference");
   lines.push("");
   lines.push(
-    "Every `raven.*` setting the VS Code extension exposes, in one alphabetical table. " +
+    "Every `raven.*` setting Raven reads, in one alphabetical table. " +
+      "Most are exposed through the VS Code Settings UI; a handful of advanced " +
+      "server-side knobs are LSP-init-only (still readable from `raven.toml`). " +
       "For narrative explanations of each surface, follow the **Docs** link on a row. " +
       "For how `raven.toml` layering works, see [Configuration](configuration.md)."
   );
@@ -184,11 +213,15 @@ function buildMarkdown(properties) {
 
 function main() {
   const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
-  const properties = packageJson?.contributes?.configuration?.properties;
-  if (!properties || typeof properties !== "object") {
+  const schemaProperties = packageJson?.contributes?.configuration?.properties;
+  if (!schemaProperties || typeof schemaProperties !== "object") {
     console.error("Could not find contributes.configuration.properties in package.json");
     process.exit(2);
   }
+  // Merge in LSP-init-only entries that aren't surfaced through the VS Code
+  // Settings UI. Schema-derived keys still win on collision so a future
+  // promotion of one of these to the UI just removes the entry here.
+  const properties = { ...LSP_INIT_ONLY_SETTINGS, ...schemaProperties };
   const generated = buildMarkdown(properties);
 
   const args = new Set(process.argv.slice(2));
