@@ -48,13 +48,14 @@ Raven checks whether each symbol reference has a visible definition — either i
 | Ambiguous parent | warning | Multiple parents source this file and auto-inference can't determine which to use |
 | Redundant directive | hint | `@lsp-source` directive for a file already sourced via `source()` on the same line |
 
-### Invalid Assignment Targets
+### Assignment Targets
+
+Always on whenever diagnostics are enabled; not configurable per rule. Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators the target is the right-hand side; for the others it's the left-hand side.
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
-| Invalid assignment target | error | The target of an assignment is a value R can't bind to: a literal (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`, a number, a string), a reserved word (`else`, `in`, `next`, `break`), or `...` / `..N` (dots arguments) |
-
-Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators (`->`, `->>`) the target is the right-hand side; for the others it's the left-hand side. Always on whenever diagnostics are enabled; not configurable per rule (these are R errors, not stylistic preferences).
+| Invalid assignment target | error | Target is a value R rejects outright: a literal (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`, a number including signed `-1`/`+1.5`) or a reserved word (`else`, `in`, `next`, `break`) |
+| Suspicious assignment target | warning | Target is something R technically accepts, but the binding is almost always unintended: a string literal (`"foo" <- 1` — R binds the value to a variable named `foo`) or a dots argument (`... <- 1`, `..1 <- 1` — R creates a binding the standard `...` / `..N` accessors can't reach). Suppress with `# @lsp-ignore` when intentional |
 
 **Not flagged:**
 - `T <- FALSE` / `F <- TRUE` — `T` and `F` are ordinary bindings that default to `TRUE`/`FALSE`; R accepts the assignment. Use the [`T` / `F` symbol](#style-lints) style lint if you want these reported.

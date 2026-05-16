@@ -7754,13 +7754,22 @@ mod invalid_assignment_target_tests {
 
     #[track_caller]
     fn assert_one(code: &str, expect_substr: &str) {
+        assert_one_with_severity(code, DiagnosticSeverity::ERROR, expect_substr);
+    }
+
+    #[track_caller]
+    fn assert_one_with_severity(
+        code: &str,
+        expected: DiagnosticSeverity,
+        expect_substr: &str,
+    ) {
         let diags = collect(code);
         assert_eq!(
             diags.len(),
             1,
             "expected exactly one diagnostic for `{code}`, got {diags:?}"
         );
-        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diags[0].severity, Some(expected));
         assert!(
             diags[0].message.contains(expect_substr),
             "message `{}` did not contain `{}`",
@@ -7834,9 +7843,26 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
-    fn left_arrow_string_literal_flagged() {
-        assert_one("\"foo\" <- 1", "string literal");
-        assert_one("'foo' <- 1", "string literal");
+    fn string_lhs_flagged_as_warning() {
+        // R accepts `"foo" <- 1` (binds the value to variable `foo`), so this
+        // is not an ERROR, but it's almost always a typo or confusion.
+        // Surface as WARNING; suppressible with `# @lsp-ignore` when
+        // intentional.
+        assert_one_with_severity(
+            "\"foo\" <- 1",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+        assert_one_with_severity(
+            "'foo' <- 1",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+        assert_one_with_severity(
+            "1 -> \"foo\"",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
     }
 
     #[test]
@@ -7888,13 +7914,24 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
-    fn left_arrow_dots_flagged() {
-        // `...` and `..N` are part of R's reserved special-argument syntax,
-        // not user-defined names; R rejects every assignment to them.
-        assert_one("... <- 1", "reserved word `...`");
-        assert_one("..1 <- 1", "reserved word `..1`");
-        assert_one("..2 <- 1", "reserved word `..2`");
-        assert_one("..10 <- 1", "reserved word `..10`");
+    fn dots_lhs_flagged_as_warning() {
+        // R accepts these but the binding is unreachable through the usual
+        // `...` / `..N` accessors — almost certainly unintended.
+        assert_one_with_severity(
+            "... <- 1",
+            DiagnosticSeverity::WARNING,
+            "can't be reached",
+        );
+        assert_one_with_severity(
+            "..1 <- 1",
+            DiagnosticSeverity::WARNING,
+            "can't be reached",
+        );
+        assert_one_with_severity(
+            "..10 <- 1",
+            DiagnosticSeverity::WARNING,
+            "can't be reached",
+        );
     }
 
     // ---- Other assignment operators -----------------------------------------
@@ -7914,7 +7951,7 @@ mod invalid_assignment_target_tests {
     #[test]
     fn right_arrow_targets_rhs() {
         assert_one("1 -> TRUE", "logical literal `TRUE`");
-        assert_one("\"foo\" -> NULL", "Cannot assign to `NULL`");
+        assert_one("1 -> NULL", "Cannot assign to `NULL`");
     }
 
     #[test]
@@ -7974,7 +8011,7 @@ mod invalid_assignment_target_tests {
 
     #[test]
     fn multiple_in_one_file() {
-        let code = "TRUE <- 1\nNULL <- 2\n\"x\" <- 3\n";
+        let code = "TRUE <- 1\nNULL <- 2\n1 <- 3\n";
         let diags = collect(code);
         assert_eq!(diags.len(), 3, "got {diags:?}");
     }
@@ -7998,6 +8035,16 @@ mod invalid_assignment_target_tests {
         assert_eq!(r.start.character, 0);
         assert_eq!(r.end.line, 0);
         assert_eq!(r.end.character, 4); // "TRUE" is 4 columns
+    }
+
+    #[test]
+    fn lsp_ignore_suppresses_diagnostic() {
+        // Inline marker on the same line.
+        assert_none("TRUE <- 1 # @lsp-ignore");
+        // Above the line.
+        assert_none("# @lsp-ignore-next\nTRUE <- 1");
+        // Warning tier too.
+        assert_none("\"foo\" <- 1 # @lsp-ignore");
     }
 
     #[test]
@@ -8188,38 +8235,52 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
     last_brace_line
 }
 
-/// Emit diagnostics for assignments whose target is something R rejects.
+/// Emit diagnostics for assignments whose target is suspect or invalid.
 ///
-/// Covers the LHS of `<-`, `<<-`, `=` and the RHS of `->`, `->>`. Flagged
-/// targets are literals (`TRUE`, `FALSE`, `NULL`, any `NA*`, `Inf`, `NaN`,
-/// numeric incl. signed `-1`/`+1.5`, string) and reserved-word identifiers
-/// tree-sitter still parses as `binary_operator` (`else <- 1`, `in <- 1`,
-/// `next <- 1`, `break <- 1`, `... <- 1`, `..1 <- 1`).
+/// Two severity tiers:
 ///
-/// Cases that tree-sitter reports as an `ERROR` node (`if <- 1`, `for <- 1`,
-/// `while <- 1`, `function <- 1`) are intentionally left alone — they already
-/// surface through [`collect_syntax_errors`], and we don't want duplicate
-/// diagnostics. Named-argument `=` inside a call (`f(name = value)`) is also
-/// skipped, matching the existing assignment-operator lint's logic.
+/// **ERROR** — R itself rejects: literals (`TRUE`, `FALSE`, `NULL`, any
+/// `NA*`, `Inf`, `NaN`, numeric incl. signed `-1`/`+1.5`) and reserved-word
+/// identifiers tree-sitter still parses as `binary_operator`
+/// (`else <- 1`, `in <- 1`, `next <- 1`, `break <- 1`).
 ///
-/// Severity is `ERROR`: every case here is code R refuses to evaluate. The
-/// issue note explicitly excludes REPL-tolerated bindings like `T <- FALSE`,
-/// since `T`/`F` are ordinary identifiers that happen to default to logical
-/// values — those flow through `invalid_target_kind` as plain identifiers and
-/// are not flagged.
+/// **WARNING** — R accepts, but the binding is almost certainly unintended:
+/// `"foo" <- 1` (R coerces the string to a name and binds the value to
+/// `foo`), `... <- 1`, `..1 <- 1` (R creates a binding that the standard
+/// `...` / `..N` accessors can't reach). Suppressible via `# @lsp-ignore`
+/// when the binding really is intentional.
+///
+/// Covers the LHS of `<-`, `<<-`, `=` and the RHS of `->`, `->>`. Cases
+/// tree-sitter reports as an `ERROR` node (`if <- 1`, `for <- 1`,
+/// `while <- 1`, `function <- 1`) are deliberately left to
+/// [`collect_syntax_errors`] to avoid duplicate diagnostics. Named-argument
+/// `=` inside a call (`f(name = value)`) is skipped, matching the existing
+/// assignment-operator lint's logic. `T <- FALSE` is **not** flagged: `T`
+/// and `F` are regular bindings, not reserved words.
 fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let suppressions = crate::linting::nolint::Suppressions::from_text(text);
+    collect_invalid_assignment_targets_inner(node, text, &suppressions, diagnostics);
+}
+
+fn collect_invalid_assignment_targets_inner(
+    node: Node,
+    text: &str,
+    suppressions: &crate::linting::nolint::Suppressions,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     if node.kind() == "binary_operator" {
-        check_invalid_assignment_target(node, text, diagnostics);
+        check_invalid_assignment_target(node, text, suppressions, diagnostics);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_invalid_assignment_targets(child, text, diagnostics);
+        collect_invalid_assignment_targets_inner(child, text, suppressions, diagnostics);
     }
 }
 
 fn check_invalid_assignment_target(
     binop: Node,
     text: &str,
+    suppressions: &crate::linting::nolint::Suppressions,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(op) = binop.child_by_field_name("operator") else {
@@ -8251,11 +8312,14 @@ fn check_invalid_assignment_target(
         return;
     }
 
-    let Some(label) = invalid_target_kind(target, text) else {
+    let Some(classification) = classify_target(target, text) else {
         return;
     };
 
     let row = target.start_position().row as u32;
+    if suppressions.is_suppressed(row) {
+        return;
+    }
     let line_text = text.lines().nth(row as usize).unwrap_or("");
     let start_col = crate::cross_file::types::byte_offset_to_utf16_column(
         line_text,
@@ -8270,16 +8334,65 @@ fn check_invalid_assignment_target(
     let target_text = text
         .get(target.start_byte()..target.end_byte())
         .unwrap_or("");
-    let message = format_invalid_target_message(label, target_text);
     diagnostics.push(Diagnostic {
         range: Range {
             start: Position::new(row, start_col),
             end: Position::new(end_row, end_col),
         },
-        severity: Some(DiagnosticSeverity::ERROR),
-        message,
+        severity: Some(classification.severity),
+        message: classification.format_message(target_text),
         ..Default::default()
     });
+}
+
+/// Severity + label for an offending assignment target.
+struct TargetClassification {
+    severity: DiagnosticSeverity,
+    label: &'static str,
+}
+
+impl TargetClassification {
+    fn format_message(&self, target_text: &str) -> String {
+        match (self.severity, self.label) {
+            // NULL / NA are self-descriptive — don't repeat the kind name.
+            (DiagnosticSeverity::ERROR, "NULL" | "NA") => {
+                format!("Cannot assign to `{target_text}`.")
+            }
+            (DiagnosticSeverity::ERROR, _) => {
+                format!("Cannot assign to {} `{target_text}`.", self.label)
+            }
+            (DiagnosticSeverity::WARNING, "string literal") => format!(
+                "Assigning to string literal {target_text}; R will bind the value to the variable named by the string. Was this intentional?"
+            ),
+            (DiagnosticSeverity::WARNING, "dots") => format!(
+                "Assigning to `{target_text}` creates a binding that can't be reached through the usual `...` accessors."
+            ),
+            (DiagnosticSeverity::WARNING, "dot-dot-N") => format!(
+                "Assigning to `{target_text}` creates a binding that can't be reached through the usual `..N` accessors."
+            ),
+            // Fallback shouldn't occur in practice — keep a generic phrasing.
+            (DiagnosticSeverity::WARNING, _) => {
+                format!("Suspicious assignment to `{target_text}`.")
+            }
+            _ => format!("Assignment to `{target_text}`."),
+        }
+    }
+}
+
+fn classify_target(node: Node, text: &str) -> Option<TargetClassification> {
+    if let Some(label) = invalid_target_kind(node, text) {
+        return Some(TargetClassification {
+            severity: DiagnosticSeverity::ERROR,
+            label,
+        });
+    }
+    if let Some(label) = suspicious_target_kind(node, text) {
+        return Some(TargetClassification {
+            severity: DiagnosticSeverity::WARNING,
+            label,
+        });
+    }
+    None
 }
 
 /// Classify an assignment-target node. Returns `Some(label)` when the target
@@ -8290,18 +8403,24 @@ fn check_invalid_assignment_target(
 /// `else <- 1` (flagged) from `T <- FALSE` (not flagged: `T` is a regular
 /// binding, not a reserved word).
 fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
+    // Only flag targets R itself rejects at parse or eval time.
+    //
+    // Deliberately NOT flagged, despite appearing in early drafts of #34:
+    //   - `"foo" <- 1` / `'foo' <- 1` — R accepts string LHS as a name (it
+    //     binds the value to the variable named `foo`).
+    //   - `... <- 1` and `..1 <- 1` — R accepts these too (the binding
+    //     itself is allowed; the name is just unusable later). Confirmed
+    //     against R 4.6.0.
+    //
+    // The issue's guidance "target cases that are truly invalid" wins over
+    // the literal bullet list.
     match node.kind() {
         "true" | "false" => Some("logical literal"),
         "null" => Some("NULL"),
         "na" => Some("NA"),
         "inf" | "nan" => Some("special constant"),
         "float" | "integer" | "complex" => Some("numeric literal"),
-        "string" => Some("string literal"),
         "next" | "break" => Some("reserved word"),
-        // tree-sitter-r gives `...` and `..1`/`..2`/... their own kinds.
-        // R rejects assignments like `... <- 1` and `..1 <- 1` outright; they
-        // are part of the reserved special-argument syntax, not user names.
-        "dots" | "dot_dot_i" => Some("reserved word"),
         // Signed numeric literals: `-1 <- 2`, `+1.5 <- 2`, `5 -> -1`.
         // tree-sitter-r wraps these as `unary_operator` with the sign as an
         // anonymous child token and the numeric value on the `rhs` field.
@@ -8345,11 +8464,15 @@ fn unary_operator_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
     None
 }
 
-fn format_invalid_target_message(label: &str, target_text: &str) -> String {
-    match label {
-        // NULL / NA are self-descriptive — don't repeat the kind name.
-        "NULL" | "NA" => format!("Cannot assign to `{target_text}`."),
-        _ => format!("Cannot assign to {label} `{target_text}`."),
+/// Classify an assignment-target node as suspicious (R accepts, but the
+/// binding is almost certainly unintended). Returns `Some(label)` for cases
+/// like `"foo" <- 1`, `... <- 1`, `..N <- 1`.
+fn suspicious_target_kind(node: Node, _text: &str) -> Option<&'static str> {
+    match node.kind() {
+        "string" => Some("string literal"),
+        "dots" => Some("dots"),
+        "dot_dot_i" => Some("dot-dot-N"),
+        _ => None,
     }
 }
 
