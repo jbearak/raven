@@ -72,7 +72,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 **Setup and reference:**
 
 - [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
-- [Configuration](docs/configuration.md) — All settings and options
+- [Configuration](docs/configuration.md) — All settings and options ([alphabetical reference](docs/settings-reference.md))
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools
 - [Limitations](docs/limitations.md) — Features not yet implemented
 
