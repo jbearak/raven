@@ -8579,11 +8579,20 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
                     match sibling.kind() {
                         "comment" => prev = sibling.prev_sibling(),
                         "if_statement" => {
-                            let brace_line = find_closing_brace_line(&sibling, text);
-                            let else_start_line = node.start_position().row;
-                            let ref_line = brace_line.unwrap_or_else(|| sibling.end_position().row);
-                            if else_start_line > ref_line {
-                                emit_else_newline_diagnostic(node, text, diagnostics);
+                            if if_statement_has_else(sibling) {
+                                // The preceding `if` already has an `else`
+                                // branch consumed (`if (a) {b} else {c} else
+                                // {d}`); the trailing `else` is fully orphan,
+                                // not a misplaced `else` for this `if`.
+                                emit_orphan_else_diagnostic(node, text, diagnostics);
+                            } else {
+                                let brace_line = find_closing_brace_line(&sibling, text);
+                                let else_start_line = node.start_position().row;
+                                let ref_line = brace_line
+                                    .unwrap_or_else(|| sibling.end_position().row);
+                                if else_start_line > ref_line {
+                                    emit_else_newline_diagnostic(node, text, diagnostics);
+                                }
                             }
                             handled = true;
                             break;
@@ -8647,11 +8656,27 @@ fn statement_level_anchor<'a>(else_id: Node<'a>) -> Option<(Node<'a>, Node<'a>)>
         if matches!(parent.kind(), "program" | "braced_expression") {
             return Some((anchor, parent));
         }
+        // `parenthesized_expression` is a transparent wrapper: its start_byte
+        // is the opening `(`, but its only real content is the inner
+        // expression. Keep walking — `(else)` is just as orphan as `else`.
+        if parent.kind() == "parenthesized_expression" {
+            anchor = parent;
+            continue;
+        }
         if parent.start_byte() != start {
             return None;
         }
         anchor = parent;
     }
+}
+
+/// Returns true if `if_stmt` (a tree-sitter `if_statement` node) already
+/// contains an `else` keyword child — i.e. a trailing `else` after this
+/// statement is a fully orphan token, not a misplaced `else` for this `if`.
+fn if_statement_has_else(if_stmt: Node) -> bool {
+    let mut cursor = if_stmt.walk();
+    let has_else = if_stmt.children(&mut cursor).any(|c| c.kind() == "else");
+    has_else
 }
 
 /// LSP `Position` for a tree-sitter node's start, converting byte column to
@@ -16711,6 +16736,88 @@ clean_data <- function(x) {
             diagnostics.is_empty(),
             "`else` as assignment RHS must not trigger orphan-else, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `(else)` — orphan `else` wrapped in parentheses. `parenthesized_expression`
+    /// is a transparent wrapper: the identifier is the only real content but
+    /// its start_byte trails the `(`. The detector must still fire.
+    #[test]
+    fn test_orphan_else_inside_parens() {
+        let code = "(else)";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`(else)` should emit one orphan-else diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `(else |> f())` — orphan `else` as the leading token of a binary_operator
+    /// wrapped in parens. Compound transparent-wrapper case.
+    #[test]
+    fn test_orphan_else_inside_parens_with_expression() {
+        let code = "(else |> f())";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`(else |> f())` should emit one orphan-else diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `if (a) { b } else { c } else { d }` — the first `if_statement` already
+    /// has an `else` branch; the second `else` is a fully orphan token. R
+    /// rejects this with "unexpected 'else'". The detector must NOT emit the
+    /// "move else to same line" message (the inner `else` IS on the right
+    /// line). It must emit the orphan-else message (the previous if/else is
+    /// already complete).
+    #[test]
+    fn test_orphan_else_after_already_complete_if_else_same_line() {
+        let code = "if (a) { b } else { c } else { d }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "second `else` after complete if/else should emit one orphan-else, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            diagnostics[0].message.contains("without a preceding"),
+            "should use the orphan-else (not the same-line) message, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// `if (a) { b } else { c }\nelse { d }` — same as above but the orphan
+    /// `else` is on a new line. The closing `}` is on the previous line, so
+    /// the old logic would emit the "move to same line" message — which is
+    /// wrong: the if already has its else, so the right hint is "remove the
+    /// trailing else", not "move it up".
+    #[test]
+    fn test_orphan_else_after_already_complete_if_else_newline() {
+        let code = "if (a) { b } else { c }\nelse { d }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "second `else` after complete if/else should emit one orphan-else, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            diagnostics[0].message.contains("without a preceding"),
+            "should use the orphan-else (not the same-line) message, got: {}",
+            diagnostics[0].message
         );
     }
 
