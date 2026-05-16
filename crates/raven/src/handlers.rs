@@ -4029,7 +4029,11 @@ fn collect_workspace_symbols_from_artifacts(
 /// Retained for the bench harness
 /// (`crates/raven/benches/lsp_operations.rs`) and the inline tests in
 /// this module, which build their own short-lived `WorldState` and do
-/// not contend for the lock.
+/// not contend for the lock. The intentionally awkward name plus the
+/// warning block above are meant to surface in IDE hover tooltips at
+/// any future call site — `#[deprecated]` would generate dozens of
+/// warnings on the existing in-module test fleet, which would defeat
+/// its visibility for genuinely new callers.
 #[allow(dead_code)]
 pub fn diagnostics_via_snapshot(
     state: &WorldState,
@@ -4121,7 +4125,11 @@ pub fn diagnostics_via_snapshot_profile(
 ///
 /// Retained as a `pub` entry point for bench harnesses
 /// (`crates/raven/benches/lsp_operations.rs`) and downstream consumers
-/// that have their own lock strategy.
+/// that have their own lock strategy. The warning block above is
+/// meant to surface in IDE hover tooltips at any future call site —
+/// `#[deprecated]` would emit dozens of warnings against the existing
+/// in-module test fleet, defeating its visibility for genuinely new
+/// production callers.
 #[allow(dead_code)]
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled

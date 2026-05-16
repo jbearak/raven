@@ -214,31 +214,44 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // The server emits `raven/projectConfigLoaded` whenever it picks up (or
     // re-picks up) a portable `raven.toml` / `.lintr` — and now also when
     // the file is removed. `path: null` + `source: null` is the cleared
-    // form; both string ⇒ a config is in effect. Surface the source so
-    // users can confirm what's authoritative at a glance.
+    // form; both fields must be present and consistent for a "config in
+    // effect" notification. Surface the source so users can confirm
+    // what's authoritative at a glance.
     client.onNotification(
         'raven/projectConfigLoaded',
         (params: unknown) => {
             // Runtime type guard so a future server-side schema change fails
             // loudly rather than silently rendering "undefined" in the UI.
-            const isStringOrNull = (v: unknown): v is string | null =>
-                v === null || typeof v === 'string';
-            if (
-                typeof params !== 'object' || params === null ||
-                !isStringOrNull((params as { path?: unknown }).path) ||
-                !isStringOrNull((params as { source?: unknown }).source)
-            ) {
+            // Enforce pair-shape consistency: both fields are null (cleared)
+            // OR both fields are non-empty strings with `source` matching
+            // the known discriminator set. Half-null / empty-string / unknown
+            // source values are treated as malformed and logged.
+            const isValidSource = (v: unknown): v is 'raven.toml' | '.lintr' =>
+                v === 'raven.toml' || v === '.lintr';
+            if (typeof params !== 'object' || params === null) {
                 outputChannel.appendLine(
                     `Raven: ignoring malformed projectConfigLoaded payload: ${JSON.stringify(params)}`,
                 );
                 return;
             }
-            const { path, source } = params as { path: string | null; source: string | null };
-            if (path === null || source === null) {
+            const rawPath = (params as { path?: unknown }).path;
+            const rawSource = (params as { source?: unknown }).source;
+            const cleared = rawPath === null && rawSource === null;
+            const inEffect =
+                typeof rawPath === 'string' && rawPath.length > 0 && isValidSource(rawSource);
+            if (!cleared && !inEffect) {
+                outputChannel.appendLine(
+                    `Raven: ignoring malformed projectConfigLoaded payload: ${JSON.stringify(params)}`,
+                );
+                return;
+            }
+            if (cleared) {
                 outputChannel.appendLine('Raven: project config cleared (no raven.toml / .lintr in effect)');
                 vscode.window.setStatusBarMessage('$(circle-slash) Raven: no project config', 5000);
                 return;
             }
+            const path = rawPath as string;
+            const source = rawSource as 'raven.toml' | '.lintr';
             outputChannel.appendLine(`Raven: using config at ${path} (${source})`);
             vscode.window.setStatusBarMessage(`$(check) Raven: using ${source}`, 5000);
         },
