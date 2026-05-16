@@ -1723,6 +1723,51 @@ impl tower_lsp::lsp_types::notification::Notification for RavenProjectConfigLoad
     const METHOD: &'static str = "raven/projectConfigLoaded";
 }
 
+/// Pre-recompute snapshot of the parsed configs that drive change-detection
+/// inside [`Backend::reconcile_after_config_recompute`].
+///
+/// Captured by the caller under a write lock, **before** the caller mutates
+/// `raw_client_settings` / `raw_project_settings` and calls
+/// [`crate::config_file::recompute_parsed_configs`]. The helper diffs the
+/// post-recompute `state.*_config` values against this snapshot to decide
+/// which downstream rebuilds to run.
+#[derive(Debug, Clone)]
+struct ConfigChangeSnapshot {
+    prev_cross_file: crate::cross_file::CrossFileConfig,
+    prev_lint: crate::linting::LintConfig,
+    prev_completion: crate::state::CompletionConfig,
+    /// `recompute_parsed_configs` resets `symbol_config` to defaults. The
+    /// helper restores `hierarchical_document_symbol_support` from this
+    /// value (set from client capabilities at initialize time).
+    prev_hier_support: bool,
+}
+
+/// Flags + carried state derived under the write lock inside
+/// [`Backend::reconcile_after_config_recompute`], consumed by the
+/// out-of-lock work below.
+///
+/// Replaces what was a 12-element tuple. Don't make it `pub` — every
+/// field is internal to one helper.
+#[derive(Debug)]
+struct ReconciliationDecisions {
+    scope_changed: bool,
+    package_settings_changed: bool,
+    watch_settings_changed: bool,
+    only_watch_changed: bool,
+    diagnostics_enabled_changed: bool,
+    old_diagnostics_enabled: bool,
+    new_diagnostics_enabled: bool,
+    packages_enabled: bool,
+    trigger_on_open_paren_changed: bool,
+    new_trigger_on_open_paren: bool,
+    /// `Some(root)` when `packageMode` flipped to a non-Disabled mode and
+    /// the helper still needs to read `DESCRIPTION` / `NAMESPACE` from
+    /// disk before re-applying. `None` otherwise (no mode change, or the
+    /// mode change was already applied in-lock for Disabled).
+    pkg_mode_io_needed: Option<std::path::PathBuf>,
+    open_uris: Vec<Url>,
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     /// Initializes the server state from the client's InitializeParams and returns the LSP
@@ -3923,28 +3968,19 @@ impl LanguageServer for Backend {
             self.client.show_message(MessageType::WARNING, err).await;
         }
 
-        let (
-            open_uris,
-            scope_changed,
-            package_settings_changed,
-            watch_settings_changed,
-            only_watch_changed,
-            diagnostics_enabled_changed,
-            old_diagnostics_enabled,
-            new_diagnostics_enabled,
-            packages_enabled,
-            trigger_on_open_paren_changed,
-            new_trigger_on_open_paren,
-            pkg_mode_io_needed,
-        ) = {
+        // Lock-only window: snapshot pre-change configs, store the new raw
+        // client settings, recompute parsed configs, recompile lint
+        // overrides. NO I/O — the helper handles every blocking action
+        // outside the lock.
+        let snapshot = {
             let mut state = self.state.write().await;
 
-            // Snapshot the pre-change parsed configs so we can detect what
-            // moved after the recompute.
-            let prev_cross_file = state.cross_file_config.clone();
-            let prev_lint = state.lint_config.clone();
-            let prev_completion = state.completion_config.clone();
-            let prev_hier_support = state.symbol_config.hierarchical_document_symbol_support;
+            let prev = ConfigChangeSnapshot {
+                prev_cross_file: state.cross_file_config.clone(),
+                prev_lint: state.lint_config.clone(),
+                prev_completion: state.completion_config.clone(),
+                prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
+            };
 
             // Store the new raw client settings and re-merge with the project
             // file (if any). recompute_parsed_configs() overwrites every
@@ -3965,299 +4001,17 @@ impl LanguageServer for Backend {
                 state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
             }
 
-            // --- Recompute each `*_changed` flag against the pre-recompute
-            // snapshots. Logic is preserved from the original parse-then-apply
-            // site; the only change is the source of truth (state.* now
-            // reflects the merged result, not parse_*_config output applied
-            // to params.settings directly).
-
-            // Check if scope-affecting settings changed
-            let scope_changed = prev_cross_file.scope_settings_changed(&state.cross_file_config);
-
-            // Check if diagnostics_enabled (master switch) changed - Requirement 5.2
-            let old_diagnostics_enabled = prev_cross_file.diagnostics_enabled;
-            let new_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
-            let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
-
-            // Settings that require reinitializing `PackageLibrary` via an R
-            // subprocess call (~100ms). Keep this narrow.
-            let package_settings_changed = state.cross_file_config.packages_enabled
-                != prev_cross_file.packages_enabled
-                || state.cross_file_config.packages_r_path != prev_cross_file.packages_r_path
-                || state.cross_file_config.packages_additional_library_paths
-                    != prev_cross_file.packages_additional_library_paths;
-
-            // Watcher-only settings. Changing just these should restart the
-            // filesystem watcher but MUST NOT trigger an R subprocess roundtrip
-            // or wipe the package cache — toggling a debounce slider in the
-            // Settings UI should not force every open document to revalidate.
-            let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
-                != prev_cross_file.packages_watch_library_paths
-                || state.cross_file_config.packages_watch_debounce_ms
-                    != prev_cross_file.packages_watch_debounce_ms;
-
-            // If `watch_settings_changed` is the only thing that flipped, the
-            // change is purely watcher-lifecycle (debounce ms or enable flag
-            // for the filesystem watcher). Diagnostic content is unaffected,
-            // so don't force every open document to revalidate.
-            //
-            // Coverage is automatic for every field on `CrossFileConfig`: we
-            // compare the entire struct with the watch fields reverted, so
-            // any new diagnostic-affecting field added to `CrossFileConfig`
-            // is picked up without touching this site. Config structs that
-            // live OUTSIDE `CrossFileConfig` (e.g. `LintConfig`) still need
-            // an explicit `*_changed` guard below — extend the chain when
-            // adding another such struct.
-            let lint_config_changed = state.lint_config != prev_lint;
-
-            let only_watch_changed = watch_settings_changed
-                && !lint_config_changed
-                && {
-                    let mut probe = state.cross_file_config.clone();
-                    probe.packages_watch_library_paths =
-                        prev_cross_file.packages_watch_library_paths;
-                    probe.packages_watch_debounce_ms = prev_cross_file.packages_watch_debounce_ms;
-                    probe == prev_cross_file
-                };
-
-            // Capture new package settings (post-recompute)
-            let packages_enabled = state.cross_file_config.packages_enabled;
-
-            // If package_mode changed, apply the setting change via the event-driven
-            // path. For Disabled: translate immediately (derive yields no workspace).
-            // For Auto/Enabled: capture root for disk I/O outside the lock.
-            let package_mode_changed =
-                state.cross_file_config.package_mode != prev_cross_file.package_mode;
-            let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
-                use crate::cross_file::config::PackageMode;
-                let mode = state.cross_file_config.package_mode;
-                // Translate the setting change — updates package_inputs.package_mode.
-                let event =
-                    crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
-                    if mode == PackageMode::Disabled {
-                        // Derive immediately: effective_workspace returns None for Disabled.
-                        state.apply_package_event(&delta);
-                        None
-                    } else {
-                        // Need to repopulate description/namespace from disk outside the
-                        // lock; capture root so caller can do the I/O.
-                        state
-                            .workspace_folders
-                            .first()
-                            .and_then(|u| u.to_file_path().ok())
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Recompute reset symbol_config to its default; restore the
-            // hierarchical-symbol-support flag the client capabilities set at
-            // initialize() time.
-            state.symbol_config.hierarchical_document_symbol_support = prev_hier_support;
-
-            // Track completion trigger change.
-            let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
-            let trigger_on_open_paren_changed =
-                prev_completion.trigger_on_open_paren != new_trigger_on_open_paren;
-
-            // Mark all open documents for force republish (unless only the
-            // watcher-lifecycle settings changed). Bulk-mark to avoid per-URI
-            // lock churn on workspaces with many open files.
-            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
-            if !only_watch_changed {
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(open_uris.iter());
-            }
-
-            (
-                open_uris,
-                scope_changed,
-                package_settings_changed,
-                watch_settings_changed,
-                only_watch_changed,
-                diagnostics_enabled_changed,
-                old_diagnostics_enabled,
-                new_diagnostics_enabled,
-                packages_enabled,
-                trigger_on_open_paren_changed,
-                new_trigger_on_open_paren,
-                pkg_mode_io_needed,
-            )
+            prev
         };
 
-        // --- Package mode rebuild: repopulate inputs after mode switch ---
-        // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
-        // from disk (lightweight; R files are already in package_inputs from
-        // prior did_open/did_change/scan events). Then derive package state.
-        if let Some(root) = pkg_mode_io_needed {
-            let root_clone = root.clone();
-            let (desc_text, ns_text, disk_r_files) = tokio::task::spawn_blocking(move || {
-                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                    .ok()
-                    .map(|s| std::sync::Arc::from(s.as_str()));
-                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
-                    .ok()
-                    .map(|s| std::sync::Arc::from(s.as_str()));
-                let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
-                (desc, ns, disk_r_files)
-            })
-            .await
-            .unwrap_or((None, None, Default::default()));
+        // Helper drives change detection, package rebuilds, watcher
+        // restart, completion re-registration, and force-republish
+        // marking. Returns the URIs to publish (empty when only the
+        // watcher-lifecycle settings flipped).
+        let to_publish = self.reconcile_after_config_recompute(snapshot).await;
 
-            // Re-acquire write lock to apply results
-            let mut state = self.state.write().await;
-            // Repopulate description/namespace inputs with fresh disk content.
-            state.package_inputs.workspace_root = Some(root.clone());
-            state.package_inputs.description =
-                desc_text.map(|text| crate::package_state::DescriptionInput { text });
-            state.package_inputs.namespace =
-                ns_text.map(|text| crate::package_state::NamespaceInput { text });
-            // Seed from disk so packageMode switches still see closed R files
-            // when the background workspace index has not populated yet; then
-            // overlay index entries and open buffers through the shared helper.
-            let new_r_files = hydrate_package_r_files_from_state(&state, &root, disk_r_files);
-            state.package_inputs.r_files = new_r_files;
-            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
-            log::info!("Rebuilt package state after packageMode change (event-driven)");
-        }
-
-        // Log diagnostics_enabled change - Requirement 5.2
-        if diagnostics_enabled_changed {
-            log::info!(
-                "Diagnostics master switch changed: {} -> {}",
-                old_diagnostics_enabled,
-                new_diagnostics_enabled
-            );
-        }
-
-        // Dynamically re-register completion capability if trigger characters changed
-        if trigger_on_open_paren_changed {
-            log::info!(
-                "trigger_on_open_paren changed to {}, re-registering completion capability",
-                new_trigger_on_open_paren
-            );
-
-            let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
-            let registration_options = CompletionRegistrationOptions {
-                text_document_registration_options: TextDocumentRegistrationOptions {
-                    document_selector: Some(vec![
-                        DocumentFilter {
-                            language: Some(String::from("r")),
-                            scheme: None,
-                            pattern: None,
-                        },
-                        DocumentFilter {
-                            language: Some(String::from("jags")),
-                            scheme: None,
-                            pattern: None,
-                        },
-                        DocumentFilter {
-                            language: Some(String::from("stan")),
-                            scheme: None,
-                            pattern: None,
-                        },
-                    ]),
-                },
-                completion_options: CompletionOptions {
-                    trigger_characters: Some(trigger_chars),
-                    resolve_provider: Some(true),
-                    ..Default::default()
-                },
-            };
-
-            let registration_id = String::from("completion");
-            let method = String::from("textDocument/completion");
-
-            // Unregister old, then register new
-            if let Err(e) = self
-                .client
-                .unregister_capability(vec![Unregistration {
-                    id: registration_id.clone(),
-                    method: method.clone(),
-                }])
-                .await
-            {
-                log::warn!("Failed to unregister completion capability: {}", e);
-            }
-
-            if let Err(e) = self
-                .client
-                .register_capability(vec![Registration {
-                    id: registration_id,
-                    method,
-                    register_options: serde_json::to_value(registration_options).ok(),
-                }])
-                .await
-            {
-                log::warn!("Failed to re-register completion capability: {}", e);
-            }
-        }
-
-        // Reinitialize PackageLibrary only if R-subprocess-affecting settings
-        // changed (enabled flag, R path, or additional library paths).
-        if package_settings_changed {
-            log::info!("Package settings changed, reinitializing PackageLibrary");
-
-            let (new_package_library, package_library_ready) = if packages_enabled {
-                rebuild_package_library(&self.state).await
-            } else {
-                (
-                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
-                    false,
-                )
-            };
-
-            // Replace under brief write lock
-            {
-                let mut state = self.state.write().await;
-                state.package_library = new_package_library;
-                state.package_library_ready = package_library_ready;
-            }
-
-            // Help/HTML help caches index by (topic, package); the package set
-            // just changed, so flush them to match watcher and refresh paths.
-            self.state.read().await.clear_help_caches();
-        }
-
-        // Restart the libpath watcher if any setting that affects it changed.
-        // Covers both the reinit path above (the `lib_paths` vector may have
-        // changed) and the pure watch-settings path (e.g. user flipped
-        // `watchLibraryPaths` or adjusted the debounce slider) — the helper
-        // handles the teardown + respawn atomically and does NOT re-run the
-        // R subprocess.
-        if package_settings_changed || watch_settings_changed {
-            restart_libpath_watcher(&self.state, &self.client, true).await;
-        }
-
-        // Warm the package export cache before republishing diagnostics so
-        // the fresh (empty) library doesn't cause transient false-positive
-        // "unknown function" diagnostics for package exports.
-        if package_settings_changed && packages_enabled {
-            let pkg_lib = self.state.read().await.package_library.clone();
-            prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
-        }
-
-        if scope_changed {
-            log::trace!(
-                "Scope-affecting settings changed, revalidating {} open documents",
-                open_uris.len()
-            );
-        }
-
-        // Schedule diagnostics for all open documents, but skip the workspace
-        // republish if only the watcher-lifecycle settings changed — nothing
-        // about diagnostic content moved.
-        if !only_watch_changed {
-            for uri in open_uris {
-                self.publish_diagnostics(&uri).await;
-            }
+        for uri in to_publish {
+            self.publish_diagnostics(&uri).await;
         }
     }
 
@@ -4319,14 +4073,18 @@ impl LanguageServer for Backend {
             }
 
             // Step 2 (under write lock, no I/O): apply the reload —
-            // snapshot prev configs for downstream rebuild gating, recompute
-            // parsed configs, recompile overrides, restore client-capability
-            // flags, mark force-republish for open documents.
-            let (open_uris, package_settings_changed, watch_settings_changed, package_mode_changed) = {
+            // snapshot prev configs for downstream rebuild gating, swap
+            // raw project settings, recompute parsed configs, recompile
+            // overrides. The shared reconciliation helper drives every
+            // downstream action outside the lock.
+            let snapshot = {
                 let mut state = self.state.write().await;
-                let prev_cross_file = state.cross_file_config.clone();
-                let prev_hier_support =
-                    state.symbol_config.hierarchical_document_symbol_support;
+                let prev = ConfigChangeSnapshot {
+                    prev_cross_file: state.cross_file_config.clone(),
+                    prev_lint: state.lint_config.clone(),
+                    prev_completion: state.completion_config.clone(),
+                    prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
+                };
 
                 // Re-run discovery from the workspace root. Order matters:
                 // raven.toml beats .lintr (DiscoveredConfig embodies that).
@@ -4339,10 +4097,6 @@ impl LanguageServer for Backend {
 
                 crate::config_file::recompute_parsed_configs(&mut state);
 
-                // Recompute resets symbol_config; restore the hierarchical
-                // capability flag set from client capabilities at init time.
-                state.symbol_config.hierarchical_document_symbol_support = prev_hier_support;
-
                 if let Some(root) = &project_root {
                     let merged = crate::config_file::merge_settings(
                         &state.raw_client_settings,
@@ -4352,72 +4106,21 @@ impl LanguageServer for Backend {
                         crate::config_file::compile_lint_overrides(&merged, root);
                 }
 
-                let package_settings_changed = state.cross_file_config.packages_enabled
-                    != prev_cross_file.packages_enabled
-                    || state.cross_file_config.packages_r_path != prev_cross_file.packages_r_path
-                    || state.cross_file_config.packages_additional_library_paths
-                        != prev_cross_file.packages_additional_library_paths;
-                let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
-                    != prev_cross_file.packages_watch_library_paths
-                    || state.cross_file_config.packages_watch_debounce_ms
-                        != prev_cross_file.packages_watch_debounce_ms;
-                let package_mode_changed =
-                    state.cross_file_config.package_mode != prev_cross_file.package_mode;
-
-                let open: Vec<Url> = state.documents.keys().cloned().collect();
-                state.diagnostics_gate.mark_force_republish_many(open.iter());
-                (
-                    open,
-                    package_settings_changed,
-                    watch_settings_changed,
-                    package_mode_changed,
-                )
+                prev
             };
 
-            // v1 scope note: settings whose rebuild lives in
-            // `did_change_configuration` (package_library rebuild via R
-            // subprocess, libpath watcher restart, packageMode mode switch)
-            // are NOT auto-applied here. Detecting them and calling
-            // `did_change_configuration` ourselves would either (a) corrupt
-            // the raw layer split (synthesizing the merged result into
-            // `raw_client_settings` makes stale project keys outlive a
-            // raven.toml deletion) or (b) require extracting a
-            // post-recompute reconciliation helper from
-            // `did_change_configuration` — bigger than this PR.
-            //
-            // Issue a one-time warning so the user knows to restart if they
-            // changed one of these keys. Linting / cross-file thresholds /
-            // diagnostics / indentation / symbols / completion all reload
-            // live; the warning calls out the gap explicitly.
-            if package_settings_changed || watch_settings_changed || package_mode_changed {
-                let mut classes = Vec::with_capacity(3);
-                if package_settings_changed { classes.push("packages.*"); }
-                if package_mode_changed { classes.push("packageMode"); }
-                if watch_settings_changed { classes.push("packagesWatch*"); }
-                let detail = classes.join(", ");
-                log::warn!(
-                    "raven.toml: {detail} changed; restart Raven to pick them up. \
-                     (Live-reload is scoped to non-rebuild settings in this version.)"
-                );
-                // Surface to the user via `window/showMessage` so editors
-                // that don't tail the server log still see it.
-                let client = self.client.clone();
-                tokio::spawn(async move {
-                    use tower_lsp::lsp_types::MessageType;
-                    client
-                        .show_message(
-                            MessageType::WARNING,
-                            format!("raven.toml: {detail} changed; restart Raven to pick them up."),
-                        )
-                        .await;
-                });
-            }
+            // Helper drives change detection, package rebuilds, watcher
+            // restart, completion re-registration, and force-republish
+            // marking. Returns the URIs to publish (empty when only the
+            // watcher-lifecycle settings flipped — nothing
+            // diagnostic-affecting moved).
+            let to_publish = self.reconcile_after_config_recompute(snapshot).await;
 
-            // Re-publish diagnostics for every open document. The force-
-            // republish marker we set above ensures `publish_diagnostics`
-            // actually emits (rather than being short-circuited by an
-            // unchanged-version check).
-            for uri in &open_uris {
+            // Re-publish diagnostics for every open document. The
+            // force-republish markers set by the helper ensure
+            // `publish_diagnostics` actually emits (rather than being
+            // short-circuited by an unchanged-version check).
+            for uri in &to_publish {
                 self.publish_diagnostics(uri).await;
             }
         }
@@ -5531,6 +5234,357 @@ fn help_html_to_json(
 }
 
 impl Backend {
+    /// Drive every downstream action that depends on which parsed-config
+    /// field moved during a configuration reload.
+    ///
+    /// Caller contract — the helper assumes the caller has already, under a
+    /// write lock on `self.state`:
+    ///   1. Captured the pre-change parsed configs into a
+    ///      [`ConfigChangeSnapshot`].
+    ///   2. Mutated whichever raw settings layer the caller owns
+    ///      (`raw_client_settings` for `did_change_configuration`;
+    ///      `raw_project_settings` + `project_config_path` for
+    ///      `did_change_watched_files`).
+    ///   3. Called [`crate::config_file::recompute_parsed_configs`].
+    ///   4. Compiled `lint_overrides` against the merged settings via
+    ///      [`crate::config_file::compile_lint_overrides`]. The helper
+    ///      does NOT re-compile these.
+    ///   5. Released the write lock before calling this helper.
+    ///
+    /// The helper acquires its own brief write lock to:
+    ///   - restore `symbol_config.hierarchical_document_symbol_support`
+    ///     (which `recompute_parsed_configs` resets to default),
+    ///   - compute `*_changed` flags against the snapshot,
+    ///   - apply the `packageMode` `SettingChanged` translate (and capture
+    ///     the workspace root for off-lock disk I/O when the new mode is
+    ///     non-`Disabled`),
+    ///   - mark every open document for force-republish (unless only the
+    ///     `packagesWatch*` lifecycle settings flipped).
+    ///
+    /// It releases that lock before doing any blocking work. Outside the
+    /// lock, in order, it:
+    ///   - re-reads `DESCRIPTION` / `NAMESPACE` on a `packageMode` mode
+    ///     switch, then re-applies under a brief write lock,
+    ///   - re-registers the completion capability if `triggerOnOpenParen`
+    ///     changed,
+    ///   - rebuilds `PackageLibrary` (R subprocess) if a package-rebuild
+    ///     setting changed,
+    ///   - restarts the libpath watcher if any package or
+    ///     `packagesWatch*` setting changed,
+    ///   - prefetches package exports for open documents if a
+    ///     package-rebuild setting changed and packages remain enabled.
+    ///
+    /// Returns the open URIs the caller should republish. Empty when only
+    /// `packagesWatch*` flipped — nothing about diagnostic content moved,
+    /// so the workspace-wide republish is a waste.
+    async fn reconcile_after_config_recompute(
+        &self,
+        prev: ConfigChangeSnapshot,
+    ) -> Vec<Url> {
+        // Brief write lock: change detection, package_mode translate,
+        // hier_support restore, force-republish marking. NO blocking I/O
+        // happens inside this scope.
+        let decisions = {
+            let mut state = self.state.write().await;
+
+            // `recompute_parsed_configs` reset `symbol_config` to defaults
+            // when the caller ran it; restore the hierarchical-support flag
+            // set from client capabilities at initialize() time.
+            state.symbol_config.hierarchical_document_symbol_support = prev.prev_hier_support;
+
+            let scope_changed =
+                prev.prev_cross_file.scope_settings_changed(&state.cross_file_config);
+
+            let old_diagnostics_enabled = prev.prev_cross_file.diagnostics_enabled;
+            let new_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
+            let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
+
+            // Settings that require reinitializing `PackageLibrary` via an R
+            // subprocess call (~100ms). Keep this narrow.
+            let package_settings_changed = state.cross_file_config.packages_enabled
+                != prev.prev_cross_file.packages_enabled
+                || state.cross_file_config.packages_r_path
+                    != prev.prev_cross_file.packages_r_path
+                || state.cross_file_config.packages_additional_library_paths
+                    != prev.prev_cross_file.packages_additional_library_paths;
+
+            // Watcher-only settings. Changing just these should restart the
+            // filesystem watcher but MUST NOT trigger an R subprocess
+            // roundtrip or wipe the package cache.
+            let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
+                != prev.prev_cross_file.packages_watch_library_paths
+                || state.cross_file_config.packages_watch_debounce_ms
+                    != prev.prev_cross_file.packages_watch_debounce_ms;
+
+            // If `watch_settings_changed` is the only thing that flipped,
+            // the change is purely watcher-lifecycle; diagnostic content is
+            // unaffected, so don't force every open document to revalidate.
+            //
+            // Coverage is automatic for every field on `CrossFileConfig`:
+            // we compare the entire struct with the watch fields reverted,
+            // so any new diagnostic-affecting field added to
+            // `CrossFileConfig` is picked up without touching this site.
+            // Config structs that live OUTSIDE `CrossFileConfig` (e.g.
+            // `LintConfig`) still need an explicit `*_changed` guard below —
+            // extend the chain when adding another such struct.
+            let lint_config_changed = state.lint_config != prev.prev_lint;
+
+            let only_watch_changed = watch_settings_changed
+                && !lint_config_changed
+                && {
+                    let mut probe = state.cross_file_config.clone();
+                    probe.packages_watch_library_paths =
+                        prev.prev_cross_file.packages_watch_library_paths;
+                    probe.packages_watch_debounce_ms =
+                        prev.prev_cross_file.packages_watch_debounce_ms;
+                    probe == prev.prev_cross_file
+                };
+
+            let packages_enabled = state.cross_file_config.packages_enabled;
+
+            // If `package_mode` changed, apply the setting change via the
+            // event-driven path. For Disabled: translate immediately
+            // (derive yields no workspace). For Auto/Enabled: capture root
+            // for disk I/O outside the lock.
+            let package_mode_changed =
+                state.cross_file_config.package_mode != prev.prev_cross_file.package_mode;
+            let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
+                use crate::cross_file::config::PackageMode;
+                let mode = state.cross_file_config.package_mode;
+                let event = crate::package_state::event::HandlerEvent::SettingChanged {
+                    new_mode: mode,
+                };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
+                    if mode == PackageMode::Disabled {
+                        state.apply_package_event(&delta);
+                        None
+                    } else {
+                        state
+                            .workspace_folders
+                            .first()
+                            .and_then(|u| u.to_file_path().ok())
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
+            let trigger_on_open_paren_changed =
+                prev.prev_completion.trigger_on_open_paren != new_trigger_on_open_paren;
+
+            // Mark all open documents for force republish (unless only the
+            // watcher-lifecycle settings changed). Bulk-mark to avoid
+            // per-URI lock churn on workspaces with many open files.
+            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+            if !only_watch_changed {
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(open_uris.iter());
+            }
+
+            ReconciliationDecisions {
+                scope_changed,
+                package_settings_changed,
+                watch_settings_changed,
+                only_watch_changed,
+                diagnostics_enabled_changed,
+                old_diagnostics_enabled,
+                new_diagnostics_enabled,
+                packages_enabled,
+                trigger_on_open_paren_changed,
+                new_trigger_on_open_paren,
+                pkg_mode_io_needed,
+                open_uris,
+            }
+        };
+
+        let ReconciliationDecisions {
+            scope_changed,
+            package_settings_changed,
+            watch_settings_changed,
+            only_watch_changed,
+            diagnostics_enabled_changed,
+            old_diagnostics_enabled,
+            new_diagnostics_enabled,
+            packages_enabled,
+            trigger_on_open_paren_changed,
+            new_trigger_on_open_paren,
+            pkg_mode_io_needed,
+            open_uris,
+        } = decisions;
+
+        // --- Package mode rebuild: repopulate inputs after mode switch ---
+        // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
+        // from disk (R files are already in `package_inputs` from prior
+        // did_open/did_change/scan events). Then derive package state.
+        if let Some(root) = pkg_mode_io_needed {
+            let root_clone = root.clone();
+            let (desc_text, ns_text, disk_r_files) = tokio::task::spawn_blocking(move || {
+                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                    .ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                    .ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                (desc, ns, disk_r_files)
+            })
+            .await
+            .unwrap_or((None, None, Default::default()));
+
+            // Re-acquire write lock to apply results.
+            let mut state = self.state.write().await;
+            state.package_inputs.workspace_root = Some(root.clone());
+            state.package_inputs.description =
+                desc_text.map(|text| crate::package_state::DescriptionInput { text });
+            state.package_inputs.namespace =
+                ns_text.map(|text| crate::package_state::NamespaceInput { text });
+            // Seed from disk so packageMode switches still see closed R
+            // files when the background workspace index has not populated
+            // yet; then overlay index entries and open buffers through the
+            // shared helper.
+            let new_r_files = hydrate_package_r_files_from_state(&state, &root, disk_r_files);
+            state.package_inputs.r_files = new_r_files;
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+            log::info!("Rebuilt package state after packageMode change (event-driven)");
+        }
+
+        if diagnostics_enabled_changed {
+            log::info!(
+                "Diagnostics master switch changed: {} -> {}",
+                old_diagnostics_enabled,
+                new_diagnostics_enabled
+            );
+        }
+
+        // Dynamically re-register completion capability if trigger
+        // characters changed.
+        if trigger_on_open_paren_changed {
+            log::info!(
+                "trigger_on_open_paren changed to {}, re-registering completion capability",
+                new_trigger_on_open_paren
+            );
+
+            let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
+            let registration_options = CompletionRegistrationOptions {
+                text_document_registration_options: TextDocumentRegistrationOptions {
+                    document_selector: Some(vec![
+                        DocumentFilter {
+                            language: Some(String::from("r")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("jags")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("stan")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                    ]),
+                },
+                completion_options: CompletionOptions {
+                    trigger_characters: Some(trigger_chars),
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            };
+
+            let registration_id = String::from("completion");
+            let method = String::from("textDocument/completion");
+
+            if let Err(e) = self
+                .client
+                .unregister_capability(vec![Unregistration {
+                    id: registration_id.clone(),
+                    method: method.clone(),
+                }])
+                .await
+            {
+                log::warn!("Failed to unregister completion capability: {}", e);
+            }
+
+            if let Err(e) = self
+                .client
+                .register_capability(vec![Registration {
+                    id: registration_id,
+                    method,
+                    register_options: serde_json::to_value(registration_options).ok(),
+                }])
+                .await
+            {
+                log::warn!("Failed to re-register completion capability: {}", e);
+            }
+        }
+
+        // Reinitialize PackageLibrary only if R-subprocess-affecting
+        // settings changed (enabled flag, R path, or additional library
+        // paths).
+        if package_settings_changed {
+            log::info!("Package settings changed, reinitializing PackageLibrary");
+
+            let (new_package_library, package_library_ready) = if packages_enabled {
+                rebuild_package_library(&self.state).await
+            } else {
+                (
+                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
+                    false,
+                )
+            };
+
+            // Replace under brief write lock.
+            {
+                let mut state = self.state.write().await;
+                state.package_library = new_package_library;
+                state.package_library_ready = package_library_ready;
+            }
+
+            // Help/HTML help caches index by (topic, package); the package
+            // set just changed, so flush them to match watcher and refresh
+            // paths.
+            self.state.read().await.clear_help_caches();
+        }
+
+        // Restart the libpath watcher if any setting that affects it
+        // changed. Covers both the reinit path above (the `lib_paths`
+        // vector may have changed) and the pure watch-settings path (e.g.
+        // user flipped `watchLibraryPaths` or adjusted the debounce
+        // slider) — the helper handles the teardown + respawn atomically
+        // and does NOT re-run the R subprocess.
+        if package_settings_changed || watch_settings_changed {
+            restart_libpath_watcher(&self.state, &self.client, true).await;
+        }
+
+        // Warm the package export cache before republishing diagnostics so
+        // the fresh (empty) library doesn't cause transient false-positive
+        // "unknown function" diagnostics for package exports.
+        if package_settings_changed && packages_enabled {
+            let pkg_lib = self.state.read().await.package_library.clone();
+            prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
+        }
+
+        if scope_changed {
+            log::trace!(
+                "Scope-affecting settings changed, revalidating {} open documents",
+                open_uris.len()
+            );
+        }
+
+        if only_watch_changed {
+            Vec::new()
+        } else {
+            open_uris
+        }
+    }
+
     /// Synchronously index a file on-demand (blocking operation).
     /// Returns the cross-file metadata if indexing succeeded, None otherwise.
     ///
@@ -9656,6 +9710,64 @@ mod project_config_initialize_tests {
             .await;
 
         assert_eq!(backend.state.read().await.lint_config.line_length, 140);
+    }
+
+    /// A live reload of `raven.toml` must reapply `packages.enabled` —
+    /// flipping it `false` should rebuild `PackageLibrary` to the empty
+    /// instance and drop `package_library_ready` without requiring a
+    /// server restart. The pre-extraction code path warned the user to
+    /// restart instead; the shared reconciliation helper now drives the
+    /// rebuild from both call sites.
+    #[tokio::test]
+    async fn watched_files_reload_disables_packages_live() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[packages]\nenabled = true\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Sanity: project file initially enables packages.
+        assert!(backend.state.read().await.cross_file_config.packages_enabled);
+
+        // Edit raven.toml to disable packages on disk.
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[packages]\nenabled = false\n",
+        )
+        .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // Effective config now reflects the new value (live reload), and
+        // the package_library_ready flag has been dropped — confirming the
+        // reconciliation helper ran the rebuild path rather than just
+        // warning the user.
+        let state = backend.state.read().await;
+        assert!(!state.cross_file_config.packages_enabled);
+        assert!(!state.package_library_ready);
     }
 
     /// `DiagnosticsSnapshot::build` (the snapshot site in `handlers.rs` that

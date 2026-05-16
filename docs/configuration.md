@@ -44,9 +44,9 @@ undefinedVariableSeverity = "warning"
 
 ### Live reload
 
-Edits to `raven.toml` are picked up live for: every `[linting]` key (including `overrides`), `[crossFile]` (except `packageMode`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. Open documents re-publish diagnostics automatically.
+Edits to `raven.toml` (or `.lintr`) are picked up live for every section: `[linting]` (including `overrides`), `[crossFile]` (including `packageMode`), `[packages]`, `[packagesWatch*]`, `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. Open documents re-publish diagnostics automatically — no Raven restart required.
 
-Changes to `[packages]` (any key), `[crossFile].packageMode`, or the package-watcher knobs (`packagesWatchLibraryPaths`, `packagesWatchDebounceMs`) currently require restarting Raven; the server surfaces a warning when it detects such a change so the user knows. This v1 scope keeps the live-reload path narrow — rebuilding the package library involves an R subprocess and the watcher restart is non-trivial to wire safely. A follow-up will lift the restriction once the post-recompute reconciliation logic in `did_change_configuration` is extracted into a shared helper.
+Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rPath`, additional library paths, or watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
 
 ## Diagnostics
 
