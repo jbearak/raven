@@ -175,6 +175,21 @@
         "category": "Raven"
       },
       {
+        "command": "raven.knit",
+        "title": "Knit",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.knit.openOutputChannel",
+        "title": "Show Knit Output",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.walkthrough.createSampleRmd",
+        "title": "Create Sample .Rmd",
+        "category": "Raven"
+      },
+      {
         "command": "raven.scaffold.gitignore",
         "title": "Create .gitignore",
         "category": "Raven"
@@ -321,6 +336,13 @@
         {
           "command": "raven.build.buildSource",
           "when": "raven.rConsoleEnabled && raven.isRPackage"
+        },
+        {
+          "command": "raven.knit",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        },
+        {
+          "command": "raven.knit.openOutputChannel"
         }
       ],
       "editor/title": [
@@ -660,6 +682,39 @@
           "highContrast": "#3794ff",
           "highContrastLight": "#0066bf"
         }
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "raven.getStarted",
+        "title": "Get started with Raven for R Markdown",
+        "description": "Set up grammar, live preview, and run your first knit.",
+        "steps": [
+          {
+            "id": "raven.getStarted.installQuarto",
+            "title": "Install Quarto for .qmd grammar and preview",
+            "description": "Raven defers .qmd grammar, LSP, and live preview to the official Quarto extension. [Install Quarto](command:extension.open?%22quarto.quarto%22).",
+            "media": { "markdown": "README.md" },
+            "completionEvents": ["extensionInstalled:quarto.quarto"]
+          },
+          {
+            "id": "raven.getStarted.installRSyntax",
+            "title": "Install R Syntax for .Rmd grammar",
+            "description": "For .Rmd grammar and embedded-language highlighting install [R Syntax](command:extension.open?%22REditorSupport.r-syntax%22) (or the full [R extension](command:extension.open?%22REditorSupport.r%22)).",
+            "media": { "markdown": "README.md" },
+            "completionEvents": [
+              "extensionInstalled:REditorSupport.r-syntax",
+              "extensionInstalled:REditorSupport.r"
+            ]
+          },
+          {
+            "id": "raven.getStarted.knit",
+            "title": "Create a sample .Rmd and knit it",
+            "description": "[Create sample .Rmd](command:raven.walkthrough.createSampleRmd) — Raven will open it. Then run [Raven: Knit](command:raven.knit) from the command palette.",
+            "media": { "markdown": "README.md" },
+            "completionEvents": ["onCommand:raven.knit"]
+          }
+        ]
       }
     ],
     "configuration": {
@@ -1074,7 +1129,28 @@
             "Activate Raven's R console, plot viewer, and data viewer unless the REditorSupport (R) extension is enabled or VS Code is running as Positron."
           ],
           "default": "auto",
-          "description": "Controls when Raven's R console (and the plot and data viewers it powers) activates. The default `auto` leaves them off when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't interfere with existing R-session integration. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
+          "description": "Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd knit command. The default `auto` resolves to `disabled` when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't duplicate surfaces those provide. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
+        },
+        "raven.knit.workingDirectory": {
+          "type": "string",
+          "enum": [
+            "document",
+            "project",
+            "current"
+          ],
+          "enumDescriptions": [
+            "Use the directory containing the .Rmd file (default).",
+            "Use the workspace folder containing the .Rmd file.",
+            "Use R's startup working directory (don't pass knit_root_dir)."
+          ],
+          "default": "document",
+          "description": "Working directory passed to rmarkdown::render's knit_root_dir argument. Matches RStudio's Knit Directory submenu."
+        },
+        "raven.knit.timeoutMs": {
+          "type": "integer",
+          "default": 600000,
+          "minimum": 1000,
+          "description": "Hard timeout (milliseconds) for the Raven: Knit subprocess. After this elapses, Raven escalates the kill ladder (SIGINT → SIGTERM → SIGKILL) and surfaces a 'Knit timed out' message."
         },
         "raven.plot.viewerColumn": {
           "type": "string",
@@ -1636,6 +1712,7 @@
   },
   "dependencies": {
     "apache-arrow": "^21.1.0",
+    "js-yaml": "^4.1.0",
     "jsonc-parser": "^3.3.1",
     "vscode-languageclient": "^9.0.1"
   },
@@ -1647,6 +1724,7 @@
   },
   "devDependencies": {
     "@types/jsdom": "^28.0.1",
+    "@types/js-yaml": "^4.0.9",
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.75.0",
