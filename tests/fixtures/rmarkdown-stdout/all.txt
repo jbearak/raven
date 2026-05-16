@@ -1,0 +1,11 @@
+processing file: example.Rmd
+output file: example.knit.md
+Output created: example.html
+
+processing file: example.Rmd
+output file: example.knit.md
+Output created: example.pdf
+
+processing file: example.Rmd
+output file: example.knit.md
+Output created: example.docx

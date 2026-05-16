@@ -45,6 +45,9 @@ import {
     registerActivationReactivity,
     resolveRConsoleActivation,
 } from './r-console-activation';
+import { registerKnit } from './knit';
+import { registerInstallNags } from './recommendations/install-nag';
+import { registerWalkthroughCommands } from './recommendations/walkthrough';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -258,6 +261,22 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // still register the detection unconditionally so the key is
     // populated for whichever surfaces (current or future) consult it.
     register_r_package_detection(context);
+
+    // `Raven: Knit` registers unconditionally so the walkthrough's
+    // command-link works even when the resolved gate is closed. The
+    // handler itself re-checks `resolveRConsoleActivation()` at
+    // invocation and surfaces a clear info message if the gate is
+    // closed. Setting `raven.rmdKnit.enabled` to match the resolved gate
+    // gates the command-palette entry.
+    registerKnit(context, r_console_resolved === 'enabled');
+
+    // Install nags (one-time recommendations to install quarto.quarto for .qmd
+    // and REditorSupport.r-syntax for .Rmd grammar) and the Get-Started
+    // walkthrough's `raven.walkthrough.createSampleRmd` command. Both
+    // activate regardless of the R-console gate — they're about grammar and
+    // discoverability, not subprocess features.
+    registerInstallNags(context);
+    registerWalkthroughCommands(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //
