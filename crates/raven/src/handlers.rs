@@ -341,6 +341,11 @@ pub(crate) fn diagnostics_from_snapshot(
     // Fast collectors (no scope resolution needed)
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+    collect_invalid_assignment_targets(
+        snapshot.tree.root_node(),
+        &snapshot.text,
+        &mut diagnostics,
+    );
 
     // Style/lint diagnostics. Native Rust rules driven by `lint_config`; no R
     // subprocess. `run_lints` short-circuits when the master switch is off.
@@ -7727,6 +7732,436 @@ mod syntax_error_range_tests {
     }
 }
 
+#[cfg(test)]
+mod invalid_assignment_target_tests {
+    use super::collect_invalid_assignment_targets;
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+
+    fn parse_r(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn collect(code: &str) -> Vec<Diagnostic> {
+        let tree = parse_r(code);
+        let mut diagnostics = Vec::new();
+        collect_invalid_assignment_targets(tree.root_node(), code, &mut diagnostics);
+        diagnostics
+    }
+
+    #[track_caller]
+    fn assert_one(code: &str, expect_substr: &str) {
+        assert_one_with_severity(code, DiagnosticSeverity::ERROR, expect_substr);
+    }
+
+    #[track_caller]
+    fn assert_one_with_severity(
+        code: &str,
+        expected: DiagnosticSeverity,
+        expect_substr: &str,
+    ) {
+        let diags = collect(code);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic for `{code}`, got {diags:?}"
+        );
+        assert_eq!(diags[0].severity, Some(expected));
+        assert!(
+            diags[0].message.contains(expect_substr),
+            "message `{}` did not contain `{}`",
+            diags[0].message,
+            expect_substr
+        );
+    }
+
+    #[track_caller]
+    fn assert_none(code: &str) {
+        let diags = collect(code);
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics for `{code}`, got {diags:?}"
+        );
+    }
+
+
+
+    // ---- LHS literals on `<-` ------------------------------------------------
+
+    #[test]
+    fn left_arrow_logical_true_flagged() {
+        assert_one("TRUE <- 5", "logical literal `TRUE`");
+    }
+
+    #[test]
+    fn left_arrow_logical_false_flagged() {
+        assert_one("FALSE <- 5", "logical literal `FALSE`");
+    }
+
+    #[test]
+    fn left_arrow_null_flagged() {
+        assert_one("NULL <- 1", "Cannot assign to `NULL`");
+    }
+
+    #[test]
+    fn left_arrow_na_variants_flagged() {
+        for case in [
+            "NA <- 1",
+            "NA_integer_ <- 1",
+            "NA_real_ <- 1",
+            "NA_complex_ <- 1",
+            "NA_character_ <- 1",
+        ] {
+            let diags = collect(case);
+            assert_eq!(diags.len(), 1, "expected one diagnostic for `{case}`");
+            assert!(
+                diags[0].message.contains("Cannot assign to `NA"),
+                "message `{}` should mention NA",
+                diags[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn left_arrow_inf_flagged() {
+        assert_one("Inf <- 1", "special constant `Inf`");
+    }
+
+    #[test]
+    fn left_arrow_nan_flagged() {
+        assert_one("NaN <- 1", "special constant `NaN`");
+    }
+
+    #[test]
+    fn left_arrow_numeric_literals_flagged() {
+        assert_one("1 <- \"x\"", "numeric literal `1`");
+        assert_one("1.5 <- 2", "numeric literal `1.5`");
+        assert_one("1L <- 2", "numeric literal `1L`");
+    }
+
+    #[test]
+    fn string_lhs_flagged_as_warning() {
+        // R accepts `"foo" <- 1` (binds the value to variable `foo`), so this
+        // is not an ERROR, but it's almost always a typo or confusion.
+        // Surface as WARNING; suppressible with `# @lsp-ignore` when
+        // intentional.
+        assert_one_with_severity(
+            "\"foo\" <- 1",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+        assert_one_with_severity(
+            "'foo' <- 1",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+        assert_one_with_severity(
+            "1 -> \"foo\"",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+    }
+
+    #[test]
+    fn left_arrow_reserved_word_else_flagged() {
+        assert_one("else <- 1", "reserved word `else`");
+    }
+
+    #[test]
+    fn left_arrow_reserved_word_in_flagged() {
+        assert_one("in <- 1", "reserved word `in`");
+    }
+
+    #[test]
+    fn left_arrow_next_break_flagged() {
+        assert_one("next <- 1", "reserved word `next`");
+        assert_one("break <- 1", "reserved word `break`");
+    }
+
+    #[test]
+    fn left_arrow_signed_numeric_flagged() {
+        assert_one("-1 <- 2", "numeric literal `-1`");
+        assert_one("+1 <- 2", "numeric literal `+1`");
+        assert_one("-1.5 <- 2", "numeric literal `-1.5`");
+        assert_one("-1L <- 2", "numeric literal `-1L`");
+    }
+
+    #[test]
+    fn right_arrow_signed_numeric_target_flagged() {
+        assert_one("5 -> -1", "numeric literal `-1`");
+    }
+
+    #[test]
+    fn parenthesized_literal_target_flagged() {
+        // R rejects `(TRUE) <- 1`, `(1) <- 2`, etc. for the same reason as
+        // the bare forms. Unwrap parens and classify the inner node.
+        assert_one("(TRUE) <- 1", "logical literal `(TRUE)`");
+        assert_one("(1) <- 2", "numeric literal `(1)`");
+        assert_one("5 -> (NULL)", "Cannot assign to `(NULL)`");
+        // Warning tier propagates through parens too.
+        assert_one_with_severity(
+            "(\"foo\") <- 1",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+    }
+
+    #[test]
+    fn parenthesized_identifier_not_flagged() {
+        // `(x) <- 1` is unusual but R accepts it and the issue scope is
+        // literals/reserved words.
+        assert_none("(x) <- 1");
+        assert_none("(my_var) <- 1");
+    }
+
+    #[test]
+    fn unary_on_identifier_not_flagged() {
+        // `-x <- 1` is rejected by R, but the issue scope is literals and
+        // reserved words. The lhs's operand is an ordinary identifier, so we
+        // leave it alone — flagging arbitrary unary-on-identifier targets
+        // would expand scope beyond the spec.
+        assert_none("-x <- 1");
+        assert_none("+y <- 1");
+    }
+
+    #[test]
+    fn other_unary_operators_not_flagged() {
+        // `!`, `~`, `?` on the LHS are not in scope for this diagnostic. R
+        // does reject them, but they don't match the issue's literal /
+        // reserved-word framing — keeping the predicate tight.
+        assert_none("!TRUE <- 1");
+        assert_none("~x <- 1");
+    }
+
+    #[test]
+    fn dots_lhs_flagged_as_warning() {
+        // R accepts these but the binding is unreachable through the usual
+        // `...` / `..N` accessors — almost certainly unintended.
+        assert_one_with_severity(
+            "... <- 1",
+            DiagnosticSeverity::WARNING,
+            "can't be reached",
+        );
+        assert_one_with_severity(
+            "..1 <- 1",
+            DiagnosticSeverity::WARNING,
+            "can't be reached",
+        );
+        assert_one_with_severity(
+            "..10 <- 1",
+            DiagnosticSeverity::WARNING,
+            "can't be reached",
+        );
+    }
+
+    // ---- Other assignment operators -----------------------------------------
+
+    #[test]
+    fn super_assign_flagged() {
+        assert_one("TRUE <<- 1", "logical literal `TRUE`");
+        assert_one("1 <<- 2", "numeric literal `1`");
+    }
+
+    #[test]
+    fn equals_at_top_level_flagged() {
+        assert_one("TRUE = 1", "logical literal `TRUE`");
+        assert_one("1 = 2", "numeric literal `1`");
+    }
+
+    #[test]
+    fn right_arrow_targets_rhs() {
+        assert_one("1 -> TRUE", "logical literal `TRUE`");
+        assert_one("1 -> NULL", "Cannot assign to `NULL`");
+    }
+
+    #[test]
+    fn super_right_arrow_targets_rhs() {
+        assert_one("5 ->> TRUE", "logical literal `TRUE`");
+    }
+
+    // ---- Negative cases -----------------------------------------------------
+
+    #[test]
+    fn valid_assignment_not_flagged() {
+        assert_none("x <- 1");
+        assert_none("data <- 5");
+        assert_none("my_var <<- 1");
+        assert_none("1 -> x");
+        assert_none("5 ->> y");
+    }
+
+    #[test]
+    fn t_and_f_not_flagged() {
+        // `T` and `F` are ordinary bindings, not reserved words; R accepts the
+        // assignment at the REPL. The issue note explicitly excludes these.
+        assert_none("T <- FALSE");
+        assert_none("F <- TRUE");
+    }
+
+    #[test]
+    fn named_argument_equals_not_flagged() {
+        // Valid named arguments — tree-sitter parses these as
+        // `argument name: value:` with no `binary_operator` at all, so
+        // there's nothing for the collector to look at.
+        assert_none("f(x = 1)");
+        assert_none("plot(x = 1, y = 2)");
+    }
+
+    #[test]
+    fn invalid_named_argument_flagged() {
+        // R rejects `f(TRUE = 1)` / `f(1 = 2)` as parse errors (only
+        // identifiers and strings are valid argument names). tree-sitter
+        // recovers by wrapping the `=` as a `binary_operator` inside the
+        // argument's `value:` field — perfect for us to catch.
+        assert_one("f(TRUE = 1)", "logical literal `TRUE`");
+        assert_one("f(1 = 2)", "numeric literal `1`");
+        assert_one("list(TRUE = 1)", "logical literal `TRUE`");
+        assert_one("list(1 = 2)", "numeric literal `1`");
+    }
+
+    #[test]
+    fn function_parameter_default_not_flagged() {
+        // `function(x = TRUE) {}` — `=` inside formal parameters is parameter
+        // syntax, not assignment. tree-sitter-r doesn't wrap it as a
+        // `binary_operator`, so it's naturally ignored.
+        assert_none("function(x = TRUE) NULL");
+        assert_none("function(x = 1, y = \"a\") x");
+    }
+
+    #[test]
+    fn error_targets_skipped() {
+        // `if <- 1`, `for <- 1`, `while <- 1`, `function <- 1` parse with the
+        // LHS as an `ERROR` node. `collect_syntax_errors` already reports them;
+        // our collector deliberately stays silent to avoid duplicates.
+        for code in ["if <- 1", "for <- 1", "while <- 1", "function <- 1"] {
+            let diags = collect(code);
+            assert!(
+                diags.is_empty(),
+                "expected no diagnostics from this collector for `{code}` (ERROR case is owned by collect_syntax_errors): got {diags:?}"
+            );
+        }
+    }
+
+    // ---- Multi-site, nesting, position --------------------------------------
+
+    #[test]
+    fn multiple_in_one_file() {
+        let code = "TRUE <- 1\nNULL <- 2\n1 <- 3\n";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 3, "got {diags:?}");
+    }
+
+    #[test]
+    fn nested_assignment_flagged() {
+        // The outer assignment is valid; the inner is not.
+        let code = "x <- (TRUE <- 5)";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(diags[0].message.contains("logical literal `TRUE`"));
+    }
+
+    #[test]
+    fn diagnostic_range_points_at_target_not_operator() {
+        // `TRUE <- 5` — diagnostic range should cover `TRUE`, not the operator.
+        let diags = collect("TRUE <- 5");
+        assert_eq!(diags.len(), 1);
+        let r = diags[0].range;
+        assert_eq!(r.start.line, 0);
+        assert_eq!(r.start.character, 0);
+        assert_eq!(r.end.line, 0);
+        assert_eq!(r.end.character, 4); // "TRUE" is 4 columns
+    }
+
+    #[test]
+    fn lsp_ignore_suppresses_diagnostic() {
+        // Inline marker on the same line.
+        assert_none("TRUE <- 1 # @lsp-ignore");
+        // Above the line.
+        assert_none("# @lsp-ignore-next\nTRUE <- 1");
+        // Warning tier too.
+        assert_none("\"foo\" <- 1 # @lsp-ignore");
+    }
+
+    #[test]
+    fn lsp_ignore_marker_requires_word_boundary() {
+        // `@lsp-ignored` and `@lsp-ignore_foo` aren't the directive — must
+        // not be picked up by substring matching.
+        let diags = collect("TRUE <- 1 # @lsp-ignored");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("TRUE <- 1 # @lsp-ignore_foo");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
+    fn ignore_next_only_applies_when_standalone() {
+        // Trailing `# @lsp-ignore-next` on a code line MUST NOT suppress
+        // the diagnostic on the next line — this matches the directive
+        // parser in `cross_file/directive.rs`.
+        let code = "x <- 1 # @lsp-ignore-next\nTRUE <- 1";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
+    fn at_lsp_ignore_inside_string_does_not_suppress() {
+        // The `#` is inside a string literal, so it doesn't open a comment.
+        let diags = collect("TRUE <- 1; x <- \"# @lsp-ignore\"");
+        assert!(!diags.is_empty(), "got {diags:?}");
+    }
+
+    #[test]
+    fn at_lsp_ignore_inside_backticks_does_not_suppress() {
+        // R allows backtick-quoted identifiers; the `#` inside one is
+        // identifier content, not a comment.
+        let diags = collect("TRUE <- 1; `# @lsp-ignore` <- 2");
+        assert!(!diags.is_empty(), "got {diags:?}");
+    }
+
+    #[test]
+    fn at_lsp_ignore_inside_multiline_string_does_not_suppress() {
+        // The `# @lsp-ignore-next` is inside a multi-line string literal.
+        // Driving suppression off `comment` AST nodes (not raw line text)
+        // means this is never mistaken for a directive.
+        let code = "x <- \"abc\n# @lsp-ignore-next\"\nTRUE <- 1";
+        let diags = collect(code);
+        assert!(
+            !diags.is_empty(),
+            "expected diagnostic for TRUE <- 1, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nolint_does_not_suppress_diagnostic() {
+        // `# nolint` belongs to the opt-in lint pipeline. R rejects
+        // `TRUE <- 1` outright; an unrelated style suppression like
+        // `# nolint: line_length` shouldn't silence the assignment error.
+        // Only `# @lsp-ignore` may turn this off.
+        let diags = collect("TRUE <- 1 # nolint");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("TRUE <- 1 # nolint: line_length");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("# nolint start\nTRUE <- 1\n# nolint end\n");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
+    fn diagnostic_range_handles_utf16_columns() {
+        // Use a non-BMP character (`🦀`, U+1F980) to actually exercise the
+        // gap between UTF-16 code units and Unicode scalars: 🦀 is 4 UTF-8
+        // bytes / 2 UTF-16 units / 1 scalar. A BMP test input would pass
+        // even if the helper miscounted scalars.
+        let code = "🦀 <- (TRUE <- 5)";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        // `TRUE` starts at column 7 in UTF-16: 🦀(2) + " <- ("(5) = 7.
+        assert_eq!(diags[0].range.start.character, 7);
+        assert_eq!(diags[0].range.end.character, 11);
+    }
+}
+
 /// Detect and report diagnostics for `else` keywords that appear on a new line
 /// after the closing brace of an `if` block.
 ///
@@ -7898,6 +8333,377 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
     }
 
     last_brace_line
+}
+
+/// Emit diagnostics for assignments whose target is suspect or invalid.
+///
+/// Two severity tiers:
+///
+/// **ERROR** — R itself rejects: literals (`TRUE`, `FALSE`, `NULL`, any
+/// `NA*`, `Inf`, `NaN`, numeric incl. signed `-1`/`+1.5`) and reserved-word
+/// identifiers tree-sitter still parses as `binary_operator`
+/// (`else <- 1`, `in <- 1`, `next <- 1`, `break <- 1`).
+///
+/// **WARNING** — R accepts, but the binding is almost certainly unintended:
+/// `"foo" <- 1` (R coerces the string to a name and binds the value to
+/// `foo`), `... <- 1`, `..1 <- 1` (R creates a binding that the standard
+/// `...` / `..N` accessors can't reach). Suppressible via `# @lsp-ignore`
+/// when the binding really is intentional.
+///
+/// Covers the LHS of `<-`, `<<-`, `=` and the RHS of `->`, `->>`. Cases
+/// tree-sitter reports as an `ERROR` node (`if <- 1`, `for <- 1`,
+/// `while <- 1`, `function <- 1`) are deliberately left to
+/// [`collect_syntax_errors`] to avoid duplicate diagnostics. Named-argument
+/// `=` inside a call (`f(name = value)`) is skipped, matching the existing
+/// assignment-operator lint's logic. `T <- FALSE` is **not** flagged: `T`
+/// and `F` are regular bindings, not reserved words.
+fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let ignored = lsp_ignored_lines_from_tree(node, text);
+    collect_invalid_assignment_targets_inner(node, text, &ignored, diagnostics);
+}
+
+fn collect_invalid_assignment_targets_inner(
+    node: Node,
+    text: &str,
+    ignored: &std::collections::HashSet<u32>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if node.kind() == "binary_operator" {
+        check_invalid_assignment_target(node, text, ignored, diagnostics);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_invalid_assignment_targets_inner(child, text, ignored, diagnostics);
+    }
+}
+
+/// Lines suppressed by `# @lsp-ignore` (on the same line) or
+/// `# @lsp-ignore-next` (on the preceding line), discovered by walking the
+/// tree-sitter AST for `comment` nodes.
+///
+/// Driving this off the AST rather than line-scanning the raw text means
+/// we automatically respect every nuance of where `#` characters open
+/// comments: inside string literals, inside raw strings, inside multi-line
+/// strings, inside backtick-quoted identifiers — none of those are
+/// comment nodes, so they're never mistaken for directives.
+///
+/// We deliberately do **not** reuse `crate::linting::nolint::Suppressions`:
+/// that parser also honors `# nolint` / `# nolint start...end`, which
+/// belong to the opt-in lint pipeline. Silencing an ERROR-tier diagnostic
+/// for code R itself rejects (e.g. `TRUE <- 1`) because the user wrote
+/// `# nolint: line_length` for an unrelated style lint would be a
+/// surprise; restricting to `@lsp-ignore` keeps the suppression channel
+/// the same one the rest of `handlers.rs` uses.
+fn lsp_ignored_lines_from_tree(
+    root: Node<'_>,
+    text: &str,
+) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    visit_comments_for_ignore(root, text, &mut out);
+    out
+}
+
+fn visit_comments_for_ignore(
+    node: Node<'_>,
+    text: &str,
+    out: &mut std::collections::HashSet<u32>,
+) {
+    if node.kind() == "comment" {
+        classify_comment_for_ignore(node, text, out);
+        // Comments have no AST children we care about.
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_comments_for_ignore(child, text, out);
+    }
+}
+
+fn classify_comment_for_ignore(
+    comment: Node<'_>,
+    text: &str,
+    out: &mut std::collections::HashSet<u32>,
+) {
+    let raw = text
+        .get(comment.start_byte()..comment.end_byte())
+        .unwrap_or("");
+    // tree-sitter-r includes the leading `#` in the comment node's text.
+    let body = raw.trim_start_matches('#');
+    let row = comment.start_position().row as u32;
+    let start_col = comment.start_position().column;
+    // Was there any non-whitespace code on the same line before the `#`?
+    // Use the underlying line text rather than the AST; cheaper and exact.
+    let line_text = text.lines().nth(row as usize).unwrap_or("");
+    let prefix = line_text.get(..start_col).unwrap_or("");
+    let standalone = prefix.trim().is_empty();
+
+    match classify_lsp_ignore_marker(body) {
+        Some(LspIgnoreKind::SameLine) => {
+            // Inline `# @lsp-ignore` suppresses *this* line — but only
+            // when there's code before the marker. A standalone
+            // `# @lsp-ignore` on its own line has nothing to suppress
+            // (use `# @lsp-ignore-next` instead).
+            if !standalone {
+                out.insert(row);
+            }
+        }
+        Some(LspIgnoreKind::NextLine) => {
+            // `@lsp-ignore-next` only applies when the comment is on its
+            // own line, matching the directive parser in
+            // `cross_file/directive.rs`. A trailing
+            // `x <- 1 # @lsp-ignore-next` does NOT suppress the next
+            // line.
+            if standalone {
+                out.insert(row.saturating_add(1));
+            }
+        }
+        None => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LspIgnoreKind {
+    SameLine,
+    NextLine,
+}
+
+/// Classify the text after a `#` that opens a comment. Returns `SameLine`
+/// for `@lsp-ignore` (with optional rule filter) and `NextLine` for
+/// `@lsp-ignore-next`. Returns `None` otherwise. Matches word-boundary so
+/// `@lsp-ignored` does not match `@lsp-ignore`.
+fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
+    // Allow extra leading `#` characters (`## @lsp-ignore`) and whitespace,
+    // mirroring `linting::nolint::classify`.
+    let trimmed = after_hash.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
+    let rest = trimmed.strip_prefix("@lsp-ignore")?;
+    // Word-boundary: the next byte (if any) must not be an identifier byte.
+    // `-` and `:` are explicitly allowed because they begin the `-next`
+    // suffix or rule filter.
+    match rest.as_bytes().first() {
+        None => Some(LspIgnoreKind::SameLine),
+        Some(b) if b.is_ascii_alphanumeric() || *b == b'_' => None,
+        Some(_) => {
+            let suffix = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
+            if suffix.starts_with("next") {
+                Some(LspIgnoreKind::NextLine)
+            } else {
+                Some(LspIgnoreKind::SameLine)
+            }
+        }
+    }
+}
+
+
+fn check_invalid_assignment_target(
+    binop: Node,
+    text: &str,
+    ignored: &std::collections::HashSet<u32>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(op) = binop.child_by_field_name("operator") else {
+        return;
+    };
+    let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
+    let target = match op_text {
+        "<-" | "<<-" | "=" => binop.child_by_field_name("lhs"),
+        "->" | "->>" => binop.child_by_field_name("rhs"),
+        _ => return,
+    };
+    // No special case for named-argument `=`: tree-sitter-r parses a valid
+    // `f(x = 1)` as `argument name: value:` (no `binary_operator` at all),
+    // while an invalid name like `f(TRUE = 1)` falls back to wrapping the
+    // `=` as `argument value: (binary_operator …)`. We want to flag the
+    // second case, so simply rely on `binary_operator` being absent for the
+    // valid one.
+    //
+    // Parameter defaults (`function(x = TRUE)`) similarly parse as
+    // `parameter name: default:` without producing a `binary_operator`.
+    let Some(target) = target else {
+        return;
+    };
+
+    // Tree-sitter ERROR / MISSING in the target subtree means
+    // `collect_syntax_errors` will already report something. Stay out of its
+    // way to avoid duplicate diagnostics.
+    if target.is_error() || target.is_missing() || target.has_error() {
+        return;
+    }
+
+    let Some(classification) = classify_target(target, text) else {
+        return;
+    };
+
+    let row = target.start_position().row as u32;
+    if ignored.contains(&row) {
+        return;
+    }
+    let line_text = text.lines().nth(row as usize).unwrap_or("");
+    let start_col = crate::cross_file::types::byte_offset_to_utf16_column(
+        line_text,
+        target.start_position().column,
+    );
+    let end_row = target.end_position().row as u32;
+    let end_line_text = text.lines().nth(end_row as usize).unwrap_or("");
+    let end_col = crate::cross_file::types::byte_offset_to_utf16_column(
+        end_line_text,
+        target.end_position().column,
+    );
+    let target_text = text
+        .get(target.start_byte()..target.end_byte())
+        .unwrap_or("");
+    diagnostics.push(Diagnostic {
+        range: Range {
+            start: Position::new(row, start_col),
+            end: Position::new(end_row, end_col),
+        },
+        severity: Some(classification.severity),
+        message: classification.format_message(target_text),
+        ..Default::default()
+    });
+}
+
+/// Severity + label for an offending assignment target.
+struct TargetClassification {
+    severity: DiagnosticSeverity,
+    label: &'static str,
+}
+
+impl TargetClassification {
+    fn format_message(&self, target_text: &str) -> String {
+        match (self.severity, self.label) {
+            // NULL / NA are self-descriptive — don't repeat the kind name.
+            (DiagnosticSeverity::ERROR, "NULL" | "NA") => {
+                format!("Cannot assign to `{target_text}`.")
+            }
+            (DiagnosticSeverity::ERROR, _) => {
+                format!("Cannot assign to {} `{target_text}`.", self.label)
+            }
+            (DiagnosticSeverity::WARNING, "string literal") => format!(
+                "Assigning to string literal {target_text}; R will bind the value to the variable named by the string. Was this intentional?"
+            ),
+            (DiagnosticSeverity::WARNING, "dots") => format!(
+                "Assigning to `{target_text}` creates a binding that can't be reached through the usual `...` accessors."
+            ),
+            (DiagnosticSeverity::WARNING, "dot-dot-N") => format!(
+                "Assigning to `{target_text}` creates a binding that can't be reached through the usual `..N` accessors."
+            ),
+            // Fallback shouldn't occur in practice — keep a generic phrasing.
+            (DiagnosticSeverity::WARNING, _) => {
+                format!("Suspicious assignment to `{target_text}`.")
+            }
+            _ => format!("Assignment to `{target_text}`."),
+        }
+    }
+}
+
+fn classify_target(node: Node, text: &str) -> Option<TargetClassification> {
+    if let Some(label) = invalid_target_kind(node, text) {
+        return Some(TargetClassification {
+            severity: DiagnosticSeverity::ERROR,
+            label,
+        });
+    }
+    if let Some(label) = suspicious_target_kind(node, text) {
+        return Some(TargetClassification {
+            severity: DiagnosticSeverity::WARNING,
+            label,
+        });
+    }
+    None
+}
+
+/// Classify an assignment-target node. Returns `Some(label)` when the target
+/// is something R will always reject.
+///
+/// Identifiers are flagged only when their text is a reserved word per
+/// [`crate::reserved_words::is_reserved_word`] — this is what distinguishes
+/// `else <- 1` (flagged) from `T <- FALSE` (not flagged: `T` is a regular
+/// binding, not a reserved word).
+fn invalid_target_kind(node: Node, text: &str) -> Option<&'static str> {
+    // ERROR tier only: targets R itself rejects at parse or eval time.
+    // Cases R technically accepts but the binding is almost certainly
+    // unintended (`"foo" <- 1`, `... <- 1`, `..1 <- 1`) are handled by
+    // [`suspicious_target_kind`] at WARNING severity.
+    match node.kind() {
+        "true" | "false" => Some("logical literal"),
+        "null" => Some("NULL"),
+        "na" => Some("NA"),
+        "inf" | "nan" => Some("special constant"),
+        "float" | "integer" | "complex" => Some("numeric literal"),
+        "next" | "break" => Some("reserved word"),
+        // Signed numeric literals: `-1 <- 2`, `+1.5 <- 2`, `5 -> -1`.
+        // tree-sitter-r wraps these as `unary_operator` with the sign as an
+        // anonymous child token and the numeric value on the `rhs` field.
+        // Recurse to classify the operand so `-x <- 1` (where `x` is a
+        // regular identifier) is correctly NOT flagged — the issue scope is
+        // literals and reserved words, not arbitrary expressions.
+        "unary_operator" => {
+            let op = unary_operator_text(node, text)?;
+            if op != "-" && op != "+" {
+                return None;
+            }
+            let operand = node.child_by_field_name("rhs")?;
+            invalid_target_kind(operand, text)
+        }
+        // Parenthesized literal targets: `(TRUE) <- 1`, `(1) <- 2`,
+        // `5 -> (NULL)`. R rejects these for the same reason as the bare
+        // form; tree-sitter just keeps the parens in a wrapper node.
+        // Recurse so `(x) <- 1` (parenthesized identifier — not a literal)
+        // stays unflagged.
+        "parenthesized_expression" => {
+            let inner = node.child_by_field_name("body")?;
+            invalid_target_kind(inner, text)
+        }
+        // tree-sitter-r parses `TRUE`/`FALSE`/`NULL`/`Inf`/`NaN`/`NA*` as
+        // their own node kinds (above), so this branch only fires for
+        // reserved words that lex as identifiers — `else <- 1`, `in <- 1`.
+        // Other reserved words like `if`/`for`/`while`/`function`/`repeat`
+        // produce ERROR / `repeat_statement` parents and never reach here.
+        "identifier" => {
+            let t = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
+            if is_reserved_word(t) {
+                Some("reserved word")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Return the operator-token text of a `unary_operator` node. tree-sitter-r
+/// does not expose the operator as a named field, so we scan anonymous
+/// children for the sign / prefix token.
+fn unary_operator_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            continue;
+        }
+        let t = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+        if matches!(t, "-" | "+" | "!" | "~" | "?") {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Classify an assignment-target node as suspicious (R accepts, but the
+/// binding is almost certainly unintended). Returns `Some(label)` for cases
+/// like `"foo" <- 1`, `... <- 1`, `..N <- 1`.
+fn suspicious_target_kind(node: Node, text: &str) -> Option<&'static str> {
+    match node.kind() {
+        "string" => Some("string literal"),
+        "dots" => Some("dots"),
+        "dot_dot_i" => Some("dot-dot-N"),
+        // Mirror the parenthesis-unwrap from `invalid_target_kind` so
+        // `("foo") <- 1` and `(... ) <- 1` keep getting the WARNING tier.
+        "parenthesized_expression" => {
+            let inner = node.child_by_field_name("body")?;
+            suspicious_target_kind(inner, text)
+        }
+        _ => None,
+    }
 }
 
 /// True when an identifier is textually followed by `(` (ignoring whitespace),
