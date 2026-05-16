@@ -186,7 +186,7 @@
       },
       {
         "command": "raven.createProjectConfig",
-        "title": "Raven: Create raven.toml",
+        "title": "Create raven.toml",
         "category": "Raven"
       },
       {
