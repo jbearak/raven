@@ -247,9 +247,10 @@ User: raven.knit on foo.Rmd
        • NUL byte (0x00) — un-representable in argv on every platform; in R, embedded NUL inside a
          string literal terminates the C string and produces a value that does NOT equal the original.
          This is an immediate refusal, not a sanitization.
-       • Other ASCII control characters in the range 0x01–0x1F EXCEPT 0x09 (tab) — these can mangle
-         the R expression's diagnostic output and have no legitimate place in a filesystem path or
-         format identifier. Includes CR (0x0D), LF (0x0A), FF (0x0C), etc.
+       • Other ASCII control characters in the range 0x01–0x1F EXCEPT 0x09 (tab) — the rejected
+         controls (CR, LF, FF, etc.) can mangle the R expression's diagnostic output and have no
+         legitimate place in a filesystem path or format identifier. Tab is the one control we keep
+         because some filesystems do permit it and it's harmless inside a single-quoted R string.
        • DEL (0x7F).
      Bidi-override / other non-printable Unicode characters are NOT pre-rejected; they are exotic but
      legitimate in some filesystems. They round-trip through escapeRString correctly.
@@ -447,6 +448,5 @@ Tier 2 implementation reuses Tier 1's `yaml-frontmatter.parseFrontmatter`, `r-ex
 
 ## Open questions
 
-1. **Walkthrough sample `.Rmd` content** — what should the sample document contain? Probably the simplest possible (one chunk, one heading, one paragraph). Addressed during implementation.
-2. **Editor-title button vs. command-palette-only** — RStudio puts Knit in the editor title bar. Should raven? Modest discoverability win; deferable to a follow-up. Current spec: command palette only.
-3. **`raven.r.executablePath`** — already exists in raven for the R console. Reusing it for the knit subprocess is the natural choice and assumed throughout this spec.
+1. **Editor-title button vs. command-palette-only** — RStudio puts Knit in the editor title bar. Should raven? Modest discoverability win; deferable to a follow-up. Current spec: command palette only.
+2. **`raven.r.executablePath`** — already exists in raven for the R console. Reusing it for the knit subprocess is the natural choice and assumed throughout this spec.
