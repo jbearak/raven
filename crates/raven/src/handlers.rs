@@ -6277,19 +6277,28 @@ fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
 }
 
 /// Returns a diagnostic message if `node` is an ERROR consisting of a lone
-/// `>` token whose immediately-preceding sibling is an `=` operator. This is
-/// the parse shape tree-sitter-r produces for the JavaScript-style fat-arrow
-/// typo `x => 1`: a `binary_operator` with `=` as its operator child, an
-/// ERROR child containing `>`, and the right-hand expression as the next
-/// sibling.
+/// `>` token *immediately* following an `=` operator (no intervening
+/// whitespace or comments). This is the parse shape tree-sitter-r produces
+/// for the JavaScript-style fat-arrow typo `x => 1`: inside a
+/// `binary_operator` (or named `argument`) we get `=` as one child, an
+/// ERROR child whose only token is `>`, and the right-hand expression as
+/// the next sibling. Adjacency matters — `x = > 1` (with a space) and
+/// `x =\n> 1` produce the same node shape but are *not* a literal `=>`
+/// token, so they should fall back to the generic "Syntax error".
 fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
-    let node_text = text.get(node.start_byte()..node.end_byte())?.trim();
+    let node_text = text.get(node.start_byte()..node.end_byte())?;
     if node_text != ">" {
         return None;
     }
     let prev = node.prev_sibling()?;
     let prev_text = text.get(prev.start_byte()..prev.end_byte())?;
     if prev_text != "=" {
+        return None;
+    }
+    // Adjacency check: the `=` must be flush against the `>` (no
+    // whitespace/comments between), otherwise the user did not type the
+    // `=>` token even though the parse shape happens to match.
+    if prev.end_byte() != node.start_byte() {
         return None;
     }
     Some(
@@ -7117,6 +7126,44 @@ mod syntax_error_range_tests {
         assert!(
             diags.iter().all(|d| !d.message.contains("no `=>` operator")),
             "non-`=>` errors must not be misclassified as fat-arrow, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fat_arrow_typo_inside_call_argument() {
+        // `f(x => 1)` — the same parse shape appears inside an `argument`
+        // node when the typo is written at a named-argument position.
+        let code = "f(x => 1)";
+        let diags = collect(code);
+        assert!(
+            diags.iter().any(|d| d.message.contains("no `=>` operator")),
+            "should emit fat-arrow diagnostic inside a call, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn space_between_eq_and_gt_is_not_fat_arrow() {
+        // `x = > 1` — `=` and `>` are not adjacent, so this is not a literal
+        // `=>` token even though the parse shape happens to match.
+        let code = "x = > 1";
+        let diags = collect(code);
+        assert!(
+            diags.iter().all(|d| !d.message.contains("no `=>` operator")),
+            "spaced `= >` must not be misclassified as fat-arrow, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn newline_between_eq_and_gt_is_not_fat_arrow() {
+        // `x =\n> 1` — newline between `=` and `>` rules out a literal `=>`.
+        let code = "x =\n> 1";
+        let diags = collect(code);
+        assert!(
+            diags.iter().all(|d| !d.message.contains("no `=>` operator")),
+            "newline-separated `= ... >` must not be misclassified as fat-arrow, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
