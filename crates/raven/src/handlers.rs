@@ -8073,6 +8073,16 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn ignore_next_only_applies_when_standalone() {
+        // Trailing `# @lsp-ignore-next` on a code line MUST NOT suppress
+        // the diagnostic on the next line — this matches the directive
+        // parser in `cross_file/directive.rs`.
+        let code = "x <- 1 # @lsp-ignore-next\nTRUE <- 1";
+        let diags = collect(code);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
     fn at_lsp_ignore_inside_string_does_not_suppress() {
         // The `#` is inside a string literal, so it doesn't open a comment.
         let diags = collect("TRUE <- 1; x <- \"# @lsp-ignore\"");
@@ -8344,18 +8354,24 @@ fn lsp_ignored_lines(text: &str) -> std::collections::HashSet<u32> {
             continue;
         };
         let after_hash = &line[comment_start + 1..];
+        let prefix_trim = line[..comment_start].trim();
         match classify_lsp_ignore_marker(after_hash) {
             Some(LspIgnoreKind::SameLine) => {
                 // Inline `# @lsp-ignore` suppresses *this* line — but only
-                // if the marker appears after non-comment code. A standalone
+                // when there's code before the marker. A standalone
                 // `# @lsp-ignore` comment is meaningless on its own.
-                let prefix = &line[..comment_start];
-                if !prefix.trim().is_empty() {
+                if !prefix_trim.is_empty() {
                     out.insert(idx as u32);
                 }
             }
             Some(LspIgnoreKind::NextLine) => {
-                out.insert((idx as u32).saturating_add(1));
+                // `@lsp-ignore-next` only applies when standalone (matching
+                // the directive parser in `cross_file/directive.rs`). A
+                // trailing `x <- 1 # @lsp-ignore-next` does NOT suppress
+                // the next line.
+                if prefix_trim.is_empty() {
+                    out.insert((idx as u32).saturating_add(1));
+                }
             }
             None => {}
         }
