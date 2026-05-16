@@ -2205,6 +2205,41 @@ impl LanguageServer for Backend {
         // watcher over the newly-discovered paths. See `docs/packages.md`.
         restart_libpath_watcher(&self.state, &self.client, true).await;
 
+        // Register dynamic file watches for raven.toml / .lintr. VS Code also
+        // covers these via its synchronize.fileEvents glob, so this is a no-op
+        // there; non-VS Code clients that honor dynamic registration pick up
+        // live reload from here.
+        {
+            use tower_lsp::lsp_types::{
+                DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, GlobPattern,
+                Registration, WatchKind,
+            };
+            let watchers = vec![
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/raven.toml".into()),
+                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                },
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/.lintr".into()),
+                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                },
+            ];
+            let reg = Registration {
+                id: "raven-config-files".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                        .unwrap(),
+                ),
+            };
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = client.register_capability(vec![reg]).await {
+                    log::warn!("dynamic watch registration failed: {e}");
+                }
+            });
+        }
+
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
@@ -4223,6 +4258,175 @@ impl LanguageServer for Backend {
             "Received watched files change: {} changes",
             params.changes.len()
         );
+
+        // Detect raven.toml / .lintr events. These are not part of the
+        // source-file flow — they trigger a config-layer reload instead.
+        let config_file_changes: Vec<FileEvent> = params
+            .changes
+            .iter()
+            .filter(|c| {
+                let Ok(p) = c.uri.to_file_path() else {
+                    return false;
+                };
+                matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("raven.toml") | Some(".lintr")
+                )
+            })
+            .cloned()
+            .collect();
+
+        if !config_file_changes.is_empty() {
+            // Step 1 (lock-free I/O): snapshot the workspace root, then run
+            // discovery + load_toml off-lock. Holding the write lock across
+            // disk I/O violates the locking-discipline invariant in
+            // CLAUDE.md.
+            let project_root: Option<std::path::PathBuf> = {
+                let state = self.state.read().await;
+                state
+                    .workspace_folders
+                    .first()
+                    .and_then(|u| u.to_file_path().ok())
+            };
+
+            let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
+            if let Some(root) = &project_root {
+                match crate::config_file::find_config(root) {
+                    crate::config_file::DiscoveredConfig::RavenToml(p) => {
+                        if let Some(loaded) = crate::config_file::load_toml(&p) {
+                            for w in &loaded.warnings {
+                                log::warn!("{w}");
+                            }
+                            loaded_project = Some((p, loaded.settings));
+                        }
+                    }
+                    crate::config_file::DiscoveredConfig::Lintr(_p) => {
+                        // .lintr loader lands in Task 10. For now, skip with
+                        // an info log (mirrors `initialize` behavior).
+                        log::info!(
+                            ".lintr discovered but its loader is not wired in \
+                             did_change_watched_files yet; using defaults"
+                        );
+                    }
+                    crate::config_file::DiscoveredConfig::None => {}
+                }
+            }
+
+            // Step 2 (under write lock, no I/O): apply the reload —
+            // snapshot prev configs for downstream rebuild gating, recompute
+            // parsed configs, recompile overrides, restore client-capability
+            // flags, mark force-republish for open documents.
+            let (open_uris, package_settings_changed, watch_settings_changed, package_mode_changed) = {
+                let mut state = self.state.write().await;
+                let prev_cross_file = state.cross_file_config.clone();
+                let prev_hier_support =
+                    state.symbol_config.hierarchical_document_symbol_support;
+
+                // Re-run discovery from the workspace root. Order matters:
+                // raven.toml beats .lintr (DiscoveredConfig embodies that).
+                state.raw_project_settings = None;
+                state.project_config_path = None;
+                if let Some((p, settings)) = loaded_project {
+                    state.raw_project_settings = Some(settings);
+                    state.project_config_path = Some(p);
+                }
+
+                crate::config_file::recompute_parsed_configs(&mut state);
+
+                // Recompute resets symbol_config; restore the hierarchical
+                // capability flag set from client capabilities at init time.
+                state.symbol_config.hierarchical_document_symbol_support = prev_hier_support;
+
+                if let Some(root) = &project_root {
+                    let merged = crate::config_file::merge_settings(
+                        &state.raw_client_settings,
+                        state.raw_project_settings.as_ref(),
+                    );
+                    state.lint_overrides =
+                        crate::config_file::compile_lint_overrides(&merged, root);
+                }
+
+                let package_settings_changed = state.cross_file_config.packages_enabled
+                    != prev_cross_file.packages_enabled
+                    || state.cross_file_config.packages_r_path != prev_cross_file.packages_r_path
+                    || state.cross_file_config.packages_additional_library_paths
+                        != prev_cross_file.packages_additional_library_paths;
+                let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
+                    != prev_cross_file.packages_watch_library_paths
+                    || state.cross_file_config.packages_watch_debounce_ms
+                        != prev_cross_file.packages_watch_debounce_ms;
+                let package_mode_changed =
+                    state.cross_file_config.package_mode != prev_cross_file.package_mode;
+
+                let open: Vec<Url> = state.documents.keys().cloned().collect();
+                state.diagnostics_gate.mark_force_republish_many(open.iter());
+                (
+                    open,
+                    package_settings_changed,
+                    watch_settings_changed,
+                    package_mode_changed,
+                )
+            };
+
+            // v1 scope note: settings whose rebuild lives in
+            // `did_change_configuration` (package_library rebuild via R
+            // subprocess, libpath watcher restart, packageMode mode switch)
+            // are NOT auto-applied here. Detecting them and calling
+            // `did_change_configuration` ourselves would either (a) corrupt
+            // the raw layer split (synthesizing the merged result into
+            // `raw_client_settings` makes stale project keys outlive a
+            // raven.toml deletion) or (b) require extracting a
+            // post-recompute reconciliation helper from
+            // `did_change_configuration` — bigger than this PR.
+            //
+            // Issue a one-time warning so the user knows to restart if they
+            // changed one of these keys. Linting / cross-file thresholds /
+            // diagnostics / indentation / symbols / completion all reload
+            // live; the warning calls out the gap explicitly.
+            if package_settings_changed || watch_settings_changed || package_mode_changed {
+                log::warn!(
+                    "raven.toml: package settings, packageMode, or watcher knobs changed; \
+                     restart Raven to pick them up. \
+                     (Live-reload is scoped to non-rebuild settings in this version.)"
+                );
+                // Surface to the user via `window/showMessage` so editors
+                // that don't tail the server log still see it.
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    use tower_lsp::lsp_types::MessageType;
+                    client
+                        .show_message(
+                            MessageType::WARNING,
+                            "raven.toml: package-related settings changed; restart Raven to pick them up.",
+                        )
+                        .await;
+                });
+            }
+
+            // Re-publish diagnostics for every open document. The force-
+            // republish marker we set above ensures `publish_diagnostics`
+            // actually emits (rather than being short-circuited by an
+            // unchanged-version check).
+            for uri in &open_uris {
+                self.publish_diagnostics(uri).await;
+            }
+        }
+
+        // If every change was a config file, the source-file flow below has
+        // nothing to do. Otherwise, build a filtered `params` containing
+        // only the non-config events and continue.
+        let remaining_changes: Vec<FileEvent> = params
+            .changes
+            .iter()
+            .filter(|c| !config_file_changes.iter().any(|cc| cc.uri == c.uri))
+            .cloned()
+            .collect();
+        if remaining_changes.is_empty() {
+            return;
+        }
+        let params = DidChangeWatchedFilesParams {
+            changes: remaining_changes,
+        };
 
         // Collect deleted URIs for batch cancellation
         let deleted_uris: Vec<Url> = params
@@ -9392,5 +9596,55 @@ mod project_config_initialize_tests {
         // Project still pins lineLength; objectLength falls back to default (30).
         assert_eq!(state.lint_config.line_length, 100);
         assert_eq!(state.lint_config.object_length, 30);
+    }
+
+    /// When `did_change_watched_files` reports a change to `raven.toml` on
+    /// disk, the backend must re-discover the project config, re-load it,
+    /// and recompute parsed configs so the new value is reflected in
+    /// `state.lint_config`. This is the live-reload entry point used by
+    /// non-VS Code clients that honor dynamic file watch registration.
+    #[tokio::test]
+    async fn watched_files_reload_picks_up_new_raven_toml() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 100\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(backend.state.read().await.lint_config.line_length, 100);
+
+        // Edit raven.toml on disk.
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 140\n",
+        )
+        .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        assert_eq!(backend.state.read().await.lint_config.line_length, 140);
     }
 }
