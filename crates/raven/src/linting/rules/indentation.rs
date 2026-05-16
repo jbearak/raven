@@ -44,10 +44,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 
 pub(crate) fn collect(
@@ -101,6 +102,7 @@ pub(crate) fn collect(
             },
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
+            code: Some(NumberOrString::String(rule_ids::INDENTATION.to_string())),
             message: expected.message(actual),
             ..Default::default()
         });

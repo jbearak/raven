@@ -8,11 +8,12 @@
 //! inside an argument list. This matches `lintr::assignment_linter`'s default
 //! behavior.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::config::AssignmentOperatorStyle;
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -64,6 +65,9 @@ fn visit(
                             },
                             severity: Some(severity),
                             source: Some(LINT_SOURCE.to_string()),
+                            code: Some(NumberOrString::String(
+                                rule_ids::ASSIGNMENT_OPERATOR.to_string(),
+                            )),
                             message: format!(
                                 "Use `{preferred}` for assignment instead of `{op_text}`."
                             ),

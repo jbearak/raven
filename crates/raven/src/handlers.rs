@@ -240,12 +240,34 @@ impl DiagnosticsSnapshot {
             total_elapsed,
         );
 
+        // Resolve the effective `LintConfig` for this URI by layering any
+        // matching `[[linting.overrides]]` patches over the base
+        // `state.lint_config`. Fast path: when no overrides are configured
+        // (the common case), skip the merge + section-clone work entirely.
+        // The merge+resolve only runs once per snapshot build, but a project
+        // with many open documents and zero overrides shouldn't pay for it.
+        let lint_config = if state.lint_overrides.is_empty() {
+            state.lint_config.clone()
+        } else {
+            let merged = crate::config_file::merge_settings(
+                &state.raw_client_settings,
+                state.raw_project_settings.as_ref(),
+            );
+            let section = merged.get("linting").cloned().unwrap_or(serde_json::json!({}));
+            crate::config_file::resolve_lint_for_document(
+                &state.lint_config,
+                &section,
+                &state.lint_overrides,
+                uri,
+            )
+        };
+
         Some(DiagnosticsSnapshot {
             tree,
             text,
             directive_meta,
             cross_file_config: state.cross_file_config.clone(),
-            lint_config: state.lint_config.clone(),
+            lint_config,
             cross_file_graph: trimmed_graph,
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
@@ -3993,9 +4015,31 @@ fn collect_workspace_symbols_from_artifacts(
 // ============================================================================
 
 /// Build a `DiagnosticsSnapshot` and run the snapshot-based diagnostic
-/// pipeline. This is the production entry point for sync diagnostic
-/// computation (called by `pub fn diagnostics`), and is also the bench
-/// harness target for `crates/raven/benches/lsp_operations.rs`.
+/// pipeline.
+///
+/// # ⚠️ Lock discipline — do not call from production publish paths
+///
+/// This convenience wrapper builds the snapshot AND runs
+/// `diagnostics_from_snapshot` (scope resolution) in a single call.
+/// Production callers that hold `WorldState::state.read().await` would
+/// therefore hold the read lock across the entire scope-resolution
+/// pass — violating the CLAUDE.md "Locking discipline in cross-file
+/// work" invariant and starving concurrent `did_change` writers.
+///
+/// The production publish path in `backend.rs::publish_diagnostics_inner`
+/// splits this into a brief lock window that builds the snapshot, a
+/// lock release, and an unlocked `diagnostics_from_snapshot` call. New
+/// production code should follow that pattern, not this wrapper.
+///
+/// Retained for the bench harness
+/// (`crates/raven/benches/lsp_operations.rs`) and the inline tests in
+/// this module, which build their own short-lived `WorldState` and do
+/// not contend for the lock. The intentionally awkward name plus the
+/// warning block above are meant to surface in IDE hover tooltips at
+/// any future call site — `#[deprecated]` would generate dozens of
+/// warnings on the existing in-module test fleet, which would defeat
+/// its visibility for genuinely new callers.
+#[allow(dead_code)]
 pub fn diagnostics_via_snapshot(
     state: &WorldState,
     uri: &Url,
@@ -4068,6 +4112,30 @@ pub fn diagnostics_via_snapshot_profile(
 /// let diags = diagnostics(&state, &uri, &DiagCancelToken::never());
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
+///
+/// # ⚠️ Lock discipline — do not call from production publish paths
+///
+/// This is a convenience wrapper that builds a `DiagnosticsSnapshot`
+/// AND runs `diagnostics_from_snapshot` (scope resolution) in one
+/// call. Calling it from inside a `WorldState::state.read().await`
+/// guard holds the read lock across the entire scope-resolution
+/// pass — violating the CLAUDE.md "Locking discipline in cross-file
+/// work" invariant and starving concurrent `did_change` writers.
+///
+/// The production publish path in `backend.rs::publish_diagnostics_inner`
+/// splits the work: build the snapshot under a brief read lock,
+/// release the lock, then run `diagnostics_from_snapshot` on the
+/// snapshot. New production code should follow that pattern, not
+/// reach for this wrapper.
+///
+/// Retained as a `pub` entry point for bench harnesses
+/// (`crates/raven/benches/lsp_operations.rs`) and downstream consumers
+/// that have their own lock strategy. The warning block above is
+/// meant to surface in IDE hover tooltips at any future call site —
+/// `#[deprecated]` would emit dozens of warnings against the existing
+/// in-module test fleet, defeating its visibility for genuinely new
+/// production callers.
+#[allow(dead_code)]
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
@@ -8945,6 +9013,7 @@ fn is_package_export(
     package_library.is_symbol_from_loaded_packages(name, loaded_packages)
 }
 
+#[allow(dead_code)]
 fn document_file_type(state: &WorldState, uri: &Url) -> FileType {
     state
         .get_document(uri)

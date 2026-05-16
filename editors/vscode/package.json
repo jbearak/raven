@@ -200,6 +200,11 @@
         "category": "Raven"
       },
       {
+        "command": "raven.createProjectConfig",
+        "title": "Create raven.toml",
+        "category": "Raven"
+      },
+      {
         "command": "raven.build.loadAll",
         "title": "Load All",
         "category": "Raven Build"

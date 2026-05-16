@@ -12,10 +12,11 @@
 //! symbol name — only the LHS field does, and `object_name` already won't
 //! flag those for the same reason).
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -146,6 +147,7 @@ fn check_name(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(rule_ids::OBJECT_LENGTH.to_string())),
         message: format!(
             "Identifier `{name}` is {len} characters long; maximum is {max_length}."
         ),

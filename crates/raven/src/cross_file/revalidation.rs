@@ -242,6 +242,19 @@ impl CrossFileDiagnosticsGate {
         last_published.remove(uri);
         force.remove(uri);
     }
+
+    /// Test-only accessor for the outstanding force-republish counter for
+    /// a given URI. A non-zero return means the gate is still expecting a
+    /// matching publish to consume the marker; zero means every prior
+    /// `mark_force_republish*` increment has been matched by a successful
+    /// `try_consume_publish`. Used by integration tests that need to
+    /// assert "the publish actually ran" without inspecting client-side
+    /// notification queues.
+    #[cfg(test)]
+    pub fn force_republish_count_for_test(&self, uri: &Url) -> u32 {
+        let force = self.force_republish.read().unwrap();
+        force.get(uri).copied().unwrap_or(0)
+    }
 }
 
 /// Tracks client activity hints for revalidation prioritization

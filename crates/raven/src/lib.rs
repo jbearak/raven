@@ -21,6 +21,7 @@ pub mod backend;
 pub mod builtins;
 pub mod chunks;
 pub mod completion_context;
+pub mod config_file;
 pub mod content_provider;
 pub mod document_store;
 pub mod extract_op;

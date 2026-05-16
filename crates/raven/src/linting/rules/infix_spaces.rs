@@ -22,10 +22,11 @@
 //! arguments (`f(name = value)`) are parsed as `argument` nodes, never
 //! `binary_operator`, so they're naturally exempt.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -261,6 +262,7 @@ fn report(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(rule_ids::INFIX_SPACES.to_string())),
         message: format!("{prefix}{op_text}{suffix}."),
         ..Default::default()
     });

@@ -470,6 +470,17 @@ pub(crate) fn parse_cross_file_config(
 ///   - `functionLeftParenthesesSeverity`
 ///   - `spacesInsideSeverity`
 ///   - `indentationSeverity`
+/// Variant of `parse_lint_config` that takes the `[linting]` section directly
+/// (not wrapped in a top-level object). Used by per-document override resolution
+/// where we've already extracted the section.
+pub(crate) fn parse_lint_config_from_section(
+    section: &serde_json::Value,
+) -> Option<crate::linting::LintConfig> {
+    // Wrap into the shape `parse_lint_config` expects and delegate.
+    let wrapped = serde_json::json!({ "linting": section });
+    parse_lint_config(&wrapped)
+}
+
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
 ) -> Option<crate::linting::LintConfig> {
@@ -1705,6 +1716,85 @@ async fn run_debounced_diagnostics(
     }
 }
 
+pub(crate) enum RavenProjectConfigLoaded {}
+
+impl tower_lsp::lsp_types::notification::Notification for RavenProjectConfigLoaded {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "raven/projectConfigLoaded";
+}
+
+/// Build the `raven/projectConfigLoaded` payload. Pure function so it can
+/// be unit-tested without spinning up an LSP service. The notification
+/// payload schema is:
+///   - `path: string | null` — absolute path of the active project
+///     config, or `null` when no config is in effect.
+///   - `source: "raven.toml" | ".lintr" | null` — discriminator derived
+///     from the file name; `null` when `path` is `null`.
+fn build_project_config_loaded_payload(path: Option<&std::path::Path>) -> serde_json::Value {
+    match path {
+        Some(p) => {
+            let source = if p.file_name() == Some(std::ffi::OsStr::new(".lintr")) {
+                ".lintr"
+            } else {
+                "raven.toml"
+            };
+            serde_json::json!({
+                "path": p.display().to_string(),
+                "source": source,
+            })
+        }
+        None => serde_json::json!({
+            "path": serde_json::Value::Null,
+            "source": serde_json::Value::Null,
+        }),
+    }
+}
+
+/// Pre-recompute snapshot of the parsed configs that drive change-detection
+/// inside [`Backend::reconcile_after_config_recompute`].
+///
+/// Captured by the caller under a write lock, **before** the caller mutates
+/// `raw_client_settings` / `raw_project_settings` and calls
+/// [`crate::config_file::recompute_parsed_configs`]. The helper diffs the
+/// post-recompute `state.*_config` values against this snapshot to decide
+/// which downstream rebuilds to run.
+#[derive(Debug, Clone)]
+struct ConfigChangeSnapshot {
+    prev_cross_file: crate::cross_file::CrossFileConfig,
+    prev_lint: crate::linting::LintConfig,
+    prev_completion: crate::state::CompletionConfig,
+    /// `recompute_parsed_configs` resets `symbol_config` to defaults. The
+    /// helper restores `hierarchical_document_symbol_support` from this
+    /// value (set from client capabilities at initialize time).
+    prev_hier_support: bool,
+}
+
+/// Flags + carried state derived under the write lock inside
+/// [`Backend::reconcile_after_config_recompute`], consumed by the
+/// out-of-lock work below.
+///
+/// Replaces what was a 12-element tuple. Don't make it `pub` — every
+/// field is internal to one helper.
+#[derive(Debug)]
+struct ReconciliationDecisions {
+    scope_changed: bool,
+    package_settings_changed: bool,
+    watch_settings_changed: bool,
+    only_watch_changed: bool,
+    diagnostics_enabled_changed: bool,
+    old_diagnostics_enabled: bool,
+    new_diagnostics_enabled: bool,
+    packages_enabled: bool,
+    trigger_on_open_paren_changed: bool,
+    new_trigger_on_open_paren: bool,
+    /// `Some(root)` when `packageMode` flipped to a non-Disabled mode and
+    /// the helper still needs to read `DESCRIPTION` / `NAMESPACE` from
+    /// disk before re-applying. `None` otherwise (no mode change, or the
+    /// mode change was already applied in-lock for Disabled).
+    pkg_mode_io_needed: Option<std::path::PathBuf>,
+    open_uris: Vec<Url>,
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     /// Initializes the server state from the client's InitializeParams and returns the LSP
@@ -1728,54 +1818,81 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         log::info!("Initializing ark-lsp");
 
-        let mut state = self.state.write().await;
-
-        if let Some(folders) = params.workspace_folders {
-            for folder in folders {
-                log::info!("Adding workspace folder: {}", folder.uri);
-                state.workspace_folders.push(folder.uri);
+        // First lock window: register workspace folders, snapshot the root for
+        // off-lock discovery + I/O.
+        let project_root: Option<std::path::PathBuf> = {
+            let mut state = self.state.write().await;
+            if let Some(folders) = params.workspace_folders.clone() {
+                for folder in folders {
+                    log::info!("Adding workspace folder: {}", folder.uri);
+                    state.workspace_folders.push(folder.uri);
+                }
+            } else if let Some(root_uri) = params.root_uri.clone() {
+                log::info!("Adding root URI as workspace folder: {}", root_uri);
+                state.workspace_folders.push(root_uri);
             }
-        } else if let Some(root_uri) = params.root_uri {
-            log::info!("Adding root URI as workspace folder: {}", root_uri);
-            state.workspace_folders.push(root_uri);
+            state
+                .workspace_folders
+                .first()
+                .and_then(|u| u.to_file_path().ok())
+        };
+
+        // OFF-LOCK: filesystem walk + TOML read. Holding the write lock across
+        // file I/O violates the locking-discipline invariant in CLAUDE.md.
+        let raw_client = params
+            .initialization_options
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
+        if let Some(root) = &project_root {
+            match crate::config_file::find_config(root) {
+                crate::config_file::DiscoveredConfig::RavenToml(p) => {
+                    if let Some(loaded) = crate::config_file::load_toml(&p) {
+                        for w in &loaded.warnings {
+                            log::warn!("{w}");
+                        }
+                        loaded_project = Some((p, loaded.settings));
+                    }
+                }
+                crate::config_file::DiscoveredConfig::Lintr(p) => {
+                    if let Some(loaded) = crate::config_file::load_lintr(&p) {
+                        for w in &loaded.warnings {
+                            log::warn!("{w}");
+                        }
+                        loaded_project = Some((p, loaded.settings));
+                    }
+                }
+                crate::config_file::DiscoveredConfig::None => {}
+            }
         }
 
-        // Parse initialization options for configuration
-        // Requirement 11.2: Parse symbols.workspaceMaxResults from initialization options
-        if let Some(ref init_options) = params.initialization_options {
-            // Parse cross-file configuration
-            match parse_cross_file_config(init_options) {
-                Ok(Some(config)) => {
-                    state.resize_caches(&config);
-                    state.cross_file_config = config;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    log::warn!("Failed to parse cross-file configuration: {err}");
-                }
+        // Second lock window: store raw layers, recompute parsed configs,
+        // compile overrides. No I/O in this scope. The discovered path
+        // (if any) is now read back from `state.project_config_path` in
+        // `initialized()` — sending the notification from here would
+        // violate the LSP spec (see note above).
+        {
+            let mut state = self.state.write().await;
+            state.raw_client_settings = raw_client;
+            if let Some((p, settings)) = loaded_project {
+                state.raw_project_settings = Some(settings);
+                state.project_config_path = Some(p);
             }
-
-            // Parse symbol configuration
-            // Requirement 11.3: Valid range 100-10000 with clamping
-            if let Some(config) = parse_symbol_config(init_options) {
-                state.symbol_config = config;
-            }
-
-            // Parse completion configuration
-            if let Some(config) = parse_completion_config(init_options) {
-                state.completion_config = config;
-            }
-
-            // Parse indentation configuration
-            if let Some(config) = parse_indentation_config(init_options) {
-                state.indentation_config = config;
-            }
-
-            // Parse linting configuration
-            if let Some(config) = parse_lint_config(init_options) {
-                state.lint_config = config;
-            }
+            // `recompute_parsed_configs` now also recompiles
+            // `state.lint_overrides` — callers no longer need a
+            // separate `compile_lint_overrides` step.
+            crate::config_file::recompute_parsed_configs(&mut state);
         }
+
+        // NOTE: the `raven/projectConfigLoaded` notification is NOT sent
+        // from here. Per the LSP spec, the server MUST NOT send any
+        // requests or notifications to the client before responding to
+        // `initialize` (only `window/showMessage`, `window/logMessage`,
+        // `telemetry/event`, `window/showMessageRequest`, and
+        // `$/progress` are allowed during the initialization phase).
+        // The matching emit lives in `initialized()` below — by then
+        // the handshake is guaranteed to be complete and the client
+        // will reliably route the custom notification.
 
         // Detect client capability for hierarchical document symbols
         // Requirements 1.1, 1.2: Response type selection based on client capability
@@ -1788,16 +1905,18 @@ impl LanguageServer for Backend {
             .and_then(|ds| ds.hierarchical_document_symbol_support)
             .unwrap_or(false);
 
-        state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
         log::info!(
             "Client hierarchicalDocumentSymbolSupport: {}",
             hierarchical_support
         );
 
-        // Extract completion settings before dropping state lock
-        let trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
-
-        drop(state);
+        // Third lock window: store the hierarchical-support flag and read the
+        // completion trigger setting. Short and lock-only — no I/O.
+        let trigger_on_open_paren = {
+            let mut state = self.state.write().await;
+            state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
+            state.completion_config.trigger_on_open_paren
+        };
 
         let completion_trigger_chars = build_completion_trigger_chars(trigger_on_open_paren);
 
@@ -1854,6 +1973,17 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
         let init_start = std::time::Instant::now();
+
+        // Emit the project-config-loaded notification deferred from
+        // `initialize()` (LSP requires the handshake to complete before
+        // any custom notifications). Skipped here when no config was
+        // discovered; the watched-files reload path emits the
+        // cleared-config form (`path: null`) once the user actually
+        // removes the file.
+        let loaded_path = self.state.read().await.project_config_path.clone();
+        if let Some(path) = &loaded_path {
+            self.notify_project_config_loaded(Some(path.as_path()));
+        }
 
         // Get workspace folders and config under brief lock
         let (
@@ -2149,6 +2279,41 @@ impl LanguageServer for Backend {
         // rebuilds `PackageLibrary` (re-running `.libPaths()`) and restarts the
         // watcher over the newly-discovered paths. See `docs/packages.md`.
         restart_libpath_watcher(&self.state, &self.client, true).await;
+
+        // Register dynamic file watches for raven.toml / .lintr. VS Code also
+        // covers these via its synchronize.fileEvents glob, so this is a no-op
+        // there; non-VS Code clients that honor dynamic registration pick up
+        // live reload from here.
+        {
+            use tower_lsp::lsp_types::{
+                DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, GlobPattern,
+                Registration, WatchKind,
+            };
+            let watchers = vec![
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/raven.toml".into()),
+                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                },
+                FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/.lintr".into()),
+                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                },
+            ];
+            let reg = Registration {
+                id: "raven-config-files".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                        .unwrap(),
+                ),
+            };
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = client.register_capability(vec![reg]).await {
+                    log::warn!("dynamic watch registration failed: {e}");
+                }
+            });
+        }
 
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
@@ -3818,385 +3983,46 @@ impl LanguageServer for Backend {
         // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
         log::trace!("Configuration changed, parsing new config and scheduling revalidation");
 
-        // Parse new configuration if provided
-        let new_config = match parse_cross_file_config(&params.settings) {
-            Ok(config) => config,
-            Err(err) => {
-                log::warn!(
-                    "Failed to parse cross-file configuration from settings: {}",
-                    err
-                );
-                self.client.show_message(MessageType::WARNING, err).await;
-                None
-            }
-        };
+        // Surface cross-file validation errors as a VS Code toast (matches
+        // pre-Task-7 behavior). Recompute below also logs the same error via
+        // log::warn!, so we don't need the value — only the side effect.
+        if let Err(err) = parse_cross_file_config(&params.settings) {
+            self.client.show_message(MessageType::WARNING, err).await;
+        }
 
-        // Parse symbol configuration if provided
-        // Requirement 11.2: Parse symbols.workspaceMaxResults from settings
-        let new_symbol_config = parse_symbol_config(&params.settings);
-
-        // Parse completion configuration if provided
-        let new_completion_config = parse_completion_config(&params.settings);
-
-        // Parse indentation configuration if provided
-        let new_indentation_config = parse_indentation_config(&params.settings);
-
-        // Parse linting configuration if provided
-        let new_lint_config = parse_lint_config(&params.settings);
-
-        let (
-            open_uris,
-            scope_changed,
-            package_settings_changed,
-            watch_settings_changed,
-            only_watch_changed,
-            diagnostics_enabled_changed,
-            old_diagnostics_enabled,
-            new_diagnostics_enabled,
-            packages_enabled,
-            trigger_on_open_paren_changed,
-            new_trigger_on_open_paren,
-            pkg_mode_io_needed,
-        ) = {
+        // Lock-only window: snapshot pre-change configs, store the new raw
+        // client settings, recompute parsed configs, recompile lint
+        // overrides. NO I/O — the helper handles every blocking action
+        // outside the lock.
+        let snapshot = {
             let mut state = self.state.write().await;
 
-            // Check if scope-affecting settings changed
-            let scope_changed = new_config
-                .as_ref()
-                .map(|c| state.cross_file_config.scope_settings_changed(c))
-                .unwrap_or(false);
-
-            // Check if diagnostics_enabled (master switch) changed - Requirement 5.2
-            let old_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
-            let new_diagnostics_enabled = new_config
-                .as_ref()
-                .map(|c| c.diagnostics_enabled)
-                .unwrap_or(old_diagnostics_enabled);
-            let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
-
-            // Settings that require reinitializing `PackageLibrary` via an R
-            // subprocess call (~100ms). Keep this narrow.
-            let package_settings_changed = new_config
-                .as_ref()
-                .map(|c| {
-                    c.packages_enabled != state.cross_file_config.packages_enabled
-                        || c.packages_r_path != state.cross_file_config.packages_r_path
-                        || c.packages_additional_library_paths
-                            != state.cross_file_config.packages_additional_library_paths
-                })
-                .unwrap_or(false);
-
-            // Watcher-only settings. Changing just these should restart the
-            // filesystem watcher but MUST NOT trigger an R subprocess roundtrip
-            // or wipe the package cache — toggling a debounce slider in the
-            // Settings UI should not force every open document to revalidate.
-            let watch_settings_changed = new_config
-                .as_ref()
-                .map(|c| {
-                    c.packages_watch_library_paths
-                        != state.cross_file_config.packages_watch_library_paths
-                        || c.packages_watch_debounce_ms
-                            != state.cross_file_config.packages_watch_debounce_ms
-                })
-                .unwrap_or(false);
-
-            // If `watch_settings_changed` is the only thing that flipped, the
-            // change is purely watcher-lifecycle (debounce ms or enable flag
-            // for the filesystem watcher). Diagnostic content is unaffected,
-            // so don't force every open document to revalidate.
-            //
-            // Coverage is automatic for every field on `CrossFileConfig`: we
-            // compare the entire struct with the watch fields reverted, so
-            // any new diagnostic-affecting field added to `CrossFileConfig`
-            // is picked up without touching this site. Config structs that
-            // live OUTSIDE `CrossFileConfig` (e.g. `LintConfig`) still need
-            // an explicit `*_changed` guard below — extend the chain when
-            // adding another such struct.
-            let lint_config_changed = new_lint_config
-                .as_ref()
-                .map(|c| c != &state.lint_config)
-                .unwrap_or(false);
-
-            let only_watch_changed = watch_settings_changed
-                && !lint_config_changed
-                && new_config
-                    .as_ref()
-                    .map(|c| {
-                        let mut probe = c.clone();
-                        probe.packages_watch_library_paths =
-                            state.cross_file_config.packages_watch_library_paths;
-                        probe.packages_watch_debounce_ms =
-                            state.cross_file_config.packages_watch_debounce_ms;
-                        probe == state.cross_file_config
-                    })
-                    .unwrap_or(false);
-
-            // Capture new package settings before applying config
-            let packages_enabled = new_config
-                .as_ref()
-                .map(|c| c.packages_enabled)
-                .unwrap_or(state.cross_file_config.packages_enabled);
-
-            // Apply new config if parsed
-            let package_mode_changed = new_config
-                .as_ref()
-                .map(|c| c.package_mode != state.cross_file_config.package_mode)
-                .unwrap_or(false);
-            if let Some(config) = new_config {
-                state.resize_caches(&config);
-                state.cross_file_config = config;
-            }
-
-            // If package_mode changed, apply the setting change via the event-driven
-            // path. For Disabled: translate immediately (derive yields no workspace).
-            // For Auto/Enabled: capture root for disk I/O outside the lock.
-            let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
-                use crate::cross_file::config::PackageMode;
-                let mode = state.cross_file_config.package_mode;
-                // Translate the setting change — updates package_inputs.package_mode.
-                let event =
-                    crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
-                    if mode == PackageMode::Disabled {
-                        // Derive immediately: effective_workspace returns None for Disabled.
-                        state.apply_package_event(&delta);
-                        None
-                    } else {
-                        // Need to repopulate description/namespace from disk outside the
-                        // lock; capture root so caller can do the I/O.
-                        state
-                            .workspace_folders
-                            .first()
-                            .and_then(|u| u.to_file_path().ok())
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
+            let prev = ConfigChangeSnapshot {
+                prev_cross_file: state.cross_file_config.clone(),
+                prev_lint: state.lint_config.clone(),
+                prev_completion: state.completion_config.clone(),
+                prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
             };
 
-            // Apply new symbol config if parsed
-            // Requirement 11.2: Apply symbols.workspaceMaxResults from settings
-            if let Some(mut config) = new_symbol_config {
-                config.hierarchical_document_symbol_support =
-                    state.symbol_config.hierarchical_document_symbol_support;
-                state.symbol_config = config;
-            }
+            // Store the new raw client settings and re-merge with the project
+            // file (if any). recompute_parsed_configs() overwrites every
+            // parsed config; absent sections reset to defaults.
+            state.raw_client_settings = params.settings.clone();
+            // `recompute_parsed_configs` now also recompiles
+            // `state.lint_overrides` from the merged settings.
+            crate::config_file::recompute_parsed_configs(&mut state);
 
-            // Apply new indentation config if parsed
-            if let Some(config) = new_indentation_config {
-                state.indentation_config = config;
-            }
-
-            // Apply new linting config if parsed
-            if let Some(config) = new_lint_config {
-                state.lint_config = config;
-            }
-
-            // Apply new completion config if parsed, tracking trigger change
-            let old_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
-            if let Some(config) = new_completion_config {
-                state.completion_config = config;
-            }
-            let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
-            let trigger_on_open_paren_changed =
-                old_trigger_on_open_paren != new_trigger_on_open_paren;
-
-            // Mark all open documents for force republish (unless only the
-            // watcher-lifecycle settings changed). Bulk-mark to avoid per-URI
-            // lock churn on workspaces with many open files.
-            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
-            if !only_watch_changed {
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(open_uris.iter());
-            }
-
-            (
-                open_uris,
-                scope_changed,
-                package_settings_changed,
-                watch_settings_changed,
-                only_watch_changed,
-                diagnostics_enabled_changed,
-                old_diagnostics_enabled,
-                new_diagnostics_enabled,
-                packages_enabled,
-                trigger_on_open_paren_changed,
-                new_trigger_on_open_paren,
-                pkg_mode_io_needed,
-            )
+            prev
         };
 
-        // --- Package mode rebuild: repopulate inputs after mode switch ---
-        // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
-        // from disk (lightweight; R files are already in package_inputs from
-        // prior did_open/did_change/scan events). Then derive package state.
-        if let Some(root) = pkg_mode_io_needed {
-            let root_clone = root.clone();
-            let (desc_text, ns_text, disk_r_files) = tokio::task::spawn_blocking(move || {
-                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                    .ok()
-                    .map(|s| std::sync::Arc::from(s.as_str()));
-                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
-                    .ok()
-                    .map(|s| std::sync::Arc::from(s.as_str()));
-                let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
-                (desc, ns, disk_r_files)
-            })
-            .await
-            .unwrap_or((None, None, Default::default()));
+        // Helper drives change detection, package rebuilds, watcher
+        // restart, completion re-registration, and force-republish
+        // marking. Returns the URIs to publish (empty when only the
+        // watcher-lifecycle settings flipped).
+        let to_publish = self.reconcile_after_config_recompute(snapshot).await;
 
-            // Re-acquire write lock to apply results
-            let mut state = self.state.write().await;
-            // Repopulate description/namespace inputs with fresh disk content.
-            state.package_inputs.workspace_root = Some(root.clone());
-            state.package_inputs.description =
-                desc_text.map(|text| crate::package_state::DescriptionInput { text });
-            state.package_inputs.namespace =
-                ns_text.map(|text| crate::package_state::NamespaceInput { text });
-            // Seed from disk so packageMode switches still see closed R files
-            // when the background workspace index has not populated yet; then
-            // overlay index entries and open buffers through the shared helper.
-            let new_r_files = hydrate_package_r_files_from_state(&state, &root, disk_r_files);
-            state.package_inputs.r_files = new_r_files;
-            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
-            log::info!("Rebuilt package state after packageMode change (event-driven)");
-        }
-
-        // Log diagnostics_enabled change - Requirement 5.2
-        if diagnostics_enabled_changed {
-            log::info!(
-                "Diagnostics master switch changed: {} -> {}",
-                old_diagnostics_enabled,
-                new_diagnostics_enabled
-            );
-        }
-
-        // Dynamically re-register completion capability if trigger characters changed
-        if trigger_on_open_paren_changed {
-            log::info!(
-                "trigger_on_open_paren changed to {}, re-registering completion capability",
-                new_trigger_on_open_paren
-            );
-
-            let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
-            let registration_options = CompletionRegistrationOptions {
-                text_document_registration_options: TextDocumentRegistrationOptions {
-                    document_selector: Some(vec![
-                        DocumentFilter {
-                            language: Some(String::from("r")),
-                            scheme: None,
-                            pattern: None,
-                        },
-                        DocumentFilter {
-                            language: Some(String::from("jags")),
-                            scheme: None,
-                            pattern: None,
-                        },
-                        DocumentFilter {
-                            language: Some(String::from("stan")),
-                            scheme: None,
-                            pattern: None,
-                        },
-                    ]),
-                },
-                completion_options: CompletionOptions {
-                    trigger_characters: Some(trigger_chars),
-                    resolve_provider: Some(true),
-                    ..Default::default()
-                },
-            };
-
-            let registration_id = String::from("completion");
-            let method = String::from("textDocument/completion");
-
-            // Unregister old, then register new
-            if let Err(e) = self
-                .client
-                .unregister_capability(vec![Unregistration {
-                    id: registration_id.clone(),
-                    method: method.clone(),
-                }])
-                .await
-            {
-                log::warn!("Failed to unregister completion capability: {}", e);
-            }
-
-            if let Err(e) = self
-                .client
-                .register_capability(vec![Registration {
-                    id: registration_id,
-                    method,
-                    register_options: serde_json::to_value(registration_options).ok(),
-                }])
-                .await
-            {
-                log::warn!("Failed to re-register completion capability: {}", e);
-            }
-        }
-
-        // Reinitialize PackageLibrary only if R-subprocess-affecting settings
-        // changed (enabled flag, R path, or additional library paths).
-        if package_settings_changed {
-            log::info!("Package settings changed, reinitializing PackageLibrary");
-
-            let (new_package_library, package_library_ready) = if packages_enabled {
-                rebuild_package_library(&self.state).await
-            } else {
-                (
-                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
-                    false,
-                )
-            };
-
-            // Replace under brief write lock
-            {
-                let mut state = self.state.write().await;
-                state.package_library = new_package_library;
-                state.package_library_ready = package_library_ready;
-            }
-
-            // Help/HTML help caches index by (topic, package); the package set
-            // just changed, so flush them to match watcher and refresh paths.
-            self.state.read().await.clear_help_caches();
-        }
-
-        // Restart the libpath watcher if any setting that affects it changed.
-        // Covers both the reinit path above (the `lib_paths` vector may have
-        // changed) and the pure watch-settings path (e.g. user flipped
-        // `watchLibraryPaths` or adjusted the debounce slider) — the helper
-        // handles the teardown + respawn atomically and does NOT re-run the
-        // R subprocess.
-        if package_settings_changed || watch_settings_changed {
-            restart_libpath_watcher(&self.state, &self.client, true).await;
-        }
-
-        // Warm the package export cache before republishing diagnostics so
-        // the fresh (empty) library doesn't cause transient false-positive
-        // "unknown function" diagnostics for package exports.
-        if package_settings_changed && packages_enabled {
-            let pkg_lib = self.state.read().await.package_library.clone();
-            prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
-        }
-
-        if scope_changed {
-            log::trace!(
-                "Scope-affecting settings changed, revalidating {} open documents",
-                open_uris.len()
-            );
-        }
-
-        // Schedule diagnostics for all open documents, but skip the workspace
-        // republish if only the watcher-lifecycle settings changed — nothing
-        // about diagnostic content moved.
-        if !only_watch_changed {
-            for uri in open_uris {
-                self.publish_diagnostics(&uri).await;
-            }
+        for uri in to_publish {
+            self.publish_diagnostics(&uri).await;
         }
     }
 
@@ -4205,6 +4031,150 @@ impl LanguageServer for Backend {
             "Received watched files change: {} changes",
             params.changes.len()
         );
+
+        // Detect raven.toml / .lintr events. These are not part of the
+        // source-file flow — they trigger a config-layer reload instead.
+        let config_file_changes: Vec<FileEvent> = params
+            .changes
+            .iter()
+            .filter(|c| {
+                let Ok(p) = c.uri.to_file_path() else {
+                    return false;
+                };
+                let Some(name) = p.file_name() else { return false };
+                name == std::ffi::OsStr::new("raven.toml") || name == std::ffi::OsStr::new(".lintr")
+            })
+            .cloned()
+            .collect();
+
+        if !config_file_changes.is_empty() {
+            // Step 1 (lock-free I/O): snapshot the workspace root, then run
+            // discovery + load_toml off-lock. Holding the write lock across
+            // disk I/O violates the locking-discipline invariant in
+            // CLAUDE.md.
+            let project_root: Option<std::path::PathBuf> = {
+                let state = self.state.read().await;
+                state
+                    .workspace_folders
+                    .first()
+                    .and_then(|u| u.to_file_path().ok())
+            };
+
+            let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
+            if let Some(root) = &project_root {
+                match crate::config_file::find_config(root) {
+                    crate::config_file::DiscoveredConfig::RavenToml(p) => {
+                        if let Some(loaded) = crate::config_file::load_toml(&p) {
+                            for w in &loaded.warnings {
+                                log::warn!("{w}");
+                            }
+                            loaded_project = Some((p, loaded.settings));
+                        }
+                    }
+                    crate::config_file::DiscoveredConfig::Lintr(p) => {
+                        if let Some(loaded) = crate::config_file::load_lintr(&p) {
+                            for w in &loaded.warnings {
+                                log::warn!("{w}");
+                            }
+                            loaded_project = Some((p, loaded.settings));
+                        }
+                    }
+                    crate::config_file::DiscoveredConfig::None => {}
+                }
+            }
+
+            // Step 2 (under write lock, no I/O): apply the reload —
+            // snapshot prev configs for downstream rebuild gating, swap
+            // raw project settings, recompute parsed configs, recompile
+            // overrides. The shared reconciliation helper drives every
+            // downstream action outside the lock.
+            let snapshot = {
+                let mut state = self.state.write().await;
+                let prev = ConfigChangeSnapshot {
+                    prev_cross_file: state.cross_file_config.clone(),
+                    prev_lint: state.lint_config.clone(),
+                    prev_completion: state.completion_config.clone(),
+                    prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
+                };
+
+                // Re-run discovery from the workspace root. Order matters:
+                // raven.toml beats .lintr (DiscoveredConfig embodies that).
+                state.raw_project_settings = None;
+                state.project_config_path = None;
+                if let Some((p, settings)) = loaded_project {
+                    state.raw_project_settings = Some(settings);
+                    state.project_config_path = Some(p);
+                }
+
+                // `recompute_parsed_configs` now also recompiles
+                // `state.lint_overrides` from the merged settings.
+                crate::config_file::recompute_parsed_configs(&mut state);
+
+                prev
+            };
+
+            // Helper drives change detection, package rebuilds, watcher
+            // restart, completion re-registration, and force-republish
+            // marking. Returns the URIs to publish (empty when only the
+            // watcher-lifecycle settings flipped — nothing
+            // diagnostic-affecting moved).
+            let to_publish = self.reconcile_after_config_recompute(snapshot).await;
+
+            // Re-emit `raven/projectConfigLoaded` so clients (the VS Code
+            // status bar in particular) see the new state without a
+            // window reload. The notification fires unconditionally for
+            // every reload event — even when the new path matches the
+            // old — so consumers can treat it as the authoritative
+            // "what's in effect now" signal. `path: null` means the
+            // config file was removed.
+            let new_path = self.state.read().await.project_config_path.clone();
+            self.notify_project_config_loaded(new_path.as_deref());
+
+            // Re-publish diagnostics for every open document. The
+            // force-republish markers set by the helper ensure
+            // `publish_diagnostics` actually emits (rather than being
+            // short-circuited by an unchanged-version check).
+            //
+            // Per-URI publishes are independent: each takes brief read
+            // locks on `state` and the `diagnostics_gate`'s per-URI
+            // `HashMap` entries, then releases before doing the async
+            // missing-file checks and the `client.publish_diagnostics`
+            // send. Running them in parallel — bounded — avoids N×
+            // latency on workspaces with many open files. The
+            // monotonic-publish invariant still holds: distinct URIs
+            // commit to distinct gate entries, and every spawned task is
+            // joined before this handler returns so a later `did_change`
+            // can't race a still-running reload publish.
+            const MAX_CONCURRENT_PUBLISHES: usize = 8;
+            let mut join_set = tokio::task::JoinSet::new();
+            for uri in to_publish {
+                while join_set.len() >= MAX_CONCURRENT_PUBLISHES {
+                    join_set.join_next().await;
+                }
+                let state_arc = self.state.clone();
+                let client = self.client.clone();
+                join_set.spawn(async move {
+                    publish_diagnostics_inner(&state_arc, &client, &uri).await;
+                });
+            }
+            while join_set.join_next().await.is_some() {}
+        }
+
+        // If every change was a config file, the source-file flow below has
+        // nothing to do. Otherwise, build a filtered `params` containing
+        // only the non-config events and continue.
+        let remaining_changes: Vec<FileEvent> = params
+            .changes
+            .iter()
+            .filter(|c| !config_file_changes.iter().any(|cc| cc.uri == c.uri))
+            .cloned()
+            .collect();
+        if remaining_changes.is_empty() {
+            return;
+        }
+        let params = DidChangeWatchedFilesParams {
+            changes: remaining_changes,
+        };
 
         // Collect deleted URIs for batch cancellation
         let deleted_uris: Vec<Url> = params
@@ -5299,6 +5269,375 @@ fn help_html_to_json(
 }
 
 impl Backend {
+    /// Send the `raven/projectConfigLoaded` notification reflecting the
+    /// current project-config state.
+    ///
+    /// Fires from both [`initialize`] and the `did_change_watched_files`
+    /// `raven.toml` / `.lintr` reload branch — so clients see a fresh
+    /// payload every time the on-disk config is re-discovered (created,
+    /// edited, or deleted), not just at session start.
+    ///
+    /// Spawns the send on a detached tokio task so callers never hold a
+    /// state lock across `client.send_notification`.
+    fn notify_project_config_loaded(&self, path: Option<&std::path::Path>) {
+        let client = self.client.clone();
+        let payload = build_project_config_loaded_payload(path);
+        tokio::spawn(async move {
+            let _ = client
+                .send_notification::<RavenProjectConfigLoaded>(payload)
+                .await;
+        });
+    }
+
+    /// Drive every downstream action that depends on which parsed-config
+    /// field moved during a configuration reload.
+    ///
+    /// Caller contract — the helper assumes the caller has already, under a
+    /// write lock on `self.state`:
+    ///   1. Captured the pre-change parsed configs into a
+    ///      [`ConfigChangeSnapshot`].
+    ///   2. Mutated whichever raw settings layer the caller owns
+    ///      (`raw_client_settings` for `did_change_configuration`;
+    ///      `raw_project_settings` + `project_config_path` for
+    ///      `did_change_watched_files`).
+    ///   3. Called [`crate::config_file::recompute_parsed_configs`],
+    ///      which now also recompiles `state.lint_overrides`.
+    ///   4. Released the write lock before calling this helper.
+    ///
+    /// The helper acquires its own brief write lock to:
+    ///   - restore `symbol_config.hierarchical_document_symbol_support`
+    ///     (which `recompute_parsed_configs` resets to default),
+    ///   - compute `*_changed` flags against the snapshot,
+    ///   - apply the `packageMode` `SettingChanged` translate (and capture
+    ///     the workspace root for off-lock disk I/O when the new mode is
+    ///     non-`Disabled`),
+    ///   - mark every open document for force-republish (unless only the
+    ///     `packagesWatch*` lifecycle settings flipped).
+    ///
+    /// It releases that lock before doing any blocking work. Outside the
+    /// lock, in order, it:
+    ///   - re-reads `DESCRIPTION` / `NAMESPACE` on a `packageMode` mode
+    ///     switch, then re-applies under a brief write lock,
+    ///   - re-registers the completion capability if `triggerOnOpenParen`
+    ///     changed,
+    ///   - rebuilds `PackageLibrary` (R subprocess) if a package-rebuild
+    ///     setting changed,
+    ///   - restarts the libpath watcher if any package or
+    ///     `packagesWatch*` setting changed,
+    ///   - prefetches package exports for open documents if a
+    ///     package-rebuild setting changed and packages remain enabled.
+    ///
+    /// Returns the open URIs the caller should republish. Empty when only
+    /// `packagesWatch*` flipped — nothing about diagnostic content moved,
+    /// so the workspace-wide republish is a waste.
+    async fn reconcile_after_config_recompute(
+        &self,
+        prev: ConfigChangeSnapshot,
+    ) -> Vec<Url> {
+        // Brief write lock: change detection, package_mode translate,
+        // hier_support restore, force-republish marking. NO blocking I/O
+        // happens inside this scope.
+        let decisions = {
+            let mut state = self.state.write().await;
+
+            // `recompute_parsed_configs` reset `symbol_config` to defaults
+            // when the caller ran it; restore the hierarchical-support flag
+            // set from client capabilities at initialize() time.
+            state.symbol_config.hierarchical_document_symbol_support = prev.prev_hier_support;
+
+            let scope_changed =
+                prev.prev_cross_file.scope_settings_changed(&state.cross_file_config);
+
+            let old_diagnostics_enabled = prev.prev_cross_file.diagnostics_enabled;
+            let new_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
+            let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
+
+            // Settings that require reinitializing `PackageLibrary` via an R
+            // subprocess call (~100ms). Keep this narrow.
+            let package_settings_changed = state.cross_file_config.packages_enabled
+                != prev.prev_cross_file.packages_enabled
+                || state.cross_file_config.packages_r_path
+                    != prev.prev_cross_file.packages_r_path
+                || state.cross_file_config.packages_additional_library_paths
+                    != prev.prev_cross_file.packages_additional_library_paths;
+
+            // Watcher-only settings. Changing just these should restart the
+            // filesystem watcher but MUST NOT trigger an R subprocess
+            // roundtrip or wipe the package cache.
+            let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
+                != prev.prev_cross_file.packages_watch_library_paths
+                || state.cross_file_config.packages_watch_debounce_ms
+                    != prev.prev_cross_file.packages_watch_debounce_ms;
+
+            // If `watch_settings_changed` is the only thing that flipped,
+            // the change is purely watcher-lifecycle; diagnostic content is
+            // unaffected, so don't force every open document to revalidate.
+            //
+            // Coverage is automatic for every field on `CrossFileConfig`:
+            // we compare the entire struct with the watch fields reverted,
+            // so any new diagnostic-affecting field added to
+            // `CrossFileConfig` is picked up without touching this site.
+            // Config structs that live OUTSIDE `CrossFileConfig` (e.g.
+            // `LintConfig`) still need an explicit `*_changed` guard below —
+            // extend the chain when adding another such struct.
+            let lint_config_changed = state.lint_config != prev.prev_lint;
+
+            let only_watch_changed = watch_settings_changed
+                && !lint_config_changed
+                && {
+                    let mut probe = state.cross_file_config.clone();
+                    probe.packages_watch_library_paths =
+                        prev.prev_cross_file.packages_watch_library_paths;
+                    probe.packages_watch_debounce_ms =
+                        prev.prev_cross_file.packages_watch_debounce_ms;
+                    probe == prev.prev_cross_file
+                };
+
+            let packages_enabled = state.cross_file_config.packages_enabled;
+
+            // If `package_mode` changed, apply the setting change via the
+            // event-driven path. For Disabled: translate immediately
+            // (derive yields no workspace). For Auto/Enabled: capture root
+            // for disk I/O outside the lock.
+            let package_mode_changed =
+                state.cross_file_config.package_mode != prev.prev_cross_file.package_mode;
+            let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
+                use crate::cross_file::config::PackageMode;
+                let mode = state.cross_file_config.package_mode;
+                let event = crate::package_state::event::HandlerEvent::SettingChanged {
+                    new_mode: mode,
+                };
+                if let Some(delta) =
+                    crate::package_state::event::translate(&mut state.package_inputs, event)
+                {
+                    if mode == PackageMode::Disabled {
+                        state.apply_package_event(&delta);
+                        None
+                    } else {
+                        state
+                            .workspace_folders
+                            .first()
+                            .and_then(|u| u.to_file_path().ok())
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
+            let trigger_on_open_paren_changed =
+                prev.prev_completion.trigger_on_open_paren != new_trigger_on_open_paren;
+
+            // Mark all open documents for force republish (unless only the
+            // watcher-lifecycle settings changed). Bulk-mark to avoid
+            // per-URI lock churn on workspaces with many open files.
+            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+            if !only_watch_changed {
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(open_uris.iter());
+            }
+
+            ReconciliationDecisions {
+                scope_changed,
+                package_settings_changed,
+                watch_settings_changed,
+                only_watch_changed,
+                diagnostics_enabled_changed,
+                old_diagnostics_enabled,
+                new_diagnostics_enabled,
+                packages_enabled,
+                trigger_on_open_paren_changed,
+                new_trigger_on_open_paren,
+                pkg_mode_io_needed,
+                open_uris,
+            }
+        };
+
+        let ReconciliationDecisions {
+            scope_changed,
+            package_settings_changed,
+            watch_settings_changed,
+            only_watch_changed,
+            diagnostics_enabled_changed,
+            old_diagnostics_enabled,
+            new_diagnostics_enabled,
+            packages_enabled,
+            trigger_on_open_paren_changed,
+            new_trigger_on_open_paren,
+            pkg_mode_io_needed,
+            open_uris,
+        } = decisions;
+
+        // --- Package mode rebuild: repopulate inputs after mode switch ---
+        // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
+        // from disk (R files are already in `package_inputs` from prior
+        // did_open/did_change/scan events). Then derive package state.
+        if let Some(root) = pkg_mode_io_needed {
+            let root_clone = root.clone();
+            let (desc_text, ns_text, disk_r_files) = tokio::task::spawn_blocking(move || {
+                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                    .ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                    .ok()
+                    .map(|s| std::sync::Arc::from(s.as_str()));
+                let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                (desc, ns, disk_r_files)
+            })
+            .await
+            .unwrap_or((None, None, Default::default()));
+
+            // Re-acquire write lock to apply results.
+            let mut state = self.state.write().await;
+            state.package_inputs.workspace_root = Some(root.clone());
+            state.package_inputs.description =
+                desc_text.map(|text| crate::package_state::DescriptionInput { text });
+            state.package_inputs.namespace =
+                ns_text.map(|text| crate::package_state::NamespaceInput { text });
+            // Seed from disk so packageMode switches still see closed R
+            // files when the background workspace index has not populated
+            // yet; then overlay index entries and open buffers through the
+            // shared helper.
+            let new_r_files = hydrate_package_r_files_from_state(&state, &root, disk_r_files);
+            state.package_inputs.r_files = new_r_files;
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+            log::info!("Rebuilt package state after packageMode change (event-driven)");
+        }
+
+        if diagnostics_enabled_changed {
+            log::info!(
+                "Diagnostics master switch changed: {} -> {}",
+                old_diagnostics_enabled,
+                new_diagnostics_enabled
+            );
+        }
+
+        // Dynamically re-register completion capability if trigger
+        // characters changed.
+        if trigger_on_open_paren_changed {
+            log::info!(
+                "trigger_on_open_paren changed to {}, re-registering completion capability",
+                new_trigger_on_open_paren
+            );
+
+            let trigger_chars = build_completion_trigger_chars(new_trigger_on_open_paren);
+            let registration_options = CompletionRegistrationOptions {
+                text_document_registration_options: TextDocumentRegistrationOptions {
+                    document_selector: Some(vec![
+                        DocumentFilter {
+                            language: Some(String::from("r")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("jags")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                        DocumentFilter {
+                            language: Some(String::from("stan")),
+                            scheme: None,
+                            pattern: None,
+                        },
+                    ]),
+                },
+                completion_options: CompletionOptions {
+                    trigger_characters: Some(trigger_chars),
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            };
+
+            let registration_id = String::from("completion");
+            let method = String::from("textDocument/completion");
+
+            if let Err(e) = self
+                .client
+                .unregister_capability(vec![Unregistration {
+                    id: registration_id.clone(),
+                    method: method.clone(),
+                }])
+                .await
+            {
+                log::warn!("Failed to unregister completion capability: {}", e);
+            }
+
+            if let Err(e) = self
+                .client
+                .register_capability(vec![Registration {
+                    id: registration_id,
+                    method,
+                    register_options: serde_json::to_value(registration_options).ok(),
+                }])
+                .await
+            {
+                log::warn!("Failed to re-register completion capability: {}", e);
+            }
+        }
+
+        // Reinitialize PackageLibrary only if R-subprocess-affecting
+        // settings changed (enabled flag, R path, or additional library
+        // paths).
+        if package_settings_changed {
+            log::info!("Package settings changed, reinitializing PackageLibrary");
+
+            let (new_package_library, package_library_ready) = if packages_enabled {
+                rebuild_package_library(&self.state).await
+            } else {
+                (
+                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
+                    false,
+                )
+            };
+
+            // Replace under brief write lock.
+            {
+                let mut state = self.state.write().await;
+                state.package_library = new_package_library;
+                state.package_library_ready = package_library_ready;
+            }
+
+            // Help/HTML help caches index by (topic, package); the package
+            // set just changed, so flush them to match watcher and refresh
+            // paths.
+            self.state.read().await.clear_help_caches();
+        }
+
+        // Restart the libpath watcher if any setting that affects it
+        // changed. Covers both the reinit path above (the `lib_paths`
+        // vector may have changed) and the pure watch-settings path (e.g.
+        // user flipped `watchLibraryPaths` or adjusted the debounce
+        // slider) — the helper handles the teardown + respawn atomically
+        // and does NOT re-run the R subprocess.
+        if package_settings_changed || watch_settings_changed {
+            restart_libpath_watcher(&self.state, &self.client, true).await;
+        }
+
+        // Warm the package export cache before republishing diagnostics so
+        // the fresh (empty) library doesn't cause transient false-positive
+        // "unknown function" diagnostics for package exports.
+        if package_settings_changed && packages_enabled {
+            let pkg_lib = self.state.read().await.package_library.clone();
+            prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
+        }
+
+        if scope_changed {
+            log::trace!(
+                "Scope-affecting settings changed, revalidating {} open documents",
+                open_uris.len()
+            );
+        }
+
+        if only_watch_changed {
+            Vec::new()
+        } else {
+            open_uris
+        }
+    }
+
     /// Synchronously index a file on-demand (blocking operation).
     /// Returns the cross-file metadata if indexing succeeded, None otherwise.
     ///
@@ -5832,92 +6171,7 @@ impl Backend {
     }
 
     async fn publish_diagnostics(&self, uri: &Url) {
-        // Extract needed data while holding read lock briefly
-        let (version, sync_diagnostics, directive_meta, workspace_folder, missing_file_severity) = {
-            let state = self.state.read().await;
-            let version = state.documents.get(uri).and_then(|d| d.version);
-
-            // Check if we can publish (monotonic gate)
-            if let Some(ver) = version {
-                if !state.diagnostics_gate.can_publish(uri, ver) {
-                    log::trace!(
-                        "Skipping diagnostics for {}: monotonic gate (version={})",
-                        uri,
-                        ver
-                    );
-                    return;
-                } else {
-                    log::trace!(
-                        "Publishing diagnostics for {}: monotonic gate allows (version={})",
-                        uri,
-                        ver
-                    );
-                }
-            }
-
-            // Get sync diagnostics (uses cached-only existence checks)
-            let sync_diagnostics =
-                handlers::diagnostics(&state, uri, &handlers::DiagCancelToken::never());
-
-            // Extract metadata for async missing file checks
-            let directive_meta = state
-                .documents
-                .get(uri)
-                .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
-                .unwrap_or_default();
-
-            let workspace_folder = state.workspace_folders.first().cloned();
-            let missing_file_severity = state.cross_file_config.missing_file_severity;
-
-            (
-                version,
-                sync_diagnostics,
-                directive_meta,
-                workspace_folder,
-                missing_file_severity,
-            )
-        };
-        // Lock released here
-
-        // Perform async missing file existence checks (non-blocking I/O)
-        let diagnostics = handlers::diagnostics_async_standalone(
-            uri,
-            sync_diagnostics,
-            &directive_meta,
-            workspace_folder.as_ref(),
-            missing_file_severity,
-        )
-        .await;
-
-        // Re-check freshness after async work, atomically commit gate state, before publishing.
-        // try_consume_publish replaces the racy can_publish + record_publish pair.
-        {
-            let state = self.state.read().await;
-            if let Some(ver) = version {
-                let current_version = state.documents.get(uri).and_then(|d| d.version);
-                if current_version != Some(ver) {
-                    log::trace!(
-                        "Skipping diagnostics for {}: version changed (was {:?}, now {:?})",
-                        uri,
-                        version,
-                        current_version
-                    );
-                    return;
-                }
-                if !state.diagnostics_gate.try_consume_publish(uri, ver) {
-                    log::trace!(
-                        "Skipping diagnostics for {}: monotonic gate after async (version={})",
-                        uri,
-                        ver
-                    );
-                    return;
-                }
-            }
-        }
-
-        self.client
-            .publish_diagnostics(uri.clone(), diagnostics, None)
-            .await;
+        publish_diagnostics_inner(&self.state, &self.client, uri).await
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -5941,6 +6195,175 @@ impl Backend {
             .cross_file_activity
             .update(active_uri, visible_uris, params.timestamp_ms);
     }
+}
+
+/// Body of [`Backend::publish_diagnostics`], factored out so that
+/// parallel publish drivers (e.g. the `did_change_watched_files` reload
+/// path) can spawn tasks that own clones of `state_arc` + `client`
+/// rather than borrowing `&Backend`.
+///
+/// Concurrency: safe to invoke from multiple tasks for distinct URIs.
+/// The monotonic publish predicate is atomically committed via
+/// [`crate::cross_file::CrossFileDiagnosticsGate::try_consume_publish`],
+/// which writes to per-URI `HashMap` entries — concurrent commits for
+/// different URIs touch disjoint state, contending only on the briefly
+/// held global `RwLock<HashMap<Url, _>>` write lock around the
+/// `HashMap::get`/`HashMap::insert` call.
+///
+/// Lock discipline: the read lock on `WorldState` is only held while
+/// building [`handlers::DiagnosticsSnapshot`] (which captures all
+/// inputs the scope engine needs) and capturing the directive metadata
+/// / workspace folder / severity. The lock is then released BEFORE the
+/// heavy `diagnostics_from_snapshot` call (which runs scope resolution)
+/// and the async missing-file checks. This matches the snapshot
+/// pattern's design intent — "Built under the read lock, then used to
+/// compute diagnostics without holding any lock" — and is required for
+/// the parallel reload driver: with up to 8 concurrent
+/// `publish_diagnostics_inner` tasks, holding the read lock across
+/// scope resolution would block `did_change` writers for the full
+/// duration of every parallel diagnostic computation.
+pub(crate) async fn publish_diagnostics_inner(
+    state_arc: &Arc<RwLock<WorldState>>,
+    client: &Client,
+    uri: &Url,
+) {
+    // Phase 1: brief read lock — gate check, build the diagnostics
+    // snapshot, capture inputs for the off-lock work. NO scope
+    // resolution or other heavy work happens inside this scope.
+    let (
+        version,
+        diagnostics_enabled,
+        snapshot,
+        directive_meta,
+        workspace_folder,
+        missing_file_severity,
+    ) = {
+        let state = state_arc.read().await;
+        let version = state.documents.get(uri).and_then(|d| d.version);
+
+        // Check if we can publish (monotonic gate)
+        if let Some(ver) = version {
+            if !state.diagnostics_gate.can_publish(uri, ver) {
+                log::trace!(
+                    "Skipping diagnostics for {}: monotonic gate (version={})",
+                    uri,
+                    ver
+                );
+                return;
+            } else {
+                log::trace!(
+                    "Publishing diagnostics for {}: monotonic gate allows (version={})",
+                    uri,
+                    ver
+                );
+            }
+        }
+
+        // Capture the diagnostics master switch under the read lock so
+        // it gates BOTH the sync snapshot build AND the async
+        // missing-file checks below — without this, a config reload
+        // that flips `diagnostics.enabled` to `false` could still
+        // publish missing-file diagnostics from the async phase.
+        let diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
+
+        // Skip the snapshot build entirely when the master switch is
+        // off — saves the snapshot's metadata clone + neighborhood walk.
+        // Mirrors the early-exit in `handlers::diagnostics`.
+        let snapshot = if diagnostics_enabled {
+            handlers::DiagnosticsSnapshot::build(&state, uri)
+        } else {
+            None
+        };
+
+        // Extract metadata for async missing file checks
+        let directive_meta = state
+            .documents
+            .get(uri)
+            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+            .unwrap_or_default();
+
+        let workspace_folder = state.workspace_folders.first().cloned();
+        let missing_file_severity = state.cross_file_config.missing_file_severity;
+
+        (
+            version,
+            diagnostics_enabled,
+            snapshot,
+            directive_meta,
+            workspace_folder,
+            missing_file_severity,
+        )
+    };
+    // Read lock released — scope resolution and async I/O run unlocked.
+
+    // Phase 2: run `diagnostics_from_snapshot` outside the lock. This is
+    // the heavy phase the snapshot pattern was designed to keep
+    // lock-free (see DiagnosticsSnapshot doc comment in handlers.rs).
+    // Replicate the remaining `handlers::diagnostics` early-exits via
+    // snapshot fields, which already mirror `doc.file_type` and
+    // `doc.chunk_kind` from build time.
+    let sync_diagnostics = match snapshot {
+        Some(snap)
+            if snap.file_type == crate::file_type::FileType::R
+                && snap.chunk_kind != crate::chunks::ChunkKind::Rmd =>
+        {
+            handlers::diagnostics_from_snapshot(
+                &snap,
+                uri,
+                &handlers::DiagCancelToken::never(),
+            )
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    // Phase 3: async missing-file existence checks. Gated on
+    // `diagnostics_enabled` so a master-switch-off reload doesn't keep
+    // publishing missing-file diagnostics while the sync phase was
+    // empty. When disabled, publish an explicit empty `Vec` so the
+    // client clears any prior diagnostics for the URI.
+    let diagnostics = if diagnostics_enabled {
+        handlers::diagnostics_async_standalone(
+            uri,
+            sync_diagnostics,
+            &directive_meta,
+            workspace_folder.as_ref(),
+            missing_file_severity,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
+    // Re-check freshness after async work, atomically commit gate state, before publishing.
+    // try_consume_publish replaces the racy can_publish + record_publish pair.
+    {
+        let state = state_arc.read().await;
+        if let Some(ver) = version {
+            let current_version = state.documents.get(uri).and_then(|d| d.version);
+            if current_version != Some(ver) {
+                log::trace!(
+                    "Skipping diagnostics for {}: version changed (was {:?}, now {:?})",
+                    uri,
+                    version,
+                    current_version
+                );
+                return;
+            }
+            if !state.diagnostics_gate.try_consume_publish(uri, ver) {
+                log::trace!(
+                    "Skipping diagnostics for {}: monotonic gate after async (version={})",
+                    uri,
+                    ver
+                );
+                return;
+            }
+        }
+    }
+
+    client
+        .publish_diagnostics(uri.clone(), diagnostics, None)
+        .await;
 }
 
 pub async fn start_lsp() -> anyhow::Result<()> {
@@ -9263,5 +9686,612 @@ mod refresh_packages_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod project_config_initialize_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+    use tower_lsp::lsp_types::{
+        DidChangeConfigurationParams, InitializeParams, Url, WorkspaceFolder,
+    };
+
+    #[tokio::test]
+    async fn initialize_loads_raven_toml_from_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 123\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let params = InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root.clone(),
+                name: "test".into(),
+            }]),
+            ..Default::default()
+        };
+        backend.initialize(params).await.unwrap();
+        let state = backend.state.read().await;
+        assert!(state.lint_config.enabled);
+        assert_eq!(state.lint_config.line_length, 123);
+        assert!(state.project_config_path.is_some());
+    }
+
+    #[tokio::test]
+    async fn initialize_uses_init_options_when_no_project_config() {
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let params = InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root.clone(),
+                name: "test".into(),
+            }]),
+            initialization_options: Some(serde_json::json!({
+                "linting": { "enabled": true, "lineLength": 90 }
+            })),
+            ..Default::default()
+        };
+        backend.initialize(params).await.unwrap();
+        let state = backend.state.read().await;
+        assert!(state.lint_config.enabled);
+        assert_eq!(state.lint_config.line_length, 90);
+        assert!(state.project_config_path.is_none());
+    }
+
+    /// When a client clears its linting settings (e.g. user "Reset Setting"
+    /// in VS Code), `did_change_configuration` must re-merge against the
+    /// project file: project-pinned keys still win, and keys with no project
+    /// override fall back to built-in defaults rather than retaining the
+    /// previous client value.
+    #[tokio::test]
+    async fn did_change_configuration_falls_back_to_project_when_client_clears() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 100\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": true, "lineLength": 80, "objectLength": 40 }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Sanity: project file wins on lineLength; client wins on objectLength.
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.lint_config.line_length, 100);
+            assert_eq!(state.lint_config.object_length, 40);
+        }
+
+        // Client clears all linting settings (e.g. user "Reset Setting" in VS Code).
+        backend
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({ "linting": {} }),
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        // Project still pins lineLength; objectLength falls back to default (30).
+        assert_eq!(state.lint_config.line_length, 100);
+        assert_eq!(state.lint_config.object_length, 30);
+    }
+
+    /// When `did_change_watched_files` reports a change to `raven.toml` on
+    /// disk, the backend must re-discover the project config, re-load it,
+    /// and recompute parsed configs so the new value is reflected in
+    /// `state.lint_config`. This is the live-reload entry point used by
+    /// non-VS Code clients that honor dynamic file watch registration.
+    #[tokio::test]
+    async fn watched_files_reload_picks_up_new_raven_toml() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 100\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(backend.state.read().await.lint_config.line_length, 100);
+
+        // Edit raven.toml on disk.
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 140\n",
+        )
+        .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        assert_eq!(backend.state.read().await.lint_config.line_length, 140);
+    }
+
+    /// A live reload of `raven.toml` must reapply `packages.enabled` —
+    /// flipping it `false` should drive the package-rebuild path
+    /// (replacing `state.package_library` with a fresh empty instance)
+    /// without requiring a server restart. The pre-extraction code path
+    /// warned the user to restart instead; the shared reconciliation
+    /// helper now drives the rebuild from both call sites.
+    ///
+    /// `package_library_ready` defaults to `false` and stays false until
+    /// `rebuild_package_library` runs successfully against an R
+    /// subprocess (which we don't have in unit tests). So instead of
+    /// asserting on that flag, we capture the `package_library` Arc's
+    /// raw pointer before and after the reload — a different pointer is
+    /// proof the rebuild path replaced the instance, which is the
+    /// specific behavior this PR adds to the watched-files branch.
+    #[tokio::test]
+    async fn watched_files_reload_disables_packages_live() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[packages]\nenabled = true\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Sanity: project file initially enables packages.
+        assert!(backend.state.read().await.cross_file_config.packages_enabled);
+        // Capture the package_library Arc identity so we can prove the
+        // reload's rebuild path replaced the instance.
+        let library_before =
+            std::sync::Arc::as_ptr(&backend.state.read().await.package_library);
+
+        // Edit raven.toml to disable packages on disk.
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[packages]\nenabled = false\n",
+        )
+        .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // Effective config reflects the new value (live reload) AND the
+        // package_library Arc was replaced — proof the rebuild path ran
+        // rather than the prior warn-only behavior.
+        let state = backend.state.read().await;
+        assert!(!state.cross_file_config.packages_enabled);
+        let library_after = std::sync::Arc::as_ptr(&state.package_library);
+        assert!(
+            !std::ptr::eq(library_before, library_after),
+            "expected package_library to be replaced by the reload's rebuild path"
+        );
+        // The fresh library replaces whatever the initialize-time
+        // `PackageLibrary::new_empty()` was — confirm it's the empty
+        // variant the disabled path constructs.
+        assert!(state.package_library.lib_paths().is_empty());
+    }
+
+    /// `.lintr` reload via `did_change_watched_files` must round-trip
+    /// through the same reconciliation helper as `raven.toml`. The
+    /// `.lintr` load branch lives at `did_change_watched_files`'s step-1
+    /// discovery, and its loaded settings feed the same `prev`/recompute
+    /// flow — so this exists primarily to guard against drift in either
+    /// of those two paths.
+    #[tokio::test]
+    async fn watched_files_reload_picks_up_new_dotlintr() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        // `lintr_loader` translates `line_length_linter(N)` (under the
+        // `linters_with_defaults(...)` wrapper that real `.lintr` files
+        // use) into `linting.lineLength = N`. See the loader's own
+        // `line_length_param_maps` test for the canonical form.
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Initialize picks up the `.lintr` and translates it to the
+        // expected line length.
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .project_config_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str()),
+                Some(".lintr"),
+                "initialize should have picked up the .lintr"
+            );
+            assert_eq!(
+                state.lint_config.line_length, 120,
+                ".lintr should have been parsed into lineLength=120 at initialize"
+            );
+        }
+
+        // Edit the `.lintr` on disk and replay the watched-files event.
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(180))\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join(".lintr")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // Reload preserves the `.lintr` source discriminator AND reapplies
+        // the new setting — proof that the live-reload pipeline survives
+        // the `.lintr` branch, not just the raven.toml one.
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .project_config_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some(".lintr"),
+            "reload should have kept the .lintr discriminator"
+        );
+        assert_eq!(
+            state.lint_config.line_length, 180,
+            "reload should have re-translated the new .lintr line_length_linter value"
+        );
+    }
+
+    /// The watched-files reload path must update `state.project_config_path`
+    /// so the subsequent `raven/projectConfigLoaded` notification carries
+    /// the live value (rather than the path captured at initialize time).
+    /// This complements the initialize-time test
+    /// `initialize_loads_raven_toml_from_workspace_root`.
+    #[tokio::test]
+    async fn watched_files_reload_updates_project_config_path_for_notification() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // No config at initialize time.
+        assert!(backend.state.read().await.project_config_path.is_none());
+
+        // Create raven.toml; watched_files reload should pick it up and
+        // populate project_config_path so the notification helper has a
+        // fresh value to emit.
+        let toml_path = tmp.path().join("raven.toml");
+        fs::write(&toml_path, "[linting]\nenabled = true\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+        assert_eq!(
+            backend.state.read().await.project_config_path.as_deref(),
+            Some(toml_path.as_path())
+        );
+
+        // Delete raven.toml; watched_files reload should clear the path
+        // so the notification helper emits the cleared form (`path: null`).
+        std::fs::remove_file(&toml_path).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        assert!(backend.state.read().await.project_config_path.is_none());
+    }
+
+    /// `did_change_watched_files` publishes diagnostics for every open
+    /// document on a `raven.toml` reload. With the parallel JoinSet
+    /// driver, all spawned publish tasks must be joined before the
+    /// handler returns — otherwise a later `did_change` could race a
+    /// still-running reload publish and corrupt monotonic-version
+    /// ordering.
+    ///
+    /// We exercise 12 open `.R` files (above the concurrency cap of 8).
+    /// The reload's reconciliation helper marks every open URI for
+    /// force-republish (counter increment); a successful publish
+    /// decrements that counter via `try_consume_publish`. Asserting that
+    /// every URI's `force_republish_count_for_test == 0` after the
+    /// handler returns is a stronger signal than checking
+    /// `last_published_version` — the gate's prior-publish state from
+    /// `did_open` would already make `can_publish(uri, 1)` return
+    /// false, so that observable could pass without the reload doing
+    /// anything.
+    #[tokio::test]
+    async fn watched_files_reload_publishes_all_open_documents_in_parallel() {
+        use tower_lsp::lsp_types::{
+            DidChangeWatchedFilesParams, DidOpenTextDocumentParams, FileChangeType, FileEvent,
+            TextDocumentItem,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 100\n",
+        )
+        .unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        const N: usize = 12;
+        let mut uris: Vec<Url> = Vec::with_capacity(N);
+        for i in 0..N {
+            let p = tmp.path().join(format!("file_{i}.R"));
+            fs::write(&p, "x <- 1\n").unwrap();
+            let uri = Url::from_file_path(&p).unwrap();
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: "x <- 1\n".into(),
+                    },
+                })
+                .await;
+            uris.push(uri);
+        }
+
+        // Sanity: pre-reload, no outstanding force-republish markers — the
+        // reload is the only path under test that will mark and then
+        // consume them.
+        {
+            let state = backend.state.read().await;
+            for uri in &uris {
+                assert_eq!(
+                    state.diagnostics_gate.force_republish_count_for_test(uri),
+                    0,
+                    "unexpected pre-reload force-republish marker for {uri}"
+                );
+            }
+        }
+
+        // Edit raven.toml and trigger a reload.
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 140\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // After the handler returns, every URI's force-republish marker
+        // (set by the reconciliation helper) must have been consumed by
+        // a successful `try_consume_publish` — a stuck or un-awaited
+        // task would leave its URI's counter at 1.
+        let state = backend.state.read().await;
+        for uri in &uris {
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(uri),
+                0,
+                "reload's parallel publish driver left an outstanding force-republish marker for {uri}",
+            );
+        }
+    }
+
+    /// The `raven/projectConfigLoaded` payload schema is a contract with
+    /// the VS Code extension. Lock it down: `path: string` ⇒
+    /// `source: "raven.toml" | ".lintr"`; `path: None` ⇒ both fields
+    /// JSON `null`. The `path` field uses `Path::display()`, which is
+    /// platform-dependent — build the test paths from a tempdir so the
+    /// assertion stays correct on both Unix and Windows.
+    #[test]
+    fn project_config_loaded_payload_shape() {
+        let tmp = TempDir::new().unwrap();
+
+        let raven_toml = tmp.path().join("raven.toml");
+        let payload = super::build_project_config_loaded_payload(Some(&raven_toml));
+        assert_eq!(
+            payload["path"].as_str(),
+            Some(raven_toml.display().to_string().as_str())
+        );
+        assert_eq!(payload["source"].as_str(), Some("raven.toml"));
+
+        let lintr = tmp.path().join(".lintr");
+        let payload = super::build_project_config_loaded_payload(Some(&lintr));
+        assert_eq!(
+            payload["path"].as_str(),
+            Some(lintr.display().to_string().as_str())
+        );
+        assert_eq!(payload["source"].as_str(), Some(".lintr"));
+
+        let payload = super::build_project_config_loaded_payload(None);
+        assert!(payload["path"].is_null());
+        assert!(payload["source"].is_null());
+    }
+
+    /// `DiagnosticsSnapshot::build` (the snapshot site in `handlers.rs` that
+    /// every diagnostics pass takes) must apply per-document
+    /// `[[linting.overrides]]` patches when computing the effective
+    /// `LintConfig`. This exercises the handlers-site refactor: two files
+    /// under the same project produce snapshots with different
+    /// `lint_config.line_length` values depending on which override globs
+    /// they match.
+    #[tokio::test]
+    async fn published_diagnostics_use_per_file_override() {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            r#"
+[linting]
+enabled = true
+lineLength = 30
+lineLengthSeverity = "warning"
+
+[[linting.overrides]]
+files = ["tests/**/*.R"]
+lineLength = 200
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        let r_path = tmp.path().join("R/a.R");
+        let test_path = tmp.path().join("tests/test-a.R");
+        // 80-column line: triggers in R/ (line_length = 30), not in tests/ (200).
+        let long_line =
+            "x_long_identifier <- 'sample value with a longer literal string' ; cat('hi')\n";
+        fs::write(&r_path, long_line).unwrap();
+        fs::write(&test_path, long_line).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let r_uri = Url::from_file_path(&r_path).unwrap();
+        let test_uri = Url::from_file_path(&test_path).unwrap();
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: r_uri.clone(),
+                    language_id: "r".into(),
+                    version: 1,
+                    text: long_line.into(),
+                },
+            })
+            .await;
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: test_uri.clone(),
+                    language_id: "r".into(),
+                    version: 1,
+                    text: long_line.into(),
+                },
+            })
+            .await;
+
+        // Build the snapshots that handlers.rs would build for each URI and
+        // assert their effective LintConfig. This is the same struct +
+        // build path that `handlers.rs:DiagnosticsSnapshot::build` takes
+        // during a diagnostics pass.
+        let state = backend.state.read().await;
+        let r_snap = crate::handlers::DiagnosticsSnapshot::build(&state, &r_uri)
+            .expect("snapshot built for R/a.R");
+        let test_snap = crate::handlers::DiagnosticsSnapshot::build(&state, &test_uri)
+            .expect("snapshot built for tests/test-a.R");
+        assert_eq!(r_snap.lint_config.line_length, 30);
+        assert_eq!(test_snap.lint_config.line_length, 200);
     }
 }

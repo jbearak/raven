@@ -73,6 +73,11 @@ When making significant changes:
 - **Locking discipline in cross-file work**
   - Diagnostic computation and the libpath consumer's "which docs are affected" filter must NOT hold the `WorldState` read lock across cross-file scope resolution. Snapshot the inputs (artifacts, metadata, graph clone, config) under the lock, then release the guard before iterating; otherwise concurrent `did_change` writers starve.
 
+- **Project config layering**
+  - `WorldState` stores both `raw_client_settings` and `raw_project_settings` as `serde_json::Value`s.
+  - `config_file::recompute_parsed_configs(state)` is the only function that should write to `state.lint_config` / `cross_file_config` / etc. after a settings change.
+  - Callers (`initialize`, `did_change_configuration`, `did_change_watched_files`) must mutate the raw layers and then call `recompute_parsed_configs`, never the parsers directly.
+
 ## Quick commands
 
 - Debug build: `cargo build -p raven`

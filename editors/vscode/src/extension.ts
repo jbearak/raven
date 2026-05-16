@@ -202,10 +202,15 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         synchronize: {
             // Matches the LSP `documentSelector` above. `.Rmd` / `.qmd` are
             // included so workspace file events for those documents reach the
-            // server too.
-            fileEvents: vscode.workspace.createFileSystemWatcher(
-                '**/*.{r,R,rmd,Rmd,RMD,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}',
-            ),
+            // server too. `raven.toml` and `.lintr` are watched so portable
+            // project-config edits reach the server for live reconfiguration.
+            fileEvents: [
+                vscode.workspace.createFileSystemWatcher(
+                    '**/*.{r,R,rmd,Rmd,RMD,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}',
+                ),
+                vscode.workspace.createFileSystemWatcher('**/raven.toml'),
+                vscode.workspace.createFileSystemWatcher('**/.lintr'),
+            ],
         },
         outputChannel: outputChannel,
         initializationOptions: getInitializationOptions,
@@ -223,6 +228,52 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         'Raven - R Language Server',
         serverOptions,
         clientOptions
+    );
+
+    // The server emits `raven/projectConfigLoaded` whenever it picks up (or
+    // re-picks up) a portable `raven.toml` / `.lintr` — and now also when
+    // the file is removed. `path: null` + `source: null` is the cleared
+    // form; both fields must be present and consistent for a "config in
+    // effect" notification. Surface the source so users can confirm
+    // what's authoritative at a glance.
+    client.onNotification(
+        'raven/projectConfigLoaded',
+        (params: unknown) => {
+            // Runtime type guard so a future server-side schema change fails
+            // loudly rather than silently rendering "undefined" in the UI.
+            // Enforce pair-shape consistency: both fields are null (cleared)
+            // OR both fields are non-empty strings with `source` matching
+            // the known discriminator set. Half-null / empty-string / unknown
+            // source values are treated as malformed and logged.
+            const isValidSource = (v: unknown): v is 'raven.toml' | '.lintr' =>
+                v === 'raven.toml' || v === '.lintr';
+            if (typeof params !== 'object' || params === null) {
+                outputChannel.appendLine(
+                    `Raven: ignoring malformed projectConfigLoaded payload: ${JSON.stringify(params)}`,
+                );
+                return;
+            }
+            const rawPath = (params as { path?: unknown }).path;
+            const rawSource = (params as { source?: unknown }).source;
+            const cleared = rawPath === null && rawSource === null;
+            const inEffect =
+                typeof rawPath === 'string' && rawPath.length > 0 && isValidSource(rawSource);
+            if (!cleared && !inEffect) {
+                outputChannel.appendLine(
+                    `Raven: ignoring malformed projectConfigLoaded payload: ${JSON.stringify(params)}`,
+                );
+                return;
+            }
+            if (cleared) {
+                outputChannel.appendLine('Raven: project config cleared (no raven.toml / .lintr in effect)');
+                vscode.window.setStatusBarMessage('$(circle-slash) Raven: no project config', 5000);
+                return;
+            }
+            const path = rawPath as string;
+            const source = rawSource as 'raven.toml' | '.lintr';
+            outputChannel.appendLine(`Raven: using config at ${path} (${source})`);
+            vscode.window.setStatusBarMessage(`$(check) Raven: using ${source}`, 5000);
+        },
     );
 
     client.start();
@@ -338,6 +389,16 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     // Register .gitignore / .lintr scaffold commands
     registerScaffoldCommands(context);
+
+    // Scaffold a portable `raven.toml` from current VS Code linting settings.
+    // Lives here (not in `scaffold.ts`) because it pulls the nested LSP-shape
+    // linting payload via `buildInitializationOptions`, which the rest of
+    // extension.ts already imports.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.createProjectConfig', async () => {
+            await scaffoldProjectConfig();
+        }),
+    );
 
     // If `auto` chose to disable, surface a one-time popover so the user knows
     // why their R console / plot viewer / data viewer didn't activate.
@@ -488,6 +549,108 @@ async function ensureWordSeparators(wordSeparators: string) {
             await config.update(`[${languageId}]`, updatedLanguageConfig, vscode.ConfigurationTarget.Global);
         }
     }
+}
+
+async function scaffoldProjectConfig(): Promise<void> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) {
+        vscode.window.showErrorMessage('Raven: open a workspace folder first.');
+        return;
+    }
+    const target = vscode.Uri.joinPath(folders[0].uri, 'raven.toml');
+    try {
+        await vscode.workspace.fs.stat(target);
+        const choice = await vscode.window.showWarningMessage(
+            'raven.toml already exists. Overwrite?',
+            { modal: true },
+            'Overwrite',
+            'Cancel',
+        );
+        if (choice !== 'Overwrite') return;
+    } catch {
+        // not present — fall through
+    }
+
+    // Reuse the existing factory that converts VS Code's flat
+    // `raven.linting.*` settings into the nested LSP init-options shape.
+    // The TOML we render is the same shape Raven's server consumes.
+    const config = vscode.workspace.getConfiguration('raven');
+    const initOptions = buildInitializationOptions(config);
+    const body = renderRavenToml(initOptions.linting as Record<string, unknown> | undefined);
+    const encoder = new TextEncoder();
+    await vscode.workspace.fs.writeFile(target, encoder.encode(body));
+    const doc = await vscode.workspace.openTextDocument(target);
+    await vscode.window.showTextDocument(doc);
+}
+
+function renderRavenToml(linting: Record<string, unknown> | undefined): string {
+    const lines: string[] = ['# Generated by Raven: Create raven.toml', ''];
+    lines.push('[linting]');
+    // Keep this list exhaustive across every `raven.linting.*` key the
+    // server understands so the scaffold faithfully mirrors explicit VS
+    // Code settings in portable config. Missing a severity here would
+    // create behavior drift for CLI / non-VS-Code consumers, where
+    // `raven.toml` is the shared source of truth. Any new lint rule
+    // should add both its value key (if it has one) and its severity
+    // key here at the time the rule is added.
+    const severities: [string, string][] = [
+        ['lineLengthSeverity', 'hint'],
+        ['trailingWhitespaceSeverity', 'hint'],
+        ['noTabSeverity', 'hint'],
+        ['trailingBlankLinesSeverity', 'hint'],
+        ['assignmentOperatorSeverity', 'hint'],
+        ['objectNameSeverity', 'hint'],
+        ['infixSpacesSeverity', 'hint'],
+        ['commentedCodeSeverity', 'hint'],
+        ['quotesSeverity', 'hint'],
+        ['commasSeverity', 'hint'],
+        ['tAndFSymbolSeverity', 'hint'],
+        ['semicolonSeverity', 'hint'],
+        ['equalsNaSeverity', 'hint'],
+        ['objectLengthSeverity', 'hint'],
+        ['vectorLogicSeverity', 'hint'],
+        ['functionLeftParenthesesSeverity', 'hint'],
+        ['spacesInsideSeverity', 'hint'],
+        ['indentationSeverity', 'hint'],
+    ];
+    const entries: [string, unknown, string][] = [
+        ['enabled', false, 'master switch'],
+        ['lineLength', 80, 'maximum line length (UTF-16 code units)'],
+        ['objectLength', 30, 'maximum identifier length'],
+        ['indentationUnit', 2, 'expected indent unit'],
+        ['assignmentOperator', '<-', '"<-" or "="'],
+        ['stringDelimiter', '"', '"\\"" or "\'"'],
+        ['objectNameStyleFunction', 'snake_case', 'or camelCase, dotted.case, UPPER_CASE, lowercase, any'],
+        ['objectNameStyleVariable', 'snake_case', 'as above'],
+        ['objectNameStyleArgument', 'snake_case', 'as above'],
+        ...severities.map<[string, unknown, string]>(([k, d]) => [
+            k,
+            d,
+            'error | warning | information | hint | off',
+        ]),
+    ];
+    const ravenDefaultEnabled = false; // mirror VS Code package.json default
+    for (const [key, dflt, comment] of entries) {
+        const fromUser = linting?.[key];
+        // `enabled` is special: the init-options factory always emits it
+        // (see initializationOptions.ts:367), so the "is this explicit?"
+        // heuristic above doesn't apply. Treat enabled as explicit only when
+        // it differs from the package.json default.
+        const isExplicit = key === 'enabled'
+            ? fromUser !== undefined && fromUser !== ravenDefaultEnabled
+            : fromUser !== undefined;
+        const value = isExplicit ? fromUser : dflt;
+        const prefix = isExplicit ? '' : '# ';
+        lines.push(`${prefix}${key} = ${toTomlScalar(value)}    # ${comment}`);
+    }
+    lines.push('');
+    return lines.join('\n');
+}
+
+function toTomlScalar(v: unknown): string {
+    if (typeof v === 'string') return JSON.stringify(v);
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    return JSON.stringify(v);
 }
 
 let active_plot_services: PlotServices | null = null;

@@ -29,11 +29,12 @@
 //!   heuristic anyway, but skipping them up front keeps the rule from
 //!   competing with the suppression infrastructure.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
 use crate::linting::parse_gate::looks_like_code;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -96,6 +97,7 @@ pub(crate) fn collect(
                 },
                 severity: Some(severity),
                 source: Some(LINT_SOURCE.to_string()),
+                code: Some(NumberOrString::String(rule_ids::COMMENTED_CODE.to_string())),
                 message: "Commented code should be removed.".to_string(),
                 ..Default::default()
             });

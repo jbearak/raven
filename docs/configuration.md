@@ -2,6 +2,52 @@
 
 Most settings are exposed as VS Code settings — search for "raven" in Settings (Cmd/Ctrl-,). A handful of advanced server-side knobs are only available via LSP initialization options; those are noted in the tables below.
 
+## Project config: `raven.toml`
+
+The recommended way to configure Raven is a `raven.toml` file at the project root. Every editor and the `raven lint` CLI read this file, so a single committed config governs both interactive editing and CI.
+
+### Discovery
+
+Raven walks upward from each workspace folder looking for `raven.toml`. If none is found, `.lintr` is read for linting settings only (subset; see [Linting](linting.md#migrating-from-lintr)).
+
+### Precedence
+
+Per-key. For each setting, project values win over the LSP client's `initializationOptions` / `did_change_configuration` payload. Keys not pinned by the project file continue to come from client settings (or Raven's defaults if neither layer specifies them).
+
+### Schema
+
+The TOML mirrors the LSP `initializationOptions` shape 1:1. The reference table below lists every key; the same key in `raven.toml` is at the path indicated.
+
+```toml
+[linting]
+enabled = true
+lineLength = 100
+lineLengthSeverity = "warning"
+
+[[linting.overrides]]
+files = ["tests/**/*.R"]
+lineLength = 120
+
+[crossFile]
+maxChainDepth = 10
+
+[packages]
+enabled = true
+
+[diagnostics]
+undefinedVariableSeverity = "warning"
+```
+
+### Per-file overrides
+
+`[[linting.overrides]]` is an array of glob → patch entries. Globs are anchored at the project root. Order matters: later entries win on conflicts. Setting `enabled = false` in an override skips matching files entirely.
+
+### Live reload
+
+Edits to `raven.toml` (or `.lintr`) are picked up live for every section: `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. Open documents re-publish diagnostics automatically — no Raven restart required.
+
+Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rPath`, `additionalLibraryPaths`, or the watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
+
 ## Diagnostics
 
 | Setting | Default | Description |

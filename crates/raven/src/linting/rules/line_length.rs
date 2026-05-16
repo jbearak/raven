@@ -3,9 +3,10 @@
 //! Width is measured in UTF-16 code units to align with LSP positions. Tabs
 //! count as one unit, matching `lintr::line_length_linter`'s convention.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 
 pub(crate) fn collect(
@@ -31,6 +32,7 @@ pub(crate) fn collect(
             },
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
+            code: Some(NumberOrString::String(rule_ids::LINE_LENGTH.to_string())),
             message: format!("Line is {width} characters long; limit is {max_len}."),
             ..Default::default()
         });

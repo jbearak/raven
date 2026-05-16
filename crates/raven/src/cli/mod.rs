@@ -3,3 +3,4 @@
 // This module contains non-LSP CLI commands like `analysis-stats`.
 
 pub mod analysis_stats;
+pub mod lint;

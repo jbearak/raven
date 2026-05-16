@@ -69,6 +69,7 @@
 pub mod config;
 mod nolint;
 mod parse_gate;
+pub mod rule_ids;
 mod rules;
 
 use tower_lsp::lsp_types::Diagnostic;
@@ -1784,6 +1785,154 @@ print.data.frame <- function(x, ...) NULL
         let diags = lint("f <- function() {\n  x <- 1\n}\n", &config);
         assert_eq!(diags.len(), 1, "got {:?}", diags);
         assert!(diags[0].message.contains("should be 4 spaces"));
+    }
+}
+
+#[cfg(test)]
+mod code_field_tests {
+    use super::*;
+    use crate::parser_pool::with_parser;
+    use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
+
+    fn rule_id_of(d: &tower_lsp::lsp_types::Diagnostic) -> Option<&str> {
+        match &d.code {
+            Some(NumberOrString::String(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn run_one(
+        text: &str,
+        configure: impl FnOnce(&mut LintConfig),
+    ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let mut cfg = LintConfig::default();
+        cfg.enabled = true;
+        configure(&mut cfg);
+        let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
+        run_lints(text, tree.root_node(), &cfg)
+    }
+
+    fn warn(slot: &mut Option<DiagnosticSeverity>) {
+        *slot = Some(DiagnosticSeverity::WARNING);
+    }
+
+    #[test]
+    fn every_rule_emits_its_id() {
+        use super::rule_ids::*;
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut LintConfig)>, &str)> = vec![
+            (
+                LINE_LENGTH,
+                Box::new(|c| {
+                    c.line_length = 4;
+                    warn(&mut c.line_length_severity);
+                }),
+                "very_long_line\n",
+            ),
+            (
+                TRAILING_WHITESPACE,
+                Box::new(|c| warn(&mut c.trailing_whitespace_severity)),
+                "x <- 1   \n",
+            ),
+            (
+                NO_TAB,
+                Box::new(|c| warn(&mut c.no_tab_severity)),
+                "\tx <- 1\n",
+            ),
+            (
+                TRAILING_BLANK_LINES,
+                Box::new(|c| warn(&mut c.trailing_blank_lines_severity)),
+                "x <- 1\n\n\n",
+            ),
+            (
+                ASSIGNMENT_OPERATOR,
+                Box::new(|c| warn(&mut c.assignment_operator_severity)),
+                "x = 1\n",
+            ),
+            (
+                OBJECT_NAME,
+                Box::new(|c| warn(&mut c.object_name_severity)),
+                "BadName <- 1\n",
+            ),
+            (
+                INFIX_SPACES,
+                Box::new(|c| warn(&mut c.infix_spaces_severity)),
+                "x<-1+2\n",
+            ),
+            (
+                COMMENTED_CODE,
+                Box::new(|c| warn(&mut c.commented_code_severity)),
+                "# x <- 1\n",
+            ),
+            (
+                QUOTES,
+                Box::new(|c| warn(&mut c.quotes_severity)),
+                "x <- 'single'\n",
+            ),
+            (
+                COMMAS,
+                Box::new(|c| warn(&mut c.commas_severity)),
+                "f(a ,b)\n",
+            ),
+            (
+                T_AND_F_SYMBOL,
+                Box::new(|c| warn(&mut c.t_and_f_symbol_severity)),
+                "if (T) 1 else 2\n",
+            ),
+            (
+                SEMICOLON,
+                Box::new(|c| warn(&mut c.semicolon_severity)),
+                "x <- 1; y <- 2\n",
+            ),
+            (
+                EQUALS_NA,
+                Box::new(|c| warn(&mut c.equals_na_severity)),
+                "if (x == NA) 1\n",
+            ),
+            (
+                OBJECT_LENGTH,
+                Box::new(|c| {
+                    c.object_length = 4;
+                    warn(&mut c.object_length_severity);
+                }),
+                "very_long_name <- 1\n",
+            ),
+            (
+                VECTOR_LOGIC,
+                Box::new(|c| warn(&mut c.vector_logic_severity)),
+                "if (x & y) 1\n",
+            ),
+            (
+                FUNCTION_LEFT_PARENTHESES,
+                Box::new(|c| warn(&mut c.function_left_parentheses_severity)),
+                "f <- function (x) x\n",
+            ),
+            (
+                SPACES_INSIDE,
+                Box::new(|c| warn(&mut c.spaces_inside_severity)),
+                "f( x )\n",
+            ),
+            (
+                INDENTATION,
+                Box::new(|c| warn(&mut c.indentation_severity)),
+                "if (x) {\n   y <- 1\n}\n",
+            ),
+        ];
+
+        for (expected_id, configure, fixture) in cases {
+            let diags = run_one(fixture, |c| configure(c));
+            let matched: Vec<_> = diags
+                .iter()
+                .filter(|d| rule_id_of(d) == Some(expected_id))
+                .collect();
+            assert!(
+                !matched.is_empty(),
+                "rule {} produced no diagnostic for fixture {:?}; emissions: {:?}",
+                expected_id,
+                fixture,
+                diags
+            );
+        }
     }
 }
 

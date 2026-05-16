@@ -10,6 +10,7 @@ mod builtins;
 mod chunks;
 mod cli;
 mod completion_context;
+mod config_file;
 mod content_provider;
 mod cross_file;
 mod document_store;
@@ -53,6 +54,7 @@ fn print_usage() {
     print!(
         r#"
 Usage: raven [OPTIONS]
+       raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
 
 Available options:
@@ -63,6 +65,7 @@ Available options:
 
 Subcommands:
 
+lint [PATHS...]              Run the native style linter on files / directories
 analysis-stats <path>        Profile workspace analysis phases
   --csv                      Output results in CSV format
   --only <phase>             Run only the specified phase
@@ -98,6 +101,24 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!("analysis-stats: {}", e));
+                }
+            }
+        }
+
+        if first == "lint" {
+            env_logger::init();
+            let rest = args.into_iter().skip(1);
+            match cli::lint::parse_args(rest) {
+                Ok(lint_args) => {
+                    let code = cli::lint::run(lint_args);
+                    std::process::exit(code);
+                }
+                Err(msg) if msg == "HELP" => {
+                    cli::lint::print_help();
+                    return Ok(());
+                }
+                Err(msg) => {
+                    return Err(anyhow::anyhow!("raven lint: {}", msg));
                 }
             }
         }

@@ -6,10 +6,11 @@
 //! `NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`), both as `==`
 //! and `!=`, on either side.
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
 use crate::linting::nolint::Suppressions;
+use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -80,6 +81,7 @@ fn check(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
+        code: Some(NumberOrString::String(rule_ids::EQUALS_NA.to_string())),
         message: format!(
             "Use `is.na(x)` instead of `x {op_text} {na_text}`; comparison with `NA` returns `NA`."
         ),

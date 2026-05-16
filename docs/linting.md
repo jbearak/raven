@@ -155,7 +155,9 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 ## Migrating from `.lintr`
 
-Raven does not read `.lintr` files — its rules are configured per VS Code settings instead. The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
+The recommended path is to configure Raven via `raven.toml` at the project root (see [Configuration § Project config](configuration.md#project-config-raventoml)). The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
+
+> **Runtime support:** When no `raven.toml` is present at the project root, Raven reads a documented subset of `.lintr` at startup. The mapping table below is the supported surface. Forms outside the supported subset log a single batch warning and are otherwise ignored.
 
 | `.lintr` linter | Raven settings |
 |---|---|
@@ -203,7 +205,7 @@ The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?it
 
 1. Keep Raven installed and enabled.
 2. Install the REditorSupport (R) extension. Leave `r.lsp.enabled` at its default (`true`).
-3. Place a `.lintr` file at your project root. Raven does not scaffold this file — its format is `lintr`'s own DSL and Raven doesn't read it. A minimal starter that mirrors the `lintr` default rule set with a 120-character line limit is one line:
+3. Place a `.lintr` file at your project root. Raven does not scaffold this file — its format is `lintr`'s own DSL. (Raven reads a [documented subset](#migrating-from-lintr) of `.lintr` at runtime when no `raven.toml` is present, but the file primarily exists so `lintr` itself can consume it from REditorSupport's R session.) A minimal starter that mirrors the `lintr` default rule set with a 120-character line limit is one line:
 
    ```r
    linters: linters_with_defaults(line_length_linter(120))
