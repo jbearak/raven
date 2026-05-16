@@ -570,7 +570,7 @@ pub struct WorldState {
 
     /// Resolved path of the project config currently in effect, if any.
     /// Reported via `raven/projectConfigLoaded` to the client.
-    pub project_config_path: Option<std::path::PathBuf>,
+    pub project_config_path: Option<PathBuf>,
 
     /// Compiled `[[linting.overrides]]` entries. Empty when no overrides
     /// are configured. Per-document resolution scans this list.
