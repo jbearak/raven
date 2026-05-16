@@ -45,12 +45,12 @@ async function createSampleRmd(): Promise<void> {
         ? folder.uri
         : vscode.Uri.file(os.tmpdir());
 
-    let candidate = vscode.Uri.joinPath(baseUri, 'raven-sample.Rmd');
-    let counter = 2;
-    while (await uriExists(candidate)) {
-        candidate = vscode.Uri.joinPath(baseUri, `raven-sample-${counter}.Rmd`);
-        counter += 1;
-        if (counter > 100) break; // safety
+    const candidate = await pickFreeSampleUri(baseUri);
+    if (!candidate) {
+        await vscode.window.showErrorMessage(
+            'Raven: Knit — too many sample files in this directory; clean some up before creating another.',
+        );
+        return;
     }
 
     try {
@@ -77,4 +77,20 @@ async function uriExists(uri: vscode.Uri): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+/**
+ * Probe `raven-sample.Rmd`, `raven-sample-2.Rmd`, ... until we find one
+ * that doesn't already exist. Returns `null` if the cap is exceeded so
+ * the caller can surface an error instead of silently overwriting a
+ * pre-existing sample.
+ */
+async function pickFreeSampleUri(baseUri: vscode.Uri): Promise<vscode.Uri | null> {
+    const MAX_ATTEMPTS = 100;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+        const filename = attempt === 1 ? 'raven-sample.Rmd' : `raven-sample-${attempt}.Rmd`;
+        const candidate = vscode.Uri.joinPath(baseUri, filename);
+        if (!(await uriExists(candidate))) return candidate;
+    }
+    return null;
 }

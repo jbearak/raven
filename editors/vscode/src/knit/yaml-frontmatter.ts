@@ -3,7 +3,7 @@
  *
  * This module owns three concerns:
  *   1. Slicing the leading `---` ... `---` block out of a document.
- *   2. Parsing that block with js-yaml's SAFE schema (no `!!js/function`,
+ *   2. Parsing that block with js-yaml's JSON schema (no `!!js/function`,
  *      no other dangerous tags) into a plain object.
  *   3. Reading the small surface we care about: output format and the
  *      "deferred-feature blockers" listed in the design doc — `knit:`
@@ -43,9 +43,6 @@ export function extractFrontmatter(text: string): string | null {
     if (body.startsWith(BOM)) body = body.slice(BOM.length);
     body = body.replace(/\r\n/g, '\n');
 
-    if (!body.startsWith('---\n') && body !== '---' && !body.startsWith('---')) {
-        return null;
-    }
     if (!body.startsWith('---\n')) return null;
 
     const rest = body.slice(4);
@@ -153,9 +150,7 @@ export function detectBlockers(fm: FrontmatterDoc): Blocker[] {
             message: "Site projects aren't supported by Raven: Knit.",
             copyCommand: isBookdown
                 ? "bookdown::serve_book()"
-                : (siteValue && /^rmarkdown::render_site$/.test(siteValue))
-                    ? "rmarkdown::render_site()"
-                    : "rmarkdown::render_site()",
+                : "rmarkdown::render_site()",
         });
     }
 

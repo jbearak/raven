@@ -25,6 +25,12 @@ describe('parseRenderedOutputPath', () => {
         expect(parseRenderedOutputPath(stdout).paths).toEqual(['/Users/me/proj/foo.html']);
     });
 
+    test('extracts a Windows drive-letter absolute path', () => {
+        const stdout = "Output created: C:\\Users\\me\\proj\\foo.html\r\n";
+        expect(parseRenderedOutputPath(stdout).paths)
+            .toEqual(['C:\\Users\\me\\proj\\foo.html']);
+    });
+
     test('returns empty when message is absent (quiet mode)', () => {
         const stdout = "rendering...\n";
         expect(parseRenderedOutputPath(stdout).paths).toEqual([]);

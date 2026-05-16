@@ -36,11 +36,17 @@ export function registerKnitCommands(context: vscode.ExtensionContext): void {
         return outputChannel;
     };
 
+    // Per-file in-flight set. A second knit against a file that's
+    // already rendering would race on the same output and confuse the
+    // user; we surface a clear info message instead. Keyed by the
+    // resolved fsPath after the up-front gate/extension checks.
+    const inFlight = new Set<string>();
+
     context.subscriptions.push(
         vscode.commands.registerCommand(
             'raven.knit',
             async (uri?: vscode.Uri) => {
-                await runKnitCommand(uri, getOutput());
+                await runKnitCommand(uri, getOutput(), inFlight);
             },
         ),
         vscode.commands.registerCommand(
@@ -53,6 +59,7 @@ export function registerKnitCommands(context: vscode.ExtensionContext): void {
 async function runKnitCommand(
     explicitUri: vscode.Uri | undefined,
     output: vscode.OutputChannel,
+    inFlight: Set<string>,
 ): Promise<void> {
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
@@ -187,6 +194,19 @@ async function runKnitCommand(
     const timeoutMs = readTimeoutMs();
     const baseName = path.basename(fsPath);
 
+    // Concurrent-knit guard. Re-invoking the command on a file that's
+    // already rendering produces two progress notifications, two R
+    // subprocesses, and interleaved output into the shared channel.
+    // Surface a clear info message instead. The key is the absolute
+    // fsPath so the same file under different relative URIs collapses.
+    if (inFlight.has(fsPath)) {
+        await vscode.window.showInformationMessage(
+            `Raven: Knit — ${baseName} is already being knitted.`,
+        );
+        return;
+    }
+    inFlight.add(fsPath);
+
     output.appendLine(`---`);
     output.appendLine(`Knitting ${fsPath}`);
     output.appendLine(`R: ${rBinary}`);
@@ -194,6 +214,7 @@ async function runKnitCommand(
     output.appendLine(`cwd: ${cwd}`);
     output.appendLine(``);
 
+    try {
     await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
@@ -285,6 +306,9 @@ async function runKnitCommand(
             else if (choice === SHOW_ALL) output.show(true);
         },
     );
+    } finally {
+        inFlight.delete(fsPath);
+    }
 }
 
 interface KnitDirOk {
