@@ -6256,7 +6256,14 @@ pub(crate) async fn publish_diagnostics_inner(
     // Phase 1: brief read lock — gate check, build the diagnostics
     // snapshot, capture inputs for the off-lock work. NO scope
     // resolution or other heavy work happens inside this scope.
-    let (version, snapshot, directive_meta, workspace_folder, missing_file_severity) = {
+    let (
+        version,
+        diagnostics_enabled,
+        snapshot,
+        directive_meta,
+        workspace_folder,
+        missing_file_severity,
+    ) = {
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
 
@@ -6278,10 +6285,17 @@ pub(crate) async fn publish_diagnostics_inner(
             }
         }
 
+        // Capture the diagnostics master switch under the read lock so
+        // it gates BOTH the sync snapshot build AND the async
+        // missing-file checks below — without this, a config reload
+        // that flips `diagnostics.enabled` to `false` could still
+        // publish missing-file diagnostics from the async phase.
+        let diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
+
         // Skip the snapshot build entirely when the master switch is
         // off — saves the snapshot's metadata clone + neighborhood walk.
         // Mirrors the early-exit in `handlers::diagnostics`.
-        let snapshot = if state.cross_file_config.diagnostics_enabled {
+        let snapshot = if diagnostics_enabled {
             handlers::DiagnosticsSnapshot::build(&state, uri)
         } else {
             None
@@ -6299,6 +6313,7 @@ pub(crate) async fn publish_diagnostics_inner(
 
         (
             version,
+            diagnostics_enabled,
             snapshot,
             directive_meta,
             workspace_folder,
@@ -6328,15 +6343,23 @@ pub(crate) async fn publish_diagnostics_inner(
         _ => Vec::new(),
     };
 
-    // Phase 3: async missing-file existence checks (already lock-free).
-    let diagnostics = handlers::diagnostics_async_standalone(
-        uri,
-        sync_diagnostics,
-        &directive_meta,
-        workspace_folder.as_ref(),
-        missing_file_severity,
-    )
-    .await;
+    // Phase 3: async missing-file existence checks. Gated on
+    // `diagnostics_enabled` so a master-switch-off reload doesn't keep
+    // publishing missing-file diagnostics while the sync phase was
+    // empty. When disabled, publish an explicit empty `Vec` so the
+    // client clears any prior diagnostics for the URI.
+    let diagnostics = if diagnostics_enabled {
+        handlers::diagnostics_async_standalone(
+            uri,
+            sync_diagnostics,
+            &directive_meta,
+            workspace_folder.as_ref(),
+            missing_file_severity,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
 
     // Re-check freshness after async work, atomically commit gate state, before publishing.
     // try_consume_publish replaces the racy can_publish + record_publish pair.
