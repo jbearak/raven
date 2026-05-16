@@ -3873,32 +3873,6 @@ impl LanguageServer for Backend {
         // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
         log::trace!("Configuration changed, parsing new config and scheduling revalidation");
 
-        // Parse new configuration if provided
-        let new_config = match parse_cross_file_config(&params.settings) {
-            Ok(config) => config,
-            Err(err) => {
-                log::warn!(
-                    "Failed to parse cross-file configuration from settings: {}",
-                    err
-                );
-                self.client.show_message(MessageType::WARNING, err).await;
-                None
-            }
-        };
-
-        // Parse symbol configuration if provided
-        // Requirement 11.2: Parse symbols.workspaceMaxResults from settings
-        let new_symbol_config = parse_symbol_config(&params.settings);
-
-        // Parse completion configuration if provided
-        let new_completion_config = parse_completion_config(&params.settings);
-
-        // Parse indentation configuration if provided
-        let new_indentation_config = parse_indentation_config(&params.settings);
-
-        // Parse linting configuration if provided
-        let new_lint_config = parse_lint_config(&params.settings);
-
         let (
             open_uris,
             scope_changed,
@@ -3915,45 +3889,62 @@ impl LanguageServer for Backend {
         ) = {
             let mut state = self.state.write().await;
 
+            // Snapshot the pre-change parsed configs so we can detect what
+            // moved after the recompute.
+            let prev_cross_file = state.cross_file_config.clone();
+            let prev_lint = state.lint_config.clone();
+            let prev_completion = state.completion_config.clone();
+            let prev_hier_support = state.symbol_config.hierarchical_document_symbol_support;
+
+            // Store the new raw client settings and re-merge with the project
+            // file (if any). recompute_parsed_configs() overwrites every
+            // parsed config; absent sections reset to defaults.
+            state.raw_client_settings = params.settings.clone();
+            crate::config_file::recompute_parsed_configs(&mut state);
+
+            // Refresh compiled overrides from the merged settings.
+            let project_root = state
+                .workspace_folders
+                .first()
+                .and_then(|u| u.to_file_path().ok());
+            if let Some(root) = &project_root {
+                let merged = crate::config_file::merge_settings(
+                    &state.raw_client_settings,
+                    state.raw_project_settings.as_ref(),
+                );
+                state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
+            }
+
+            // --- Recompute each `*_changed` flag against the pre-recompute
+            // snapshots. Logic is preserved from the original parse-then-apply
+            // site; the only change is the source of truth (state.* now
+            // reflects the merged result, not parse_*_config output applied
+            // to params.settings directly).
+
             // Check if scope-affecting settings changed
-            let scope_changed = new_config
-                .as_ref()
-                .map(|c| state.cross_file_config.scope_settings_changed(c))
-                .unwrap_or(false);
+            let scope_changed = prev_cross_file.scope_settings_changed(&state.cross_file_config);
 
             // Check if diagnostics_enabled (master switch) changed - Requirement 5.2
-            let old_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
-            let new_diagnostics_enabled = new_config
-                .as_ref()
-                .map(|c| c.diagnostics_enabled)
-                .unwrap_or(old_diagnostics_enabled);
+            let old_diagnostics_enabled = prev_cross_file.diagnostics_enabled;
+            let new_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
             let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
 
             // Settings that require reinitializing `PackageLibrary` via an R
             // subprocess call (~100ms). Keep this narrow.
-            let package_settings_changed = new_config
-                .as_ref()
-                .map(|c| {
-                    c.packages_enabled != state.cross_file_config.packages_enabled
-                        || c.packages_r_path != state.cross_file_config.packages_r_path
-                        || c.packages_additional_library_paths
-                            != state.cross_file_config.packages_additional_library_paths
-                })
-                .unwrap_or(false);
+            let package_settings_changed = state.cross_file_config.packages_enabled
+                != prev_cross_file.packages_enabled
+                || state.cross_file_config.packages_r_path != prev_cross_file.packages_r_path
+                || state.cross_file_config.packages_additional_library_paths
+                    != prev_cross_file.packages_additional_library_paths;
 
             // Watcher-only settings. Changing just these should restart the
             // filesystem watcher but MUST NOT trigger an R subprocess roundtrip
             // or wipe the package cache — toggling a debounce slider in the
             // Settings UI should not force every open document to revalidate.
-            let watch_settings_changed = new_config
-                .as_ref()
-                .map(|c| {
-                    c.packages_watch_library_paths
-                        != state.cross_file_config.packages_watch_library_paths
-                        || c.packages_watch_debounce_ms
-                            != state.cross_file_config.packages_watch_debounce_ms
-                })
-                .unwrap_or(false);
+            let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
+                != prev_cross_file.packages_watch_library_paths
+                || state.cross_file_config.packages_watch_debounce_ms
+                    != prev_cross_file.packages_watch_debounce_ms;
 
             // If `watch_settings_changed` is the only thing that flipped, the
             // change is purely watcher-lifecycle (debounce ms or enable flag
@@ -3967,44 +3958,26 @@ impl LanguageServer for Backend {
             // live OUTSIDE `CrossFileConfig` (e.g. `LintConfig`) still need
             // an explicit `*_changed` guard below — extend the chain when
             // adding another such struct.
-            let lint_config_changed = new_lint_config
-                .as_ref()
-                .map(|c| c != &state.lint_config)
-                .unwrap_or(false);
+            let lint_config_changed = state.lint_config != prev_lint;
 
             let only_watch_changed = watch_settings_changed
                 && !lint_config_changed
-                && new_config
-                    .as_ref()
-                    .map(|c| {
-                        let mut probe = c.clone();
-                        probe.packages_watch_library_paths =
-                            state.cross_file_config.packages_watch_library_paths;
-                        probe.packages_watch_debounce_ms =
-                            state.cross_file_config.packages_watch_debounce_ms;
-                        probe == state.cross_file_config
-                    })
-                    .unwrap_or(false);
+                && {
+                    let mut probe = state.cross_file_config.clone();
+                    probe.packages_watch_library_paths =
+                        prev_cross_file.packages_watch_library_paths;
+                    probe.packages_watch_debounce_ms = prev_cross_file.packages_watch_debounce_ms;
+                    probe == prev_cross_file
+                };
 
-            // Capture new package settings before applying config
-            let packages_enabled = new_config
-                .as_ref()
-                .map(|c| c.packages_enabled)
-                .unwrap_or(state.cross_file_config.packages_enabled);
-
-            // Apply new config if parsed
-            let package_mode_changed = new_config
-                .as_ref()
-                .map(|c| c.package_mode != state.cross_file_config.package_mode)
-                .unwrap_or(false);
-            if let Some(config) = new_config {
-                state.resize_caches(&config);
-                state.cross_file_config = config;
-            }
+            // Capture new package settings (post-recompute)
+            let packages_enabled = state.cross_file_config.packages_enabled;
 
             // If package_mode changed, apply the setting change via the event-driven
             // path. For Disabled: translate immediately (derive yields no workspace).
             // For Auto/Enabled: capture root for disk I/O outside the lock.
+            let package_mode_changed =
+                state.cross_file_config.package_mode != prev_cross_file.package_mode;
             let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
                 use crate::cross_file::config::PackageMode;
                 let mode = state.cross_file_config.package_mode;
@@ -4033,32 +4006,15 @@ impl LanguageServer for Backend {
                 None
             };
 
-            // Apply new symbol config if parsed
-            // Requirement 11.2: Apply symbols.workspaceMaxResults from settings
-            if let Some(mut config) = new_symbol_config {
-                config.hierarchical_document_symbol_support =
-                    state.symbol_config.hierarchical_document_symbol_support;
-                state.symbol_config = config;
-            }
+            // Recompute reset symbol_config to its default; restore the
+            // hierarchical-symbol-support flag the client capabilities set at
+            // initialize() time.
+            state.symbol_config.hierarchical_document_symbol_support = prev_hier_support;
 
-            // Apply new indentation config if parsed
-            if let Some(config) = new_indentation_config {
-                state.indentation_config = config;
-            }
-
-            // Apply new linting config if parsed
-            if let Some(config) = new_lint_config {
-                state.lint_config = config;
-            }
-
-            // Apply new completion config if parsed, tracking trigger change
-            let old_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
-            if let Some(config) = new_completion_config {
-                state.completion_config = config;
-            }
+            // Track completion trigger change.
             let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
             let trigger_on_open_paren_changed =
-                old_trigger_on_open_paren != new_trigger_on_open_paren;
+                prev_completion.trigger_on_open_paren != new_trigger_on_open_paren;
 
             // Mark all open documents for force republish (unless only the
             // watcher-lifecycle settings changed). Bulk-mark to avoid per-URI
@@ -9326,7 +9282,9 @@ mod project_config_initialize_tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-    use tower_lsp::lsp_types::{InitializeParams, Url, WorkspaceFolder};
+    use tower_lsp::lsp_types::{
+        DidChangeConfigurationParams, InitializeParams, Url, WorkspaceFolder,
+    };
 
     #[tokio::test]
     async fn initialize_loads_raven_toml_from_workspace_root() {
@@ -9376,5 +9334,56 @@ mod project_config_initialize_tests {
         assert!(state.lint_config.enabled);
         assert_eq!(state.lint_config.line_length, 90);
         assert!(state.project_config_path.is_none());
+    }
+
+    /// When a client clears its linting settings (e.g. user "Reset Setting"
+    /// in VS Code), `did_change_configuration` must re-merge against the
+    /// project file: project-pinned keys still win, and keys with no project
+    /// override fall back to built-in defaults rather than retaining the
+    /// previous client value.
+    #[tokio::test]
+    async fn did_change_configuration_falls_back_to_project_when_client_clears() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 100\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": true, "lineLength": 80, "objectLength": 40 }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Sanity: project file wins on lineLength; client wins on objectLength.
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.lint_config.line_length, 100);
+            assert_eq!(state.lint_config.object_length, 40);
+        }
+
+        // Client clears all linting settings (e.g. user "Reset Setting" in VS Code).
+        backend
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({ "linting": {} }),
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        // Project still pins lineLength; objectLength falls back to default (30).
+        assert_eq!(state.lint_config.line_length, 100);
+        assert_eq!(state.lint_config.object_length, 30);
     }
 }
