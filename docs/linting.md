@@ -5,7 +5,7 @@ Raven ships an opt-in, native style linter that re-implements a small subset of 
 This page is the landing point for users coming from `lintr` or `REditorSupport`. For these rules alongside Raven's other diagnostic categories, see [Diagnostics § Style Lints](diagnostics.md#style-lints); the per-key configuration reference lives in [Configuration § Linting Settings](configuration.md#linting-settings).
 
 > [!NOTE]
-> In Raven, "linting" means subjective style rules — line length, naming, infix spacing, and similar — and is opt-in. Correctness diagnostics (parse errors, semantic warnings, cross-file issues, assignment-target errors) are always on under `raven.diagnostics.enabled` and are not controlled by `raven.linting.*`. If you're looking for things like the orphan-`else` parse error, see [Diagnostics](diagnostics.md), not this page.
+> In Raven, "linting" means subjective style rules — line length, naming, infix spacing, and similar — and the whole group is opt-in via `raven.linting.enabled`. Correctness diagnostics (parse errors, semantic warnings, cross-file issues, assignment-target errors) are on by default under `raven.diagnostics.enabled`; most categories have a per-category severity that can silence them (`"off"`), while a few (parse errors, assignment-target errors) respond only to the master switch. None of these are controlled by `raven.linting.*`. If you're looking for things like the orphan-`else` parse error, see [Diagnostics](diagnostics.md), not this page.
 
 ## Quick start
 
