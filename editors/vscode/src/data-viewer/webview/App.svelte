@@ -122,6 +122,8 @@
             nrow,
             columns: columns.length,
             visibleRows: visibleRows.length,
+            visibleRangeStart,
+            visibleRangeEnd: visibleRangeStart + visibleRows.length,
             timestamp: Date.now(),
         });
     }
@@ -151,6 +153,20 @@
                     return;
                 case 'copyDone':
                     applyCopyDone(m);
+                    return;
+                case 'testKey':
+                    // Test-only: dispatch a synthetic KeyboardEvent on
+                    // `window` so the same onKeyDown handler a real
+                    // keypress would invoke runs end-to-end. The
+                    // <svelte:window onkeydown={onKeyDown}> binding
+                    // listens at the window level, so window.dispatchEvent
+                    // is the canonical delivery path for synthetic events.
+                    window.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: m.key,
+                        code: m.key,
+                        bubbles: true,
+                        cancelable: true,
+                    }));
                     return;
             }
         };
@@ -306,6 +322,11 @@
             visibleRows = [];
             visibleRangeStart = range.start;
             persistWebviewState();
+            // Tell the host every change to visibleRangeStart, including
+            // the empty-range case — otherwise the test API can stall on
+            // a stale range when nrow shrinks to 0 or the viewport
+            // collapses.
+            postLifecycle('empty-range');
             return;
         }
         const cached = rowCache.get(range.start, range.end);
@@ -313,6 +334,11 @@
             visibleRows = cached;
             visibleRangeStart = range.start;
             persistWebviewState();
+            // Without this, an End keypress that lands on a pre-cached
+            // window (e.g., re-pressing End after a scroll-up) would
+            // never tell the host its range changed, leaving the polling
+            // test stuck on a stale lastVisibleRange.
+            postLifecycle('cache-hit');
             return;
         }
         viewportGeneration += 1;

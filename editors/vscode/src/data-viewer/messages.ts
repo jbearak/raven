@@ -83,6 +83,17 @@ export type ExtensionToWebview =
         type: 'error';
         panelGeneration: number;
         message: string;
+    }
+    | {
+        /** Test-only: dispatch a synthetic KeyboardEvent on `window` from
+         *  inside the webview, so the integration test harness can drive
+         *  the same onKeyDown handler a real keypress would invoke.
+         *  Production code paths never post this message; the webview can
+         *  only receive messages from its own extension host, so exposing
+         *  it does not introduce an external attack surface. */
+        type: 'testKey';
+        panelGeneration: number;
+        key: string;
     };
 
 export type WebviewToExtension =
@@ -96,6 +107,13 @@ export type WebviewToExtension =
         nrow: number;
         columns: number;
         visibleRows: number;
+        /** Start row index of the currently rendered window (inclusive).
+         *  Used by the test API to verify scroll position. Always reflects
+         *  visibleRangeStart at the moment postLifecycle was called. */
+        visibleRangeStart: number;
+        /** End row index of the currently rendered window (exclusive).
+         *  Equal to visibleRangeStart + visibleRows.length. */
+        visibleRangeEnd: number;
         timestamp: number;
     }
     | {

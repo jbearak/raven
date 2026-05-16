@@ -39,6 +39,11 @@ export class DataViewerPanel {
     private columns: ColumnSchema[] = [];
     private layout: Layout = { columnWidths: {}, hiddenColumns: [] };
     private readonly traceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    /** Latest visible-row range observed via lifecycle events. Used by
+     *  the integration test API. `undefined` until the first lifecycle
+     *  message arrives; cleared on `replace()` so a stale range from the
+     *  previous dataset is never returned for the new one. */
+    private lastVisibleRange: { start: number; end: number } | undefined;
 
     private constructor(
         panelName: string,
@@ -105,6 +110,10 @@ export class DataViewerPanel {
             return;
         }
         this.generation += 1;
+        // Clear cached visible range so a stale range from the previous
+        // dataset is never returned for the new one. The next lifecycle
+        // event from the webview will repopulate it.
+        this.lastVisibleRange = undefined;
         const prevReader = this.reader;
         const prevPath = this.filePath;
         this.reader = reader;
@@ -235,8 +244,22 @@ export class DataViewerPanel {
                 nrow: m.nrow,
                 columns: m.columns,
                 visibleRows: m.visibleRows,
+                visibleRangeStart: m.visibleRangeStart,
+                visibleRangeEnd: m.visibleRangeEnd,
                 timestamp: m.timestamp,
             });
+            // Cache the range only when both fields are finite numbers.
+            // panel.ts is the trust boundary for messages from the webview;
+            // narrow defensively so a malformed message can never store
+            // {start: NaN, end: undefined as number} into lastVisibleRange.
+            if (m.panelGeneration === this.generation
+                && Number.isFinite(m.visibleRangeStart)
+                && Number.isFinite(m.visibleRangeEnd)) {
+                this.lastVisibleRange = {
+                    start: m.visibleRangeStart,
+                    end: m.visibleRangeEnd,
+                };
+            }
             return;
         }
         // Save messages are keyed by their carried schemaHash, not by the
@@ -387,6 +410,27 @@ export class DataViewerPanel {
             await this.webviewPanel.webview.postMessage(
                 replyDone(false, err instanceof Error ? err.message : String(err)));
         }
+    }
+
+    /** Latest visible-row range from the most recent lifecycle message,
+     *  or undefined if none has arrived yet. Used by the test harness to
+     *  verify scroll position. */
+    getVisibleRange(): { start: number; end: number } | undefined {
+        return this.lastVisibleRange;
+    }
+
+    /** Test-only: post a `testKey` message to the webview so it dispatches
+     *  a synthetic KeyboardEvent on `window`. Awaiting the returned promise
+     *  waits for the message to be queued, not for any reply; tests should
+     *  poll `getVisibleRange()` to observe the result. */
+    async pressKey(key: string): Promise<void> {
+        if (this.disposed) return;
+        const msg: ExtensionToWebview = {
+            type: 'testKey',
+            panelGeneration: this.generation,
+            key,
+        };
+        await this.webviewPanel.webview.postMessage(msg);
     }
 
     /** Column names in schema order — used by the test harness. */
