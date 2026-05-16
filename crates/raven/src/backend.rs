@@ -1716,6 +1716,13 @@ async fn run_debounced_diagnostics(
     }
 }
 
+pub(crate) enum RavenProjectConfigLoaded {}
+
+impl tower_lsp::lsp_types::notification::Notification for RavenProjectConfigLoaded {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "raven/projectConfigLoaded";
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     /// Initializes the server state from the client's InitializeParams and returns the LSP
@@ -1751,41 +1758,65 @@ impl LanguageServer for Backend {
             state.workspace_folders.push(root_uri);
         }
 
-        // Parse initialization options for configuration
-        // Requirement 11.2: Parse symbols.workspaceMaxResults from initialization options
-        if let Some(ref init_options) = params.initialization_options {
-            // Parse cross-file configuration
-            match parse_cross_file_config(init_options) {
-                Ok(Some(config)) => {
-                    state.resize_caches(&config);
-                    state.cross_file_config = config;
+        // Store the raw init options on state and run the project-config
+        // discovery walk against the first workspace folder. The merged result
+        // feeds the existing parse_*_config functions via recompute.
+        let raw_client = params
+            .initialization_options
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        state.raw_client_settings = raw_client;
+
+        let project_root: Option<std::path::PathBuf> = state
+            .workspace_folders
+            .first()
+            .and_then(|u| u.to_file_path().ok());
+
+        let mut loaded_path: Option<std::path::PathBuf> = None;
+        if let Some(root) = &project_root {
+            match crate::config_file::find_config(root) {
+                crate::config_file::DiscoveredConfig::RavenToml(p) => {
+                    if let Some(loaded) = crate::config_file::load_toml(&p) {
+                        for w in &loaded.warnings {
+                            log::warn!("{w}");
+                        }
+                        state.raw_project_settings = Some(loaded.settings);
+                        state.project_config_path = Some(p.clone());
+                        loaded_path = Some(p);
+                    }
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    log::warn!("Failed to parse cross-file configuration: {err}");
+                crate::config_file::DiscoveredConfig::Lintr(_p) => {
+                    // .lintr loader lands in Task 10. For now, skip and warn.
+                    log::warn!("found .lintr but loader not yet wired in initialize; using defaults");
                 }
+                crate::config_file::DiscoveredConfig::None => {}
             }
+        }
 
-            // Parse symbol configuration
-            // Requirement 11.3: Valid range 100-10000 with clamping
-            if let Some(config) = parse_symbol_config(init_options) {
-                state.symbol_config = config;
-            }
+        crate::config_file::recompute_parsed_configs(&mut state);
 
-            // Parse completion configuration
-            if let Some(config) = parse_completion_config(init_options) {
-                state.completion_config = config;
-            }
+        // Compile any [[linting.overrides]] from the now-merged settings.
+        if let Some(root) = &project_root {
+            let merged = crate::config_file::merge_settings(
+                &state.raw_client_settings,
+                state.raw_project_settings.as_ref(),
+            );
+            state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
+        }
 
-            // Parse indentation configuration
-            if let Some(config) = parse_indentation_config(init_options) {
-                state.indentation_config = config;
-            }
-
-            // Parse linting configuration
-            if let Some(config) = parse_lint_config(init_options) {
-                state.lint_config = config;
-            }
+        // Notify client when a project config is in effect.
+        if let Some(path) = loaded_path {
+            let client = self.client.clone();
+            let path_str = path.display().to_string();
+            tokio::spawn(async move {
+                let payload = serde_json::json!({
+                    "path": path_str,
+                    "source": "raven.toml",
+                });
+                let _ = client
+                    .send_notification::<RavenProjectConfigLoaded>(payload)
+                    .await;
+            });
         }
 
         // Detect client capability for hierarchical document symbols
@@ -9274,5 +9305,63 @@ mod refresh_packages_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod project_config_initialize_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+    use tower_lsp::lsp_types::{InitializeParams, Url, WorkspaceFolder};
+
+    #[tokio::test]
+    async fn initialize_loads_raven_toml_from_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 123\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let params = InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root.clone(),
+                name: "test".into(),
+            }]),
+            ..Default::default()
+        };
+        backend.initialize(params).await.unwrap();
+        let state = backend.state.read().await;
+        assert!(state.lint_config.enabled);
+        assert_eq!(state.lint_config.line_length, 123);
+        assert!(state.project_config_path.is_some());
+    }
+
+    #[tokio::test]
+    async fn initialize_uses_init_options_when_no_project_config() {
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let params = InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root.clone(),
+                name: "test".into(),
+            }]),
+            initialization_options: Some(serde_json::json!({
+                "linting": { "enabled": true, "lineLength": 90 }
+            })),
+            ..Default::default()
+        };
+        backend.initialize(params).await.unwrap();
+        let state = backend.state.read().await;
+        assert!(state.lint_config.enabled);
+        assert_eq!(state.lint_config.line_length, 90);
+        assert!(state.project_config_path.is_none());
     }
 }
