@@ -14,7 +14,7 @@ For the exact trigger list and expansion bodies, see `editors/vscode/snippets/r.
 
 ## R Markdown and Quarto
 
-Raven contributes dedicated `rmd` and `quarto` language IDs for `.Rmd` and `.qmd` files. Both also register the plain-R snippets from `r.json`, so `for` / `fun` / `if` etc. still expand inside `.Rmd` / `.qmd` buffers — typically what you want when the cursor sits inside an R chunk.
+Raven contributes dedicated `rmd` and `quarto` language IDs for `.Rmd` and `.qmd` files. Plain-R snippets from `r.json` (`for` / `fun` / `if` etc.) also expand inside `.Rmd` / `.qmd` buffers when Raven's R console is active — typically what you want when the cursor sits inside an R chunk. These overlap with REditorSupport's snippet contributions, so they are gated behind `raven.rConsole.activation`; see [Coexistence](./coexistence.md). The R Markdown and Quarto chunk / helper snippets below register unconditionally, since REditorSupport doesn't ship equivalents.
 
 The R Markdown set (`rmd`) adds:
 
