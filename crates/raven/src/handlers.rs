@@ -8063,6 +8063,23 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn lsp_ignore_marker_requires_word_boundary() {
+        // `@lsp-ignored` and `@lsp-ignore_foo` aren't the directive — must
+        // not be picked up by substring matching.
+        let diags = collect("TRUE <- 1 # @lsp-ignored");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("TRUE <- 1 # @lsp-ignore_foo");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
+    fn at_lsp_ignore_inside_string_does_not_suppress() {
+        // The `#` is inside a string literal, so it doesn't open a comment.
+        let diags = collect("TRUE <- 1; x <- \"# @lsp-ignore\"");
+        assert!(!diags.is_empty(), "got {diags:?}");
+    }
+
+    #[test]
     fn nolint_does_not_suppress_diagnostic() {
         // `# nolint` belongs to the opt-in lint pipeline. R rejects
         // `TRUE <- 1` outright; an unrelated style suppression like
@@ -8316,29 +8333,92 @@ fn collect_invalid_assignment_targets_inner(
 /// `# nolint: line_length` for an unrelated style lint would be a
 /// surprise; restricting to `@lsp-ignore` keeps the suppression channel
 /// the same one the rest of `handlers.rs` uses.
+///
+/// The parser is string-literal-aware (a `#` inside `"…"` or `'…'` doesn't
+/// open a comment) and uses word-boundary matching so spurious tokens like
+/// `@lsp-ignored` or `@lsp-ignore-suffix` don't match.
 fn lsp_ignored_lines(text: &str) -> std::collections::HashSet<u32> {
     let mut out = std::collections::HashSet::new();
     for (idx, line) in text.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix('#') {
-            // Standalone `@lsp-ignore-next` comment line — suppress the
-            // NEXT non-blank line below (matching the rest of raven's
-            // handler-emitted diagnostics).
-            if rest.trim_start().starts_with("@lsp-ignore-next") {
-                let next = (idx as u32).saturating_add(1);
-                out.insert(next);
-            }
+        let Some(comment_start) = find_unquoted_hash(line) else {
             continue;
-        }
-        // Inline `# @lsp-ignore` on the same line as code.
-        if let Some(hash_at) = line.find('#') {
-            let comment = &line[hash_at..];
-            if comment.contains("@lsp-ignore") && !comment.contains("@lsp-ignore-next") {
-                out.insert(idx as u32);
+        };
+        let after_hash = &line[comment_start + 1..];
+        match classify_lsp_ignore_marker(after_hash) {
+            Some(LspIgnoreKind::SameLine) => {
+                // Inline `# @lsp-ignore` suppresses *this* line — but only
+                // if the marker appears after non-comment code. A standalone
+                // `# @lsp-ignore` comment is meaningless on its own.
+                let prefix = &line[..comment_start];
+                if !prefix.trim().is_empty() {
+                    out.insert(idx as u32);
+                }
             }
+            Some(LspIgnoreKind::NextLine) => {
+                out.insert((idx as u32).saturating_add(1));
+            }
+            None => {}
         }
     }
     out
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LspIgnoreKind {
+    SameLine,
+    NextLine,
+}
+
+/// Classify the text after a `#` that opens a comment. Returns `SameLine`
+/// for `@lsp-ignore` (with optional rule filter) and `NextLine` for
+/// `@lsp-ignore-next`. Returns `None` otherwise. Matches word-boundary so
+/// `@lsp-ignored` does not match `@lsp-ignore`.
+fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
+    // Allow extra leading `#` characters (`## @lsp-ignore`) and whitespace,
+    // mirroring `linting::nolint::classify`.
+    let trimmed = after_hash.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
+    let rest = trimmed.strip_prefix("@lsp-ignore")?;
+    // Word-boundary: the next byte (if any) must not be an identifier byte.
+    // `-` and `:` are explicitly allowed because they begin the `-next`
+    // suffix or rule filter.
+    match rest.as_bytes().first() {
+        None => Some(LspIgnoreKind::SameLine),
+        Some(b) if b.is_ascii_alphanumeric() || *b == b'_' => None,
+        Some(_) => {
+            let suffix = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
+            if suffix.starts_with("next") {
+                Some(LspIgnoreKind::NextLine)
+            } else {
+                Some(LspIgnoreKind::SameLine)
+            }
+        }
+    }
+}
+
+/// Return the byte index of the first `#` in `line` that is not inside a
+/// string literal. Tracks `"…"` and `'…'` with `\`-escapes, matching the
+/// scanner in `linting::nolint::find_inline_marker`.
+fn find_unquoted_hash(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && (in_single || in_double) {
+            i += 2;
+            continue;
+        }
+        if !in_single && b == b'"' {
+            in_double = !in_double;
+        } else if !in_double && b == b'\'' {
+            in_single = !in_single;
+        } else if !in_single && !in_double && b == b'#' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn check_invalid_assignment_target(
