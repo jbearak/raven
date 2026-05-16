@@ -176,9 +176,14 @@ pub fn run(args: LintArgs) -> i32 {
                 (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings))
             }
             crate::config_file::DiscoveredConfig::Lintr(p) => {
-                let l = crate::config_file::load_lintr_str(
-                    &std::fs::read_to_string(&p).unwrap_or_default(),
-                );
+                let text = match std::fs::read_to_string(&p) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("raven lint: cannot read {}: {e}", p.display());
+                        return EXIT_OPERATOR_ERROR;
+                    }
+                };
+                let l = crate::config_file::load_lintr_str(&text);
                 for w in l.warnings {
                     eprintln!("{w}");
                 }
@@ -258,7 +263,19 @@ fn walk(
         if crate::config_file::is_skipped_by_overrides(base_section, overrides, rel) {
             return;
         }
-        let uri = tower_lsp::lsp_types::Url::from_file_path(path)
+        // `Url::from_file_path` requires an absolute path. The CLI is
+        // commonly invoked with `raven lint .`, which produces relative
+        // entries like `R/foo.R` from the directory walk — without
+        // canonicalization the URL build falls back to `file:///` and
+        // `resolve_lint_for_document`'s `strip_prefix(root)` check
+        // silently drops every per-file `[[linting.overrides]]` patch.
+        // Canonicalize against `root` to preserve file identity.
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&abs_path)
             .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///").unwrap());
         let effective = crate::config_file::resolve_lint_for_document(
             base_lint,
@@ -332,7 +349,9 @@ fn is_chunk_file(p: &Path) -> bool {
 fn print_text(diags: &[(PathBuf, Diagnostic)], args: &LintArgs, root: &Path) {
     let mut errors = 0;
     let mut warnings = 0;
+    let mut infos = 0;
     let mut hints = 0;
+    let mut notes = 0;
     for (path, d) in diags {
         let rel = path.strip_prefix(root).unwrap_or(path);
         let level = match d.severity {
@@ -345,14 +364,17 @@ fn print_text(diags: &[(PathBuf, Diagnostic)], args: &LintArgs, root: &Path) {
                 "warning"
             }
             Some(DiagnosticSeverity::INFORMATION) => {
-                warnings += 1;
+                infos += 1;
                 "info"
             }
             Some(DiagnosticSeverity::HINT) => {
                 hints += 1;
                 "hint"
             }
-            _ => "note",
+            _ => {
+                notes += 1;
+                "note"
+            }
         };
         let line = d.range.start.line + 1;
         let col = d.range.start.character + 1;
@@ -371,12 +393,19 @@ fn print_text(diags: &[(PathBuf, Diagnostic)], args: &LintArgs, root: &Path) {
         );
     }
     if !args.quiet {
+        // Buckets sum to diags.len(): errors + warnings + infos + hints
+        // + notes (severity-less / unrecognized). Per-bucket reporting
+        // keeps INFORMATION distinct from WARNING in summaries — SARIF
+        // collapses them onto "note" by spec, but the human-readable
+        // CLI output should reflect the original LSP severity.
         println!(
-            "{} issues ({} errors, {} warnings, {} hints)",
+            "{} issues ({} errors, {} warnings, {} infos, {} hints, {} notes)",
             diags.len(),
             errors,
             warnings,
-            hints
+            infos,
+            hints,
+            notes
         );
     }
 }
