@@ -318,9 +318,10 @@ test('End key reaches the last row in a 700K-row data frame', async () => {
     //   same dataset (a same-shape replace doesn't reset visibleRangeStart
     //   inside applyInitOrReplace)
     await api.pressDataViewerKey('big', 'Home');
-    // poll until lastVisibleRange.end < N / 2 (the Home reset has landed
-    //   AND the rows for the top of the grid have been fetched —
-    //   distinguishes 'panel exists' from 'panel reached steady state')
+    // poll until lastVisibleRange has 0 < end < N / 2 (the Home reset
+    //   has landed AND rows for the top of the grid have actually been
+    //   fetched — a mount/init lifecycle reports {start: 0, end: 0},
+    //   which satisfies end < N / 2 alone but means no rows yet)
     await api.pressDataViewerKey('big', 'End');
     // poll until lastVisibleRange.end === N (the bottom-row fetch arrived)
 });
