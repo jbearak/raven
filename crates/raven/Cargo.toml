@@ -39,6 +39,7 @@ lru = "0.16"
 notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
 percent-encoding = "2"
 tempfile = "3"
+toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
