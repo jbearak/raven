@@ -4,6 +4,8 @@ Raven reports problems in your R code as you type — undefined variables, missi
 
 Diagnostics are deferred until the workspace scan completes (in `auto` backward dependency mode), so cross-file warnings reflect the full project.
 
+Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, undefined variables, package and cross-file issues, assignment-target errors, and semantic warnings — are always on whenever `raven.diagnostics.enabled` is true; per-category severities only tune them. **Style lints** are subjective formatting rules and are off until you set `raven.linting.enabled` to `true`. If you're looking for a specific check, scan the categories below before reaching for [Linting](linting.md), which only covers the opt-in style group.
+
 ## Quick Reference
 
 - **Silence one site** — add `# @lsp-ignore` on the line, or `# @lsp-ignore-next` on the line above
