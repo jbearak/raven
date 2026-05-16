@@ -151,6 +151,11 @@ but `End` jumps there in one keystroke. Modifier combinations (`Shift`,
 `Cmd`/`Ctrl`, `Alt` on these navigation keys) fall through to the
 browser/OS unchanged so platform shortcuts are not hijacked.
 
+On data frames with more than ~625 K rows, Raven also replaces the
+native vertical scrollbar with an overlay so dragging the scrollbar
+thumb to the bottom reaches the last row. The native scrollbar is
+preserved on smaller frames.
+
 ## Settings
 
 | Setting | Default | Description |
