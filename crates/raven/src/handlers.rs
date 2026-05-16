@@ -6190,6 +6190,8 @@ fn has_unclosed_quote_child(node: Node) -> bool {
 /// 2. Consecutive pipe — only meaningful child is `|>` / `%>%`.
 /// 3. Mismatched bracket — opens with `(`, `[`, or `[[` but closes with a
 ///    non-matching bracket (detected through a nested ERROR child).
+/// 4. Fat-arrow typo — a lone `>` immediately following an `=` token, which
+///    arises from writing `=>` (no such operator in R).
 fn classify_error(node: Node, text: &str) -> String {
     if has_unclosed_quote_child(node) {
         return "Unclosed string literal".to_string();
@@ -6198,6 +6200,9 @@ fn classify_error(node: Node, text: &str) -> String {
         return msg;
     }
     if let Some(msg) = detect_mismatched_bracket(node, text) {
+        return msg;
+    }
+    if let Some(msg) = detect_fat_arrow(node, text) {
         return msg;
     }
     "Syntax error".to_string()
@@ -6269,6 +6274,29 @@ fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Returns a diagnostic message if `node` is an ERROR consisting of a lone
+/// `>` token whose immediately-preceding sibling is an `=` operator. This is
+/// the parse shape tree-sitter-r produces for the JavaScript-style fat-arrow
+/// typo `x => 1`: a `binary_operator` with `=` as its operator child, an
+/// ERROR child containing `>`, and the right-hand expression as the next
+/// sibling.
+fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
+    let node_text = text.get(node.start_byte()..node.end_byte())?.trim();
+    if node_text != ">" {
+        return None;
+    }
+    let prev = node.prev_sibling()?;
+    let prev_text = text.get(prev.start_byte()..prev.end_byte())?;
+    if prev_text != "=" {
+        return None;
+    }
+    Some(
+        "Unexpected `>`: R has no `=>` operator. \
+         For assignment use `<-`; for a pipeline use `|>` (R 4.1+) or `%>%`."
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -7051,6 +7079,44 @@ mod syntax_error_range_tests {
         assert!(
             diags.is_empty(),
             "well-matched brackets should produce no diagnostics, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fat_arrow_typo_emits_descriptive_message() {
+        // `x => 1` — R has no `=>` operator. tree-sitter-r parses this as
+        // `binary_operator(=)` with an ERROR child containing `>`.
+        let code = "x => 1";
+        let diags = collect(code);
+        assert!(
+            diags.iter().any(|d| d.message.contains("no `=>` operator")),
+            "should emit fat-arrow diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fat_arrow_typo_with_call_rhs() {
+        // `foo => bar(x)` — same pattern with a more complex right-hand side.
+        let code = "foo => bar(x)";
+        let diags = collect(code);
+        assert!(
+            diags.iter().any(|d| d.message.contains("no `=>` operator")),
+            "should emit fat-arrow diagnostic for call rhs, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lone_gt_after_non_eq_is_generic_syntax_error() {
+        // `1 > > 2` — the second `>` is an ERROR but its preceding token is
+        // not `=`, so it should NOT be reported as the fat-arrow typo.
+        let code = "1 > > 2";
+        let diags = collect(code);
+        assert!(
+            diags.iter().all(|d| !d.message.contains("no `=>` operator")),
+            "non-`=>` errors must not be misclassified as fat-arrow, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
