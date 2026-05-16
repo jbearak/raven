@@ -130,7 +130,7 @@ Create `crush.json` in your project root:
 
 ## Project configuration
 
-All editor integrations honor `raven.toml` at the project root automatically. See [Configuration § Project config](configuration.md#project-config-ravenstoml). Editor-specific settings (e.g. VS Code's `raven.linting.lineLength`) act as a fallback for keys the project file does not pin.
+All editor integrations honor `raven.toml` at the project root automatically. See [Configuration § Project config](configuration.md#project-config-raventoml). Editor-specific settings (e.g. VS Code's `raven.linting.lineLength`) act as a fallback for keys the project file does not pin.
 
 ## Troubleshooting
 
