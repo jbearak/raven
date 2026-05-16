@@ -205,7 +205,7 @@ The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?it
 
 1. Keep Raven installed and enabled.
 2. Install the REditorSupport (R) extension. Leave `r.lsp.enabled` at its default (`true`).
-3. Place a `.lintr` file at your project root. Raven does not scaffold this file — its format is `lintr`'s own DSL and Raven doesn't read it. A minimal starter that mirrors the `lintr` default rule set with a 120-character line limit is one line:
+3. Place a `.lintr` file at your project root. Raven does not scaffold this file — its format is `lintr`'s own DSL. (Raven reads a [documented subset](#migrating-from-lintr) of `.lintr` at runtime when no `raven.toml` is present, but the file primarily exists so `lintr` itself can consume it from REditorSupport's R session.) A minimal starter that mirrors the `lintr` default rule set with a 120-character line limit is one line:
 
    ```r
    linters: linters_with_defaults(line_length_linter(120))
