@@ -481,14 +481,14 @@ test('customThumbHeight: large dataset → MIN_THUMB_PX floor')
 test('customThumbHeight: mid-size proportional')
 test('customThumbHeight: nrow === 0 → full track')
 test('customThumbHeight: rowHeight === 0 → full track')   // edge
-test('customThumbHeight: viewportHeight === 0 → 0')        // edge
-test('customThumbHeight: viewportHeight < MIN_THUMB_PX → viewportHeight (no overflow)')
+test('customThumbHeight: trackHeight === 0 → 0')           // edge
+test('customThumbHeight: trackHeight < MIN_THUMB_PX → trackHeight (no overflow)')
 
 test('customThumbTop: scrollTop=0 → 0')
-test('customThumbTop: scrollTop=maxPhysical → viewportHeight - thumbHeight')
+test('customThumbTop: scrollTop=maxPhysical → trackHeight - thumbHeight')
 test('customThumbTop: midpoint → midpoint')
 test('customThumbTop: maxPhysical <= 0 → 0')               // edge
-test('customThumbTop: thumbHeight >= viewportHeight → 0')  // edge
+test('customThumbTop: thumbHeight >= trackHeight → 0')     // edge
 
 test('customScrollTopFromThumbTop: thumbTop=0 → 0')
 test('customScrollTopFromThumbTop: thumbTop=trackUsable → maxPhysical')
@@ -502,11 +502,10 @@ applying `customThumbTop` then `customScrollTopFromThumbTop` should match
 the original (within floating-point tolerance). This catches any
 asymmetry between the forward and reverse mappings.
 
-The tiny-viewport edge tests guard against the
-`Math.max(MIN_THUMB_PX, ...)` regression from the codex review: with the
-clamp in the corrected order (`min(viewportHeight, max(MIN_THUMB_PX,
-proportional))`), a 20-px viewport gets a 20-px thumb (full track), not
-a 30-px thumb that overflows.
+The tiny-track edge tests guard against the `Math.max(MIN_THUMB_PX, ...)`
+regression from the codex review: with the clamp in the corrected order
+(`min(trackHeight, max(MIN_THUMB_PX, proportional))`), a 20-px track gets
+a 20-px thumb (full track), not a 30-px thumb that overflows.
 
 ### Mocha integration test
 
