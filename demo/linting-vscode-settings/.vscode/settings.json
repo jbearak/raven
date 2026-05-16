@@ -1,0 +1,12 @@
+{
+  "raven.linting.enabled": true,
+  "raven.linting.lineLength": 80,
+  "raven.linting.lineLengthSeverity": "warning",
+  "raven.linting.trailingWhitespaceSeverity": "warning",
+  "raven.linting.assignmentOperator": "<-",
+  "raven.linting.assignmentOperatorSeverity": "warning",
+  "raven.linting.objectNameStyleVariable": "snake_case",
+  "raven.linting.objectNameSeverity": "warning",
+  "raven.linting.tAndFSymbolSeverity": "warning",
+  "raven.linting.infixSpacesSeverity": "warning"
+}
