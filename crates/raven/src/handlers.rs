@@ -8063,6 +8063,20 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn nolint_does_not_suppress_diagnostic() {
+        // `# nolint` belongs to the opt-in lint pipeline. R rejects
+        // `TRUE <- 1` outright; an unrelated style suppression like
+        // `# nolint: line_length` shouldn't silence the assignment error.
+        // Only `# @lsp-ignore` may turn this off.
+        let diags = collect("TRUE <- 1 # nolint");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("TRUE <- 1 # nolint: line_length");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("# nolint start\nTRUE <- 1\n# nolint end\n");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
     fn diagnostic_range_handles_utf16_columns() {
         // Use a non-BMP character (`🦀`, U+1F980) to actually exercise the
         // gap between UTF-16 code units and Unicode scalars: 🦀 is 4 UTF-8
@@ -8273,29 +8287,64 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// assignment-operator lint's logic. `T <- FALSE` is **not** flagged: `T`
 /// and `F` are regular bindings, not reserved words.
 fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
-    let suppressions = crate::linting::nolint::Suppressions::from_text(text);
-    collect_invalid_assignment_targets_inner(node, text, &suppressions, diagnostics);
+    let ignored = lsp_ignored_lines(text);
+    collect_invalid_assignment_targets_inner(node, text, &ignored, diagnostics);
 }
 
 fn collect_invalid_assignment_targets_inner(
     node: Node,
     text: &str,
-    suppressions: &crate::linting::nolint::Suppressions,
+    ignored: &std::collections::HashSet<u32>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if node.kind() == "binary_operator" {
-        check_invalid_assignment_target(node, text, suppressions, diagnostics);
+        check_invalid_assignment_target(node, text, ignored, diagnostics);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_invalid_assignment_targets_inner(child, text, suppressions, diagnostics);
+        collect_invalid_assignment_targets_inner(child, text, ignored, diagnostics);
     }
+}
+
+/// Lines suppressed by `# @lsp-ignore` (on the same line) or
+/// `# @lsp-ignore-next` (on the preceding line).
+///
+/// We deliberately do **not** reuse `crate::linting::nolint::Suppressions`
+/// here: that parser also honors `# nolint` / `# nolint start...end`, which
+/// belong to the opt-in lint pipeline. Silencing an ERROR-tier diagnostic
+/// for code R itself rejects (e.g. `TRUE <- 1`) because the user wrote
+/// `# nolint: line_length` for an unrelated style lint would be a
+/// surprise; restricting to `@lsp-ignore` keeps the suppression channel
+/// the same one the rest of `handlers.rs` uses.
+fn lsp_ignored_lines(text: &str) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            // Standalone `@lsp-ignore-next` comment line — suppress the
+            // NEXT non-blank line below (matching the rest of raven's
+            // handler-emitted diagnostics).
+            if rest.trim_start().starts_with("@lsp-ignore-next") {
+                let next = (idx as u32).saturating_add(1);
+                out.insert(next);
+            }
+            continue;
+        }
+        // Inline `# @lsp-ignore` on the same line as code.
+        if let Some(hash_at) = line.find('#') {
+            let comment = &line[hash_at..];
+            if comment.contains("@lsp-ignore") && !comment.contains("@lsp-ignore-next") {
+                out.insert(idx as u32);
+            }
+        }
+    }
+    out
 }
 
 fn check_invalid_assignment_target(
     binop: Node,
     text: &str,
-    suppressions: &crate::linting::nolint::Suppressions,
+    ignored: &std::collections::HashSet<u32>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(op) = binop.child_by_field_name("operator") else {
@@ -8332,7 +8381,7 @@ fn check_invalid_assignment_target(
     };
 
     let row = target.start_position().row as u32;
-    if suppressions.is_suppressed(row) {
+    if ignored.contains(&row) {
         return;
     }
     let line_text = text.lines().nth(row as usize).unwrap_or("");

@@ -67,7 +67,7 @@
 //! full pipeline and limits.
 
 pub mod config;
-pub(crate) mod nolint;
+mod nolint;
 mod parse_gate;
 mod rules;
 
