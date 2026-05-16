@@ -8,8 +8,8 @@ pub mod toml_loader;
 pub use discovery::{find_config, DiscoveredConfig};
 pub use merge::merge as merge_settings;
 pub use overrides::{
-    compile_from_settings as compile_lint_overrides, is_skipped_by_overrides,
-    resolve_lint_for_document, CompiledLintOverride,
+    compile_lint_overrides, is_skipped_by_overrides, resolve_lint_for_document,
+    CompiledLintOverride,
 };
 pub use toml_loader::{load as load_toml, load_str as load_toml_str, LoadedToml};
 

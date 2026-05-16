@@ -25,7 +25,7 @@ pub struct CompiledLintOverride {
 /// Build compiled overrides from the merged `[linting].overrides` array.
 /// `root` is the directory containing `raven.toml`. Returns an empty vec if
 /// no overrides are configured.
-pub fn compile_from_settings(merged: &Value, root: &Path) -> Vec<CompiledLintOverride> {
+pub fn compile_lint_overrides(merged: &Value, root: &Path) -> Vec<CompiledLintOverride> {
     let Some(arr) = merged.get("linting").and_then(|v| v.get("overrides")).and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -94,7 +94,7 @@ pub fn resolve_lint_for_document(
     for ov in overrides {
         if ov.matchers.iter().any(|m| m.is_match(rel)) {
             matched_any = true;
-            merge_in_place(&mut effective, &ov.patch);
+            crate::config_file::merge::merge_into(&mut effective, &ov.patch);
         }
     }
     if !matched_any {
@@ -115,17 +115,13 @@ pub fn is_skipped_by_overrides(
     for ov in overrides {
         if ov.matchers.iter().any(|m| m.is_match(relative_path)) {
             matched = true;
-            merge_in_place(&mut effective, &ov.patch);
+            crate::config_file::merge::merge_into(&mut effective, &ov.patch);
         }
     }
     if !matched {
         return false;
     }
     effective.get("enabled").and_then(|v| v.as_bool()) == Some(false)
-}
-
-fn merge_in_place(dst: &mut Value, src: &Value) {
-    crate::config_file::merge::merge_into(dst, src);
 }
 
 #[cfg(test)]
