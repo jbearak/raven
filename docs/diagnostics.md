@@ -24,6 +24,7 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 | `Consecutive pipe \|>`: expected an expression before this operator | Two pipe operators appear back-to-back without an intervening expression (`x \|> \|> y`) |
 | `Mismatched brackets: \`(\` opened here; close with \`)\` not \`]`` | A bracket opened with `(`, `[`, or `[[` is closed with a non-matching bracket (`c(1, 2]`) |
 | `Missing \`)`` / `Missing \`]`` / etc. | A delimiter was opened but never closed (`library(`) |
+| In R, `else` must appear on the same line as the closing `}` of the if block | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
 | `Syntax error` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
 
 ### Undefined Variables
