@@ -26,7 +26,8 @@ import * as vscode from 'vscode';
 export interface KnitEngineOptions {
     rBinary: string;
     expression: string;
-    cwd: string;
+    /** Subprocess cwd. `undefined` inherits Node's `process.cwd()`. */
+    cwd: string | undefined;
     /** Hard timeout; SIGKILL on expiry. */
     timeoutMs: number;
     output: vscode.OutputChannel;

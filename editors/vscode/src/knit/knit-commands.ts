@@ -253,7 +253,14 @@ async function runKnitCommand(
                 if (choice === SHOW) output.show(true);
                 return;
             }
-            const primary = absolutizeFromCwd(parsedOutputs[0], cwd);
+            // Resolve any relative `Output created:` path against the
+            // subprocess cwd we passed (or the document directory when
+            // `current` mode is in effect with no workspace open). The
+            // input file is always absolute, so rmarkdown normally
+            // prints absolute paths and `absolutizeFromCwd` short-
+            // circuits via `path.isAbsolute`.
+            const base = cwd ?? path.dirname(fsPath);
+            const primary = absolutizeFromCwd(parsedOutputs[0], base);
             const OPEN = 'Open';
             const SHOW_ALL = 'Show All';
             const buttons = parsedOutputs.length > 1 ? [OPEN, SHOW_ALL] : [OPEN];
@@ -274,8 +281,12 @@ interface KnitDirOk {
     ok: true;
     /** `knit_root_dir` argument to rmarkdown::render; null = omit. */
     knitRootDir: string | null;
-    /** cwd for the R subprocess. */
-    cwd: string;
+    /**
+     * cwd for the R subprocess. `undefined` = inherit Node's
+     * `process.cwd()` (the spec's "R's working directory at subprocess
+     * start" — only used in `current` mode without a workspace).
+     */
+    cwd: string | undefined;
 }
 interface KnitDirErr { ok: false; error: string; }
 type KnitDirResult = KnitDirOk | KnitDirErr;
@@ -288,11 +299,12 @@ type KnitDirResult = KnitDirOk | KnitDirErr;
  *     document's parent directory.
  *   - `project`: both = the workspace folder containing the document.
  *     Refuses if the document is outside every workspace folder.
- *   - `current`: omit `knit_root_dir` and use the first workspace
- *     folder's path as cwd, falling back to the document directory only
- *     when no workspace is open. The spec calls this "R's startup
- *     working directory at subprocess start" — VS Code's convention is
- *     that R-started-from-the-workspace inherits the workspace root.
+ *   - `current`: omit `knit_root_dir`. When a workspace is open, use the
+ *     first workspace folder as cwd (matches VS Code's convention that
+ *     R-started-from-the-workspace inherits the workspace root). When
+ *     no workspace is open, inherit Node's `process.cwd()` so we don't
+ *     pretend the document directory is "R's startup wd" — the spec is
+ *     specifically about not pinning a directory in this mode.
  */
 function resolveKnitDir(
     docUri: vscode.Uri,
@@ -318,7 +330,7 @@ function resolveKnitDir(
     return {
         ok: true,
         knitRootDir: null,
-        cwd: workspaceRoot ?? path.dirname(fsPath),
+        cwd: workspaceRoot,
     };
 }
 
