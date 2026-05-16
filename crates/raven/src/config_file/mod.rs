@@ -1,11 +1,13 @@
 //! Project-level configuration loader (raven.toml, .lintr).
 
 pub mod discovery;
+pub mod lintr_loader;
 pub mod merge;
 pub mod overrides;
 pub mod toml_loader;
 
 pub use discovery::{find_config, DiscoveredConfig};
+pub use lintr_loader::{load as load_lintr, load_str as load_lintr_str, LoadedLintr};
 pub use merge::merge as merge_settings;
 pub use overrides::{
     compile_lint_overrides, is_skipped_by_overrides, resolve_lint_for_document,

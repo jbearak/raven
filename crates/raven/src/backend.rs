@@ -1782,10 +1782,13 @@ impl LanguageServer for Backend {
                         loaded_project = Some((p, loaded.settings));
                     }
                 }
-                crate::config_file::DiscoveredConfig::Lintr(_p) => {
-                    // .lintr loader lands in Task 10. For now, skip with an
-                    // info log (this is expected, not a problem to report).
-                    log::info!(".lintr discovered but its loader is not wired in initialize yet; using defaults");
+                crate::config_file::DiscoveredConfig::Lintr(p) => {
+                    if let Some(loaded) = crate::config_file::load_lintr(&p) {
+                        for w in &loaded.warnings {
+                            log::warn!("{w}");
+                        }
+                        loaded_project = Some((p, loaded.settings));
+                    }
                 }
                 crate::config_file::DiscoveredConfig::None => {}
             }
@@ -1818,11 +1821,16 @@ impl LanguageServer for Backend {
         // Notify client when a project config is in effect.
         if let Some(path) = loaded_path {
             let client = self.client.clone();
+            let source = if path.file_name() == Some(std::ffi::OsStr::new(".lintr")) {
+                ".lintr"
+            } else {
+                "raven.toml"
+            };
             let path_str = path.display().to_string();
             tokio::spawn(async move {
                 let payload = serde_json::json!({
                     "path": path_str,
-                    "source": "raven.toml",
+                    "source": source,
                 });
                 let _ = client
                     .send_notification::<RavenProjectConfigLoaded>(payload)
@@ -4300,13 +4308,13 @@ impl LanguageServer for Backend {
                             loaded_project = Some((p, loaded.settings));
                         }
                     }
-                    crate::config_file::DiscoveredConfig::Lintr(_p) => {
-                        // .lintr loader lands in Task 10. For now, skip with
-                        // an info log (mirrors `initialize` behavior).
-                        log::info!(
-                            ".lintr discovered but its loader is not wired in \
-                             did_change_watched_files yet; using defaults"
-                        );
+                    crate::config_file::DiscoveredConfig::Lintr(p) => {
+                        if let Some(loaded) = crate::config_file::load_lintr(&p) {
+                            for w in &loaded.warnings {
+                                log::warn!("{w}");
+                            }
+                            loaded_project = Some((p, loaded.settings));
+                        }
                     }
                     crate::config_file::DiscoveredConfig::None => {}
                 }
