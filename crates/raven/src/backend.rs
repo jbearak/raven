@@ -9927,9 +9927,15 @@ mod project_config_initialize_tests {
         use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
 
         let tmp = TempDir::new().unwrap();
-        // `.lintr` is an R-style assignment list — the `LoadedLintr` loader
-        // parses `line_length = 100L` into `linting.lineLength = 100`.
-        fs::write(tmp.path().join(".lintr"), "linters: line_length_linter(120)\n").unwrap();
+        // `lintr_loader` translates `line_length_linter(N)` (under the
+        // `linters_with_defaults(...)` wrapper that real `.lintr` files
+        // use) into `linting.lineLength = N`. See the loader's own
+        // `line_length_param_maps` test for the canonical form.
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
         let root = Url::from_file_path(tmp.path()).unwrap();
 
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
@@ -9944,21 +9950,31 @@ mod project_config_initialize_tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            backend
-                .state
-                .read()
-                .await
-                .project_config_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str()),
-            Some(".lintr"),
-            "initialize should have picked up the .lintr"
-        );
+        // Initialize picks up the `.lintr` and translates it to the
+        // expected line length.
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .project_config_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str()),
+                Some(".lintr"),
+                "initialize should have picked up the .lintr"
+            );
+            assert_eq!(
+                state.lint_config.line_length, 120,
+                ".lintr should have been parsed into lineLength=120 at initialize"
+            );
+        }
 
         // Edit the `.lintr` on disk and replay the watched-files event.
-        fs::write(tmp.path().join(".lintr"), "linters: line_length_linter(180)\n").unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(180))\n",
+        )
+        .unwrap();
         backend
             .did_change_watched_files(DidChangeWatchedFilesParams {
                 changes: vec![FileEvent {
@@ -9968,10 +9984,9 @@ mod project_config_initialize_tests {
             })
             .await;
 
-        // Reload preserves the `.lintr` source discriminator and reapplies
-        // the new value. We don't bind to the exact integer here (the
-        // .lintr translation layer is its own concern); we just confirm
-        // the project config path was re-resolved as `.lintr`.
+        // Reload preserves the `.lintr` source discriminator AND reapplies
+        // the new setting — proof that the live-reload pipeline survives
+        // the `.lintr` branch, not just the raven.toml one.
         let state = backend.state.read().await;
         assert_eq!(
             state
@@ -9980,7 +9995,11 @@ mod project_config_initialize_tests {
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str()),
             Some(".lintr"),
-            "reload should have kept the .lintr discriminator",
+            "reload should have kept the .lintr discriminator"
+        );
+        assert_eq!(
+            state.lint_config.line_length, 180,
+            "reload should have re-translated the new .lintr line_length_linter value"
         );
     }
 
