@@ -8368,6 +8368,58 @@ mod invalid_assignment_target_tests {
     }
 }
 
+/// Regression guard: semantic-warning rules must fire through `diagnostics_from_snapshot`
+/// even when the style-lint master switch (`LintConfig::enabled`) is off.
+///
+/// These rules live in the always-on diagnostic pipeline (`CrossFileConfig`), not in the
+/// opt-in lint pipeline (`LintConfig`). A future refactor that accidentally moved them
+/// behind `run_lints` would silently suppress them for any user with linting disabled.
+#[cfg(test)]
+mod semantic_warning_pipeline_tests {
+    use super::{diagnostics_from_snapshot, DiagCancelToken, DiagnosticsSnapshot};
+    use crate::linting::LintConfig;
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::Url;
+
+    fn build_snapshot_with_lint_disabled(code: &str) -> (DiagnosticsSnapshot, Url) {
+        let uri = Url::parse("file:///test.R").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        // Disable the opt-in lint master switch — semantic rules must still fire.
+        state.lint_config = LintConfig {
+            enabled: false,
+            ..LintConfig::default()
+        };
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        (snapshot, uri)
+    }
+
+    #[test]
+    fn mixed_logical_fires_when_linting_disabled() {
+        let (snapshot, uri) = build_snapshot_with_lint_disabled("x <- a & b | c\n");
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            diags.iter().any(|d| d.message.contains("parentheses")),
+            "mixed_logical must fire regardless of LintConfig::enabled; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn condition_assignment_fires_when_linting_disabled() {
+        let (snapshot, uri) = build_snapshot_with_lint_disabled("if (x = 1) x\n");
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            diags.iter().any(|d| d.message.contains("==")),
+            "condition_assignment must fire regardless of LintConfig::enabled; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// Detect and report diagnostics for `else` keywords that appear on a new line
 /// after the closing brace of an `if` block.
 ///
