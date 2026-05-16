@@ -1,6 +1,6 @@
 # CLI
 
-Raven ships a single binary that serves the LSP via stdio *and* exposes a `lint` subcommand for use outside an editor.
+Raven ships a single binary that serves the LSP via stdio *and* exposes a `lint` subcommand for use outside an editor. This page documents `lint`. The binary also has an `analysis-stats <path> [--csv] [--only <phase>]` subcommand for profiling workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help` for the current invocation.
 
 ## `raven lint`
 

@@ -205,8 +205,8 @@ directory is swept of files older than 24 hours.
 ## Troubleshooting
 
 - **Nothing happens when I call `View(df)`.** Check that the terminal
-  was started by Raven (the terminal profile dropdown's "R (Raven)"
-  entry, or via send-to-R). Confirm `requireNamespace("arrow")`
+  was started by Raven (the terminal profile dropdown's "R" entry,
+  or via send-to-R). Confirm `requireNamespace("arrow")`
   returns `TRUE`. Check `raven.rConsole.activation`: if it's
   `"disabled"`, or `"auto"` while REditorSupport (R) is enabled or
   you're in Positron, Raven's R console — and the data viewer — won't

@@ -71,7 +71,7 @@ Code sent via the Terminal submenu follows the same send method as the main comm
 > [!TIP]
 > **Remote sessions and long-running jobs** — If you're connected to a remote host via VS Code Remote Development and want an R session that survives disconnections (closing your laptop, losing internet, etc.), launch a terminal multiplexer like `tmux` and start R inside it. Then use the Terminal submenu to send code to that tmux-hosted R session. Because tmux keeps running on the remote host independently of your VS Code connection, you can disconnect and reconnect hours or days later with your session — and any long-running computation (MCMC sampling in Stan or JAGS, large simulations, etc.) — still intact.
 
-The Terminal submenu has its own default keyboard shortcuts that mirror the main send shortcuts exactly, with `Option` (Mac) or `Alt` (Windows/Linux) replacing `Cmd`/`Ctrl`. So `Option+Enter` sends a line or selection to the active terminal, and `Shift+Option+Enter` sources the file — the same gestures, just swapping the modifier.
+The Terminal submenu commands (`raven.terminal.runLineOrSelection`, `raven.terminal.runUpwardLines`, `raven.terminal.runDownwardLines`, `raven.terminal.sourceFile`) ship without default keybindings — assign your own in `keybindings.json` if you want keyboard access. A common convention is to mirror the main send shortcuts with `Option` (Mac) or `Alt` (Windows/Linux) in place of `Cmd`/`Ctrl`, e.g. binding `alt+enter` (or `option+enter`) to `raven.terminal.runLineOrSelection`.
 
 ## Statement Detection
 

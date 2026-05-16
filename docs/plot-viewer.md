@@ -34,6 +34,6 @@ The viewer's overall enable/disable is controlled by `raven.rConsole.activation`
 
 ## Troubleshooting
 
-- **No viewer appears.** Confirm httpgd is installed (`packageVersion("httpgd")`) and that you're running R inside a terminal launched via Raven (the terminal profile dropdown's "R (Raven)" entry, or any of Raven's send-to-R commands). Plots from terminals you opened manually outside Raven won't trigger the viewer.
+- **No viewer appears.** Confirm httpgd is installed (`packageVersion("httpgd")`) and that you're running R inside a terminal launched via Raven (the terminal profile dropdown's "R" entry, or any of Raven's send-to-R commands). Plots from terminals you opened manually outside Raven won't trigger the viewer.
 - **httpgd console message about installing or upgrading.** Follow the printed `install.packages("httpgd")` instructions. Plots fall back to R's default graphics device until httpgd is available.
 - **The plot viewer doesn't activate at all.** Check `raven.rConsole.activation`. If you have the REditorSupport (R) extension enabled or you're using Positron, the default `auto` value leaves Raven's R-session features off. Set it to `"enabled"` to turn them on.
