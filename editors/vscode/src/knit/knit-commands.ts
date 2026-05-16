@@ -9,6 +9,7 @@ import {
 } from './yaml-frontmatter';
 import {
     buildKnitExpression,
+    escapeRString,
     ValidateFormatError,
     ValidatePathError,
 } from './r-expression';
@@ -243,7 +244,13 @@ async function runKnitCommand(
                 return;
             }
 
-            const parsedOutputs = parseRenderedOutputPath(result.stdout).paths;
+            // rmarkdown::render's "Output created:" line is emitted
+            // via R's `message()`, which writes to stderr. Older
+            // configurations / future versions could route it to stdout,
+            // so we parse both streams to stay robust.
+            const parsedOutputs = parseRenderedOutputPath(
+                result.stdout + '\n' + result.stderr,
+            ).paths;
             if (parsedOutputs.length === 0) {
                 const SHOW = 'Show Output';
                 const choice = await vscode.window.showInformationMessage(
@@ -359,7 +366,13 @@ function absolutizeFromCwd(raw: string, cwd: string): string {
 
 async function showBlocker(blocker: Blocker, fsPath: string): Promise<void> {
     const COPY = 'Copy command';
-    const filledCommand = blocker.copyCommand.replace('FILENAME', fsPath);
+    // The blocker's copyCommand uses `'FILENAME'` as a quoted
+    // placeholder. Substitute the actual path as a properly escaped R
+    // literal so Windows backslashes and paths containing apostrophes
+    // stay valid R syntax.
+    const filledCommand = blocker.copyCommand.includes("'FILENAME'")
+        ? blocker.copyCommand.replace("'FILENAME'", escapeRString(fsPath))
+        : blocker.copyCommand;
     const choice = await vscode.window.showInformationMessage(
         blocker.message,
         { modal: false },

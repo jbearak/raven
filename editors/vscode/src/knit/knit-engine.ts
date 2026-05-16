@@ -36,8 +36,14 @@ export interface KnitEngineOptions {
 
 export interface KnitEngineResult {
     exitCode: number | null;
-    /** Captured stdout for `parseRenderedOutputPath` to read. */
+    /** Captured stdout. */
     stdout: string;
+    /**
+     * Captured stderr. `rmarkdown::render` emits its "Output created:"
+     * line via R's `message()`, which writes to stderr; that's where
+     * `parseRenderedOutputPath` will find it on a successful knit.
+     */
+    stderr: string;
     /** True when the run was aborted by the user or by timeout. */
     cancelled: boolean;
     timedOut: boolean;
@@ -69,6 +75,7 @@ export async function runKnit(opts: KnitEngineOptions): Promise<KnitEngineResult
         return {
             exitCode: null,
             stdout: '',
+            stderr: '',
             cancelled: false,
             timedOut: false,
             spawnError: err as NodeJS.ErrnoException,
@@ -76,6 +83,7 @@ export async function runKnit(opts: KnitEngineOptions): Promise<KnitEngineResult
     }
 
     let stdout = '';
+    let stderr = '';
     let cancelled = false;
     let timedOut = false;
     let spawnError: NodeJS.ErrnoException | null = null;
@@ -88,6 +96,7 @@ export async function runKnit(opts: KnitEngineOptions): Promise<KnitEngineResult
     });
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk: string) => {
+        stderr += chunk;
         for (const line of chunk.split(/\r?\n/)) {
             if (line === '') continue;
             output.appendLine(`[stderr] ${line}`);
@@ -138,7 +147,7 @@ export async function runKnit(opts: KnitEngineOptions): Promise<KnitEngineResult
     clearTimers();
     cancelHook.dispose();
 
-    return { exitCode, stdout, cancelled, timedOut, spawnError };
+    return { exitCode, stdout, stderr, cancelled, timedOut, spawnError };
 }
 
 function sendSignal(child: ChildProcess, signal: 'SIGINT' | 'SIGTERM' | 'SIGKILL'): void {

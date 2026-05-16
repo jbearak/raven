@@ -94,6 +94,22 @@ describe('detectBlockers', () => {
         const blockers = detectBlockers({ knit: '(function(input, ...) bookdown::render_book(input, ...))' });
         expect(blockers).toHaveLength(1);
         expect(blockers[0].kind).toBe('knit-hook');
+        // Inferred copy command should pick the inner pkg::fn, not the
+        // anonymous-function wrapper.
+        expect(blockers[0].copyCommand).toBe("bookdown::render_book('FILENAME')");
+    });
+
+    test('falls back to rmarkdown::render when knit: hook is opaque', () => {
+        const blockers = detectBlockers({ knit: 'opaque_string_no_call' });
+        expect(blockers).toHaveLength(1);
+        expect(blockers[0].copyCommand).toBe("rmarkdown::render('FILENAME')");
+    });
+
+    test('picks first pkg::fn for nested anonymous wrappers', () => {
+        const blockers = detectBlockers({
+            knit: '(function(input, encoding) { pkgdown::build_site() })',
+        });
+        expect(blockers[0].copyCommand).toBe("pkgdown::build_site('FILENAME')");
     });
 
     test('null knit: value is not a blocker', () => {

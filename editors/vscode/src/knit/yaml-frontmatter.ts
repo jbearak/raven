@@ -171,10 +171,15 @@ function inferKnitHookCommand(value: unknown): string {
     if (typeof value === 'string') {
         const trimmed = value.trim();
         // Common shape: `(function(input, ...) bookdown::render_book(input, ...))`.
-        // Pick out the inner pkg::fn call when we can — gives the user a
-        // working starting point. Otherwise fall back to the default.
-        const match = trimmed.match(/([A-Za-z_][A-Za-z0-9_.]*(?:::[A-Za-z_][A-Za-z0-9_.]*)?)\s*\(/);
-        if (match) return `${match[1]}('FILENAME')`;
+        // Prefer a namespaced `pkg::fn(` over an unqualified call so we
+        // skip past `function(` in the wrapper. If neither exists, fall
+        // back to the first identifier-like call. The `FILENAME`
+        // placeholder is substituted by the caller using `escapeRString`
+        // so paths with apostrophes / backslashes stay valid R syntax.
+        const namespaced = trimmed.match(/([A-Za-z_][A-Za-z0-9_.]*::[A-Za-z_][A-Za-z0-9_.]*)\s*\(/);
+        if (namespaced) return `${namespaced[1]}('FILENAME')`;
+        const plain = trimmed.match(/([A-Za-z_][A-Za-z0-9_.]*)\s*\(/);
+        if (plain && plain[1] !== 'function') return `${plain[1]}('FILENAME')`;
     }
     return "rmarkdown::render('FILENAME')";
 }
