@@ -98,3 +98,79 @@ export function coalesceScroll<F extends (...args: any[]) => void>(
         }, intervalMs);
     };
 }
+
+
+// ----- Custom scrollbar math (issue #183 follow-up) ---------------------
+
+/** Minimum pixel height for the custom scrollbar thumb. Below this the
+ *  thumb is hard to click/drag. Chosen so even a 10 M-row dataset gets a
+ *  visible, draggable thumb. */
+export const MIN_THUMB_PX = 30;
+
+/** Pixel reservation at the bottom of the custom scrollbar track for the
+ *  native horizontal scrollbar, when present. The CSS rule sets the
+ *  track's `bottom: HORIZONTAL_GUTTER_PX`, and the math takes
+ *  `trackHeight = viewportHeight - HORIZONTAL_GUTTER_PX`. Sharing the
+ *  constant guarantees the math + layout agree.
+ *
+ *  Always reserved, regardless of whether the horizontal scrollbar is
+ *  actually present. The visual cost when absent is the thumb stopping
+ *  ~12 px shy of the viewport bottom (negligible). The alternative —
+ *  measuring dynamically — adds layout-thrash on every render with
+ *  little benefit. */
+export const HORIZONTAL_GUTTER_PX = 12;
+
+/** Pixel height of the custom scrollbar thumb. The thumb represents the
+ *  fraction of the dataset currently visible (visibleCount / nrow), with
+ *  a hard minimum so even a single visible row in a 10 M-row dataset
+ *  produces a draggable thumb. The minimum is itself capped at the
+ *  track height — for tiny tracks (< MIN_THUMB_PX), the thumb fills the
+ *  track rather than overflowing it.
+ *
+ *  Note `trackHeight`, not `viewportHeight`: the track is shorter than
+ *  the viewport by HORIZONTAL_GUTTER_PX (see above). */
+export function customThumbHeight(
+    trackHeight: number,
+    rowHeight: number,
+    nrow: number,
+): number {
+    if (trackHeight <= 0) return 0;
+    if (nrow <= 0 || rowHeight <= 0) return trackHeight;
+    const visibleCount = Math.max(1, Math.ceil(trackHeight / rowHeight));
+    if (visibleCount >= nrow) return trackHeight;
+    const proportional = trackHeight * (visibleCount / nrow);
+    return Math.min(trackHeight, Math.max(MIN_THUMB_PX, proportional));
+}
+
+/** Pixel offset of the thumb's top from the top of the track. Track
+ *  height is `viewportHeight - HORIZONTAL_GUTTER_PX`; the thumb's top
+ *  can range from 0 to (trackHeight - thumbHeight). The mapping is
+ *  linear in the *physical* scrollTop so the thumb tracks user
+ *  scrolling exactly. */
+export function customThumbTop(
+    scrollTop: number,
+    trackHeight: number,
+    thumbHeight: number,
+    maxPhysical: number,
+): number {
+    const trackUsable = Math.max(0, trackHeight - thumbHeight);
+    if (maxPhysical <= 0 || trackUsable <= 0) return 0;
+    const fraction = Math.max(0, Math.min(1, scrollTop / maxPhysical));
+    return fraction * trackUsable;
+}
+
+/** Convert a thumb-top pixel offset (during a drag) back to the physical
+ *  scrollTop the viewport needs. Inverse of customThumbTop. The caller
+ *  sets viewportEl.scrollTop = result; the existing onScroll →
+ *  scheduleFetchVisible pipeline does the rest. */
+export function customScrollTopFromThumbTop(
+    thumbTop: number,
+    trackHeight: number,
+    thumbHeight: number,
+    maxPhysical: number,
+): number {
+    const trackUsable = Math.max(0, trackHeight - thumbHeight);
+    if (trackUsable <= 0 || maxPhysical <= 0) return 0;
+    const fraction = Math.max(0, Math.min(1, thumbTop / trackUsable));
+    return fraction * maxPhysical;
+}
