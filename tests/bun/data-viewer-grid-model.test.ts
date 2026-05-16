@@ -6,6 +6,11 @@ import {
     cappedScrollHeight,
     logicalScrollTop,
     visualOffsetPx,
+    MIN_THUMB_PX,
+    HORIZONTAL_GUTTER_PX,
+    customThumbHeight,
+    customThumbTop,
+    customScrollTopFromThumbTop,
 } from '../../editors/vscode/src/data-viewer/webview/grid-model';
 import { RowCache } from '../../editors/vscode/src/data-viewer/webview/row-cache';
 import { Selection } from '../../editors/vscode/src/data-viewer/webview/selection-model';
@@ -110,6 +115,51 @@ describe('scroll height capping', () => {
             scrollTop: logical, viewportHeight: VH,
             rowHeight: RH, nrow, overscan: 8,
         });
+        expect(range.end).toBe(nrow);
+    });
+
+    test('logicalScrollTop: clamps overshoot above maxPhysical to maxLogical (large)', () => {
+        // macOS rubber-band can briefly push scrollTop above maxPhysical.
+        // Without the clamp, the scaled value exceeds maxLogical and
+        // visibleRange would return an empty window.
+        expect(logicalScrollTop(maxPhysical * 1.1, LARGE, VH, RH))
+            .toBe(maxLogicalLarge);
+    });
+
+    test('logicalScrollTop: clamps negative scrollTop to 0 (large)', () => {
+        // Defensive: Chromium shouldn't report negative scrollTop, but the
+        // clamp removes the assumption.
+        expect(logicalScrollTop(-50, LARGE, VH, RH)).toBe(0);
+    });
+
+    test('logicalScrollTop: clamps negative scrollTop to 0 (small)', () => {
+        // The small-data fast path also clamps now, so a stray negative
+        // scrollTop never propagates to visibleRange's floor() math.
+        expect(logicalScrollTop(-50, SMALL, VH, RH)).toBe(0);
+    });
+
+    test('logicalScrollTop: clamps positive overshoot in small data to maxLogicalSmall', () => {
+        // The small-data branch also clamps overshoot. macOS rubber-band
+        // can briefly push scrollTop above maxLogicalSmall; without the
+        // clamp, visibleRange would read past the end of the dataset.
+        const maxLogicalSmall = SMALL + RH - VH;
+        expect(logicalScrollTop(maxLogicalSmall * 1.1, SMALL, VH, RH))
+            .toBe(maxLogicalSmall);
+    });
+
+    test('visibleRange after clamped overshoot still includes the last row', () => {
+        const nrow = 10_000_000;
+        const totalGridHeight = nrow * RH;
+        // Simulate rubber-band overshoot: scrollTop 10% past maxPhysical.
+        const logical = logicalScrollTop(maxPhysical * 1.1, totalGridHeight, VH, RH);
+        const range = visibleRange({
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 8,
+        });
+        // Without the clamp, logical exceeds maxLogical, range.start exceeds
+        // nrow, and range.end (clamped at nrow) ends up < range.start — an
+        // empty window that blanks the grid. The clamp keeps start < end.
+        expect(range.start).toBeLessThan(range.end);
         expect(range.end).toBe(nrow);
     });
 });
@@ -270,5 +320,91 @@ describe('formatCell', () => {
     test('truncated cell shows truncation indicator', () => {
         expect(formatCell({ _: 'trunc', v: 'long…' }, undefined, undefined, false, false, 3))
             .toEqual({ text: 'long…', missing: false });
+    });
+});
+
+describe('custom scrollbar math', () => {
+    const VH = 600;
+    const RH = 24;
+    const TRACK = VH - HORIZONTAL_GUTTER_PX;  // 588
+
+    test('customThumbHeight: tiny dataset → full track', () => {
+        // 5 rows fit in the track many times over → thumb fills track.
+        expect(customThumbHeight(TRACK, RH, 5)).toBe(TRACK);
+    });
+    test('customThumbHeight: large dataset → MIN_THUMB_PX floor', () => {
+        // 10M rows on 600 px viewport: proportional thumb ≈ 0.0015 px.
+        // Clamped up to MIN_THUMB_PX.
+        expect(customThumbHeight(TRACK, RH, 10_000_000)).toBe(MIN_THUMB_PX);
+    });
+    test('customThumbHeight: mid-size proportional', () => {
+        // 100 rows: visibleCount = ceil(588/24) = 25.
+        // proportional = 588 * (25/100) = 147. Above MIN_THUMB.
+        expect(customThumbHeight(TRACK, RH, 100)).toBeCloseTo(147);
+    });
+    test('customThumbHeight: nrow === 0 → full track', () => {
+        expect(customThumbHeight(TRACK, RH, 0)).toBe(TRACK);
+    });
+    test('customThumbHeight: rowHeight === 0 → full track', () => {
+        expect(customThumbHeight(TRACK, 0, 1000)).toBe(TRACK);
+    });
+    test('customThumbHeight: trackHeight === 0 → 0', () => {
+        expect(customThumbHeight(0, RH, 1000)).toBe(0);
+    });
+    test('customThumbHeight: trackHeight < MIN_THUMB_PX → trackHeight', () => {
+        // 20-px track gets a 20-px thumb, not a 30-px overflowing one.
+        expect(customThumbHeight(20, RH, 10_000_000)).toBe(20);
+    });
+
+    test('customThumbTop: scrollTop=0 → 0', () => {
+        const th = customThumbHeight(TRACK, RH, 10_000_000);
+        expect(customThumbTop(0, TRACK, th, 14_999_424)).toBe(0);
+    });
+    test('customThumbTop: scrollTop=maxPhysical → trackHeight - thumbHeight', () => {
+        const th = customThumbHeight(TRACK, RH, 10_000_000);
+        const maxPhysical = 14_999_424;
+        expect(customThumbTop(maxPhysical, TRACK, th, maxPhysical))
+            .toBeCloseTo(TRACK - th);
+    });
+    test('customThumbTop: midpoint → midpoint', () => {
+        const th = customThumbHeight(TRACK, RH, 10_000_000);
+        const maxPhysical = 14_999_424;
+        expect(customThumbTop(maxPhysical / 2, TRACK, th, maxPhysical))
+            .toBeCloseTo((TRACK - th) / 2);
+    });
+    test('customThumbTop: maxPhysical <= 0 → 0', () => {
+        expect(customThumbTop(100, TRACK, MIN_THUMB_PX, 0)).toBe(0);
+        expect(customThumbTop(100, TRACK, MIN_THUMB_PX, -10)).toBe(0);
+    });
+    test('customThumbTop: thumbHeight >= trackHeight → 0', () => {
+        // Whole track is thumb; nothing to scroll.
+        expect(customThumbTop(100, TRACK, TRACK, 14_999_424)).toBe(0);
+    });
+
+    test('customScrollTopFromThumbTop: thumbTop=0 → 0', () => {
+        expect(customScrollTopFromThumbTop(0, TRACK, MIN_THUMB_PX, 14_999_424))
+            .toBe(0);
+    });
+    test('customScrollTopFromThumbTop: thumbTop=trackUsable → maxPhysical', () => {
+        const th = MIN_THUMB_PX;
+        const maxPhysical = 14_999_424;
+        expect(customScrollTopFromThumbTop(TRACK - th, TRACK, th, maxPhysical))
+            .toBeCloseTo(maxPhysical);
+    });
+    test('customScrollTopFromThumbTop: round-trip with customThumbTop', () => {
+        const th = customThumbHeight(TRACK, RH, 10_000_000);
+        const maxPhysical = 14_999_424;
+        for (const scrollTop of [0, 1234, maxPhysical / 3, maxPhysical / 2,
+                                 maxPhysical * 0.99, maxPhysical]) {
+            const top = customThumbTop(scrollTop, TRACK, th, maxPhysical);
+            const back = customScrollTopFromThumbTop(top, TRACK, th, maxPhysical);
+            expect(back).toBeCloseTo(scrollTop);
+        }
+    });
+    test('customScrollTopFromThumbTop: maxPhysical <= 0 → 0', () => {
+        expect(customScrollTopFromThumbTop(100, TRACK, MIN_THUMB_PX, 0)).toBe(0);
+    });
+    test('customScrollTopFromThumbTop: trackUsable <= 0 → 0', () => {
+        expect(customScrollTopFromThumbTop(100, TRACK, TRACK, 14_999_424)).toBe(0);
     });
 });

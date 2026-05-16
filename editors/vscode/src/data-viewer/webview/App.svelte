@@ -11,11 +11,13 @@
     import {
         visibleRange, coalesceScroll,
         cappedScrollHeight, logicalScrollTop, visualOffsetPx,
+        MAX_SCROLL_PX, HORIZONTAL_GUTTER_PX,
     } from './grid-model';
     import { RowCache } from './row-cache';
     import { Selection } from './selection-model';
     import { formatCell } from './cell-render';
     import Toolbar from './Toolbar.svelte';
+    import CustomScrollbar from './CustomScrollbar.svelte';
     type PersistedState = {
         panelGeneration: number;
         nrow: number;
@@ -103,6 +105,7 @@
             .filter(i => !hiddenSet.has(i)),
     );
     const totalGridHeight = $derived(nrow * ROW_HEIGHT);
+    const useCustomScrollbar = $derived(totalGridHeight > MAX_SCROLL_PX);
     /** Width of the sticky row-number column, sized to fit the widest row number. */
     const rowColWidth = $derived(`calc(${String(Math.max(1, nrow)).length}ch + 16px)`);
 
@@ -122,6 +125,8 @@
             nrow,
             columns: columns.length,
             visibleRows: visibleRows.length,
+            visibleRangeStart,
+            visibleRangeEnd: visibleRangeStart + visibleRows.length,
             timestamp: Date.now(),
         });
     }
@@ -152,6 +157,62 @@
                 case 'copyDone':
                     applyCopyDone(m);
                     return;
+                case 'testKey':
+                    // Test-only: dispatch a synthetic KeyboardEvent on
+                    // `window` so the same onKeyDown handler a real
+                    // keypress would invoke runs end-to-end. The
+                    // <svelte:window onkeydown={onKeyDown}> binding
+                    // listens at the window level, so window.dispatchEvent
+                    // is the canonical delivery path for synthetic events.
+                    window.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: m.key,
+                        code: m.key,
+                        bubbles: true,
+                        cancelable: true,
+                    }));
+                    return;
+                case 'testScrollbarDrag': {
+                    // Test-only: dispatch synthetic pointerdown/move/up
+                    // events on the thumb element so the same drag
+                    // handlers a real user pointer would invoke run
+                    // end-to-end. pointerId 999 avoids colliding with
+                    // any real mouse pointer (Chromium primary mouse is
+                    // pointerId 1).
+                    const fraction = Math.max(0, Math.min(1, m.fraction));
+                    const thumb = document.querySelector('[data-test-id="custom-scrollbar-thumb"]');
+                    if (!(thumb instanceof HTMLElement)) return;
+                    const trackEl = thumb.parentElement;
+                    if (!(trackEl instanceof HTMLElement)) return;
+                    const trackHeight = Math.max(0, viewportHeight - HORIZONTAL_GUTTER_PX);
+                    const thumbRect = thumb.getBoundingClientRect();
+                    const trackRect = trackEl.getBoundingClientRect();
+                    const thumbHeightPx = thumbRect.height;
+                    // Current thumb center.
+                    const centerX = thumbRect.left + thumbRect.width / 2;
+                    const startY = thumbRect.top + thumbRect.height / 2;
+                    // Target thumb-top, then target Y for the pointer
+                    // (we want the pointer to end up such that thumb's
+                    // top lands at fraction*(trackHeight - thumbHeight)).
+                    const targetThumbTop = fraction * Math.max(0, trackHeight - thumbHeightPx);
+                    const targetY = trackRect.top + targetThumbTop + thumbHeightPx / 2;
+                    const opts = {
+                        pointerId: 999,
+                        pointerType: 'mouse',
+                        bubbles: true,
+                        cancelable: true,
+                        button: 0,
+                    } as const;
+                    thumb.dispatchEvent(new PointerEvent('pointerdown', {
+                        ...opts, clientX: centerX, clientY: startY,
+                    }));
+                    thumb.dispatchEvent(new PointerEvent('pointermove', {
+                        ...opts, clientX: centerX, clientY: targetY,
+                    }));
+                    thumb.dispatchEvent(new PointerEvent('pointerup', {
+                        ...opts, clientX: centerX, clientY: targetY,
+                    }));
+                    return;
+                }
             }
         };
         window.addEventListener('message', handler);
@@ -306,6 +367,11 @@
             visibleRows = [];
             visibleRangeStart = range.start;
             persistWebviewState();
+            // Tell the host every change to visibleRangeStart, including
+            // the empty-range case — otherwise the test API can stall on
+            // a stale range when nrow shrinks to 0 or the viewport
+            // collapses.
+            postLifecycle('empty-range');
             return;
         }
         const cached = rowCache.get(range.start, range.end);
@@ -313,6 +379,11 @@
             visibleRows = cached;
             visibleRangeStart = range.start;
             persistWebviewState();
+            // Without this, an End keypress that lands on a pre-cached
+            // window (e.g., re-pressing End after a scroll-up) would
+            // never tell the host its range changed, leaving the polling
+            // test stuck on a stale lastVisibleRange.
+            postLifecycle('cache-hit');
             return;
         }
         viewportGeneration += 1;
@@ -470,6 +541,52 @@
         if (e.key === 'Escape' && contextMenu) {
             closeContextMenu();
             return;
+        }
+        // Plain (no-modifier) navigation keys — added for issue #183.
+        // We deliberately ignore any modifier so platform shortcuts
+        // (Shift+End to extend selection, Cmd+End in some apps to jump-
+        // and-extend) fall through to the browser/OS unchanged. The
+        // viewportEl null guard handles the brief window between mount
+        // and the bind:this assignment.
+        //
+        // Skip when focus is on a form control: <select>, <input>,
+        // <textarea>, or a contenteditable element have their own native
+        // Home/End/PageUp/PageDown semantics (e.g. <select> jumps to the
+        // first/last option) that we'd otherwise hijack. The toolbar's
+        // digits <select> and the column-popover checkboxes are concrete
+        // examples.
+        const target = e.target;
+        const onFormControl = target instanceof HTMLElement && (
+            target.tagName === 'INPUT'
+            || target.tagName === 'SELECT'
+            || target.tagName === 'TEXTAREA'
+            || target.isContentEditable
+        );
+        if (!meta && !e.shiftKey && !e.altKey && !onFormControl && viewportEl) {
+            switch (e.key) {
+                case 'End':
+                    e.preventDefault();
+                    // scrollHeight - clientHeight is the canonical
+                    // browser-clamped maximum. The inner .grid div is
+                    // height-capped at MAX_SCROLL_PX + ROW_HEIGHT, so
+                    // this lands at or near the model's maxPhysical;
+                    // logicalScrollTop's clamp absorbs any DOM-vs-model
+                    // rounding mismatch.
+                    viewportEl.scrollTop = viewportEl.scrollHeight - viewportEl.clientHeight;
+                    return;
+                case 'Home':
+                    e.preventDefault();
+                    viewportEl.scrollTop = 0;
+                    return;
+                case 'PageDown':
+                    e.preventDefault();
+                    viewportEl.scrollTop += viewportEl.clientHeight;
+                    return;
+                case 'PageUp':
+                    e.preventDefault();
+                    viewportEl.scrollTop -= viewportEl.clientHeight;
+                    return;
+            }
         }
         if (meta && (e.key === 'a' || e.key === 'A')) {
             e.preventDefault();
@@ -782,20 +899,22 @@
     {#if copyStatus !== ''}
         <div class="toast toast-{copyStatus}">{copyStatusMsg}</div>
     {/if}
-    <div class="viewport"
-         role="grid"
-         aria-rowcount={nrow}
-         bind:this={viewportEl}
-         onscroll={onScroll}
-         tabindex="0">
-        <div class="grid" style="height: {cappedScrollHeight(totalGridHeight) + ROW_HEIGHT}px;">
-            <!-- Header row (sticky top) -->
-            <div class="header-row">
-                <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div class="cell header rowname-col corner-cell"
-                     style="width: {rowColWidth};"
-                     title="Select all"
-                     onpointerdown={onCornerPointerDown}>#</div>
+    <div class="viewport-wrapper">
+        <div class="viewport"
+             class:using-custom-scrollbar={useCustomScrollbar}
+             role="grid"
+             aria-rowcount={nrow}
+             bind:this={viewportEl}
+             onscroll={onScroll}
+             tabindex="0">
+            <div class="grid" style="height: {cappedScrollHeight(totalGridHeight) + ROW_HEIGHT}px;">
+                <!-- Header row (sticky top) -->
+                <div class="header-row">
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <div class="cell header rowname-col corner-cell"
+                         style="width: {rowColWidth};"
+                         title="Select all"
+                         onpointerdown={onCornerPointerDown}>#</div>
                 {#each visibleCols as colIdx (colIdx)}
                     {@const col = columns[colIdx]}
                     <div class="cell header col-header
@@ -865,6 +984,19 @@
                 {/each}
             </div>
         </div>
+    </div>
+    {#if useCustomScrollbar}
+        <CustomScrollbar
+            trackHeight={Math.max(0, viewportHeight - HORIZONTAL_GUTTER_PX)}
+            scrollTop={scrollTop}
+            nrow={nrow}
+            rowHeight={ROW_HEIGHT}
+            maxPhysical={MAX_SCROLL_PX + ROW_HEIGHT - viewportHeight}
+            onScrollTo={(newScrollTop) => {
+                if (viewportEl) viewportEl.scrollTop = newScrollTop;
+            }}
+        />
+    {/if}
     </div>
     {#if contextMenu}
         <div class="context-menu"

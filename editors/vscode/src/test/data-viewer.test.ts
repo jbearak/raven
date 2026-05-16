@@ -31,6 +31,25 @@ async function pollForPanel(
     return false;
 }
 
+/** Poll a predicate at 100 ms intervals until it returns a truthy value or
+ *  the deadline elapses. Returns the truthy value on success or `undefined`
+ *  on timeout (caller asserts). */
+async function pollFor<T>(
+    predicate: () => T | undefined,
+    timeoutMs: number,
+    intervalMs = 100,
+): Promise<T | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const value = predicate();
+        if (value) {
+            return value as T;
+        }
+        await sleep(intervalMs);
+    }
+    return undefined;
+}
+
 suite('data-viewer smoke tests', function (this: Mocha.Suite) {
     // Each test may need to wait for R startup + arrow write + HTTP round-trip.
     this.timeout(120000);
@@ -150,5 +169,138 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             after.includes('mtcars'),
             `"mtcars" panel must still be open after replace; panels: ${JSON.stringify(after)}`,
         );
+    });
+
+    test('End key reaches the last row in a 700K-row data frame', async function () {
+        // R startup + 700K rnorm + arrow write + scroll round-trip can run
+        // up against the suite's 120 s default when earlier suites have put
+        // the runner under load. Give this test its own larger budget so
+        // it isn't flaky on slow CI runners.
+        this.timeout(240000);
+
+        // Smallest size that engages the cap (700_000 × 24 = 16.8 M >
+        // MAX_SCROLL_PX of 15 M) — exactly the failure mode from #183.
+        const N = 700_000;
+
+        await api.sendToRTerminal(
+            `big <- as.data.frame(matrix(rnorm(${N} * 5), `
+            + `nrow = ${N}, ncol = 5)); View(big)`,
+        );
+
+        // Wait for the panel to exist. R startup + matrix rnorm + Arrow
+        // write can take several seconds on a cold runner; allow extra
+        // headroom for slow CI.
+        const panelAppeared = await pollForPanel(api, 'big', 90000);
+        assert.ok(panelAppeared, 'panel "big" did not appear within 90 s');
+
+        // Reset scroll to the top before the End test. A previous --watch
+        // run could have left the same-shape panel scrolled to the bottom;
+        // applyInitOrReplace's sameDataset branch intentionally preserves
+        // visibleRangeStart, so an unconditional 'end < N/2' gate would
+        // deadlock on that. Pressing Home first makes the readiness gate
+        // robust regardless of prior state.
+        //
+        // Note: this is NOT a positive test for Home — a fresh panel's
+        // initial fetch lands at the top regardless of whether Home does
+        // anything, so the gate below is satisfied either way. It's
+        // strictly a deterministic-reset step for the End test.
+        await api.pressDataViewerKey('big', 'Home');
+
+        // Wait for the Home reset to land AND rows for the top of the
+        // grid to be fetched. A mount/init lifecycle reports
+        // {start: 0, end: 0}, which would satisfy 'end < N/2' alone — so
+        // require end > 0 too.
+        const topRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            return r && r.end > 0 && r.end < N / 2 ? r : undefined;
+        }, 60000);
+        assert.ok(topRange,
+            `Home reset did not land at the top within 60 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
+
+        // Drive End and wait for the bottom-row fetch to land.
+        await api.pressDataViewerKey('big', 'End');
+
+        const bottomRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            return r && r.end === N ? r : undefined;
+        }, 60000);
+        assert.ok(bottomRange,
+            `End key did not reach the last row within 60 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
+    });
+
+    test('Drag scrollbar to bottom reaches last row in 700K-row data frame', async function () {
+        // R startup + 700K rnorm + arrow write + scroll round-trip can
+        // run up against the suite's 120 s default when earlier suites
+        // have put the runner under load.
+        this.timeout(240000);
+        const N = 700_000;
+
+        // Reuse the panel from the End-key test if still open;
+        // otherwise the prior test created and left it in place.
+        if (!api.getDataViewerPanelNames().includes('big')) {
+            await api.sendToRTerminal(
+                `big <- as.data.frame(matrix(rnorm(${N} * 5), `
+                + `nrow = ${N}, ncol = 5)); View(big)`,
+            );
+            const appeared = await pollForPanel(api, 'big', 90000);
+            assert.ok(appeared, 'panel "big" did not appear within 90 s');
+        }
+
+        // Reset to top, wait for steady state.
+        await api.pressDataViewerKey('big', 'Home');
+        const topRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            return r && r.end > 0 && r.end < N / 2 ? r : undefined;
+        }, 60000);
+        assert.ok(topRange,
+            `pre-drag Home reset did not land at the top within 60 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
+
+        // Drag the scrollbar thumb to the bottom.
+        await api.dragDataViewerScrollbar('big', 1.0);
+
+        const bottomRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            return r && r.end === N ? r : undefined;
+        }, 60000);
+        assert.ok(bottomRange,
+            `Drag-to-bottom did not reach the last row within 60 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
+    });
+
+    test('Drag scrollbar to 50% lands near row N/2 in 700K-row data frame', async function () {
+        this.timeout(240000);
+        const N = 700_000;
+
+        if (!api.getDataViewerPanelNames().includes('big')) {
+            await api.sendToRTerminal(
+                `big <- as.data.frame(matrix(rnorm(${N} * 5), `
+                + `nrow = ${N}, ncol = 5)); View(big)`,
+            );
+            const appeared = await pollForPanel(api, 'big', 90000);
+            assert.ok(appeared, 'panel "big" did not appear within 90 s');
+        }
+
+        await api.pressDataViewerKey('big', 'Home');
+        const topRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            return r && r.end > 0 && r.end < N / 2 ? r : undefined;
+        }, 60000);
+        assert.ok(topRange);
+
+        await api.dragDataViewerScrollbar('big', 0.5);
+
+        const midRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange('big');
+            if (!r) return undefined;
+            // Allow a generous 10 % band around N/2 — the exact value
+            // depends on thumb-height / track-usable arithmetic.
+            return r.start >= 0.40 * N && r.start <= 0.60 * N ? r : undefined;
+        }, 60000);
+        assert.ok(midRange,
+            `Drag-to-50% did not land near N/2 within 60 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
     });
 });

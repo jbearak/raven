@@ -83,6 +83,32 @@ export type ExtensionToWebview =
         type: 'error';
         panelGeneration: number;
         message: string;
+    }
+    | {
+        /** Test-only: dispatch a synthetic KeyboardEvent on `window` from
+         *  inside the webview, so the integration test harness can drive
+         *  the same onKeyDown handler a real keypress would invoke.
+         *  Production code paths never post this message; the webview can
+         *  only receive messages from its own extension host, so exposing
+         *  it does not introduce an external attack surface. */
+        type: 'testKey';
+        panelGeneration: number;
+        key: string;
+    }
+    | {
+        /** Test-only: drive a custom-scrollbar drag-to-fraction (0..1)
+         *  by dispatching synthetic pointerdown/move/up events on the
+         *  thumb element. fraction=0 jumps to top, fraction=1 jumps to
+         *  bottom. The webview computes the target thumbTop, then fires
+         *  the events to exercise the real pointer handlers (drag
+         *  offset capture, drag math, cleanup).
+         *
+         *  Production code paths never post this message; the webview
+         *  can only receive messages from its own extension host, so
+         *  exposing it does not introduce an external attack surface. */
+        type: 'testScrollbarDrag';
+        panelGeneration: number;
+        fraction: number;
     };
 
 export type WebviewToExtension =
@@ -96,6 +122,13 @@ export type WebviewToExtension =
         nrow: number;
         columns: number;
         visibleRows: number;
+        /** Start row index of the currently rendered window (inclusive).
+         *  Used by the test API to verify scroll position. Always reflects
+         *  visibleRangeStart at the moment postLifecycle was called. */
+        visibleRangeStart: number;
+        /** End row index of the currently rendered window (exclusive).
+         *  Equal to visibleRangeStart + visibleRows. */
+        visibleRangeEnd: number;
         timestamp: number;
     }
     | {
