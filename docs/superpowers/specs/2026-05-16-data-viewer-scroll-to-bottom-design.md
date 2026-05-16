@@ -49,10 +49,11 @@ Goals:
 
 Non-goals for this change:
 
-- A custom overlay scrollbar that bypasses the native widget. (The issue lists
-  it as an option; out of scope here. Once End/Home/PageUp/PageDown work, the
-  remaining "drag the pill to the bottom" gap is a UX nice-to-have, not a
-  blocker.)
+- A custom overlay scrollbar that bypasses the native widget. (See "Known
+  limitations" — the native-drag-to-bottom symptom from the issue is
+  *partially* unresolved by this change. End-key support fully addresses
+  the keyboard / programmatic case; dragging the scrollbar pill is a
+  separate fix that lives outside this PR.)
 - Sort/filter/search semantics. Unrelated.
 - Adjusting `MAX_SCROLL_PX`. The issue notes this trades resolution for thumb
   size with non-trivial side effects — out of scope until a custom scrollbar
@@ -94,8 +95,11 @@ api.getDataViewerPanelVisibleRange  →     poll until end === nrow
 ### 1. Keyboard shortcuts in `App.svelte`
 
 Add Home / End / PageUp / PageDown branches to `onKeyDown`, **before** the
-existing Cmd-A / Cmd-C branches so the new keys win when no modifier is
-pressed:
+existing Cmd-A / Cmd-C branches. Each branch fires only when no modifier is
+pressed (`!e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey`) so platform
+shortcuts like `Cmd-End` (extend selection in some apps) don't get hijacked
+into "scroll to last row" — that combination falls through unchanged for the
+browser/OS to handle:
 
 - `End` → `viewportEl.scrollTop = viewportEl.scrollHeight - viewportEl.clientHeight`
 - `Home` → `viewportEl.scrollTop = 0`
@@ -109,43 +113,58 @@ render).
 
 The existing `onScroll` handler does the rest — we don't bypass
 `scheduleFetchVisible` or call `visibleRange` directly. The inner `.grid` div
-is already height-capped at `MAX_SCROLL_PX`, so `scrollHeight - clientHeight`
-yields exactly `maxPhysical`, which after the existing `logicalScrollTop`
-remap drives `visibleRange.end === nrow` — the bottom-row math already
-verified by `tests/bun/data-viewer-grid-model.test.ts` ("bottom: max
-scrollTop reaches the last row").
+is height-capped at `MAX_SCROLL_PX + ROW_HEIGHT`, so
+`scrollHeight - clientHeight` lands at or near the model's `maxPhysical`. The
+two values can differ slightly under sub-pixel layout rounding or when a
+horizontal scrollbar reduces `clientHeight`; the new `logicalScrollTop` clamp
+(below) absorbs the difference so `visibleRange.end` still resolves to
+`nrow`.
 
 A doc comment on the new branches notes that `scrollHeight - clientHeight`
 is the canonical browser-clamped maximum and works regardless of the
-container's content height.
+container's content height; the clamp in `logicalScrollTop` makes the math
+robust to any DOM-vs-model rounding mismatch.
 
 ### 2. Clamp `logicalScrollTop` in `grid-model.ts`
 
-The current implementation:
+Both branches of `logicalScrollTop` get a clamp. The current implementation:
 
 ```typescript
+if (totalGridHeight <= MAX_SCROLL_PX) return scrollTop;
+const maxPhysical = MAX_SCROLL_PX + rowHeight - viewportHeight;
+if (maxPhysical <= 0) return 0;
+const maxLogical = totalGridHeight + rowHeight - viewportHeight;
 return (scrollTop / maxPhysical) * maxLogical;
 ```
 
 becomes:
 
 ```typescript
+const maxLogicalSmall = Math.max(0, totalGridHeight + rowHeight - viewportHeight);
+if (totalGridHeight <= MAX_SCROLL_PX) {
+    return Math.max(0, Math.min(maxLogicalSmall, scrollTop));
+}
+const maxPhysical = MAX_SCROLL_PX + rowHeight - viewportHeight;
+if (maxPhysical <= 0) return 0;
+const maxLogical = totalGridHeight + rowHeight - viewportHeight;
 const scaled = (scrollTop / maxPhysical) * maxLogical;
 return Math.max(0, Math.min(maxLogical, scaled));
 ```
 
-Without the clamp, a macOS rubber-band overshoot (`scrollTop > maxPhysical`)
-maps to `logical > maxLogical`. `visibleRange` then computes
-`start = floor(logical / rowHeight) - overscan`, which may exceed `nrow`,
-and the resulting range is empty. With the clamp, `logical` saturates at
-`maxLogical`, `visibleRange.end` stays at `nrow`, and the bottom row keeps
-rendering through the bounce.
+Without a clamp on the large path, a macOS rubber-band overshoot
+(`scrollTop > maxPhysical`) maps to `logical > maxLogical`. `visibleRange`
+then computes `start = floor(logical / rowHeight) - overscan`, which may
+exceed `nrow`, and the resulting range is empty. With the clamp, `logical`
+saturates at `maxLogical`, `visibleRange.end` stays at `nrow`, and the
+bottom row keeps rendering through the bounce.
 
-The clamp is also defensive against negative `scrollTop` values — Chromium
-shouldn't report them, but the clamp removes the assumption.
+Clamping the small-data fast path is defensive: Chromium shouldn't report
+`scrollTop < 0` or `scrollTop > totalGridHeight - viewportHeight` in normal
+flow, but rubber-band overshoot has been observed to do so under macOS
+elastic scroll, and the cost of the clamp is two `Math.min/max` calls.
 
-The function's existing doc comment is extended with a one-line note
-explaining the clamp's purpose.
+The function's existing doc comment is extended with a note explaining the
+clamp's purpose.
 
 ## Test surface
 
@@ -215,6 +234,17 @@ exercising the same code path a user keypress would.
 `postLifecycle(event)` is updated to include `visibleRangeStart` and
 `visibleRangeEnd: visibleRangeStart + visibleRows.length`.
 
+`scheduleFetchVisible` currently posts a lifecycle event from `applyRows`
+but **not** from its own cache-hit fast path (where rows come from
+`rowCache.get`). Without a fix, an `End` keypress that lands on a
+pre-cached window — e.g., re-pressing `End` after a brief scroll-up — would
+update `visibleRangeStart` in the webview but never tell the host, leaving
+the polling test stuck on a stale range. Add `postLifecycle('cache-hit')`
+to the cache-hit branch so every change to `visibleRangeStart` is
+observable from the host. The same call goes in the empty-range branch so
+the host sees a `{start, end}` even when the visible window is empty (e.g.,
+`nrow === 0`).
+
 ### `panel.ts`
 
 `DataViewerPanel` gains:
@@ -228,8 +258,11 @@ exercising the same code path a user keypress would.
   queued, not for a reply; the test polls `getVisibleRange` after.
 
 The lifecycle handler in `handleInner` (which today only traces the event)
-extends to also update `lastVisibleRange` from the now-required
-`visibleRangeStart` / `visibleRangeEnd` fields. `lastVisibleRange` is
+extends to also update `lastVisibleRange`. Because `panel.ts` is the
+extension-side trust boundary for messages from the webview, the handler
+narrows defensively: it only writes `lastVisibleRange` when both
+`m.visibleRangeStart` and `m.visibleRangeEnd` are finite numbers, leaving
+the previous value (or `undefined`) otherwise. `lastVisibleRange` is
 cleared on `replace()` so a stale range from the previous dataset is never
 returned for the new one.
 
@@ -267,35 +300,48 @@ Each delegates to the manager.
 Add one test to `editors/vscode/src/test/data-viewer.test.ts`:
 
 ```text
-test('End key reaches the last row in a 1M-row data frame', async () => {
+test('End key reaches the last row in a 700K-row data frame', async () => {
+    const N = 700_000;
     await api.sendToRTerminal(
-        'big <- as.data.frame(matrix(rnorm(1e6 * 5), nrow = 1e6, ncol = 5)); View(big)'
+        `big <- as.data.frame(matrix(rnorm(${N} * 5), nrow = ${N}, ncol = 5)); View(big)`
     );
     // poll until panel "big" exists
-    // poll until visibleRange is reported (initial fetch landed)
+    // poll until lastVisibleRange has end > start AND end < N (the
+    //   initial fetch landed for rows near the top, and the panel has
+    //   reached steady state — not just a mount/init lifecycle with
+    //   visibleRows === 0)
     await api.pressDataViewerKey('big', 'End');
-    // poll until visibleRange.end === 1_000_000
+    // poll until lastVisibleRange.end === N (the bottom-row fetch arrived)
 });
 ```
 
-`1_000_000 rows × 5 cols` is `~38 MB` of doubles; well below the cap and
-small enough that R can compute and write it in a few seconds. The suite
-already runs at a 120 s timeout. The test inherits the same R-availability
-and `arrow`-package-availability skips the existing tests use.
+`700_000 rows × 5 cols` is `~28 MB` of doubles, the smallest size that
+engages the cap (`700_000 × 24 = 16.8 M > MAX_SCROLL_PX`) — exactly the
+failure mode from the issue. R can compute and write it in a few seconds.
+The suite already runs at a 120 s timeout. The test inherits the same
+R-availability and `arrow`-package-availability skips the existing tests
+use.
 
-`1 M rows × 24 px = 24 M px > MAX_SCROLL_PX (15 M)`, so the cap is engaged
-and the remap is exercised — exactly the failure mode from the issue.
+The readiness gate ("end > start AND end < N") deliberately distinguishes
+the post-init steady state (rows fetched near the top) from the
+post-`End` state (rows fetched near the bottom). Without this gate the
+test could observe `lastVisibleRange` from the very first lifecycle event
+posted by the `init` handler, where `visibleRows.length === 0` — and the
+subsequent `End` key would race the initial row fetch.
 
 ### Bun unit tests
 
-Three additions to the existing `'scroll height capping'` group in
+Four additions to the existing `'scroll height capping'` group in
 `tests/bun/data-viewer-grid-model.test.ts`:
 
-- `logicalScrollTop: clamps overshoot above maxPhysical to maxLogical` —
+- `logicalScrollTop: clamps overshoot above maxPhysical to maxLogical (large)` —
   `logicalScrollTop(maxPhysical * 1.1, LARGE, VH, RH)` should equal
   `maxLogicalLarge` exactly.
-- `logicalScrollTop: clamps negative scrollTop to 0` — `logicalScrollTop(-50,
-  LARGE, VH, RH)` should equal `0`.
+- `logicalScrollTop: clamps negative scrollTop to 0 (large)` —
+  `logicalScrollTop(-50, LARGE, VH, RH)` should equal `0`.
+- `logicalScrollTop: clamps negative scrollTop to 0 (small)` —
+  `logicalScrollTop(-50, SMALL, VH, RH)` should equal `0` (the small-data
+  fast path now clamps too).
 - `visibleRange after clamped overshoot still includes the last row` —
   round-trip test asserting `end === nrow` even with an overshooting
   `scrollTop`.
@@ -313,29 +359,78 @@ pass unchanged (clamping at `maxLogical` is a no-op for the in-range case).
 > - `Cmd/Ctrl-C` — copy the current selection as TSV.
 
 Per AGENTS.md ("prefer code comments over Learnings entries"), the invariants
-that pin behavior — that `End` uses `scrollHeight - clientHeight` to reach
-exactly `maxPhysical`, and that `logicalScrollTop` clamps overshoot — go in
-doc comments on the relevant code, not in `AGENTS.md`.
+that pin behavior — that `End` sets `scrollTop = scrollHeight - clientHeight`
+(the canonical browser-clamped bottom), and that `logicalScrollTop` clamps
+overshoot/undershoot to `[0, maxLogical]` so any DOM-vs-model rounding still
+lands on the last row — go in doc comments on the relevant code, not in
+`AGENTS.md`.
 
 ## Open questions
 
 None — the fix is small enough and the protocol extension narrow enough that
 the design is fully determined by the existing code.
 
+## What the mocha test does and does not prove
+
+The `testKey` mechanism dispatches a synthetic `KeyboardEvent` against
+`window` from inside the webview's iframe. That reaches the
+`<svelte:window onkeydown={onKeyDown}>` listener and exercises the full
+`onKeyDown` → `viewportEl.scrollTop = …` → `onScroll` → `scheduleFetchVisible`
+→ `getRows` → `applyRows` → `postLifecycle('rows')` pipeline.
+
+It does **not** exercise:
+
+- VS Code's parent-window → iframe key forwarding.
+- Iframe focus acquisition (we already pull focus on mount via
+  `focusViewport()`, but this isn't tested here).
+- Chromium's default behavior for End / Home / PageUp / PageDown on a
+  focused scrollable element — the synthetic event fires our handler
+  *after* the browser would have its turn at a real key event.
+
+Those are the legitimate pieces of the keyboard pipeline that an
+extension-host integration test fundamentally can't reach. The synthetic
+mechanism is the closest a mocha test can get without spawning a UI
+automation driver. A regression in any of the un-covered layers (focus
+loss, key forwarding) would be caught by manual testing or higher-level
+end-to-end harnesses, not this test.
+
+## Known limitations / partially-resolved part of #183
+
+Issue #183's first listed failure mode — "dragging the scrollbar pill to
+the very bottom" — is **not** addressed by this PR. The browser's minimum
+thumb size compresses the bottom of the drag track, so even with the
+clamp in place the pill cannot map a drag to `scrollTop = maxPhysical`.
+Closing this gap requires a custom overlay scrollbar (issue option 1) and
+is tracked as a follow-up rather than rolled into this change.
+
+The new `End` key gives users a deterministic way to reach the last row
+in the meantime, and the clamp ensures the grid no longer blanks during
+elastic-scroll overshoot. Pointer wheel and `ArrowDown` continue to work
+within the native scrollbar's range (which is the same as before this PR).
+
 ## Risks
 
-- **Mocha test runtime.** R startup + 1 M-row matrix construction +
-  Arrow write can take 5–10 s on slow machines. The 120 s suite timeout has
+- **Mocha test runtime.** R startup + 700 K-row matrix construction +
+  Arrow write can take 5–8 s on slow machines. The 120 s suite timeout has
   ample headroom, but the new test extends total suite runtime by roughly
   that amount. Acceptable; the existing `View(mtcars)` tests already pay R
-  startup cost once.
+  startup cost once. If timing becomes flaky on slower CI runners, the
+  test can be split into its own describe block with a tighter
+  per-test timeout, or moved behind a `RAVEN_RUN_LARGE_TESTS` env-gate.
 - **Synthetic `KeyboardEvent` reaching `<svelte:window onkeydown>`.** In
   Svelte 5, `<svelte:window>` attaches a window-level listener;
   `window.dispatchEvent` is the documented way to deliver synthetic events
   to such listeners and is verified by Chromium. If the binding ever moves
-  off `window`, the test handler must move with it.
+  off `window`, the test handler must move with it. See "What the mocha
+  test does and does not prove" for what this synthetic path covers.
 - **`testKey` discoverability.** A future contributor could call this from
   production code. Mitigation: the doc comment marks it test-only and the
   branch is the only `testKey` consumer; a lint/grep check at PR time would
   catch new callers, but no automated guard is added (the surface is
   small).
+- **Lifecycle event volume.** Adding a `postLifecycle('cache-hit')` to
+  `scheduleFetchVisible` increases the rate of lifecycle messages by one
+  per cached scroll. Lifecycle handling is trace-only on the host side
+  (no I/O, no state writes besides `lastVisibleRange`), and
+  `scheduleFetchVisible` is already coalesced at 16 ms, so the worst
+  case is one extra message per coalesce window — negligible.
