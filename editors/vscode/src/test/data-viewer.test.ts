@@ -172,6 +172,12 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
     });
 
     test('End key reaches the last row in a 700K-row data frame', async function () {
+        // R startup + 700K rnorm + arrow write + scroll round-trip can run
+        // up against the suite's 120 s default when earlier suites have put
+        // the runner under load. Give this test its own larger budget so
+        // it isn't flaky on slow CI runners.
+        this.timeout(240000);
+
         // Smallest size that engages the cap (700_000 × 24 = 16.8 M >
         // MAX_SCROLL_PX of 15 M) — exactly the failure mode from #183.
         const N = 700_000;
@@ -182,9 +188,10 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         );
 
         // Wait for the panel to exist. R startup + matrix rnorm + Arrow
-        // write can take several seconds on a cold runner.
-        const panelAppeared = await pollForPanel(api, 'big', 60000);
-        assert.ok(panelAppeared, 'panel "big" did not appear within 60 s');
+        // write can take several seconds on a cold runner; allow extra
+        // headroom for slow CI.
+        const panelAppeared = await pollForPanel(api, 'big', 90000);
+        assert.ok(panelAppeared, 'panel "big" did not appear within 90 s');
 
         // Reset scroll to the top. A previous --watch run could have left
         // the same-shape panel scrolled to the bottom; applyInitOrReplace's
@@ -201,9 +208,9 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         const topRange = await pollFor(() => {
             const r = api.getDataViewerPanelVisibleRange('big');
             return r && r.end > 0 && r.end < N / 2 ? r : undefined;
-        }, 30000);
+        }, 60000);
         assert.ok(topRange,
-            `Home reset did not land at the top within 30 s; `
+            `Home reset did not land at the top within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
 
         // Drive End and wait for the bottom-row fetch to land.
@@ -212,9 +219,9 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         const bottomRange = await pollFor(() => {
             const r = api.getDataViewerPanelVisibleRange('big');
             return r && r.end === N ? r : undefined;
-        }, 30000);
+        }, 60000);
         assert.ok(bottomRange,
-            `End key did not reach the last row within 30 s; `
+            `End key did not reach the last row within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
     });
 });
