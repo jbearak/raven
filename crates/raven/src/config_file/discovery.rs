@@ -13,6 +13,12 @@ pub enum DiscoveredConfig {
 /// Walk upward from `start` (inclusive) toward the filesystem root, returning
 /// the first `raven.toml` found. If none is found, return the first `.lintr`
 /// found on the same walk. Walks at most `MAX_DEPTH` levels.
+///
+/// The walk is **lexical**: it consults `Path::parent` without canonicalizing
+/// symlinks, so opening a symlinked workspace searches the link's parent
+/// chain rather than the real parent chain. Infinite loops are impossible
+/// because of the `MAX_DEPTH` bound, but if a user reports surprising
+/// discovery behavior across symlinks, the canonicalize-once fix lives here.
 const MAX_DEPTH: usize = 32;
 
 pub fn find_config(start: &Path) -> DiscoveredConfig {

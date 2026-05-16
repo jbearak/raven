@@ -79,6 +79,12 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "completion",
 ];
 
+/// Known leaves under `[linting]`. **Hand-maintained**: when adding a new
+/// `raven.linting.*` setting, update this list AND the schema in
+/// `editors/vscode/src/initializationOptions.ts` AND the parser in
+/// `crates/raven/src/backend.rs::parse_lint_config`. Forgetting the list
+/// here causes a spurious "unknown key" warning at load time; forgetting
+/// the parser causes the new setting to be silently ignored.
 const KNOWN_LINTING_KEYS: &[&str] = &[
     "enabled", "lineLength", "objectLength", "indentationUnit",
     "assignmentOperator", "stringDelimiter",
