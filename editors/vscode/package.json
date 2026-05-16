@@ -688,7 +688,7 @@
       {
         "id": "raven.getStarted",
         "title": "Get started with Raven for R Markdown",
-        "description": "Set up grammar, live preview, and run your first knit.",
+        "description": "Install the recommended sibling extensions and knit your first R Markdown document. Live preview is provided by Quarto (the sibling extension Raven recommends).",
         "steps": [
           {
             "id": "raven.getStarted.installQuarto",

@@ -12,21 +12,32 @@ import {
 /**
  * Watches editor activations for the first `.qmd` or `.Rmd` document
  * opened in a session and surfaces a one-time install info message.
- * Dismissal persists across sessions via `globalState`.
+ * Dismissal persists across sessions via `globalState`; in-session
+ * dismissal (including closing the toast with the X button) is tracked
+ * by `shownThisSession` so we don't re-fire every time the user
+ * switches editors.
  *
  * The message recommends grammar / LSP extensions only. It deliberately
  * does NOT promise Raven preview or render features — Raven defers
  * preview entirely to `quarto.quarto`.
  */
 export function registerInstallNags(context: vscode.ExtensionContext): void {
+    const shownThisSession = new Set<NagKey>();
+    const inFlight = new Set<NagKey>();
+
     const consider = (document: vscode.TextDocument | undefined): void => {
         if (!document) return;
         const key = nagStateForLanguageId(document.languageId);
         if (!key) return;
+        if (shownThisSession.has(key) || inFlight.has(key)) return;
         const isInstalled = (id: string): boolean =>
             vscode.extensions.getExtension(id) !== undefined;
         if (!shouldShowNag(context.globalState, key, isInstalled)) return;
-        void surfaceNag(context, key);
+        inFlight.add(key);
+        void surfaceNag(context, key).finally(() => {
+            inFlight.delete(key);
+            shownThisSession.add(key);
+        });
     };
 
     context.subscriptions.push(

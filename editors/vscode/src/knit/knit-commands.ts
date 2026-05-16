@@ -74,14 +74,15 @@ async function runKnitCommand(
         return;
     }
 
-    // Reject obviously-wrong inputs. The `when` clauses already filter
-    // the command palette, but a direct `executeCommand('raven.knit',
-    // uri)` from another extension or a keybinding could pass an
-    // arbitrary URI.
-    const ext = path.extname(docUri.fsPath || docUri.path).toLowerCase();
-    if (ext !== '.rmd') {
+    // Reject inputs that aren't file-backed `.Rmd` documents. Order
+    // matters: an untitled buffer with `languageId === 'rmd'` has a
+    // URI scheme of `untitled` and a path without an extension; we
+    // surface "save the file first" rather than the misleading
+    // "not a .Rmd file" message. The AGENTS.md "File-type tracking"
+    // learning calls this out specifically.
+    if (docUri.scheme !== 'file' && docUri.scheme !== 'vscode-remote') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit only runs on .Rmd files.',
+            'Save the file to disk before running Raven: Knit.',
         );
         return;
     }
@@ -98,9 +99,11 @@ async function runKnitCommand(
         return;
     }
 
-    if (docUri.scheme !== 'file' && docUri.scheme !== 'vscode-remote') {
+    // After the scheme check passes we know we have a file-backed URI.
+    const ext = path.extname(docUri.fsPath || docUri.path).toLowerCase();
+    if (ext !== '.rmd') {
         await vscode.window.showInformationMessage(
-            'Save the file to disk before running Raven: Knit.',
+            'Raven: Knit only runs on .Rmd files.',
         );
         return;
     }
