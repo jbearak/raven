@@ -506,11 +506,12 @@ mod tests {
         )
         .unwrap();
 
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        // Use --config + absolute path arguments instead of mutating CWD.
+        // CWD is process-global; cargo runs tests in parallel by default, so
+        // touching it from a test races with any other test that does the same.
         let args = LintArgs {
-            paths: vec![PathBuf::from(".")],
-            config_path: None,
+            paths: vec![tmp.path().to_path_buf()],
+            config_path: Some(tmp.path().join("raven.toml")),
             no_config: false,
             format: OutputFormat::Json,
             max_severity: SeverityLevel::Info,
@@ -521,7 +522,6 @@ mod tests {
         // assert the exit code. Stdout assertions live in the integration test
         // suite that runs the binary.
         let code = run(args);
-        std::env::set_current_dir(prev).unwrap();
         assert_eq!(code, EXIT_LINT_FAILED); // warning > info default
     }
 }
