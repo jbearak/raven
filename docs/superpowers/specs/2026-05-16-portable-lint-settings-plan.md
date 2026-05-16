@@ -212,9 +212,9 @@ The constant to pass varies per rule (`rule_ids::LINE_LENGTH`, `rule_ids::OBJECT
 
 Some rule files emit more than one `Diagnostic` (e.g. `object_name.rs` for function/variable/argument). All emissions in a single file use the same constant.
 
-- [ ] **Step 5: Write a cross-rule integration test**
+- [ ] **Step 5: Write a per-rule integration test**
 
-Append to `crates/raven/src/linting/mod.rs` (under the existing `#[cfg(test)]` module, or add one if it doesn't exist):
+Append to `crates/raven/src/linting/mod.rs` (under the existing `#[cfg(test)]` module, or add one if it doesn't exist). The test fires each rule against a fixture line known to trigger it, then asserts the produced diagnostic's `code` matches the corresponding `rule_ids::*` constant. Catches "added a new rule, forgot to wire `code`" mistakes.
 
 ```rust
 #[cfg(test)]
@@ -222,41 +222,96 @@ mod code_field_tests {
     use super::*;
     use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
 
-    fn config_all_warn() -> LintConfig {
-        let mut cfg = LintConfig::default();
-        cfg.enabled = true;
-        cfg.line_length = 10; // force line_length to trigger
-        // Severities default to Some(Hint) when populated by parse_lint_config;
-        // here LintConfig::default() already populates them as Hint per current code.
-        // Promote to Warning for visibility in the test:
-        for sev in [
-            &mut cfg.line_length_severity,
-            &mut cfg.trailing_whitespace_severity,
-            &mut cfg.no_tab_severity,
-            &mut cfg.semicolon_severity,
-        ] {
-            *sev = Some(DiagnosticSeverity::WARNING);
+    fn rule_id_of(d: &tower_lsp::lsp_types::Diagnostic) -> Option<&str> {
+        match &d.code {
+            Some(NumberOrString::String(s)) => Some(s.as_str()),
+            _ => None,
         }
-        cfg
     }
 
+    fn parse(text: &str) -> tree_sitter::Tree {
+        let mut p = tree_sitter::Parser::new();
+        p.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        p.parse(text, None).unwrap()
+    }
+
+    fn run_one(text: &str, configure: impl FnOnce(&mut LintConfig)) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let mut cfg = LintConfig::default();
+        cfg.enabled = true;
+        configure(&mut cfg);
+        let tree = parse(text);
+        run_lints(text, tree.root_node(), &cfg)
+    }
+
+    /// Each pair: (rule id, configure-LintConfig closure, fixture text known
+    /// to trigger that rule). Every entry must produce ≥ 1 diagnostic whose
+    /// `code` equals the rule id.
     #[test]
-    fn every_diagnostic_carries_a_code() {
-        let text = "x        = 1;\t# trailing       \nfoo <- 2\n";
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
-        let tree = parser.parse(text, None).unwrap();
-        let diags = run_lints(text, tree.root_node(), &config_all_warn());
-        assert!(!diags.is_empty(), "fixture should produce at least one diagnostic");
-        for d in &diags {
-            match &d.code {
-                Some(NumberOrString::String(s)) => assert!(!s.is_empty()),
-                _ => panic!("diagnostic missing code: {:?}", d),
-            }
+    fn every_rule_emits_its_id() {
+        use super::rule_ids::*;
+
+        // Helper to bump a Severity slot from Hint → Warning to make sure
+        // the rule is on (LintConfig::default() already enables all of them
+        // at Hint).
+        fn warn(slot: &mut Option<DiagnosticSeverity>) {
+            *slot = Some(DiagnosticSeverity::WARNING);
+        }
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut LintConfig)>, &str)> = vec![
+            (LINE_LENGTH, Box::new(|c| { c.line_length = 4; warn(&mut c.line_length_severity); }),
+             "very_long_line\n"),
+            (TRAILING_WHITESPACE, Box::new(|c| warn(&mut c.trailing_whitespace_severity)),
+             "x <- 1   \n"),
+            (NO_TAB, Box::new(|c| warn(&mut c.no_tab_severity)),
+             "\tx <- 1\n"),
+            (TRAILING_BLANK_LINES, Box::new(|c| warn(&mut c.trailing_blank_lines_severity)),
+             "x <- 1\n\n\n"),
+            (ASSIGNMENT_OPERATOR, Box::new(|c| warn(&mut c.assignment_operator_severity)),
+             "x = 1\n"),
+            (OBJECT_NAME, Box::new(|c| warn(&mut c.object_name_severity)),
+             "BadName <- 1\n"),
+            (INFIX_SPACES, Box::new(|c| warn(&mut c.infix_spaces_severity)),
+             "x<-1+2\n"),
+            (COMMENTED_CODE, Box::new(|c| warn(&mut c.commented_code_severity)),
+             "# x <- 1\n"),
+            (QUOTES, Box::new(|c| warn(&mut c.quotes_severity)),
+             "x <- 'single'\n"),
+            (COMMAS, Box::new(|c| warn(&mut c.commas_severity)),
+             "f(a ,b)\n"),
+            (T_AND_F_SYMBOL, Box::new(|c| warn(&mut c.t_and_f_symbol_severity)),
+             "if (T) 1 else 2\n"),
+            (SEMICOLON, Box::new(|c| warn(&mut c.semicolon_severity)),
+             "x <- 1; y <- 2\n"),
+            (EQUALS_NA, Box::new(|c| warn(&mut c.equals_na_severity)),
+             "if (x == NA) 1\n"),
+            (OBJECT_LENGTH, Box::new(|c| { c.object_length = 4; warn(&mut c.object_length_severity); }),
+             "very_long_name <- 1\n"),
+            (VECTOR_LOGIC, Box::new(|c| warn(&mut c.vector_logic_severity)),
+             "if (x & y) 1\n"),
+            (FUNCTION_LEFT_PARENTHESES, Box::new(|c| warn(&mut c.function_left_parentheses_severity)),
+             "f <- function (x) x\n"),
+            (SPACES_INSIDE, Box::new(|c| warn(&mut c.spaces_inside_severity)),
+             "f( x )\n"),
+            (INDENTATION, Box::new(|c| warn(&mut c.indentation_severity)),
+             "if (x) {\n   y <- 1\n}\n"),
+        ];
+
+        for (expected_id, configure, fixture) in cases {
+            let diags = run_one(fixture, |c| configure(c));
+            let matched: Vec<_> = diags.iter()
+                .filter(|d| rule_id_of(d) == Some(expected_id))
+                .collect();
+            assert!(
+                !matched.is_empty(),
+                "rule {} produced no diagnostic for fixture {:?}; emissions: {:?}",
+                expected_id, fixture, diags
+            );
         }
     }
 }
 ```
+
+If a particular fixture line doesn't trigger the rule (e.g. the parser changes a behavior over time), tighten that fixture rather than removing the assertion — the test is the contract.
 
 - [ ] **Step 6: Run the full linting test suite**
 
@@ -579,14 +634,43 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "completion",
 ];
 
+const KNOWN_LINTING_KEYS: &[&str] = &[
+    "enabled", "lineLength", "objectLength", "indentationUnit",
+    "assignmentOperator", "stringDelimiter",
+    "objectNameStyleFunction", "objectNameStyleVariable", "objectNameStyleArgument",
+    "lineLengthSeverity", "trailingWhitespaceSeverity", "noTabSeverity",
+    "trailingBlankLinesSeverity", "assignmentOperatorSeverity", "objectNameSeverity",
+    "infixSpacesSeverity", "commentedCodeSeverity", "quotesSeverity", "commasSeverity",
+    "tAndFSymbolSeverity", "semicolonSeverity", "equalsNaSeverity", "objectLengthSeverity",
+    "vectorLogicSeverity", "functionLeftParenthesesSeverity", "spacesInsideSeverity",
+    "indentationSeverity", "overrides",
+];
+
+/// For nested validation we accept the existence of any key in a known
+/// section but warn on unknown leaves. The exhaustive nested key lists live
+/// at the call sites of `parse_*_config` in `backend.rs`; for v1 we validate
+/// `[linting]` (the most user-facing section) and trust the parsers to
+/// ignore unrecognized keys in the other sections quietly.
 fn validate_top_level_keys(
     map: &serde_json::Map<String, Value>,
     source_label: &str,
     warnings: &mut Vec<String>,
 ) {
-    for key in map.keys() {
+    for (key, value) in map {
         if !KNOWN_TOP_LEVEL.contains(&key.as_str()) {
             warnings.push(format!("{source_label}: unknown top-level key '{key}'; ignoring"));
+            continue;
+        }
+        if key == "linting" {
+            if let Value::Object(linting_map) = value {
+                for nested in linting_map.keys() {
+                    if !KNOWN_LINTING_KEYS.contains(&nested.as_str()) {
+                        warnings.push(format!(
+                            "{source_label}: unknown key 'linting.{nested}'; ignoring"
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -660,6 +744,18 @@ foo = 1
     }
 
     #[test]
+    fn unknown_nested_linting_key_produces_warning() {
+        let toml = r#"
+[linting]
+enabled = true
+foo = 42
+"#;
+        let out = load_str(toml, "test").unwrap();
+        assert_eq!(out.warnings.len(), 1);
+        assert!(out.warnings[0].contains("linting.foo"));
+    }
+
+    #[test]
     fn malformed_toml_returns_none() {
         let toml = "this is not = valid = toml = at all";
         assert!(load_str(toml, "test").is_none());
@@ -690,7 +786,7 @@ pub struct CompiledLintOverride {
 - [ ] **Step 6: Run all new tests**
 
 Run: `cargo test -p raven config_file`
-Expected: 10 passed (5 discovery + 5 toml_loader).
+Expected: 11 passed (5 discovery + 6 toml_loader).
 
 - [ ] **Step 7: Commit**
 
@@ -820,37 +916,50 @@ pub mod merge;
 pub use merge::merge as merge_settings;
 
 /// Re-run every `parse_*_config` over the merged `(client, project)` JSON
-/// and store the parsed configs back on `state`. Idempotent.
+/// and overwrite the parsed configs on `state`. Idempotent.
+///
+/// Resets each parsed config to its struct default when the corresponding
+/// section is absent in the merged JSON. This matches the spec's layered
+/// precedence: built-in defaults are the floor; client-supplied settings
+/// and project-supplied settings layer on top. Both layers being silent on
+/// a section means "fall to default", not "preserve whatever was there".
+///
+/// One exception: `parse_cross_file_config` returns `Ok(None)` when ALL of
+/// `crossFile`, `diagnostics`, `packages` are absent — in that case we still
+/// overwrite with `CrossFileConfig::default()`. A validation error
+/// (`Err(...)`) is logged and the existing config is preserved (best-effort
+/// graceful degradation; same as the existing behavior at
+/// `backend.rs:3819-3838`).
 ///
 /// Callers: `backend::initialize`, `backend::did_change_configuration`,
 /// `backend::did_change_watched_files` (project-config change).
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let merged = merge_settings(&state.raw_client_settings, state.raw_project_settings.as_ref());
 
-    // Reuse the existing parsers in `backend`. Each returns `Some(config)` only
-    // when the relevant section is present in the merged JSON; absent sections
-    // mean "leave current state alone" — which means caller code that wants a
-    // hard reset must store defaults into the raw layer first.
-    if let Some(cfg) = crate::backend::parse_cross_file_config_strict(&merged) {
-        state.resize_caches(&cfg);
-        state.cross_file_config = cfg;
+    match crate::backend::parse_cross_file_config(&merged) {
+        Ok(Some(cfg)) => {
+            state.resize_caches(&cfg);
+            state.cross_file_config = cfg;
+        }
+        Ok(None) => {
+            let cfg = crate::cross_file::CrossFileConfig::default();
+            state.resize_caches(&cfg);
+            state.cross_file_config = cfg;
+        }
+        Err(err) => {
+            log::warn!("recompute_parsed_configs: cross_file validation error: {err}");
+        }
     }
-    if let Some(cfg) = crate::backend::parse_symbol_config(&merged) {
-        state.symbol_config = cfg;
-    }
-    if let Some(cfg) = crate::backend::parse_completion_config(&merged) {
-        state.completion_config = cfg;
-    }
-    if let Some(cfg) = crate::backend::parse_indentation_config(&merged) {
-        state.indentation_config = cfg;
-    }
-    if let Some(cfg) = crate::backend::parse_lint_config(&merged) {
-        state.lint_config = cfg;
-    }
+    state.symbol_config = crate::backend::parse_symbol_config(&merged).unwrap_or_default();
+    state.completion_config =
+        crate::backend::parse_completion_config(&merged).unwrap_or_default();
+    state.indentation_config =
+        crate::backend::parse_indentation_config(&merged).unwrap_or_default();
+    state.lint_config = crate::backend::parse_lint_config(&merged).unwrap_or_default();
 }
 ```
 
-(Note: `parse_cross_file_config_strict` is the existing `parse_cross_file_config` — rename or expose if necessary. In Task 6 we adjust visibility on the four parser functions in `backend.rs:434-627` to make them `pub(crate)`.)
+(All five parser functions in `crates/raven/src/backend.rs` are already `pub(crate)`. Verify with `grep -n "fn parse_.*_config" crates/raven/src/backend.rs` before writing the call sites — every match should start `pub(crate) fn parse_...`.)
 
 - [ ] **Step 4: Build**
 
@@ -1204,16 +1313,10 @@ fall through to the base config."
 - Modify: `crates/raven/src/backend.rs` around `initialize()` (line 1728-1840)
 - Modify: `crates/raven/src/backend.rs` to make parser functions `pub(crate)` (lines 120, 240, 434, 627)
 
-- [ ] **Step 1: Make `parse_*_config` functions `pub(crate)`**
+- [ ] **Step 1: Verify `parse_*_config` visibility**
 
-In `crates/raven/src/backend.rs`, four `parse_*_config` functions exist. Add `pub(crate)` to each:
-- `fn parse_cross_file_config` (~line 120)
-- `fn parse_symbol_config` (~line 240)
-- `fn parse_completion_config` (~around 360)
-- `fn parse_indentation_config` (~around 410)
-- `fn parse_lint_config` (line 473, already `pub(crate)`)
-
-Verify with: `grep -n "fn parse_.*_config" crates/raven/src/backend.rs` — every match should start `pub(crate) fn parse_...`.
+Run: `grep -n "fn parse_.*_config" crates/raven/src/backend.rs | grep -v "_tests\|_returns_\|_reads_"`
+Expected: each match starts `pub(crate) fn parse_...`. They already do — this is a sanity check only. If any are still private, add `pub(crate)`.
 
 - [ ] **Step 2: Rewrite `initialize` to use raw layers**
 
@@ -1269,17 +1372,14 @@ In `crates/raven/src/backend.rs`, find `async fn initialize` (line 1728). Replac
         // Notify client when a project config is in effect.
         if let Some(path) = loaded_path {
             let client = self.client.clone();
+            let path_str = path.display().to_string();
             tokio::spawn(async move {
-                #[derive(serde::Serialize)]
-                struct ProjectConfigLoaded<'a> {
-                    path: &'a str,
-                    source: &'a str,
-                }
+                let payload = serde_json::json!({
+                    "path": path_str,
+                    "source": "raven.toml",
+                });
                 let _ = client
-                    .send_notification::<RavenProjectConfigLoaded>(ProjectConfigLoaded {
-                        path: &path.display().to_string(),
-                        source: "raven.toml",
-                    })
+                    .send_notification::<RavenProjectConfigLoaded>(payload)
                     .await;
             });
         }
@@ -1288,7 +1388,7 @@ In `crates/raven/src/backend.rs`, find `async fn initialize` (line 1728). Replac
 Add the custom-notification type declaration. Near the top of `backend.rs` (e.g. just before `impl LanguageServer for Backend`):
 
 ```rust
-enum RavenProjectConfigLoaded {}
+pub(crate) enum RavenProjectConfigLoaded {}
 
 impl tower_lsp::lsp_types::notification::Notification for RavenProjectConfigLoaded {
     type Params = serde_json::Value;
@@ -1296,7 +1396,7 @@ impl tower_lsp::lsp_types::notification::Notification for RavenProjectConfigLoad
 }
 ```
 
-(Inspect `backend.rs` imports — if `serde` isn't already imported at the top of the file, add `use serde::Serialize;` near the other `use` lines.)
+The notification's `Params` is `serde_json::Value`, so the payload passed to `send_notification` must also be a `serde_json::Value` — that's why the snippet above builds a `json!({...})` rather than a typed struct.
 
 - [ ] **Step 3: Write an integration test**
 
@@ -1390,56 +1490,162 @@ emits raven/projectConfigLoaded when a project config is in effect."
 **Files:**
 - Modify: `crates/raven/src/backend.rs` `did_change_configuration` (line 3817-3997)
 
-- [ ] **Step 1: Replace the parsing block with a recompute call**
+- [ ] **Step 1: Replace the parse block while preserving all `*_changed` locals**
 
-In `crates/raven/src/backend.rs`, find `async fn did_change_configuration`. The current body computes `new_cross_file_config`, `new_symbol_config`, ..., `new_lint_config` from `params.settings` directly. Replace the parse calls with a single recompute:
+In `crates/raven/src/backend.rs`, find `async fn did_change_configuration` (around line 3817). The current body at lines 3819-3997 parses settings, computes a tuple of locals, and applies. Replace this whole block with one that captures `prev_*` snapshots, calls `recompute_parsed_configs`, and recomputes the same locals from `prev_*` vs the new `state.*` values.
 
-Around line 3845, where it currently reads:
-
-```rust
-        let new_lint_config = parse_lint_config(&params.settings);
-        // ... and similar `new_*_config` lets above for the other parsers
-```
-
-Replace the entire block from "compute new configs" through "store new configs" with:
+The function header and the early return for "no settings" stay as-is. Replace the body from "Parse cross-file configuration if provided" (around line 3825) through the closing `};` of the tuple binding (around line 4032) with:
 
 ```rust
-        // Store the new client settings raw and re-merge with whatever
-        // project file is currently in effect.
-        let mut state = self.state.write().await;
-        let prev_lint = state.lint_config.clone();
-        let prev_cross = state.cross_file_config.clone();
-        let prev_packages_enabled = state.cross_file_config.packages_enabled;
+        let (
+            open_uris,
+            scope_changed,
+            package_settings_changed,
+            watch_settings_changed,
+            only_watch_changed,
+            diagnostics_enabled_changed,
+            old_diagnostics_enabled,
+            new_diagnostics_enabled,
+            packages_enabled,
+            trigger_on_open_paren_changed,
+            new_trigger_on_open_paren,
+            pkg_mode_io_needed,
+        ) = {
+            let mut state = self.state.write().await;
 
-        state.raw_client_settings = params.settings.clone();
-        crate::config_file::recompute_parsed_configs(&mut state);
+            // Snapshot the pre-change parsed configs so we can detect what
+            // moved after the recompute.
+            let prev_cross_file = state.cross_file_config.clone();
+            let prev_lint = state.lint_config.clone();
+            let prev_completion = state.completion_config.clone();
+            let prev_hier_support = state.symbol_config.hierarchical_document_symbol_support;
 
-        // Recompile overrides if the merged [linting].overrides changed.
-        let project_root = state
-            .workspace_folders
-            .first()
-            .and_then(|u| u.to_file_path().ok());
-        if let Some(root) = &project_root {
-            let merged = crate::config_file::merge_settings(
-                &state.raw_client_settings,
-                state.raw_project_settings.as_ref(),
-            );
-            state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
-        }
+            // Store the new raw client settings and re-merge with the project
+            // file (if any). recompute_parsed_configs() overwrites every
+            // parsed config; absent sections reset to defaults.
+            state.raw_client_settings = params.settings.clone();
+            crate::config_file::recompute_parsed_configs(&mut state);
 
-        let lint_config_changed = state.lint_config != prev_lint;
-        let cross_file_changed = state.cross_file_config != prev_cross;
-        let package_settings_changed =
-            state.cross_file_config.packages_enabled != prev_packages_enabled
-                || state.cross_file_config.packages_r_path
-                    != prev_cross.packages_r_path
-                || state.cross_file_config.packages_additional_library_paths
-                    != prev_cross.packages_additional_library_paths;
+            // Refresh compiled overrides from the merged settings.
+            let project_root = state
+                .workspace_folders
+                .first()
+                .and_then(|u| u.to_file_path().ok());
+            if let Some(root) = &project_root {
+                let merged = crate::config_file::merge_settings(
+                    &state.raw_client_settings,
+                    state.raw_project_settings.as_ref(),
+                );
+                state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
+            }
+
+            // --- Recompute each `*_changed` flag against the pre-recompute
+            // snapshots. Logic is preserved from the original site at
+            // `backend.rs:3863-4006`; the only change is the source of truth
+            // (state.* now reflects the merged result, not parse_*_config
+            // output applied to params.settings directly).
+            let scope_changed =
+                prev_cross_file.scope_settings_changed(&state.cross_file_config);
+
+            let old_diagnostics_enabled = prev_cross_file.diagnostics_enabled;
+            let new_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
+            let diagnostics_enabled_changed =
+                old_diagnostics_enabled != new_diagnostics_enabled;
+
+            let package_settings_changed =
+                state.cross_file_config.packages_enabled != prev_cross_file.packages_enabled
+                    || state.cross_file_config.packages_r_path
+                        != prev_cross_file.packages_r_path
+                    || state.cross_file_config.packages_additional_library_paths
+                        != prev_cross_file.packages_additional_library_paths;
+
+            let watch_settings_changed = state.cross_file_config.packages_watch_library_paths
+                != prev_cross_file.packages_watch_library_paths
+                || state.cross_file_config.packages_watch_debounce_ms
+                    != prev_cross_file.packages_watch_debounce_ms;
+
+            let lint_config_changed = state.lint_config != prev_lint;
+
+            // `only_watch_changed` is true when the watch fields are the only
+            // differences across the entire `CrossFileConfig`.
+            let only_watch_changed = watch_settings_changed
+                && !lint_config_changed
+                && {
+                    let mut probe = state.cross_file_config.clone();
+                    probe.packages_watch_library_paths =
+                        prev_cross_file.packages_watch_library_paths;
+                    probe.packages_watch_debounce_ms =
+                        prev_cross_file.packages_watch_debounce_ms;
+                    probe == prev_cross_file
+                };
+
+            let packages_enabled = state.cross_file_config.packages_enabled;
+
+            // Trigger pkg-mode rebuild if mode flipped.
+            let package_mode_changed =
+                state.cross_file_config.package_mode != prev_cross_file.package_mode;
+            let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
+                use crate::cross_file::config::PackageMode;
+                let mode = state.cross_file_config.package_mode;
+                let event = crate::package_state::event::HandlerEvent::SettingChanged {
+                    new_mode: mode,
+                };
+                if let Some(delta) = crate::package_state::event::translate(
+                    &mut state.package_inputs,
+                    event,
+                ) {
+                    if mode == PackageMode::Disabled {
+                        state.apply_package_event(&delta);
+                        None
+                    } else {
+                        state
+                            .workspace_folders
+                            .first()
+                            .and_then(|u| u.to_file_path().ok())
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Recompute reset symbol_config to its default; restore the
+            // hierarchical-symbol-support flag the client capabilities set at
+            // initialize() time.
+            state.symbol_config.hierarchical_document_symbol_support = prev_hier_support;
+
+            let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
+            let trigger_on_open_paren_changed =
+                prev_completion.trigger_on_open_paren != new_trigger_on_open_paren;
+
+            // Force-republish open documents (matches existing call site at
+            // backend.rs:4011-4016).
+            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+            if !only_watch_changed {
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(open_uris.iter());
+            }
+
+            (
+                open_uris,
+                scope_changed,
+                package_settings_changed,
+                watch_settings_changed,
+                only_watch_changed,
+                diagnostics_enabled_changed,
+                old_diagnostics_enabled,
+                new_diagnostics_enabled,
+                packages_enabled,
+                trigger_on_open_paren_changed,
+                new_trigger_on_open_paren,
+                pkg_mode_io_needed,
+            )
+        };
 ```
 
-Keep the rest of `did_change_configuration` intact — the post-merge logic (force republish, package library rebuild, etc.) continues to operate on parsed configs and is unchanged.
-
-Delete the now-unused `new_*_config` variables and the `*_changed` boolean derivations that compared against the parsed-from-init values.
+The downstream code after this block (package-mode rebuild, watch-restart, force-republish, completion-trigger update — the rest of `did_change_configuration` through ~line 4150) is unchanged.
 
 - [ ] **Step 2: Write a per-key fallback regression test**
 
@@ -1552,72 +1758,102 @@ In `crates/raven/src/backend.rs`, find `async fn initialized` (line 1854). After
         });
 ```
 
-- [ ] **Step 2: Implement `did_change_watched_files`**
+- [ ] **Step 2: Add a project-config branch at the *top* of `did_change_watched_files`**
 
-In `crates/raven/src/backend.rs`, find the existing `did_change_watched_files` method (search for `async fn did_change_watched_files`). If none exists, add one to the `impl LanguageServer for Backend` block. Implementation:
+`did_change_watched_files` already exists at `backend.rs:4203` and does significant work for source-file changes (cancel pending indexing, invalidate caches, schedule workspace updates, dependency revalidation, package-manifest deltas). The new behavior is an *addition*: detect raven.toml/.lintr events at the top, run the reload, and then continue to the existing logic for any remaining non-config events.
+
+In `crates/raven/src/backend.rs`, find `async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams)` and modify in place. Immediately after the `log::trace!` call at the start (around line 4204-4207), and BEFORE the existing `deleted_uris` collection, insert:
 
 ```rust
-    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        // Detect whether any event touches raven.toml or .lintr in the workspace root.
-        let mut project_config_changed = false;
-        for change in &params.changes {
-            let Ok(path) = change.uri.to_file_path() else { continue };
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-            if name == "raven.toml" || name == ".lintr" {
-                project_config_changed = true;
-                break;
-            }
-        }
-        if !project_config_changed {
-            return;
-        }
+        // Detect raven.toml / .lintr events. These are not part of the
+        // source-file flow — they trigger a config-layer reload instead.
+        let config_file_changes: Vec<&FileEvent> = params
+            .changes
+            .iter()
+            .filter(|c| {
+                let Ok(p) = c.uri.to_file_path() else { return false };
+                matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("raven.toml") | Some(".lintr")
+                )
+            })
+            .collect();
 
-        let mut state = self.state.write().await;
-        let project_root = state
-            .workspace_folders
-            .first()
-            .and_then(|u| u.to_file_path().ok());
+        if !config_file_changes.is_empty() {
+            let open_uris: Vec<Url> = {
+                let mut state = self.state.write().await;
+                let project_root = state
+                    .workspace_folders
+                    .first()
+                    .and_then(|u| u.to_file_path().ok());
 
-        // Re-run discovery and load.
-        state.raw_project_settings = None;
-        state.project_config_path = None;
-        if let Some(root) = &project_root {
-            match crate::config_file::find_config(root) {
-                crate::config_file::DiscoveredConfig::RavenToml(p) => {
-                    if let Some(loaded) = crate::config_file::load_toml(&p) {
-                        for w in &loaded.warnings {
-                            log::warn!("{w}");
+                // Re-run discovery from the workspace root. Order matters:
+                // raven.toml beats .lintr (DiscoveredConfig embodies that).
+                state.raw_project_settings = None;
+                state.project_config_path = None;
+                if let Some(root) = &project_root {
+                    match crate::config_file::find_config(root) {
+                        crate::config_file::DiscoveredConfig::RavenToml(p) => {
+                            if let Some(loaded) = crate::config_file::load_toml(&p) {
+                                for w in &loaded.warnings { log::warn!("{w}"); }
+                                state.raw_project_settings = Some(loaded.settings);
+                                state.project_config_path = Some(p);
+                            }
                         }
-                        state.raw_project_settings = Some(loaded.settings);
-                        state.project_config_path = Some(p);
+                        crate::config_file::DiscoveredConfig::Lintr(p) => {
+                            if let Some(loaded) = crate::config_file::load_lintr(&p) {
+                                for w in &loaded.warnings { log::warn!("{w}"); }
+                                state.raw_project_settings = Some(loaded.settings);
+                                state.project_config_path = Some(p);
+                            }
+                        }
+                        crate::config_file::DiscoveredConfig::None => {}
                     }
                 }
-                crate::config_file::DiscoveredConfig::Lintr(_) => {
-                    log::warn!(".lintr reload deferred until Task 10");
+
+                crate::config_file::recompute_parsed_configs(&mut state);
+                if let Some(root) = &project_root {
+                    let merged = crate::config_file::merge_settings(
+                        &state.raw_client_settings,
+                        state.raw_project_settings.as_ref(),
+                    );
+                    state.lint_overrides =
+                        crate::config_file::compile_lint_overrides(&merged, root);
                 }
-                crate::config_file::DiscoveredConfig::None => {}
+
+                let open: Vec<Url> = state.documents.keys().cloned().collect();
+                state.diagnostics_gate.mark_force_republish_many(open.iter());
+                open
+            };
+
+            // Re-publish diagnostics for every open document. The existing
+            // revalidation pipeline picks up the force-republish marker on
+            // the next `validate_and_publish` call for each URI; we trigger
+            // those here. `compute_and_publish_diagnostics` is the canonical
+            // single-URI republish (see e.g. backend.rs:6203).
+            for uri in &open_uris {
+                self.compute_and_publish_diagnostics(uri.clone()).await;
             }
         }
 
-        crate::config_file::recompute_parsed_configs(&mut state);
-        if let Some(root) = &project_root {
-            let merged = crate::config_file::merge_settings(
-                &state.raw_client_settings,
-                state.raw_project_settings.as_ref(),
-            );
-            state.lint_overrides = crate::config_file::compile_lint_overrides(&merged, root);
+        // If every change was a config file, the source-file flow below has
+        // nothing to do. Otherwise, build a filtered `params` containing only
+        // the non-config events and continue.
+        let remaining_changes: Vec<FileEvent> = params
+            .changes
+            .iter()
+            .filter(|c| !config_file_changes.iter().any(|cc| cc.uri == c.uri))
+            .cloned()
+            .collect();
+        if remaining_changes.is_empty() {
+            return;
         }
-
-        // Force republish of diagnostics for all open documents.
-        state.diagnostics_gate.mark_force_republish();
-        drop(state);
-
-        // Trigger re-publish via existing revalidation flow.
-        self.revalidate_all_open_documents().await;
-    }
+        let params = DidChangeWatchedFilesParams { changes: remaining_changes };
 ```
 
-(`revalidate_all_open_documents` is the existing internal helper used by `did_change_configuration` after `mark_force_republish`. If it has a different name in the current codebase, use whatever `did_change_configuration` calls today.)
+The existing `did_change_watched_files` body continues below this block, now operating on the filtered `params`. The local rebinding (`let params = ...`) shadows the parameter so existing references keep working without further changes.
+
+Verify the helper name `compute_and_publish_diagnostics` matches the actual single-URI republish entry point. Search: `grep -n "compute_and_publish_diagnostics\|pub.* async fn.*publish" crates/raven/src/backend.rs`. If the name differs (e.g. `validate_and_publish_diagnostics`), substitute the actual name.
 
 - [ ] **Step 3: Test live reload**
 
@@ -1700,20 +1936,21 @@ Find the existing snapshot-build site (around line 243-249). Replace the `lint_c
 
 (`uri` is the parameter the snapshot-build function already receives — confirm by reading the surrounding signature in `handlers.rs`.)
 
-- [ ] **Step 2: Test override resolution under the LSP**
+- [ ] **Step 2: Test override resolution end-to-end through the snapshot path**
 
-Append to backend tests:
+Append to backend tests. The test opens two documents (one in `R/`, one in `tests/`) via `did_open`, then triggers the diagnostics flow and verifies the published diagnostics reflect different effective `lineLength` values. This actually exercises the `handlers.rs` site, not just the pure resolver.
 
 ```rust
 #[tokio::test]
-async fn open_document_in_tests_dir_uses_override_line_length() {
+async fn published_diagnostics_use_per_file_override() {
     let tmp = TempDir::new().unwrap();
     fs::write(
         tmp.path().join("raven.toml"),
         r#"
 [linting]
 enabled = true
-lineLength = 80
+lineLength = 30
+lineLengthSeverity = "warning"
 
 [[linting.overrides]]
 files = ["tests/**/*.R"]
@@ -1722,9 +1959,12 @@ lineLength = 200
     ).unwrap();
     fs::create_dir_all(tmp.path().join("tests")).unwrap();
     fs::create_dir_all(tmp.path().join("R")).unwrap();
-
-    let r_uri = Url::from_file_path(tmp.path().join("R/a.R")).unwrap();
-    let test_uri = Url::from_file_path(tmp.path().join("tests/test-a.R")).unwrap();
+    let r_path = tmp.path().join("R/a.R");
+    let test_path = tmp.path().join("tests/test-a.R");
+    // 80-column line: triggers in R/ (line_length = 30), not in tests/ (200).
+    let long_line = "x_long_identifier <- 'sample value with a longer literal string' ; cat('hi')\n";
+    fs::write(&r_path, long_line).unwrap();
+    fs::write(&test_path, long_line).unwrap();
 
     let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
     let backend = svc.inner();
@@ -1736,22 +1976,35 @@ lineLength = 200
         ..Default::default()
     }).await.unwrap();
 
-    // Use the resolver directly to assert per-document behavior.
+    let r_uri = Url::from_file_path(&r_path).unwrap();
+    let test_uri = Url::from_file_path(&test_path).unwrap();
+
+    backend.did_open(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: r_uri.clone(), language_id: "r".into(),
+            version: 1, text: long_line.into(),
+        },
+    }).await;
+    backend.did_open(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: test_uri.clone(), language_id: "r".into(),
+            version: 1, text: long_line.into(),
+        },
+    }).await;
+
+    // Pull the snapshots that handlers.rs would build for each URI and assert
+    // their effective LintConfig. This exercises DiagnosticsSnapshot::build
+    // directly; the equivalent path is what handlers.rs:243-249 takes during
+    // a diagnostics pass.
     let state = backend.state.read().await;
-    let merged = crate::config_file::merge_settings(
-        &state.raw_client_settings, state.raw_project_settings.as_ref()
-    );
-    let section = merged.get("linting").cloned().unwrap();
-    let r_cfg = crate::config_file::resolve_lint_for_document(
-        &state.lint_config, &section, &state.lint_overrides, &r_uri,
-    );
-    let test_cfg = crate::config_file::resolve_lint_for_document(
-        &state.lint_config, &section, &state.lint_overrides, &test_uri,
-    );
-    assert_eq!(r_cfg.line_length, 80);
-    assert_eq!(test_cfg.line_length, 200);
+    let r_snap = crate::handlers::DiagnosticsSnapshot::build(&state, &r_uri).unwrap();
+    let test_snap = crate::handlers::DiagnosticsSnapshot::build(&state, &test_uri).unwrap();
+    assert_eq!(r_snap.lint_config.line_length, 30);
+    assert_eq!(test_snap.lint_config.line_length, 200);
 }
 ```
+
+(Test imports near top of test module: `DidOpenTextDocumentParams`, `TextDocumentItem` from `tower_lsp::lsp_types`. The `DiagnosticsSnapshot::build` signature is the same one `handlers.rs` calls today; verify by running `grep -n "DiagnosticsSnapshot::build\|fn build" crates/raven/src/handlers.rs` and adjusting the call site if the signature differs.)
 
 - [ ] **Step 3: Run the test**
 
@@ -2273,10 +2526,16 @@ Create `crates/raven/src/cli/lint.rs`:
 //! `raven lint` subcommand: walk paths, run native lint rules, format output.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use serde_json::json;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+
+/// Exit codes are returned as plain `i32` so `main()` can pass them directly
+/// to `std::process::exit`. Avoids the `ExitCode` cast trap (`ExitCode` is not
+/// a primitive and cannot be cast with `as`).
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_LINT_FAILED: i32 = 1;
+pub const EXIT_OPERATOR_ERROR: i32 = 2;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct LintArgs {
@@ -2355,12 +2614,12 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<LintArgs, St
     Ok(LintArgs { paths, config_path, no_config, format, max_severity, quiet, no_color })
 }
 
-pub fn run(args: LintArgs) -> ExitCode {
+pub fn run(args: LintArgs) -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("raven lint: cannot read current directory: {e}");
-            return ExitCode::from(2);
+            return EXIT_OPERATOR_ERROR;
         }
     };
 
@@ -2376,7 +2635,7 @@ pub fn run(args: LintArgs) -> ExitCode {
             }
             None => {
                 eprintln!("raven lint: failed to load --config {}", explicit.display());
-                return ExitCode::from(2);
+                return EXIT_OPERATOR_ERROR;
             }
         }
     } else {
@@ -2384,7 +2643,7 @@ pub fn run(args: LintArgs) -> ExitCode {
             crate::config_file::DiscoveredConfig::RavenToml(p) => {
                 let l = match crate::config_file::load_toml(&p) {
                     Some(v) => v,
-                    None => return ExitCode::from(2),
+                    None => return EXIT_OPERATOR_ERROR,
                 };
                 for w in l.warnings { eprintln!("{w}"); }
                 (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings))
@@ -2411,8 +2670,12 @@ pub fn run(args: LintArgs) -> ExitCode {
     let overrides = crate::config_file::compile_lint_overrides(&merged, &root);
 
     let mut diagnostics: Vec<(PathBuf, Diagnostic)> = Vec::new();
+    let mut operator_error = false;
     for p in &args.paths {
-        walk(p, &root, &base_section, &lint_config, &overrides, &mut diagnostics);
+        walk(p, &root, &base_section, &lint_config, &overrides, &mut diagnostics, &mut operator_error);
+    }
+    if operator_error {
+        return EXIT_OPERATOR_ERROR;
     }
 
     let any_above_threshold = diagnostics.iter().any(|(_, d)|
@@ -2425,7 +2688,7 @@ pub fn run(args: LintArgs) -> ExitCode {
         OutputFormat::Sarif => print_sarif(&diagnostics, &root),
     }
 
-    if any_above_threshold { ExitCode::from(1) } else { ExitCode::from(0) }
+    if any_above_threshold { EXIT_LINT_FAILED } else { EXIT_OK }
 }
 
 fn walk(
@@ -2435,6 +2698,7 @@ fn walk(
     base_lint: &crate::linting::LintConfig,
     overrides: &[crate::config_file::CompiledLintOverride],
     out: &mut Vec<(PathBuf, Diagnostic)>,
+    operator_error: &mut bool,
 ) {
     if path.is_file() {
         if !is_r_file(path) { return; }
@@ -2442,7 +2706,6 @@ fn walk(
         if crate::config_file::is_skipped_by_overrides(base_section, overrides, rel) {
             return;
         }
-        // Resolve effective config via URI-shaped helper.
         let uri = tower_lsp::lsp_types::Url::from_file_path(path)
             .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///").unwrap());
         let effective = crate::config_file::resolve_lint_for_document(
@@ -2450,13 +2713,21 @@ fn walk(
         );
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
-            Err(e) => { eprintln!("raven lint: cannot read {}: {e}", path.display()); return; }
+            Err(e) => {
+                eprintln!("raven lint: cannot read {}: {e}", path.display());
+                *operator_error = true;
+                return;
+            }
         };
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
         let tree = match parser.parse(&text, None) {
             Some(t) => t,
-            None => { eprintln!("raven lint: parse failed for {}", path.display()); return; }
+            None => {
+                eprintln!("raven lint: parse failed for {}", path.display());
+                *operator_error = true;
+                return;
+            }
         };
         for d in crate::linting::run_lints(&text, tree.root_node(), &effective) {
             out.push((path.to_path_buf(), d));
@@ -2464,13 +2735,20 @@ fn walk(
     } else if path.is_dir() {
         let entries = match std::fs::read_dir(path) {
             Ok(it) => it,
-            Err(e) => { eprintln!("raven lint: cannot read dir {}: {e}", path.display()); return; }
+            Err(e) => {
+                eprintln!("raven lint: cannot read dir {}: {e}", path.display());
+                *operator_error = true;
+                return;
+            }
         };
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_symlink() { continue; }
-            walk(&p, root, base_section, base_lint, overrides, out);
+            walk(&p, root, base_section, base_lint, overrides, out, operator_error);
         }
+    } else {
+        eprintln!("raven lint: path does not exist: {}", path.display());
+        *operator_error = true;
     }
 }
 
@@ -2624,7 +2902,7 @@ In `crates/raven/src/main.rs`, add a branch alongside `analysis-stats` (~line 85
             match cli::lint::parse_args(rest) {
                 Ok(lint_args) => {
                     let code = cli::lint::run(lint_args);
-                    std::process::exit(code as u8 as i32);
+                    std::process::exit(code);
                 }
                 Err(msg) if msg == "HELP" => {
                     cli::lint::print_help();
@@ -2718,7 +2996,7 @@ fn end_to_end_finds_line_length_violation() {
     // suite that runs the binary.
     let code = run(args);
     std::env::set_current_dir(prev).unwrap();
-    assert_eq!(code, ExitCode::from(1)); // warning > info default
+    assert_eq!(code, EXIT_LINT_FAILED); // warning > info default
 }
 ```
 
@@ -2789,6 +3067,8 @@ In `editors/vscode/src/extension.ts` `activate(...)`, add (near the other `regis
     );
 ```
 
+At the top of `extension.ts` ensure `getInitializationOptions` is imported (it is, today — the existing import line in `extension.ts` reads `import { getInitializationOptions } from './initializationOptions';`).
+
 Add an implementation function (anywhere in the file):
 
 ```ts
@@ -2810,17 +3090,19 @@ async function scaffoldProjectConfig(): Promise<void> {
         // not present — fall through
     }
 
+    // Reuse the existing factory that converts VS Code's flat
+    // `raven.linting.*` settings into the nested LSP init-options shape.
+    // The TOML we render is the same shape Raven's server consumes.
     const config = vscode.workspace.getConfiguration('raven');
-    const linting = config.inspect<unknown>('linting');
-    const explicit = linting && (linting.workspaceValue ?? linting.globalValue);
-    const body = renderRavenToml(explicit as Record<string, unknown> | undefined);
+    const initOptions = getInitializationOptions(config);
+    const body = renderRavenToml(initOptions.linting);
     const encoder = new TextEncoder();
     await vscode.workspace.fs.writeFile(target, encoder.encode(body));
     const doc = await vscode.workspace.openTextDocument(target);
     await vscode.window.showTextDocument(doc);
 }
 
-function renderRavenToml(explicit?: Record<string, unknown>): string {
+function renderRavenToml(linting: Record<string, unknown> | undefined): string {
     const lines: string[] = ['# Generated by Raven: Create raven.toml', ''];
     lines.push('[linting]');
     const entries: [string, unknown, string][] = [
@@ -2835,10 +3117,18 @@ function renderRavenToml(explicit?: Record<string, unknown>): string {
         ['objectNameStyleArgument', 'snake_case', 'as above'],
         ['lineLengthSeverity', 'hint', 'error | warning | information | hint | off'],
     ];
+    const ravenDefaultEnabled = false; // mirror VS Code package.json default
     for (const [key, dflt, comment] of entries) {
-        const set = explicit && (explicit as Record<string, unknown>)[key];
-        const value = set !== undefined ? set : dflt;
-        const prefix = set !== undefined ? '' : '# ';
+        const fromUser = linting?.[key];
+        // `enabled` is special: the init-options factory always emits it
+        // (see initializationOptions.ts:367), so the "is this explicit?"
+        // heuristic above doesn't apply. Treat enabled as explicit only when
+        // it differs from the package.json default.
+        const isExplicit = key === 'enabled'
+            ? fromUser !== undefined && fromUser !== ravenDefaultEnabled
+            : fromUser !== undefined;
+        const value = isExplicit ? fromUser : dflt;
+        const prefix = isExplicit ? '' : '# ';
         lines.push(`${prefix}${key} = ${toTomlScalar(value)}    # ${comment}`);
     }
     lines.push('');
