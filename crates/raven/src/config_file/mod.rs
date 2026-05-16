@@ -7,13 +7,13 @@ pub mod overrides;
 pub mod toml_loader;
 
 pub use discovery::{find_config, DiscoveredConfig};
-pub use lintr_loader::{load as load_lintr, load_str as load_lintr_str, LoadedLintr};
+pub use lintr_loader::{load as load_lintr, load_str as load_lintr_str};
 pub use merge::merge as merge_settings;
 pub use overrides::{
     compile_lint_overrides, is_skipped_by_overrides, resolve_lint_for_document,
     CompiledLintOverride,
 };
-pub use toml_loader::{load as load_toml, load_str as load_toml_str, LoadedToml};
+pub use toml_loader::load as load_toml;
 
 /// Re-run every `parse_*_config` over the merged `(client, project)` JSON
 /// and overwrite the parsed configs on `state`. Idempotent.
