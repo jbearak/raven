@@ -14,6 +14,7 @@ import {
 } from './r-expression';
 import { runKnit } from './knit-engine';
 import { parseRenderedOutputPath } from './output-path';
+import { resolveRConsoleActivation } from '../r-console-activation';
 
 const OUTPUT_CHANNEL_NAME = 'Raven: Knit';
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -60,15 +61,26 @@ async function runKnitCommand(
         return;
     }
 
-    // Gate check via context key — set by `registerKnit`. Re-check the
-    // setting too, in case someone invokes the command from a script
-    // ignoring our `when` clauses.
-    const knitEnabled = vscode.workspace
-        .getConfiguration('raven.rConsole')
-        .get<string>('activation', 'auto') !== 'disabled';
-    if (!knitEnabled) {
+    // Re-check the *resolved* gate. The command-palette `when` clauses
+    // already gate on `raven.rmdKnit.enabled`, but the command itself is
+    // registered unconditionally (so the walkthrough's command-link
+    // works), and a stale auto-resolution after REditorSupport is
+    // enabled would otherwise let knit run.
+    if (resolveRConsoleActivation() !== 'enabled') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit is disabled by `raven.rConsole.activation`.',
+            'Raven: Knit is disabled by your `raven.rConsole.activation` setting (or because REditorSupport / Positron is active).',
+        );
+        return;
+    }
+
+    // Reject obviously-wrong inputs. The `when` clauses already filter
+    // the command palette, but a direct `executeCommand('raven.knit',
+    // uri)` from another extension or a keybinding could pass an
+    // arbitrary URI.
+    const ext = path.extname(docUri.fsPath || docUri.path).toLowerCase();
+    if (ext !== '.rmd') {
+        await vscode.window.showInformationMessage(
+            'Raven: Knit only runs on .Rmd files.',
         );
         return;
     }
@@ -136,12 +148,12 @@ async function runKnitCommand(
     const workingDirectoryMode = vscode.workspace
         .getConfiguration('raven.knit')
         .get<WorkingDirectoryMode>('workingDirectory', 'document');
-    const knitDirResult = resolveKnitRootDir(docUri, workingDirectoryMode);
+    const knitDirResult = resolveKnitDir(docUri, workingDirectoryMode);
     if (!knitDirResult.ok) {
         await vscode.window.showErrorMessage(knitDirResult.error);
         return;
     }
-    const knitRootDir = knitDirResult.value;
+    const { knitRootDir, cwd } = knitDirResult;
 
     // [6] Build R expression.
     let expression: string;
@@ -169,7 +181,6 @@ async function runKnitCommand(
     // [7] Spawn + [8] Stream + [9] Exit.
     const rBinary = resolveRBinary();
     const timeoutMs = readTimeoutMs();
-    const cwd = knitRootDir ?? path.dirname(fsPath);
     const baseName = path.basename(fsPath);
 
     output.appendLine(`---`);
@@ -259,26 +270,56 @@ async function runKnitCommand(
     );
 }
 
-interface KnitDirOk { ok: true; value: string | null; }
+interface KnitDirOk {
+    ok: true;
+    /** `knit_root_dir` argument to rmarkdown::render; null = omit. */
+    knitRootDir: string | null;
+    /** cwd for the R subprocess. */
+    cwd: string;
+}
 interface KnitDirErr { ok: false; error: string; }
 type KnitDirResult = KnitDirOk | KnitDirErr;
 
-function resolveKnitRootDir(
+/**
+ * Map the `raven.knit.workingDirectory` mode to the pair (subprocess
+ * cwd, `knit_root_dir` argument):
+ *
+ *   - `document` (default): subprocess cwd = `knit_root_dir` = the
+ *     document's parent directory.
+ *   - `project`: both = the workspace folder containing the document.
+ *     Refuses if the document is outside every workspace folder.
+ *   - `current`: omit `knit_root_dir` and use the first workspace
+ *     folder's path as cwd, falling back to the document directory only
+ *     when no workspace is open. The spec calls this "R's startup
+ *     working directory at subprocess start" — VS Code's convention is
+ *     that R-started-from-the-workspace inherits the workspace root.
+ */
+function resolveKnitDir(
     docUri: vscode.Uri,
     mode: WorkingDirectoryMode,
 ): KnitDirResult {
     const fsPath = docUri.fsPath;
-    if (mode === 'document') return { ok: true, value: path.dirname(fsPath) };
-    if (mode === 'current') return { ok: true, value: null };
-    // project
-    const folder = vscode.workspace.getWorkspaceFolder(docUri);
-    if (!folder) {
-        return {
-            ok: false,
-            error: 'Raven: Knit — cannot resolve project root: document is outside the workspace.',
-        };
+    if (mode === 'document') {
+        const dir = path.dirname(fsPath);
+        return { ok: true, knitRootDir: dir, cwd: dir };
     }
-    return { ok: true, value: folder.uri.fsPath };
+    if (mode === 'project') {
+        const folder = vscode.workspace.getWorkspaceFolder(docUri);
+        if (!folder) {
+            return {
+                ok: false,
+                error: 'Raven: Knit — cannot resolve project root: document is outside the workspace.',
+            };
+        }
+        return { ok: true, knitRootDir: folder.uri.fsPath, cwd: folder.uri.fsPath };
+    }
+    // mode === 'current'
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    return {
+        ok: true,
+        knitRootDir: null,
+        cwd: workspaceRoot ?? path.dirname(fsPath),
+    };
 }
 
 function resolveRBinary(): string {

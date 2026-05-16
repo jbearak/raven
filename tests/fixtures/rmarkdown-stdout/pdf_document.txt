@@ -1,0 +1,18 @@
+processing file: example.Rmd
+  |..........                                                                |  14%
+   ordinary text without R code
+
+  |....................                                                      |  28%
+label: setup
+  |..............................                                            |  42%
+label: plot1
+  |........................................                                  |  57%
+   ordinary text without R code
+
+output file: example.knit.md
+
+/opt/homebrew/bin/pandoc +RTS -K512m -RTS example.knit.md --to latex --output example.tex --template ...
+
+! LaTeX Warning: There were undefined references.
+
+Output created: /Users/me/proj/example.pdf

@@ -1,0 +1,19 @@
+processing file: example.Rmd
+  |.................                                                         |  23%
+   ordinary text without R code
+
+  |.................................                                        |  45%
+label: setup
+  |..................................................                       |  68%
+   ordinary text without R code
+
+  |..................................................................       |  90%
+label: plot
+  |..........................................................................| 100%
+   ordinary text without R code
+
+output file: example.knit.md
+
+/opt/homebrew/bin/pandoc +RTS -K512m -RTS example.knit.md --to html5 --from markdown+autolink_bare_uris+tex_math_single_backslash --output example.html --lua-filter ... --standalone --self-contained
+
+Output created: example.html

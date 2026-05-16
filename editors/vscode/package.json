@@ -28,7 +28,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "Executable-path settings are read from user/global settings only in untrusted workspaces.",
+      "description": "Raven: Knit executes R code from the workspace and is disabled in untrusted workspaces. Executable-path settings are also read from user/global settings only.",
       "restrictedConfigurations": [
         "raven.rTerminal.program",
         "raven.server.path",

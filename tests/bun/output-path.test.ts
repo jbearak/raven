@@ -1,5 +1,11 @@
 import { describe, test, expect } from 'bun:test';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { parseRenderedOutputPath } from '../../editors/vscode/src/knit/output-path';
+
+const FIXTURE_DIR = path.resolve(__dirname, '..', 'fixtures', 'rmarkdown-stdout');
+const readFixture = (name: string): string =>
+    fs.readFileSync(path.join(FIXTURE_DIR, name), 'utf8');
 
 describe('parseRenderedOutputPath', () => {
     test('extracts a single output path', () => {
@@ -56,5 +62,20 @@ describe('parseRenderedOutputPath', () => {
     test('ignores leading whitespace on the message line', () => {
         const stdout = "    Output created: foo.html\n";
         expect(parseRenderedOutputPath(stdout).paths).toEqual(['foo.html']);
+    });
+
+    test('extracts the path from a realistic html_document run', () => {
+        expect(parseRenderedOutputPath(readFixture('html_document.txt')).paths)
+            .toEqual(['example.html']);
+    });
+
+    test('extracts an absolute path from a realistic pdf_document run', () => {
+        expect(parseRenderedOutputPath(readFixture('pdf_document.txt')).paths)
+            .toEqual(['/Users/me/proj/example.pdf']);
+    });
+
+    test('extracts all three paths from an output_format = "all" run', () => {
+        expect(parseRenderedOutputPath(readFixture('all.txt')).paths)
+            .toEqual(['example.html', 'example.pdf', 'example.docx']);
     });
 });

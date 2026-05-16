@@ -246,10 +246,6 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         // REditorSupport / Positron handling chunks, Raven steps aside.
         register_chunks_navigation_and_highlight(context);
 
-        // `Raven: Knit` rides the same R-console gate as chunks — see the
-        // updated description of `raven.rConsole.activation` for rationale.
-        registerKnit(context);
-
         // R snippets for `rmd` / `quarto` are registered programmatically here
         // (rather than statically in package.json) so they only appear when
         // Raven's R-console is active. The static `language: "r"` registration
@@ -265,6 +261,14 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // still register the detection unconditionally so the key is
     // populated for whichever surfaces (current or future) consult it.
     register_r_package_detection(context);
+
+    // `Raven: Knit` registers unconditionally so the walkthrough's
+    // command-link works even when the resolved gate is closed. The
+    // handler itself re-checks `resolveRConsoleActivation()` at
+    // invocation and surfaces a clear info message if the gate is
+    // closed. Setting `raven.rmdKnit.enabled` to match the resolved gate
+    // gates the command-palette entry.
+    registerKnit(context, r_console_resolved === 'enabled');
 
     // Install nags (one-time recommendations to install quarto.quarto for .qmd
     // and REditorSupport.r-syntax for .Rmd grammar) and the Get-Started
