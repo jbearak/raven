@@ -152,7 +152,19 @@ pub fn run(args: LintArgs) -> i32 {
                 for w in l.warnings {
                     eprintln!("{w}");
                 }
-                let root = explicit.parent().unwrap_or(&cwd).to_path_buf();
+                // Canonicalize the parent so `root` is absolute even when
+                // `--config` points at a relative path. Without this,
+                // `resolve_lint_for_document`'s `strip_prefix(root)`
+                // check fails for the absolute URIs produced by `walk`
+                // — silently dropping every per-file
+                // `[[linting.overrides]]` patch (same failure mode as
+                // commit 81978f0 fixed for the non-explicit root).
+                let parent = explicit.parent().unwrap_or(&cwd).to_path_buf();
+                let root = if parent.is_absolute() {
+                    parent
+                } else {
+                    cwd.join(&parent)
+                };
                 (root, Some(l.settings))
             }
             None => {
