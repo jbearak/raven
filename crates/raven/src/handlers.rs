@@ -8547,26 +8547,33 @@ mod semantic_warning_pipeline_tests {
 /// share traversal and range emission, but get different messages so the
 /// suggested fix matches the actual mistake.
 ///
-/// Out of scope: `else` inside an expression context (e.g. `x <- else`,
-/// `f(else)`) — parent kind is not `program`/`braced_expression` there, and a
-/// different rule should describe the right fix.
+/// Out of scope: `else` that is NOT the leading token of a statement-level
+/// expression — e.g. `f(else)`, `x <- else`, `-else`. Those parse shapes mean
+/// the user meant `else` as an operand or argument, and a different rule
+/// should describe the right fix.
 fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
     // Case 1: identifier `else` at statement level. tree-sitter-r parses an
     // orphan `else` as a regular identifier; this branch covers both the
     // "newline after `if {…}`" pattern and the "no preceding `if` at all"
-    // pattern from issue #258. Only statement-level parents (`program` and
-    // `braced_expression`) are considered — `f(else)` / `x <- else` etc. have
-    // a different parent kind and live outside the scope of this rule.
+    // pattern from issue #258.
+    //
+    // "Statement level" means the `else` token is the leftmost descendant of
+    // some expression that itself sits directly in a `program` or
+    // `braced_expression`. That covers `else { 1 }` (parent is `program`
+    // directly), `function() { else { 1 } }` (parent is `braced_expression`),
+    // and also expression-leading shapes like `else |> f()`, `else$foo`,
+    // `else()` where the immediate parent is `binary_operator`,
+    // `extract_operator`, `call`, etc. Cases where `else` is NOT the leading
+    // token (`f(else)`, `x <- else`, `-else`) are deliberately out of scope —
+    // the start_byte equality check below fails for them.
     if node.kind() == "identifier" && node_text(node, text) == "else" && !node.is_error() {
-        if let Some(parent) = node.parent() {
-            let parent_is_stmt_level = matches!(parent.kind(), "program" | "braced_expression");
-            if parent_is_stmt_level && !parent.is_error() {
-                // Look back through preceding siblings (skipping comments) for
-                // an `if_statement`. If found and the `else` is on a later
-                // line than the closing `}`, emit the "same-line" diagnostic.
-                // Otherwise (no preceding `if` at all, or some other prior
-                // sibling), emit the orphan-else diagnostic.
-                let mut prev = node.prev_sibling();
+        if let Some((anchor, anchor_parent)) = statement_level_anchor(node) {
+            if !anchor_parent.is_error() {
+                // Look back through the anchor's preceding siblings (skipping
+                // comments) for an `if_statement`. If found and the `else` is
+                // on a later line than the closing `}`, emit the "same-line"
+                // diagnostic. Otherwise emit the orphan-else diagnostic.
+                let mut prev = anchor.prev_sibling();
                 let mut handled = false;
                 while let Some(sibling) = prev {
                     match sibling.kind() {
@@ -8576,7 +8583,7 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
                             let else_start_line = node.start_position().row;
                             let ref_line = brace_line.unwrap_or_else(|| sibling.end_position().row);
                             if else_start_line > ref_line {
-                                emit_else_newline_diagnostic(node, diagnostics);
+                                emit_else_newline_diagnostic(node, text, diagnostics);
                             }
                             handled = true;
                             break;
@@ -8585,7 +8592,7 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
                     }
                 }
                 if !handled {
-                    emit_orphan_else_diagnostic(node, diagnostics);
+                    emit_orphan_else_diagnostic(node, text, diagnostics);
                 }
             }
         }
@@ -8615,7 +8622,7 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
         if let (Some(brace_line), Some(else_kw)) = (consequence_end_line, else_node) {
             let else_start_line = else_kw.start_position().row;
             if else_start_line > brace_line {
-                emit_else_newline_diagnostic(else_kw, diagnostics);
+                emit_else_newline_diagnostic(else_kw, text, diagnostics);
             }
         }
     }
@@ -8627,18 +8634,57 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
     }
 }
 
-/// Emit a diagnostic for an orphaned else keyword
-fn emit_else_newline_diagnostic(node: Node, diagnostics: &mut Vec<Diagnostic>) {
+/// Walk up from an `else` identifier through ancestors that start at the same
+/// byte (i.e. `else` is their leftmost descendant) until the parent is a
+/// statement-level block (`program` or `braced_expression`). Returns the
+/// (anchor, anchor_parent) pair when the chain terminates at such a block, or
+/// `None` if `else` is not statement-leading (e.g. `f(else)`, `x <- else`).
+fn statement_level_anchor<'a>(else_id: Node<'a>) -> Option<(Node<'a>, Node<'a>)> {
+    let start = else_id.start_byte();
+    let mut anchor = else_id;
+    loop {
+        let parent = anchor.parent()?;
+        if matches!(parent.kind(), "program" | "braced_expression") {
+            return Some((anchor, parent));
+        }
+        if parent.start_byte() != start {
+            return None;
+        }
+        anchor = parent;
+    }
+}
+
+/// LSP `Position` for a tree-sitter node's start, converting byte column to
+/// UTF-16 character column.
+fn ts_start_to_lsp(node: Node, text: &str) -> Position {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+    let row = node.start_position().row;
+    let line_text = text.lines().nth(row).unwrap_or("");
+    Position::new(
+        row as u32,
+        byte_offset_to_utf16_column(line_text, node.start_position().column) as u32,
+    )
+}
+
+/// LSP `Position` for a tree-sitter node's end, converting byte column to
+/// UTF-16 character column.
+fn ts_end_to_lsp(node: Node, text: &str) -> Position {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+    let row = node.end_position().row;
+    let line_text = text.lines().nth(row).unwrap_or("");
+    Position::new(
+        row as u32,
+        byte_offset_to_utf16_column(line_text, node.end_position().column) as u32,
+    )
+}
+
+/// Emit a diagnostic for an `else` keyword that appears on a new line after
+/// an `if (...) {...}` block.
+fn emit_else_newline_diagnostic(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
     diagnostics.push(Diagnostic {
         range: Range {
-            start: Position::new(
-                node.start_position().row as u32,
-                node.start_position().column as u32,
-            ),
-            end: Position::new(
-                node.end_position().row as u32,
-                node.end_position().column as u32,
-            ),
+            start: ts_start_to_lsp(node, text),
+            end: ts_end_to_lsp(node, text),
         },
         severity: Some(DiagnosticSeverity::ERROR),
         message: "In R, 'else' must appear on the same line as the closing '}' of the if block"
@@ -8650,17 +8696,11 @@ fn emit_else_newline_diagnostic(node: Node, diagnostics: &mut Vec<Diagnostic>) {
 /// Emit a diagnostic for a statement-level `else` with no preceding `if` body.
 /// Distinct from `emit_else_newline_diagnostic` so users see the right hint:
 /// here the fix is to add the missing `if`, not to move `else` up a line.
-fn emit_orphan_else_diagnostic(node: Node, diagnostics: &mut Vec<Diagnostic>) {
+fn emit_orphan_else_diagnostic(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
     diagnostics.push(Diagnostic {
         range: Range {
-            start: Position::new(
-                node.start_position().row as u32,
-                node.start_position().column as u32,
-            ),
-            end: Position::new(
-                node.end_position().row as u32,
-                node.end_position().column as u32,
-            ),
+            start: ts_start_to_lsp(node, text),
+            end: ts_end_to_lsp(node, text),
         },
         severity: Some(DiagnosticSeverity::ERROR),
         message: "'else' without a preceding 'if' body: in R, 'else' must follow `if (...) {...}` on the same line"
@@ -16283,13 +16323,11 @@ clean_data <- function(x) {
     // Validates: Requirements 5.1, 5.3
     // ========================================================================
 
-    /// Test that standalone `else` without preceding `if` does NOT emit a duplicate diagnostic.
-    /// Tree-sitter handles this as a general syntax error, so we should not emit our
-    /// newline-specific diagnostic to avoid duplicates.
     /// Validates: Requirement 5.1 — standalone `else` should emit exactly one
     /// orphan-else diagnostic (not the "same line" variant intended for the
     /// `if {…}\nelse` pattern). Issue #258: tree-sitter-r does NOT flag
-    /// `else {z}` itself, so this collector is the only thing that does.
+    /// `else {z}` itself (verified by parse-tree dump), so this collector is
+    /// the only thing that can emit a diagnostic for the pattern.
     #[test]
     fn test_else_newline_standalone_else_emits_orphan_diagnostic() {
         let code = "else {z}";
@@ -16591,6 +16629,112 @@ clean_data <- function(x) {
             diagnostics.is_empty(),
             "`else` inside a string literal must not trigger orphan-else, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `else |> f()` — orphan `else` is the leading identifier of a
+    /// `binary_operator` expression that itself sits at statement level.
+    /// Parent of the identifier is `binary_operator` (not `program`), but
+    /// the *outermost* expression starting at the `else` token is
+    /// statement-level and is just as invalid as `else { 1 }`.
+    #[test]
+    fn test_orphan_else_leading_binary_operator() {
+        let code = "else |> f()";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`else` as the LHS of a statement-level pipe should emit one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `else$foo` — orphan `else` as the receiver of `$`. Same shape as
+    /// the pipe case but the wrapper is `extract_operator`.
+    #[test]
+    fn test_orphan_else_leading_extract_operator() {
+        let code = "else$foo";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`else$foo` should emit one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `else()` — orphan `else` invoked as a function call. Wrapper is `call`.
+    #[test]
+    fn test_orphan_else_leading_call() {
+        let code = "else()";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`else()` should emit one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `f(else)` — `else` appears inside a call's argument list, not at
+    /// statement level. R rejects this too, but it's outside the issue's
+    /// scope (different message would be wrong, no preceding `if` to point
+    /// at). Must NOT fire.
+    #[test]
+    fn test_orphan_else_inside_call_argument_is_ignored() {
+        let code = "f(else)";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert!(
+            diagnostics.is_empty(),
+            "`else` inside a call argument must not trigger orphan-else, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x <- else` — `else` is the RHS of an assignment, not a statement-
+    /// level leading token. Out of scope; must NOT fire.
+    #[test]
+    fn test_orphan_else_assignment_rhs_is_ignored() {
+        let code = "x <- else";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert!(
+            diagnostics.is_empty(),
+            "`else` as assignment RHS must not trigger orphan-else, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Range bug check — tree-sitter reports byte columns, but LSP expects
+    /// UTF-16 character columns. `é` is 2 bytes / 1 UTF-16 code unit, so a
+    /// leading `é ` followed by `else` should produce an LSP range whose
+    /// start.character is 2 (not 3).
+    #[test]
+    fn test_orphan_else_range_uses_utf16_columns() {
+        let code = "é else { 1 }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1, "expected one diagnostic");
+        let r = &diagnostics[0].range;
+        assert_eq!(
+            (r.start.line, r.start.character),
+            (0, 2),
+            "range start must be UTF-16 column 2 (after `é `), not byte column 3"
+        );
+        assert_eq!(
+            (r.end.line, r.end.character),
+            (0, 6),
+            "range end must be UTF-16 column 6 (after `else`)"
         );
     }
 
