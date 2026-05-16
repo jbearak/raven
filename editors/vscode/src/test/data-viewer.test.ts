@@ -42,7 +42,7 @@ async function pollFor<T>(
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         const value = predicate();
-        if (value !== undefined && value !== null && value !== false) {
+        if (value) {
             return value as T;
         }
         await sleep(intervalMs);

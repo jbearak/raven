@@ -127,7 +127,7 @@ export type WebviewToExtension =
          *  visibleRangeStart at the moment postLifecycle was called. */
         visibleRangeStart: number;
         /** End row index of the currently rendered window (exclusive).
-         *  Equal to visibleRangeStart + visibleRows.length. */
+         *  Equal to visibleRangeStart + visibleRows. */
         visibleRangeEnd: number;
         timestamp: number;
     }

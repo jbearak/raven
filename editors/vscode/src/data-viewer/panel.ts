@@ -414,9 +414,12 @@ export class DataViewerPanel {
 
     /** Latest visible-row range from the most recent lifecycle message,
      *  or undefined if none has arrived yet. Used by the test harness to
-     *  verify scroll position. */
+     *  verify scroll position. Returns a defensive copy so callers cannot
+     *  mutate the internal state. */
     getVisibleRange(): { start: number; end: number } | undefined {
-        return this.lastVisibleRange;
+        return this.lastVisibleRange
+            ? { ...this.lastVisibleRange }
+            : undefined;
     }
 
     /** Test-only: post a `testKey` message to the webview so it dispatches
@@ -435,15 +438,21 @@ export class DataViewerPanel {
 
     /** Test-only: post a `testScrollbarDrag` message to the webview so
      *  it dispatches synthetic pointer events on the thumb element.
-     *  fraction=0 jumps to top, fraction=1 jumps to bottom. Awaiting
-     *  waits for the message to be queued, not for any reply; tests
-     *  should poll `getVisibleRange()` to observe the result. */
+     *  fraction=0 jumps to top, fraction=1 jumps to bottom. Non-finite
+     *  inputs are rejected, and finite values are clamped to [0, 1] to
+     *  keep test behavior deterministic. Awaiting waits for the message
+     *  to be queued, not for any reply; tests should poll
+     *  `getVisibleRange()` to observe the result. */
     async dragScrollbar(fraction: number): Promise<void> {
         if (this.disposed) return;
+        if (!Number.isFinite(fraction)) {
+            throw new RangeError('fraction must be a finite number');
+        }
+        const clampedFraction = Math.min(1, Math.max(0, fraction));
         const msg: ExtensionToWebview = {
             type: 'testScrollbarDrag',
             panelGeneration: this.generation,
-            fraction,
+            fraction: clampedFraction,
         };
         await this.webviewPanel.webview.postMessage(msg);
     }
