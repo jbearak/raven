@@ -216,14 +216,22 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // users can confirm what's authoritative at a glance.
     client.onNotification(
         'raven/projectConfigLoaded',
-        (params: { path: string; source: string }) => {
-            outputChannel.appendLine(
-                `Raven: using config at ${params.path} (${params.source})`,
-            );
-            vscode.window.setStatusBarMessage(
-                `$(check) Raven: using ${params.source}`,
-                5000,
-            );
+        (params: unknown) => {
+            // Runtime type guard so a future server-side schema change fails
+            // loudly rather than silently rendering "undefined" in the UI.
+            if (
+                typeof params !== 'object' || params === null ||
+                typeof (params as { path?: unknown }).path !== 'string' ||
+                typeof (params as { source?: unknown }).source !== 'string'
+            ) {
+                outputChannel.appendLine(
+                    `Raven: ignoring malformed projectConfigLoaded payload: ${JSON.stringify(params)}`,
+                );
+                return;
+            }
+            const { path, source } = params as { path: string; source: string };
+            outputChannel.appendLine(`Raven: using config at ${path} (${source})`);
+            vscode.window.setStatusBarMessage(`$(check) Raven: using ${source}`, 5000);
         },
     );
 
