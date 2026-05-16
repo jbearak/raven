@@ -666,10 +666,6 @@ impl WorldState {
             config.circular_dependency_severity
         );
         log::info!("    out_of_scope: {:?}", config.out_of_scope_severity);
-        log::info!(
-            "    ambiguous_parent: {:?}",
-            config.ambiguous_parent_severity
-        );
         log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
 
         Self {

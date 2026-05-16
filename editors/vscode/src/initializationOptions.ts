@@ -57,7 +57,6 @@ export interface RavenInitializationOptions {
         missingFileSeverity?: SeverityLevel;
         circularDependencySeverity?: SeverityLevel;
         outOfScopeSeverity?: SeverityLevel;
-        ambiguousParentSeverity?: SeverityLevel;
         maxChainDepthSeverity?: SeverityLevel;
         redundantDirectiveSeverity?: SeverityLevel;
         onDemandIndexing?: {
@@ -168,7 +167,6 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     const missingFileSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.missingFileSeverity');
     const circularDependencySeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.circularDependencySeverity');
     const outOfScopeSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.outOfScopeSeverity');
-    const ambiguousParentSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.ambiguousParentSeverity');
     const maxChainDepthSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.maxChainDepthSeverity');
     const redundantDirectiveSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.redundantDirectiveSeverity');
 
@@ -238,7 +236,6 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         missingFileSeverity !== undefined ||
         circularDependencySeverity !== undefined ||
         outOfScopeSeverity !== undefined ||
-        ambiguousParentSeverity !== undefined ||
         maxChainDepthSeverity !== undefined ||
         redundantDirectiveSeverity !== undefined ||
         onDemandIndexing !== undefined ||
@@ -277,9 +274,6 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         }
         if (outOfScopeSeverity !== undefined) {
             options.crossFile.outOfScopeSeverity = outOfScopeSeverity;
-        }
-        if (ambiguousParentSeverity !== undefined) {
-            options.crossFile.ambiguousParentSeverity = ambiguousParentSeverity;
         }
         if (maxChainDepthSeverity !== undefined) {
             options.crossFile.maxChainDepthSeverity = maxChainDepthSeverity;

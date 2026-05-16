@@ -62,8 +62,6 @@ pub struct CrossFileConfig {
     pub circular_dependency_severity: Option<DiagnosticSeverity>,
     /// Severity for out-of-scope symbol diagnostics (None = disabled)
     pub out_of_scope_severity: Option<DiagnosticSeverity>,
-    /// Severity for ambiguous parent diagnostics (None = disabled)
-    pub ambiguous_parent_severity: Option<DiagnosticSeverity>,
     /// Severity for max chain depth exceeded diagnostics (None = disabled)
     pub max_chain_depth_severity: Option<DiagnosticSeverity>,
     /// Whether on-demand indexing is enabled
@@ -173,7 +171,6 @@ impl Default for CrossFileConfig {
             missing_file_severity: Some(DiagnosticSeverity::WARNING),
             circular_dependency_severity: Some(DiagnosticSeverity::ERROR),
             out_of_scope_severity: Some(DiagnosticSeverity::WARNING),
-            ambiguous_parent_severity: Some(DiagnosticSeverity::WARNING),
             max_chain_depth_severity: Some(DiagnosticSeverity::WARNING),
             on_demand_indexing_enabled: true,
             on_demand_indexing_max_transitive_depth: 2,

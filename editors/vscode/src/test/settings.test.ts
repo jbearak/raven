@@ -91,7 +91,6 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.missingFileSeverity', jsonPath: ['crossFile', 'missingFileSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.circularDependencySeverity', jsonPath: ['crossFile', 'circularDependencySeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.outOfScopeSeverity', jsonPath: ['crossFile', 'outOfScopeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'crossFile.ambiguousParentSeverity', jsonPath: ['crossFile', 'ambiguousParentSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.maxChainDepthSeverity', jsonPath: ['crossFile', 'maxChainDepthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.redundantDirectiveSeverity', jsonPath: ['crossFile', 'redundantDirectiveSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     // On-demand indexing settings
@@ -770,7 +769,6 @@ suite('Settings Transmission Unit Tests', () => {
             ['crossFile.missingFileSeverity', 'error'],
             ['crossFile.circularDependencySeverity', 'warning'],
             ['crossFile.outOfScopeSeverity', 'information'],
-            ['crossFile.ambiguousParentSeverity', 'hint'],
             ['crossFile.maxChainDepthSeverity', 'error'],
             ['packages.missingPackageSeverity', 'warning'],
             ['diagnostics.undefinedVariableSeverity', 'off'],
@@ -782,7 +780,6 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.crossFile?.missingFileSeverity, 'error');
         assert.strictEqual(options.crossFile?.circularDependencySeverity, 'warning');
         assert.strictEqual(options.crossFile?.outOfScopeSeverity, 'information');
-        assert.strictEqual(options.crossFile?.ambiguousParentSeverity, 'hint');
         assert.strictEqual(options.crossFile?.maxChainDepthSeverity, 'error');
         assert.strictEqual(options.packages?.missingPackageSeverity, 'warning');
         assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, 'off');
