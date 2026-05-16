@@ -27,7 +27,7 @@ pub fn find_config(start: &Path) -> DiscoveredConfig {
     let mut depth = 0;
 
     while let Some(dir) = current {
-        if depth > MAX_DEPTH {
+        if depth >= MAX_DEPTH {
             break;
         }
         let candidate = dir.join("raven.toml");
