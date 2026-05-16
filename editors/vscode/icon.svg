@@ -2,89 +2,40 @@
 <!--
   Raven extension icon.
 
-  Concept: a raven perched on the lowest bar of a three-bar chart. The raven
-  reads first; the evergreen chart gives the mark an R/data-analysis cue
-  without forcing a letterform into the bird silhouette.
+  Bell-curve mark with a cool blue-to-grey ramp. The shape mirrors a normal
+  distribution to cue R / statistics work; the muted palette keeps the badge
+  legible at small sizes in the VS Code Marketplace and extension UI.
 
-  Canvas: 128x128. Safe area is ~112x112 centered (8px margin all round) so
-  the mark reads at small sizes in the VS Code Marketplace and extension UI.
+  Canvas: 128x128.
 -->
-<svg xmlns="http://www.w3.org/2000/svg"
-     width="128" height="128"
-     viewBox="0 0 128 128"
-     role="img"
-     aria-label="Raven - R Language Server">
-  <!-- Forest dusk tile -->
-  <rect width="128" height="128" rx="24" fill="#26352D"/>
-
-  <!-- Three-bar chart perch -->
-  <rect x="22" y="82" width="18" height="24" rx="3" fill="#8FA878"/>
-  <rect x="55" y="64" width="18" height="42" rx="3" fill="#678C64"/>
-  <rect x="88" y="42" width="18" height="64" rx="3" fill="#4A7656"/>
-
-  <!-- Muted chart baseline, kept thin so it supports without becoming the focus. -->
-  <path d="M18 106H110" stroke="#8FA878" stroke-width="3" stroke-linecap="round"/>
-
-  <!-- Top edge of the short bar under the raven's feet. -->
-  <path d="M24 82H40" stroke="#D4DEC9" stroke-width="3" stroke-linecap="round"/>
-
-  <!-- Raven silhouette -->
-  <path d="
-      M 28 82
-      C 28 72, 32 62, 40 52
-      C 49 41, 62 33, 79 29
-      C 75 38, 74 46, 77 53
-      C 84 54, 91 57, 97 61
-      C 88 63, 80 67, 73 72
-      C 72 83, 67 92, 57 98
-      C 45 105, 34 101, 28 82
-      Z"
-    fill="#05070A"/>
-
-  <!-- Beak -->
-  <path d="
-      M 60 43
-      C 71 36, 84 34, 99 36
-      L 73 55
-      Z"
-    fill="#05070A"/>
-
-  <!-- Tail feathers -->
-  <path d="
-      M 35 59
-      C 26 63, 17 65, 7 64
-      C 14 73, 23 80, 35 86
-      C 40 77, 40 68, 35 59
-      Z"
-    fill="#05070A"/>
-
-  <!-- Folded wing -->
-  <path d="
-      M 45 57
-      C 49 63, 52 70, 53 78
-      C 44 75, 36 71, 30 65
-      C 36 62, 40 60, 45 57
-      Z"
-    fill="#1F2933"/>
-
-  <!-- Feet and talons gripping the low bar -->
-  <path d="M30 78V82 M38 78V82" stroke="#05070A" stroke-width="5" stroke-linecap="round"/>
-  <path d="
-      M 28 82 L 23 85
-      M 31 82 L 34 86
-      M 38 82 L 34 86
-      M 40 82 L 45 85"
-    stroke="#05070A"
-    stroke-width="2.4"
-    stroke-linecap="round"/>
-
-  <!-- Subtle feather highlight -->
-  <path d="M55 56C51 63, 50 70, 52 77"
-        stroke="#F5F1E8"
-        stroke-width="4"
-        stroke-linecap="round"
-        opacity="0.22"/>
-
-  <!-- Warm eye accent -->
-  <circle cx="65" cy="48" r="3" fill="#D69E2E"/>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Raven - R Language Server">
+  <defs>
+    <linearGradient id="raven-ramp" x1="14" y1="0" x2="114" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0.00" stop-color="#1E3A8A"/>
+      <stop offset="0.30" stop-color="#3B82F6"/>
+      <stop offset="0.55" stop-color="#CBD5E1"/>
+      <stop offset="0.78" stop-color="#64748B"/>
+      <stop offset="1.00" stop-color="#1F2937"/>
+    </linearGradient>
+    <clipPath id="raven-clip">
+      <path d="M 14.00 97.87L 15.25 97.82L 16.50 97.76L 17.75 97.68L 19.00 97.57L 20.25 97.42L 21.50 97.24L 22.75 97.01L 24.00 96.72L 25.25 96.35L 26.50 95.90L 27.75 95.34L 29.00 94.66L 30.25 93.84L 31.50 92.86L 32.75 91.71L 34.00 90.35L 35.25 88.77L 36.50 86.96L 37.75 84.90L 39.00 82.57L 40.25 79.97L 41.50 77.11L 42.75 73.98L 44.00 70.61L 45.25 67.00L 46.50 63.20L 47.75 59.25L 49.00 55.19L 50.25 51.08L 51.50 46.98L 52.75 42.97L 54.00 39.11L 55.25 35.48L 56.50 32.16L 57.75 29.21L 59.00 26.70L 60.25 24.68L 61.50 23.20L 62.75 22.30L 64.00 22.00L 65.25 22.30L 66.50 23.20L 67.75 24.68L 69.00 26.70L 70.25 29.21L 71.50 32.16L 72.75 35.48L 74.00 39.11L 75.25 42.97L 76.50 46.98L 77.75 51.08L 79.00 55.19L 80.25 59.25L 81.50 63.20L 82.75 67.00L 84.00 70.61L 85.25 73.98L 86.50 77.11L 87.75 79.97L 89.00 82.57L 90.25 84.90L 91.50 86.96L 92.75 88.77L 94.00 90.35L 95.25 91.71L 96.50 92.86L 97.75 93.84L 99.00 94.66L 100.25 95.34L 101.50 95.90L 102.75 96.35L 104.00 96.72L 105.25 97.01L 106.50 97.24L 107.75 97.42L 109.00 97.57L 110.25 97.68L 111.50 97.76L 112.75 97.82L 114.00 97.87 L 114 100 L 14 100 Z"/>
+    </clipPath>
+    <filter id="raven-blur" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3.0"/>
+    </filter>
+    <mask id="raven-glow" maskUnits="userSpaceOnUse" x="0" y="0" width="128" height="128">
+      <rect width="128" height="128" fill="black"/>
+      <g filter="url(#raven-blur)">
+        <path d="M 14.00 97.87L 15.25 97.82L 16.50 97.76L 17.75 97.68L 19.00 97.57L 20.25 97.42L 21.50 97.24L 22.75 97.01L 24.00 96.72L 25.25 96.35L 26.50 95.90L 27.75 95.34L 29.00 94.66L 30.25 93.84L 31.50 92.86L 32.75 91.71L 34.00 90.35L 35.25 88.77L 36.50 86.96L 37.75 84.90L 39.00 82.57L 40.25 79.97L 41.50 77.11L 42.75 73.98L 44.00 70.61L 45.25 67.00L 46.50 63.20L 47.75 59.25L 49.00 55.19L 50.25 51.08L 51.50 46.98L 52.75 42.97L 54.00 39.11L 55.25 35.48L 56.50 32.16L 57.75 29.21L 59.00 26.70L 60.25 24.68L 61.50 23.20L 62.75 22.30L 64.00 22.00L 65.25 22.30L 66.50 23.20L 67.75 24.68L 69.00 26.70L 70.25 29.21L 71.50 32.16L 72.75 35.48L 74.00 39.11L 75.25 42.97L 76.50 46.98L 77.75 51.08L 79.00 55.19L 80.25 59.25L 81.50 63.20L 82.75 67.00L 84.00 70.61L 85.25 73.98L 86.50 77.11L 87.75 79.97L 89.00 82.57L 90.25 84.90L 91.50 86.96L 92.75 88.77L 94.00 90.35L 95.25 91.71L 96.50 92.86L 97.75 93.84L 99.00 94.66L 100.25 95.34L 101.50 95.90L 102.75 96.35L 104.00 96.72L 105.25 97.01L 106.50 97.24L 107.75 97.42L 109.00 97.57L 110.25 97.68L 111.50 97.76L 112.75 97.82L 114.00 97.87" fill="none" stroke="white" stroke-width="8"/>
+      </g>
+      <path d="M 14.00 97.87L 15.25 97.82L 16.50 97.76L 17.75 97.68L 19.00 97.57L 20.25 97.42L 21.50 97.24L 22.75 97.01L 24.00 96.72L 25.25 96.35L 26.50 95.90L 27.75 95.34L 29.00 94.66L 30.25 93.84L 31.50 92.86L 32.75 91.71L 34.00 90.35L 35.25 88.77L 36.50 86.96L 37.75 84.90L 39.00 82.57L 40.25 79.97L 41.50 77.11L 42.75 73.98L 44.00 70.61L 45.25 67.00L 46.50 63.20L 47.75 59.25L 49.00 55.19L 50.25 51.08L 51.50 46.98L 52.75 42.97L 54.00 39.11L 55.25 35.48L 56.50 32.16L 57.75 29.21L 59.00 26.70L 60.25 24.68L 61.50 23.20L 62.75 22.30L 64.00 22.00L 65.25 22.30L 66.50 23.20L 67.75 24.68L 69.00 26.70L 70.25 29.21L 71.50 32.16L 72.75 35.48L 74.00 39.11L 75.25 42.97L 76.50 46.98L 77.75 51.08L 79.00 55.19L 80.25 59.25L 81.50 63.20L 82.75 67.00L 84.00 70.61L 85.25 73.98L 86.50 77.11L 87.75 79.97L 89.00 82.57L 90.25 84.90L 91.50 86.96L 92.75 88.77L 94.00 90.35L 95.25 91.71L 96.50 92.86L 97.75 93.84L 99.00 94.66L 100.25 95.34L 101.50 95.90L 102.75 96.35L 104.00 96.72L 105.25 97.01L 106.50 97.24L 107.75 97.42L 109.00 97.57L 110.25 97.68L 111.50 97.76L 112.75 97.82L 114.00 97.87" fill="none" stroke="white" stroke-width="2"/>
+    </mask>
+  </defs>
+  <rect width="128" height="128" rx="24" fill="#0B1220"/>
+  <g clip-path="url(#raven-clip)" opacity="1">
+    <g mask="url(#raven-glow)">
+      <rect x="0" y="0" width="128" height="128" fill="url(#raven-ramp)"/>
+    </g>
+  </g>
+  <path d="M 14.00 97.87L 15.25 97.82L 16.50 97.76L 17.75 97.68L 19.00 97.57L 20.25 97.42L 21.50 97.24L 22.75 97.01L 24.00 96.72L 25.25 96.35L 26.50 95.90L 27.75 95.34L 29.00 94.66L 30.25 93.84L 31.50 92.86L 32.75 91.71L 34.00 90.35L 35.25 88.77L 36.50 86.96L 37.75 84.90L 39.00 82.57L 40.25 79.97L 41.50 77.11L 42.75 73.98L 44.00 70.61L 45.25 67.00L 46.50 63.20L 47.75 59.25L 49.00 55.19L 50.25 51.08L 51.50 46.98L 52.75 42.97L 54.00 39.11L 55.25 35.48L 56.50 32.16L 57.75 29.21L 59.00 26.70L 60.25 24.68L 61.50 23.20L 62.75 22.30L 64.00 22.00L 65.25 22.30L 66.50 23.20L 67.75 24.68L 69.00 26.70L 70.25 29.21L 71.50 32.16L 72.75 35.48L 74.00 39.11L 75.25 42.97L 76.50 46.98L 77.75 51.08L 79.00 55.19L 80.25 59.25L 81.50 63.20L 82.75 67.00L 84.00 70.61L 85.25 73.98L 86.50 77.11L 87.75 79.97L 89.00 82.57L 90.25 84.90L 91.50 86.96L 92.75 88.77L 94.00 90.35L 95.25 91.71L 96.50 92.86L 97.75 93.84L 99.00 94.66L 100.25 95.34L 101.50 95.90L 102.75 96.35L 104.00 96.72L 105.25 97.01L 106.50 97.24L 107.75 97.42L 109.00 97.57L 110.25 97.68L 111.50 97.76L 112.75 97.82L 114.00 97.87" fill="none" stroke="#93C5FD" stroke-width="1" stroke-linejoin="round" stroke-linecap="round"/>
 </svg>
