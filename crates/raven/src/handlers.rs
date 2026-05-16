@@ -8113,6 +8113,14 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn at_lsp_ignore_inside_backticks_does_not_suppress() {
+        // R allows backtick-quoted identifiers; the `#` inside one is
+        // identifier content, not a comment.
+        let diags = collect("TRUE <- 1; `# @lsp-ignore` <- 2");
+        assert!(!diags.is_empty(), "got {diags:?}");
+    }
+
+    #[test]
     fn nolint_does_not_suppress_diagnostic() {
         // `# nolint` belongs to the opt-in lint pipeline. R rejects
         // `TRUE <- 1` outright; an unrelated style suppression like
@@ -8435,24 +8443,27 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
 }
 
 /// Return the byte index of the first `#` in `line` that is not inside a
-/// string literal. Tracks `"…"` and `'…'` with `\`-escapes, matching the
-/// scanner in `linting::nolint::find_inline_marker`.
+/// string or backtick-quoted identifier. Tracks `"…"`, `'…'`, and `` `…` ``
+/// with `\`-escapes inside quotes.
 fn find_unquoted_hash(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_backtick = false;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\\' && (in_single || in_double) {
             i += 2;
             continue;
         }
-        if !in_single && b == b'"' {
+        if !in_single && !in_backtick && b == b'"' {
             in_double = !in_double;
-        } else if !in_double && b == b'\'' {
+        } else if !in_double && !in_backtick && b == b'\'' {
             in_single = !in_single;
-        } else if !in_single && !in_double && b == b'#' {
+        } else if !in_single && !in_double && b == b'`' {
+            in_backtick = !in_backtick;
+        } else if !in_single && !in_double && !in_backtick && b == b'#' {
             return Some(i);
         }
         i += 1;
