@@ -2,6 +2,8 @@
 
 Most settings are exposed as VS Code settings — search for "raven" in Settings (Cmd/Ctrl-,). A handful of advanced server-side knobs are only available via LSP initialization options; those are noted in the tables below.
 
+> Looking for a specific key? See [Settings reference](settings-reference.md) for an alphabetical index of every `raven.*` setting with default, type, `raven.toml` path, and a one-line description. The sections below add context: when each setting matters, how the project file interacts with VS Code settings, and which knobs hang together.
+
 ## Project config: `raven.toml`
 
 The recommended way to configure Raven is a `raven.toml` file at the project root. Every editor and the `raven lint` CLI read this file, so a single committed config governs both interactive editing and CI.
