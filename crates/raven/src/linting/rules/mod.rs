@@ -18,6 +18,8 @@ pub(crate) mod object_name;
 pub(crate) mod quotes;
 pub(crate) mod semicolon;
 pub(crate) mod spaces_inside;
+pub(crate) mod condition_assignment;
+pub(crate) mod mixed_logical;
 pub(crate) mod t_and_f_symbol;
 pub(crate) mod trailing_blank_lines;
 pub(crate) mod trailing_whitespace;

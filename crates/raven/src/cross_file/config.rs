@@ -91,6 +91,18 @@ pub struct CrossFileConfig {
     /// same file as earlier source() call)
     /// _Requirements: 6.2_
     pub redundant_directive_severity: Option<DiagnosticSeverity>,
+    /// Severity for the mixed-logical rule. `None` disables the rule.
+    ///
+    /// Flags `|` / `||` binary operators whose immediate operand is a bare
+    /// `&` / `&&` (no parentheses), e.g. `a & b | c`. Stops at call/subset
+    /// boundaries so vectorized data-mask patterns are not flagged.
+    pub mixed_logical_severity: Option<DiagnosticSeverity>,
+    /// Severity for the condition-assignment rule. `None` disables the rule.
+    ///
+    /// Flags `=` used as a binary operator directly inside an `if` or `while`
+    /// condition. R rejects `if (x = 1)` as a syntax error at runtime;
+    /// tree-sitter-r accepts it silently.
+    pub condition_assignment_severity: Option<DiagnosticSeverity>,
     /// Maximum entries in the metadata cache (LRU eviction)
     pub cache_metadata_max_entries: usize,
     /// Maximum entries in the file content cache (LRU eviction)
@@ -173,6 +185,8 @@ impl Default for CrossFileConfig {
             packages_watch_library_paths: true,
             packages_watch_debounce_ms: 500,
             redundant_directive_severity: Some(DiagnosticSeverity::HINT),
+            mixed_logical_severity: Some(DiagnosticSeverity::WARNING),
+            condition_assignment_severity: Some(DiagnosticSeverity::WARNING),
             cache_metadata_max_entries: 1000,
             cache_file_content_max_entries: 500,
             cache_existence_max_entries: 2000,

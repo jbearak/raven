@@ -303,6 +303,20 @@ pub(crate) fn parse_cross_file_config(
         {
             config.undefined_variable_severity = parse_severity(sev);
         }
+        // Parse diagnostics.mixedLogicalSeverity
+        if let Some(sev) = diag
+            .get("mixedLogicalSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.mixed_logical_severity = parse_severity(sev);
+        }
+        // Parse diagnostics.conditionAssignmentSeverity
+        if let Some(sev) = diag
+            .get("conditionAssignmentSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.condition_assignment_severity = parse_severity(sev);
+        }
     }
 
     // Parse package settings (Requirement 12, Task 14.2)

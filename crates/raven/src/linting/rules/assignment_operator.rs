@@ -39,7 +39,10 @@ fn visit(
     if node.kind() == "binary_operator" {
         if let Some(op_node) = node.child_by_field_name("operator") {
             let op_text = node_text(op_node, text);
-            if !is_named_argument(node, op_text) {
+            // Skip `=` that is directly in an if/while condition —
+            // condition_assignment handles it with a more specific message.
+            let skip_for_condition = op_text == "=" && is_if_while_condition_directly(node);
+            if !skip_for_condition && !is_named_argument(node, op_text) {
                 let bad = match style {
                     AssignmentOperatorStyle::LeftArrow => op_text == "=",
                     AssignmentOperatorStyle::Equals => op_text == "<-",
@@ -101,6 +104,20 @@ fn is_named_argument(binop: Node<'_>, op_text: &str) -> bool {
     binop
         .parent()
         .is_some_and(|p| p.kind() == "argument")
+}
+
+/// Returns `true` if `binop` is the direct `condition` field of an
+/// `if_statement` or `while_statement`. Used to avoid double-diagnosing
+/// `if (x = 1)` — `condition_assignment` handles that case specifically.
+fn is_if_while_condition_directly(binop: Node<'_>) -> bool {
+    if let Some(parent) = binop.parent() {
+        if matches!(parent.kind(), "if_statement" | "while_statement") {
+            if let Some(cond) = parent.child_by_field_name("condition") {
+                return cond.id() == binop.id();
+            }
+        }
+    }
+    false
 }
 
 fn node_text<'a>(node: Node<'_>, text: &'a str) -> &'a str {

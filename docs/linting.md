@@ -14,7 +14,7 @@ The linter is off by default. The minimum `settings.json` to turn it on with def
 }
 ```
 
-All rules default to severity `hint` so they don't crowd the Problems pane. To raise a rule (e.g. line length) to `warning`, or to disable an individual rule, set its severity:
+All style lint rules default to severity `hint` so they don't crowd the Problems pane. To raise a rule (e.g. line length) to `warning`, or to disable an individual rule, set its severity:
 
 ```json
 {
@@ -176,6 +176,8 @@ The recommended path is to configure Raven via `raven.toml` at the project root 
 | `equals_na_linter()` | `raven.linting.equalsNaSeverity` |
 | `object_length_linter(length = N)` | `raven.linting.objectLength = N`, `raven.linting.objectLengthSeverity` |
 | `vector_logic_linter()` | `raven.linting.vectorLogicSeverity` |
+| *(no equivalent)* | `raven.linting.mixedLogicalSeverity` |
+| *(no equivalent)* | `raven.linting.conditionAssignmentSeverity` |
 | `function_left_parentheses_linter()` | `raven.linting.functionLeftParenthesesSeverity` |
 | `spaces_inside_linter()` | `raven.linting.spacesInsideSeverity` |
 | `indentation_linter(indent = N)` | `raven.linting.indentationUnit = N`, `raven.linting.indentationSeverity` |

@@ -75,6 +75,8 @@ export interface RavenInitializationOptions {
     diagnostics?: {
         enabled?: boolean;
         undefinedVariableSeverity?: SeverityLevel;
+        mixedLogicalSeverity?: SeverityLevel;
+        conditionAssignmentSeverity?: SeverityLevel;
     };
     packages?: {
         enabled?: boolean;
@@ -295,12 +297,20 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
 
     const diagnosticsEnabled = config.get<boolean>('diagnostics.enabled', true);
     const undefinedVariableSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.undefinedVariableSeverity');
+    const mixedLogicalSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.mixedLogicalSeverity');
+    const conditionAssignmentSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.conditionAssignmentSeverity');
 
     options.diagnostics = {
         enabled: diagnosticsEnabled,
     };
     if (undefinedVariableSeverity !== undefined) {
         options.diagnostics.undefinedVariableSeverity = undefinedVariableSeverity;
+    }
+    if (mixedLogicalSeverity !== undefined) {
+        options.diagnostics.mixedLogicalSeverity = mixedLogicalSeverity;
+    }
+    if (conditionAssignmentSeverity !== undefined) {
+        options.diagnostics.conditionAssignmentSeverity = conditionAssignmentSeverity;
     }
 
     const packagesEnabled = getExplicitSetting<boolean>(config, 'packages.enabled');
