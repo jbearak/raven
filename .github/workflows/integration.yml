@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache wraps rustc; unchanged crates are served from ~/.cache/sccache
+  # even when Cargo.lock changes. We use the local-filesystem backend (not
+  # SCCACHE_GHA_ENABLED) so sccache never does a hard startup probe against
+  # the GHA cache API — actions/cache below handles persistence gracefully.
+  RUSTC_WRAPPER: sccache
 
 permissions:
   contents: read
@@ -28,15 +33,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # rust-cache caches ~/.cargo/registry, ~/.cargo/git, and per-crate
-      # entries under target/ keyed by crate name + version + feature flags.
-      # Unlike caching the whole target/ on Cargo.lock hash, adding/removing
-      # one dep only evicts that dep's artifacts; everything else hits the cache.
-      # Falls through gracefully on a cache-service error (miss, not failure).
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea4b4e5dc1340 # v2.7.8
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache sccache storage and cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          workspaces: ". -> target"
+          path: |
+            ~/.cache/sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-sccache-${{ runner.os }}-
 
       # `--features test-support` exposes `raven::test_utils`, which the
       # `performance_budgets` integration test imports. Without the flag,
@@ -57,10 +66,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea4b4e5dc1340 # v2.7.8
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache sccache storage and cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          workspaces: ". -> target"
+          path: |
+            ~/.cache/sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-sccache-${{ runner.os }}-
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
