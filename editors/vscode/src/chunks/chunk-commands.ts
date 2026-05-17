@@ -137,6 +137,15 @@ async function run_chunk_at(
     cursor_line: number,
     target: TerminalTarget = 'managed',
 ): Promise<void> {
+    // Active-terminal path: bail upfront if there is no terminal to send
+    // into. Otherwise the `…AndMove` variants would still advance the
+    // cursor after `send_to_r` short-circuited on the "no active terminal"
+    // error, leaving the user with a moved cursor and nothing sent.
+    if (target === 'active' && !vscode.window.activeTerminal) {
+        vscode.window.showErrorMessage('No active terminal. Open a terminal first.');
+        return;
+    }
+
     const editor = find_visible_editor(document.uri);
     const lines = get_document_lines(document);
     const chunks = chunks_for_document(document);
