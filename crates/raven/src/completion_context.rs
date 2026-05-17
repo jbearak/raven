@@ -139,9 +139,12 @@ fn is_inside_string(node: &Node) -> bool {
 ///    unreliable. For example `a(if(b, c))` parses `if(b` as an ERROR
 ///    inside the outer call's arguments, so the AST groups the outer `)`
 ///    with the outer `(` even though textually it pairs with the inner
-///    `(`. Whenever we'd walk through an ERROR — directly as an ancestor
-///    or inside an enclosing call's arguments — we bail and let the
-///    bracket heuristic take over.
+///    `(`. When we walk through an `ERROR` ancestor we bail to the
+///    heuristic. When we land in a `call` whose arguments subtree has
+///    parse errors, we cross-check the AST callee against the heuristic
+///    and prefer the heuristic on disagreement — but keep the AST result
+///    when the heuristic returns `None` (it can't extract backticked or
+///    non-ASCII names that the AST handles fine).
 fn find_enclosing_function_call(
     node: Node,
     text: &str,
@@ -173,19 +176,35 @@ fn find_enclosing_function_call(
         if kind == "call" {
             // Check if cursor is inside the arguments (between `(` and `)`)
             if let Some(args_node) = current.child_by_field_name("arguments") {
-                // If the argument subtree has parse errors anywhere, bracket
-                // pairings may have been recovered incorrectly — fall back
-                // to the bracket heuristic.
-                if args_node.has_error() {
-                    return None;
-                }
                 let args_start = args_node.start_position();
                 let args_end = args_node.end_position();
 
                 // cursor must be after the opening `(` and before or at the closing `)`
                 if cursor_point > args_start && cursor_point <= args_end {
                     if let Some(func_node) = current.child_by_field_name("function") {
-                        return extract_call_info(func_node, text);
+                        let ast_ctx = extract_call_info(func_node, text);
+
+                        // When the argument subtree has parse errors,
+                        // tree-sitter's bracket recovery can mis-group `(`
+                        // with `)` (e.g. `a(if(b, c))` — the outer `)` is
+                        // grouped with the outer `(` at the AST level even
+                        // though textually it pairs with the inner `(`).
+                        // Cross-check against the bracket heuristic and
+                        // prefer it on disagreement — but keep the AST
+                        // result when the heuristic returns `None` or
+                        // agrees with it (the heuristic can't extract
+                        // backticked or non-ASCII function names that the
+                        // AST handles fine).
+                        if args_node.has_error() {
+                            if let Some(fallback) =
+                                detect_via_bracket_heuristic(text, position)
+                            {
+                                if ast_ctx.as_ref() != Some(&fallback) {
+                                    return Some(fallback);
+                                }
+                            }
+                        }
+                        return ast_ctx;
                     }
                 }
             }
@@ -200,8 +219,14 @@ fn find_enclosing_function_call(
 /// `if`/`for`/`while`, and on the `parameters` child for
 /// `function_definition`.
 ///
-/// The cursor span matches the existing `call` behaviour: strictly after
-/// `(` and at or before the byte just past `)`.
+/// Cursor inclusivity: strictly after `(`, at or before `)`. We compare
+/// against `close.start_position()` rather than `close.end_position()`
+/// because the keyword construct's range extends past `)` into the body
+/// — without this, a cursor in the whitespace immediately after `)` would
+/// still walk up to `if_statement` and be claimed as the `if` header.
+/// (Ordinary `call` nodes don't have this hazard because the call node
+/// itself ends at `)`, so `descendant_for_point_range` filters past-`)`
+/// cursors out before the walk-up starts.)
 fn keyword_construct_name(node: Node, cursor: Point) -> Option<&'static str> {
     let (keyword, paren_owner) = match node.kind() {
         "if_statement" => ("if", node),
@@ -212,7 +237,7 @@ fn keyword_construct_name(node: Node, cursor: Point) -> Option<&'static str> {
     };
     let open = paren_owner.child_by_field_name("open")?;
     let close = paren_owner.child_by_field_name("close")?;
-    if cursor > open.start_position() && cursor <= close.end_position() {
+    if cursor > open.start_position() && cursor <= close.start_position() {
         Some(keyword)
     } else {
         None
@@ -896,6 +921,52 @@ mod tests {
         // Cursor at the `x` inside the parameter list
         let ctx = detect_function_call_context(&tree, code, Position::new(0, 20));
         assert_eq!(ctx, keyword_ctx("function"));
+    }
+
+    #[test]
+    fn test_keyword_cursor_immediately_past_close_paren() {
+        // The keyword construct's range extends past `)` into the body,
+        // unlike ordinary `call` nodes whose range ends at `)`. A cursor
+        // in the whitespace immediately after `)` must NOT be claimed by
+        // the keyword header.
+        let code = "if(cond) body";
+        let tree = parse_r(code);
+        // Cursor at col 8, one byte past the `)` (which is at col 7).
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 8)),
+            None
+        );
+
+        let code = "function(x) body";
+        let tree = parse_r(code);
+        // `)` of the parameter list is at col 10; col 11 is the space.
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 11)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_keyword_nested_inside_call_middle_position() {
+        // Same regression as test_keyword_nested_inside_call_regression_274
+        // but at a middle position between the inner args. This is the
+        // path exercised by the `args_node.has_error()` cross-check: the
+        // cursor's AST ancestor chain doesn't pass through the inner ERROR
+        // (the cursor is on a comma that's a direct child of the outer
+        // call's `arguments`), so we have to disagree with the AST via the
+        // bracket-heuristic cross-check.
+        let code = "a(if(a, a, a))";
+        let tree = parse_r(code);
+        // Cursor between the second-and-third args of the (logical) inner if
+        for col in [6, 7, 8, 9, 10, 11] {
+            assert_eq!(
+                detect_function_call_context(&tree, code, Position::new(0, col)),
+                keyword_ctx("if"),
+                "Expected `if` at col {} in code {:?}",
+                col,
+                code,
+            );
+        }
     }
 
     #[test]
