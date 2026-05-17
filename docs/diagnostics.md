@@ -39,6 +39,8 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 
 Raven checks whether each symbol reference has a visible definition — either in the current file (above the cursor), in a sourced parent/child file (respecting position), or in a loaded package. If not found, it reports an undefined variable diagnostic at the configured severity (default `warning`; see `raven.diagnostics.undefinedVariableSeverity` in [Configuration](configuration.md)).
 
+If the symbol is defined later in the same file at top level, the message also reports that line — e.g. `Undefined variable: total_count (defined later on line 7)`. R does not hoist top-level bindings, so the use is still flagged, but the annotation makes it easy to distinguish a forward reference from a missing import or typo.
+
 **What suppresses it:**
 - A definition above the usage in the same file
 - A definition in a sourced file (via `source()` or directives)
