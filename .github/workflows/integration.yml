@@ -12,6 +12,9 @@ env:
   # SCCACHE_GHA_ENABLED) so sccache never does a hard startup probe against
   # the GHA cache API — actions/cache below handles persistence gracefully.
   RUSTC_WRAPPER: sccache
+  # mold is a fast linker that significantly reduces link time on Linux.
+  # Set globally so both jobs use it without repeating the flag.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 permissions:
   contents: read
@@ -47,11 +50,16 @@ jobs:
           restore-keys: |
             cargo-sccache-${{ runner.os }}-
 
+      - name: Install mold linker
+        run: sudo apt-get install -y --no-install-recommends mold
+
       # `--features test-support` exposes `raven::test_utils`, which the
       # `performance_budgets` integration test imports. Without the flag,
       # the test binary fails to compile (E0433: cannot find `test_utils`).
-      - name: Run cargo tests (release)
-        run: cargo test --release -p raven --features test-support
+      # Debug profile (no --release) is sufficient for correctness testing
+      # and compiles significantly faster than release.
+      - name: Run cargo tests
+        run: cargo test -p raven --features test-support
 
   # Sibling job 2: the VS Code Mocha integration suite — runs the
   # extension under a real Electron host via `vscode-test`. Mirrors
@@ -120,6 +128,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            mold \
             xvfb \
             libnss3 \
             libatk-bridge2.0-0t64 \
