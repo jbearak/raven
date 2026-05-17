@@ -6028,7 +6028,7 @@ fn anchor_missing_position(
 /// Returns None when:
 /// - `missing.kind()` is not `)`, `}`, `]`, or `]]`
 /// - the parent's kind is not one of the three structural kinds above
-fn find_opener_for_missing<'a>(missing: Node<'a>, text: &'a str) -> Option<(Node<'a>, Range)> {
+fn find_opener_for_missing<'a>(missing: Node<'a>, text: &str) -> Option<(Node<'a>, Range)> {
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
     if !matches!(missing.kind(), ")" | "}" | "]" | "]]") {
@@ -8587,7 +8587,7 @@ mod syntax_error_range_tests {
     // find_opener_for_missing
     // ------------------------------------------------------------------
 
-    fn first_missing(tree: &tree_sitter::Tree) -> Option<tree_sitter::Node> {
+    fn first_missing(tree: &tree_sitter::Tree) -> Option<tree_sitter::Node<'_>> {
         fn walk<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
             if n.is_missing() { return Some(n); }
             let mut c = n.walk();
