@@ -81,6 +81,35 @@ suite('KnitOutputPanel integration', () => {
         }
     });
 
+    test('panel is created with the security-relevant webview options', async () => {
+        await activate();
+        const output = vscode.window.createOutputChannel('Knit Test');
+        try {
+            const a = writeFixture(tmp, 'a.html');
+            const src = vscode.Uri.file(path.join(tmp, 'src.Rmd'));
+
+            const r = await KnitOutputPanel.showOrUpdate(
+                {} as vscode.ExtensionContext,
+                { sourceUri: src, outputPath: a, output },
+            );
+            assert.deepStrictEqual(r, { ok: true });
+            const inst = KnitOutputPanel.getInstanceForTesting();
+            assert.ok(inst);
+
+            // Access the panel via the singleton — the panel field is
+            // private but the only public surface, `panel.webview`, is
+            // reachable via `WebviewPanel.webview`. We assert the
+            // *options* set at creation time.
+            const opts = (inst as unknown as { panel: vscode.WebviewPanel }).panel.webview.options;
+            assert.strictEqual(opts.enableScripts, true);
+            assert.ok(opts.localResourceRoots, 'localResourceRoots is set');
+            assert.strictEqual(opts.localResourceRoots!.length, 1);
+            assert.strictEqual(opts.localResourceRoots![0].fsPath, tmp);
+        } finally {
+            output.dispose();
+        }
+    });
+
     test('showOrUpdate returns {ok: false} when the output file does not exist', async () => {
         await activate();
         const output = vscode.window.createOutputChannel('Knit Test');

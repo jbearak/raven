@@ -79,9 +79,42 @@ suite('knit progress lifecycle', () => {
                 'inFlight should be cleared before the success toast is dismissed',
             );
 
-            // Now dismiss every pending info-message so runPromise can resolve.
+            // Direct regression check: a second invocation while the first
+            // success toast is still pending must NOT report "already being
+            // knitted". This reproduces the user-reported bug ("____ is
+            // already being knitted" on rapid re-invoke).
+            let secondRunKnitCalled = false;
+            const secondDeps: KnitDeps = {
+                runKnit: (async () => {
+                    secondRunKnitCalled = true;
+                    return {
+                        spawnError: null,
+                        cancelled: false,
+                        timedOut: false,
+                        exitCode: 0,
+                        stdout: `Output created: ${path.join(path.dirname(docUri.fsPath), 'sample.html')}\n`,
+                        stderr: '',
+                    };
+                }) as KnitDeps['runKnit'],
+                showOrUpdatePanel: (async () => ({ ok: true })) as KnitDeps['showOrUpdatePanel'],
+            };
+            const secondPromise = __runKnitCommandForTest({
+                uri: docUri,
+                output,
+                inFlight,
+                context: fakeContext,
+                deps: secondDeps,
+            });
+            await sleep(100);
+            assert.ok(
+                secondRunKnitCalled,
+                'second invocation was blocked by the inFlight gate — the original bug regressed',
+            );
+
+            // Now dismiss every pending info-message so both promises resolve.
             for (const res of resolvers) res(undefined);
             await runPromise;
+            await secondPromise;
         } finally {
             (vscode.window as { showInformationMessage: unknown }).showInformationMessage = origShow;
             output.dispose();
