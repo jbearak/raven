@@ -62,6 +62,109 @@ export function classify(
 }
 
 /**
+ * Minimal vscode.Webview shape buildShellHtml needs. Defined inline so
+ * the pure helper has no dependency on the actual vscode module — tests
+ * pass a fake.
+ */
+export interface MinimalWebview {
+    asWebviewUri(uri: { fsPath: string }): { toString(): string };
+    cspSource: string;
+}
+
+function escapeHtml(s: string): string {
+    return s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/**
+ * Build the outer-shell HTML for the Knit Output webview.
+ *
+ * The shell is Raven-controlled and owns the CSP in `<head>`; the
+ * rendered HTML loads inside `<iframe sandbox="">` from
+ * `webview.asWebviewUri(outputPath)`. Three independent containment
+ * layers (sandbox attribute, outer-shell CSP, localResourceRoots) make
+ * the security model robust to either layer failing.
+ *
+ * See `docs/superpowers/specs/2026-05-17-knit-output-webview-design.md`
+ * for the threat model.
+ */
+export function buildShellHtml(args: {
+    webview: MinimalWebview;
+    outputPath: string;
+    nonce: string;
+}): string {
+    const { webview, outputPath, nonce } = args;
+    const iframeSrc = webview.asWebviewUri({ fsPath: outputPath }).toString();
+    // path.basename handles both POSIX and Windows separators.
+    const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
+    const basename = lastSep >= 0 ? outputPath.slice(lastSep + 1) : outputPath;
+    const safeName = escapeHtml(basename);
+
+    const csp = [
+        `default-src 'none'`,
+        `frame-src ${webview.cspSource}`,
+        `img-src ${webview.cspSource} https: data:`,
+        `style-src ${webview.cspSource} 'unsafe-inline'`,
+        `font-src ${webview.cspSource} https: data:`,
+        `script-src 'nonce-${nonce}'`,
+        `connect-src 'none'`,
+    ].join('; ');
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<title>Knit Output</title>
+<style nonce="${nonce}">
+  body { margin: 0; padding: 0; height: 100vh; display: flex; flex-direction: column;
+         font-family: var(--vscode-font-family); color: var(--vscode-foreground); }
+  #raven-knit-toolbar { display: flex; gap: 0.5rem; align-items: center;
+                        padding: 0.4rem 0.75rem;
+                        background: var(--vscode-editorWidget-background);
+                        border-bottom: 1px solid var(--vscode-editorWidget-border);
+                        flex: 0 0 auto; }
+  #raven-knit-toolbar button { font: inherit; padding: 0.2rem 0.6rem;
+                               background: var(--vscode-button-background);
+                               color: var(--vscode-button-foreground);
+                               border: 1px solid var(--vscode-button-border, transparent);
+                               cursor: pointer; }
+  #raven-knit-toolbar button:hover { background: var(--vscode-button-hoverBackground); }
+  #raven-knit-filename { margin-left: 0.5rem; opacity: 0.8; font-size: 0.9em; }
+  #raven-knit-frame { flex: 1 1 auto; width: 100%; border: 0; background: white; }
+</style>
+</head>
+<body>
+  <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit output">
+    <button id="raven-knit-refresh" type="button" title="Re-knit the source document">Refresh</button>
+    <button id="raven-knit-open-browser" type="button" title="Open the rendered file in your default browser">Open in Browser</button>
+    <span id="raven-knit-filename" aria-live="polite">${safeName}</span>
+  </div>
+  <iframe id="raven-knit-frame"
+          src="${escapeHtml(iframeSrc)}"
+          sandbox=""
+          referrerpolicy="no-referrer"
+          title="Rendered output: ${safeName}"></iframe>
+  <script nonce="${nonce}">
+    (function () {
+      const vscode = acquireVsCodeApi();
+      document.getElementById('raven-knit-refresh').addEventListener('click', function () {
+        vscode.postMessage({ type: 'refresh' });
+      });
+      document.getElementById('raven-knit-open-browser').addEventListener('click', function () {
+        vscode.postMessage({ type: 'openInBrowser' });
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+/**
  * Pick the output path to surface in the Knit Output panel.
  *
  * When `output_format = "all"` (or a custom multi-format render) produces
