@@ -403,10 +403,15 @@ export function buildShellHtml(args: {
       const ctxMenu = document.getElementById('raven-knit-context-menu');
       const ctxCopyBtn = ctxMenu.querySelector('[data-action="copy"]');
       const ctxCopyImageBtn = ctxMenu.querySelector('[data-action="copy-image"]');
-      // Source URL of the <img> the user right-clicked, captured at
-      // contextmenu time. Cleared when the menu hides so a stale src
+      // The <img> the user right-clicked, captured at contextmenu
+      // time. Cleared when the menu hides so a stale reference
       // can't leak into a follow-up Copy from a text selection.
-      let pendingImageSrc = null;
+      // We capture the element (not just its src) because the
+      // canvas-based copy below reads pixels from the already-
+      // loaded image — fetch() is blocked by the outer-shell CSP's
+      // connect-src 'none', so going back to the network would
+      // fail for every supported source kind.
+      let pendingImage = null;
 
       function copyIframeSelection() {
         const win = iframe.contentWindow;
@@ -449,50 +454,61 @@ export function buildShellHtml(args: {
         }
       }
 
-      // Copy the image at pendingImageSrc onto the system clipboard.
-      // Uses the async Clipboard API's ClipboardItem flavor so that
-      // the OS clipboard receives a real image bitmap (paste into
-      // Slack / Preview / Photoshop yields the image, not the URL).
-      // We fetch the URL — it resolves through the webview's
-      // localResourceRoots since rendered figures live in the
-      // panel's rootDir.
+      // Copy the right-clicked image onto the system clipboard.
+      // Draws the already-loaded image onto an offscreen canvas
+      // and writes the canvas as a PNG blob via the async
+      // Clipboard API. We use canvas rather than fetch because the
+      // outer-shell CSP sets connect-src 'none', which blocks any
+      // JS-initiated request (including same-origin local-resource
+      // URLs). The image element has already loaded its pixels by
+      // the time the user right-clicks, so the canvas approach
+      // needs no further network access. Output is always PNG so
+      // the clipboard MIME type is deterministic and supported on
+      // every platform.
       function copyImageFromIframe() {
-        const src = pendingImageSrc;
-        if (!src) return;
-        // navigator.clipboard.write is gated behind a user gesture;
-        // the contextmenu click satisfies that. ClipboardItem itself
-        // is widely supported in Electron-based webviews.
+        const img = pendingImage;
+        if (!img) return;
         const w = window;
         if (!w.ClipboardItem || !navigator.clipboard || !navigator.clipboard.write) {
           return;
         }
-        fetch(src)
-          .then(function (r) { return r.blob(); })
-          .then(function (blob) {
-            const type = blob.type || 'image/png';
-            const item = new w.ClipboardItem({ [type]: blob });
-            return navigator.clipboard.write([item]);
-          })
-          .catch(function () { /* swallow — best-effort */ });
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          if (canvas.width === 0 || canvas.height === 0) return;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return;
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob(function (blob) {
+            if (!blob) return;
+            try {
+              const item = new w.ClipboardItem({ 'image/png': blob });
+              navigator.clipboard.write([item]).catch(function () {
+                /* swallow — best-effort */
+              });
+            } catch (e) { /* swallow */ }
+          }, 'image/png');
+        } catch (e) { /* swallow */ }
       }
 
       function hideContextMenu() {
         ctxMenu.hidden = true;
-        pendingImageSrc = null;
+        pendingImage = null;
       }
 
-      function showContextMenu(clientX, clientY, hasSelection, imageSrc) {
+      function showContextMenu(clientX, clientY, hasSelection, image) {
         if (hasSelection) {
           ctxCopyBtn.removeAttribute('disabled');
         } else {
           ctxCopyBtn.setAttribute('disabled', 'true');
         }
-        if (imageSrc) {
+        if (image) {
           ctxCopyImageBtn.removeAttribute('disabled');
-          pendingImageSrc = imageSrc;
+          pendingImage = image;
         } else {
           ctxCopyImageBtn.setAttribute('disabled', 'true');
-          pendingImageSrc = null;
+          pendingImage = null;
         }
         // Render off-screen first to measure, then clamp into the
         // viewport so the menu never spills past the right/bottom
@@ -538,20 +554,27 @@ export function buildShellHtml(args: {
         const doc = iframe.contentDocument;
         if (!win || !doc) return;
         // Cmd/Ctrl-C and Cmd/Ctrl-A while the iframe has focus.
-        // For every other shortcut we synthesize the keydown event
-        // on the outer shell document so VS Code's keybinding
-        // handler sees it. The iframe is sandboxed and keystrokes
-        // that fire inside it don't reach VS Code's chrome
-        // otherwise; the same-origin sandbox lets us reach across
-        // the document boundary to re-dispatch.
+        // For every other *modifier* shortcut we synthesize the
+        // keydown event on the outer shell document so VS Code's
+        // keybinding handler sees it. The iframe is sandboxed and
+        // keystrokes that fire inside it don't reach VS Code's
+        // chrome otherwise; the same-origin sandbox lets us reach
+        // across the document boundary to re-dispatch.
+        //
+        // We gate on the modifier so plain typing inside any
+        // input/widget rendered in the report does NOT bubble out
+        // and silently trigger a single-key keybinding the user
+        // may have configured in VS Code.
         win.addEventListener('keydown', function (e) {
-          const mod = e.metaKey || e.ctrlKey;
+          const mod = e.metaKey || e.ctrlKey || e.altKey;
+          if (!mod) return;
           const k = (e.key || '').toLowerCase();
-          if (mod && k === 'c') {
+          const primary = e.metaKey || e.ctrlKey;
+          if (primary && k === 'c') {
             if (copyIframeSelection()) e.preventDefault();
             return;
           }
-          if (mod && k === 'a') {
+          if (primary && k === 'a') {
             selectAllInIframe();
             e.preventDefault();
             return;
@@ -590,12 +613,15 @@ export function buildShellHtml(args: {
           const y = e.clientY + rect.top;
           const sel = win.getSelection();
           const hasSel = !!(sel && sel.toString().length > 0);
-          // If the user right-clicked on an <img>, capture its src
-          // so the Copy image action knows what to fetch.
-          let imageSrc = null;
+          // If the user right-clicked on an <img>, capture the
+          // element itself so the Copy image action can draw it
+          // onto a canvas (fetch() is blocked by the outer-shell
+          // CSP's connect-src 'none', so we read pixels from the
+          // already-loaded image rather than re-requesting).
+          let image = null;
           const tgt = e.target;
-          if (tgt && tgt.tagName === 'IMG' && tgt.src) imageSrc = tgt.src;
-          showContextMenu(x, y, hasSel, imageSrc);
+          if (tgt && tgt.tagName === 'IMG') image = tgt;
+          showContextMenu(x, y, hasSel, image);
         });
         // A new click inside the iframe should dismiss the menu so
         // it does not linger after the user moves on.

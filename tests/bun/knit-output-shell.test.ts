@@ -223,12 +223,36 @@ describe('buildShellHtml', () => {
         // The handler must read e.target and check whether the
         // right-clicked element is an HTMLImageElement so the
         // Copy image button can be enabled / disabled and so the
-        // image src is captured for the copy action.
+        // image is captured for the copy action.
         const html = buildShellHtml(args('/work/report.html'));
-        // The webview script must reach for the image src via the
-        // target element; a regex check on the source pattern is the
-        // structural guarantee.
         expect(html).toMatch(/tagName[\s\S]*?===[\s\S]*?['"]IMG['"]/i);
+    });
+
+    test('copy-image uses canvas (not fetch) to bypass connect-src CSP', () => {
+        // The outer-shell CSP sets `connect-src 'none'`, which blocks
+        // JS-initiated network requests (including fetch of local
+        // webview resources). The Copy image action draws the
+        // already-loaded image onto an offscreen canvas instead so
+        // it needs no further network access, then writes the canvas
+        // as a PNG blob via ClipboardItem.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('createElement(\'canvas\')');
+        expect(html).toContain('drawImage(');
+        expect(html).toMatch(/canvas\.toBlob\([\s\S]*?['"]image\/png['"]/);
+        expect(html).toContain("'image/png'");
+        // No fetch() call in the image-copy path.
+        expect(html).not.toContain('fetch(src)');
+        expect(html).not.toMatch(/fetch\(pending/);
+    });
+
+    test('re-dispatch is gated on a modifier (no plain typing forwarded)', () => {
+        // Without the modifier gate, plain letters typed into any
+        // input/widget rendered in the report would be re-dispatched
+        // on the outer document and could fire single-key
+        // keybindings the user has configured in VS Code.
+        const html = buildShellHtml(args('/work/report.html'));
+        // The handler must early-exit when no modifier is held.
+        expect(html).toMatch(/if\s*\(!mod\)\s*return/);
     });
 
     test('script wires Cmd/Ctrl-C and Cmd/Ctrl-A on the iframe', () => {
