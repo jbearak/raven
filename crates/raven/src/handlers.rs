@@ -817,7 +817,7 @@ fn encode_semantic_tokens(mut absolute_tokens: Vec<AbsoluteSemanticToken>) -> Ve
 
 /// Delimiter character types used in banner-style section detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DelimiterKind {
+enum BannerDelimKind {
     Hash,
     Dash,
     Equals,
@@ -839,7 +839,7 @@ enum ModelCommentStyle {
 /// - `# ================` (leading `#` + space + 4+ of one delimiter)
 ///
 /// Returns `Some(kind)` if the line is a delimiter line, `None` otherwise.
-fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
+fn classify_delimiter_line(line: &str) -> Option<BannerDelimKind> {
     let trimmed = line.trim();
     let after_first_hash = trimmed.strip_prefix('#')?;
 
@@ -848,7 +848,7 @@ fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
         && after_first_hash.chars().all(|c| c == '#')
         && trimmed.len() >= 4
     {
-        return Some(DelimiterKind::Hash);
+        return Some(BannerDelimKind::Hash);
     }
 
     // Case 2: "# <delimiters>" — leading # then space then 4+ of one delimiter
@@ -864,11 +864,11 @@ fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
 
     let first_char = content.chars().next()?;
     let kind = match first_char {
-        '-' => DelimiterKind::Dash,
-        '=' => DelimiterKind::Equals,
-        '*' => DelimiterKind::Asterisk,
-        '+' => DelimiterKind::Plus,
-        '#' => DelimiterKind::Hash,
+        '-' => BannerDelimKind::Dash,
+        '=' => BannerDelimKind::Equals,
+        '*' => BannerDelimKind::Asterisk,
+        '+' => BannerDelimKind::Plus,
+        '#' => BannerDelimKind::Hash,
         _ => return None,
     };
 
@@ -920,7 +920,7 @@ fn strip_model_comment_prefix(line: &str, style: ModelCommentStyle) -> Option<&s
     }
 }
 
-fn classify_model_delimiter_line(line: &str, style: ModelCommentStyle) -> Option<DelimiterKind> {
+fn classify_model_delimiter_line(line: &str, style: ModelCommentStyle) -> Option<BannerDelimKind> {
     let content = strip_model_comment_prefix(line, style)?.trim();
     if content.len() < 4 {
         return None;
@@ -928,11 +928,11 @@ fn classify_model_delimiter_line(line: &str, style: ModelCommentStyle) -> Option
 
     let first_char = content.chars().next()?;
     let kind = match first_char {
-        '#' => DelimiterKind::Hash,
-        '-' => DelimiterKind::Dash,
-        '=' => DelimiterKind::Equals,
-        '*' => DelimiterKind::Asterisk,
-        '+' => DelimiterKind::Plus,
+        '#' => BannerDelimKind::Hash,
+        '-' => BannerDelimKind::Dash,
+        '=' => BannerDelimKind::Equals,
+        '*' => BannerDelimKind::Asterisk,
+        '+' => BannerDelimKind::Plus,
         _ => return None,
     };
 
@@ -5885,6 +5885,198 @@ fn collect_identifier_usages_utf16<'a>(
     }
 }
 
+/// Compute the UTF-16 column just past the last non-comment, non-whitespace
+/// character on `line`. Comment detection is string-aware: a `#` inside
+/// `"..."`, `'...'`, or `` `...` `` is not a comment. `\r` is treated as
+/// trailing whitespace.
+///
+/// Used to trim trailing comments and whitespace from the opener-line range
+/// of an `Unclosed X` diagnostic. See bracket-diagnostics design spec.
+fn end_of_meaningful_content(line: &str) -> u32 {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut in_backtick = false;
+    let mut escape = false;
+    let mut comment_byte: Option<usize> = None;
+
+    for (byte_idx, ch) in line.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_double {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_double = false,
+                _ => {}
+            }
+            continue;
+        }
+        if in_single {
+            match ch {
+                '\\' => escape = true,
+                '\'' => in_single = false,
+                _ => {}
+            }
+            continue;
+        }
+        if in_backtick {
+            if ch == '`' {
+                in_backtick = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_double = true,
+            '\'' => in_single = true,
+            '`' => in_backtick = true,
+            '#' => {
+                comment_byte = Some(byte_idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let cutoff_byte = comment_byte.unwrap_or(line.len());
+    let meaningful = &line[..cutoff_byte];
+    let trimmed = meaningful.trim_end_matches(|c: char| c.is_whitespace());
+
+    byte_offset_to_utf16_column(line, trimmed.len())
+}
+
+/// Anchor a MISSING node's reported position back to the offending source line.
+///
+/// Tree-sitter positions a MISSING node where the parser expected the missing
+/// token. For an unclosed opener (e.g. `mean(c(1, 2, 3)`) followed by blank
+/// lines and/or a trailing comment, that position can land on whitespace or on
+/// the next non-empty token — visually disconnected from the broken
+/// expression. When the MISSING node's row contains no code (blank or
+/// comment-only), walk back within `lower_bound..=raw_row` to the last line
+/// with non-comment, non-whitespace content and anchor at end-of-line there so
+/// the diagnostic squiggle lands on the offending expression. See issue #286.
+///
+/// `raw_byte` is the global byte offset of `(raw_row, raw_col)` — i.e.
+/// `node.start_byte()` from the caller. Tree-sitter reports `column` as bytes
+/// within the line, so `raw_byte - raw_col` is the byte offset where line
+/// `raw_row` begins. That lets us locate the starting line in O(1) and walk
+/// backward via `rfind('\n')`, touching only the bytes of lines we actually
+/// visit — far better than re-scanning the prefix of `text` for every call,
+/// which would be linear in file size even when the offending code line is
+/// just a few rows above the MISSING.
+fn anchor_missing_position(
+    raw_row: usize,
+    raw_col: usize,
+    lower_bound: usize,
+    raw_byte: usize,
+    text: &str,
+) -> (u32, u32) {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    let is_code_line = |s: &str| {
+        let t = s.trim_start();
+        !t.is_empty() && !t.starts_with('#')
+    };
+
+    let raw_line_start = raw_byte.saturating_sub(raw_col);
+    let raw_line_end = text[raw_line_start..]
+        .find('\n')
+        .map(|i| raw_line_start + i)
+        .unwrap_or(text.len());
+    let raw_line = &text[raw_line_start..raw_line_end];
+
+    if is_code_line(raw_line) {
+        return (
+            raw_row as u32,
+            byte_offset_to_utf16_column(raw_line, raw_col),
+        );
+    }
+
+    let lower = lower_bound.min(raw_row);
+    let mut r = raw_row;
+    let mut cur_start = raw_line_start;
+    while r > lower && cur_start > 0 {
+        // Byte `cur_start - 1` is the `\n` terminating the previous line.
+        let prev_line_end = cur_start - 1;
+        let prev_line_start = text[..prev_line_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_line = &text[prev_line_start..prev_line_end];
+        r -= 1;
+        if is_code_line(prev_line) {
+            // Use the same comment-aware trim as opener-line ranges so a
+            // trailing inline comment (e.g. `f( # tail`) doesn't push the
+            // anchor column past the last meaningful byte.
+            return (r as u32, end_of_meaningful_content(prev_line));
+        }
+        cur_start = prev_line_start;
+    }
+
+    (
+        raw_row as u32,
+        byte_offset_to_utf16_column(raw_line, raw_col),
+    )
+}
+
+/// Walk up one level from a bracket-kind MISSING node to its structural
+/// parent (`arguments`, `braced_expression`, `parenthesized_expression`)
+/// and return that parent's first delimiter child plus a UTF-16 Range
+/// from the opener's column through `end_of_meaningful_content` of the
+/// opener's line.
+///
+/// Returns None when:
+/// - `missing.kind()` is not `)`, `}`, `]`, or `]]`
+/// - the parent's kind is not one of the three structural kinds above
+fn find_opener_for_missing<'a>(missing: Node<'a>, text: &str) -> Option<(Node<'a>, Range)> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    if !matches!(missing.kind(), ")" | "}" | "]" | "]]") {
+        return None;
+    }
+
+    let parent = missing.parent()?;
+    if !matches!(
+        parent.kind(),
+        "arguments" | "braced_expression" | "parenthesized_expression"
+    ) {
+        return None;
+    }
+
+    let mut cursor = parent.walk();
+    let opener = parent
+        .children(&mut cursor)
+        .find(|n| {
+            let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
+            matches!(t, "(" | "{" | "[" | "[[")
+        })?;
+
+    let opener_row = opener.start_position().row as u32;
+    let opener_start_byte_col = opener.start_position().column;
+
+    let line = text.lines().nth(opener_row as usize).unwrap_or("");
+    let start_col = byte_offset_to_utf16_column(line, opener_start_byte_col);
+    let end_col = end_of_meaningful_content(line);
+
+    let end_col = if end_col > start_col {
+        end_col
+    } else {
+        // For multi-char openers like `[[`, span the opener token's width.
+        let opener_end_byte_col = opener.end_position().column;
+        byte_offset_to_utf16_column(line, opener_end_byte_col).max(start_col + 1)
+    };
+
+    Some((
+        opener,
+        Range {
+            start: Position::new(opener_row, start_col),
+            end: Position::new(opener_row, end_col),
+        },
+    ))
+}
+
 /// Find the first MISSING descendant inside a node (depth-first).
 fn find_first_missing_descendant(node: Node) -> Option<Node> {
     // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
@@ -6101,10 +6293,12 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 
     // Phase 1: If there's a MISSING descendant, point the diagnostic there.
     if let Some(missing) = find_first_missing_descendant(node) {
-        let m_row = missing.start_position().row as u32;
-        let m_col = byte_offset_to_utf16_column(
-            line_at(missing.start_position().row),
+        let (m_row, m_col) = anchor_missing_position(
+            missing.start_position().row,
             missing.start_position().column,
+            node.start_position().row,
+            missing.start_byte(),
+            text,
         );
         return Range {
             start: Position::new(m_row, m_col),
@@ -6217,16 +6411,46 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 }
 
 fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
-    use crate::cross_file::types::byte_offset_to_utf16_column;
+    let mut state = CollectState::default();
+    collect_syntax_errors_inner(node, text, diagnostics, &mut state);
+}
 
+fn collect_syntax_errors_inner(
+    node: Node,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    state: &mut CollectState,
+) {
     if node.is_error() {
-        let message = classify_error(node, text);
-        diagnostics.push(Diagnostic {
-            range: minimize_error_range(node, text),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message,
-            ..Default::default()
-        });
+        match classify_error(node, text, state) {
+            ErrorClassification::Whole(diag) => {
+                diagnostics.push(Diagnostic {
+                    range: diag.range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: diag.message,
+                    ..Default::default()
+                });
+            }
+            ErrorClassification::Multi(diags) if diags.is_empty() => {
+                // Fallback: generic "Syntax error" at the minimized range.
+                diagnostics.push(Diagnostic {
+                    range: minimize_error_range(node, text),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: "Syntax error".to_string(),
+                    ..Default::default()
+                });
+            }
+            ErrorClassification::Multi(diags) => {
+                for diag in diags {
+                    diagnostics.push(Diagnostic {
+                        range: diag.range,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: diag.message,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         // Don't recurse into ERROR children — the minimized range already
         // accounts for nested MISSING nodes, and recursing would produce
         // duplicate diagnostics for nested ERROR children.
@@ -6234,9 +6458,49 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
     }
 
     if node.is_missing() {
-        let row = node.start_position().row as u32;
-        let line_text = text.lines().nth(node.start_position().row).unwrap_or("");
-        let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
+        // Bracket-kind MISSING routes through the opener-anchoring helper
+        // unless the opener is already covered by a mismatched-bracket
+        // diagnostic emitted earlier in this traversal.
+        if matches!(node.kind(), ")" | "}" | "]" | "]]") {
+            if let Some((opener, range)) = find_opener_for_missing(node, text) {
+                if !state.covered_openers.contains(&opener.id()) {
+                    let opener_text = text
+                        .get(opener.start_byte()..opener.end_byte())
+                        .unwrap_or("");
+                    if let Some(k) = DelimiterKind::from_opener(opener_text) {
+                        diagnostics.push(Diagnostic {
+                            range,
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            message: format!(
+                                "Unclosed `{}`: missing matching `{}`",
+                                k.opener_str(),
+                                k.closer_str(),
+                            ),
+                            ..Default::default()
+                        });
+                    } else {
+                        debug_assert!(
+                            false,
+                            "find_opener_for_missing returned opener text {:?} that DelimiterKind::from_opener does not recognize; this is a precondition violation",
+                            opener_text
+                        );
+                    }
+                }
+                return;
+            }
+            // Bracket-kind MISSING with no structural parent: fall through
+            // to the existing default branch.
+        }
+
+        // Existing default branch for non-bracket MISSING (e.g. identifier
+        // missing after `x <-`). PRESERVE BYTE-FOR-BYTE from Task 3.
+        let (row, col) = anchor_missing_position(
+            node.start_position().row,
+            node.start_position().column,
+            0,
+            node.start_byte(),
+            text,
+        );
         let message = if is_string_quote_kind(node.kind()) {
             "Unclosed string literal".to_string()
         } else {
@@ -6255,7 +6519,7 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_syntax_errors(child, text, diagnostics);
+        collect_syntax_errors_inner(child, text, diagnostics, state);
     }
 }
 
@@ -6280,8 +6544,265 @@ fn has_unclosed_quote_child(node: Node) -> bool {
     false
 }
 
-/// Classify an ERROR node into a specific, actionable message where possible,
-/// falling back to the generic "Syntax error" for unrecognised patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelimiterKind {
+    Paren,         // ( )
+    Brace,         // { }
+    Bracket,       // [ ]
+    DoubleBracket, // [[ ]]
+}
+
+impl DelimiterKind {
+    fn opener_str(self) -> &'static str {
+        match self {
+            DelimiterKind::Paren => "(",
+            DelimiterKind::Brace => "{",
+            DelimiterKind::Bracket => "[",
+            DelimiterKind::DoubleBracket => "[[",
+        }
+    }
+    fn closer_str(self) -> &'static str {
+        match self {
+            DelimiterKind::Paren => ")",
+            DelimiterKind::Brace => "}",
+            DelimiterKind::Bracket => "]",
+            DelimiterKind::DoubleBracket => "]]",
+        }
+    }
+    fn from_opener(s: &str) -> Option<Self> {
+        match s {
+            "(" => Some(Self::Paren),
+            "{" => Some(Self::Brace),
+            "[" => Some(Self::Bracket),
+            "[[" => Some(Self::DoubleBracket),
+            _ => None,
+        }
+    }
+    fn from_closer(s: &str) -> Option<Self> {
+        match s {
+            ")" => Some(Self::Paren),
+            "}" => Some(Self::Brace),
+            "]" => Some(Self::Bracket),
+            "]]" => Some(Self::DoubleBracket),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DelimEvent {
+    is_open: bool,
+    kind: DelimiterKind,
+    range_bytes: std::ops::Range<usize>,
+    row: u32,
+}
+
+/// One classified syntax-error diagnostic produced by [`classify_error`].
+/// The caller in [`collect_syntax_errors_inner`] attaches `severity` and
+/// `source` when constructing the final [`Diagnostic`].
+#[derive(Debug, Clone)]
+struct ClassifiedSyntaxDiagnostic {
+    message: String,
+    range: Range,
+}
+
+/// Result of classifying an ERROR node. A single ERROR can now produce
+/// either one whole-error diagnostic (the existing classifiers) or
+/// multiple per-fault diagnostics (the new delimiter scan).
+#[derive(Debug, Clone)]
+enum ErrorClassification {
+    /// Single diagnostic describing the whole ERROR. Used by unclosed
+    /// string, consecutive pipe, mismatched bracket, fat-arrow.
+    Whole(ClassifiedSyntaxDiagnostic),
+    /// Zero or more diagnostics, each describing a distinct delimiter
+    /// fault inside the ERROR. An empty Vec means "no classifier matched
+    /// — caller falls back to a single generic 'Syntax error' at the
+    /// minimized range".
+    Multi(Vec<ClassifiedSyntaxDiagnostic>),
+}
+
+/// Per-traversal mutable state threaded through `collect_syntax_errors_inner`
+/// so that the mismatched-bracket coalescing rule can suppress a duplicate
+/// `Unclosed X` diagnostic for the same opener.
+#[derive(Default)]
+struct CollectState {
+    /// `Node::id()` values of opener tokens already covered by a
+    /// `Mismatched brackets` diagnostic. The MISSING-anchoring branch
+    /// skips emitting `Unclosed X` for any opener whose id appears here.
+    covered_openers: std::collections::HashSet<usize>,
+}
+
+/// Walk an ERROR node's direct children and produce a flat stream of
+/// delimiter events. See bracket-diagnostics design spec.
+fn delimiter_events(error: Node, text: &str) -> Vec<DelimEvent> {
+    let mut out = Vec::new();
+    walk_for_delimiters(error, text, &mut out, /*allow_recurse_into_error=*/ true);
+    out
+}
+
+fn walk_for_delimiters(
+    node: Node,
+    text: &str,
+    out: &mut Vec<DelimEvent>,
+    allow_recurse_into_error: bool,
+) {
+    // Only the ROOT ERROR is walked with `allow_recurse_into_error=true`;
+    // we recurse one level into nested ERRORs but not into balanced
+    // semantic children.
+    //
+    // Tree-sitter sometimes represents a bare token run (e.g. `}}}`) as a
+    // leaf ERROR node (child_count=0) nested inside the outer ERROR.  When
+    // we arrive here with `allow_recurse_into_error=false` and the node
+    // itself has no children, treat the node as a leaf directly.
+    if node.child_count() == 0 {
+        let raw = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
+        extract_from_leaf(raw, node.start_byte(), node.start_position().row as u32, out);
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_error() && allow_recurse_into_error {
+            walk_for_delimiters(child, text, out, false);
+            continue;
+        }
+        if child.is_error() {
+            // Leaf-like ERROR child at the non-recurse level: treat as leaf.
+            if child.child_count() == 0 {
+                let raw = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+                extract_from_leaf(
+                    raw,
+                    child.start_byte(),
+                    child.start_position().row as u32,
+                    out,
+                );
+            }
+            // Non-leaf inner ERROR at this depth: skip (balanced subtree).
+            continue;
+        }
+        if child.child_count() == 0 {
+            let raw = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+            extract_from_leaf(
+                raw,
+                child.start_byte(),
+                child.start_position().row as u32,
+                out,
+            );
+            continue;
+        }
+        // Non-leaf, non-error child: skip.
+    }
+}
+
+/// Extract delimiter events from a raw leaf text slice. Implements the
+/// homogeneous-run rule (`}}}` → one event) and the mixed-run rule
+/// (`])` → per-character events with `]]` recognized greedily).
+fn extract_from_leaf(raw: &str, base_byte: usize, row: u32, out: &mut Vec<DelimEvent>) {
+    // Fast path: the leaf is exactly one opener or closer token.
+    if let Some(k) = DelimiterKind::from_opener(raw) {
+        out.push(DelimEvent {
+            is_open: true,
+            kind: k,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+    if let Some(k) = DelimiterKind::from_closer(raw) {
+        out.push(DelimEvent {
+            is_open: false,
+            kind: k,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+
+    // Homogeneous closer runs of `}` or `)` → one event.
+    let all_brace = !raw.is_empty() && raw.chars().all(|c| c == '}');
+    let all_paren = !raw.is_empty() && raw.chars().all(|c| c == ')');
+    if all_brace {
+        out.push(DelimEvent {
+            is_open: false,
+            kind: DelimiterKind::Brace,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+    if all_paren {
+        out.push(DelimEvent {
+            is_open: false,
+            kind: DelimiterKind::Paren,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+
+    // Per spec ("leaf whose text consists only of closer characters"):
+    // only byte-scan when every byte is a closer (`}`, `)`, `]`) or ASCII
+    // whitespace. Tree-sitter occasionally wraps multi-line closer runs in
+    // a single leaf ERROR (e.g. `}\n}`), so we allow whitespace between
+    // closer characters. Any other byte (identifier chars, `%`, etc.)
+    // means this leaf is a non-delimiter token (e.g. an unparseable
+    // special operator like `%]%`); emitting bracket events from such a
+    // leaf would produce misleading `Missing opening …` / `Unclosed …`
+    // diagnostics where the user's real problem is a different syntax
+    // error.
+    let allowed = !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|b| matches!(b, b'}' | b')' | b']' | b' ' | b'\t' | b'\n' | b'\r'));
+    if !allowed {
+        return;
+    }
+
+    // Tokenize per-character left-to-right, recognizing `]]` greedily.
+    // Only closer events are emitted from this path; openers only enter
+    // the stream as exact-match leaf tokens (handled by the fast path
+    // above), never from byte-scanning a mixed leaf.
+    //
+    // Track `current_row` through the loop so that a leaf containing an
+    // embedded newline (e.g. tree-sitter wrapping `}\n}` in a single
+    // ERROR leaf) emits each closer event on its actual row. Reusing the
+    // leaf's starting row for every emitted event would mis-anchor the
+    // downstream diagnostic.
+    let mut current_row = row;
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            current_row += 1;
+            i += 1;
+            continue;
+        }
+        if b == b']' && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            out.push(DelimEvent {
+                is_open: false,
+                kind: DelimiterKind::DoubleBracket,
+                range_bytes: base_byte + i..base_byte + i + 2,
+                row: current_row,
+            });
+            i += 2;
+            continue;
+        }
+        let one = std::str::from_utf8(&bytes[i..i + 1]).unwrap_or("");
+        if let Some(k) = DelimiterKind::from_closer(one) {
+            out.push(DelimEvent {
+                is_open: false,
+                kind: k,
+                range_bytes: base_byte + i..base_byte + i + 1,
+                row: current_row,
+            });
+        }
+        i += 1;
+    }
+}
+
+/// Classify an ERROR node into a specific, actionable diagnostic where possible,
+/// falling back to the delimiter scan which produces per-fault diagnostics.
 ///
 /// Checks (in priority order):
 /// 1. Unclosed string literal — lone `"` / `'` as a direct child.
@@ -6290,20 +6811,230 @@ fn has_unclosed_quote_child(node: Node) -> bool {
 ///    non-matching bracket (detected through a nested ERROR child).
 /// 4. Fat-arrow typo — a lone `>` immediately following an `=` token, which
 ///    arises from writing `=>` (no such operator in R).
-fn classify_error(node: Node, text: &str) -> String {
+/// 5. Delimiter scan — stack-based processing of the event stream; emits
+///    zero or more per-fault diagnostics. An empty result causes the caller
+///    to fall back to a single generic `"Syntax error"`.
+///
+/// Returns `ErrorClassification::Whole` when a single classifier matched, or
+/// `ErrorClassification::Multi` with the scan's results otherwise.
+fn classify_error(node: Node, text: &str, state: &mut CollectState) -> ErrorClassification {
+    let range = minimize_error_range(node, text);
+
     if has_unclosed_quote_child(node) {
-        return "Unclosed string literal".to_string();
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic {
+            message: "Unclosed string literal".to_string(),
+            range,
+        });
     }
     if let Some(msg) = detect_consecutive_pipe(node, text) {
-        return msg;
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
-    if let Some(msg) = detect_mismatched_bracket(node, text) {
-        return msg;
+    if let Some(diag) = detect_mismatched_bracket(node, text) {
+        return ErrorClassification::Whole(diag);
+    }
+    if let Some(diag) = detect_mismatched_via_structural_parent(node, text, state) {
+        return ErrorClassification::Whole(diag);
     }
     if let Some(msg) = detect_fat_arrow(node, text) {
-        return msg;
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
-    "Syntax error".to_string()
+
+    // Delimiter scan: produces zero or more per-fault diagnostics. An
+    // empty Vec falls back to a single "Syntax error" in the caller.
+    let scan = classify_via_delimiter_scan(node, text, state);
+    ErrorClassification::Multi(scan)
+}
+
+/// Process the delimiter event stream from an ERROR node and produce per-fault
+/// diagnostics. Each distinct fault gets its own range and message:
+///
+/// - Stray closer with empty stack → `Missing opening X` at the closer's range.
+/// - Closer matching the stack top → pop silently (balanced pair).
+/// - Closer mismatching the stack top → `Mismatched brackets` at the closer's
+///   range; the opener's id is recorded in `state.covered_openers`.
+/// - Unclosed openers remaining at end → `Unclosed X: missing matching Y`
+///   with non-overlapping ranges derived from the next-opener-on-same-line
+///   tie-breaking rule.
+fn classify_via_delimiter_scan(
+    error: Node,
+    text: &str,
+    state: &mut CollectState,
+) -> Vec<ClassifiedSyntaxDiagnostic> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    struct StackItem {
+        kind: DelimiterKind,
+        row: u32,
+        start_byte: usize,
+        node_id: usize,
+    }
+
+    let events = delimiter_events(error, text);
+    let mut stack: Vec<StackItem> = Vec::new();
+    let mut out: Vec<ClassifiedSyntaxDiagnostic> = Vec::new();
+
+    // For mismatched-bracket coalescing we need the opener's tree-sitter
+    // Node id. Map an opener event's start byte back to a Node by scanning
+    // the error subtree, recursing up to two levels deep into nested
+    // ERROR children (matches the two-level wrapping pattern tree-sitter
+    // uses for closer-runs like `}}}` — see Task 5 probe finding).
+    fn find_node_by_byte<'a>(
+        root: Node<'a>,
+        target: usize,
+        depth: usize,
+    ) -> Option<Node<'a>> {
+        if depth > 2 {
+            return None;
+        }
+        let mut c = root.walk();
+        for ch in root.children(&mut c) {
+            if ch.start_byte() == target && ch.child_count() == 0 {
+                return Some(ch);
+            }
+            if ch.is_error() {
+                if let Some(found) = find_node_by_byte(ch, target, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    for ev in &events {
+        if ev.is_open {
+            stack.push(StackItem {
+                kind: ev.kind,
+                row: ev.row,
+                start_byte: ev.range_bytes.start,
+                node_id: find_node_by_byte(error, ev.range_bytes.start, 0)
+                    .map(|n| n.id())
+                    .unwrap_or(0),
+            });
+            continue;
+        }
+        // closer
+        match stack.last() {
+            None => {
+                let line = text.lines().nth(ev.row as usize).unwrap_or("");
+                let line_start = line_start_byte(text, ev.row as usize);
+                let start_col_byte = ev.range_bytes.start - line_start;
+                let end_col_byte = ev.range_bytes.end - line_start;
+                out.push(ClassifiedSyntaxDiagnostic {
+                    message: format!("Missing opening `{}`", ev.kind.opener_str()),
+                    range: Range {
+                        start: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, start_col_byte),
+                        ),
+                        end: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, end_col_byte),
+                        ),
+                    },
+                });
+            }
+            Some(top) if top.kind == ev.kind => {
+                stack.pop();
+            }
+            Some(top) => {
+                let opener_kind = top.kind;
+                let opener_node_id = top.node_id;
+                let line = text.lines().nth(ev.row as usize).unwrap_or("");
+                let line_start = line_start_byte(text, ev.row as usize);
+                let start_col_byte = ev.range_bytes.start - line_start;
+                let end_col_byte = ev.range_bytes.end - line_start;
+                out.push(ClassifiedSyntaxDiagnostic {
+                    message: format!(
+                        "Mismatched brackets: `{}` opened here; close with `{}` not `{}`.",
+                        opener_kind.opener_str(),
+                        opener_kind.closer_str(),
+                        ev.kind.closer_str(),
+                    ),
+                    range: Range {
+                        start: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, start_col_byte),
+                        ),
+                        end: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, end_col_byte),
+                        ),
+                    },
+                });
+                // Task 7 reads `covered_openers` from the MISSING-handling branch of
+                // `collect_syntax_errors_inner` to suppress the duplicate `Unclosed X`
+                // diagnostic that would otherwise fire for the same opener.
+                if opener_node_id != 0 {
+                    state.covered_openers.insert(opener_node_id);
+                }
+                stack.pop();
+            }
+        }
+    }
+
+    // Unclosed openers remaining on the stack: emit "Unclosed X" with
+    // the next-opener-on-same-line tie-breaking rule.
+    if !stack.is_empty() {
+        let row_of: Vec<u32> = stack.iter().map(|s| s.row).collect();
+        let start_byte_of: Vec<usize> = stack.iter().map(|s| s.start_byte).collect();
+
+        for (i, item) in stack.iter().enumerate() {
+            let line = text.lines().nth(item.row as usize).unwrap_or("");
+            let line_start = line_start_byte(text, item.row as usize);
+            let start_col_utf16 =
+                byte_offset_to_utf16_column(line, item.start_byte - line_start);
+
+            // Next opener at a later byte on the SAME row
+            let next_on_row = (i + 1..stack.len())
+                .find(|&j| row_of[j] == item.row && start_byte_of[j] > item.start_byte)
+                .map(|j| byte_offset_to_utf16_column(line, start_byte_of[j] - line_start));
+
+            let eomc = end_of_meaningful_content(line);
+            let mut end_col = next_on_row.unwrap_or(eomc).min(eomc);
+            if end_col <= start_col_utf16 {
+                // Collapse to opener-token width
+                let opener_len_utf16 = match item.kind {
+                    DelimiterKind::DoubleBracket => 2,
+                    _ => 1,
+                };
+                end_col = start_col_utf16 + opener_len_utf16;
+            }
+
+            out.push(ClassifiedSyntaxDiagnostic {
+                message: format!(
+                    "Unclosed `{}`: missing matching `{}`",
+                    item.kind.opener_str(),
+                    item.kind.closer_str(),
+                ),
+                range: Range {
+                    start: Position::new(item.row, start_col_utf16),
+                    end: Position::new(item.row, end_col),
+                },
+            });
+        }
+    }
+
+    out
+}
+
+/// Byte offset of the start of line `row` in `text` (0-indexed row).
+fn line_start_byte(text: &str, row: usize) -> usize {
+    let mut start = 0;
+    let mut current_row = 0;
+    for (idx, b) in text.bytes().enumerate() {
+        if current_row == row {
+            return start;
+        }
+        if b == b'\n' {
+            current_row += 1;
+            start = idx + 1;
+        }
+    }
+    if current_row == row {
+        start
+    } else {
+        text.len()
+    }
 }
 
 /// Returns a diagnostic message if `node` is an ERROR whose only non-trivial
@@ -6330,11 +7061,18 @@ fn detect_consecutive_pipe(node: Node, text: &str) -> Option<String> {
     None
 }
 
-/// Returns a diagnostic message if `node` is an ERROR that opens with a
-/// bracket (`(`, `[`, `[[`) and contains a nested ERROR child that is a
-/// non-matching closing bracket. Catches patterns like `c(1, 2]` where the
-/// programmer used the wrong closing delimiter.
-fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
+/// Detects ERROR nodes shaped like `c(1, 2]` — a single bracket opener
+/// (`(`, `[`, `[[`) as a direct child paired with a wrong-closer leaf in
+/// a nested ERROR child.
+///
+/// Returns the `Mismatched brackets` message together with a range
+/// anchored on the offending closer (per the design goal of pointing at
+/// the bad delimiter, not the whole expression). The range is
+/// single-line; the closer leaves tree-sitter produces here are always
+/// single tokens.
+fn detect_mismatched_bracket(node: Node, text: &str) -> Option<ClassifiedSyntaxDiagnostic> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
     let mut cursor = node.walk();
     let children: Vec<_> = node.children(&mut cursor).collect();
 
@@ -6360,18 +7098,108 @@ fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
         if !child.is_error() {
             continue;
         }
-        let child_text = text
-            .get(child.start_byte()..child.end_byte())
-            .unwrap_or("")
-            .trim();
-        if matches!(child_text, ")" | "]" | "]]") && child_text != expected_closer {
-            return Some(format!(
+        let child_raw = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+        let child_text = child_raw.trim();
+        if !matches!(child_text, ")" | "]" | "]]") || child_text == expected_closer {
+            continue;
+        }
+        // Locate the closer token's byte span within the (possibly
+        // whitespace-padded) child range, so the diagnostic range falls on
+        // the closer character itself.
+        let leading_ws = child_raw.len() - child_raw.trim_start().len();
+        let closer_start_byte = child.start_byte() + leading_ws;
+        let closer_end_byte = closer_start_byte + child_text.len();
+        let row = text[..closer_start_byte].bytes().filter(|&b| b == b'\n').count() as u32;
+        let line = text.lines().nth(row as usize).unwrap_or("");
+        let line_start = line_start_byte(text, row as usize);
+        let start_col = byte_offset_to_utf16_column(line, closer_start_byte - line_start);
+        let end_col = byte_offset_to_utf16_column(line, closer_end_byte - line_start);
+        return Some(ClassifiedSyntaxDiagnostic {
+            message: format!(
                 "Mismatched brackets: `{opener}` opened here; \
                  close with `{expected_closer}` not `{child_text}`."
-            ));
-        }
+            ),
+            range: Range {
+                start: Position::new(row, start_col),
+                end: Position::new(row, end_col),
+            },
+        });
     }
     None
+}
+
+/// Detect `f(} y` / `vec[} y` style typos where the wrong closer is an
+/// ERROR child of `arguments` / `braced_expression` / `parenthesized_expression`
+/// and a MISSING closer of the expected kind sits at the parent's end.
+/// Emits a single `Mismatched brackets` diagnostic anchored on the wrong
+/// closer and records the parent's opener in `state.covered_openers` to
+/// suppress the MISSING follow-up.
+fn detect_mismatched_via_structural_parent(
+    node: Node,
+    text: &str,
+    state: &mut CollectState,
+) -> Option<ClassifiedSyntaxDiagnostic> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    // Only fire on ERROR nodes whose text (trimmed) is a single closer token.
+    let inner_text = text.get(node.start_byte()..node.end_byte())?.trim();
+    let wrong_kind = DelimiterKind::from_closer(inner_text)?;
+
+    // Walk up one level.
+    let parent = node.parent()?;
+    if !matches!(
+        parent.kind(),
+        "arguments" | "braced_expression" | "parenthesized_expression"
+    ) {
+        return None;
+    }
+
+    // Parent's first delimiter child is the opener.
+    let mut cursor = parent.walk();
+    let opener = parent
+        .children(&mut cursor)
+        .find(|n| {
+            let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
+            matches!(t, "(" | "{" | "[" | "[[")
+        })?;
+    let opener_text = text.get(opener.start_byte()..opener.end_byte())?;
+    let opener_kind = DelimiterKind::from_opener(opener_text)?;
+
+    if opener_kind == wrong_kind {
+        return None; // not actually a mismatch
+    }
+
+    // Parent must end with a MISSING closer of the expected kind.
+    let mut last_child = None;
+    let mut c2 = parent.walk();
+    for ch in parent.children(&mut c2) {
+        last_child = Some(ch);
+    }
+    let last = last_child?;
+    if !last.is_missing() || last.kind() != opener_kind.closer_str() {
+        return None;
+    }
+
+    state.covered_openers.insert(opener.id());
+
+    let row = node.start_position().row as u32;
+    let line = text.lines().nth(row as usize).unwrap_or("");
+    let line_start = line_start_byte(text, row as usize);
+    let start_col = byte_offset_to_utf16_column(line, node.start_byte() - line_start);
+    let end_col = byte_offset_to_utf16_column(line, node.end_byte() - line_start);
+
+    Some(ClassifiedSyntaxDiagnostic {
+        message: format!(
+            "Mismatched brackets: `{}` opened here; close with `{}` not `{}`.",
+            opener_kind.opener_str(),
+            opener_kind.closer_str(),
+            wrong_kind.closer_str(),
+        ),
+        range: Range {
+            start: Position::new(row, start_col),
+            end: Position::new(row, end_col),
+        },
+    })
 }
 
 /// Returns a diagnostic message if `node` is an ERROR consisting of a lone
@@ -6408,7 +7236,11 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod syntax_error_range_tests {
-    use super::{collect_syntax_errors, find_first_content_line, find_innermost_error};
+    use super::{
+        anchor_missing_position, classify_via_delimiter_scan, collect_syntax_errors,
+        delimiter_events, end_of_meaningful_content, find_first_content_line, find_innermost_error,
+        find_opener_for_missing, CollectState, DelimiterKind,
+    };
     use tower_lsp::lsp_types::Diagnostic;
 
     fn parse_r(code: &str) -> tree_sitter::Tree {
@@ -6550,6 +7382,108 @@ mod syntax_error_range_tests {
             diags.len(),
             diags
         );
+    }
+
+    #[test]
+    fn unclosed_paren_diagnostic_anchors_on_offending_line() {
+        // Regression test for issue #286.
+        //
+        // For an unclosed call followed by blank lines and/or a comment, the
+        // tree-sitter MISSING `)` descendant is positioned past the end of the
+        // offending line (often on a blank line or the next comment). Using
+        // that raw position puts the diagnostic squiggle on whitespace or on
+        // the trailing comment — far from the line a user has to fix.
+        //
+        // The diagnostic should anchor on line 0 (the line with the unmatched
+        // `(`), so the user's eye lands on the broken expression.
+        //
+        // Message updated (Task 7): bracket-kind MISSING now emits
+        // "Unclosed `(`: missing matching `)`" via the opener-anchoring path.
+        let code = "x <- mean(c(1, 2, 3)\n\n# Here is a comment\n";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce a diagnostic");
+        let missing_close = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an 'Unclosed `(`: ...' diagnostic, got: {:?}",
+                    diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            missing_close.range.start.line, 0,
+            "Unclosed `(` diagnostic should anchor on line 0 (the line with the \
+             unclosed `(`), got line {}. Full range: ({},{})..({},{})",
+            missing_close.range.start.line,
+            missing_close.range.start.line,
+            missing_close.range.start.character,
+            missing_close.range.end.line,
+            missing_close.range.end.character,
+        );
+    }
+
+    #[test]
+    fn anchor_missing_walks_back_past_blank_lines() {
+        // The MISSING node is reported on a trailing comment line; the walk
+        // should skip the comment and the two blank lines above it to land on
+        // the code line containing the unclosed expression.
+        let text = "x <-\n\n\n# more";
+        let (row, col) = anchor_missing_position(3, 6, 0, text.len(), text);
+        assert_eq!((row, col), (0, 4));
+    }
+
+    #[test]
+    fn anchor_missing_no_walk_when_raw_row_is_code() {
+        // When the MISSING's own row already has code, the fast path returns
+        // immediately without inspecting prior lines.
+        let text = "x <- mean(c(1, 2, 3";
+        let (row, col) = anchor_missing_position(0, 19, 0, 19, text);
+        assert_eq!((row, col), (0, 19));
+    }
+
+    #[test]
+    fn anchor_missing_lower_bound_clamps_walk() {
+        // With lower_bound = 2, the walk may not reach the code on row 0.
+        // The function falls back to the raw position rather than crossing the
+        // bound — this protects nested ERROR contexts from anchoring on code
+        // that's outside the enclosing node's span.
+        let text = "code()\n\n\n# bad";
+        let (row, col) = anchor_missing_position(3, 5, 2, text.len(), text);
+        assert_eq!((row, col), (3, 5));
+    }
+
+    #[test]
+    fn anchor_missing_handles_multibyte_utf8() {
+        // The `é` on row 0 is two bytes but one UTF-16 code unit. The byte
+        // arithmetic (`raw_byte - raw_col`) must land on a valid char boundary,
+        // and the returned column must be a UTF-16 offset, not a byte offset.
+        let text = "café <- 1\n\n\n# trailing";
+        let (row, col) = anchor_missing_position(3, 10, 0, text.len(), text);
+        // "café <- 1" has 10 bytes but 9 UTF-16 code units.
+        assert_eq!((row, col), (0, 9));
+    }
+
+    #[test]
+    fn anchor_missing_handles_crlf_line_endings() {
+        // Slicing on `\n` keeps a trailing `\r` in each line, but `trim_end`
+        // strips it before we measure the column, so the returned offset
+        // matches what `text.lines()` would have produced.
+        let text = "x()\r\n\r\n# eof\r\n";
+        // MISSING positioned at the end of "# eof" on row 2.
+        let (row, col) = anchor_missing_position(2, 5, 0, 12, text);
+        assert_eq!((row, col), (0, 3));
+    }
+
+    #[test]
+    fn anchor_missing_strips_inline_comment_on_prev_line() {
+        // The walk-back lands on `f( # tail`; the anchor must skip past the
+        // inline comment (and its leading whitespace) to the last meaningful
+        // byte — col 2, just after the `(` — not the end of "# tail".
+        let text = "f( # tail\n\n# more\n";
+        // MISSING positioned at end of "# more" on row 2 (raw_byte = 17).
+        let (row, col) = anchor_missing_position(2, 6, 0, 17, text);
+        assert_eq!((row, col), (0, 2));
     }
 
     #[test]
@@ -7095,6 +8029,8 @@ mod syntax_error_range_tests {
     #[test]
     fn unclosed_library_call() {
         // `library(` — unclosed function call.
+        // Message updated (Task 7): bracket-kind MISSING now emits
+        // "Unclosed `(`: missing matching `)`" via the opener-anchoring path.
         let code = "library(";
         let diags = collect(code);
         assert!(
@@ -7102,10 +8038,12 @@ mod syntax_error_range_tests {
             "should produce at least one diagnostic for unclosed library call"
         );
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
-            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().any(|d| {
+                d.message == "Syntax error"
+                    || d.message.starts_with("Missing")
+                    || d.message.starts_with("Unclosed")
+            }),
+            "should produce a syntax/missing/unclosed diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
@@ -7291,12 +8229,13 @@ mod syntax_error_range_tests {
         None
     }
 
-    /// Collect all MISSING node positions (row, col) in the tree.
-    fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32)>) {
+    /// Collect all MISSING node positions (row, col, kind) in the tree.
+    fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32, String)>) {
         if node.is_missing() {
             out.push((
                 node.start_position().row as u32,
                 node.start_position().column as u32,
+                node.kind().to_string(),
             ));
         }
         let mut cursor = node.walk();
@@ -7636,7 +8575,7 @@ mod syntax_error_range_tests {
             let tree = parse_r(&code);
             let root = tree.root_node();
 
-            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            let mut missing_positions: Vec<(u32, u32, String)> = Vec::new();
             collect_missing_positions(root, &mut missing_positions);
 
             // Our generator should always produce at least one MISSING node
@@ -7660,9 +8599,39 @@ mod syntax_error_range_tests {
             // 1. minimize_error_range Phase 1 (MISSING inside ERROR → "Syntax error")
             // 2. collect_syntax_errors direct MISSING handling (→ "Missing <kind>")
             //
-            // In either case, the diagnostic start position must match the MISSING
-            // node's position.
-            for &(m_row, m_col) in &missing_positions {
+            // Exception (Task 7): bracket-kind MISSING nodes (`)`, `}`, `]`, `]]`)
+            // are re-anchored to the opener position and emit "Unclosed `X`...".
+            // For those, we verify that at least one "Unclosed" diagnostic exists
+            // for the code, rather than checking the raw MISSING position.
+            // NOTE: weak global check — passes if ANY "Unclosed" diagnostic exists,
+            // not one per bracket-kind MISSING node. If `missing_node_code()` is later
+            // extended to produce multiple unclosed brackets per code string, tighten
+            // this to verify one "Unclosed" per distinct bracket-kind MISSING.
+            let has_any_unclosed = diagnostics.iter().any(|d| d.message.starts_with("Unclosed `"));
+
+            for (m_row, m_col, m_kind) in &missing_positions {
+                let m_row = *m_row;
+                let m_col = *m_col;
+                let is_bracket_missing = matches!(m_kind.as_str(), ")" | "}" | "]" | "]]");
+
+                if is_bracket_missing {
+                    // Bracket-kind MISSING: diagnostic is at the opener, not the MISSING
+                    // position. Verify at least one "Unclosed" diagnostic was emitted.
+                    prop_assert!(
+                        has_any_unclosed,
+                        "Expected an 'Unclosed' diagnostic for bracket-kind MISSING at ({}, {}). \
+                         Code: {}, Diagnostics: {:?}",
+                        m_row,
+                        m_col,
+                        code,
+                        diagnostics
+                            .iter()
+                            .map(|d| &d.message)
+                            .collect::<Vec<_>>()
+                    );
+                    continue;
+                }
+
                 let has_matching_diag = diagnostics.iter().any(|d| {
                     d.range.start.line == m_row && d.range.start.character == m_col
                 });
@@ -7932,7 +8901,7 @@ mod syntax_error_range_tests {
             let tree = parse_r(&code);
             let root = tree.root_node();
 
-            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            let mut missing_positions: Vec<(u32, u32, String)> = Vec::new();
             collect_missing_positions(root, &mut missing_positions);
 
             // Our generator should always produce at least one MISSING node
@@ -7958,8 +8927,22 @@ mod syntax_error_range_tests {
             // 1. "Missing <kind>" — from collect_syntax_errors direct MISSING handling
             // 2. "Syntax error" — from minimize_error_range Phase 1 (MISSING inside ERROR)
             //
-            // Both paths create a 1-column-wide range at the MISSING node's position.
-            for &(m_row, m_col) in &missing_positions {
+            // Exception (Task 7): bracket-kind MISSING nodes (`)`, `}`, `]`, `]]`)
+            // are re-anchored to the opener position and emit "Unclosed `X`...".
+            // The opener-anchored diagnostic range spans opener..EOL (not 1 column),
+            // so we skip the width check for bracket-kind MISSING.
+            for (m_row, m_col, m_kind) in &missing_positions {
+                let m_row = *m_row;
+                let m_col = *m_col;
+                let is_bracket_missing = matches!(m_kind.as_str(), ")" | "}" | "]" | "]]");
+
+                if is_bracket_missing {
+                    // Bracket-kind MISSING diagnostic is at the opener, not the MISSING
+                    // position. Width check does not apply; the "Unclosed" diagnostic
+                    // spans opener..EOL (see find_opener_for_missing). Skip.
+                    continue;
+                }
+
                 let matching_diag = diagnostics.iter().find(|d| {
                     d.range.start.line == m_row && d.range.start.character == m_col
                 });
@@ -8015,6 +8998,55 @@ mod syntax_error_range_tests {
                     diag.range.end.line,
                     diag.range.end.character,
                     code
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: bracket-diagnostics, Property: bracket-kind MISSING anchors on opener
+        //
+        // For each bracket-kind MISSING node, the corresponding diagnostic
+        // is NOT at the MISSING's position; it's anchored on the opener
+        // (an ancestor's first delimiter child) with a range whose start
+        // <= the MISSING's column.
+        //
+        // **Validates: bracket-diagnostics design spec.**
+        // ============================================================================
+
+        #[test]
+        fn prop_bracket_missing_anchors_on_opener(code in missing_node_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let mut missing_positions: Vec<(u32, u32, String)> = Vec::new();
+            collect_missing_positions(root, &mut missing_positions);
+
+            prop_assume!(
+                missing_positions.iter().any(|(_, _, k)| matches!(k.as_str(), ")" | "}" | "]" | "]]")),
+                "Generated code must produce at least one bracket-kind MISSING"
+            );
+
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            for (m_row, m_col, m_kind) in &missing_positions {
+                let m_row = *m_row;
+                let m_col = *m_col;
+                if !matches!(m_kind.as_str(), ")" | "}" | "]" | "]]") {
+                    continue;
+                }
+                // Find a diagnostic of the right kind anchored at or before
+                // the MISSING position (on the same or earlier line).
+                let matching = diagnostics.iter().find(|d| {
+                    (d.message.contains("Unclosed")
+                        || d.message.contains("Mismatched brackets"))
+                        && d.range.start.line <= m_row
+                });
+                prop_assert!(
+                    matching.is_some(),
+                    "Expected an 'Unclosed' or 'Mismatched' diagnostic anchored at or before \
+                     the MISSING position ({m_row}, {m_col}) kind {m_kind}, but none found. \
+                     Code: {code:?}, Diagnostics: {diagnostics:?}",
                 );
             }
         }
@@ -8147,6 +9179,629 @@ mod syntax_error_range_tests {
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // end_of_meaningful_content
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn eomc_plain_content() {
+        assert_eq!(end_of_meaningful_content("f(x, y)"), 7);
+    }
+
+    #[test]
+    fn eomc_trailing_whitespace() {
+        assert_eq!(end_of_meaningful_content("f(   "), 2);
+    }
+
+    #[test]
+    fn eomc_trailing_comment() {
+        assert_eq!(end_of_meaningful_content("f( # comment"), 2);
+    }
+
+    #[test]
+    fn eomc_content_then_comment() {
+        // last meaningful char `)` at col 3; just past = 4
+        assert_eq!(end_of_meaningful_content("f(1) # tail"), 4);
+    }
+
+    #[test]
+    fn eomc_hash_inside_double_quoted_string() {
+        assert_eq!(end_of_meaningful_content("x <- \"a # b\""), 12);
+    }
+
+    #[test]
+    fn eomc_hash_inside_single_quoted_string() {
+        assert_eq!(end_of_meaningful_content("x <- 'a # b'"), 12);
+    }
+
+    #[test]
+    fn eomc_hash_inside_backticks() {
+        assert_eq!(end_of_meaningful_content("x <- `a # b`"), 12);
+    }
+
+    #[test]
+    fn eomc_crlf_carriage_return_trimmed() {
+        assert_eq!(end_of_meaningful_content("f(\r"), 2);
+    }
+
+    #[test]
+    fn eomc_only_comment() {
+        assert_eq!(end_of_meaningful_content("# nothing here"), 0);
+    }
+
+    #[test]
+    fn eomc_empty_line() {
+        assert_eq!(end_of_meaningful_content(""), 0);
+    }
+
+    #[test]
+    fn eomc_non_ascii_identifier() {
+        // line "é <- 1" — last meaningful char `1` at UTF-16 col 5; just past = 6
+        assert_eq!(end_of_meaningful_content("é <- 1"), 6);
+    }
+
+    #[test]
+    fn eomc_astral_emoji() {
+        // 😀 = 2 UTF-16 code units; "😀 <- 1" — `1` at UTF-16 col 6; just past = 7
+        assert_eq!(end_of_meaningful_content("😀 <- 1"), 7);
+    }
+
+    // ------------------------------------------------------------------
+    // find_opener_for_missing
+    // ------------------------------------------------------------------
+
+    fn first_missing(tree: &tree_sitter::Tree) -> Option<tree_sitter::Node<'_>> {
+        fn walk<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+            if n.is_missing() { return Some(n); }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(m) = walk(child) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        walk(tree.root_node())
+    }
+
+    #[test]
+    fn fofm_call_arguments_paren() {
+        let code = "library(";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).expect("expected MISSING");
+        let (opener, range) = find_opener_for_missing(missing, code)
+            .expect("should find opener for ( inside arguments");
+        assert_eq!(opener.kind(), "(");
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 7);
+        assert_eq!(range.end.line, 0);
+        assert_eq!(range.end.character, 8);
+    }
+
+    #[test]
+    fn fofm_subset_arguments_bracket() {
+        let code = "vec[1, 2\n";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        let (opener, range) = find_opener_for_missing(missing, code).unwrap();
+        assert_eq!(opener.kind(), "[");
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 8);
+    }
+
+    #[test]
+    fn fofm_subset2_arguments_double_bracket() {
+        let code = "vec[[1, 2\n";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        let (opener, range) = find_opener_for_missing(missing, code).unwrap();
+        assert_eq!(opener.kind(), "[[");
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 9);
+    }
+
+    #[test]
+    fn fofm_braced_expression() {
+        let code = "f <- function() {\n  x <- 1\n";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        let (opener, range) = find_opener_for_missing(missing, code).unwrap();
+        assert_eq!(opener.kind(), "{");
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 16);
+        assert_eq!(range.end.character, 17);
+    }
+
+    #[test]
+    fn fofm_non_bracket_missing_returns_none() {
+        let code = "x <-";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        assert!(find_opener_for_missing(missing, code).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // delimiter_events
+    // ------------------------------------------------------------------
+
+    fn find_first_error(tree: &tree_sitter::Tree) -> Option<tree_sitter::Node<'_>> {
+        fn walk<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+            if n.is_error() {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(e) = walk(child) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+        walk(tree.root_node())
+    }
+
+    #[test]
+    fn devents_flat_nested_openers() {
+        // f(g(h(  -> ERROR("(" "g" "(" "h" "(")
+        let code = "f(g(h(\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        assert_eq!(evs.len(), 3, "got: {evs:?}");
+        for ev in &evs {
+            assert!(ev.is_open);
+            assert_eq!(ev.kind, DelimiterKind::Paren);
+        }
+    }
+
+    #[test]
+    fn devents_stray_close_brace() {
+        let code = "x <- 1\n}\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        assert_eq!(evs.len(), 1);
+        assert!(!evs[0].is_open);
+        assert_eq!(evs[0].kind, DelimiterKind::Brace);
+    }
+
+    #[test]
+    fn devents_homogeneous_run() {
+        let code = "}}}\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        assert_eq!(evs.len(), 1);
+        assert!(!evs[0].is_open);
+        assert_eq!(evs[0].kind, DelimiterKind::Brace);
+        assert_eq!(evs[0].range_bytes, 0..3);
+    }
+
+    #[test]
+    fn devents_mixed_closer_run() {
+        let code = "f(])";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        let open_count = evs.iter().filter(|e| e.is_open).count();
+        let close_count = evs.iter().filter(|e| !e.is_open).count();
+        assert!(open_count >= 1, "expected ≥1 open event, got: {evs:?}");
+        assert!(close_count >= 2, "expected ≥2 close events, got: {evs:?}");
+        let mut closes = evs.iter().filter(|e| !e.is_open);
+        let first = closes.next().unwrap();
+        let second = closes.next().unwrap();
+        assert_eq!(first.kind, DelimiterKind::Bracket);
+        assert_eq!(second.kind, DelimiterKind::Paren);
+    }
+
+    #[test]
+    fn devents_double_bracket_run() {
+        let code = "]]]]\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        let closes: Vec<_> = evs.iter().filter(|e| !e.is_open).collect();
+        assert_eq!(closes.len(), 2, "got: {evs:?}");
+        for c in closes {
+            assert_eq!(c.kind, DelimiterKind::DoubleBracket);
+        }
+    }
+
+    #[test]
+    fn devents_triple_bracket_pairs_then_single() {
+        // `]]]` greedy left-to-right -> one `]]` event + one `]` event
+        let code = "]]]\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        let closes: Vec<_> = evs.iter().filter(|e| !e.is_open).collect();
+        assert_eq!(closes.len(), 2, "got: {evs:?}");
+        assert_eq!(closes[0].kind, DelimiterKind::DoubleBracket);
+        assert_eq!(closes[1].kind, DelimiterKind::Bracket);
+    }
+
+    // ------------------------------------------------------------------
+    // classify_via_delimiter_scan (stack processing)
+    // ------------------------------------------------------------------
+
+    fn run_scan(code: &str) -> Vec<(String, tower_lsp::lsp_types::Range)> {
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).expect("expected ERROR node");
+        let mut state = CollectState::default();
+        classify_via_delimiter_scan(err, code, &mut state)
+            .into_iter()
+            .map(|d| (d.message, d.range))
+            .collect()
+    }
+
+    #[test]
+    fn scan_stray_close_brace() {
+        let diags = run_scan("x <- 1\n}\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `{`"), "got: {}", diags[0].0);
+        assert_eq!(diags[0].1.start.line, 1);
+        assert_eq!(diags[0].1.start.character, 0);
+        assert_eq!(diags[0].1.end.character, 1);
+    }
+
+    #[test]
+    fn scan_stray_close_paren() {
+        let diags = run_scan("x <- 1\n)\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `(`"));
+    }
+
+    #[test]
+    fn scan_stray_close_bracket() {
+        let diags = run_scan("x <- 1\n]\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `[`"));
+    }
+
+    #[test]
+    fn scan_stray_double_close_bracket() {
+        let diags = run_scan("x <- 1\n]]\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `[[`"));
+        assert_eq!(diags[0].1.start.character, 0);
+        assert_eq!(diags[0].1.end.character, 2);
+    }
+
+    #[test]
+    fn scan_homogeneous_brace_run_single_diagnostic() {
+        let diags = run_scan("}}}\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(diags[0].0.contains("Missing opening `{`"));
+        assert_eq!(diags[0].1.start.character, 0);
+        assert_eq!(diags[0].1.end.character, 3);
+    }
+
+    #[test]
+    fn scan_flat_nested_openers_three_diagnostics() {
+        let diags = run_scan("f(g(h(\n");
+        assert_eq!(diags.len(), 3, "got: {diags:?}");
+        for d in &diags {
+            assert!(d.0.contains("Unclosed `(`"));
+        }
+        let mut sorted = diags.clone();
+        sorted.sort_by_key(|d| d.1.start.character);
+        // Per spec: cols 1..3, 3..5, 5..6 (non-overlapping)
+        assert_eq!(sorted[0].1.start.character, 1);
+        assert_eq!(sorted[0].1.end.character, 3);
+        assert_eq!(sorted[1].1.start.character, 3);
+        assert_eq!(sorted[1].1.end.character, 5);
+        assert_eq!(sorted[2].1.start.character, 5);
+        assert_eq!(sorted[2].1.end.character, 6);
+    }
+
+    #[test]
+    fn scan_flat_error_mismatched_close_coalesces() {
+        // f(}  -> outer ERROR contains "(" and ERROR("}") (or similar)
+        // Inside the delimiter scan, top-of-stack is `(`, incoming closer is `}`
+        // → mismatched-bracket sub-rule fires, one diagnostic.
+        let diags = run_scan("f(}\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(
+            diags[0].0.contains("Mismatched brackets")
+                && diags[0].0.contains("`(`")
+                && diags[0].0.contains("`}`"),
+            "got: {}",
+            diags[0].0,
+        );
+    }
+
+    // ========================================================================
+    // Bracket-kind MISSING anchor tests (Task 7)
+    // ========================================================================
+
+    #[test]
+    fn unclosed_paren_anchors_on_opener() {
+        // mean(c(1,2,3) — opener `(` of mean( at col 9, EOL of opener line at col 20
+        let diags = collect("x <- mean(c(1, 2, 3)\n\n# comment\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 9);
+        assert_eq!(target.range.end.line, 0);
+        assert_eq!(target.range.end.character, 20);
+    }
+
+    #[test]
+    fn unclosed_brace_anchors_on_opener() {
+        // f <- function() { ... — opener `{` at col 16, EOL at col 17
+        let diags = collect("f <- function() {\n  x <- 1\n  y <- 2\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `{`"))
+            .expect("expected Unclosed { diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 16);
+        assert_eq!(target.range.end.character, 17);
+    }
+
+    #[test]
+    fn unclosed_bracket_anchors_on_opener() {
+        let diags = collect("vec[1, 2\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `[`"))
+            .expect("expected Unclosed [ diagnostic");
+        assert_eq!(target.range.start.character, 3);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_double_bracket_anchors_on_opener() {
+        let diags = collect("vec[[1, 2\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `[[`"))
+            .expect("expected Unclosed [[ diagnostic");
+        assert_eq!(target.range.start.character, 3);
+        assert_eq!(target.range.end.character, 9);
+    }
+
+    #[test]
+    fn unclosed_paren_at_end_of_file() {
+        let diags = collect("library(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_opener_with_trailing_comment() {
+        // `f( # comment\n` — opener `(` at col 1, range collapses to just `(`
+        let diags = collect("f( # comment\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 1);
+        assert_eq!(target.range.end.character, 2);
+    }
+
+    #[test]
+    fn unclosed_opener_with_trailing_whitespace() {
+        let diags = collect("f(   \n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 1);
+        assert_eq!(target.range.end.character, 2);
+    }
+
+    // Regression: a leaf ERROR whose text spans multiple lines (e.g.
+    // tree-sitter wrapping `}\n}` into a single leaf) must emit each
+    // closer event on its actual row, not the leaf's starting row. With
+    // the wrong row, `classify_via_delimiter_scan` mis-anchors the
+    // downstream diagnostic (wrong line, zero-width column).
+    #[test]
+    fn multiline_closer_run_anchors_on_each_row() {
+        // `x <- 1\n}\n}` — two stray `}` on lines 1 and 2.
+        let diags = collect("x <- 1\n}\n}");
+        let close_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Missing opening `{`"))
+            .collect();
+        assert_eq!(close_diags.len(), 2, "got: {diags:?}");
+        assert_eq!(close_diags[0].range.start.line, 1);
+        assert_eq!(close_diags[0].range.start.character, 0);
+        assert_eq!(close_diags[0].range.end.character, 1);
+        assert_eq!(close_diags[1].range.start.line, 2);
+        assert_eq!(close_diags[1].range.start.character, 0);
+        assert_eq!(close_diags[1].range.end.character, 1);
+    }
+
+    // Regression: leaves that aren't pure-closer runs must not produce
+    // bracket diagnostics. Unparseable special operators (`%]%`, `%(%`,
+    // etc.) parse as a single ERROR leaf whose text contains `%`;
+    // byte-scanning such a leaf used to emit spurious `Missing opening …`
+    // / `Unclosed …` events. The fix in `extract_from_leaf` guards the
+    // byte-scan with an "every byte is `}`/`)`/`]` or ASCII whitespace"
+    // precondition, so these leaves now fall back to the generic
+    // "Syntax error".
+    #[test]
+    fn special_operator_with_bracket_chars_no_spurious_bracket_diag() {
+        for code in &["x <- %]%", "x <- %}%", "x <- %(%", "x <- %[[%"] {
+            let diags = collect(code);
+            for d in &diags {
+                let m = &d.message;
+                assert!(
+                    !m.contains("Missing opening") && !m.contains("Unclosed"),
+                    "code {code:?} should not produce a bracket diagnostic; got: {m:?}"
+                );
+            }
+        }
+    }
+
+    // Regression: the `c(1, 2]` mismatched-bracket path used to return
+    // the whole minimized ERROR range. Per the design (anchor on the
+    // offending delimiter), the range must be the wrong closer's span.
+    #[test]
+    fn mismatched_bracket_range_anchors_on_wrong_closer() {
+        let code = "c(1, 2]";
+        let diags = collect(code);
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Mismatched brackets"))
+            .expect("expected Mismatched diagnostic");
+        // `]` is at byte 6, column 6 in UTF-16.
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 6);
+        assert_eq!(target.range.end.character, 7);
+    }
+
+    #[test]
+    fn coalesce_wrong_closer_in_arguments_with_trailing_arg() {
+        // f(} y  -> arguments("(" ERROR("}") argument MISSING ")")
+        let diags = collect("f(} y\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        let d = &diags[0];
+        assert!(
+            d.message.contains("Mismatched brackets")
+                && d.message.contains("`(`")
+                && d.message.contains("`}`"),
+            "got: {}",
+            d.message,
+        );
+    }
+
+    #[test]
+    fn coalesce_wrong_closer_for_subset() {
+        // vec[} y — analog for [
+        let diags = collect("vec[} y\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        let d = &diags[0];
+        assert!(
+            d.message.contains("Mismatched brackets")
+                && d.message.contains("`[`")
+                && d.message.contains("`}`"),
+            "got: {}",
+            d.message,
+        );
+    }
+
+    #[test]
+    fn coalesce_no_double_fire_unclosed_after_mismatch() {
+        // After coalescing, no separate "Unclosed (" follow-up
+        let diags = collect("f(} y\n");
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Unclosed `(`")),
+            "should NOT have a separate 'Unclosed (' diagnostic; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unclosed_opener_crlf() {
+        // library(\r\n -- opener `(` at col 7, content ends at col 8 (just past `(`)
+        let diags = collect("library(\r\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_opener_no_final_newline() {
+        let diags = collect("library(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_opener_with_bom() {
+        // BOM (U+FEFF) = 3 UTF-8 bytes, 1 UTF-16 unit. `library(` follows.
+        // `(` byte col = 3 (BOM) + 7 (library) = 10. UTF-16 col = 1 + 7 = 8.
+        let diags = collect("\u{FEFF}library(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 8);
+        assert_eq!(target.range.end.character, 9);
+    }
+
+    #[test]
+    fn unclosed_opener_non_ascii_before() {
+        // `é_func(` -- `é` is 2 UTF-8 bytes, 1 UTF-16 unit at col 0.
+        // `(` at UTF-16 col 6 (é=1 + _func=5 = 6).
+        let diags = collect("é_func(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 6);
+        assert_eq!(target.range.end.character, 7);
+    }
+
+    #[test]
+    fn unclosed_opener_astral_before() {
+        // `😀_func(` -- `😀` is 4 UTF-8 bytes, 2 UTF-16 units (surrogate pair).
+        // `(` at UTF-16 col 7 (😀=2 + _func=5 = 7).
+        let diags = collect("😀_func(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn nested_flat_unclosed_emits_per_opener_via_collect() {
+        // f(g(h(  -> three Unclosed `(` diagnostics with non-overlapping
+        // ranges via the public collect() path (not run_scan). Verifies
+        // the ErrorClassification::Multi dispatch in collect_syntax_errors_inner.
+        let diags = collect("f(g(h(\n");
+        let unclosed: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Unclosed `(`"))
+            .collect();
+        assert_eq!(unclosed.len(), 3, "expected 3 Unclosed ( diagnostics, got: {diags:?}");
+        let mut sorted = unclosed.clone();
+        sorted.sort_by_key(|d| d.range.start.character);
+        // Non-overlapping per spec: cols 1..3, 3..5, 5..6
+        assert_eq!(sorted[0].range.start.character, 1);
+        assert_eq!(sorted[0].range.end.character, 3);
+        assert_eq!(sorted[1].range.start.character, 3);
+        assert_eq!(sorted[1].range.end.character, 5);
+        assert_eq!(sorted[2].range.start.character, 5);
+        assert_eq!(sorted[2].range.end.character, 6);
+    }
+
+    #[test]
+    fn stray_closer_after_valid_expr_via_collect() {
+        // f() }  -> exactly one Missing opening `{` diagnostic on the `}`,
+        // none on the complete `f()` call.
+        let diags = collect("f() }\n");
+        let stray: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Missing opening `{`"))
+            .collect();
+        assert_eq!(stray.len(), 1, "expected exactly one Missing opening `{{` diagnostic, got: {diags:?}");
+        // The `}` is on line 0 at col 4
+        assert_eq!(stray[0].range.start.line, 0);
+        assert_eq!(stray[0].range.start.character, 4);
+        assert_eq!(stray[0].range.end.character, 5);
+    }
+
 }
 
 #[cfg(test)]
@@ -8577,6 +10232,7 @@ mod invalid_assignment_target_tests {
         assert_eq!(diags[0].range.start.character, 7);
         assert_eq!(diags[0].range.end.character, 11);
     }
+
 }
 
 /// Regression guard: semantic-warning rules must fire through `diagnostics_from_snapshot`
@@ -20103,13 +21759,13 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_all_hashes() {
         assert_eq!(
             classify_delimiter_line("################"),
-            Some(DelimiterKind::Hash)
+            Some(BannerDelimKind::Hash)
         );
     }
 
     #[test]
     fn test_classify_delimiter_line_min_hashes() {
-        assert_eq!(classify_delimiter_line("####"), Some(DelimiterKind::Hash));
+        assert_eq!(classify_delimiter_line("####"), Some(BannerDelimKind::Hash));
     }
 
     #[test]
@@ -20121,7 +21777,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_equals() {
         assert_eq!(
             classify_delimiter_line("# ================"),
-            Some(DelimiterKind::Equals)
+            Some(BannerDelimKind::Equals)
         );
     }
 
@@ -20129,7 +21785,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_dashes() {
         assert_eq!(
             classify_delimiter_line("# ----------------"),
-            Some(DelimiterKind::Dash)
+            Some(BannerDelimKind::Dash)
         );
     }
 
@@ -20137,7 +21793,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_asterisks() {
         assert_eq!(
             classify_delimiter_line("# ****************"),
-            Some(DelimiterKind::Asterisk)
+            Some(BannerDelimKind::Asterisk)
         );
     }
 
@@ -20145,7 +21801,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_plus() {
         assert_eq!(
             classify_delimiter_line("# ++++++++++++++++"),
-            Some(DelimiterKind::Plus)
+            Some(BannerDelimKind::Plus)
         );
     }
 
@@ -20153,7 +21809,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_hash_after_hash_space() {
         assert_eq!(
             classify_delimiter_line("# ################"),
-            Some(DelimiterKind::Hash)
+            Some(BannerDelimKind::Hash)
         );
     }
 
@@ -20186,11 +21842,11 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_leading_whitespace() {
         assert_eq!(
             classify_delimiter_line("  ################"),
-            Some(DelimiterKind::Hash)
+            Some(BannerDelimKind::Hash)
         );
         assert_eq!(
             classify_delimiter_line("  # ================"),
-            Some(DelimiterKind::Equals)
+            Some(BannerDelimKind::Equals)
         );
     }
 
@@ -42465,7 +44121,10 @@ result <- undefined_var
                 .iter()
                 .any(|d| d.message.to_lowercase().contains("error")
                     || d.message.to_lowercase().contains("syntax")
-                    || d.message.to_lowercase().contains("unexpected")),
+                    || d.message.to_lowercase().contains("unexpected")
+                    || d.message.starts_with("Unclosed")
+                    || d.message.starts_with("Missing opening")
+                    || d.message.starts_with("Missing")),
             "Should contain syntax-related diagnostics, got: {:?}",
             result_enabled
                 .iter()

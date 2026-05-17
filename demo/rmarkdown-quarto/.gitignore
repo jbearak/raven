@@ -1,0 +1,5 @@
+# Rendered outputs from knit / quarto render — sources (.Rmd, .qmd) are the
+# tracked artifacts; the rendered HTML and its companion asset directory are
+# regenerated locally and should not be committed.
+*.html
+*_files/
