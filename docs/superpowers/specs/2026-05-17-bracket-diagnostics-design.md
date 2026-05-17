@@ -96,7 +96,7 @@ contract emits exactly one diagnostic per `ERROR`, supporting "multiple
 diagnostics per ERROR" requires a structural refactor of that boundary
 without breaking the existing classifiers.
 
-### Internal types
+### Internal types and helper signatures
 
 ```rust
 struct ClassifiedSyntaxDiagnostic {
@@ -113,13 +113,37 @@ enum ErrorClassification {
     /// to a single generic 'Syntax error' at the minimized range".
     Multi(Vec<ClassifiedSyntaxDiagnostic>),
 }
+
+/// Per-traversal mutable state threaded through `collect_syntax_errors`.
+/// Lets the classifier coalesce a MISSING follow-up that was already
+/// reported via a mismatched-bracket diagnostic on the same opener.
+#[derive(Default)]
+struct CollectState {
+    /// Tree-sitter Node IDs of opener tokens already covered by a
+    /// `Mismatched brackets` diagnostic. The MISSING-handling branch
+    /// must skip emitting a separate `Unclosed X` for any opener whose
+    /// node ID appears here.
+    covered_openers: HashSet<usize>,
+}
+
+/// Signature of the new opener-anchoring helper. Needs the source text
+/// to compute UTF-16 columns and end-of-meaningful-content.
+fn find_opener_for_missing(missing: Node, text: &str) -> Option<(Node, Range)>;
+
+/// Compute the UTF-16 column just past the last non-comment, non-
+/// whitespace character on `line`. Used by the opener-anchoring helper
+/// to trim trailing comments and whitespace from the range.
+fn end_of_meaningful_content(line: &str) -> u32;
 ```
 
-`classify_error` returns `ErrorClassification` instead of `String`. The
-caller (`collect_syntax_errors`) decides whether to emit one or many
-diagnostics for each ERROR. This keeps the single-classifier contract for
-existing classifiers (they all return `Whole`) while allowing the new
-delimiter logic to return `Multi` when appropriate.
+`classify_error` returns `ErrorClassification` instead of `String`, and
+takes `&mut CollectState` so it can record openers covered by mismatched-
+bracket diagnostics. The single production caller (`collect_syntax_errors`
+— verified to be the only one) passes the state through its recursion.
+This keeps the single-classifier contract for existing classifiers (they
+all return `Whole` and don't touch state) while allowing the new
+delimiter logic to return `Multi` and the coalescing rule to suppress
+duplicate MISSING follow-ups.
 
 ### Classifier ordering inside `classify_error`
 
@@ -139,58 +163,111 @@ that classifies the ERROR:
 
 ### Delimiter scan rules
 
-When the delimiter scan runs on an ERROR, it does this single pass:
+The delimiter scan converts an ERROR's structure into a flat stream of
+delimiter events (`Open(kind, byte_pos)` / `Close(kind, byte_pos, end_byte)`),
+then processes the stream with a stack.
 
-1. Iterate the ERROR's *direct* children left-to-right, tracking a stack
-   of unmatched openers.
-2. For each child whose token text is an opener (`(`, `{`, `[`, `[[`),
-   push `(kind, position, line, end_of_meaningful_content_col)` onto the
-   stack.
-3. For each child whose token text is a closer (`)`, `}`, `]`, `]]`),
-   look at the top of the stack:
-   - If the stack is empty → it's a stray closer. Emit
-     `Missing opening `X`` at the closer token's range.
-   - If the top of the stack matches (same kind) → pop and discard
-     (this matched pair lived inside the ERROR; nothing to report).
-   - If the top of the stack is a mismatched opener → emit
-     `Mismatched brackets: ` and pop. (This handles e.g. `(...]` patterns
-     embedded inside a broader ERROR.)
-4. For each opener left on the stack at the end → emit
-   `Unclosed `X`: missing matching `Y`` ranged from the opener through
-   end-of-meaningful-content on the opener's line.
+**Event extraction.** Walk the ERROR's direct children left-to-right.
+For each child:
 
-This pass produces between zero and N diagnostics where N is the number of
-delimiter tokens in the ERROR. For `f(g(h(` the stack has three unclosed
-`(` at the end → three diagnostics. For `}}}` there's one ERROR whose only
-direct child is `ERROR "}}}"` (a single undifferentiated leaf) — the leaf
-is not parsed as three closer tokens, so the rule above sees one closer
-token of text `"}}}"`. We treat that whole leaf as a single stray-closer
-diagnostic and produce ONE `Missing opening `{`` ranged over the entire
-leaf.
+- **If the child is a recognized opener token** (`text == "(" | "{" | "[" | "[["`):
+  emit one `Open` event at the child's start position.
+- **If the child is a recognized closer token** (`text == ")" | "}" | "]" | "]]"`):
+  emit one `Close` event spanning the child's range.
+- **If the child is itself an ERROR or unrecognized leaf whose text
+  consists only of closer characters** (`}`, `)`, `]` — any mix or repetition):
+  treat the leaf as a sequence of closers and emit events using these rules:
+  - A **homogeneous run** of one closer kind (`}}}`, `)))`, `]]`, `]]]]`,
+    etc.) → ONE `Close` event spanning the entire run. The closer kind
+    is the single character making up the run; for `]]` and `]]]]`-style
+    runs, treat consecutive pairs as `]]` tokens left-to-right (so `]]]`
+    becomes one `]]` event covering cols 0..2 plus one `]` event at
+    col 2..3).
+  - A **mixed run** of multiple closer kinds (`])`, `}]`, `)]`, etc.) →
+    ONE `Close` event per character (or per `]]` pair), emitted in
+    source order at the appropriate byte ranges.
+- **If the child is a nested ERROR** whose direct children include
+  delimiter tokens, recurse one level into it and apply the same rules
+  to its direct children. Do NOT recurse into non-ERROR semantic
+  children — they have their own balanced structure that the parser has
+  already validated.
+- **Any other child** (identifier, literal, comment, complete semantic
+  subtree) is skipped — it cannot contribute a delimiter event.
 
-### Stray closer in unclosed-opener arguments (coalescing rule)
+**Stack processing.** Iterate the event stream:
 
-For the very common `f(}` typo, the parse shape is **NOT** the same as the
-ERROR-scan case above: the `}` lives inside the `arguments` node, not
-inside an ERROR that also contains the `(`. The mismatched-bracket
-detector at step 3 of the classifier order is extended to handle this:
+1. `Open` → push `(kind, byte_pos, row, col_utf16, line_text)` onto the stack.
+2. `Close` → consult the top of the stack:
+   - **Stack empty** → it's a stray closer. Emit
+     `` Missing opening `X` `` at the closer event's range
+     (UTF-16-converted).
+   - **Top matches (same kind)** → pop. The pair lived inside the
+     ERROR; nothing to report.
+   - **Top is mismatched** → emit
+     `` Mismatched brackets: `O` opened here; close with `C` not `W`. ``
+     (where `O` is the opener kind, `C` is the expected closer for `O`,
+     and `W` is the actual wrong-closer kind). Pop and record the
+     opener's node ID in `CollectState::covered_openers` so the
+     downstream MISSING handler suppresses any `Unclosed O` diagnostic
+     for the same opener. The diagnostic range is the closer event's
+     range (UTF-16-converted).
+3. **After the stream is exhausted**, walk the remaining openers on
+   the stack. For each opener, emit
+   `` Unclosed `X`: missing matching `Y` `` ranged from
+   `(row, col_utf16)` through the **next unclosed opener on the same
+   line, or end-of-meaningful-content on that line, whichever comes
+   first**. The "next unclosed opener on the same line" rule prevents
+   overlapping ranges when multiple openers share one line (e.g.
+   `f(g(h(`: outer `(` spans cols 1–3, middle `(` spans 3–5, inner
+   `(` spans 5–6).
 
-When the existing mismatched-bracket detector finds an ERROR whose only
-non-whitespace child is a closer token, it now also walks up one level to
-check whether the parent is `arguments`, `braced_expression`, or
-`parenthesized_expression` AND whether that parent contains an opener
-*and* a `MISSING` closer of the expected kind. If yes, emit a single
-mismatched-bracket diagnostic anchored on the stray closer, with message
-`` Mismatched brackets: `(` opened here; close with `)` not `}`. ``
-(opener character substituted from the parent's actual opener; stray-closer
-character substituted from the ERROR's child).
+This pass produces between zero and N diagnostics where N is the
+number of delimiter events in the ERROR. For `f(g(h(`: stack ends with
+three unclosed `(` → three diagnostics with non-overlapping ranges. For
+`}}}`: one homogeneous-run event → one `` Missing opening `{` ``
+diagnostic spanning the run. For `])`: two mixed events → two
+diagnostics, one per character.
 
-The diagnostic suppresses the `MISSING` follow-up that would otherwise
-produce a separate "Unclosed `(`" message for the same opener — the
-mismatched-bracket diagnostic already names it. This is implemented by
-having the `MISSING`-handling branch consult a small per-traversal set of
-"openers already covered by a mismatched-bracket diagnostic" populated at
-classification time.
+### Stray closer adjacent to an unclosed opener (coalescing)
+
+The very common `f(}` typo has two parse shapes depending on whether
+content follows the wrong closer:
+
+- **Flat-ERROR shape** (`f(}`, `f(}\n`): `program(identifier, ERROR("("
+  ERROR(ERROR "}")))`. No `arguments` node; the `(` and the `}` are
+  both inside one flat ERROR. The delimiter scan handles this via its
+  "Top is mismatched" rule (step 2.c above) — one `Mismatched brackets`
+  diagnostic, no Unclosed-X follow-up. No special coalescing rule
+  needed.
+- **Arguments shape** (`f(} y`, `f(} 1`): `program(call(identifier,
+  arguments("(" ERROR(ERROR "}") argument MISSING ")")))`. Here the
+  parser was able to extract a trailing argument, so the structure
+  partially recovered — the wrong closer sits in an ERROR child of
+  `arguments`, and the MISSING `)` is at the end. This case needs an
+  explicit coalescing rule (below) because the delimiter scan only
+  sees the `}` ERROR (not the opener `(`, which is `arguments`'s first
+  child).
+
+**Coalescing rule for the `arguments` shape.** Inside the
+mismatched-bracket detector (classifier step 3), when an ERROR has no
+opener-token child but has exactly one closer-token leaf descendant,
+walk up to the ERROR's direct parent. If the parent kind is
+`arguments`, `braced_expression`, or `parenthesized_expression`, AND
+the parent's first child is an opener token whose matching closer kind
+is *different* from the ERROR's closer leaf, AND the parent's last
+child is `MISSING` of the expected closer kind, then:
+
+1. Emit one `Mismatched brackets` diagnostic anchored on the ERROR's
+   closer leaf, with message
+   `` Mismatched brackets: `O` opened here; close with `C` not `W`. ``
+   (opener `O` and expected closer `C` from the parent's opener;
+   actual wrong-closer `W` from the ERROR leaf).
+2. Record the opener token's node ID in `CollectState::covered_openers`.
+
+The MISSING-anchoring branch checks `covered_openers` before emitting
+`Unclosed O: missing matching C` for that opener, and skips it. The set
+is mutable state on `CollectState` threaded through `classify_error` and
+the MISSING-handling code.
 
 ### Opener anchoring via MISSING (single-level parent walk)
 
@@ -355,18 +432,23 @@ All new tests go in `mod syntax_error_range_tests` in
 | `unclosed_brace_anchors_on_opener` | `"f <- function() {\n  x <- 1\n  y <- 2\n"` | range on `{` only (opener at EOL); message `` Unclosed `{`: missing matching `}` `` |
 | `unclosed_bracket_anchors_on_opener` | `"vec[1, 2\n"` | range from `[` (col 3) through end of line content (col 8); message `` Unclosed `[`: missing matching `]` `` |
 | `unclosed_double_bracket_anchors_on_opener` | `"vec[[1, 2\n"` | range from `[[` start (col 3) through end of line content (col 9); message `` Unclosed `[[`: missing matching `]]` `` |
-| `nested_flat_unclosed_emits_per_opener` | `"f(g(h(\n"` | THREE diagnostics, one anchored on each `(` (cols 1, 3, 5). Each range covers its `(` only (no content after). |
+| `nested_flat_unclosed_emits_per_opener` | `"f(g(h(\n"` | THREE diagnostics, one anchored on each `(`. Ranges: outer `(` cols 1–3, middle `(` cols 3–5, inner `(` cols 5–6 (per the "next opener on same line, or end-of-meaningful-content" rule). Ranges do NOT overlap. |
 | `unclosed_paren_at_end_of_file` | `"library("` | range on the `(`; message `` Unclosed `(`: missing matching `)` `` |
 | `unclosed_opener_with_trailing_comment` | `"f( # comment\n"` | range covers just the `(` (comment excluded); message `` Unclosed `(`: missing matching `)` `` |
 | `unclosed_opener_with_trailing_whitespace` | `"f(   \n"` | range covers just the `(` (whitespace excluded); message `` Unclosed `(`: missing matching `)` `` |
 
-### Coalescing — stray closer inside an unclosed opener
+### Coalescing — wrong closer for the surrounding opener
 
-| Test | Input | Expected |
-|---|---|---|
-| `wrong_closer_in_args_coalesces` | `"f(}\n"` | exactly ONE diagnostic, message `` Mismatched brackets: `(` opened here; close with `)` not `}`. ``, range on the `}` |
-| `wrong_closer_followed_by_content_coalesces` | `"f(} y\n"` | exactly ONE diagnostic (Mismatched brackets), NOT two |
-| `wrong_closer_for_subset_coalesces` | `"vec[}\n"` | one Mismatched-brackets diagnostic naming `[` and `}` |
+These cover both parse shapes (flat ERROR and `arguments`-with-MISSING).
+Both shapes coalesce into a single `Mismatched brackets` diagnostic.
+
+| Test | Input | Parse shape | Expected |
+|---|---|---|---|
+| `wrong_closer_flat_error_coalesces` | `"f(}\n"` | flat ERROR contains both `(` and `ERROR("}")` | exactly ONE diagnostic via delimiter-scan mismatched-bracket sub-rule. Message `` Mismatched brackets: `(` opened here; close with `)` not `}`. ``, range on the `}` |
+| `wrong_closer_in_arguments_coalesces` | `"f(} y\n"` | `arguments(`(`, ERROR(`}`), argument, MISSING `)`)` | exactly ONE diagnostic via the arguments-coalescing rule. No `Unclosed `(`` follow-up for the same opener (suppressed by `CollectState::covered_openers`). |
+| `wrong_closer_for_subset_coalesces` | `"vec[}\n"` | (flat ERROR — verify in test) | one Mismatched-brackets diagnostic naming `[` and `}` |
+| `wrong_closer_with_braced_expression` | `"function() ]\n"` | `function_definition` with `braced_expression` followed by stray `]` (verify exact shape) | Specific to the parse shape: if `]` is in `braced_expression`, coalesces against `{`; otherwise stays as a stray closer (`` Missing opening `[` ``). Test asserts whichever the verified parse shape produces. |
+| `mixed_closer_leaf_emits_per_kind` | `"]\n)"` placed as two separate stray closers OR `f(])` whose flat ERROR contains a leaf `])` | For mixed leaves like `])`: two diagnostics, one `` Missing opening `[` `` on the `]`, one `` Missing opening `(` `` on the `)`. |
 
 ### Encoding / line-ending edge cases
 
@@ -380,25 +462,36 @@ All new tests go in `mod syntax_error_range_tests` in
 
 ### Regression / non-regression
 
-| Test | Behavior to preserve |
+| Test | Behavior to preserve / change |
 |---|---|
 | `unclosed_paren_diagnostic_anchors_on_offending_line` (existing) | Rewrite to expect new anchor (on opener) instead of end-of-statement. |
 | `mismatched_bracket_emits_descriptive_message` (existing) | Unchanged behavior. |
 | `incomplete_assignment_in_block_minimized` (existing) | Unchanged — non-bracket `MISSING`, uses unchanged code path. |
 | `top_level_incomplete_assignment` (existing) | Unchanged (same reason). |
 | `unclosed_string_literal_*` (existing) | Unchanged — string-literal handling untouched. |
+| `prop_missing_node_priority` (handlers.rs:7802) | Unchanged — asserts on `"Syntax error"`-message count, not on `Missing X` ranges. Our new messages don't affect this property. |
+| `prop_missing_node_width` (handlers.rs:8098) | **Update**: the property currently asserts that every diagnostic at a `MISSING` node's reported position has width 1. The new design anchors *bracket-kind* `MISSING` on the opener (not the MISSING position) with a multi-column range. The fix is to scope the property: filter `missing_positions` to exclude bracket-kind closers (`)`, `}`, `]`, `]]`), keeping the width-1 assertion only for non-bracket `MISSING` kinds (e.g. identifiers, operators). Add a parallel property asserting that bracket-kind `MISSING` produces a diagnostic anchored on the opener, with range ending at end-of-meaningful-content. |
+| `prop_diagnostic_deduplication` (handlers.rs:7951), `prop_error_detection_completeness` (handlers.rs:8199) | Verify in implementation that these still pass; they don't assert specific messages or anchor positions. |
 
-### Helper-level unit test
+### Helper-level unit tests
 
-Add a unit test for the new helpers:
+Add unit tests for the new helpers:
 
-- `find_opener_for_missing(missing) -> Option<(Node, Range)>` — covers
-  `MISSING` inside `arguments` (with `(`/`[`/`[[` opener), inside
+- `find_opener_for_missing(missing: Node, text: &str) -> Option<(Node, Range)>`
+  — covers `MISSING` inside `arguments` (with `(`/`[`/`[[` opener), inside
   `braced_expression`, inside `parenthesized_expression`, and the
   defensive `None` case.
-- `end_of_meaningful_content(line, byte_col) -> u32` — covers a line with
-  trailing whitespace, with a trailing comment, with a `#` inside a string
-  (must not trim there), and with CRLF.
+- `end_of_meaningful_content(line: &str) -> u32` — covers: trailing
+  whitespace only, trailing comment only, content + trailing comment,
+  content + trailing whitespace, `#` inside a string literal (must NOT
+  trim there — comment detection is string-aware), `#` inside a
+  backtick-quoted identifier (must NOT trim there), CRLF (`\r` is
+  whitespace, must be trimmed).
+- Delimiter-scan event extraction — covers: opener tokens as direct
+  children of an ERROR, closer tokens as direct children, homogeneous
+  closer-run leaves (`}}}` → one event), mixed closer-run leaves (`])`
+  → two events), nested ERROR leaves, non-delimiter children that are
+  skipped (identifiers, literals, comments).
 
 ## Documentation
 
