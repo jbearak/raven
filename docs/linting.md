@@ -5,11 +5,11 @@ Raven ships an opt-in, native style linter that re-implements a small subset of 
 This page is the landing point for users coming from `lintr` or `REditorSupport`. For these rules alongside Raven's other diagnostic categories, see [Diagnostics § Style Lints](diagnostics.md#style-lints); the per-key configuration reference lives in [Configuration § Linting Settings](configuration.md#linting-settings).
 
 > [!NOTE]
-> In Raven, "linting" means subjective style rules — line length, naming, infix spacing, and similar — and the whole group is opt-in via `raven.linting.enabled`. Correctness diagnostics (parse errors, semantic warnings, cross-file issues, assignment-target errors) are on by default under `raven.diagnostics.enabled`; most categories have a per-category severity that can silence them (`"off"`), while a few (parse errors, assignment-target errors) respond only to the master switch. None of these are controlled by `raven.linting.*`. If you're looking for things like the orphan-`else` parse error, see [Diagnostics](diagnostics.md), not this page.
+> In Raven, "linting" means subjective style rules — line length, naming, infix spacing, and similar — and the whole group is governed by the tri-state master switch `raven.linting.enabled` (default `"auto"`, see below). Correctness diagnostics (parse errors, semantic warnings, cross-file issues, assignment-target errors) are on by default under `raven.diagnostics.enabled`; most categories have a per-category severity that can silence them (`"off"`), while a few (parse errors, assignment-target errors) respond only to the master switch. None of these are controlled by `raven.linting.*`. If you're looking for things like the orphan-`else` parse error, see [Diagnostics](diagnostics.md), not this page.
 
 ## Quick start
 
-The linter is off by default. The minimum `settings.json` to turn it on with default rules:
+By default (`"auto"`), Raven turns linting on when it discovers a `.lintr` or a `raven.toml` opt-in, and stays off otherwise. To force linting on regardless of project state, set:
 
 ```json
 {
@@ -42,6 +42,41 @@ To change the line-length threshold or pick a different naming scheme:
 Setting an `objectNameStyle*` to `"any"` disables the check for that symbol kind while leaving the other two active. Setting `raven.linting.objectNameSeverity` to `"off"` disables the rule entirely.
 
 Lint diagnostics carry the `source` field `raven (lint)`, so they're easy to filter from Raven's other diagnostics in the Problems pane.
+
+## Master switch (`raven.linting.enabled`)
+
+`raven.linting.enabled` is tri-state: `"auto"` (the default), `true` (or `"on"`), or `false` (or `"off"`). Booleans are accepted for backward compatibility with existing settings.
+
+- `"auto"` — lint when a project config opts in. Specifically: when a `.lintr` is discovered on the upward walk from the workspace (matching `lintr`'s own ancestor lookup, including a `~/.lintr` in your home directory), or when a `raven.toml` sets `[linting] enabled = true`. Otherwise off.
+- `true` / `"on"` — force linting on. Discovered rule severities still apply.
+- `false` / `"off"` — disable linting unless a discovered `raven.toml` explicitly sets `enabled = true` (raven.toml always wins at the leaf — the project-policy contract). A discovered `.lintr` alone never re-enables linting.
+
+### Behavior matrix
+
+Resolution by client setting × project state:
+
+<!-- markdownlint-disable MD013 -->
+
+| Client (`raven.linting.enabled`) | Project state | Result |
+|---|---|---|
+| `"auto"` (default) | no `.lintr`, no `raven.toml` | off |
+| `"auto"` | `.lintr` discovered (workspace or any ancestor incl. `~`) | on |
+| `"auto"` | `raven.toml` with `enabled = true` (or `"on"`) | on |
+| `"auto"` | `raven.toml` with `enabled = false` (or `"off"`) | off — `.lintr` not consulted (raven.toml wins discovery) |
+| `"auto"` | `raven.toml` with `enabled = "auto"` or no `[linting]` | off (no `.lintr` discovered; raven.toml was discovered instead) |
+| `false` / `"off"` | no project config | off |
+| `false` / `"off"` | `.lintr` discovered | off |
+| `false` / `"off"` | `raven.toml` with `enabled = true` | on (raven.toml project layer wins at the leaf — project-policy contract) |
+| `false` / `"off"` | `raven.toml` with `enabled = false` / `"auto"` / no `[linting]` | off |
+| `true` / `"on"` | no project config | on with built-in defaults |
+| `true` / `"on"` | `.lintr` discovered | on with `.lintr`'s rule severities |
+| `true` / `"on"` | `raven.toml` with `enabled = true` | on |
+| `true` / `"on"` | `raven.toml` with `enabled = false` | off (raven.toml project layer wins at the leaf — project-policy contract) |
+| `true` / `"on"` | `raven.toml` with `enabled = "auto"` or no `[linting]` | on (project layer is silent on `enabled`; client value passes through) |
+
+<!-- markdownlint-enable MD013 -->
+
+`raven.toml` and `.lintr` are mutually exclusive at discovery: `raven.toml` wins on the same walk and `.lintr` is not consulted.
 
 ## Settings reference by rule
 

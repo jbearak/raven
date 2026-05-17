@@ -33,8 +33,25 @@ pub use toml_loader::load as load_toml;
 ///
 /// Callers: `backend::initialize`, `backend::did_change_configuration`,
 /// `backend::did_change_watched_files` (project-config change).
+/// Strip `linting.enabled = "auto"` from a (cloned) project layer so it
+/// behaves as if the key were omitted. Without this, the deep merge would
+/// overwrite a client-explicit `true`/`false` with the project's `"auto"`
+/// and then resolve `Auto → lintr_discovered`, which contradicts the
+/// behavior matrix in `docs/linting.md` for `true` + `raven.toml enabled =
+/// "auto"`. See #281.
+fn strip_project_auto_enabled(project: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let mut cloned = project.cloned()?;
+    if let Some(linting) = cloned.get_mut("linting").and_then(|l| l.as_object_mut()) {
+        if linting.get("enabled") == Some(&serde_json::Value::String("auto".into())) {
+            linting.remove("enabled");
+        }
+    }
+    Some(cloned)
+}
+
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
-    let merged = merge_settings(&state.raw_client_settings, state.raw_project_settings.as_ref());
+    let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
+    let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
 
     match crate::backend::parse_cross_file_config(&merged) {
         Ok(Some(cfg)) => {
@@ -55,7 +72,13 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         crate::backend::parse_completion_config(&merged).unwrap_or_default();
     state.indentation_config =
         crate::backend::parse_indentation_config(&merged).unwrap_or_default();
-    state.lint_config = crate::backend::parse_lint_config(&merged).unwrap_or_default();
+    let lintr_discovered = state
+        .project_config_path
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .map(|n| n == std::ffi::OsStr::new(".lintr"))
+        .unwrap_or(false);
+    state.lint_config = crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
 
     // Recompile per-document lint overrides as part of the centralized
     // recompute. Splitting this into a separate caller step (as earlier

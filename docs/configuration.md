@@ -184,11 +184,11 @@ See [Smart Indentation](indentation.md) for details.
 
 ## Linting Settings
 
-Native style/lint diagnostics. Off by default; opt in with `raven.linting.enabled`. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for a user-facing guide that covers quick-start configuration, mapping from a `.lintr` file, gaps vs `lintr`, and the suppression matrix.
+Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (default `"auto"`); auto turns on when a `.lintr` or `raven.toml` opts in, set `true`/`false` for explicit overrides. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for the master-switch behavior matrix, quick-start configuration, mapping from a `.lintr` file, and the suppression matrix.
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.linting.enabled` | `false` | Master switch for all lint diagnostics |
+| `raven.linting.enabled` | `"auto"` | Master switch (`"auto"` / `"on"` / `"off"` / `true` / `false`). See the [behavior matrix](linting.md#behavior-matrix). |
 | `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
 | `raven.linting.indentationUnit` | `2` | Spaces per indent level used by the indentation lint (clamped to `1..=8`) |

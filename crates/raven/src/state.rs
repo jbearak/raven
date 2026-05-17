@@ -556,7 +556,9 @@ pub struct WorldState {
     /// Indentation configuration
     pub indentation_config: IndentationSettings,
     /// Style/lint configuration.
-    /// Master switch defaults to off; opt in via `raven.linting.enabled`.
+    /// Master switch is tri-state (`"auto" | true | false`); default `"auto"`
+    /// resolves to on when a `.lintr` is discovered (see #281 and
+    /// `docs/linting.md` for the full matrix).
     pub lint_config: crate::linting::LintConfig,
 
     /// Last-seen client-supplied settings: LSP `initializationOptions` at

@@ -435,14 +435,68 @@ pub(crate) fn parse_cross_file_config(
     Ok(Some(config))
 }
 
-/// Parse linting configuration from LSP settings.
+/// Variant of [`parse_lint_config`] that takes the `[linting]` section
+/// directly (not wrapped in a top-level object). Used by per-document
+/// override resolution where the section has already been extracted; the
+/// override inherits `base_enabled` instead of re-resolving `Auto` from
+/// discovery state. See spec section 6.
+pub(crate) fn parse_lint_config_from_section(
+    section: &serde_json::Value,
+    base_enabled: bool,
+) -> Option<crate::linting::LintConfig> {
+    let wrapped = serde_json::json!({ "linting": section });
+    parse_lint_config(&wrapped, base_enabled)
+}
+
+fn parse_lint_enabled(raw: Option<&serde_json::Value>) -> crate::linting::LintEnabled {
+    use crate::linting::LintEnabled;
+    use serde_json::Value;
+    match raw {
+        // Absent and explicit JSON null are semantically equivalent
+        // ("no preference") and remain silent.
+        None | Some(Value::Null) => LintEnabled::Auto,
+        Some(Value::Bool(true)) => LintEnabled::On,
+        Some(Value::Bool(false)) => LintEnabled::Off,
+        Some(Value::String(s)) => match s.as_str() {
+            "auto" => LintEnabled::Auto,
+            "on" | "true" => LintEnabled::On,
+            "off" | "false" => LintEnabled::Off,
+            other => {
+                log::warn!(
+                    "Unrecognised linting.enabled value '{other}'; defaulting to 'auto'."
+                );
+                LintEnabled::Auto
+            }
+        },
+        Some(other) => {
+            let kind = match other {
+                Value::Number(_) => "number",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                _ => "value",
+            };
+            log::warn!(
+                "linting.enabled must be boolean or string \"auto|on|off\"; got {kind}. Defaulting to 'auto'."
+            );
+            LintEnabled::Auto
+        }
+    }
+}
+
+/// Parse linting configuration from merged client + project settings.
 ///
-/// Reads the `linting` section and constructs a [`LintConfig`]. Returns
-/// `None` when the section is absent so callers can fall back to defaults
-/// without losing the "section never seen" signal.
+/// Reads the `linting` section and constructs a [`LintConfig`]. The
+/// `enabled` field is tri-state (see [`crate::linting::LintEnabled`]):
+/// `Auto` (the default) resolves to `lintr_discovered`; `On` and `Off`
+/// always win. When `linting` is absent or non-object, returns
+/// `Some(LintConfig::default())` with `enabled = lintr_discovered` if a
+/// `.lintr` was the discovered project config (preserves the implicit
+/// opt-in for `.lintr` files with no recognised content) and `None`
+/// otherwise (so callers can fall back to defaults without losing the
+/// "section never seen" signal).
 ///
 /// Recognised keys:
-/// * `enabled` (bool) — master switch.
+/// * `enabled` (`"auto"` / `"on"` / `"off"` / `true` / `false`) — master switch.
 /// * `lineLength` (number) — max line length; clamped to `[20, 10_000]`.
 /// * `objectLength` (number) — max identifier length; clamped to `[5, 1_000]`.
 /// * `indentationUnit` (number) — spaces per indent level for the
@@ -474,31 +528,48 @@ pub(crate) fn parse_cross_file_config(
 ///   - `functionLeftParenthesesSeverity`
 ///   - `spacesInsideSeverity`
 ///   - `indentationSeverity`
-/// Variant of `parse_lint_config` that takes the `[linting]` section directly
-/// (not wrapped in a top-level object). Used by per-document override resolution
-/// where we've already extracted the section.
-pub(crate) fn parse_lint_config_from_section(
-    section: &serde_json::Value,
-) -> Option<crate::linting::LintConfig> {
-    // Wrap into the shape `parse_lint_config` expects and delegate.
-    let wrapped = serde_json::json!({ "linting": section });
-    parse_lint_config(&wrapped)
-}
-
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
+    lintr_discovered: bool,
 ) -> Option<crate::linting::LintConfig> {
-    let linting = settings.get("linting")?;
-    if !linting.is_object() {
-        log::warn!("linting settings must be an object; ignoring.");
-        return None;
-    }
+    use crate::linting::LintEnabled;
+
+    let linting = settings.get("linting");
+    let linting_obj = match linting {
+        Some(v) if v.is_object() => Some(v),
+        Some(_) => {
+            log::warn!("linting settings must be an object; ignoring.");
+            // When `.lintr` was discovered, still return a defaulted config so
+            // Auto resolves to on; otherwise behave as before and return None.
+            if !lintr_discovered {
+                return None;
+            }
+            None
+        }
+        None => {
+            if !lintr_discovered {
+                return None;
+            }
+            None
+        }
+    };
 
     let mut config = crate::linting::LintConfig::default();
 
-    if let Some(v) = linting.get("enabled").and_then(|v| v.as_bool()) {
-        config.enabled = v;
-    }
+    let raw_enabled = linting_obj.and_then(|l| l.get("enabled"));
+    config.enabled = match parse_lint_enabled(raw_enabled) {
+        LintEnabled::On => true,
+        LintEnabled::Off => false,
+        LintEnabled::Auto => lintr_discovered,
+    };
+
+    // Re-bind `linting` for the rest of the function below to keep the
+    // existing field-parsing code unchanged. If we have no linting object
+    // (synthesised default for .lintr), use an empty object so `.get(...)`
+    // calls below uniformly return None.
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let linting = linting_obj.unwrap_or(&empty);
+
     if let Some(v) = linting.get("lineLength").and_then(|v| v.as_u64()) {
         // Clamp on u64 first; casting to u32 before clamping would wrap values
         // above u32::MAX (e.g. u32::MAX + 5 becomes 4) into a small value and
@@ -7957,7 +8028,7 @@ mod tests {
         #[test]
         fn parse_lint_config_returns_none_when_section_absent() {
             let settings = json!({});
-            assert!(crate::backend::parse_lint_config(&settings).is_none());
+            assert!(crate::backend::parse_lint_config(&settings, false).is_none());
         }
 
         #[test]
@@ -7968,7 +8039,7 @@ mod tests {
                     "lineLength": 120
                 }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert!(cfg.enabled);
             assert_eq!(cfg.line_length, 120);
         }
@@ -7976,11 +8047,11 @@ mod tests {
         #[test]
         fn parse_lint_config_clamps_line_length() {
             let settings = json!({ "linting": { "lineLength": 1 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length, 20);
 
             let settings = json!({ "linting": { "lineLength": 999_999 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length, 10_000);
         }
 
@@ -7992,21 +8063,21 @@ mod tests {
             // 10_000.
             let oversized = (u32::MAX as u64) + 5;
             let settings = json!({ "linting": { "lineLength": oversized } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length, 10_000);
         }
 
         #[test]
         fn parse_lint_config_reads_assignment_operator_styles() {
             let settings = json!({ "linting": { "assignmentOperator": "=" } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(
                 cfg.assignment_operator_style,
                 crate::linting::AssignmentOperatorStyle::Equals
             );
 
             let settings = json!({ "linting": { "assignmentOperator": "<-" } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(
                 cfg.assignment_operator_style,
                 crate::linting::AssignmentOperatorStyle::LeftArrow
@@ -8028,7 +8099,7 @@ mod tests {
                     "indentationSeverity": "off"
                 }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length_severity, None);
             assert_eq!(cfg.trailing_whitespace_severity, None);
             assert_eq!(cfg.no_tab_severity, None);
@@ -8043,17 +8114,17 @@ mod tests {
         #[test]
         fn parse_lint_config_reads_indentation_unit_and_clamps() {
             let settings = json!({ "linting": { "indentationUnit": 4 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.indentation_unit, 4);
 
             // Above the ceiling is clamped down to 8.
             let settings = json!({ "linting": { "indentationUnit": 99 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.indentation_unit, 8);
 
             // Zero is clamped up to 1 (the floor).
             let settings = json!({ "linting": { "indentationUnit": 0 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.indentation_unit, 1);
         }
 
@@ -8067,7 +8138,7 @@ mod tests {
                     "objectNameStyleArgument": "any"
                 }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.object_name_style_function, ObjectNameStyle::CamelCase);
             assert_eq!(cfg.object_name_style_variable, ObjectNameStyle::UpperCase);
             assert_eq!(cfg.object_name_style_argument, ObjectNameStyle::Any);
@@ -8079,14 +8150,120 @@ mod tests {
             let settings = json!({
                 "linting": { "objectNameStyleFunction": "kebab-case" }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.object_name_style_function, ObjectNameStyle::Any);
         }
 
         #[test]
         fn parse_lint_config_non_object_returns_none() {
             let settings = json!({ "linting": 42 });
-            assert!(crate::backend::parse_lint_config(&settings).is_none());
+            assert!(crate::backend::parse_lint_config(&settings, false).is_none());
+        }
+
+        // ============================================================================
+        // Tri-state `enabled` resolution (#281)
+        // ============================================================================
+
+        #[test]
+        fn parse_lint_config_client_false_overrides_lintr_discovery() {
+            // Regression for #281: an explicit client `enabled = false` must
+            // remain false even when a .lintr is the discovered project config.
+            let settings = json!({ "linting": { "enabled": false } });
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(!cfg.enabled, "client false must win over .lintr discovery");
+        }
+
+        #[test]
+        fn parse_lint_config_auto_default_no_project_off() {
+            let settings = json!({ "linting": { "enabled": "auto" } });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(!cfg.enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_auto_with_lintr_on() {
+            let settings = json!({ "linting": { "enabled": "auto" } });
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_auto_lintr_no_recognized_content_still_on() {
+            // .lintr was discovered but its content yielded no linting fields.
+            // parse_lint_config should still return Some(default config) with
+            // enabled = true so the implicit `.lintr` opt-in survives.
+            let settings = json!({});
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(
+                cfg.line_length,
+                crate::linting::LintConfig::default().line_length
+            );
+        }
+
+        #[test]
+        fn parse_lint_config_no_section_no_lintr_returns_none() {
+            // No linting section AND no .lintr discovered → keep the old
+            // behavior of returning None so the caller can decide a default.
+            let settings = json!({});
+            assert!(crate::backend::parse_lint_config(&settings, false).is_none());
+        }
+
+        #[test]
+        fn parse_lint_config_string_on_off() {
+            let on = json!({ "linting": { "enabled": "on" } });
+            let off = json!({ "linting": { "enabled": "off" } });
+            assert!(crate::backend::parse_lint_config(&on, false).unwrap().enabled);
+            assert!(!crate::backend::parse_lint_config(&off, true).unwrap().enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_string_true_false_backcompat() {
+            let t = json!({ "linting": { "enabled": "true" } });
+            let f = json!({ "linting": { "enabled": "false" } });
+            assert!(crate::backend::parse_lint_config(&t, false).unwrap().enabled);
+            assert!(!crate::backend::parse_lint_config(&f, true).unwrap().enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_bool_backcompat() {
+            let t = json!({ "linting": { "enabled": true } });
+            let f = json!({ "linting": { "enabled": false } });
+            assert!(crate::backend::parse_lint_config(&t, false).unwrap().enabled);
+            assert!(!crate::backend::parse_lint_config(&f, true).unwrap().enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_invalid_string_warns_falls_back_to_auto() {
+            let settings = json!({ "linting": { "enabled": "yes" } });
+            // With lintr_discovered = false, Auto resolves to off.
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(!cfg.enabled);
+            // With lintr_discovered = true, Auto resolves to on.
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_invalid_json_types_fall_back_to_auto() {
+            for bad in [json!(42), json!([]), json!({})] {
+                let settings = json!({ "linting": { "enabled": bad } });
+                // Auto with no lintr_discovered → off.
+                let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+                assert!(
+                    !cfg.enabled,
+                    "expected off for invalid enabled value {bad}"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_lint_config_null_silent_falls_back_to_auto() {
+            let settings = json!({ "linting": { "enabled": null } });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(!cfg.enabled);
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
         }
     }
 
@@ -9701,6 +9878,145 @@ mod project_config_initialize_tests {
     use tower_lsp::lsp_types::{
         DidChangeConfigurationParams, InitializeParams, Url, WorkspaceFolder,
     };
+
+    /// Regression for #281: an explicit client `enabled = false` must
+    /// remain off even when discovery picks up a `.lintr` from the
+    /// workspace (or an ancestor — same code path). Pre-fix, the `.lintr`
+    /// loader injected `enabled = true` into the project layer, which won
+    /// at the merge step over the client value.
+    #[tokio::test]
+    async fn initialize_client_false_overrides_lintr_discovery() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            !state.lint_config.enabled,
+            "client enabled=false must win over .lintr discovery (#281)"
+        );
+    }
+
+    /// Default client `"auto"` + a discovered `.lintr` resolves to on,
+    /// preserving the implicit opt-in users had before #281.
+    #[tokio::test]
+    async fn initialize_auto_with_lintr_resolves_on() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto" }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            state.lint_config.enabled,
+            "auto + .lintr discovered must resolve to on (#281)"
+        );
+        assert_eq!(state.lint_config.line_length, 120);
+    }
+
+    /// Client `true` + `raven.toml [linting] enabled = "auto"` resolves
+    /// to on. `"auto"` in raven.toml is semantically equivalent to omitting
+    /// `enabled`, so the client's explicit value wins. Without the
+    /// `strip_project_auto_enabled` normalization in `recompute_parsed_configs`,
+    /// the project layer's `"auto"` would overwrite the client value at
+    /// merge and then resolve to off because raven.toml was discovered (no
+    /// `.lintr`). See #281.
+    #[tokio::test]
+    async fn initialize_client_true_with_raven_toml_auto_resolves_on() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = \"auto\"\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": true }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            state.lint_config.enabled,
+            "client true with raven.toml enabled=\"auto\" must resolve to on (#281)"
+        );
+    }
+
+    /// Default client `"auto"` with no project config → off.
+    #[tokio::test]
+    async fn initialize_auto_no_project_resolves_off() {
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto" }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            !state.lint_config.enabled,
+            "auto + no project config must resolve to off"
+        );
+    }
 
     #[tokio::test]
     async fn initialize_loads_raven_toml_from_workspace_root() {
