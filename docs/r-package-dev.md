@@ -52,6 +52,58 @@ In contrast, a function defined in `tests/testthat/test-helpers.R` is **not**
 visible to `R/helpers.R` — symbols in `R/` are visible from `tests/testthat/`,
 but not the other way around.
 
+#### Implicit `library(testthat)` under `tests/testthat/`
+
+Raven treats `testthat` as if it were attached (via `library(testthat)`) when
+all of the following hold:
+
+- the workspace is in package mode (DESCRIPTION with a valid `Package:` field), and
+- the DESCRIPTION declares `testthat` in `Suggests:`, `Imports:`, or `Depends:`, and
+- the queried file is under `tests/testthat/`.
+
+This matches `testthat::test_check`'s loader, which attaches testthat before
+sourcing each test file. Test files therefore do not need (and conventionally
+do not include) an explicit `library(testthat)` — calling `test_that(...)`,
+`expect_equal(...)`, etc. produces no "undefined variable" diagnostic. Outside
+`tests/testthat/`, the same calls remain flagged: implicit attachment is scoped
+to the testthat directory.
+
+If the DESCRIPTION does not declare testthat, no implicit attachment happens —
+the diagnostic stays as "undefined variable" until the user either adds
+`Suggests: testthat` (the conventional fix) or adds an explicit `library(testthat)`.
+
+#### Helper files (`tests/testthat/helper-*.R`)
+
+`testthat::source_test_helpers` sources files matching `^helper.*\.[Rr]$`
+in `sort()` order before each test runs. Raven mirrors this:
+
+- Top-level definitions in any `tests/testthat/helper-*.R` file are visible
+  from `test-*.R` (and other non-helper test files), because by the time a
+  test runs all helpers have been sourced.
+- Between helpers, visibility follows sourcing order: a helper sees
+  earlier-sorted peers but not later ones. For example, `helper-b.R`
+  sees `helper-a.R`'s top-level defs, but `helper-a.R` does NOT see
+  `helper-b.R`'s — `helper-b.R` is sourced strictly later.
+- Helpers are matched by filename only at the top level of
+  `tests/testthat/`; files in subdirectories (e.g.
+  `tests/testthat/sub/helper-x.R`) are not auto-sourced by testthat and
+  are NOT treated as helpers here either.
+- Helper defs never propagate into `R/` (the one-way visibility into `R/`
+  stays asymmetric).
+
+```r
+# tests/testthat/helper-fixtures.R
+demo_input <- c(1, 2, 3)
+
+# tests/testthat/test-foo.R
+test_that("works on demo_input", {
+  expect_equal(length(demo_input), 3)  # No diagnostic — visible from helper
+})
+```
+
+Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
+for visibility purposes; declare any cross-file fixtures in `helper-*.R`.
+
 ### Build commands
 
 When the workspace is detected as an R package (DESCRIPTION with a non-empty

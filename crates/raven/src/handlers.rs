@@ -5067,6 +5067,21 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         snapshot.cross_file_config.backward_dependencies,
         &is_cancelled_fn,
         &snapshot.parent_prefix_cache,
+        Some(&snapshot.scope_contribution),
+    );
+
+    // Pre-compute the names of test-attached packages (testthat under
+    // `tests/testthat/`) for this URI so the per-usage loop below can
+    // suppress "used before available" misattributions for testthat
+    // exports. Without this, a `test_that(...)` use earlier than a later
+    // `source()` whose target also exports `test_that` would falsely
+    // report the source() as the binding origin. The undefined-variable
+    // collector handles this via `is_package_export` reading
+    // `scope.inherited_packages`, but `is_visible` here only checks the
+    // symbol set, so we need the explicit guard.
+    let test_attached_packages_for_uri: Vec<String> = test_attached_packages_for_uri(
+        snapshot,
+        uri,
     );
 
     // Pre-resolve scope at each forward-source's call site so the
@@ -5131,6 +5146,34 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         };
 
         if in_scope {
+            continue;
+        }
+
+        // Suppress out-of-scope misattribution when `name` is exported by a
+        // test-attached package (testthat under `tests/testthat/`). Matches
+        // the undefined-variable collector's `is_package_export` path —
+        // without it, a later `source()` that happens to export the same
+        // name would be reported as the binding origin even though the
+        // testthat attachment already provides it.
+        //
+        // Intentional limitation: we do not apply a pending-cache fallback
+        // here (as the undefined-variable collector does). The
+        // out-of-scope diagnostic is much narrower — it only fires when a
+        // later `source()` exports the same name — so a transient false
+        // positive during `PackageLibrary` startup is preferable to the
+        // over-suppression a pending fallback would introduce: such a
+        // fallback would skip *every* function-call usage in
+        // `tests/testthat/` whenever testthat is uncached, silencing real
+        // "used before source()" bugs for unrelated names.
+        if snapshot.cross_file_config.packages_enabled
+            && snapshot.package_library_ready
+            && !test_attached_packages_for_uri.is_empty()
+            && is_package_export(
+                name,
+                &test_attached_packages_for_uri,
+                &snapshot.package_library,
+            )
+        {
             continue;
         }
 
@@ -5374,6 +5417,7 @@ fn collect_undefined_variables_from_snapshot(
         snapshot.cross_file_config.backward_dependencies,
         &is_cancelled_fn,
         &snapshot.parent_prefix_cache,
+        Some(&snapshot.scope_contribution),
     );
 
     // Reusable buffer for position-aware packages; avoids per-iteration allocation.
@@ -9391,6 +9435,38 @@ fn is_package_export(
     // This checks base exports first, then cached package exports
     // Requirements 8.1, 8.2: Check position-aware loaded packages
     package_library.is_symbol_from_loaded_packages(name, loaded_packages)
+}
+
+/// Return the list of test-attached package names that apply to `uri` —
+/// i.e. the packages the snapshot's `scope_contribution.test_attached_packages`
+/// declares, but only when `uri` is under `<root>/tests/testthat/`. Empty
+/// otherwise (R/ files and non-package workspaces).
+///
+/// Used by the out-of-scope diagnostic collector to suppress
+/// misattribution of testthat exports to a later `source()` call.
+/// The undefined-variable collector achieves the same effect via
+/// `scope.inherited_packages` (which `append_package_contribution`
+/// populates), but `ScopeStream::is_visible` only consults the symbol
+/// set, so the out-of-scope path needs this explicit guard.
+fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
+    if snapshot.scope_contribution.test_attached_packages.is_empty() {
+        return Vec::new();
+    }
+    let Some(root) = snapshot.scope_contribution.workspace_root.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(path) = uri.to_file_path() else {
+        return Vec::new();
+    };
+    match crate::package_state::is_r_source_path(&path, root) {
+        Some(crate::package_state::RFileKind::Test) => snapshot
+            .scope_contribution
+            .test_attached_packages
+            .iter()
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[allow(dead_code)]
@@ -15631,6 +15707,8 @@ clean_data <- function(x) {
                         r_internal_symbols: std::sync::Arc::new(internal),
                         imported_symbols: Default::default(),
                         full_imports: Default::default(),
+                        test_attached_packages: Default::default(),
+                        test_helper_symbols: Default::default(),
                     },
                     ..Default::default()
                 });
@@ -15708,6 +15786,8 @@ clean_data <- function(x) {
                         r_internal_symbols: Default::default(),
                         imported_symbols: Default::default(),
                         full_imports: std::sync::Arc::new(full),
+                        test_attached_packages: Default::default(),
+                        test_helper_symbols: Default::default(),
                     },
                     ..Default::default()
                 });
@@ -15772,6 +15852,8 @@ clean_data <- function(x) {
                     r_internal_symbols: Default::default(),
                     imported_symbols: std::sync::Arc::new(imported),
                     full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -15851,6 +15933,8 @@ clean_data <- function(x) {
                     r_internal_symbols: std::sync::Arc::new(internal),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -15887,6 +15971,556 @@ clean_data <- function(x) {
                 .any(|d| d.message == "Undefined variable: helper_fn"),
             "r_internal_symbols must suppress undefined-variable for R/ files. \
              messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #275: `test_helper_symbols` (top-level defs from
+    /// `tests/testthat/helper-*.R`) must suppress undefined-variable
+    /// diagnostics in peer files under `tests/testthat/`.
+    ///
+    /// The synthetic `helper-*.R` symbol contribution flows through the
+    /// recursive resolver's depth-0 `append_package_contribution`; the
+    /// streaming diagnostic loop catches it via `parent_symbol_names`
+    /// (computed by `snapshot.get_scope(uri, 0, 0)` — the recursive path
+    /// with the package contribution applied).
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_test_helper_symbol_in_testthat_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut helper_syms = BTreeSet::new();
+        helper_syms.insert("fixture".to_string());
+        let mut helpers = std::collections::BTreeMap::new();
+        helpers.insert(
+            std::path::PathBuf::from("/work/pkg/tests/testthat/helper-fixtures.R"),
+            std::sync::Arc::new(helper_syms),
+        );
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: std::sync::Arc::new(helpers),
+                },
+                ..Default::default()
+            });
+
+        let code = "x <- fixture()\n";
+        let uri = Url::parse("file:///work/pkg/tests/testthat/test-foo.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: fixture"),
+            "test_helper_symbols must suppress undefined-variable for peer test files. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #275 asymmetry: `test_helper_symbols` must NOT suppress the
+    /// undefined-variable diagnostic for files under `R/` — the same one-way
+    /// visibility that excludes `tests/testthat/` defs from
+    /// `r_internal_symbols` applies here.
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_diagnostic_does_not_suppress_test_helper_in_R_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut helper_syms = BTreeSet::new();
+        helper_syms.insert("fixture".to_string());
+        let mut helpers = std::collections::BTreeMap::new();
+        helpers.insert(
+            std::path::PathBuf::from("/work/pkg/tests/testthat/helper-fixtures.R"),
+            std::sync::Arc::new(helper_syms),
+        );
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: std::sync::Arc::new(helpers),
+                },
+                ..Default::default()
+            });
+
+        let code = "x <- fixture()\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: fixture"),
+            "R/ files must not see test_helper_symbols — expected an \
+             undefined-variable diagnostic. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #275: when testthat is in `test_attached_packages` and the
+    /// queried file is under `tests/testthat/`, an undefined-variable
+    /// diagnostic for a testthat export (e.g. `test_that`) must be
+    /// suppressed via the standard package-export path. This exercises the
+    /// `ScopeStream::snapshot()` injection — `is_package_export` reads
+    /// `scope.inherited_packages`, which the contribution populates with
+    /// "testthat" for files under `tests/testthat/`.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_testthat_export_in_testthat_file() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeSet, HashSet};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // Seed `testthat` with `test_that` as an export so `is_package_export`
+        // recognizes it through the package_library lookup.
+        let mut testthat_exports = HashSet::new();
+        testthat_exports.insert("test_that".to_string());
+        testthat_exports.insert("expect_equal".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("testthat".to_string(), testthat_exports))
+            .await;
+
+        let mut attached = BTreeSet::new();
+        attached.insert("testthat".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: std::sync::Arc::new(attached),
+                    test_helper_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "test_that(\"x works\", { expect_equal(1, 1) })\n";
+        let uri = Url::parse("file:///work/pkg/tests/testthat/test-foo.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("test_that") || d.message.contains("expect_equal")),
+            "testthat exports must not trigger undefined-variable in tests/testthat/. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Codex follow-up: the out-of-scope diagnostic collector must not
+    /// misattribute a testthat export to a later `source()` call when the
+    /// queried file is under `tests/testthat/`. The
+    /// `test_attached_packages_for_uri` guard inside
+    /// `collect_out_of_scope_diagnostics_from_snapshot` covers this case;
+    /// `ScopeStream::is_visible` alone does not, because the implicit
+    /// `library(testthat)` adds to `inherited_packages`, not `symbols`.
+    ///
+    /// Test layout: a `tests/testthat/` directory with one file calling
+    /// `test_that(...)` at line 0 then `source('test-other.R')` at line 1,
+    /// where `test-other.R` redefines `test_that`. Without the guard the
+    /// collector would report `test_that` as "used before source()".
+    /// Both files are registered in `state.cross_file_graph` so the AST-
+    /// detected source() edge is present — without this the collector's
+    /// inner loop has no source target to misattribute against, and the
+    /// guard would never be exercised.
+    #[tokio::test]
+    async fn test_out_of_scope_suppresses_test_attached_export_in_testthat_file() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeSet, HashSet};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let testthat_dir = workspace_path.join("tests").join("testthat");
+        std::fs::create_dir_all(&testthat_dir).unwrap();
+        let main_path = testthat_dir.join("test-foo.R");
+        let other_path = testthat_dir.join("test-other.R");
+
+        let main_code = "test_that(\"x\", { 1 })\nsource('test-other.R')\n";
+        let other_code = "test_that <- function(...) NULL\n";
+        std::fs::write(&other_path, other_code).unwrap();
+        std::fs::write(&main_path, main_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let other_url = Url::from_file_path(&other_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders = vec![workspace_url];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // Register testthat's exports so `is_package_export` recognizes `test_that`.
+        let mut testthat_exports = HashSet::new();
+        testthat_exports.insert("test_that".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("testthat".to_string(), testthat_exports))
+            .await;
+
+        let mut attached = BTreeSet::new();
+        attached.insert("testthat".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(workspace_path.to_path_buf()),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: std::sync::Arc::new(attached),
+                    test_helper_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state
+            .documents
+            .insert(other_url.clone(), Document::new(other_code, None));
+
+        // Wire up the dependency graph so the source() edge is visible
+        // to the out-of-scope collector. Without these calls
+        // `snapshot.cross_file_graph.get_dependencies(main_url)` returns
+        // nothing and the inner loop's `source_target_live_exports` lookup
+        // returns None — meaning the guard under test would never fire
+        // even if it were broken.
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            None,
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &other_url,
+            &crate::cross_file::extract_metadata(other_code),
+            None,
+            |_| None,
+        );
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for test-foo.R");
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("test_that") && d.message.contains("used before")),
+            "testthat exports under tests/testthat/ must not be reported as used-before-sourced. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Codex follow-up #2: the pending-cache fallback in the out-of-scope
+    /// guard must only treat uncached packages as pending when they
+    /// actually exist on disk. A declared-but-uninstalled testthat would
+    /// otherwise leave `is_cached_sync` returning false forever, silently
+    /// suppressing every function-call usage in `tests/testthat/`.
+    ///
+    /// Construction notes: `package_library.package_exists("testthat")`
+    /// reports false because we never insert testthat into the library
+    /// nor write a fake libpath. The source() target `test-other.R`
+    /// defines `test_that`, so the diagnostic SHOULD fire once the
+    /// pending-cache shortcut is correctly gated on installation status.
+    #[tokio::test]
+    async fn test_out_of_scope_does_not_suppress_when_test_pkg_uninstalled() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let testthat_dir = workspace_path.join("tests").join("testthat");
+        std::fs::create_dir_all(&testthat_dir).unwrap();
+        let main_path = testthat_dir.join("test-foo.R");
+        let other_path = testthat_dir.join("test-other.R");
+
+        let main_code = "test_that(\"x\", { 1 })\nsource('test-other.R')\n";
+        let other_code = "test_that <- function(...) NULL\n";
+        std::fs::write(&other_path, other_code).unwrap();
+        std::fs::write(&main_path, main_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let other_url = Url::from_file_path(&other_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders = vec![workspace_url];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        // NOTE: we intentionally do NOT seed testthat into package_library.
+        // package_exists("testthat") returns false (no libpath, no entry),
+        // so the pending-cache shortcut must NOT silence the diagnostic.
+
+        let mut attached = BTreeSet::new();
+        attached.insert("testthat".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(workspace_path.to_path_buf()),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: std::sync::Arc::new(attached),
+                    test_helper_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state
+            .documents
+            .insert(other_url.clone(), Document::new(other_code, None));
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            None,
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &other_url,
+            &crate::cross_file::extract_metadata(other_code),
+            None,
+            |_| None,
+        );
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for test-foo.R");
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("test_that") && d.message.contains("used before")),
+            "uninstalled test-attached package must NOT silence the out-of-scope diagnostic. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #275 asymmetry: testthat exports must STILL be flagged as
+    /// undefined when used outside `tests/testthat/` — even if the package
+    /// declares `Suggests: testthat`. Implicit attachment is scoped to
+    /// `tests/testthat/`; an R/ file calling `test_that(...)` is a real bug.
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_diagnostic_flags_testthat_export_in_R_file() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeSet, HashSet};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        let mut testthat_exports = HashSet::new();
+        testthat_exports.insert("test_that".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("testthat".to_string(), testthat_exports))
+            .await;
+
+        let mut attached = BTreeSet::new();
+        attached.insert("testthat".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: std::sync::Arc::new(attached),
+                    test_helper_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "test_that(\"x works\", { 1 })\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: test_that"),
+            "R/ files must flag testthat exports as undefined. messages: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())

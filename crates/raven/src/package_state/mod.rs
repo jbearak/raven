@@ -169,6 +169,41 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
     }
 }
 
+/// Returns `true` for testthat-recognized helper files: files under
+/// `tests/testthat/` whose basename starts with `"helper"` (case-insensitive
+/// match against testthat's own loader, which sources `^helper.*\\.[rR]$`
+/// before each test file). Helper top-level definitions are visible to peer
+/// files under `tests/testthat/`, but never propagate to `R/`. Setup files
+/// (`setup-*.R`) are not currently treated as helpers; if that scope expands,
+/// adjust here.
+///
+/// The caller is responsible for first confirming the file is under
+/// `tests/testthat/` (e.g. via `is_r_source_path` returning `RFileKind::Test`);
+/// this function only inspects the basename.
+pub fn is_test_helper_filename(file_name: &str) -> bool {
+    // Case-insensitive ASCII "helper" prefix. Slicing by raw byte index
+    // would panic when byte 6 lands inside a multi-byte UTF-8 sequence
+    // (e.g. `tes\u{00E9}.R`), so iterate `bytes()` and compare against
+    // the ASCII prefix instead. Filenames are not normalized by Raven —
+    // a leading non-ASCII glyph that happens to lowercase to "helper" is
+    // intentionally not matched; testthat's loader matches the ASCII
+    // pattern `^helper.*\.[rR]$`.
+    const PREFIX: &[u8] = b"helper";
+    let bytes = file_name.as_bytes();
+    if bytes.len() < PREFIX.len() {
+        return false;
+    }
+    for (i, p) in PREFIX.iter().enumerate() {
+        if !bytes[i].eq_ignore_ascii_case(p) {
+            return false;
+        }
+    }
+    matches!(
+        Path::new(file_name).extension().and_then(|e| e.to_str()),
+        Some("R" | "r")
+    )
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::*;
@@ -230,6 +265,50 @@ mod path_tests {
             Some(RFileKind::Source),
         );
     }
+
+    #[test]
+    fn test_helper_filename_recognizes_helper_prefix() {
+        assert!(is_test_helper_filename("helper.R"));
+        assert!(is_test_helper_filename("helper-utils.R"));
+        assert!(is_test_helper_filename("helper_utils.R"));
+        assert!(is_test_helper_filename("helper.r"));
+        assert!(is_test_helper_filename("Helper-mixedCase.R"));
+        assert!(is_test_helper_filename("HELPER-shouty.R"));
+    }
+
+    #[test]
+    fn test_helper_filename_rejects_non_helpers() {
+        assert!(!is_test_helper_filename("test-utils.R"));
+        assert!(!is_test_helper_filename("setup.R"));
+        assert!(!is_test_helper_filename("teardown.R"));
+        // Prefix matches but extension is not R.
+        assert!(!is_test_helper_filename("helper-data.csv"));
+        assert!(!is_test_helper_filename("helper.txt"));
+        // Too short to start with "helper".
+        assert!(!is_test_helper_filename("help.R"));
+        // Doesn't start with the helper prefix.
+        assert!(!is_test_helper_filename("my-helper.R"));
+    }
+
+    /// Regression: byte-indexed slicing of a multi-byte UTF-8 filename
+    /// must not panic. The original implementation evaluated
+    /// `file_name[..6].eq_ignore_ascii_case("helper")`, which panics when
+    /// byte index 6 falls inside a non-ASCII character.
+    #[test]
+    fn test_helper_filename_multibyte_safe() {
+        // "hel😀.R" — 3 ASCII bytes followed by the 4-byte UTF-8 sequence
+        // for U+1F600. Byte index 6 sits in the MIDDLE of the 4-byte
+        // emoji (bytes 3..7), so the old `file_name[..6]` slice would
+        // panic with "byte index 6 is not a char boundary". The byte-iter
+        // implementation must not panic and must not match (prefix bytes
+        // 0..6 are "hel" + 3 bytes of emoji, which do not equal "helper").
+        let name = "hel\u{1F600}.R";
+        assert!(!is_test_helper_filename(name));
+        // A purely non-ASCII prefix must not match (and must not panic).
+        assert!(!is_test_helper_filename("βλέπω-utils.R"));
+        // A non-ASCII-leading name that happens to share a tail must not match either.
+        assert!(!is_test_helper_filename("éhelper.R"));
+    }
 }
 
 // ============== OUTPUTS (continued) ==============
@@ -258,4 +337,32 @@ pub struct PackageScopeContribution {
     pub r_internal_symbols: Arc<BTreeSet<String>>,
     pub imported_symbols: Arc<BTreeMap<String, BTreeSet<String>>>,
     pub full_imports: Arc<BTreeSet<String>>,
+
+    /// Packages that should be treated as if attached (via `library(...)`)
+    /// when resolving scope for any file under `<root>/tests/testthat/`.
+    ///
+    /// Populated for testthat when the package's `DESCRIPTION` declares
+    /// `testthat` in `Suggests:`, `Imports:`, or `Depends:`. The standard
+    /// `tests/testthat.R` runner attaches testthat before sourcing each test
+    /// file (matching `testthat::test_check`'s semantics), so test files
+    /// transitively see testthat exports without an explicit `library(testthat)`.
+    /// These packages are NOT visible to files under `R/` — they are scoped
+    /// to `tests/testthat/` only.
+    pub test_attached_packages: Arc<BTreeSet<String>>,
+
+    /// Top-level definitions contributed by `tests/testthat/helper-*.R`
+    /// files, keyed by the helper file's path so the scope-injection layer
+    /// can skip a helper's own definitions when querying that helper file
+    /// (otherwise a `use_x()` line earlier in the helper would falsely see
+    /// `x <- ...` defined later in the same file).
+    ///
+    /// Visible from any file under `<root>/tests/testthat/` — peer helpers
+    /// see each other and `test-*.R` files see them all. Never injected
+    /// into files under `R/`. Mirrors `r_internal_symbols` but with the
+    /// opposite visibility direction.
+    ///
+    /// `BTreeMap` ordering is intentional — derive iteration is
+    /// deterministic so cached `PackageState` equality (used by the
+    /// proptest machine) is stable across runs.
+    pub test_helper_symbols: Arc<BTreeMap<PathBuf, Arc<BTreeSet<String>>>>,
 }

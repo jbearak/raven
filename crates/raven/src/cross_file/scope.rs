@@ -4077,11 +4077,73 @@ where
     // always take precedence (additive-only).
     if current_depth == 0 {
         if let Some(contrib) = package_contribution {
-            append_package_contribution(&mut scope.symbols, uri, contrib);
+            append_package_contribution(&mut scope, uri, contrib);
         }
     }
 
     scope
+}
+
+/// Compute the set of symbol names the package contribution would inject
+/// for `queried_uri`, mirroring [`append_package_contribution`]'s path /
+/// `RFileKind` gating. Returns an empty set when there's no contribution
+/// or when the queried URI isn't under `<root>/R/` or
+/// `<root>/tests/testthat/`.
+///
+/// Used by [`ScopeStream`] so `is_visible` / `symbol_for` agree with
+/// `snapshot()` on which contribution-derived names are in scope — out-of-
+/// scope diagnostics call only `is_visible`, so without this set they
+/// would emit "used before available" misattributions for helper symbols.
+///
+/// `test_helper_symbols` keyed by helper path are filtered to exclude the
+/// queried file's own entry, preserving forward-reference diagnostics
+/// inside a helper file.
+fn compute_contribution_symbol_names(
+    queried_uri: &Url,
+    contribution: Option<&crate::package_state::PackageScopeContribution>,
+) -> HashSet<Arc<str>> {
+    let mut out: HashSet<Arc<str>> = HashSet::new();
+    let Some(contrib) = contribution else {
+        return out;
+    };
+    let Some(root) = contrib.workspace_root.as_ref() else {
+        return out;
+    };
+    let Ok(path) = queried_uri.to_file_path() else {
+        return out;
+    };
+    let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
+        return out;
+    };
+    for sym in contrib.r_internal_symbols.iter() {
+        out.insert(Arc::from(sym.as_str()));
+    }
+    for sym in contrib.imported_symbols.keys() {
+        out.insert(Arc::from(sym.as_str()));
+    }
+    if kind == crate::package_state::RFileKind::Test {
+        // Mirror `append_package_contribution`'s sourcing-order gate so
+        // `is_visible` / `symbol_for` agree with `snapshot()`: a helper
+        // file only sees alphabetically-earlier helpers, while
+        // `test-*.R` and other non-helper test files see them all.
+        let queried_is_helper = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(crate::package_state::is_test_helper_filename)
+            .unwrap_or(false);
+        for (helper_path, syms) in contrib.test_helper_symbols.iter() {
+            if helper_path == &path {
+                continue;
+            }
+            if queried_is_helper && helper_path >= &path {
+                continue;
+            }
+            for sym in syms.iter() {
+                out.insert(Arc::from(sym.as_str()));
+            }
+        }
+    }
+    out
 }
 
 /// Synthetic `source_uri` used for symbols injected by
@@ -4102,19 +4164,29 @@ pub fn is_package_internal_uri(uri: &Url) -> bool {
     uri.as_str() == PACKAGE_INTERNAL_URI
 }
 
-/// Inject package-mode symbols into a visible-symbol map for Phase 5a.
+/// Inject package-mode symbols into the queried file's scope for Phase 5a.
 ///
-/// Called only at depth 0 from `scope_at_position_with_graph_recursive`.
-/// Inserts synthetic `ScopedSymbol` entries for:
+/// Called only at depth 0 from `scope_at_position_with_graph_recursive`
+/// (and from the streaming `ScopeStream::snapshot()` path).
+///
+/// For files under `<root>/R/` or `<root>/tests/testthat/`, inserts synthetic
+/// `ScopedSymbol` entries for:
 /// - Every name in `contrib.r_internal_symbols` (package-internal definitions)
 /// - Every key in `contrib.imported_symbols` (NAMESPACE `importFrom` targets)
+///
+/// For files under `<root>/tests/testthat/` additionally:
+/// - Every name in `contrib.test_helper_symbols` (top-level defs from
+///   `tests/testthat/helper-*.R`) is inserted into the symbol map
+/// - Every package in `contrib.test_attached_packages` is added to
+///   `scope.inherited_packages`, modelling the implicit `library(testthat)`
+///   that `tests/testthat.R` performs before sourcing each test file.
 ///
 /// Names already present in `symbols` are NOT overwritten — local and cross-file
 /// definitions always take precedence. `full_imports` entries are intentionally
 /// skipped: enumerating their symbols requires the package library, which is
 /// handled by the existing `pkg_resolver` / combined-exports path.
 pub(crate) fn append_package_contribution(
-    symbols: &mut HashMap<Arc<str>, ScopedSymbol>,
+    scope: &mut ScopeAtPosition,
     uri: &Url,
     contrib: &crate::package_state::PackageScopeContribution,
 ) {
@@ -4125,9 +4197,9 @@ pub(crate) fn append_package_contribution(
         return;
     };
     // Only inject for files under <root>/R/ or <root>/tests/testthat/.
-    if crate::package_state::is_r_source_path(&path, root).is_none() {
+    let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
         return;
-    }
+    };
 
     // Use a synthetic URI scheme for package-internal symbols so consumers
     // can distinguish them from real file-backed definitions.
@@ -4141,7 +4213,7 @@ pub(crate) fn append_package_contribution(
     // `PackageScopeContribution` propagates kind metadata, use it here.
     for sym in contrib.r_internal_symbols.iter() {
         let name: Arc<str> = Arc::from(sym.as_str());
-        symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
+        scope.symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
             name,
             kind: SymbolKind::Variable,
             source_uri: pkg_uri.clone(),
@@ -4154,7 +4226,7 @@ pub(crate) fn append_package_contribution(
 
     for sym in contrib.imported_symbols.keys() {
         let name: Arc<str> = Arc::from(sym.as_str());
-        symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
+        scope.symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
             name,
             kind: SymbolKind::Variable,
             source_uri: pkg_uri.clone(),
@@ -4163,6 +4235,64 @@ pub(crate) fn append_package_contribution(
             signature: None,
             is_declared: false,
         });
+    }
+
+    // Test-only contributions: only inject when the queried file is under
+    // `tests/testthat/`. Helper symbols are visible to peer test files;
+    // attached packages model `testthat::test_check`'s implicit
+    // `library(testthat)` before sourcing tests. Neither propagates into R/
+    // — that asymmetry is preserved by gating on `RFileKind::Test` here,
+    // mirroring how `r_internal_symbols` is partitioned in
+    // `build_scope_contribution`.
+    if kind == crate::package_state::RFileKind::Test {
+        // Per-helper-file iteration so a helper's own top-level defs are
+        // NOT injected back into the helper itself — preserves
+        // forward-reference diagnostics inside a helper file. Without
+        // this skip, a `use_x()` usage above an `x <- ...` definition
+        // would see `x` via the package contribution and silently mute
+        // the legitimate "undefined variable" / forward-reference
+        // diagnostic.
+        //
+        // For a helper file querying ITS scope, only earlier-sorted
+        // helpers are visible — `testthat::source_test_helpers` sources
+        // files matching `^helper.*\.[rR]$` with `sort()` applied first,
+        // so `helper-b.R`'s top-level code never sees `helper-c.R`'s
+        // defs. For non-helper test files (`test-*.R`, etc.), all
+        // helpers have already been sourced by the time the test runs,
+        // so all helpers are visible.
+        let queried_is_helper = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(crate::package_state::is_test_helper_filename)
+            .unwrap_or(false);
+        for (helper_path, syms) in contrib.test_helper_symbols.iter() {
+            if helper_path == &path {
+                continue;
+            }
+            // When the queried file is itself a helper, restrict
+            // visibility to helpers that sort strictly before it
+            // (testthat's source order). `PathBuf` comparison is
+            // byte-lexicographic, which matches what `sort()` produces
+            // for the typical flat `tests/testthat/` layout.
+            if queried_is_helper && helper_path >= &path {
+                continue;
+            }
+            for sym in syms.iter() {
+                let name: Arc<str> = Arc::from(sym.as_str());
+                scope.symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    source_uri: pkg_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                    is_declared: false,
+                });
+            }
+        }
+        for pkg in contrib.test_attached_packages.iter() {
+            scope.inherited_packages.insert(pkg.clone());
+        }
     }
 }
 
@@ -4311,6 +4441,27 @@ where
     /// Shared prefix cache so child-source recursion benefits from the
     /// same Stage-1 caching as the queried URI.
     prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
+    /// Package-mode contribution. When `Some`, `snapshot()` applies it to
+    /// the materialized `ScopeAtPosition` at the queried URI, mirroring the
+    /// recursive resolver's depth-0 `append_package_contribution` call.
+    /// This ensures the streaming and recursive paths agree on which
+    /// package-internal symbols, imported names, helper top-level defs, and
+    /// test-attached packages (e.g. `testthat` under `tests/testthat/`) are
+    /// visible at the cursor.
+    package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
+
+    /// Pre-computed set of symbol names that the package contribution would
+    /// inject for `queried_uri` (R/ internals + NAMESPACE-imported names +
+    /// helper top-level defs from peer `helper-*.R` files when querying a
+    /// file under `tests/testthat/`). Consulted by `is_visible` and
+    /// `symbol_for` as a fallthrough so out-of-scope diagnostics — which
+    /// only call `is_visible` — don't misattribute a contribution-provided
+    /// name to a forward `source()` call.
+    ///
+    /// Helper symbols from the queried file itself are intentionally
+    /// excluded (per-helper-file keying in `test_helper_symbols`) so
+    /// forward-reference diagnostics inside the helper still fire.
+    contribution_symbol_names: HashSet<Arc<str>>,
 }
 
 impl<'a, F, G> ScopeStream<'a, F, G>
@@ -4338,6 +4489,7 @@ where
         backward_dep_mode: super::config::BackwardDependencyMode,
         is_cancelled: &'a dyn Fn() -> bool,
         prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
+        package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
     ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
 
@@ -4395,6 +4547,13 @@ where
             })
             .or_else(|| super::path_resolve::PathContext::new(queried_uri, workspace_root));
 
+        // Pre-compute the names the package contribution would inject for
+        // `queried_uri`. Doing it once at construction keeps
+        // `is_visible`/`symbol_for` O(1) hash lookups instead of repeatedly
+        // walking the BTreeMap of helper files.
+        let contribution_symbol_names =
+            compute_contribution_symbol_names(queried_uri, package_contribution);
+
         Some(Self {
             queried_uri,
             artifacts,
@@ -4417,6 +4576,8 @@ where
             is_cancelled,
             path_ctx,
             prefix_cache,
+            package_contribution,
+            contribution_symbol_names,
         })
     }
 
@@ -4672,7 +4833,11 @@ where
                 return true;
             }
             if frame.removed_names.contains(name) {
-                return false;
+                // Contribution re-injects after rm() in the recursive
+                // resolver's depth-0 ordering, so we must match that:
+                // a removed name remains visible if the package
+                // contribution would re-add it.
+                return self.contribution_symbol_names.contains(name);
             }
         }
         // Global frame: strict or late, depending on hoisting.
@@ -4681,11 +4846,21 @@ where
             return true;
         }
         if global.removed_names.contains(name) {
-            return false;
+            return self.contribution_symbol_names.contains(name);
         }
         // Prefix (parent walk).
         let prefix = self.choose_prefix();
-        prefix.symbols.contains_key(name)
+        if prefix.symbols.contains_key(name) {
+            return true;
+        }
+        // Package contribution last — keeps the streaming visibility view
+        // aligned with the recursive resolver's depth-0
+        // `append_package_contribution`. The out-of-scope diagnostic
+        // collector and any other `is_visible`-only consumers need this
+        // fallthrough; otherwise a contribution-provided name would be
+        // misreported as "used before available" relative to a forward
+        // `source()` that happens to export the same name.
+        self.contribution_symbol_names.contains(name)
     }
 
     /// Materialize a full `ScopeAtPosition` at the cursor. The resulting
@@ -4832,6 +5007,16 @@ where
             }
         }
 
+        // Apply package-mode contribution at the queried URI, mirroring the
+        // recursive resolver's depth-0 injection. Keeping the call here (not
+        // inside `is_visible` / `symbol_for`) keeps the streaming fast path
+        // cheap; diagnostic callers that need the contribution in the
+        // visibility check route through `parent_symbol_names` (computed via
+        // the recursive path at position (0, 0)).
+        if let Some(contrib) = self.package_contribution {
+            append_package_contribution(&mut scope, self.queried_uri, contrib);
+        }
+
         scope
     }
 
@@ -4845,23 +5030,52 @@ where
         if self.query_inside_function() {
             self.ensure_global_late_frame();
         }
+        let mut removed = false;
         for (_iv, frame) in self.function_stack.iter().rev() {
             if let Some(sym) = frame.symbols.get(name) {
                 return Some(sym.clone());
             }
             if frame.removed_names.contains(name) {
-                return None;
+                removed = true;
+                break;
             }
         }
-        let global = self.choose_global_frame();
-        if let Some(sym) = global.symbols.get(name) {
-            return Some(sym.clone());
+        if !removed {
+            let global = self.choose_global_frame();
+            if let Some(sym) = global.symbols.get(name) {
+                return Some(sym.clone());
+            }
+            if global.removed_names.contains(name) {
+                removed = true;
+            }
         }
-        if global.removed_names.contains(name) {
-            return None;
+        if !removed {
+            let prefix = self.choose_prefix();
+            if let Some(sym) = prefix.symbols.get(name).cloned() {
+                return Some(sym);
+            }
         }
-        let prefix = self.choose_prefix();
-        prefix.symbols.get(name).cloned()
+        // Package contribution fallthrough — matches the recursive
+        // resolver's depth-0 `or_insert_with`, where contribution
+        // symbols are added AFTER local timeline events (including rm).
+        // We return a synthetic `ScopedSymbol` whose `source_uri` is the
+        // shared package-internal URI; downstream consumers already
+        // recognize it via [`is_package_internal_uri`].
+        if self.contribution_symbol_names.contains(name) {
+            let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
+                .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
+            let name_arc: Arc<str> = Arc::from(name);
+            return Some(ScopedSymbol {
+                name: name_arc,
+                kind: SymbolKind::Variable,
+                source_uri: pkg_uri,
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+                is_declared: false,
+            });
+        }
+        None
     }
 
     /// Pick the prefix slot matching the cursor's current state. With
@@ -13561,6 +13775,7 @@ y <- filter(df)"#;
                     crate::cross_file::config::BackwardDependencyMode::Auto,
                     &is_cancelled,
                     &prefix_cache,
+                    None,
                 ).expect("stream construction must succeed");
 
                 for &(line, col) in &positions {
@@ -13823,6 +14038,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &prefix_cache,
+                None,
             )
             .expect("stream construction must succeed");
 
@@ -13977,6 +14193,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &prefix_cache,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(3, 0);
@@ -14098,6 +14315,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &prefix_cache,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(1, 0);
@@ -16865,6 +17083,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &prefix_cache,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -16999,6 +17218,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &prefix_cache,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -17059,6 +17279,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &prefix_cache,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -17131,6 +17352,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &prefix_cache,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -17221,6 +17443,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &prefix_cache,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -17317,6 +17540,8 @@ mod package_contribution_tests {
             r_internal_symbols: Arc::new(r_internal_symbols),
             imported_symbols: Arc::new(imported_symbols),
             full_imports: Arc::new(BTreeSet::new()),
+            test_attached_packages: Arc::new(BTreeSet::new()),
+            test_helper_symbols: Arc::new(std::collections::BTreeMap::new()),
         }
     }
 

@@ -36,7 +36,12 @@ pub fn derive_package_state(
     } else {
         None
     };
-    let scope_contribution = build_scope_contribution(&workspace, &namespace_model, &r_file_facts);
+    let scope_contribution = build_scope_contribution(
+        &workspace,
+        &namespace_model,
+        &r_file_facts,
+        inputs.description.as_ref(),
+    );
     PackageState {
         workspace,
         namespace_model,
@@ -50,6 +55,7 @@ fn build_scope_contribution(
     workspace: &Option<PackageWorkspace>,
     namespace_model: &Option<PackageNamespaceModel>,
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
+    description: Option<&DescriptionInput>,
 ) -> PackageScopeContribution {
     let Some(ws) = workspace else {
         return PackageScopeContribution::default();
@@ -58,13 +64,56 @@ fn build_scope_contribution(
     // (exclude tests/testthat/* — those are kind == Test). Partition is
     // driven by the canonical `RFileKind` classification carried in
     // `RFileFacts`, not by a path-prefix check.
+    //
+    // test_helper_symbols: union of top_level_defs from `tests/testthat/helper-*.R`
+    // (kind == Test AND filename starts with "helper"), keyed by file path so
+    // the scope-injection layer can skip a helper's own self-injection.
+    // Visible to peer test files; never injected into R/.
+    //
+    // Known limitation (matches `r_internal_symbols`): both sets are built
+    // from `top_level_defs`, which captures every top-level assignment
+    // without applying timeline-level `rm()` / `remove()`. A helper that
+    // does `x <- 1; rm(x)` still contributes `x` to peer-visible names. The
+    // rm-aware extractor (`live_top_level_exports`) operates on parsed
+    // `ScopeArtifacts`, not on the cheap `top_level_defs` slice; aligning
+    // here would require either re-parsing helper files at derive time or
+    // re-keying `RFileFacts` around `ScopeArtifacts`. This edge case is
+    // uncommon in real testthat helpers, so it is left untreated for
+    // symmetry with `r_internal_symbols` (which has the same limitation
+    // for R/ files).
     let mut r_internal_symbols: BTreeSet<String> = BTreeSet::new();
-    for (_path, facts) in r_file_facts {
-        if facts.kind != RFileKind::Source {
-            continue;
-        }
-        for def in facts.top_level_defs.iter() {
-            r_internal_symbols.insert(def.clone());
+    let mut test_helper_symbols: BTreeMap<PathBuf, Arc<BTreeSet<String>>> = BTreeMap::new();
+    for (path, facts) in r_file_facts {
+        match facts.kind {
+            RFileKind::Source => {
+                for def in facts.top_level_defs.iter() {
+                    r_internal_symbols.insert(def.clone());
+                }
+            }
+            RFileKind::Test => {
+                // Helpers must be direct children of `tests/testthat/` —
+                // `testthat::source_test_helpers` uses non-recursive
+                // `dir(path, pattern = "^helper.*\\.[Rr]$")`, so files in
+                // subdirectories (e.g. `tests/testthat/sub/helper-x.R`)
+                // are never auto-sourced. Treating them as helpers here
+                // would silently mute legitimate undefined-variable
+                // diagnostics for any symbol they define.
+                let direct_child = ws.root.join("tests").join("testthat");
+                let is_direct_child_of_testthat = path.parent() == Some(direct_child.as_path());
+                let is_helper = is_direct_child_of_testthat
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(super::is_test_helper_filename)
+                        .unwrap_or(false);
+                if is_helper {
+                    // Reuse the helper's `top_level_defs` `Arc` rather than
+                    // cloning into a fresh set — keeps `derive_package_state`
+                    // O(helper-file count) on the cached path instead of
+                    // O(total helper defs).
+                    test_helper_symbols.insert(path.clone(), facts.top_level_defs.clone());
+                }
+            }
         }
     }
     let (imported_symbols, full_imports) = match namespace_model {
@@ -78,12 +127,51 @@ fn build_scope_contribution(
         }
         None => (BTreeMap::new(), BTreeSet::new()),
     };
+    let test_attached_packages = compute_test_attached_packages(description);
     PackageScopeContribution {
         workspace_root: Some(ws.root.clone()),
         r_internal_symbols: Arc::new(r_internal_symbols),
         imported_symbols: Arc::new(imported_symbols),
         full_imports: Arc::new(full_imports),
+        test_attached_packages: Arc::new(test_attached_packages),
+        test_helper_symbols: Arc::new(test_helper_symbols),
     }
+}
+
+/// Packages that should be implicitly attached when resolving scope under
+/// `tests/testthat/`. Currently this is the singleton `{"testthat"}` whenever
+/// the package's `DESCRIPTION` declares testthat in `Suggests:`, `Imports:`,
+/// or `Depends:` — matching `R CMD check`'s "declared dependency" gate.
+/// Returns an empty set otherwise.
+///
+/// The set is intentionally narrow: implicitly attaching every `Suggests:`
+/// dependency in tests would over-approximate and mute legitimate undefined-
+/// variable diagnostics. Other test-only packages should be brought in with
+/// an explicit `library()` call in a `helper-*.R` file or the test file
+/// itself.
+fn compute_test_attached_packages(description: Option<&DescriptionInput>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(desc) = description else {
+        return out;
+    };
+    if description_declares_dependency(&desc.text, "testthat") {
+        out.insert("testthat".to_string());
+    }
+    out
+}
+
+/// Returns `true` if `pkg` appears in DESCRIPTION's `Suggests:`, `Imports:`,
+/// or `Depends:` field. Stripping of version constraints and the special
+/// `R` entry is handled by `parse_description_field_pub`.
+fn description_declares_dependency(description_text: &str, pkg: &str) -> bool {
+    for field in ["Suggests", "Imports", "Depends"] {
+        let listed =
+            crate::namespace_parser::parse_description_field_pub(description_text, field);
+        if listed.iter().any(|p| p == pkg) {
+            return true;
+        }
+    }
+    false
 }
 
 fn merge_namespace_model(
@@ -716,5 +804,298 @@ foo <- function() 1
             n_files,
             imports_per_file,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // testthat implicit-attachment and helper file visibility (#275)
+    // ------------------------------------------------------------------
+
+    /// Suggests-declared testthat should populate `test_attached_packages`,
+    /// which the scope-injection layer uses to model `testthat::test_check`'s
+    /// implicit `library(testthat)` in `tests/testthat/` files.
+    #[test]
+    fn scope_contribution_attaches_testthat_when_in_suggests() {
+        let s = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: foo\nSuggests: testthat\n"),
+            &PackageInputDelta::Initial,
+        );
+        assert!(
+            s.scope_contribution
+                .test_attached_packages
+                .contains("testthat"),
+            "testthat in Suggests must populate test_attached_packages, got: {:?}",
+            s.scope_contribution.test_attached_packages,
+        );
+    }
+
+    /// Imports- and Depends-declared testthat also count: matches `R CMD
+    /// check`'s declared-dependency semantics.
+    #[test]
+    fn scope_contribution_attaches_testthat_when_in_imports_or_depends() {
+        let s_imp = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: foo\nImports: testthat\n"),
+            &PackageInputDelta::Initial,
+        );
+        assert!(s_imp
+            .scope_contribution
+            .test_attached_packages
+            .contains("testthat"));
+
+        let s_dep = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: foo\nDepends: testthat\n"),
+            &PackageInputDelta::Initial,
+        );
+        assert!(s_dep
+            .scope_contribution
+            .test_attached_packages
+            .contains("testthat"));
+    }
+
+    /// Without testthat declared anywhere, do not implicitly attach it.
+    /// Hard gate: an undeclared testthat would silently mute legitimate
+    /// undefined-variable diagnostics for any name that happens to be a
+    /// testthat export.
+    #[test]
+    fn scope_contribution_skips_testthat_when_undeclared() {
+        let s = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: foo\nSuggests: knitr\n"),
+            &PackageInputDelta::Initial,
+        );
+        assert!(
+            !s.scope_contribution
+                .test_attached_packages
+                .contains("testthat"),
+            "testthat must NOT be attached when only `knitr` is suggested: {:?}",
+            s.scope_contribution.test_attached_packages,
+        );
+    }
+
+    /// Without package mode active (no DESCRIPTION → no workspace), the
+    /// scope contribution is empty regardless of declared dependencies.
+    #[test]
+    fn scope_contribution_is_empty_outside_package_mode() {
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.description = Some(DescriptionInput {
+            text: "Suggests: testthat\n".into(), // No Package: field.
+        });
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        assert!(s.workspace.is_none());
+        assert!(s.scope_contribution.test_attached_packages.is_empty());
+        assert!(s.scope_contribution.test_helper_symbols.is_empty());
+    }
+
+    /// `tests/testthat/helper-*.R` top-level defs go into `test_helper_symbols`
+    /// (visible to peer tests) but NOT into `r_internal_symbols` (the one-way
+    /// visibility into R/ stays asymmetric).
+    #[test]
+    fn scope_contribution_collects_helper_top_level_defs() {
+        let helper_path: PathBuf = "/work/pkg/tests/testthat/helper-fixtures.R".into();
+        let test_path: PathBuf = "/work/pkg/tests/testthat/test-foo.R".into();
+
+        let helper_text: Arc<str> = "fixture <- function() 1\n".into();
+        let test_text: Arc<str> = "test_local <- function() 2\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            helper_path,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: helper_text.clone(),
+                content_digest: ContentDigest::of(&helper_text),
+            },
+        );
+        inputs.r_files.insert(
+            test_path,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: test_text.clone(),
+                content_digest: ContentDigest::of(&test_text),
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        // Helper defs go into test_helper_symbols.
+        assert!(
+            s.scope_contribution
+                .test_helper_symbols
+                .values()
+                .any(|syms| syms.contains("fixture")),
+            "helper top-level defs must populate test_helper_symbols: {:?}",
+            s.scope_contribution.test_helper_symbols,
+        );
+        // Non-helper test files do NOT pollute test_helper_symbols.
+        assert!(
+            !s.scope_contribution
+                .test_helper_symbols
+                .values()
+                .any(|syms| syms.contains("test_local")),
+            "test-*.R defs must NOT appear in test_helper_symbols: {:?}",
+            s.scope_contribution.test_helper_symbols,
+        );
+        // Neither leaks into r_internal_symbols (R/ files remain isolated
+        // from tests/testthat/ contributions).
+        assert!(!s
+            .scope_contribution
+            .r_internal_symbols
+            .contains("fixture"));
+        assert!(!s
+            .scope_contribution
+            .r_internal_symbols
+            .contains("test_local"));
+    }
+
+    /// Multiple helper files contribute their union — peer helpers see each
+    /// other since `testthat::test_check` sources them in order before each
+    /// test.
+    #[test]
+    fn scope_contribution_unions_helpers_across_files() {
+        let helper_a: PathBuf = "/work/pkg/tests/testthat/helper-a.R".into();
+        let helper_b: PathBuf = "/work/pkg/tests/testthat/helper-b.R".into();
+        let text_a: Arc<str> = "helper_a_fn <- function() 1\n".into();
+        let text_b: Arc<str> = "helper_b_fn <- function() 2\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            helper_a,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: text_a.clone(),
+                content_digest: ContentDigest::of(&text_a),
+            },
+        );
+        inputs.r_files.insert(
+            helper_b,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: text_b.clone(),
+                content_digest: ContentDigest::of(&text_b),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        assert!(s
+            .scope_contribution
+            .test_helper_symbols
+            .values()
+            .any(|syms| syms.contains("helper_a_fn")));
+        assert!(s
+            .scope_contribution
+            .test_helper_symbols
+            .values()
+            .any(|syms| syms.contains("helper_b_fn")));
+    }
+
+    /// Codex follow-up: `tests/testthat/sub/helper-x.R` must NOT be
+    /// treated as a testthat helper — `testthat::source_test_helpers`
+    /// uses non-recursive `dir(path, pattern = "^helper.*\\.[Rr]$")`, so
+    /// subdirectory helpers are never auto-sourced. Including them in
+    /// `test_helper_symbols` would silently mute legitimate
+    /// undefined-variable diagnostics for any symbol they define.
+    #[test]
+    fn helpers_in_subdirectories_are_not_collected() {
+        let nested: PathBuf = "/work/pkg/tests/testthat/sub/helper-deep.R".into();
+        let direct: PathBuf = "/work/pkg/tests/testthat/helper-top.R".into();
+        let nested_text: Arc<str> = "deep_fixture <- function() 1\n".into();
+        let direct_text: Arc<str> = "top_fixture <- function() 2\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            nested,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: nested_text.clone(),
+                content_digest: ContentDigest::of(&nested_text),
+            },
+        );
+        inputs.r_files.insert(
+            direct,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: direct_text.clone(),
+                content_digest: ContentDigest::of(&direct_text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        assert!(
+            s.scope_contribution
+                .test_helper_symbols
+                .values()
+                .any(|syms| syms.contains("top_fixture")),
+            "direct child helper-top.R must contribute its def",
+        );
+        assert!(
+            !s.scope_contribution
+                .test_helper_symbols
+                .values()
+                .any(|syms| syms.contains("deep_fixture")),
+            "subdir helper-deep.R must NOT contribute (testthat does not recurse): {:?}",
+            s.scope_contribution.test_helper_symbols,
+        );
+    }
+
+    /// Issue #275 / Codex review: a helper file's own top-level defs must
+    /// NOT be visible to the helper itself via the contribution. They're
+    /// keyed by file path so the scope-injection layer can skip
+    /// `helper_path == queried_path` entries — that preserves
+    /// forward-reference diagnostics inside a helper.
+    #[test]
+    fn test_helper_symbols_keyed_by_helper_path() {
+        let helper_a: PathBuf = "/work/pkg/tests/testthat/helper-a.R".into();
+        let helper_b: PathBuf = "/work/pkg/tests/testthat/helper-b.R".into();
+        let text_a: Arc<str> = "fixture_a <- function() 1\n".into();
+        let text_b: Arc<str> = "fixture_b <- function() 2\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            helper_a.clone(),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: text_a.clone(),
+                content_digest: ContentDigest::of(&text_a),
+            },
+        );
+        inputs.r_files.insert(
+            helper_b.clone(),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: text_b.clone(),
+                content_digest: ContentDigest::of(&text_b),
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        let map = &s.scope_contribution.test_helper_symbols;
+        // Each helper keeps its own defs under its own path.
+        let a_syms = map.get(&helper_a).expect("helper-a entry");
+        assert!(a_syms.contains("fixture_a"));
+        assert!(!a_syms.contains("fixture_b"));
+        let b_syms = map.get(&helper_b).expect("helper-b entry");
+        assert!(b_syms.contains("fixture_b"));
+        assert!(!b_syms.contains("fixture_a"));
     }
 }
