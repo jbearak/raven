@@ -100,7 +100,7 @@ pub fn resolve_lint_for_document(
     if !matched_any {
         return base.clone();
     }
-    parse_lint_config_from_section(&effective).unwrap_or_else(|| base.clone())
+    parse_lint_config_from_section(&effective, base.enabled).unwrap_or_else(|| base.clone())
 }
 
 /// Returns true if the override has `enabled = false` after applying patches;
@@ -121,7 +121,11 @@ pub fn is_skipped_by_overrides(
     if !matched {
         return false;
     }
-    effective.get("enabled").and_then(|v| v.as_bool()) == Some(false)
+    match effective.get("enabled") {
+        Some(serde_json::Value::Bool(false)) => true,
+        Some(serde_json::Value::String(s)) if s == "off" || s == "false" => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

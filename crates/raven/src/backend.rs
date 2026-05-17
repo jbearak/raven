@@ -479,26 +479,93 @@ pub(crate) fn parse_cross_file_config(
 /// where we've already extracted the section.
 pub(crate) fn parse_lint_config_from_section(
     section: &serde_json::Value,
+    base_enabled: bool,
 ) -> Option<crate::linting::LintConfig> {
-    // Wrap into the shape `parse_lint_config` expects and delegate.
+    // Wrap into the shape `parse_lint_config` expects and delegate. The
+    // override path inherits `base_enabled` for `Auto` resolution: an override
+    // that doesn't mention `enabled` (or sets it to `"auto"` / `null`) keeps
+    // the base's already-resolved value. See spec section 6.
     let wrapped = serde_json::json!({ "linting": section });
-    parse_lint_config(&wrapped)
+    parse_lint_config(&wrapped, base_enabled)
+}
+
+fn parse_lint_enabled(raw: Option<&serde_json::Value>) -> crate::linting::LintEnabled {
+    use crate::linting::LintEnabled;
+    use serde_json::Value;
+    match raw {
+        // Absent and explicit JSON null are semantically equivalent
+        // ("no preference") and remain silent.
+        None | Some(Value::Null) => LintEnabled::Auto,
+        Some(Value::Bool(true)) => LintEnabled::On,
+        Some(Value::Bool(false)) => LintEnabled::Off,
+        Some(Value::String(s)) => match s.as_str() {
+            "auto" => LintEnabled::Auto,
+            "on" | "true" => LintEnabled::On,
+            "off" | "false" => LintEnabled::Off,
+            other => {
+                log::warn!(
+                    "Unrecognised linting.enabled value '{other}'; defaulting to 'auto'."
+                );
+                LintEnabled::Auto
+            }
+        },
+        Some(other) => {
+            let kind = match other {
+                Value::Number(_) => "number",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                _ => "value",
+            };
+            log::warn!(
+                "linting.enabled must be boolean or string \"auto|on|off\"; got {kind}. Defaulting to 'auto'."
+            );
+            LintEnabled::Auto
+        }
+    }
 }
 
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
+    lintr_discovered: bool,
 ) -> Option<crate::linting::LintConfig> {
-    let linting = settings.get("linting")?;
-    if !linting.is_object() {
-        log::warn!("linting settings must be an object; ignoring.");
-        return None;
-    }
+    use crate::linting::LintEnabled;
+
+    let linting = settings.get("linting");
+    let linting_obj = match linting {
+        Some(v) if v.is_object() => Some(v),
+        Some(_) => {
+            log::warn!("linting settings must be an object; ignoring.");
+            // When `.lintr` was discovered, still return a defaulted config so
+            // Auto resolves to on; otherwise behave as before and return None.
+            if !lintr_discovered {
+                return None;
+            }
+            None
+        }
+        None => {
+            if !lintr_discovered {
+                return None;
+            }
+            None
+        }
+    };
 
     let mut config = crate::linting::LintConfig::default();
 
-    if let Some(v) = linting.get("enabled").and_then(|v| v.as_bool()) {
-        config.enabled = v;
-    }
+    let raw_enabled = linting_obj.and_then(|l| l.get("enabled"));
+    config.enabled = match parse_lint_enabled(raw_enabled) {
+        LintEnabled::On => true,
+        LintEnabled::Off => false,
+        LintEnabled::Auto => lintr_discovered,
+    };
+
+    // Re-bind `linting` for the rest of the function below to keep the
+    // existing field-parsing code unchanged. If we have no linting object
+    // (synthesised default for .lintr), use an empty object so `.get(...)`
+    // calls below uniformly return None.
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let linting = linting_obj.unwrap_or(&empty);
+
     if let Some(v) = linting.get("lineLength").and_then(|v| v.as_u64()) {
         // Clamp on u64 first; casting to u32 before clamping would wrap values
         // above u32::MAX (e.g. u32::MAX + 5 becomes 4) into a small value and
@@ -7957,7 +8024,7 @@ mod tests {
         #[test]
         fn parse_lint_config_returns_none_when_section_absent() {
             let settings = json!({});
-            assert!(crate::backend::parse_lint_config(&settings).is_none());
+            assert!(crate::backend::parse_lint_config(&settings, false).is_none());
         }
 
         #[test]
@@ -7968,7 +8035,7 @@ mod tests {
                     "lineLength": 120
                 }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert!(cfg.enabled);
             assert_eq!(cfg.line_length, 120);
         }
@@ -7976,11 +8043,11 @@ mod tests {
         #[test]
         fn parse_lint_config_clamps_line_length() {
             let settings = json!({ "linting": { "lineLength": 1 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length, 20);
 
             let settings = json!({ "linting": { "lineLength": 999_999 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length, 10_000);
         }
 
@@ -7992,21 +8059,21 @@ mod tests {
             // 10_000.
             let oversized = (u32::MAX as u64) + 5;
             let settings = json!({ "linting": { "lineLength": oversized } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length, 10_000);
         }
 
         #[test]
         fn parse_lint_config_reads_assignment_operator_styles() {
             let settings = json!({ "linting": { "assignmentOperator": "=" } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(
                 cfg.assignment_operator_style,
                 crate::linting::AssignmentOperatorStyle::Equals
             );
 
             let settings = json!({ "linting": { "assignmentOperator": "<-" } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(
                 cfg.assignment_operator_style,
                 crate::linting::AssignmentOperatorStyle::LeftArrow
@@ -8028,7 +8095,7 @@ mod tests {
                     "indentationSeverity": "off"
                 }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.line_length_severity, None);
             assert_eq!(cfg.trailing_whitespace_severity, None);
             assert_eq!(cfg.no_tab_severity, None);
@@ -8043,17 +8110,17 @@ mod tests {
         #[test]
         fn parse_lint_config_reads_indentation_unit_and_clamps() {
             let settings = json!({ "linting": { "indentationUnit": 4 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.indentation_unit, 4);
 
             // Above the ceiling is clamped down to 8.
             let settings = json!({ "linting": { "indentationUnit": 99 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.indentation_unit, 8);
 
             // Zero is clamped up to 1 (the floor).
             let settings = json!({ "linting": { "indentationUnit": 0 } });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.indentation_unit, 1);
         }
 
@@ -8067,7 +8134,7 @@ mod tests {
                     "objectNameStyleArgument": "any"
                 }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.object_name_style_function, ObjectNameStyle::CamelCase);
             assert_eq!(cfg.object_name_style_variable, ObjectNameStyle::UpperCase);
             assert_eq!(cfg.object_name_style_argument, ObjectNameStyle::Any);
@@ -8079,14 +8146,120 @@ mod tests {
             let settings = json!({
                 "linting": { "objectNameStyleFunction": "kebab-case" }
             });
-            let cfg = crate::backend::parse_lint_config(&settings).unwrap();
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
             assert_eq!(cfg.object_name_style_function, ObjectNameStyle::Any);
         }
 
         #[test]
         fn parse_lint_config_non_object_returns_none() {
             let settings = json!({ "linting": 42 });
-            assert!(crate::backend::parse_lint_config(&settings).is_none());
+            assert!(crate::backend::parse_lint_config(&settings, false).is_none());
+        }
+
+        // ============================================================================
+        // Tri-state `enabled` resolution (#281)
+        // ============================================================================
+
+        #[test]
+        fn parse_lint_config_client_false_overrides_lintr_discovery() {
+            // Regression for #281: an explicit client `enabled = false` must
+            // remain false even when a .lintr is the discovered project config.
+            let settings = json!({ "linting": { "enabled": false } });
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(!cfg.enabled, "client false must win over .lintr discovery");
+        }
+
+        #[test]
+        fn parse_lint_config_auto_default_no_project_off() {
+            let settings = json!({ "linting": { "enabled": "auto" } });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(!cfg.enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_auto_with_lintr_on() {
+            let settings = json!({ "linting": { "enabled": "auto" } });
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_auto_lintr_no_recognized_content_still_on() {
+            // .lintr was discovered but its content yielded no linting fields.
+            // parse_lint_config should still return Some(default config) with
+            // enabled = true so the implicit `.lintr` opt-in survives.
+            let settings = json!({});
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(
+                cfg.line_length,
+                crate::linting::LintConfig::default().line_length
+            );
+        }
+
+        #[test]
+        fn parse_lint_config_no_section_no_lintr_returns_none() {
+            // No linting section AND no .lintr discovered → keep the old
+            // behavior of returning None so the caller can decide a default.
+            let settings = json!({});
+            assert!(crate::backend::parse_lint_config(&settings, false).is_none());
+        }
+
+        #[test]
+        fn parse_lint_config_string_on_off() {
+            let on = json!({ "linting": { "enabled": "on" } });
+            let off = json!({ "linting": { "enabled": "off" } });
+            assert!(crate::backend::parse_lint_config(&on, false).unwrap().enabled);
+            assert!(!crate::backend::parse_lint_config(&off, true).unwrap().enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_string_true_false_backcompat() {
+            let t = json!({ "linting": { "enabled": "true" } });
+            let f = json!({ "linting": { "enabled": "false" } });
+            assert!(crate::backend::parse_lint_config(&t, false).unwrap().enabled);
+            assert!(!crate::backend::parse_lint_config(&f, true).unwrap().enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_bool_backcompat() {
+            let t = json!({ "linting": { "enabled": true } });
+            let f = json!({ "linting": { "enabled": false } });
+            assert!(crate::backend::parse_lint_config(&t, false).unwrap().enabled);
+            assert!(!crate::backend::parse_lint_config(&f, true).unwrap().enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_invalid_string_warns_falls_back_to_auto() {
+            let settings = json!({ "linting": { "enabled": "yes" } });
+            // With lintr_discovered = false, Auto resolves to off.
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(!cfg.enabled);
+            // With lintr_discovered = true, Auto resolves to on.
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
+        }
+
+        #[test]
+        fn parse_lint_config_invalid_json_types_fall_back_to_auto() {
+            for bad in [json!(42), json!([]), json!({})] {
+                let settings = json!({ "linting": { "enabled": bad } });
+                // Auto with no lintr_discovered → off.
+                let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+                assert!(
+                    !cfg.enabled,
+                    "expected off for invalid enabled value {bad}"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_lint_config_null_silent_falls_back_to_auto() {
+            let settings = json!({ "linting": { "enabled": null } });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(!cfg.enabled);
+            let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
+            assert!(cfg.enabled);
         }
     }
 

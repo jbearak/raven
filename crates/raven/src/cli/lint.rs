@@ -143,9 +143,12 @@ pub fn run(args: LintArgs) -> i32 {
         }
     };
 
-    // Resolve project root + project settings.
-    let (root, project_settings) = if args.no_config {
-        (cwd.clone(), None)
+    // Resolve project root + project settings + lintr-discovered signal.
+    // `lintr_discovered` is the input to `Auto` resolution in
+    // `parse_lint_config`. `--config` is currently raven.toml-only — see
+    // the design spec for tri-state enabled, section 7.
+    let (root, project_settings, lintr_discovered) = if args.no_config {
+        (cwd.clone(), None, false)
     } else if let Some(explicit) = args.config_path.as_ref() {
         match crate::config_file::load_toml(explicit) {
             Some(l) => {
@@ -165,7 +168,7 @@ pub fn run(args: LintArgs) -> i32 {
                 } else {
                     cwd.join(&parent)
                 };
-                (root, Some(l.settings))
+                (root, Some(l.settings), false)
             }
             None => {
                 eprintln!(
@@ -185,7 +188,7 @@ pub fn run(args: LintArgs) -> i32 {
                 for w in l.warnings {
                     eprintln!("{w}");
                 }
-                (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings))
+                (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings), false)
             }
             crate::config_file::DiscoveredConfig::Lintr(p) => {
                 let text = match std::fs::read_to_string(&p) {
@@ -199,9 +202,9 @@ pub fn run(args: LintArgs) -> i32 {
                 for w in l.warnings {
                     eprintln!("{w}");
                 }
-                (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings))
+                (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings), true)
             }
-            crate::config_file::DiscoveredConfig::None => (cwd.clone(), None),
+            crate::config_file::DiscoveredConfig::None => (cwd.clone(), None, false),
         }
     };
 
@@ -211,7 +214,7 @@ pub fn run(args: LintArgs) -> i32 {
         &serde_json::Value::Object(Default::default()),
         project_settings.as_ref(),
     );
-    let lint_config = crate::backend::parse_lint_config(&merged).unwrap_or_default();
+    let lint_config = crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
     let base_section = merged.get("linting").cloned().unwrap_or(json!({}));
     let overrides = crate::config_file::compile_lint_overrides(&merged, &root);
 

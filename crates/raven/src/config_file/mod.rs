@@ -55,7 +55,13 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         crate::backend::parse_completion_config(&merged).unwrap_or_default();
     state.indentation_config =
         crate::backend::parse_indentation_config(&merged).unwrap_or_default();
-    state.lint_config = crate::backend::parse_lint_config(&merged).unwrap_or_default();
+    let lintr_discovered = state
+        .project_config_path
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .map(|n| n == std::ffi::OsStr::new(".lintr"))
+        .unwrap_or(false);
+    state.lint_config = crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
 
     // Recompile per-document lint overrides as part of the centralized
     // recompute. Splitting this into a separate caller step (as earlier

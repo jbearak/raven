@@ -57,9 +57,11 @@ pub fn load_str(text: &str) -> LoadedLintr {
     }
     let mut settings = serde_json::Map::new();
     if !linting.is_empty() {
-        // Default `enabled = true` so .lintr users get linting on without
-        // having to opt in. (raven.toml users decide for themselves.)
-        linting.entry("enabled").or_insert(json!(true));
+        // `.lintr` does not contribute the `enabled` master switch. The
+        // enable signal is derived from discovery state (see #281): when
+        // `parse_lint_config` is called with `lintr_discovered = true`, the
+        // default `"auto"` resolves to on. This keeps "drop a .lintr to opt
+        // in" working without overriding an explicit client `false`.
         settings.insert("linting".into(), Value::Object(linting));
     }
     LoadedLintr { settings: Value::Object(settings), warnings }
