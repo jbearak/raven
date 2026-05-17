@@ -1445,6 +1445,71 @@ mod property_tests {
         prop::collection::vec(r_argument_expr(), min..=max)
     }
 
+    /// Strategy: R identifiers that are NOT reserved keywords. Used when
+    /// the identifier needs to parse cleanly as an identifier in
+    /// `if(<x>) <y>` etc. — otherwise tree-sitter-r would re-grammar it
+    /// (e.g. as a nested `if_statement`) and skew the test.
+    fn r_non_keyword_identifier() -> impl Strategy<Value = String> {
+        r_identifier().prop_filter("must not be a reserved keyword", |s| {
+            !matches!(
+                s.as_str(),
+                "if" | "else"
+                    | "for"
+                    | "while"
+                    | "repeat"
+                    | "function"
+                    | "return"
+                    | "break"
+                    | "next"
+                    | "in"
+                    | "TRUE"
+                    | "FALSE"
+                    | "NULL"
+                    | "NA"
+                    | "Inf"
+                    | "NaN"
+                    | "T"
+                    | "F"
+            )
+        })
+    }
+
+    /// Build a well-formed keyword construct `<kw>(<inner>) <body>` and
+    /// return `(code, keyword_str, close_paren_col, body_col)`.
+    /// `kw_idx`: 0=if, 1=for, 2=while, 3=function.
+    fn build_keyword_construct(
+        kw_idx: u8,
+        inner: &str,
+        body: &str,
+    ) -> (String, &'static str, usize, usize) {
+        let (code, keyword, prefix_len) = match kw_idx {
+            0 => (format!("if({}) {}", inner, body), "if", "if(".len()),
+            // The for header is `for(i in <inner>)`. We hard-code `i` as
+            // the iterator variable and the strategy guarantees `inner`
+            // isn't a reserved keyword, so it parses cleanly.
+            1 => (
+                format!("for(i in {}) {}", inner, body),
+                "for",
+                "for(i in ".len(),
+            ),
+            2 => (
+                format!("while({}) {}", inner, body),
+                "while",
+                "while(".len(),
+            ),
+            _ => (
+                format!("function({}) {}", inner, body),
+                "function",
+                "function(".len(),
+            ),
+        };
+        let close_col = prefix_len + inner.len();
+        // Layout is "<header>) <body>", so the body starts two bytes past
+        // `)`: one for `)`, one for the space.
+        let body_col = close_col + 2;
+        (code, keyword, close_col, body_col)
+    }
+
     /// Parse R code using the thread-local parser.
     fn parse_r(code: &str) -> tree_sitter::Tree {
         with_parser(|parser| parser.parse(code, None).unwrap())
@@ -1904,6 +1969,73 @@ mod property_tests {
                 inner_name,
                 cursor_col,
                 code
+            );
+        }
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 3: Keyword Construct Boundary
+        //
+        // For any well-formed `if(<x>) <y>` / `for(i in <x>) <y>` /
+        // `while(<x>) <y>` / `function(<x>) <y>`, the cursor AT the `)`
+        // position is inside the header (returns the keyword), the cursor
+        // immediately past `)` is OUTSIDE the header (returns None), and
+        // the cursor on the bare-identifier body is OUTSIDE (returns
+        // None).
+        //
+        // Closes a coverage gap from issue #274's adversarial review: the
+        // other properties don't generate keyword constructs with a real
+        // body and don't probe the boundary right at / immediately past
+        // `)` (where the keyword construct's AST range extends past `)`
+        // into the body, unlike plain calls).
+        // ============================================================================
+
+        #[test]
+        fn prop_keyword_construct_boundary(
+            kw_idx in 0u8..4,
+            inner in r_non_keyword_identifier(),
+            body in r_non_keyword_identifier(),
+        ) {
+            let (code, keyword, close_col, body_col) =
+                build_keyword_construct(kw_idx, &inner, &body);
+            let tree = parse_r(&code);
+
+            // 1. Cursor AT the `)` byte — inside the header.
+            let pos_close = Position::new(0, close_col as u32);
+            let ctx = detect_function_call_context(&tree, &code, pos_close);
+            prop_assert!(
+                ctx.is_some(),
+                "Expected context at `)` (col {}) in code {:?}",
+                close_col,
+                code,
+            );
+            let function_name = ctx.unwrap().function_name;
+            prop_assert_eq!(
+                function_name.as_str(),
+                keyword,
+                "Expected `{}` at `)` (col {}) in code {:?}",
+                keyword,
+                close_col,
+                code,
+            );
+
+            // 2. Cursor immediately past `)` (in the whitespace before
+            //    the body) — outside the header.
+            let pos_past = Position::new(0, (close_col + 1) as u32);
+            prop_assert!(
+                detect_function_call_context(&tree, &code, pos_past).is_none(),
+                "Expected None immediately past `)` (col {}) in code {:?}",
+                close_col + 1,
+                code,
+            );
+
+            // 3. Cursor on the bare-identifier body — outside the header
+            //    and not inside any call.
+            let pos_body = Position::new(0, body_col as u32);
+            prop_assert!(
+                detect_function_call_context(&tree, &code, pos_body).is_none(),
+                "Expected None on body (col {}) in code {:?}",
+                body_col,
+                code,
             );
         }
     }
