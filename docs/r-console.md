@@ -27,8 +27,8 @@ The selected program must be available on your PATH.
 
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
-| `Cmd+Enter` | `Ctrl+Enter` | Run line or selection |
-| `Shift+Cmd+Enter` | `Shift+Ctrl+Enter` | Source file |
+| `Cmd+Enter` | `Ctrl+Enter` | Run line or selection (every supported file type) |
+| `Shift+Cmd+Enter` | `Shift+Ctrl+Enter` | Source file (`.R`), Knit (`.Rmd` when `raven.rmdKnit.enabled`), or Run All Chunks (`.qmd`, or `.Rmd` with Knit disabled) |
 
 > [!TIP]
 > You can also access these commands via the editor toolbar menu (`▶` button) or the command palette (`Cmd+Shift+P`).
@@ -66,7 +66,7 @@ A toolbar button (▶) appears in the editor title bar for `.R`, `.Rmd`, and `.q
 - **Main commands** — Send code to the managed R terminal. If no R terminal is open, one is created automatically.
 - **Terminal submenu** — Send code to whatever terminal is currently active in VS Code, regardless of type. This is useful for sending commands to R running inside `tmux`, a Docker container, or any other terminal session that isn't the extension's built-in R terminal.
 
-For `.R` files, the menu shows **Run Line or Selection**, **Run Upward Lines**, **Run Downward Lines**, the chunk commands that work against `# %%`-style cell mode (**Run Current Chunk**, **Run Current Chunk and Move**, **Run Above Chunks**, **Run All Chunks**), and **Source File**. For `.Rmd` and `.qmd` files, the entries that auto-include prose or YAML — **Run Upward Lines**, **Run Downward Lines**, and **Source File** — are hidden, and the chunk commands are grouped into three sets: the current chunk (**Run Current Chunk**, **Run Current Chunk and Move**), one-step navigation (**Run Previous Chunk**, **Run Next Chunk**), and multi-chunk ranges (**Run Above Chunks**, **Run Current and Below Chunks**, **Run Below Chunks**, **Run All Chunks**). **Run Line or Selection** stays available because the user chooses what to send (the selection or the current statement). **Knit** is added for `.Rmd` files when `raven.rmdKnit.enabled` is on.
+For `.R` files, the menu shows **Run Line or Selection**, **Run Upward Lines**, **Run Downward Lines**, **Source File**, and the **Terminal** submenu. Chunk commands are reserved for chunk-based documents — `.R` files with `# %%` cells access **Run Current Chunk** etc. through the CodeLens or the command palette, not the toolbar. For `.Rmd` and `.qmd` files, the entries that auto-include prose or YAML — **Run Upward Lines**, **Run Downward Lines**, and **Source File** — are hidden along with the **Terminal** submenu (its only surviving item would be Run Line or Selection, which is already in the parent menu). What remains is **Run Line or Selection**, the four chunk commands (**Run Current Chunk**, **Run Current Chunk and Move**, **Run Above Chunks**, **Run All Chunks**), and — for `.Rmd` files when `raven.rmdKnit.enabled` is on — **Knit**. The Source-File keyboard shortcut (`Shift+Cmd+Enter` / `Shift+Ctrl+Enter`) is repurposed on chunk-based documents: Knit on `.Rmd` with the feature flag on, Run All Chunks on `.qmd` and on `.Rmd` with Knit disabled.
 
 Code sent via the Terminal submenu follows the same send method as the main commands. By default, Raven pastes short blocks directly and writes longer blocks to a temporary file, executing them with `source()`. **Terminal: Source File** runs `source()` directly against the document's saved path on disk (saving first if the buffer has unsaved changes).
 
