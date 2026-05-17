@@ -36,7 +36,7 @@ suite('KnitOutputPanel iframe loads rendered HTML', () => {
     });
 
     teardown(() => {
-        KnitOutputPanel.disposeForTesting();
+        KnitOutputPanel.disposeAllForTesting();
         try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* noop */ }
     });
 
@@ -64,9 +64,9 @@ suite('KnitOutputPanel iframe loads rendered HTML', () => {
                 { sourceUri: src, outputPath, output },
             );
             assert.deepStrictEqual(r, { ok: true });
-            const inst = KnitOutputPanel.getInstanceForTesting();
+            const inst = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst, 'panel instance should exist');
-            const panel = (inst as unknown as { panel: vscode.WebviewPanel }).panel;
+            const panel = inst.getPanelForTesting();
 
             // The marker is the strongest signal that content actually
             // reaches the iframe — `srcdoc` embeds the rendered HTML

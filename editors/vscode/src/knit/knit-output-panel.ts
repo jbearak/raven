@@ -5,36 +5,41 @@ import * as vscode from 'vscode';
 import { buildShellHtml, isKnitOutputMessage } from './knit-output';
 
 /**
- * Singleton webview panel that renders the most recent HTML knit output
- * inside an `<iframe sandbox="allow-same-origin">` with Refresh and
- * Open-in-Browser toolbar buttons.
+ * Webview panel that renders a single `.Rmd`'s rendered HTML output in
+ * an `<iframe sandbox="allow-same-origin">` with Refresh / Open-in-
+ * Browser / theme-toggle toolbar buttons.
  *
- * See `docs/superpowers/specs/2026-05-17-knit-output-webview-design.md`.
+ * See `docs/superpowers/specs/2026-05-17-knit-panel-per-file-design.md`
+ * and the prior `2026-05-17-knit-output-webview-design.md`.
  *
- * Architecture:
+ * Per-source registry: one panel per `.Rmd`, keyed by `sourceUri.fsPath`
+ * to match the in-flight gate in `knit-commands.ts` (which also keys by
+ * fsPath so the same file under different relative URIs collapses).
+ * New panels anchor to `previewColumn` so they stack as tabs in a
+ * single "preview" column rather than scattering.
+ *
+ * Architecture (unchanged from the singleton implementation):
  *  - Outer Raven-controlled shell document owns the CSP (in `<head>`),
  *    the toolbar, and a nonce'd `<script>` that posts messages.
- *  - Inner `<iframe>` loads the rendered HTML via
- *    `webview.asWebviewUri(outputPath)`. The sandbox blocks scripts,
- *    forms, popups, and top-navigation. `allow-same-origin` is
- *    required: VS Code serves `vscode-cdn.net` webview resources via
- *    a service worker scoped to that origin, and a sandboxed iframe
- *    with a unique opaque origin bypasses the service worker (Electron
- *    falls back to DNS resolution, which fails with
- *    `ERR_NAME_NOT_RESOLVED`). `allow-same-origin` re-enters the SW
- *    scope without enabling scripts/forms.
- *    `frame-src ${cspSource}` on the outer CSP prevents iframe
- *    navigation to external hosts.
+ *  - Inner `<iframe sandbox="allow-same-origin" srcdoc="…">` embeds the
+ *    rendered HTML inline. `allow-same-origin` is required because a
+ *    bare `sandbox=""` would give the iframe an opaque origin that
+ *    bypasses VS Code's webview service worker (Electron falls back
+ *    to DNS resolution, which fails with `ERR_NAME_NOT_RESOLVED`).
+ *    Scripts, forms, and popups are still blocked.
  *  - `localResourceRoots` is confined to `path.dirname(outputPath)`,
- *    which is also where rmarkdown's `_files/` figure directories sit.
+ *    where rmarkdown's `_files/` figure directories sit.
  *
- * Singleton: one panel per VS Code window. Subsequent knits replace the
- * iframe `src`. If the new output's `rootDir` differs, the panel is
- * disposed and recreated (VS Code does not allow updating
- * `localResourceRoots` post-creation — see `help-panel.ts`).
+ * Singleton → per-source: subsequent knits of the *same* source reuse
+ * the panel and swap iframe content. Knits of different sources open
+ * separate panels. If a panel's `outputPath` rootDir changes (rare —
+ * e.g. user edited `output_dir`), only that panel is disposed and
+ * recreated in its current column (`localResourceRoots` is immutable
+ * post-creation — same workaround `help-panel.ts` uses).
  */
 export class KnitOutputPanel {
-    private static instance: KnitOutputPanel | undefined;
+    private static instances = new Map<string, KnitOutputPanel>();
+    private static previewColumn: vscode.ViewColumn | undefined;
 
     private panel: vscode.WebviewPanel;
     private rootDir: string;
@@ -43,9 +48,10 @@ export class KnitOutputPanel {
     private readonly output: vscode.OutputChannel;
 
     /**
-     * Open or update the singleton panel. Returns `{ ok: true }` on
-     * success, `{ ok: false, error }` if the rendered file cannot be
-     * accessed (caller should fall back to `revealFileInOS`).
+     * Open or update the panel for `args.sourceUri`. Returns
+     * `{ ok: true }` on success, `{ ok: false, error }` if the rendered
+     * file cannot be accessed (caller should fall back to
+     * `revealFileInOS`).
      */
     static async showOrUpdate(
         context: vscode.ExtensionContext,
@@ -61,8 +67,9 @@ export class KnitOutputPanel {
             return { ok: false, error: err instanceof Error ? err.message : String(err) };
         }
 
+        const key = args.sourceUri.fsPath;
         const rootDir = path.dirname(args.outputPath);
-        const existing = KnitOutputPanel.instance;
+        const existing = KnitOutputPanel.instances.get(key);
 
         if (existing && existing.rootDir === rootDir) {
             existing.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
@@ -71,27 +78,83 @@ export class KnitOutputPanel {
         }
 
         if (existing) {
-            // localResourceRoots is immutable after panel creation — dispose
-            // and recreate in the same column. Same workaround as help-panel.
+            // localResourceRoots is immutable post-creation — dispose
+            // and recreate in the same column. Scoped to this source;
+            // other panels untouched.
             const column = existing.panel.viewColumn ?? vscode.ViewColumn.Beside;
             existing.panel.dispose();
-            // panel.dispose() fires onDidDispose, which clears `instance`.
             KnitOutputPanel.create(context, args, rootDir, column);
             return { ok: true };
         }
 
-        KnitOutputPanel.create(context, args, rootDir, vscode.ViewColumn.Beside);
+        const column = KnitOutputPanel.previewColumn ?? vscode.ViewColumn.Beside;
+        KnitOutputPanel.create(context, args, rootDir, column);
         return { ok: true };
     }
 
     /** Visible only for tests. */
-    static getInstanceForTesting(): KnitOutputPanel | undefined {
-        return KnitOutputPanel.instance;
+    static getInstancesForTesting(): ReadonlyMap<string, KnitOutputPanel> {
+        return KnitOutputPanel.instances;
     }
 
-    /** Visible only for tests — destroys the singleton. */
-    static disposeForTesting(): void {
-        KnitOutputPanel.instance?.panel.dispose();
+    /** Visible only for tests. */
+    static getPreviewColumnForTesting(): vscode.ViewColumn | undefined {
+        return KnitOutputPanel.previewColumn;
+    }
+
+    /**
+     * Visible only for tests — disposes every real `WebviewPanel` in
+     * the registry, clears the Map, and resets `previewColumn`. Fakes
+     * inserted via `setInstancesForTesting` do not expose `dispose`
+     * and are skipped.
+     */
+    static disposeAllForTesting(): void {
+        for (const inst of [...KnitOutputPanel.instances.values()]) {
+            const maybePanel = inst.panel as unknown as { dispose?: () => void };
+            if (typeof maybePanel?.dispose === 'function') {
+                maybePanel.dispose();
+            }
+        }
+        KnitOutputPanel.instances.clear();
+        KnitOutputPanel.previewColumn = undefined;
+    }
+
+    /**
+     * Visible only for tests — inject lightweight stand-ins into the
+     * Map so `recomputePreviewColumn` can be exercised without real
+     * `createWebviewPanel` calls. The recompute logic only reads
+     * `inst.panel.viewColumn`, so duck-typing is sufficient.
+     */
+    static setInstancesForTesting(
+        fakes: ReadonlyArray<{ key: string; viewColumn: vscode.ViewColumn | undefined }>,
+    ): void {
+        KnitOutputPanel.instances.clear();
+        for (const f of fakes) {
+            const stub = {
+                panel: { viewColumn: f.viewColumn } as unknown as vscode.WebviewPanel,
+            } as unknown as KnitOutputPanel;
+            KnitOutputPanel.instances.set(f.key, stub);
+        }
+    }
+
+    /** Visible only for tests. */
+    static setPreviewColumnForTesting(col: vscode.ViewColumn | undefined): void {
+        KnitOutputPanel.previewColumn = col;
+    }
+
+    /** Visible only for tests. */
+    static recomputePreviewColumnForTesting(): void {
+        KnitOutputPanel.recomputePreviewColumn();
+    }
+
+    /** Visible only for tests. */
+    getPanelForTesting(): vscode.WebviewPanel {
+        return this.panel;
+    }
+
+    /** Visible only for tests. */
+    getRootDirForTesting(): string {
+        return this.rootDir;
     }
 
     private static create(
@@ -104,6 +167,7 @@ export class KnitOutputPanel {
         rootDir: string,
         column: vscode.ViewColumn,
     ): KnitOutputPanel {
+        const key = args.sourceUri.fsPath;
         const panel = vscode.window.createWebviewPanel(
             'raven.knitOutput',
             'Knit Output',
@@ -116,9 +180,60 @@ export class KnitOutputPanel {
             },
         );
         const instance = new KnitOutputPanel(context, panel, rootDir, args);
-        KnitOutputPanel.instance = instance;
+        KnitOutputPanel.instances.set(key, instance);
+
+        // Anchor the preview column on the first panel that has a
+        // resolved column. Subsequent new panels open in this column
+        // so they stack as tabs rather than scattering to Beside.
+        const resolved = panel.viewColumn;
+        if (resolved !== undefined && KnitOutputPanel.previewColumn === undefined) {
+            KnitOutputPanel.previewColumn = resolved;
+        }
+
+        panel.onDidChangeViewState(() => KnitOutputPanel.recomputePreviewColumn());
+        panel.onDidDispose(() => {
+            // Guard against a stale dispose listener for an instance
+            // that has since been replaced under the same key (the
+            // rootDir-mismatch branch disposes the old panel and
+            // inserts a new one). VS Code's dispose() is synchronous
+            // today, but the guard makes the invariant explicit and
+            // survives any future async change.
+            if (KnitOutputPanel.instances.get(key) === instance) {
+                KnitOutputPanel.instances.delete(key);
+            }
+            KnitOutputPanel.recomputePreviewColumn();
+        });
+
         instance.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
         return instance;
+    }
+
+    /**
+     * Three-step preview-column recompute:
+     *  - empty registry  → previewColumn = undefined
+     *  - previewColumn still occupied by some panel → stays put
+     *  - otherwise → adopts any surviving panel's column (so a
+     *    dragged-away lone panel keeps siblings clustered with it)
+     */
+    private static recomputePreviewColumn(): void {
+        if (KnitOutputPanel.instances.size === 0) {
+            KnitOutputPanel.previewColumn = undefined;
+            return;
+        }
+        const target = KnitOutputPanel.previewColumn;
+        if (target !== undefined) {
+            for (const inst of KnitOutputPanel.instances.values()) {
+                if (inst.panel.viewColumn === target) return;
+            }
+        }
+        for (const inst of KnitOutputPanel.instances.values()) {
+            const col = inst.panel.viewColumn;
+            if (col !== undefined) {
+                KnitOutputPanel.previewColumn = col;
+                return;
+            }
+        }
+        KnitOutputPanel.previewColumn = undefined;
     }
 
     private readonly context: vscode.ExtensionContext;
@@ -141,11 +256,6 @@ export class KnitOutputPanel {
         this.output = args.output;
 
         this.panel.webview.onDidReceiveMessage((msg: unknown) => this.handleMessage(msg));
-        this.panel.onDidDispose(() => {
-            if (KnitOutputPanel.instance === this) {
-                KnitOutputPanel.instance = undefined;
-            }
-        });
     }
 
     private updateContent(args: { sourceUri: vscode.Uri; outputPath: string }): void {

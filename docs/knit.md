@@ -67,11 +67,14 @@ explorer-context-menu hook is opt-in via your own keybindings).
    instead of POSIX signals.
 10. **Reveal.** On a clean exit Raven parses `Output created: <path>`
     out of stdout. When the primary output is HTML (or there's any HTML
-    in a multi-output knit), Raven opens it in the **Knit Output**
+    in a multi-output knit), Raven opens it in a **Knit Output**
     webview panel beside the editor — no success popover, the panel
-    itself is the signal. For multi-output knits the additional output
-    paths are written to the `Raven: Knit` output channel. The panel
-    toolbar has three buttons:
+    itself is the signal. Each `.Rmd` gets its own panel; knitting a
+    second `.Rmd` opens a separate panel that stacks as a tab in the
+    same "preview" column rather than replacing the first. Re-knitting
+    the same `.Rmd` updates its panel in place. For multi-output knits
+    the additional output paths are written to the `Raven: Knit`
+    output channel. The panel toolbar has three buttons:
 
     - **Knit again** — re-knits the source `.Rmd` (the same code path
       as invoking `Raven: Knit` from the palette).

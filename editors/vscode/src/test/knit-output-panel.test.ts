@@ -21,11 +21,11 @@ suite('KnitOutputPanel integration', () => {
     });
 
     teardown(() => {
-        KnitOutputPanel.disposeForTesting();
+        KnitOutputPanel.disposeAllForTesting();
         try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* noop */ }
     });
 
-    test('showOrUpdate reuses the singleton when rootDir is unchanged', async () => {
+    test('showOrUpdate reuses the panel when rootDir is unchanged', async () => {
         await activate();
         const output = vscode.window.createOutputChannel('Knit Test');
         try {
@@ -38,7 +38,7 @@ suite('KnitOutputPanel integration', () => {
                 { sourceUri: src, outputPath: a, output },
             );
             assert.deepStrictEqual(r1, { ok: true });
-            const inst1 = KnitOutputPanel.getInstanceForTesting();
+            const inst1 = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst1);
 
             const r2 = await KnitOutputPanel.showOrUpdate(
@@ -46,8 +46,12 @@ suite('KnitOutputPanel integration', () => {
                 { sourceUri: src, outputPath: b, output },
             );
             assert.deepStrictEqual(r2, { ok: true });
-            const inst2 = KnitOutputPanel.getInstanceForTesting();
-            assert.strictEqual(inst1, inst2, 'singleton instance should be reused');
+            const inst2 = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
+            assert.strictEqual(inst1, inst2, 'panel instance for this source should be reused');
+            assert.strictEqual(
+                KnitOutputPanel.getInstancesForTesting().size, 1,
+                'only one panel exists for one source',
+            );
         } finally {
             output.dispose();
         }
@@ -66,16 +70,16 @@ suite('KnitOutputPanel integration', () => {
                 {} as vscode.ExtensionContext,
                 { sourceUri: src, outputPath: a, output },
             );
-            const inst1 = KnitOutputPanel.getInstanceForTesting();
+            const inst1 = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst1);
 
             await KnitOutputPanel.showOrUpdate(
                 {} as vscode.ExtensionContext,
                 { sourceUri: src, outputPath: b, output },
             );
-            const inst2 = KnitOutputPanel.getInstanceForTesting();
+            const inst2 = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst2);
-            assert.notStrictEqual(inst1, inst2, 'a new singleton should be created when rootDir changes');
+            assert.notStrictEqual(inst1, inst2, 'a new panel should be created when rootDir changes');
         } finally {
             output.dispose();
         }
@@ -93,14 +97,10 @@ suite('KnitOutputPanel integration', () => {
                 { sourceUri: src, outputPath: a, output },
             );
             assert.deepStrictEqual(r, { ok: true });
-            const inst = KnitOutputPanel.getInstanceForTesting();
+            const inst = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst);
 
-            // Access the panel via the singleton — the panel field is
-            // private but the only public surface, `panel.webview`, is
-            // reachable via `WebviewPanel.webview`. We assert the
-            // *options* set at creation time.
-            const opts = (inst as unknown as { panel: vscode.WebviewPanel }).panel.webview.options;
+            const opts = inst.getPanelForTesting().webview.options;
             assert.strictEqual(opts.enableScripts, true);
             assert.ok(opts.localResourceRoots, 'localResourceRoots is set');
             assert.strictEqual(opts.localResourceRoots!.length, 1);
@@ -160,9 +160,9 @@ suite('KnitOutputPanel integration', () => {
                 { sourceUri: src, outputPath: html, output },
             );
             assert.deepStrictEqual(r, { ok: true });
-            const inst = KnitOutputPanel.getInstanceForTesting();
+            const inst = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst);
-            const panel = (inst as unknown as { panel: vscode.WebviewPanel }).panel;
+            const panel = inst.getPanelForTesting();
             assert.ok(
                 /<button[^>]*id="raven-knit-theme"[^>]*aria-pressed="true"/
                     .test(panel.webview.html),
