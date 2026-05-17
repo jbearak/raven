@@ -1777,11 +1777,19 @@
           "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are left alone."
         },
         "raven.linting.indentationUnit": {
-          "type": "integer",
-          "default": 2,
-          "minimum": 1,
-          "maximum": 8,
-          "description": "Number of spaces per indent level used by the indentation lint. Mirrors `lintr::indentation_linter()`'s `indent` parameter."
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            {
+              "type": "string",
+              "const": "auto"
+            }
+          ],
+          "default": "auto",
+          "markdownDescription": "Number of spaces per indent level used by the indentation lint. Set to `\"auto\"` (default) to track each file's `editor.tabSize`; set to a fixed integer (e.g. `2` or `4`) to use the same unit for all R files. Mirrors `lintr::indentation_linter()`'s `indent` parameter."
         },
         "raven.linting.indentationSeverity": {
           "type": "string",

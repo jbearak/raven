@@ -59,7 +59,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.linting.equalsNaSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.equalsNaSeverity` | [linting](linting.md) | Severity for the equals-NA lint. |
 | `raven.linting.functionLeftParenthesesSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.functionLeftParenthesesSeverity` | [linting](linting.md) | Severity for the function-left-parentheses lint. |
 | `raven.linting.indentationSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.indentationSeverity` | [linting](linting.md) | Severity for the indentation lint. |
-| `raven.linting.indentationUnit` | `2` | integer (1–8) | `linting.indentationUnit` | [linting](linting.md) | Number of spaces per indent level used by the indentation lint. |
+| `raven.linting.indentationUnit` | `"auto"` | any | `linting.indentationUnit` | [linting](linting.md) | Number of spaces per indent level used by the indentation lint. |
 | `raven.linting.infixSpacesSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.infixSpacesSeverity` | [linting](linting.md) | Severity for the infix-spaces lint. |
 | `raven.linting.lineLength` | `80` | integer (20–10000) | `linting.lineLength` | [linting](linting.md) | Maximum allowed line length for the line-length lint. |
 | `raven.linting.lineLengthSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.lineLengthSeverity` | [linting](linting.md) | Severity for the line-length lint. |

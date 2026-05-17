@@ -99,7 +99,7 @@ export interface RavenInitializationOptions {
         enabled?: boolean | "auto" | "on" | "off";
         lineLength?: number;
         objectLength?: number;
-        indentationUnit?: number;
+        indentationUnit?: number | "auto";
         assignmentOperator?: "<-" | "=";
         stringDelimiter?: "\"" | "'";
         objectNameStyleFunction?: ObjectNameStyle;
@@ -372,7 +372,13 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         enabled: config.get<boolean | 'auto' | 'on' | 'off'>('linting.enabled', 'auto'),
         lineLength: config.get<number>('linting.lineLength', 80),
         objectLength: config.get<number>('linting.objectLength', 30),
-        indentationUnit: config.get<number>('linting.indentationUnit', 2),
+        indentationUnit: (() => {
+            const v = config.get<number | 'auto'>('linting.indentationUnit', 'auto');
+            // "auto" is resolved per-document via raven/documentIndentUnitsChanged.
+            // Send 2 as a placeholder so the server has a sane default until the
+            // first notification arrives.
+            return v === 'auto' ? 2 : v;
+        })(),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
         stringDelimiter: config.get<"\"" | "'">('linting.stringDelimiter', '"'),
         objectNameStyleFunction: config.get<ObjectNameStyle>('linting.objectNameStyleFunction', 'snake_case'),

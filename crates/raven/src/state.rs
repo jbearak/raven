@@ -578,6 +578,13 @@ pub struct WorldState {
     /// are configured. Per-document resolution scans this list.
     pub lint_overrides: Vec<crate::config_file::CompiledLintOverride>,
 
+    /// Per-document `indentation_unit` overrides sent by the client via
+    /// `raven/documentIndentUnitsChanged` when the user sets
+    /// `raven.linting.indentationUnit` to `"auto"`. Keyed by URI string.
+    /// Empty when the setting is a fixed integer; absent URIs fall back to
+    /// `lint_config.indentation_unit`.
+    pub per_document_indent_unit: std::collections::HashMap<String, u32>,
+
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_revalidation: CrossFileRevalidationState,
@@ -705,6 +712,7 @@ impl WorldState {
             raw_project_settings: None,
             project_config_path: None,
             lint_overrides: Vec::new(),
+            per_document_indent_unit: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),
