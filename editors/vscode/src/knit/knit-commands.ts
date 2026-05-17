@@ -14,8 +14,13 @@ import {
     ValidatePathError,
 } from './r-expression';
 import { runKnit } from './knit-engine';
-import { parseRenderedOutputPath } from './output-path';
 import { resolveRConsoleActivation } from '../r-console-activation';
+import { KnitOutputPanel } from './knit-output-panel';
+import {
+    classify,
+    pickPrimaryOutput,
+    type KnitOutcome,
+} from './knit-output';
 
 const OUTPUT_CHANNEL_NAME = 'Raven: Knit';
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -23,10 +28,30 @@ const DEFAULT_TIMEOUT_MS = 600_000;
 type WorkingDirectoryMode = 'document' | 'project' | 'current';
 
 /**
+ * Resolved dependency surface used throughout the knit command. The
+ * fields are required at the point of use; the public optional shape
+ * (`Partial<KnitDeps>` parameter on `registerKnitCommands`) lets tests
+ * override individual functions while production omits the parameter
+ * entirely.
+ */
+export interface KnitDeps {
+    runKnit: typeof runKnit;
+    showOrUpdatePanel: typeof KnitOutputPanel.showOrUpdate;
+}
+
+/**
  * Top-level registration. Creates the lazy OutputChannel and registers
  * the two commands listed in `package.json`.
  */
-export function registerKnitCommands(context: vscode.ExtensionContext): void {
+export function registerKnitCommands(
+    context: vscode.ExtensionContext,
+    deps?: Partial<KnitDeps>,
+): void {
+    const resolved: KnitDeps = {
+        runKnit: deps?.runKnit ?? runKnit,
+        showOrUpdatePanel: deps?.showOrUpdatePanel ?? KnitOutputPanel.showOrUpdate,
+    };
+
     let outputChannel: vscode.OutputChannel | undefined;
     const getOutput = (): vscode.OutputChannel => {
         if (!outputChannel) {
@@ -46,7 +71,7 @@ export function registerKnitCommands(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand(
             'raven.knit',
             async (uri?: vscode.Uri) => {
-                await runKnitCommand(uri, getOutput(), inFlight);
+                await runKnitCommand(uri, getOutput(), inFlight, context, resolved);
             },
         ),
         vscode.commands.registerCommand(
@@ -60,6 +85,8 @@ async function runKnitCommand(
     explicitUri: vscode.Uri | undefined,
     output: vscode.OutputChannel,
     inFlight: Set<string>,
+    context: vscode.ExtensionContext,
+    deps: KnitDeps,
 ): Promise<void> {
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
@@ -214,101 +241,191 @@ async function runKnitCommand(
     output.appendLine(`cwd: ${cwd}`);
     output.appendLine(``);
 
+    let outcome: KnitOutcome;
     try {
-    await vscode.window.withProgress(
-        {
-            location: vscode.ProgressLocation.Notification,
-            title: `Knitting ${baseName}…`,
-            cancellable: true,
-        },
-        async (_progress, token) => {
-            const result = await runKnit({
-                rBinary,
-                expression,
-                cwd,
-                timeoutMs,
-                output,
-                cancellation: token,
-            });
-
-            if (result.spawnError) {
-                const code = result.spawnError.code;
-                if (code === 'ENOENT') {
-                    output.appendLine(`[error] R not found at "${rBinary}".`);
-                    await vscode.window.showErrorMessage(
-                        'Raven: Knit — R not found on PATH. Set `raven.packages.rPath`.',
-                    );
-                } else {
-                    output.appendLine(`[error] ${result.spawnError.message}`);
-                    await vscode.window.showErrorMessage(
-                        `Raven: Knit — failed to launch R: ${result.spawnError.message}`,
-                    );
-                }
-                return;
-            }
-
-            if (result.cancelled) {
-                output.appendLine('Knit cancelled.');
-                await vscode.window.showInformationMessage('Raven: Knit cancelled.');
-                return;
-            }
-
-            if (result.timedOut) {
-                output.appendLine(`Knit timed out after ${timeoutMs} ms.`);
-                output.show(true);
-                await vscode.window.showErrorMessage('Raven: Knit timed out.');
-                return;
-            }
-
-            if (result.exitCode !== 0) {
-                output.show(true);
-                await vscode.window.showErrorMessage(
-                    `Raven: Knit failed (exit ${result.exitCode}). See Raven: Knit output.`,
-                );
-                return;
-            }
-
-            // rmarkdown::render's "Output created:" line is emitted
-            // via R's `message()`, which writes to stderr. Older
-            // configurations / future versions could route it to stdout,
-            // so we parse both streams to stay robust.
-            const parsedOutputs = parseRenderedOutputPath(
-                result.stdout + '\n' + result.stderr,
-            ).paths;
-            if (parsedOutputs.length === 0) {
-                const SHOW = 'Show Output';
-                const choice = await vscode.window.showInformationMessage(
-                    'Raven: Knit succeeded (output path unknown).',
-                    SHOW,
-                );
-                if (choice === SHOW) output.show(true);
-                return;
-            }
-            // Resolve any relative `Output created:` path against the
-            // subprocess cwd we passed (or the document directory when
-            // `current` mode is in effect with no workspace open). The
-            // input file is always absolute, so rmarkdown normally
-            // prints absolute paths and `absolutizeFromCwd` short-
-            // circuits via `path.isAbsolute`.
-            const base = cwd ?? path.dirname(fsPath);
-            const primary = absolutizeFromCwd(parsedOutputs[0], base);
-            const OPEN = 'Open';
-            const SHOW_ALL = 'Show All';
-            const buttons = parsedOutputs.length > 1 ? [OPEN, SHOW_ALL] : [OPEN];
-            const baseLabel = path.basename(primary);
-            const choice = await vscode.window.showInformationMessage(
-                parsedOutputs.length > 1
-                    ? `Raven: Knit succeeded: ${baseLabel} (and ${parsedOutputs.length - 1} more).`
-                    : `Raven: Knit succeeded: ${baseLabel}.`,
-                ...buttons,
-            );
-            if (choice === OPEN) await revealKnitOutput(primary);
-            else if (choice === SHOW_ALL) output.show(true);
-        },
-    );
+        outcome = await vscode.window.withProgress<KnitOutcome>(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: `Knitting ${baseName}…`,
+                cancellable: true,
+            },
+            async (_progress, token) => {
+                const result = await deps.runKnit({
+                    rBinary,
+                    expression,
+                    cwd,
+                    timeoutMs,
+                    output,
+                    cancellation: token,
+                });
+                return classify(result, { cwd });
+            },
+        );
     } finally {
+        // Critical: inFlight.delete runs the moment withProgress resolves,
+        // BEFORE any user-facing toast is awaited. This is the Piece A
+        // fix — under the previous code, awaiting showInformationMessage
+        // inside the withProgress callback held both the progress
+        // notification AND the inFlight gate open until the user
+        // dismissed the toast, causing a spurious "already being knitted"
+        // on rapid re-invocation.
         inFlight.delete(fsPath);
     }
+
+    await renderOutcome(outcome, {
+        fsPath,
+        baseName,
+        sourceUri: docUri,
+        cwd,
+        output,
+        rBinary,
+        timeoutMs,
+        context,
+        showOrUpdatePanel: deps.showOrUpdatePanel,
+    });
+}
+
+interface RenderOutcomeCtx {
+    fsPath: string;
+    baseName: string;
+    sourceUri: vscode.Uri;
+    cwd: string | undefined;
+    output: vscode.OutputChannel;
+    rBinary: string;
+    timeoutMs: number;
+    context: vscode.ExtensionContext;
+    showOrUpdatePanel: KnitDeps['showOrUpdatePanel'];
+}
+
+/**
+ * Surface the result of a knit to the user. Runs OUTSIDE the
+ * `vscode.window.withProgress` callback so that the progress
+ * notification closes the moment the R subprocess exits, regardless of
+ * how long the user takes to dismiss the success/failure toast.
+ */
+async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promise<void> {
+    if (outcome.kind === 'spawnError') {
+        const code = outcome.error.code;
+        if (code === 'ENOENT') {
+            ctx.output.appendLine(`[error] R not found at "${ctx.rBinary}".`);
+            void vscode.window.showErrorMessage(
+                'Raven: Knit — R not found on PATH. Set `raven.packages.rPath`.',
+            );
+        } else {
+            ctx.output.appendLine(`[error] ${outcome.error.message}`);
+            void vscode.window.showErrorMessage(
+                `Raven: Knit — failed to launch R: ${outcome.error.message}`,
+            );
+        }
+        return;
+    }
+
+    if (outcome.kind === 'cancelled') {
+        ctx.output.appendLine('Knit cancelled.');
+        void vscode.window.showInformationMessage('Raven: Knit cancelled.');
+        return;
+    }
+
+    if (outcome.kind === 'timedOut') {
+        ctx.output.appendLine(`Knit timed out after ${ctx.timeoutMs} ms.`);
+        ctx.output.show(true);
+        void vscode.window.showErrorMessage('Raven: Knit timed out.');
+        return;
+    }
+
+    if (outcome.kind === 'failed') {
+        ctx.output.show(true);
+        void vscode.window.showErrorMessage(
+            `Raven: Knit failed (exit ${outcome.exitCode}). See Raven: Knit output.`,
+        );
+        return;
+    }
+
+    if (outcome.kind === 'noOutput') {
+        const SHOW = 'Show Output';
+        const choice = await vscode.window.showInformationMessage(
+            'Raven: Knit succeeded (output path unknown).',
+            SHOW,
+        );
+        if (choice === SHOW) ctx.output.show(true);
+        return;
+    }
+
+    // ok branch — multi-output handling prefers HTML.
+    const base = outcome.cwd ?? path.dirname(ctx.fsPath);
+    const absolutized = outcome.parsedOutputs.map((p) => absolutizeFromCwd(p, base));
+    const primary = pickPrimaryOutput(absolutized);
+    if (!primary) {
+        // Defensive — classify guarantees parsedOutputs.length >= 1 for 'ok'.
+        void vscode.window.showInformationMessage('Raven: Knit succeeded.');
+        return;
+    }
+
+    const ext = path.extname(primary).toLowerCase();
+    const baseLabel = path.basename(primary);
+    const isHtml = ext === '.html' || ext === '.htm';
+    const SHOW_ALL = 'Show All';
+    const SHOW_PANEL = 'Show Output Panel';
+    const OPEN = 'Open';
+
+    if (isHtml) {
+        const panelResult = await ctx.showOrUpdatePanel(ctx.context, {
+            sourceUri: ctx.sourceUri,
+            outputPath: primary,
+            output: ctx.output,
+        });
+        if (!panelResult.ok) {
+            ctx.output.appendLine(`[panel] ${panelResult.error}`);
+            // Fall through to the non-HTML reveal path.
+            void revealKnitOutput(primary);
+            return;
+        }
+        const buttons = absolutized.length > 1 ? [SHOW_PANEL, SHOW_ALL] : [SHOW_PANEL];
+        const label = absolutized.length > 1
+            ? `Raven: Knit succeeded: ${baseLabel} (and ${absolutized.length - 1} more).`
+            : `Raven: Knit succeeded: ${baseLabel}.`;
+        const choice = await vscode.window.showInformationMessage(label, ...buttons);
+        if (choice === SHOW_PANEL) {
+            // Idempotent re-reveal; same rootDir → reuses the panel.
+            await ctx.showOrUpdatePanel(ctx.context, {
+                sourceUri: ctx.sourceUri,
+                outputPath: primary,
+                output: ctx.output,
+            });
+        } else if (choice === SHOW_ALL) {
+            ctx.output.show(true);
+        }
+        return;
+    }
+
+    // Non-HTML: PDF, Word, plain text, etc.
+    const buttons = absolutized.length > 1 ? [OPEN, SHOW_ALL] : [OPEN];
+    const label = absolutized.length > 1
+        ? `Raven: Knit succeeded: ${baseLabel} (and ${absolutized.length - 1} more).`
+        : `Raven: Knit succeeded: ${baseLabel}.`;
+    const choice = await vscode.window.showInformationMessage(label, ...buttons);
+    if (choice === OPEN) await revealKnitOutput(primary);
+    else if (choice === SHOW_ALL) ctx.output.show(true);
+}
+
+/**
+ * Test-only entry point that bypasses the registered `raven.knit`
+ * command. Exposes the same code path with caller-controlled deps.
+ * Used by `knit-progress-lifecycle.test.ts` to verify the Piece A
+ * invariant: `inFlight.delete` runs the moment `withProgress` resolves,
+ * NOT when the user dismisses the success toast.
+ *
+ * The `__` prefix signals "test-only"; do not call from production
+ * code.
+ */
+export async function __runKnitCommandForTest(args: {
+    uri: vscode.Uri | undefined;
+    output: vscode.OutputChannel;
+    inFlight: Set<string>;
+    context: vscode.ExtensionContext;
+    deps: KnitDeps;
+}): Promise<void> {
+    await runKnitCommand(args.uri, args.output, args.inFlight, args.context, args.deps);
 }
 
 interface KnitDirOk {
@@ -417,12 +534,13 @@ async function showBlocker(blocker: Blocker, fsPath: string): Promise<void> {
     }
 }
 
+/**
+ * Reveal non-HTML knit output. HTML outputs route through the Knit
+ * Output webview panel instead (see `renderOutcome`). PDFs / Word docs
+ * / etc. open via the OS file browser — the user double-clicks to
+ * launch their preferred reader.
+ */
 async function revealKnitOutput(outputPath: string): Promise<void> {
     const uri = vscode.Uri.file(outputPath);
-    const ext = path.extname(outputPath).toLowerCase();
-    if (ext === '.html' || ext === '.htm') {
-        await vscode.commands.executeCommand('vscode.open', uri);
-        return;
-    }
     await vscode.commands.executeCommand('revealFileInOS', uri);
 }
