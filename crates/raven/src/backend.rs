@@ -9875,6 +9875,106 @@ mod project_config_initialize_tests {
         DidChangeConfigurationParams, InitializeParams, Url, WorkspaceFolder,
     };
 
+    /// Regression for #281: an explicit client `enabled = false` must
+    /// remain off even when discovery picks up a `.lintr` from the
+    /// workspace (or an ancestor — same code path). Pre-fix, the `.lintr`
+    /// loader injected `enabled = true` into the project layer, which won
+    /// at the merge step over the client value.
+    #[tokio::test]
+    async fn initialize_client_false_overrides_lintr_discovery() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            !state.lint_config.enabled,
+            "client enabled=false must win over .lintr discovery (#281)"
+        );
+    }
+
+    /// Default client `"auto"` + a discovered `.lintr` resolves to on,
+    /// preserving the implicit opt-in users had before #281.
+    #[tokio::test]
+    async fn initialize_auto_with_lintr_resolves_on() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto" }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            state.lint_config.enabled,
+            "auto + .lintr discovered must resolve to on (#281)"
+        );
+        assert_eq!(state.lint_config.line_length, 120);
+    }
+
+    /// Default client `"auto"` with no project config → off.
+    #[tokio::test]
+    async fn initialize_auto_no_project_resolves_off() {
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto" }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            !state.lint_config.enabled,
+            "auto + no project config must resolve to off"
+        );
+    }
+
     #[tokio::test]
     async fn initialize_loads_raven_toml_from_workspace_root() {
         let tmp = TempDir::new().unwrap();
