@@ -5895,46 +5895,65 @@ fn collect_identifier_usages_utf16<'a>(
 /// comment-only), walk back within `lower_bound..=raw_row` to the last line
 /// with non-comment, non-whitespace content and anchor at end-of-line there so
 /// the diagnostic squiggle lands on the offending expression. See issue #286.
+///
+/// `raw_byte` is the global byte offset of `(raw_row, raw_col)` — i.e.
+/// `node.start_byte()` from the caller. Tree-sitter reports `column` as bytes
+/// within the line, so `raw_byte - raw_col` is the byte offset where line
+/// `raw_row` begins. That lets us locate the starting line in O(1) and walk
+/// backward via `rfind('\n')`, touching only the bytes of lines we actually
+/// visit — far better than re-scanning the prefix of `text` for every call,
+/// which would be linear in file size even when the offending code line is
+/// just a few rows above the MISSING.
 fn anchor_missing_position(
     raw_row: usize,
     raw_col: usize,
     lower_bound: usize,
+    raw_byte: usize,
     text: &str,
 ) -> (u32, u32) {
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    // Materialize lines `0..=raw_row` up front. Calling `text.lines().nth(row)`
-    // per iteration of the backwards walk is O(row) each, making the scan
-    // O(N²) on large files with long runs of blank/comment-only lines before
-    // a top-level MISSING token (see lower_bound=0 caller).
-    let lines: Vec<&str> = text.lines().take(raw_row.saturating_add(1)).collect();
-    let line_at = |row: usize| -> &str { lines.get(row).copied().unwrap_or("") };
     let is_code_line = |s: &str| {
         let t = s.trim_start();
         !t.is_empty() && !t.starts_with('#')
     };
 
-    if is_code_line(line_at(raw_row)) {
+    let raw_line_start = raw_byte.saturating_sub(raw_col).min(text.len());
+    let raw_line_end = text[raw_line_start..]
+        .find('\n')
+        .map(|i| raw_line_start + i)
+        .unwrap_or(text.len());
+    let raw_line = &text[raw_line_start..raw_line_end];
+
+    if is_code_line(raw_line) {
         return (
             raw_row as u32,
-            byte_offset_to_utf16_column(line_at(raw_row), raw_col),
+            byte_offset_to_utf16_column(raw_line, raw_col),
         );
     }
 
     let lower = lower_bound.min(raw_row);
     let mut r = raw_row;
-    while r > lower {
+    let mut cur_start = raw_line_start;
+    while r > lower && cur_start > 0 {
+        // Byte `cur_start - 1` is the `\n` terminating the previous line.
+        let prev_line_end = cur_start - 1;
+        let prev_line_start = text[..prev_line_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_line = &text[prev_line_start..prev_line_end];
         r -= 1;
-        if is_code_line(line_at(r)) {
-            let line = line_at(r);
-            let trimmed_len = line.trim_end().len();
-            return (r as u32, byte_offset_to_utf16_column(line, trimmed_len));
+        if is_code_line(prev_line) {
+            let trimmed_len = prev_line.trim_end().len();
+            return (r as u32, byte_offset_to_utf16_column(prev_line, trimmed_len));
         }
+        cur_start = prev_line_start;
     }
 
     (
         raw_row as u32,
-        byte_offset_to_utf16_column(line_at(raw_row), raw_col),
+        byte_offset_to_utf16_column(raw_line, raw_col),
     )
 }
 
@@ -6158,6 +6177,7 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
             missing.start_position().row,
             missing.start_position().column,
             node.start_position().row,
+            missing.start_byte(),
             text,
         );
         return Range {
@@ -6290,6 +6310,7 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
             node.start_position().row,
             node.start_position().column,
             0,
+            node.start_byte(),
             text,
         );
         let message = if is_string_quote_kind(node.kind()) {
