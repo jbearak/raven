@@ -3,7 +3,7 @@
 **Status**: Design.
 **Date**: 2026-05-17.
 **Branch**: `further-improve-knit`.
-**Amends**: [`2026-05-17-knit-output-webview-design.md`](2026-05-17-knit-output-webview-design.md) — supersedes the singleton paragraphs of that spec (the non-goal "A multi-tab 'history' of past knits. The panel is a singleton…" and the "Singleton: one panel per VS Code window" doc comment). Everything else in the 2026-05-17 spec (iframe-sandbox shell, CSP, progress-lifecycle fix, message protocol, security model) is unchanged.
+**Amends**: [`2026-05-17-knit-output-webview-design.md`](2026-05-17-knit-output-webview-design.md) — supersedes the singleton paragraphs of that spec (the non-goal "A multi-tab 'history' of past knits. The panel is a singleton…" and the "Singleton: one panel per VS Code window" doc comment). The CSP `<head>` placement, `localResourceRoots` confinement, progress-lifecycle fix, and `pickPrimaryOutput` semantics from the 2026-05-17 spec are unchanged. The sandbox attribute (`allow-same-origin`, not `""`), the loading mechanism (`srcdoc` + `<base href>` + a narrow fragment-anchor rewrite, not iframe `src`), and the message protocol (three typed messages plus two diagnostic-only messages, not two) all diverged from the prior spec's text during implementation; this spec describes what is actually in the code today and treats those as authoritative. See "Security model" and "Per-instance behavior" below.
 
 ## Why this spec exists
 
@@ -167,7 +167,7 @@ The dispose handler captures the instance it was registered for (closure over `i
 
 - The constructor captures `context`, `panel`, `rootDir`, `sourceUri`, `outputPath`, `output` exactly as today.
 - `updateContent` regenerates the shell HTML each call. Title is `Knit Output: ${path.basename(outputPath)}` — same as today, which already disambiguates panels in the tab strip.
-- `handleMessage` dispatches three message types against the captured `sourceUri` / `outputPath` of *that* instance: `{type: 'refresh'}`, `{type: 'openInBrowser'}`, `{type: 'themeChanged', applied: boolean}`. No registry lookups. The `themeChanged` message updates the global theme preference (see below) and is *not* documented in the prior spec's protocol section (which lists only `refresh` / `openInBrowser`); it was added in `4270fc8 feat(knit): fix white iframe + overhaul panel UX`. This spec treats the implemented three-message protocol as authoritative.
+- `handleMessage` dispatches three typed message types against the captured `sourceUri` / `outputPath` of *that* instance: `{type: 'refresh'}`, `{type: 'openInBrowser'}`, `{type: 'themeChanged', applied: boolean}`. No registry lookups. The `themeChanged` message updates the global theme preference (see below) and is *not* documented in the prior spec's protocol section (which lists only `refresh` / `openInBrowser`); it was added in `4270fc8 feat(knit): fix white iframe + overhaul panel UX`. The webview shell additionally posts `{type: 'iframeProbe', …}` and `{type: 'cspViolation', …}` messages for in-iframe load diagnostics and CSP-violation surfacing. These are *not* members of `KnitOutputMessage` and `isKnitOutputMessage` returns false for them, so the extension-side handler silently drops them. They exist only so tests / future telemetry can observe iframe state via a dedicated listener; the per-file-panel work does not touch them. This spec treats the implemented three-typed-message + two-diagnostic-message protocol as authoritative.
 - Theme preference is global (lives in `context.globalState`, key `raven.knit.applyVSCodeTheme`). Changing the toggle on one panel does not retro-apply to other open panels in this session — applies on the next `updateContent` (i.e. the next knit of that file). Documented as the intentional shape, mirroring how the existing singleton already behaves across knits.
 
 ## Edge cases
@@ -191,7 +191,11 @@ Each panel reuses the three-layer model already implemented in `knit-output-pane
 2. **Outer-shell CSP** in `<head>` — `default-src 'none'`, `frame-src ${cspSource}`, `script-src 'nonce-${nonce}'`, `connect-src 'none'`.
 3. **`localResourceRoots`** confined to *that panel's* `path.dirname(outputPath)`. Two panels for `A.Rmd` and `B.Rmd` whose outputs live in different directories receive different roots — neither can resolve resources from the other's directory.
 
-**Loading mechanism** (also unchanged from the implementation, but worth restating because the prior spec is imprecise): the rendered HTML is read from disk via `fs.readFileSync` and embedded as `srcdoc` on the iframe, with a `<base href>` set to the webview URI of the output's directory so relative subresources resolve through `localResourceRoots`. This is *not* iframe `src` loading; the prior spec's `src="${asWebviewUri(outputPath)}"` text described a design that was changed during implementation to work around nested-iframe navigation issues with `webview.asWebviewUri`. The security properties (sandbox + CSP + roots) hold for srcdoc the same way they hold for src.
+**Loading mechanism** (also unchanged from the implementation, but worth restating because the prior spec is imprecise): the rendered HTML is read from disk via `fs.readFileSync`, run through `rewriteFragmentAnchors` (see below), and embedded as `srcdoc` on the iframe, with a `<base href>` set to the webview URI of the output's directory so relative subresources resolve through `localResourceRoots`. This is *not* iframe `src` loading; the prior spec's `src="${asWebviewUri(outputPath)}"` text described a design that was changed during implementation to work around nested-iframe navigation issues with `webview.asWebviewUri`.
+
+**`rewriteFragmentAnchors`** is a single targeted regex rewrite that only touches `<a href="#frag">` attribute values, replacing them with `<a href="about:srcdoc#frag">`. It is required because the `<base href>` we inject — needed for relative subresources — would otherwise turn intra-document fragment clicks into full document navigations, which fail in the nested-frame setup. The rewrite is documented in detail on the function itself (`knit-output.ts:583-618`) including the *intentionally* unrewritten cases (`href="page.html#x"`, empty/`"#"` hrefs, non-`<a>` elements, hrefs containing `<`/`>`/whitespace).
+
+Security implication: the prior spec disfavored Raven-side HTML rewriting because a *general* rewriter that misses cases could re-serialize untrusted HTML through Raven's hands. `rewriteFragmentAnchors` is narrow enough that the failure mode is "TOC anchor falls back to a no-op navigation," not script-execution. The sandbox + CSP + `localResourceRoots` stack still governs everything the iframe does, regardless of whether the rewrite succeeds or partially fails on adversarial input. This spec does not change the rewriter; it is documented here so future maintainers do not "discover" it and undo it.
 
 ## Error handling
 
@@ -229,31 +233,46 @@ No changes. `knit-output-shell.test.ts`, `knit-output-message.test.ts`, `knit-ou
 
 - **`knit-multi-panel.test.ts`** — knit `A.Rmd`, knit `B.Rmd` (with outputs under distinct directories). Assert:
   - `getInstancesForTesting().size === 2`;
-  - both panels share `viewColumn === previewColumn`;
-  - A's and B's panels have *distinct* `webview.options.localResourceRoots`, each containing only its own output directory (per-panel isolation claim);
-  - re-knit `A.Rmd` and assert `instances.size === 2` still (no new panel for the same key) and that A's panel reference is identical to the pre-existing one.
-- **`knit-preview-column.test.ts`** — knit `A.Rmd`, capture the column VS Code assigned, dispose A's panel; knit `B.Rmd`, assert it opens in `ViewColumn.Beside` (preview column was reset on Map-empty). Then knit `A.Rmd` again and assert A's new panel lands in B's column (the new preview column).
-- **`knit-rootdir-change.test.ts`** — knit `A.Rmd` so its output lives under `/tmp/dir1/`. Assert the panel's `localResourceRoots` contains `/tmp/dir1`. Re-invoke `showOrUpdate` with the *same* sourceUri but an `outputPath` under `/tmp/dir2/`. Assert: the original panel is disposed (the `WebviewPanel` reference observed earlier is now disposed), a new panel exists for the same key, the new panel's `localResourceRoots` contains `/tmp/dir2`, the new panel's `viewColumn` matches the old panel's `viewColumn`, and `instances.size === 1`. This is the highest-risk lifecycle branch and was previously only manually smoked.
-- **`knit-recompute-preview-column.test.ts`** — unit test for `recomputePreviewColumn` driven through a test-only harness that injects fake instances with controlled `viewColumn` values. Cases:
-  - empty Map → `previewColumn = undefined`;
-  - one panel in column X, `previewColumn` was X → stays X;
-  - one panel in column X, `previewColumn` was Y (no panels at Y) → adopts X;
-  - two panels split between X and Y, `previewColumn` was X → stays X;
-  - two panels, both move to Z, `previewColumn` was X → adopts Z.
+  - both `getPanelForTesting().viewColumn` values equal `getPreviewColumnForTesting()`;
+  - A's and B's `getPanelForTesting().webview.options.localResourceRoots` are *distinct*, each containing only its own output directory (per-panel isolation claim);
+  - re-knit `A.Rmd` and assert `instances.size === 2` still (no new panel for the same key) and that the `WebviewPanel` reference from `getPanelForTesting()` is identical to the pre-existing one.
+- **`knit-preview-column.test.ts`** — knit `A.Rmd`, capture the column VS Code assigned via `getPreviewColumnForTesting()`, dispose A's panel via `disposeAllForTesting()`; knit `B.Rmd`, assert it opens in `ViewColumn.Beside` (preview column was reset on Map-empty). Then knit `A.Rmd` again and assert A's new panel lands in B's column (the new preview column).
+- **`knit-rootdir-change.test.ts`** — knit `A.Rmd` so its output lives under `/tmp/dir1/`. Assert `getPanelForTesting().webview.options.localResourceRoots` contains `/tmp/dir1`. Re-invoke `showOrUpdate` with the *same* sourceUri but an `outputPath` under `/tmp/dir2/`. Assert: the original `WebviewPanel` reference observed earlier no longer matches what `getInstancesForTesting().get(key)?.getPanelForTesting()` returns (it has been disposed and replaced); the new panel's `localResourceRoots` contains `/tmp/dir2`; the new panel's `viewColumn` matches the captured old `viewColumn`; `instances.size === 1`. This is the highest-risk lifecycle branch and was previously only manually smoked.
+- **`knit-recompute-preview-column.test.ts`** — unit test for `recomputePreviewColumn` driven via `setInstancesForTesting(fakes)` + `setPreviewColumnForTesting(col)` + `recomputePreviewColumnForTesting()`. Cases (each starts with `disposeAllForTesting()` to reset state):
+  - empty fakes, previewColumn = One → previewColumn becomes undefined;
+  - one fake in One, previewColumn = One → stays One;
+  - one fake in One, previewColumn = Two (no fakes at Two) → adopts One;
+  - two fakes split (One, Two), previewColumn = One → stays One;
+  - two fakes both in Three, previewColumn = One → adopts Three.
   Drives the panel-drag scenario without needing VS Code to simulate a real drag.
 
-Test-only statics on `KnitOutputPanel`:
+### Test-only API on `KnitOutputPanel`
+
+The new tests require accessors that the production interface does not expose. All are gated by name suffix `…ForTesting`, mirroring the existing `disposeForTesting` / `getInstanceForTesting` conventions:
 
 ```ts
-static getInstancesForTesting(): ReadonlyMap<string, KnitOutputPanel> { return KnitOutputPanel.instances; }
-static getPreviewColumnForTesting(): vscode.ViewColumn | undefined { return KnitOutputPanel.previewColumn; }
-static disposeAllForTesting(): void {
-    for (const inst of [...KnitOutputPanel.instances.values()]) inst.panel.dispose();
-    KnitOutputPanel.previewColumn = undefined;
-}
+// Registry inspection.
+static getInstancesForTesting(): ReadonlyMap<string, KnitOutputPanel>;
+static getPreviewColumnForTesting(): vscode.ViewColumn | undefined;
+static disposeAllForTesting(): void;
+
+// Per-instance inspection — needed because `panel` and its `webview.options`
+// are private. Returns the underlying objects so tests can assert on
+// viewColumn and localResourceRoots without unsafe casts.
+getPanelForTesting(): vscode.WebviewPanel;
+getRootDirForTesting(): string;
+
+// Recompute driver — enables knit-recompute-preview-column.test.ts to
+// exercise the column-tracking state machine through controlled fake
+// instances rather than relying on VS Code to simulate a real drag.
+static setInstancesForTesting(fakes: ReadonlyArray<{ key: string; viewColumn: vscode.ViewColumn | undefined }>): void;
+static recomputePreviewColumnForTesting(): void;
+static setPreviewColumnForTesting(col: vscode.ViewColumn | undefined): void;
 ```
 
-The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed and updated. Callers in the test suite update accordingly.
+`setInstancesForTesting` installs lightweight stand-ins (objects shaped like `{ panel: { viewColumn } }`) into the static `instances` Map, bypassing real `createWebviewPanel`. The recompute logic only reads `inst.panel.viewColumn`, so duck-typing is sufficient. `disposeAllForTesting` clears the Map and `previewColumn` regardless of how entries were inserted (real or fake), so production tests can interleave with recompute tests.
+
+The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed (`disposeAllForTesting` / `getInstancesForTesting`) and the existing test callers update accordingly.
 
 ### Manual smoke
 
@@ -274,6 +293,16 @@ The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed and u
 
 1. **`onDidChangeViewState` cost** — fires on every visibility / state change, not just column moves. The handler does an O(n) Map walk; with realistic n ≤ ~10, the overhead is negligible. If users report panel-switching jank with many panels, debounce or compare against a cached column before walking.
 2. **Tab grouping (drag-as-group)** — VS Code does not expose programmatic tab grouping. Users can manually group knit panels via the tab-strip context menu. Out of scope.
+
+## v2 → v3 changes (response to second Codex pass)
+
+| Codex finding | v3 disposition |
+| --            | --             |
+| #1 Header "unchanged" framing contradicts the patched sandbox/protocol/loading details | Header rewritten to enumerate what is *actually* unchanged (CSP placement, `localResourceRoots`, progress-lifecycle fix, `pickPrimaryOutput`) and what diverged (sandbox attribute, loading mechanism, message protocol), with pointers to the relevant sections. |
+| #2 `iframeProbe` / `cspViolation` messages omitted | Per-instance behavior section now documents both diagnostic messages, notes they are *not* members of `KnitOutputMessage`, and notes `isKnitOutputMessage` silently drops them at the extension boundary. |
+| #3 `rewriteFragmentAnchors` step omitted from loading-mechanism description | New paragraph documents the rewriter, its narrow surface (regex on `<a href="#…">` only), the intentional non-rewrite cases, and why "narrow rewrite for fragment-only anchors" is safe in a way "general HTML rewriter" is not. |
+| #4 `recomputePreviewColumn` test seam missing | Test-only API section adds `setInstancesForTesting`, `recomputePreviewColumnForTesting`, `setPreviewColumnForTesting`. The recompute test now exercises the state machine directly without VS Code drag simulation. |
+| #5 `panel` / `localResourceRoots` test access undefined | Test-only API section adds `getPanelForTesting()` / `getRootDirForTesting()` on the instance so tests can read `viewColumn` and `webview.options.localResourceRoots` without unsafe casts. The three new tests' assertions are rewritten to use these accessors explicitly. |
 
 ## v1 → v2 changes (response to Codex adversarial review)
 
