@@ -422,37 +422,41 @@
         {
           "command": "raven.runCurrentChunk",
           "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "2_chunk@1"
+          "group": "2_chunk_current@1"
         },
         {
           "command": "raven.runCurrentChunkAndMove",
           "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "2_chunk@2"
+          "group": "2_chunk_current@2"
         },
         {
           "command": "raven.runAboveChunks",
           "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "2_chunk@3"
+          "group": "3_chunk_directional@1"
+        },
+        {
+          "command": "raven.runBelowChunks",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "group": "3_chunk_directional@2"
         },
         {
           "command": "raven.runAllChunks",
           "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "2_chunk@4"
-        },
-        {
-          "command": "raven.sourceFile",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "3_file@1"
+          "group": "4_file@1"
         },
         {
           "command": "raven.knit",
           "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
-          "group": "3_file@2"
+          "group": "4_file@2"
+        },
+        {
+          "command": "raven.sourceFile",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "group": "4_file@3"
         },
         {
           "submenu": "raven.sendToR.terminal",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "4_terminal"
+          "group": "5_terminal"
         }
       ],
       "raven.sendToR.terminal": [
@@ -462,14 +466,17 @@
         },
         {
           "command": "raven.terminal.runUpwardLines",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
           "group": "1_run@2"
         },
         {
           "command": "raven.terminal.runDownwardLines",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
           "group": "1_run@3"
         },
         {
           "command": "raven.terminal.sourceFile",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
           "group": "2_file@1"
         }
       ]

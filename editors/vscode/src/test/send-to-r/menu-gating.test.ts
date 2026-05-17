@@ -128,6 +128,7 @@ suite('Send to R submenu: editor-title gating', () => {
             'raven.runCurrentChunk',
             'raven.runCurrentChunkAndMove',
             'raven.runAboveChunks',
+            'raven.runBelowChunks',
             'raven.runAllChunks',
         ]) {
             const entry = findCommand(entries, command);
@@ -159,17 +160,48 @@ suite('Send to R submenu: editor-title gating', () => {
         );
     });
 
-    test('Terminal submenu hides on .Rmd / .qmd', () => {
-        // The Terminal submenu sends to a generic terminal (tmux, Docker, …);
-        // the only terminal command that survives the .Rmd / .qmd cut would
-        // be Run Line or Selection, which is already in the parent menu. A
-        // single-item submenu is just noise, so the submenu reference itself
-        // is gated to plain `.R`.
+    test('Terminal submenu surfaces for every supported language', () => {
+        // The Terminal submenu sends to whatever terminal is currently
+        // active (tmux, Docker, …); it must stay reachable on .R, .Rmd,
+        // and .qmd. The auto-include and Source-File entries inside the
+        // submenu have their own gating — see the dedicated suite below.
         const pkg = loadPackageJson();
         const entries = pkg.contributes.menus['raven.sendToR'] ?? [];
         const submenu = findSubmenu(entries, 'raven.sendToR.terminal');
         assert.ok(submenu, 'raven.sendToR must reference the Terminal submenu');
-        assertHidesForRmdQmd(submenu, 'raven.sendToR.terminal submenu reference');
+        assert.strictEqual(
+            submenu.when,
+            undefined,
+            'raven.sendToR.terminal submenu reference must have no `when` clause',
+        );
+    });
+});
+
+suite('Send to R → Terminal submenu: editor-title gating', () => {
+    test('terminal auto-include and sourceFile entries hide on .Rmd / .qmd', () => {
+        const pkg = loadPackageJson();
+        const entries = pkg.contributes.menus['raven.sendToR.terminal'] ?? [];
+        for (const command of [
+            'raven.terminal.runUpwardLines',
+            'raven.terminal.runDownwardLines',
+            'raven.terminal.sourceFile',
+        ]) {
+            const entry = findCommand(entries, command);
+            assert.ok(entry, `raven.sendToR.terminal must contain ${command}`);
+            assertHidesForRmdQmd(entry, command);
+        }
+    });
+
+    test('Terminal: Run Line or Selection stays visible for every supported language', () => {
+        const pkg = loadPackageJson();
+        const entries = pkg.contributes.menus['raven.sendToR.terminal'] ?? [];
+        const entry = findCommand(entries, 'raven.terminal.runLineOrSelection');
+        assert.ok(entry, 'raven.sendToR.terminal must contain raven.terminal.runLineOrSelection');
+        assert.strictEqual(
+            entry.when,
+            undefined,
+            'raven.terminal.runLineOrSelection must have no `when` clause so it surfaces on .R, .Rmd, and .qmd alike',
+        );
     });
 });
 
