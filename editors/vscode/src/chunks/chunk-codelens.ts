@@ -11,11 +11,15 @@ import { CHUNK_LENS_COMMANDS } from './chunk-commands';
 const CODELENS_COMMANDS_SETTING = 'raven.chunks.codeLens.commands';
 
 /**
- * Default CodeLens menu — matches the pre-configuration behavior so existing
- * users see the same `▷ Run Chunk` and `↥ Run Above` buttons after upgrade.
+ * Default CodeLens menu — must mirror the `default` declared for
+ * `raven.chunks.codeLens.commands` in `editors/vscode/package.json`. This
+ * constant is only used as a last-resort fallback when the resolved setting
+ * isn't an array at all (i.e. corrupt state); the normal "unset" case is
+ * already covered by VS Code reading the package.json default.
  */
 const DEFAULT_LENS_COMMAND_IDS: readonly string[] = [
     'raven.runCurrentChunk',
+    'raven.runNextChunkAndMove',
     'raven.runAboveChunks',
 ];
 

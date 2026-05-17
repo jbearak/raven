@@ -13,7 +13,9 @@ const CHUNK_COMMANDS = [
     'raven.runCurrentAndBelowChunks',
     'raven.runBelowChunks',
     'raven.runPreviousChunk',
+    'raven.runPreviousChunkAndMove',
     'raven.runNextChunk',
+    'raven.runNextChunkAndMove',
     'raven.goToNextChunk',
     'raven.goToPreviousChunk',
     'raven.selectCurrentChunk',
@@ -598,6 +600,182 @@ suite('chunk commands: registration and behavior', () => {
         );
     });
 
+    // ── Issue #280: `…AndMove` variants run the next/previous chunk AND jump
+    // the cursor + viewport into the chunk that was just run.
+    test('runNextChunkAndMove runs the next chunk and moves the cursor into it', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runNextChunkAndMove');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 7); // inside the first R chunk ("setup")
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runNextChunkAndMove');
+        } finally {
+            term.restore();
+        }
+        // Next runnable chunk after "setup" is "second" (python is skipped):
+        // header at line 16, first body line at 17.
+        assert.ok(
+            payload_contains(term.sent, 'x <- 1') ||
+            payload_contains(term.sent, 'y <- 2'),
+            `expected "second" chunk body to reach terminal, got: ${captured_payload(term.sent).slice(0, 200)}`,
+        );
+        assert.strictEqual(
+            editor.selection.active.line,
+            17,
+            'cursor should land on the first body line of the just-run "second" chunk',
+        );
+    });
+
+    test('runPreviousChunkAndMove runs the previous chunk and moves the cursor into it', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runPreviousChunkAndMove');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 17); // inside the "second" R chunk
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runPreviousChunkAndMove');
+        } finally {
+            term.restore();
+        }
+        // Previous runnable chunk before "second" is "setup" (python is skipped):
+        // header at line 6, first body line at 7.
+        assert.ok(
+            payload_contains(term.sent, 'library(dplyr)'),
+            `expected "setup" chunk body to reach terminal, got: ${captured_payload(term.sent).slice(0, 200)}`,
+        );
+        assert.strictEqual(
+            editor.selection.active.line,
+            7,
+            'cursor should land on the first body line of the just-run "setup" chunk',
+        );
+    });
+
+    test('runNextChunkAndMove at end of document warns and does not move the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runNextChunkAndMove');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 22); // inside the last (noeval) chunk; no chunk below
+        const stub = stub_information_message();
+        try {
+            await vscode.commands.executeCommand('raven.runNextChunkAndMove');
+        } finally {
+            stub.restore();
+        }
+        assert.ok(
+            stub.last && stub.last.includes('no runnable chunk below'),
+            `expected "no runnable chunk below" info message, got: ${String(stub.last)}`,
+        );
+        assert.strictEqual(
+            editor.selection.active.line,
+            22,
+            'cursor should not move when there is no next runnable chunk',
+        );
+    });
+
+    test('runPreviousChunkAndMove at top of document warns and does not move the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runPreviousChunkAndMove');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 0); // before any chunk
+        const stub = stub_information_message();
+        try {
+            await vscode.commands.executeCommand('raven.runPreviousChunkAndMove');
+        } finally {
+            stub.restore();
+        }
+        assert.ok(
+            stub.last && stub.last.includes('no runnable chunk above'),
+            `expected "no runnable chunk above" info message, got: ${String(stub.last)}`,
+        );
+        assert.strictEqual(
+            editor.selection.active.line,
+            0,
+            'cursor should not move when there is no previous runnable chunk',
+        );
+    });
+
+    test('runNextChunk (legacy) does not move the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runNextChunk');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 7); // inside the first R chunk
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runNextChunk');
+        } finally {
+            term.restore();
+        }
+        assert.strictEqual(
+            editor.selection.active.line,
+            7,
+            'legacy runNextChunk must not move the cursor (backcompat)',
+        );
+    });
+
+    test('runNextChunkAndMove on an empty next chunk lands on the header (not the closing fence)', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runNextChunkAndMove');
+        if (r_console_disabled) return;
+        // Build a fixture whose next runnable chunk is empty. For an Rmd empty
+        // chunk, `header_line + 1` would land on the closing fence, which is
+        // structurally inside the chunk but a fragile cursor home. The helper
+        // should fall back to the header line itself.
+        const FIXTURE = [
+            '```{r first}',          // 0
+            'x <- 1',                // 1
+            '```',                   // 2
+            '',                      // 3
+            '```{r empty}',          // 4  ← next chunk, empty body
+            '```',                   // 5  ← closing fence
+            '',                      // 6
+        ].join('\n');
+        const editor = await open_doc(FIXTURE, 'rmd');
+        place_cursor(editor, 1); // inside "first"
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runNextChunkAndMove');
+        } finally {
+            term.restore();
+        }
+        // The empty chunk has no body to send; we still place the cursor on
+        // its header rather than the closing fence.
+        assert.strictEqual(
+            editor.selection.active.line,
+            4,
+            'cursor should land on the empty chunk\'s header, not the closing fence',
+        );
+    });
+
+    test('runPreviousChunk (legacy) does not move the cursor', async () => {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runPreviousChunk');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        place_cursor(editor, 17); // inside the "second" R chunk
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await vscode.commands.executeCommand('raven.runPreviousChunk');
+        } finally {
+            term.restore();
+        }
+        assert.strictEqual(
+            editor.selection.active.line,
+            17,
+            'legacy runPreviousChunk must not move the cursor (backcompat)',
+        );
+    });
+
     test('raven.chunks.codeLens.commands controls lens count and order', async function () {
         // Skip when R-console activation is disabled — the CodeLens provider is
         // only registered alongside the run commands.
@@ -639,6 +817,54 @@ suite('chunk commands: registration and behavior', () => {
                 lenses.length,
                 9,
                 `expected 9 lenses (3 R chunks × 3 buttons), got ${lenses.length}`,
+            );
+        } finally {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                previous,
+                vscode.ConfigurationTarget.Global,
+            );
+        }
+    });
+
+    test('default codeLens row shows ▷ Run Chunk → Run Next & Move ↥ Run Above', async function () {
+        // Issue #280: the out-of-the-box default lens row includes the new
+        // `→ Run Next & Move` button between `▷ Run Chunk` and `↥ Run Above`.
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runCurrentChunkAt');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        const config = vscode.workspace.getConfiguration();
+        const previous = config.inspect<string[]>('raven.chunks.codeLens.commands')?.globalValue;
+        try {
+            // Reset the global override so package.json's default is used.
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                undefined,
+                vscode.ConfigurationTarget.Global,
+            );
+            // 3 runnable R chunks × 3 default lenses = 9.
+            const lenses = await poll_for_lenses(
+                editor.document.uri,
+                (ls) => ls.length === 9,
+            );
+            assert.strictEqual(
+                lenses.length,
+                9,
+                `expected 9 default lenses (3 R chunks × 3 buttons), got ${lenses.length}`,
+            );
+            const first_three = lenses.slice(0, 3).map((l) => l.command?.title ?? '');
+            assert.ok(
+                first_three[0]?.startsWith('▷ Run Chunk'),
+                `default lens 1 should be Run Chunk, got: ${first_three[0]}`,
+            );
+            assert.ok(
+                first_three[1]?.startsWith('→ Run Next & Move'),
+                `default lens 2 should be Run Next & Move, got: ${first_three[1]}`,
+            );
+            assert.ok(
+                first_three[2]?.startsWith('↥ Run Above'),
+                `default lens 3 should be Run Above, got: ${first_three[2]}`,
             );
         } finally {
             await config.update(

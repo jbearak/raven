@@ -5,7 +5,7 @@ Raven recognizes R code chunks in R Markdown / Quarto documents and `# %%`-delim
 This is the daily-driver workflow for `.Rmd` / `.qmd` users coming from RStudio or vscode-R.
 
 > [!NOTE]
-> All chunk-related features — navigation commands (Go to Next/Previous Chunk, Select Current Chunk), chunk background highlighting and the active-cell indicator, `.R` cell mode (`# %%` markers and RStudio-style `# Section ----` dividers), the **run** commands (for example, Run Current Chunk, Run Above Chunks, Run All Chunks — see [Commands](#commands) for the full set), and every chunk CodeLens button (defaults `▷ Run Chunk` / `↥ Run Above`, plus any others added via `raven.chunks.codeLens.commands`) — are gated behind `raven.rConsole.activation`. The run commands and CodeLens additionally require Raven's R console because they create or reuse the R terminal Raven manages. If the R console is disabled (or `auto` defers to another R extension), none of these surfaces register, so REditorSupport / Positron handle chunks instead. See [Coexistence](./coexistence.md).
+> All chunk-related features — navigation commands (Go to Next/Previous Chunk, Select Current Chunk), chunk background highlighting and the active-cell indicator, `.R` cell mode (`# %%` markers and RStudio-style `# Section ----` dividers), the **run** commands (for example, Run Current Chunk, Run Above Chunks, Run All Chunks — see [Commands](#commands) for the full set), and every chunk CodeLens button (defaults `▷ Run Chunk` / `→ Run Next & Move` / `↥ Run Above`, plus any others added via `raven.chunks.codeLens.commands`) — are gated behind `raven.rConsole.activation`. The run commands and CodeLens additionally require Raven's R console because they create or reuse the R terminal Raven manages. If the R console is disabled (or `auto` defers to another R extension), none of these surfaces register, so REditorSupport / Positron handle chunks instead. See [Coexistence](./coexistence.md).
 
 ## Chunk forms
 
@@ -40,8 +40,10 @@ In `.R` files, `Cmd+Shift+Enter` keeps its usual meaning of **Source File** — 
 | **Run Above Chunks** | Runs every R chunk that ends before the cursor. The current chunk is not included. |
 | **Run Below Chunks** | Runs every R chunk whose header is strictly below the cursor. The current chunk is not included. |
 | **Run Current and Below Chunks** | Runs the chunk at the cursor plus every R chunk after it. |
-| **Run Previous Chunk** | Runs the R chunk immediately above the cursor (skipping non-R chunks). |
-| **Run Next Chunk** | Runs the R chunk immediately below the cursor (skipping non-R chunks). |
+| **Run Previous Chunk** | Runs the R chunk immediately above the cursor (skipping non-R chunks). The cursor does not move. |
+| **Run Previous Chunk and Move** | Runs the previous R chunk and moves the cursor into its first body line. Quarto's "Run Previous Chunk" behavior. |
+| **Run Next Chunk** | Runs the R chunk immediately below the cursor (skipping non-R chunks). The cursor does not move. |
+| **Run Next Chunk and Move** | Runs the next R chunk and moves the cursor into its first body line. Quarto's "Run Next Chunk" behavior. |
 | **Run All Chunks** | Runs every R chunk in the document, top to bottom. |
 | **Go to Next Chunk** | Moves the cursor to the body of the next R chunk. |
 | **Go to Previous Chunk** | Moves the cursor to the body of the previous R chunk. |
@@ -49,10 +51,10 @@ In `.R` files, `Cmd+Shift+Enter` keeps its usual meaning of **Source File** — 
 
 ## CodeLens buttons
 
-By default each R chunk header shows two buttons:
+By default each R chunk header shows three buttons:
 
 ```text
-▷ Run Chunk    ↥ Run Above
+▷ Run Chunk    → Run Next & Move    ↥ Run Above
 ```{r}
 …
 ```
@@ -69,7 +71,9 @@ The set of buttons (and their order) is controlled by `raven.chunks.codeLens.com
 | `raven.runBelowChunks` | `↧ Run Below` |
 | `raven.runCurrentAndBelowChunks` | `▷↓ Run Current and Below` |
 | `raven.runPreviousChunk` | `← Run Previous` |
+| `raven.runPreviousChunkAndMove` | `← Run Previous & Move` |
 | `raven.runNextChunk` | `→ Run Next` |
+| `raven.runNextChunkAndMove` | `→ Run Next & Move` |
 | `raven.runAllChunks` | `↻ Run All` |
 
 Example — show four buttons in a custom order:
