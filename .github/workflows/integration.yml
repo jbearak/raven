@@ -52,26 +52,25 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get install -y --no-install-recommends mold
 
-      # Build the release LSP binary (needed by vscode-mocha).
-      - name: Build LSP binary (release)
-        run: cargo build --release -p raven
-
       # Compile the debug test binary without running it. `--features
       # test-support` exposes `raven::test_utils` needed by
       # `performance_budgets`. The cargo test output prints the path to the
-      # compiled executable; we capture it and copy to a stable name.
-      - name: Compile test binary (debug)
+      # compiled executable; we capture it and copy to stable names.
+      # The same debug binary (`target/debug/raven`) is also used by the
+      # vscode-mocha job — debug is sufficient for correctness testing and
+      # compiles significantly faster than release.
+      - name: Compile (debug)
         run: |
           cargo test --no-run -p raven --features test-support 2>&1 | tee /tmp/cargo-test-build.txt
           TEST_BIN=$(grep -oE 'target/debug/deps/raven-[a-f0-9]+' /tmp/cargo-test-build.txt | head -1)
           echo "TEST_BIN=$TEST_BIN"
           cp "$TEST_BIN" target/raven-test
 
-      - name: Upload release binary
+      - name: Upload LSP binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: raven-release
-          path: target/release/raven
+          name: raven-debug
+          path: target/debug/raven
           retention-days: 1
 
       - name: Upload test binary
@@ -110,11 +109,11 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Download release binary
+      - name: Download LSP binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
         with:
-          name: raven-release
-          path: target/release/
+          name: raven-debug
+          path: target/debug/
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -196,7 +195,9 @@ jobs:
       - name: Bundle extension and place LSP binary
         working-directory: editors/vscode
         run: |
-          chmod +x "$GITHUB_WORKSPACE/target/release/raven"
+          mkdir -p bin
+          cp "$GITHUB_WORKSPACE/target/debug/raven" bin/raven
+          chmod +x bin/raven
           bun run vscode:prepublish
 
       - name: Compile tests
