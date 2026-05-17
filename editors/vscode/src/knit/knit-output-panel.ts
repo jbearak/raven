@@ -6,8 +6,8 @@ import { buildShellHtml, isKnitOutputMessage } from './knit-output';
 
 /**
  * Singleton webview panel that renders the most recent HTML knit output
- * inside an `<iframe sandbox="">` with Refresh and Open-in-Browser
- * toolbar buttons.
+ * inside an `<iframe sandbox="allow-same-origin">` with Refresh and
+ * Open-in-Browser toolbar buttons.
  *
  * See `docs/superpowers/specs/2026-05-17-knit-output-webview-design.md`.
  *
@@ -15,8 +15,14 @@ import { buildShellHtml, isKnitOutputMessage } from './knit-output';
  *  - Outer Raven-controlled shell document owns the CSP (in `<head>`),
  *    the toolbar, and a nonce'd `<script>` that posts messages.
  *  - Inner `<iframe>` loads the rendered HTML via
- *    `webview.asWebviewUri(outputPath)`. `sandbox=""` (empty, most
- *    restrictive) blocks scripts, forms, popups, and top-navigation.
+ *    `webview.asWebviewUri(outputPath)`. The sandbox blocks scripts,
+ *    forms, popups, and top-navigation. `allow-same-origin` is
+ *    required: VS Code serves `vscode-cdn.net` webview resources via
+ *    a service worker scoped to that origin, and a sandboxed iframe
+ *    with a unique opaque origin bypasses the service worker (Electron
+ *    falls back to DNS resolution, which fails with
+ *    `ERR_NAME_NOT_RESOLVED`). `allow-same-origin` re-enters the SW
+ *    scope without enabling scripts/forms.
  *    `frame-src ${cspSource}` on the outer CSP prevents iframe
  *    navigation to external hosts.
  *  - `localResourceRoots` is confined to `path.dirname(outputPath)`,
@@ -115,8 +121,10 @@ export class KnitOutputPanel {
         return instance;
     }
 
+    private readonly context: vscode.ExtensionContext;
+
     private constructor(
-        _context: vscode.ExtensionContext,
+        context: vscode.ExtensionContext,
         panel: vscode.WebviewPanel,
         rootDir: string,
         args: {
@@ -125,6 +133,7 @@ export class KnitOutputPanel {
             output: vscode.OutputChannel;
         },
     ) {
+        this.context = context;
         this.panel = panel;
         this.rootDir = rootDir;
         this.sourceUri = args.sourceUri;
@@ -143,16 +152,56 @@ export class KnitOutputPanel {
         this.sourceUri = args.sourceUri;
         this.outputPath = args.outputPath;
         const nonce = crypto.randomBytes(16).toString('base64');
-        const iframeSrc = this.panel.webview
-            .asWebviewUri(vscode.Uri.file(args.outputPath))
+        // Read the rendered HTML from disk; inlining via `srcdoc`
+        // bypasses the nested-iframe navigation issue (see
+        // buildShellHtml's doc comment).
+        let htmlContent: string;
+        try {
+            htmlContent = fs.readFileSync(args.outputPath, 'utf-8');
+        } catch (err) {
+            this.output.appendLine(
+                `[panel] read failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            htmlContent = '<!doctype html><html><body><p>Raven: Knit — '
+                + 'could not read the rendered output. Use Open in Browser instead.'
+                + '</p></body></html>';
+        }
+        // Subresources in the rendered HTML (CSS, images, fonts)
+        // resolve relative to the document's directory. Setting the
+        // base href to the webview URI for that directory makes those
+        // requests go through the outer webview's resource handler.
+        // The trailing slash is required so relative paths like
+        // `img.png` resolve to `${dir}/img.png` rather than replacing
+        // the last URL segment.
+        const baseHref = this.panel.webview
+            .asWebviewUri(vscode.Uri.file(path.dirname(args.outputPath) + path.sep))
             .toString();
         this.panel.webview.html = buildShellHtml({
-            iframeSrc,
+            htmlContent,
+            baseHref,
             cspSource: this.panel.webview.cspSource,
             outputPath: args.outputPath,
             nonce,
+            initialThemeApplied: KnitOutputPanel.readThemePreference(this.context),
         });
         this.panel.title = `Knit Output: ${path.basename(args.outputPath)}`;
+    }
+
+    /**
+     * Storage key for the "Apply VS Code theme" toggle. Lives in
+     * `globalState` so the choice persists across panel disposal /
+     * recreation, across knits, and across VS Code restarts.
+     */
+    private static readonly THEME_PREFERENCE_KEY = 'raven.knit.applyVSCodeTheme';
+
+    private static readThemePreference(context: vscode.ExtensionContext): boolean {
+        // `globalState` is undefined in some test paths that stub
+        // ExtensionContext with `{}`; treat that the same as
+        // "preference not yet stored" rather than crashing.
+        const gs = context.globalState as vscode.Memento | undefined;
+        if (!gs || typeof gs.get !== 'function') return false;
+        const v = gs.get<unknown>(KnitOutputPanel.THEME_PREFERENCE_KEY);
+        return typeof v === 'boolean' ? v : false;
     }
 
     private handleMessage(msg: unknown): void {
@@ -163,6 +212,13 @@ export class KnitOutputPanel {
         }
         if (msg.type === 'openInBrowser') {
             void openInBrowser(this.outputPath, this.output);
+            return;
+        }
+        if (msg.type === 'themeChanged') {
+            void this.context.globalState.update(
+                KnitOutputPanel.THEME_PREFERENCE_KEY,
+                msg.applied,
+            );
         }
     }
 }

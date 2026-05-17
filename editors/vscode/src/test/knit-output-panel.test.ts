@@ -125,4 +125,58 @@ suite('KnitOutputPanel integration', () => {
             output.dispose();
         }
     });
+
+    test('theme preference from globalState renders the button pressed', async () => {
+        // The toggle must persist across panel disposal/recreation:
+        // KnitOutputPanel.updateContent reads
+        // raven.knit.applyVSCodeTheme from globalState and threads
+        // it into buildShellHtml. With the preference set to true,
+        // the rendered shell HTML must reflect that initial state
+        // so users don't see a flicker on each knit.
+        await activate();
+        const output = vscode.window.createOutputChannel('Knit Test');
+        const stored: Record<string, unknown> = {
+            'raven.knit.applyVSCodeTheme': true,
+        };
+        const fakeGlobalState = {
+            get: <T>(key: string, defaultValue?: T) =>
+                (stored[key] as T) ?? defaultValue,
+            update: (key: string, value: unknown) => {
+                stored[key] = value;
+                return Promise.resolve();
+            },
+            keys: () => Object.keys(stored),
+            setKeysForSync: () => undefined,
+        } as unknown as vscode.Memento & { setKeysForSync(keys: readonly string[]): void };
+        const fakeContext = {
+            globalState: fakeGlobalState,
+            subscriptions: [],
+        } as unknown as vscode.ExtensionContext;
+        try {
+            const html = writeFixture(tmp, 'a.html');
+            const src = vscode.Uri.file(path.join(tmp, 'src.Rmd'));
+            const r = await KnitOutputPanel.showOrUpdate(
+                fakeContext,
+                { sourceUri: src, outputPath: html, output },
+            );
+            assert.deepStrictEqual(r, { ok: true });
+            const inst = KnitOutputPanel.getInstanceForTesting();
+            assert.ok(inst);
+            const panel = (inst as unknown as { panel: vscode.WebviewPanel }).panel;
+            assert.ok(
+                /<button[^>]*id="raven-knit-theme"[^>]*aria-pressed="true"/
+                    .test(panel.webview.html),
+                'theme button should render in pressed state when globalState has the toggle on',
+            );
+            // The button label stays constant; only aria-pressed
+            // flips, which is what CSS keys off for the visual
+            // active state.
+            assert.ok(
+                !panel.webview.html.includes('Use document theme'),
+                'button label should not switch (no document theme to switch back to)',
+            );
+        } finally {
+            output.dispose();
+        }
+    });
 });

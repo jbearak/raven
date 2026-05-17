@@ -365,7 +365,6 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
     const baseLabel = path.basename(primary);
     const isHtml = ext === '.html' || ext === '.htm';
     const SHOW_ALL = 'Show All';
-    const SHOW_PANEL = 'Show Output Panel';
     const OPEN = 'Open';
 
     if (isHtml) {
@@ -380,20 +379,20 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
             void revealKnitOutput(primary);
             return;
         }
-        const buttons = absolutized.length > 1 ? [SHOW_PANEL, SHOW_ALL] : [SHOW_PANEL];
-        const label = absolutized.length > 1
-            ? `Raven: Knit succeeded: ${baseLabel} (and ${absolutized.length - 1} more).`
-            : `Raven: Knit succeeded: ${baseLabel}.`;
-        const choice = await vscode.window.showInformationMessage(label, ...buttons);
-        if (choice === SHOW_PANEL) {
-            // Idempotent re-reveal; same rootDir → reuses the panel.
-            await ctx.showOrUpdatePanel(ctx.context, {
-                sourceUri: ctx.sourceUri,
-                outputPath: primary,
-                output: ctx.output,
-            });
-        } else if (choice === SHOW_ALL) {
-            ctx.output.show(true);
+        // No success popover here: the panel itself is the success
+        // signal, and a toast with a "Show Output Panel" button just
+        // points at content that's already on screen. For multi-
+        // output knits we still want the additional output paths
+        // discoverable — log them to the channel so the user can
+        // find them via `Raven: Knit — Show Output Channel` or by
+        // clicking the channel directly.
+        if (absolutized.length > 1) {
+            ctx.output.appendLine(
+                `[outputs] knit produced ${absolutized.length} files; primary shown in panel:`,
+            );
+            for (const p of absolutized) {
+                ctx.output.appendLine(`  - ${p}${p === primary ? ' (primary)' : ''}`);
+            }
         }
         return;
     }
