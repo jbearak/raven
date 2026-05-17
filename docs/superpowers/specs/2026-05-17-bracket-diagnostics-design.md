@@ -366,10 +366,21 @@ Add a regression test using `\r\n`.
 is the only line. End-of-meaningful-content col is computed from the line
 slice as if EOF were the line terminator. Same code path as E10.
 
-**E12. BOM at start of file.** A UTF-8 BOM (`\xEF\xBB\xBF`) shifts every
-byte column by 3. Tree-sitter reports byte columns including the BOM;
-`byte_offset_to_utf16_column` accounts for this. All range computations
-must go through that helper — no bare `column` field uses.
+**E12. BOM at start of file.** A UTF-8 BOM (`\xEF\xBB\xBF`) is 3 bytes
+of UTF-8, 1 UTF-16 code unit. Tree-sitter reports byte columns including
+the BOM. The implementation slices the raw line (BOM not stripped) and
+passes it to `byte_offset_to_utf16_column` along with the tree-sitter
+byte column. The helper's per-char iteration correctly maps the BOM to
+one UTF-16 unit at column 0, so subsequent characters land at
+LSP-correct columns. Concretely for `"\u{FEFF}library("`:
+
+- `(` byte column: 3 (BOM) + 7 (`library`) = 10
+- `(` UTF-16 column: 1 (BOM) + 7 (`library`) = 8
+- Test `unclosed_opener_with_bom` asserts range `(0, 8)..(0, 9)`
+
+No BOM stripping anywhere in the new code path. All range computations
+must go through `byte_offset_to_utf16_column` — no bare uses of
+`Point::column`.
 
 **E13. Non-ASCII identifiers and emoji.** A line containing `é` or `😀`
 before the opener has byte columns > UTF-16 columns. The same
