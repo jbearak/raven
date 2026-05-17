@@ -9642,6 +9642,44 @@ mod syntax_error_range_tests {
         assert_eq!(target.range.end.character, 8);
     }
 
+    #[test]
+    fn nested_flat_unclosed_emits_per_opener_via_collect() {
+        // f(g(h(  -> three Unclosed `(` diagnostics with non-overlapping
+        // ranges via the public collect() path (not run_scan). Verifies
+        // the ErrorClassification::Multi dispatch in collect_syntax_errors_inner.
+        let diags = collect("f(g(h(\n");
+        let unclosed: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Unclosed `(`"))
+            .collect();
+        assert_eq!(unclosed.len(), 3, "expected 3 Unclosed ( diagnostics, got: {diags:?}");
+        let mut sorted = unclosed.clone();
+        sorted.sort_by_key(|d| d.range.start.character);
+        // Non-overlapping per spec: cols 1..3, 3..5, 5..6
+        assert_eq!(sorted[0].range.start.character, 1);
+        assert_eq!(sorted[0].range.end.character, 3);
+        assert_eq!(sorted[1].range.start.character, 3);
+        assert_eq!(sorted[1].range.end.character, 5);
+        assert_eq!(sorted[2].range.start.character, 5);
+        assert_eq!(sorted[2].range.end.character, 6);
+    }
+
+    #[test]
+    fn stray_closer_after_valid_expr_via_collect() {
+        // f() }  -> exactly one Missing opening `{` diagnostic on the `}`,
+        // none on the complete `f()` call.
+        let diags = collect("f() }\n");
+        let stray: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Missing opening `{`"))
+            .collect();
+        assert_eq!(stray.len(), 1, "expected exactly one Missing opening `{{` diagnostic, got: {diags:?}");
+        // The `}` is on line 0 at col 4
+        assert_eq!(stray[0].range.start.line, 0);
+        assert_eq!(stray[0].range.start.character, 4);
+        assert_eq!(stray[0].range.end.character, 5);
+    }
+
 }
 
 #[cfg(test)]
