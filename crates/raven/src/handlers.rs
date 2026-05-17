@@ -9549,6 +9549,70 @@ mod syntax_error_range_tests {
         );
     }
 
+    #[test]
+    fn unclosed_opener_crlf() {
+        // library(\r\n -- opener `(` at col 7, content ends at col 8 (just past `(`)
+        let diags = collect("library(\r\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_opener_no_final_newline() {
+        let diags = collect("library(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_opener_with_bom() {
+        // BOM (U+FEFF) = 3 UTF-8 bytes, 1 UTF-16 unit. `library(` follows.
+        // `(` byte col = 3 (BOM) + 7 (library) = 10. UTF-16 col = 1 + 7 = 8.
+        let diags = collect("\u{FEFF}library(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 8);
+        assert_eq!(target.range.end.character, 9);
+    }
+
+    #[test]
+    fn unclosed_opener_non_ascii_before() {
+        // `é_func(` -- `é` is 2 UTF-8 bytes, 1 UTF-16 unit at col 0.
+        // `(` at UTF-16 col 6 (é=1 + _func=5 = 6).
+        let diags = collect("é_func(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 6);
+        assert_eq!(target.range.end.character, 7);
+    }
+
+    #[test]
+    fn unclosed_opener_astral_before() {
+        // `😀_func(` -- `😀` is 4 UTF-8 bytes, 2 UTF-16 units (surrogate pair).
+        // `(` at UTF-16 col 7 (😀=2 + _func=5 = 7).
+        let diags = collect("😀_func(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
 }
 
 #[cfg(test)]
