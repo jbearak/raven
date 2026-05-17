@@ -184,22 +184,54 @@ export function buildShellHtml(args: {
                                border: 1px solid var(--vscode-button-border, transparent);
                                cursor: pointer; }
   #raven-knit-toolbar button:hover { background: var(--vscode-button-hoverBackground); }
-  /* Toggle styling: when the theme button is "off" (aria-pressed=false)
-     we render it as a quieter secondary button. When "on" it gets the
-     normal primary button colors. Rmd output has no document theme to
-     "switch back to" -- the toggle simply represents whether VS Code
-     theming is active. */
-  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="false"] {
-    background: var(--vscode-button-secondaryBackground,
-                    var(--vscode-editorWidget-background));
-    color: var(--vscode-button-secondaryForeground,
-                var(--vscode-foreground));
+  /*
+   * Theme toggle: visually distinct from action buttons.
+   * Uses the VS Code "inputOption" CSS variables -- the same vars
+   * the Find widget toggles (case-sensitive, whole-word, regex)
+   * use. The active state gets a bordered, accent-tinted look
+   * that does not collide with the primary action buttons.
+   */
+  #raven-knit-toolbar button#raven-knit-theme {
+    background: transparent;
+    color: var(--vscode-foreground);
+    border: 1px solid transparent;
+    /* Push the toggle to the right edge of the toolbar so it sits
+       away from the action buttons -- "Apply theme" is a viewing
+       preference, not an action. */
+    margin-left: auto;
   }
-  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="false"]:hover {
-    background: var(--vscode-button-secondaryHoverBackground,
-                    var(--vscode-button-hoverBackground));
+  #raven-knit-toolbar button#raven-knit-theme:hover {
+    background: var(--vscode-inputOption-hoverBackground,
+                    var(--vscode-toolbar-hoverBackground,
+                        var(--vscode-list-hoverBackground)));
   }
-  #raven-knit-filename { margin-left: 0.5rem; opacity: 0.8; font-size: 0.9em; }
+  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"] {
+    background: var(--vscode-inputOption-activeBackground,
+                    var(--vscode-button-background));
+    color: var(--vscode-inputOption-activeForeground,
+                var(--vscode-button-foreground));
+    border: 1px solid var(--vscode-inputOption-activeBorder,
+                          var(--vscode-focusBorder));
+  }
+  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"]:hover {
+    background: var(--vscode-inputOption-activeBackground,
+                    var(--vscode-button-background));
+  }
+  /*
+   * The ::before pseudo-element holds the checkmark prefix and an
+   * empty placeholder when the toggle is off. Pre-allocating the
+   * width with "visibility: hidden" for the inactive state keeps
+   * the button's pixel width stable across toggles so the toolbar
+   * does not reflow on every click.
+   */
+  #raven-knit-toolbar button#raven-knit-theme::before {
+    content: "✓";
+    margin-right: 0.35em;
+    visibility: hidden;
+  }
+  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"]::before {
+    visibility: visible;
+  }
   #raven-knit-frame { flex: 1 1 auto; width: 100%; border: 0; background: white; }
   #raven-knit-context-menu {
     position: fixed; min-width: 160px; z-index: 9999;
@@ -246,7 +278,6 @@ export function buildShellHtml(args: {
     <button id="raven-knit-theme" type="button"
             aria-pressed="${initialThemeApplied ? 'true' : 'false'}"
             title="Toggle VS Code editor colors on the rendered output">Apply VS Code theme</button>
-    <span id="raven-knit-filename" aria-live="polite">${safeName}</span>
   </div>
   <iframe id="raven-knit-frame"
           srcdoc="${escapeHtml(srcdocHtml)}"

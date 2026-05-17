@@ -126,6 +126,30 @@ describe('buildShellHtml', () => {
         expect(on).not.toContain('Use document theme');
     });
 
+    test('toggle is right-aligned in the toolbar', () => {
+        // The toolbar uses flex layout; `margin-left: auto` on the
+        // toggle pushes it to the right edge, separating it from the
+        // two action buttons on the left.
+        const html = buildShellHtml(args('/work/r.html'));
+        expect(html).toMatch(/#raven-knit-theme\s*\{[\s\S]*?margin-left:\s*auto/);
+    });
+
+    test('toggle uses input-option styling and a checkmark prefix', () => {
+        // Pin the visual contract: the toggle uses VS Code's
+        // input-option CSS variables (the same vars the Find widget
+        // toggles use), and the active state prepends a ✓ via a
+        // ::before pseudo-element. Action buttons must remain on
+        // the button-background palette.
+        const html = buildShellHtml(args('/work/r.html'));
+        expect(html).toContain('--vscode-inputOption-activeBackground');
+        expect(html).toContain('--vscode-inputOption-activeBorder');
+        expect(html).toContain('--vscode-inputOption-activeForeground');
+        expect(html).toMatch(/#raven-knit-theme::before\s*\{[\s\S]*?content:\s*"✓"/);
+        expect(html).toMatch(
+            /#raven-knit-theme\[aria-pressed="true"\]::before\s*\{\s*visibility:\s*visible/,
+        );
+    });
+
     test('script reads computed vscode-editor CSS variables', () => {
         // The injected stylesheet uses RESOLVED color values pulled
         // from the outer shell's computed style — CSS variables do
@@ -194,11 +218,20 @@ describe('buildShellHtml', () => {
         expect(html).not.toContain('vscode.setState');
     });
 
-    test('filename in toolbar is HTML-escaped', () => {
-        // Use a basename that contains HTML-special characters but no
-        // path separators, so we're isolating the toolbar-label escape.
+    test('filename does not appear in the toolbar (panel title already shows it)', () => {
+        const html = buildShellHtml(args('/work/report.html'));
+        // The toolbar previously carried a `<span id="raven-knit-filename">`
+        // showing the basename, which duplicated the panel tab title.
+        expect(html).not.toContain('raven-knit-filename');
+        expect(html).not.toMatch(/<span[^>]*aria-live=/);
+    });
+
+    test('iframe title still carries the basename for accessibility', () => {
+        // We still pass the basename through to the iframe's title
+        // attribute so screen readers and the find widget can refer
+        // to "Rendered output: report.html".
         const html = buildShellHtml(args('/work/re<port>&.html'));
-        expect(html).toContain('aria-live="polite">re&lt;port&gt;&amp;.html<');
+        expect(html).toContain('title="Rendered output: re&lt;port&gt;&amp;.html"');
     });
 
     test('toolbar script is nonce-tagged', () => {
