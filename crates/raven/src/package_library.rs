@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::namespace_parser::{
-    parse_description_depends, parse_index_exports, parse_namespace_exports,
+    parse_data_symbols, parse_description_depends, parse_index_exports, parse_namespace_exports,
 };
 use crate::r_subprocess::RSubprocess;
 
@@ -936,8 +936,13 @@ impl PackageLibrary {
         // 1. Getting lib_paths if platform fallbacks fail
         // 2. Pattern packages (base R uses exportPattern)
 
-        // Step 1: Get library paths (try R first for accuracy, then fallback)
-        self.lib_paths = self.get_lib_paths_with_fallback().await;
+        // Step 1: Get library paths (try R first for accuracy, then fallback).
+        // If a caller pre-populated `lib_paths` via `set_lib_paths` (e.g. for
+        // tests, or future explicit configuration), respect that and skip
+        // rediscovery — overwriting their choice would be surprising.
+        if self.lib_paths.is_empty() {
+            self.lib_paths = self.get_lib_paths_with_fallback().await;
+        }
 
         if self.lib_paths.is_empty() {
             log::trace!("Warning: No library paths found, package loading will fail");
@@ -978,6 +983,39 @@ impl PackageLibrary {
                             pkg_exports.insert(export.clone());
                         }
                         pattern_packages.push(package.clone());
+                    }
+
+                    // Step 3b: Pick up data objects auto-attached at startup
+                    // (issue #276). Lazy-loaded base packages like `datasets`
+                    // expose `mtcars`/`iris`/... without listing them in
+                    // NAMESPACE export() or `getNamespaceExports()`. Walk
+                    // `data/` for individual files and fall back to INDEX
+                    // topics when the data is bundled into `Rdata.r{db,dx,ds}`.
+                    //
+                    // Use `symlink_metadata` (not `is_dir`, which traverses
+                    // symlinks) for consistency with `parse_data_symbols`'s
+                    // own rejection of symlinked `data/` trees.
+                    let has_real_data_dir = std::fs::symlink_metadata(pkg_dir.join("data"))
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    if has_real_data_dir {
+                        for sym in parse_data_symbols(&pkg_dir).await {
+                            all_base_exports.insert(sym.clone());
+                            pkg_exports.insert(sym);
+                        }
+                        // INDEX entries are documented topic names — for
+                        // lazy-loaded data packages these correspond to
+                        // top-level dataset names (mtcars, iris, ...). Only
+                        // applied here when has_export_pattern is false so we
+                        // don't double-merge with the existing fallback above.
+                        if !parse_result.has_export_pattern {
+                            if let Ok(index_exports) = parse_index_exports(&pkg_dir).await {
+                                for export in &index_exports {
+                                    all_base_exports.insert(export.clone());
+                                    pkg_exports.insert(export.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1896,6 +1934,132 @@ mod tests {
                 lib.is_base_export(func),
                 "Base exports should contain common function '{}'",
                 func
+            );
+        }
+    }
+
+    /// Regression test for issue #276: base-package data objects must be in scope.
+    ///
+    /// `datasets` is auto-attached at R startup, so its data objects (`mtcars`,
+    /// `iris`, `airquality`, `ChickWeight`, etc.) should be treated as defined
+    /// at every position in every R file. These items are lazy-loaded and don't
+    /// appear in `getNamespaceExports()` or NAMESPACE `export(...)` lines, so
+    /// they require dedicated discovery from the package's INDEX / data/ layout.
+    #[tokio::test]
+    async fn test_initialize_base_exports_contain_dataset_symbols() {
+        // Initialize without R subprocess - the fix must work statically via
+        // INDEX file and data/ directory enumeration.
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.initialize().await.expect("initialize() should succeed");
+
+        // Skip the assertion if no library was discovered on the test host
+        // (CI without R installed); the fix can't be exercised then.
+        let datasets_dir_found = lib
+            .lib_paths()
+            .iter()
+            .any(|p| p.join("datasets").join("INDEX").exists());
+        if !datasets_dir_found {
+            return;
+        }
+
+        // The data objects from `datasets` that should be in base_exports.
+        let dataset_objects = ["mtcars", "iris", "airquality", "ChickWeight"];
+        for name in &dataset_objects {
+            assert!(
+                lib.is_base_export(name),
+                "Base exports should contain `datasets` object '{}' (issue #276)",
+                name
+            );
+        }
+    }
+
+    /// Regression test for issue #276 that does NOT depend on a real R install.
+    ///
+    /// Builds a fake `datasets`-style package on disk and runs the real
+    /// `initialize()` against it (via a pre-set `lib_paths`). This proves the
+    /// production wiring — not just the helper functions — picks up the
+    /// dataset symbols. Runs on CI hosts without R, so a future regression
+    /// that drops the dataset path from `initialize()` will fail loudly here.
+    #[tokio::test]
+    async fn test_initialize_picks_up_datasets_from_fake_library() {
+        let lib_root = tempfile::tempdir().unwrap();
+
+        // All seven base packages need a minimal directory so
+        // `find_package_directory` returns Some for each — otherwise
+        // `initialize()` skips them silently and we lose coverage.
+        for pkg in [
+            "base",
+            "methods",
+            "utils",
+            "grDevices",
+            "graphics",
+            "stats",
+            "datasets",
+        ] {
+            let dir = lib_root.path().join(pkg);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("DESCRIPTION"),
+                format!("Package: {}\nVersion: 4.6.0\nPriority: base\n", pkg),
+            )
+            .unwrap();
+            // `base` has no NAMESPACE in real installs — leave it absent so
+            // it hits the existing INDEX-fallback branch.
+            if pkg != "base" {
+                std::fs::write(
+                    dir.join("NAMESPACE"),
+                    "# minimal NAMESPACE for fake-library test\n",
+                )
+                .unwrap();
+            }
+        }
+
+        // Datasets-specific contents: empty NAMESPACE, INDEX listing topic
+        // names, and the lazy-load sentinel `Rdata.rdx` (so the data items
+        // come from INDEX rather than individual `.rda` files).
+        let datasets_dir = lib_root.path().join("datasets");
+        let data_dir = datasets_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            datasets_dir.join("NAMESPACE"),
+            "# This package exports nothing (it uses lazydata)\n# exportPattern(\".\")\n",
+        )
+        .unwrap();
+        std::fs::write(
+            datasets_dir.join("INDEX"),
+            "mtcars                  Motor Trend Car Road Tests\n\
+             iris                    Edgar Anderson's Iris Data\n\
+             airquality              New York Air Quality Measurements\n\
+             ChickWeight             Weight Versus Age of Chicks on Different Diets\n",
+        )
+        .unwrap();
+        std::fs::write(data_dir.join("Rdata.rdx"), b"").unwrap();
+        std::fs::write(data_dir.join("Rdata.rdb"), b"").unwrap();
+        std::fs::write(data_dir.join("Rdata.rds"), b"").unwrap();
+        // Also a non-lazy data file to confirm enumeration works alongside INDEX.
+        std::fs::write(data_dir.join("morley.tab"), b"").unwrap();
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        // Pre-populate lib_paths; `initialize()` respects an existing value
+        // and only calls the platform fallback when empty.
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        for name in [
+            "mtcars",
+            "iris",
+            "airquality",
+            "ChickWeight",
+            // `morley` comes from `data/morley.tab` enumeration.
+            "morley",
+        ] {
+            assert!(
+                lib.is_base_export(name),
+                "Expected `{}` in base_exports after initialize() (issue #276); \
+                 lib_paths={:?}, base_exports_len={}",
+                name,
+                lib.lib_paths(),
+                lib.base_exports().len(),
             );
         }
     }
