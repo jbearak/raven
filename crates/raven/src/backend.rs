@@ -9947,6 +9947,45 @@ mod project_config_initialize_tests {
         assert_eq!(state.lint_config.line_length, 120);
     }
 
+    /// Client `true` + `raven.toml [linting] enabled = "auto"` resolves
+    /// to on. `"auto"` in raven.toml is semantically equivalent to omitting
+    /// `enabled`, so the client's explicit value wins. Without the
+    /// `strip_project_auto_enabled` normalization in `recompute_parsed_configs`,
+    /// the project layer's `"auto"` would overwrite the client value at
+    /// merge and then resolve to off because raven.toml was discovered (no
+    /// `.lintr`). See #281.
+    #[tokio::test]
+    async fn initialize_client_true_with_raven_toml_auto_resolves_on() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = \"auto\"\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": true }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            state.lint_config.enabled,
+            "client true with raven.toml enabled=\"auto\" must resolve to on (#281)"
+        );
+    }
+
     /// Default client `"auto"` with no project config → off.
     #[tokio::test]
     async fn initialize_auto_no_project_resolves_off() {
