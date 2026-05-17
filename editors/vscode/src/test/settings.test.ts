@@ -370,7 +370,7 @@ suite('Settings Transmission Property Tests', () => {
                 enabled: true,
             },
             linting: {
-                enabled: false,
+                enabled: 'auto',
                 lineLength: 80,
                 objectLength: 30,
                 indentationUnit: 2,
@@ -535,7 +535,7 @@ suite('Settings Transmission Unit Tests', () => {
         const options = getInitializationOptions(mockConfig);
         // Whole linting block populated with package.json defaults.
         assert.deepStrictEqual(options.linting, {
-            enabled: false,
+            enabled: 'auto',
             lineLength: 80,
             objectLength: 30,
             indentationUnit: 2,

@@ -48,8 +48,8 @@ Lint diagnostics carry the `source` field `raven (lint)`, so they're easy to fil
 `raven.linting.enabled` is tri-state: `"auto"` (the default), `true` (or `"on"`), or `false` (or `"off"`). Booleans are accepted for backward compatibility with existing settings.
 
 - `"auto"` — lint when a project config opts in. Specifically: when a `.lintr` is discovered on the upward walk from the workspace (matching `lintr`'s own ancestor lookup, including a `~/.lintr` in your home directory), or when a `raven.toml` sets `[linting] enabled = true`. Otherwise off.
-- `true` / `"on"` — always lint. Discovered rule severities still apply.
-- `false` / `"off"` — never lint from the client master switch. A discovered `raven.toml` can still set `enabled = true` and that wins per the project-policy contract; a discovered `.lintr` alone does not.
+- `true` / `"on"` — force linting on. Discovered rule severities still apply.
+- `false` / `"off"` — disable linting unless a discovered `raven.toml` explicitly sets `enabled = true` (raven.toml always wins at the leaf — the project-policy contract). A discovered `.lintr` alone never re-enables linting.
 
 ### Behavior matrix
 

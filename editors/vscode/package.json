@@ -1234,7 +1234,7 @@
           "type": ["string", "boolean"],
           "enum": ["auto", "on", "off", true, false],
           "default": "auto",
-          "description": "Controls native lint diagnostics. \"auto\" (default) enables linting when a .lintr or raven.toml opts in. true/\"on\" always lints; false/\"off\" never lints (overrides any discovered .lintr). raven.toml's [linting] enabled wins over this setting per the project-policy contract. See docs/linting.md for the full resolution matrix."
+          "description": "Controls native lint diagnostics. \"auto\" (default) enables linting when a .lintr or raven.toml opts in. true/\"on\" forces linting on. false/\"off\" disables linting unless a discovered raven.toml explicitly sets enabled = true (it always overrides .lintr auto-discovery). See docs/linting.md for the full resolution matrix."
         },
         "raven.linting.lineLength": {
           "type": "integer",
