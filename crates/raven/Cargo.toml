@@ -51,7 +51,7 @@ xdg = "2.5.2"
 test-support = []
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.5", default-features = false }
 proptest = "1.4"
 tokio = { version = "1.26.0", features = ["test-util"] }
 

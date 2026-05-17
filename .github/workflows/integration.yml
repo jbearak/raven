@@ -7,6 +7,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache wraps rustc; unchanged crates are served from ~/.cache/sccache
+  # even when Cargo.lock changes. We use the local-filesystem backend (not
+  # SCCACHE_GHA_ENABLED) so sccache never does a hard startup probe against
+  # the GHA cache API — actions/cache below handles persistence gracefully.
+  RUSTC_WRAPPER: sccache
+  # mold is a fast linker that significantly reduces link time on Linux.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 permissions:
   contents: read
@@ -16,61 +23,159 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Sibling job 1: the Rust test suite. Mirrors what `bun test` runs
-  # locally as the first half of `tests/bun/workspace-suite.test.ts`.
-  # Runs in release profile so its `target/` cache lines up with the
-  # release LSP binary that the Mocha suite builds — same cache key
-  # means whichever job finishes first warms the other on subsequent runs.
+  # Compile all Rust artifacts once in release profile and upload them.
+  # All downstream jobs download what they need — no second compile.
+  # Release profile is required so that performance_budgets tests
+  # (gated on `not(debug_assertions)`) are included and enforced.
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache cargo registry
+        id: cargo-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache sccache storage
+        id: sccache-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/sccache
+          key: sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            sccache-${{ runner.os }}-
+
+      - name: Install mold linker
+        run: sudo apt-get install -y --no-install-recommends mold
+
+      - name: Reset sccache stats
+        run: sccache --zero-stats
+
+      # `cargo test --release --no-run` compiles the test binary (all tests,
+      # including performance_budgets) without running it. The path to the
+      # compiled executable is printed to stderr; we copy it to a stable name.
+      # The same binary serves both the cargo and time-budgets jobs (filtered
+      # by passing a test name prefix to the executable).
+      - name: Compile release test + LSP binaries
+        run: |
+          cargo test --release --no-run -p raven --features test-support 2>&1 | tee /tmp/cargo-test-build.txt
+          TEST_BIN=$(grep -oE 'target/release/deps/raven-[a-f0-9]+' /tmp/cargo-test-build.txt | head -1)
+          echo "TEST_BIN=$TEST_BIN"
+          cp "$TEST_BIN" target/raven-test
+
+      - name: Upload LSP binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: raven-release
+          path: target/release/raven
+          retention-days: 1
+
+      - name: Upload test binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: raven-test
+          path: target/raven-test
+          retention-days: 1
+
+      - name: Report cache status
+        if: always()
+        run: |
+          echo "::notice title=Cache status::cargo-hit=${{ steps.cargo-cache.outputs.cache-hit }} sccache-exact-hit=${{ steps.sccache-cache.outputs.cache-hit }}"
+          sccache --show-stats
+
+  # Run the full Rust test suite using the pre-compiled release binary.
   cargo:
     name: Cargo Tests
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry & build artifacts
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - name: Download test binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            integration-cargo-${{ runner.os }}-
+          name: raven-test
+          path: target/
 
-      # `--features test-support` exposes `raven::test_utils`, which the
-      # `performance_budgets` integration test imports. Without the flag,
-      # the test binary fails to compile (E0433: cannot find `test_utils`).
       - name: Run cargo tests (release)
-        run: cargo test --release -p raven --features test-support
+        run: |
+          chmod +x target/raven-test
+          target/raven-test
 
-  # Sibling job 2: the VS Code Mocha integration suite — runs the
-  # extension under a real Electron host via `vscode-test`. Mirrors
-  # the second half of the local `workspace-suite` invocation.
+  # ── Time-budget regression tests (required check) ──────────────────────
+  # Re-uses the test binary from the build job, filtered to performance_budgets.
+  time-budgets:
+    name: Time-Budget Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Download test binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+        with:
+          name: raven-test
+          path: target/
+
+      - name: Run time-budget tests
+        run: |
+          chmod +x target/raven-test
+          target/raven-test performance_budgets
+
+  # ── Release binary size tracking ───────────────────────────────────────
+  binary-size:
+    name: Binary Size
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download LSP binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+        with:
+          name: raven-release
+          path: target/release/
+
+      - name: Display binary size
+        run: |
+          {
+            echo "## Release Binary Size"
+            echo '```'
+            ls -lh target/release/raven
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -la target/release/raven
+
+  # ── VS Code Mocha integration suite ────────────────────────────────────
   vscode-mocha:
     name: VS Code Mocha Suite
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry & build artifacts
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - name: Download LSP binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            integration-cargo-${{ runner.os }}-
+          name: raven-release
+          path: target/release/
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -126,9 +231,6 @@ jobs:
             r-base-core \
             r-cran-plyr
 
-      - name: Build LSP binary (release)
-        run: cargo build --release -p raven
-
       # The extension uses `package-lock.json` (no `bun.lockb`), so `npm ci`
       # gives us a reproducible install. The test scripts themselves still
       # run under Bun (matching the local `bun run test` invocation used by
@@ -154,7 +256,9 @@ jobs:
       # extension; `pretest` (below) only handles the test-side `tsc` build.
       - name: Bundle extension and place LSP binary
         working-directory: editors/vscode
-        run: bun run vscode:prepublish
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/target/release/raven"
+          bun run vscode:prepublish
 
       - name: Compile tests
         working-directory: editors/vscode
