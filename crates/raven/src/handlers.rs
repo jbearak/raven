@@ -6019,6 +6019,62 @@ fn anchor_missing_position(
     )
 }
 
+/// Walk up one level from a bracket-kind MISSING node to its structural
+/// parent (`arguments`, `braced_expression`, `parenthesized_expression`)
+/// and return that parent's first delimiter child plus a UTF-16 Range
+/// from the opener's column through `end_of_meaningful_content` of the
+/// opener's line.
+///
+/// Returns None when:
+/// - `missing.kind()` is not `)`, `}`, `]`, or `]]`
+/// - the parent's kind is not one of the three structural kinds above
+fn find_opener_for_missing<'a>(missing: Node<'a>, text: &'a str) -> Option<(Node<'a>, Range)> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    if !matches!(missing.kind(), ")" | "}" | "]" | "]]") {
+        return None;
+    }
+
+    let parent = missing.parent()?;
+    if !matches!(
+        parent.kind(),
+        "arguments" | "braced_expression" | "parenthesized_expression"
+    ) {
+        return None;
+    }
+
+    let mut cursor = parent.walk();
+    let opener = parent
+        .children(&mut cursor)
+        .find(|n| {
+            let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
+            matches!(t, "(" | "{" | "[" | "[[")
+        })?;
+
+    let opener_row = opener.start_position().row as u32;
+    let opener_start_byte_col = opener.start_position().column;
+
+    let line = text.lines().nth(opener_row as usize).unwrap_or("");
+    let start_col = byte_offset_to_utf16_column(line, opener_start_byte_col);
+    let end_col = end_of_meaningful_content(line);
+
+    let end_col = if end_col > start_col {
+        end_col
+    } else {
+        // For multi-char openers like `[[`, span the opener token's width.
+        let opener_end_byte_col = opener.end_position().column;
+        byte_offset_to_utf16_column(line, opener_end_byte_col).max(start_col + 1)
+    };
+
+    Some((
+        opener,
+        Range {
+            start: Position::new(opener_row, start_col),
+            end: Position::new(opener_row, end_col),
+        },
+    ))
+}
+
 /// Find the first MISSING descendant inside a node (depth-first).
 fn find_first_missing_descendant(node: Node) -> Option<Node> {
     // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
@@ -6631,7 +6687,7 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 mod syntax_error_range_tests {
     use super::{
         anchor_missing_position, collect_syntax_errors, end_of_meaningful_content,
-        find_first_content_line, find_innermost_error,
+        find_first_content_line, find_innermost_error, find_opener_for_missing,
     };
     use tower_lsp::lsp_types::Diagnostic;
 
@@ -8525,6 +8581,80 @@ mod syntax_error_range_tests {
     fn eomc_astral_emoji() {
         // 😀 = 2 UTF-16 code units; "😀 <- 1" — `1` at UTF-16 col 6; just past = 7
         assert_eq!(end_of_meaningful_content("😀 <- 1"), 7);
+    }
+
+    // ------------------------------------------------------------------
+    // find_opener_for_missing
+    // ------------------------------------------------------------------
+
+    fn first_missing(tree: &tree_sitter::Tree) -> Option<tree_sitter::Node> {
+        fn walk<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+            if n.is_missing() { return Some(n); }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(m) = walk(child) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        walk(tree.root_node())
+    }
+
+    #[test]
+    fn fofm_call_arguments_paren() {
+        let code = "library(";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).expect("expected MISSING");
+        let (opener, range) = find_opener_for_missing(missing, code)
+            .expect("should find opener for ( inside arguments");
+        assert_eq!(opener.kind(), "(");
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 7);
+        assert_eq!(range.end.line, 0);
+        assert_eq!(range.end.character, 8);
+    }
+
+    #[test]
+    fn fofm_subset_arguments_bracket() {
+        let code = "vec[1, 2\n";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        let (opener, range) = find_opener_for_missing(missing, code).unwrap();
+        assert_eq!(opener.kind(), "[");
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 8);
+    }
+
+    #[test]
+    fn fofm_subset2_arguments_double_bracket() {
+        let code = "vec[[1, 2\n";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        let (opener, range) = find_opener_for_missing(missing, code).unwrap();
+        assert_eq!(opener.kind(), "[[");
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 9);
+    }
+
+    #[test]
+    fn fofm_braced_expression() {
+        let code = "f <- function() {\n  x <- 1\n";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        let (opener, range) = find_opener_for_missing(missing, code).unwrap();
+        assert_eq!(opener.kind(), "{");
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 16);
+        assert_eq!(range.end.character, 17);
+    }
+
+    #[test]
+    fn fofm_non_bracket_missing_returns_none() {
+        let code = "x <-";
+        let tree = parse_r(code);
+        let missing = first_missing(&tree).unwrap();
+        assert!(find_opener_for_missing(missing, code).is_none());
     }
 }
 
