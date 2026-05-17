@@ -40,20 +40,32 @@ jobs:
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
 
-      - name: Cache sccache storage and cargo registry
-        id: cargo-sccache-cache
+      - name: Cache cargo registry
+        id: cargo-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
-            ~/.cache/sccache
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-sccache-${{ runner.os }}-
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache sccache storage
+        id: sccache-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/sccache
+          key: sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            sccache-${{ runner.os }}-
 
       - name: Install mold linker
         run: sudo apt-get install -y --no-install-recommends mold
+
+      - name: Reset sccache stats
+        run: sccache --zero-stats
 
       # `cargo test --release --no-run` compiles the test binary (all tests,
       # including performance_budgets) without running it. The path to the
@@ -84,7 +96,8 @@ jobs:
       - name: Report cache status
         if: always()
         run: |
-          echo "::notice title=Cache status::cargo-sccache-hit=${{ steps.cargo-sccache-cache.outputs.cache-hit }}"
+          echo "::notice title=Cache status::cargo-hit=${{ steps.cargo-cache.outputs.cache-hit }} sccache-exact-hit=${{ steps.sccache-cache.outputs.cache-hit }}"
+          sccache --show-stats
 
   # Run the full Rust test suite using the pre-compiled release binary.
   cargo:
