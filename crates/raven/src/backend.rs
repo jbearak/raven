@@ -88,6 +88,10 @@ struct DocumentIndentUnitsChangedParams {
     units: Vec<DocumentIndentUnit>,
 }
 
+fn normalize_document_indent_unit(unit: u32) -> u32 {
+    unit.clamp(1, 8)
+}
+
 /// Parse cross-file configuration from LSP settings.
 ///
 /// Reads the top-level `crossFile`, `diagnostics`, and `packages` sections from a
@@ -6306,7 +6310,7 @@ impl Backend {
         let new_map: std::collections::HashMap<String, u32> = params
             .units
             .into_iter()
-            .map(|e| (e.uri, e.indent_unit))
+            .map(|e| (e.uri, normalize_document_indent_unit(e.indent_unit)))
             .collect();
 
         let affected_uris: Vec<Url> = {
@@ -7032,6 +7036,15 @@ async fn run_libpath_consumer(
 
 #[cfg(test)]
 mod tests {
+    mod document_indent_units {
+        #[test]
+        fn normalizes_client_supplied_indent_units() {
+            assert_eq!(super::super::normalize_document_indent_unit(0), 1);
+            assert_eq!(super::super::normalize_document_indent_unit(4), 4);
+            assert_eq!(super::super::normalize_document_indent_unit(99), 8);
+        }
+    }
+
     mod request_cancellation {
         use super::super::{
             Backend, CancellableRequestKind, RequestCancellationRegistry,

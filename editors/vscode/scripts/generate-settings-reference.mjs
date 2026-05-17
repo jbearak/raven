@@ -105,6 +105,12 @@ function formatDefault(value) {
 }
 
 function formatType(schema) {
+  if (Array.isArray(schema.oneOf)) {
+    return schema.oneOf.map((variant) => formatType(variant)).join(" \\| ");
+  }
+  if (schema.const !== undefined) {
+    return inlineCode(JSON.stringify(schema.const));
+  }
   if (Array.isArray(schema.enum)) {
     return schema.enum.map((v) => inlineCode(JSON.stringify(v))).join(" \\| ");
   }

@@ -43,7 +43,15 @@ export function resolveTabSizeForDocument(
     document: Pick<vscode.TextDocument, 'uri' | 'languageId'>,
     getCfg: (scope: vscode.ConfigurationScope) => vscode.WorkspaceConfiguration = (scope) =>
         vscode.workspace.getConfiguration('editor', scope),
+    visibleTextEditors: readonly vscode.TextEditor[] = vscode.window.visibleTextEditors,
 ): number {
+    const editor = visibleTextEditors.find((candidate) =>
+        candidate.document.uri.toString() === document.uri.toString()
+    );
+    if (typeof editor?.options.tabSize === 'number') {
+        return editor.options.tabSize;
+    }
+
     return getCfg({ uri: document.uri, languageId: document.languageId })
         .get<number>('tabSize', 2);
 }

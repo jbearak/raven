@@ -134,6 +134,26 @@ suite('Extension Helpers', () => {
         assert.strictEqual(tabSize, 4);
     });
 
+    test('resolveTabSizeForDocument prefers resolved visible editor tab size', () => {
+        const doc = { uri: vscode.Uri.file('/proj/foo.R'), languageId: 'r' };
+        const tabSize = resolveTabSizeForDocument(
+            doc,
+            () => ({
+                get<T>(_key: string, defaultValue: T): T { return defaultValue; },
+                has: () => true,
+                inspect: () => undefined,
+                update: () => Promise.resolve(),
+            } as unknown as vscode.WorkspaceConfiguration),
+            [
+                {
+                    document: doc,
+                    options: { tabSize: 4 },
+                } as unknown as vscode.TextEditor,
+            ],
+        );
+        assert.strictEqual(tabSize, 4);
+    });
+
     test('getUpdatedGlobalLanguageConfig ignores workspace-only overrides', () => {
         assert.deepStrictEqual(
             getUpdatedGlobalLanguageConfig(

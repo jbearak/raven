@@ -498,6 +498,14 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     );
 
     context.subscriptions.push(
+        vscode.window.onDidChangeTextEditorOptions((event) => {
+            if (isRDocument(event.textEditor.document)) {
+                sendDocumentIndentUnitsNotification();
+            }
+        })
+    );
+
+    context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument((event) => {
             const activeEditor = vscode.window.activeTextEditor;
             if (!activeEditor || activeEditor.document.uri.toString() !== event.document.uri.toString()) {
