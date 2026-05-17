@@ -1,0 +1,6 @@
+---
+title: "Knit test sample"
+output: html_document
+---
+
+Hello.

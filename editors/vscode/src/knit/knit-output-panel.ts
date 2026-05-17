@@ -143,8 +143,12 @@ export class KnitOutputPanel {
         this.sourceUri = args.sourceUri;
         this.outputPath = args.outputPath;
         const nonce = crypto.randomBytes(16).toString('base64');
+        const iframeSrc = this.panel.webview
+            .asWebviewUri(vscode.Uri.file(args.outputPath))
+            .toString();
         this.panel.webview.html = buildShellHtml({
-            webview: this.panel.webview,
+            iframeSrc,
+            cspSource: this.panel.webview.cspSource,
             outputPath: args.outputPath,
             nonce,
         });

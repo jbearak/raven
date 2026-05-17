@@ -66,11 +66,6 @@ export function classify(
  * the pure helper has no dependency on the actual vscode module — tests
  * pass a fake.
  */
-export interface MinimalWebview {
-    asWebviewUri(uri: { fsPath: string }): { toString(): string };
-    cspSource: string;
-}
-
 function escapeHtml(s: string): string {
     return s
         .replace(/&/g, '&amp;')
@@ -84,21 +79,26 @@ function escapeHtml(s: string): string {
  * Build the outer-shell HTML for the Knit Output webview.
  *
  * The shell is Raven-controlled and owns the CSP in `<head>`; the
- * rendered HTML loads inside `<iframe sandbox="">` from
- * `webview.asWebviewUri(outputPath)`. Three independent containment
- * layers (sandbox attribute, outer-shell CSP, localResourceRoots) make
- * the security model robust to either layer failing.
+ * rendered HTML loads inside `<iframe sandbox="">`. Three independent
+ * containment layers (sandbox attribute, outer-shell CSP,
+ * `localResourceRoots`) make the security model robust to either layer
+ * failing.
+ *
+ * Pure helper — no dependency on the vscode module. The caller
+ * (`KnitOutputPanel`) is responsible for converting the output path via
+ * `webview.asWebviewUri(vscode.Uri.file(...))` and passing the result
+ * here as `iframeSrc`, and for forwarding `webview.cspSource`.
  *
  * See `docs/superpowers/specs/2026-05-17-knit-output-webview-design.md`
  * for the threat model.
  */
 export function buildShellHtml(args: {
-    webview: MinimalWebview;
+    iframeSrc: string;
+    cspSource: string;
     outputPath: string;
     nonce: string;
 }): string {
-    const { webview, outputPath, nonce } = args;
-    const iframeSrc = webview.asWebviewUri({ fsPath: outputPath }).toString();
+    const { iframeSrc, cspSource, outputPath, nonce } = args;
     // path.basename handles both POSIX and Windows separators.
     const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
     const basename = lastSep >= 0 ? outputPath.slice(lastSep + 1) : outputPath;
@@ -106,10 +106,10 @@ export function buildShellHtml(args: {
 
     const csp = [
         `default-src 'none'`,
-        `frame-src ${webview.cspSource}`,
-        `img-src ${webview.cspSource} https: data:`,
-        `style-src ${webview.cspSource} 'unsafe-inline'`,
-        `font-src ${webview.cspSource} https: data:`,
+        `frame-src ${cspSource}`,
+        `img-src ${cspSource} https: data:`,
+        `style-src ${cspSource} 'unsafe-inline'`,
+        `font-src ${cspSource} https: data:`,
         `script-src 'nonce-${nonce}'`,
         `connect-src 'none'`,
     ].join('; ');
