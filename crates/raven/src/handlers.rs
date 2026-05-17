@@ -8168,12 +8168,13 @@ mod syntax_error_range_tests {
         None
     }
 
-    /// Collect all MISSING node positions (row, col) in the tree.
-    fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32)>) {
+    /// Collect all MISSING node positions (row, col, kind) in the tree.
+    fn collect_missing_positions(node: Node, out: &mut Vec<(u32, u32, String)>) {
         if node.is_missing() {
             out.push((
                 node.start_position().row as u32,
                 node.start_position().column as u32,
+                node.kind().to_string(),
             ));
         }
         let mut cursor = node.walk();
@@ -8228,23 +8229,6 @@ mod syntax_error_range_tests {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if let Some(found) = find_error_at(child, row, col) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    /// Find a MISSING node at the given (row, col) position via depth-first search.
-    fn find_missing_node_at<'a>(node: Node<'a>, row: u32, col: u32) -> Option<Node<'a>> {
-        if node.is_missing()
-            && node.start_position().row as u32 == row
-            && node.start_position().column as u32 == col
-        {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(found) = find_missing_node_at(child, row, col) {
                 return Some(found);
             }
         }
@@ -8530,7 +8514,7 @@ mod syntax_error_range_tests {
             let tree = parse_r(&code);
             let root = tree.root_node();
 
-            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            let mut missing_positions: Vec<(u32, u32, String)> = Vec::new();
             collect_missing_positions(root, &mut missing_positions);
 
             // Our generator should always produce at least one MISSING node
@@ -8564,13 +8548,10 @@ mod syntax_error_range_tests {
             // this to verify one "Unclosed" per distinct bracket-kind MISSING.
             let has_any_unclosed = diagnostics.iter().any(|d| d.message.starts_with("Unclosed `"));
 
-            for &(m_row, m_col) in &missing_positions {
-                // Find the MISSING node at this position to check its kind.
-                // We use the tree to walk and identify it.
-                let missing_node = find_missing_node_at(root, m_row, m_col);
-                let is_bracket_missing = missing_node
-                    .map(|n| matches!(n.kind(), ")" | "}" | "]" | "]]"))
-                    .unwrap_or(false);
+            for (m_row, m_col, m_kind) in &missing_positions {
+                let m_row = *m_row;
+                let m_col = *m_col;
+                let is_bracket_missing = matches!(m_kind.as_str(), ")" | "}" | "]" | "]]");
 
                 if is_bracket_missing {
                     // Bracket-kind MISSING: diagnostic is at the opener, not the MISSING
@@ -8859,7 +8840,7 @@ mod syntax_error_range_tests {
             let tree = parse_r(&code);
             let root = tree.root_node();
 
-            let mut missing_positions: Vec<(u32, u32)> = Vec::new();
+            let mut missing_positions: Vec<(u32, u32, String)> = Vec::new();
             collect_missing_positions(root, &mut missing_positions);
 
             // Our generator should always produce at least one MISSING node
@@ -8889,11 +8870,10 @@ mod syntax_error_range_tests {
             // are re-anchored to the opener position and emit "Unclosed `X`...".
             // The opener-anchored diagnostic range spans opener..EOL (not 1 column),
             // so we skip the width check for bracket-kind MISSING.
-            for &(m_row, m_col) in &missing_positions {
-                let missing_node = find_missing_node_at(root, m_row, m_col);
-                let is_bracket_missing = missing_node
-                    .map(|n| matches!(n.kind(), ")" | "}" | "]" | "]]"))
-                    .unwrap_or(false);
+            for (m_row, m_col, m_kind) in &missing_positions {
+                let m_row = *m_row;
+                let m_col = *m_col;
+                let is_bracket_missing = matches!(m_kind.as_str(), ")" | "}" | "]" | "]]");
 
                 if is_bracket_missing {
                     // Bracket-kind MISSING diagnostic is at the opener, not the MISSING
@@ -8957,6 +8937,55 @@ mod syntax_error_range_tests {
                     diag.range.end.line,
                     diag.range.end.character,
                     code
+                );
+            }
+        }
+
+        // ============================================================================
+        // Feature: bracket-diagnostics, Property: bracket-kind MISSING anchors on opener
+        //
+        // For each bracket-kind MISSING node, the corresponding diagnostic
+        // is NOT at the MISSING's position; it's anchored on the opener
+        // (an ancestor's first delimiter child) with a range whose start
+        // <= the MISSING's column.
+        //
+        // **Validates: bracket-diagnostics design spec.**
+        // ============================================================================
+
+        #[test]
+        fn prop_bracket_missing_anchors_on_opener(code in missing_node_code()) {
+            let tree = parse_r(&code);
+            let root = tree.root_node();
+
+            let mut missing_positions: Vec<(u32, u32, String)> = Vec::new();
+            collect_missing_positions(root, &mut missing_positions);
+
+            prop_assume!(
+                missing_positions.iter().any(|(_, _, k)| matches!(k.as_str(), ")" | "}" | "]" | "]]")),
+                "Generated code must produce at least one bracket-kind MISSING"
+            );
+
+            let mut diagnostics = Vec::new();
+            collect_syntax_errors(root, &code, &mut diagnostics);
+
+            for (m_row, m_col, m_kind) in &missing_positions {
+                let m_row = *m_row;
+                let m_col = *m_col;
+                if !matches!(m_kind.as_str(), ")" | "}" | "]" | "]]") {
+                    continue;
+                }
+                // Find a diagnostic of the right kind anchored at or before
+                // the MISSING position (on the same or earlier line).
+                let matching = diagnostics.iter().find(|d| {
+                    (d.message.contains("Unclosed")
+                        || d.message.contains("Mismatched brackets"))
+                        && d.range.start.line <= m_row
+                });
+                prop_assert!(
+                    matching.is_some(),
+                    "Expected an 'Unclosed' or 'Mismatched' diagnostic anchored at or before \
+                     the MISSING position ({m_row}, {m_col}) kind {m_kind}, but none found. \
+                     Code: {code:?}, Diagnostics: {diagnostics:?}",
                 );
             }
         }
