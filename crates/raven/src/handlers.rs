@@ -27208,6 +27208,17 @@ mod proptests {
         )
     }
 
+    // Uppercase the first ASCII letter, leaving the rest unchanged.
+    // Mirrors the mixed-case construction in `prop_case_sensitive_diagnostic_suppression`
+    // so the proptest filter and the test body agree on what counts as the "mixed-case" form.
+    fn capitalize_first(s: &str) -> String {
+        let mut chars: Vec<char> = s.chars().collect();
+        if let Some(first) = chars.first_mut() {
+            *first = first.to_ascii_uppercase();
+        }
+        chars.into_iter().collect()
+    }
+
     proptest! {
         #[test]
         fn test_library_require_extraction(pkg_name in "[a-z]{3,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))) {
@@ -29603,19 +29614,16 @@ mod proptests {
         ///
         /// **Validates: Requirements 5.4**
         fn prop_case_sensitive_diagnostic_suppression(
-            base_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            base_name in "[a-z][a-z0-9_]{2,8}".prop_filter(
+                "Not reserved or builtin (in either case)",
+                |s| !is_r_reserved(s) && !super::is_builtin(s) && !super::is_builtin(&capitalize_first(s)),
+            ),
             is_function in any::<bool>()
         ) {
             use crate::state::{WorldState, Document};
 
             // Create a mixed-case version of the name
-            let mixed_case_name = {
-                let mut chars: Vec<char> = base_name.chars().collect();
-                if !chars.is_empty() {
-                    chars[0] = chars[0].to_ascii_uppercase();
-                }
-                chars.into_iter().collect::<String>()
-            };
+            let mixed_case_name = capitalize_first(&base_name);
 
             // Generate code with declaration and both exact and case-mismatched usages
             // Pattern: # @lsp-var basename\nbasename\nBasename
