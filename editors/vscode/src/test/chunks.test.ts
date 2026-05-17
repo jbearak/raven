@@ -830,6 +830,8 @@ suite('chunk commands: registration and behavior', () => {
     test('default codeLens row shows ▷ Run Chunk → Run Next & Move ↥ Run Above', async function () {
         // Issue #280: the out-of-the-box default lens row includes the new
         // `→ Run Next & Move` button between `▷ Run Chunk` and `↥ Run Above`.
+        // The last runnable chunk drops the `Run Next & Move` lens (it has
+        // nothing to point at) — see the dedicated gating test below.
         const r_console_disabled = !(await vscode.commands.getCommands(true))
             .includes('raven.runCurrentChunkAt');
         if (r_console_disabled) return;
@@ -843,15 +845,16 @@ suite('chunk commands: registration and behavior', () => {
                 undefined,
                 vscode.ConfigurationTarget.Global,
             );
-            // 3 runnable R chunks × 3 default lenses = 9.
+            // 3 runnable R chunks; the first two carry all 3 default lenses,
+            // the last carries 2 (Run Next & Move hidden). 3 + 3 + 2 = 8.
             const lenses = await poll_for_lenses(
                 editor.document.uri,
-                (ls) => ls.length === 9,
+                (ls) => ls.length === 8,
             );
             assert.strictEqual(
                 lenses.length,
-                9,
-                `expected 9 default lenses (3 R chunks × 3 buttons), got ${lenses.length}`,
+                8,
+                `expected 8 default lenses (3 + 3 + 2, last chunk omits Run Next & Move), got ${lenses.length}`,
             );
             const first_three = lenses.slice(0, 3).map((l) => l.command?.title ?? '');
             assert.ok(
@@ -865,6 +868,85 @@ suite('chunk commands: registration and behavior', () => {
             assert.ok(
                 first_three[2]?.startsWith('↥ Run Above'),
                 `default lens 3 should be Run Above, got: ${first_three[2]}`,
+            );
+            const last_chunk_titles = lenses.slice(-2).map((l) => l.command?.title ?? '');
+            assert.ok(
+                last_chunk_titles.every((t) => !t.startsWith('→ Run Next')),
+                `Run Next lenses should be absent on the last chunk, got: ${last_chunk_titles.join(', ')}`,
+            );
+        } finally {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                previous,
+                vscode.ConfigurationTarget.Global,
+            );
+        }
+    });
+
+    test('Run Next/Previous lenses are gated by target availability', async function () {
+        // The user-reported regression: clicking "→ Run Next & Move" on
+        // the LAST runnable chunk surfaced a cursor-referencing toast
+        // even though the click did not involve the cursor. Fix: hide
+        // sibling-targeted lenses on chunks where the target chunk
+        // does not exist. Symmetric for "← Run Previous" on the first.
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runCurrentChunkAt');
+        if (r_console_disabled) return;
+        const editor = await open_doc(RMD_FIXTURE, 'rmd');
+        const config = vscode.workspace.getConfiguration();
+        const previous = config.inspect<string[]>('raven.chunks.codeLens.commands')?.globalValue;
+        try {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                [
+                    'raven.runPreviousChunk',
+                    'raven.runPreviousChunkAndMove',
+                    'raven.runCurrentChunk',
+                    'raven.runNextChunk',
+                    'raven.runNextChunkAndMove',
+                ],
+                vscode.ConfigurationTarget.Global,
+            );
+            // RMD_FIXTURE has 3 R chunks. Expected lens counts:
+            //   first  chunk: Current + Next + Next&Move           = 3
+            //                 (Previous + Previous&Move suppressed)
+            //   middle chunk: Previous + Previous&Move + Current
+            //                 + Next + Next&Move                    = 5
+            //   last   chunk: Previous + Previous&Move + Current   = 3
+            //                 (Next + Next&Move suppressed)
+            // Total = 11.
+            const lenses = await poll_for_lenses(
+                editor.document.uri,
+                (ls) => ls.length === 11,
+            );
+            assert.strictEqual(
+                lenses.length,
+                11,
+                `expected 11 lenses (3 + 5 + 3), got ${lenses.length}: `
+                + lenses.map((l) => l.command?.title).join(' | '),
+            );
+            const titles = lenses.map((l) => l.command?.title ?? '');
+            // First chunk: no Previous variants.
+            const first_chunk = titles.slice(0, 3);
+            assert.ok(
+                first_chunk.every((t) => !t.startsWith('← Run Previous')),
+                `first chunk should not have any Run Previous lens, got: ${first_chunk.join(', ')}`,
+            );
+            // Last chunk: no Next variants.
+            const last_chunk = titles.slice(-3);
+            assert.ok(
+                last_chunk.every((t) => !t.startsWith('→ Run Next')),
+                `last chunk should not have any Run Next lens, got: ${last_chunk.join(', ')}`,
+            );
+            // Middle chunk has both sides.
+            const middle_chunk = titles.slice(3, 8);
+            assert.ok(
+                middle_chunk.some((t) => t.startsWith('← Run Previous')),
+                `middle chunk should have Run Previous, got: ${middle_chunk.join(', ')}`,
+            );
+            assert.ok(
+                middle_chunk.some((t) => t.startsWith('→ Run Next')),
+                `middle chunk should have Run Next, got: ${middle_chunk.join(', ')}`,
             );
         } finally {
             await config.update(

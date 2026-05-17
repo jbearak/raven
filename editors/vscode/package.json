@@ -461,17 +461,17 @@
         {
           "command": "raven.runAllChunks",
           "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "4_file@1"
+          "group": "3_chunk_directional@3"
         },
         {
           "command": "raven.knit",
           "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
-          "group": "4_file@2"
+          "group": "4_file@1"
         },
         {
           "command": "raven.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "4_file@3"
+          "group": "4_file@2"
         },
         {
           "submenu": "raven.sendToR.terminal",
@@ -516,12 +516,12 @@
         {
           "command": "raven.terminal.runAllChunks",
           "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "4_file@1"
+          "group": "3_chunk_directional@3"
         },
         {
           "command": "raven.terminal.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "4_file@2"
+          "group": "4_file@1"
         }
       ]
     },
@@ -1812,7 +1812,7 @@
     "compile": "bun run bundle",
     "compile:test": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "bun run compile:test && bun run bundle",
+    "pretest": "bun run compile:test && bun run bundle && bun run copy-binary",
     "test": "vscode-test",
     "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
     "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
