@@ -191,14 +191,14 @@ jobs:
         run: |
           mkdir -p target/criterion
           chmod +x target/raven-bench
-          target/raven-bench --bench -- --save-baseline main
+          target/raven-bench --save-baseline main
 
       - name: Run benchmarks (PR — compare against main)
         if: github.event_name == 'pull_request'
         run: |
           mkdir -p target/criterion
           chmod +x target/raven-bench
-          target/raven-bench --bench -- --save-baseline pr
+          target/raven-bench --save-baseline pr
 
       # ── PR regression comment via critcmp ────────────────────────────────
       - name: Compare benchmarks against main baseline
