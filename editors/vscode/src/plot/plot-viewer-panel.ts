@@ -224,8 +224,15 @@ export class PlotViewerPanel {
     private async handle_save(plot_id: string, format: SaveFormat): Promise<void> {
         const session = this.server.getSession(this.sessionId);
         if (!session) return;
+        // Pass only the filter matching the chosen format. macOS NSSavePanel
+        // enforces the active filter's extension, and the dialog selects the
+        // first filter by default — so including all three caused PDF/SVG
+        // saves to be rewritten as `name.pdf.png` / `name.svg.png`.
+        const filter_labels: Record<SaveFormat, string> = {
+            png: 'PNG', svg: 'SVG', pdf: 'PDF',
+        };
         const filters: Record<string, string[]> = {
-            PNG: ['png'], SVG: ['svg'], PDF: ['pdf'],
+            [filter_labels[format]]: [format],
         };
         const default_name = `plot-${Date.now()}.${format}`;
         const target = await vscode.window.showSaveDialog({
