@@ -6007,8 +6007,10 @@ fn anchor_missing_position(
         let prev_line = &text[prev_line_start..prev_line_end];
         r -= 1;
         if is_code_line(prev_line) {
-            let trimmed_len = prev_line.trim_end().len();
-            return (r as u32, byte_offset_to_utf16_column(prev_line, trimmed_len));
+            // Use the same comment-aware trim as opener-line ranges so a
+            // trailing inline comment (e.g. `f( # tail`) doesn't push the
+            // anchor column past the last meaningful byte.
+            return (r as u32, end_of_meaningful_content(prev_line));
         }
         cur_start = prev_line_start;
     }
@@ -7423,6 +7425,17 @@ mod syntax_error_range_tests {
         // MISSING positioned at the end of "# eof" on row 2.
         let (row, col) = anchor_missing_position(2, 5, 0, 12, text);
         assert_eq!((row, col), (0, 3));
+    }
+
+    #[test]
+    fn anchor_missing_strips_inline_comment_on_prev_line() {
+        // The walk-back lands on `f( # tail`; the anchor must skip past the
+        // inline comment (and its leading whitespace) to the last meaningful
+        // byte — col 2, just after the `(` — not the end of "# tail".
+        let text = "f( # tail\n\n# more\n";
+        // MISSING positioned at end of "# more" on row 2 (raw_byte = 17).
+        let (row, col) = anchor_missing_position(2, 6, 0, 17, text);
+        assert_eq!((row, col), (0, 2));
     }
 
     #[test]

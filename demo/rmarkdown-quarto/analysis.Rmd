@@ -5,7 +5,7 @@ output: html_document
 
 ## Introduction
 
-This document demonstrates Raven's R Markdown chunk detection. ddd
+This document demonstrates Raven's R Markdown chunk detection.
 
 ```{r setup, include=FALSE}
 library(ggplot2)

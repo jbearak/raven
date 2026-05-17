@@ -459,7 +459,7 @@ Both shapes coalesce into a single `Mismatched brackets` diagnostic.
 | `wrong_closer_in_arguments_coalesces` | `"f(} y\n"` | `arguments(`(`, ERROR(`}`), argument, MISSING `)`)` | exactly ONE diagnostic via the arguments-coalescing rule. No `Unclosed `(`` follow-up for the same opener (suppressed by `CollectState::covered_openers`). |
 | `wrong_closer_for_subset_coalesces` | `"vec[}\n"` | (flat ERROR — verify in test) | one Mismatched-brackets diagnostic naming `[` and `}` |
 | `wrong_closer_with_braced_expression` | `"function() ]\n"` | `function_definition` with `braced_expression` followed by stray `]` (verify exact shape) | Specific to the parse shape: if `]` is in `braced_expression`, coalesces against `{`; otherwise stays as a stray closer (`` Missing opening `[` ``). Test asserts whichever the verified parse shape produces. |
-| `mixed_closer_leaf_emits_per_kind` | `"]\n)"` placed as two separate stray closers OR `f(])` whose flat ERROR contains a leaf `])` | For mixed leaves like `])`: two diagnostics, one `` Missing opening `[` `` on the `]`, one `` Missing opening `(` `` on the `)`. |
+| `mixed_closer_leaf_emits_per_kind` | `"]\n)"` (two separate stray closers) OR `f(])` | flat ERROR contains a single leaf `])` | two diagnostics: `` Missing opening `[` `` on the `]`, and `` Missing opening `(` `` on the `)`. |
 
 ### Encoding / line-ending edge cases
 
