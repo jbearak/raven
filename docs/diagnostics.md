@@ -26,10 +26,13 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 | ``Consecutive pipe `\|>`: expected an expression before this operator.`` | Two pipe operators appear back-to-back without an intervening expression (`x \|> \|> y`) |
 | ``Mismatched brackets: `(` opened here; close with `)` not `]`.`` | A bracket opened with `(`, `[`, or `[[` is closed with a non-matching bracket (`c(1, 2]`) |
 | ``Unexpected `>`: R has no `=>` operator. For assignment use `<-`; for a pipeline use `\|>` (R 4.1+) or `%>%`.`` | A fat-arrow-style token `=>` appears where R expected an expression — common when porting code from JavaScript or other languages (`x => 1`) |
-| `Missing )` / `Missing ]` / etc. | A delimiter was opened but never closed (`library(`) |
+| `` Unclosed `(`: missing matching `)` `` / `` Unclosed `{`: missing matching `}` `` / `` Unclosed `[`: missing matching `]` `` / `` Unclosed `[[`: missing matching `]]` `` | A delimiter was opened but never closed (`library(`, `function() {`). The diagnostic is anchored on the opening delimiter, spanning to the end of meaningful content on that line. |
+| `` Missing opening `{` `` / `` Missing opening `(` `` / `` Missing opening `[` `` / `` Missing opening `[[` `` | A closing delimiter appears with no matching opener (`}` at top level, `)` after a complete expression). A run of stray closers (`}}}`) reports a single diagnostic for the whole run. |
 | `In R, 'else' must appear on the same line as the closing '}' of the if block` | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
 | ``'else' without a preceding 'if' body: in R, 'else' must follow `if (...) {...}` on the same line`` | `else` appears anywhere R would reject a bare `else` — e.g. `else { 1 }` at the top of a file, `else { … }` inside a `{ … }` block, `(else)`, `else |> f()`, or `else` used as a function argument / assignment RHS |
 | `Syntax error` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
+
+The `Mismatched brackets` message also covers wrong-closer typos where the user typed an unexpected closer immediately after an unclosed opener (e.g. `f(}` produces a single `` Mismatched brackets: `(` opened here; close with `)` not `}`. `` diagnostic rather than two separate ones).
 
 ### Undefined Variables
 
