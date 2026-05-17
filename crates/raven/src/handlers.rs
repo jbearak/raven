@@ -6418,10 +6418,10 @@ fn has_unclosed_quote_child(node: Node) -> bool {
     false
 }
 
-/// One classified syntax-error diagnostic produced by `classify_error`.
-/// Kept separate from `tower_lsp::lsp_types::Diagnostic` so that the
-/// classifier doesn't need to fill in `source` / `severity` / etc. — the
-/// caller (`collect_syntax_errors_inner`) does that.
+/// One classified syntax-error diagnostic. After the bracket-diagnostics
+/// refactor (see `docs/superpowers/specs/2026-05-17-bracket-diagnostics-design.md`),
+/// `classify_error` will return this type instead of a bare `String` so the
+/// caller can attach `source`, `severity`, etc. without re-parsing the message.
 #[derive(Debug, Clone)]
 struct ClassifiedSyntaxDiagnostic {
     message: String,
