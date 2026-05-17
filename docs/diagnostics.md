@@ -28,7 +28,7 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 | ``Unexpected `>`: R has no `=>` operator. For assignment use `<-`; for a pipeline use `\|>` (R 4.1+) or `%>%`.`` | A fat-arrow-style token `=>` appears where R expected an expression — common when porting code from JavaScript or other languages (`x => 1`) |
 | `Missing )` / `Missing ]` / etc. | A delimiter was opened but never closed (`library(`) |
 | `In R, 'else' must appear on the same line as the closing '}' of the if block` | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
-| `'else' without a preceding 'if' body: in R, 'else' must follow \`if (...) {...}\` on the same line` | `else` appears at statement level with no preceding `if` body — e.g. `else { 1 }` at the top of a file, or `else { … }` as the first expression inside a `{ … }` block |
+| ``'else' without a preceding 'if' body: in R, 'else' must follow `if (...) {...}` on the same line`` | `else` appears anywhere R would reject a bare `else` — e.g. `else { 1 }` at the top of a file, `else { … }` inside a `{ … }` block, `(else)`, `else |> f()`, or `else` used as a function argument / assignment RHS |
 | `Syntax error` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
 
 ### Undefined Variables

@@ -8577,12 +8577,16 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
                         && !if_statement_has_else(sibling)
                         && !has_separator_between(sibling, node, text)
                     {
-                        let brace_line = find_closing_brace_line(&sibling, text);
-                        let ref_line =
-                            brace_line.unwrap_or_else(|| sibling.end_position().row);
-                        if node.start_position().row > ref_line {
-                            emit_else_newline_diagnostic(node, text, diagnostics);
-                            used_same_line_message = true;
+                        // Only use the brace-specific "same-line as `}`" hint
+                        // when the `if`'s body actually has a closing `}`.
+                        // For braceless bodies (`if (x) y\nelse z`), fall
+                        // through to the orphan message — saying "same line as
+                        // `}`" would lie about a brace that isn't there.
+                        if let Some(brace_line) = find_closing_brace_line(&sibling, text) {
+                            if node.start_position().row > brace_line {
+                                emit_else_newline_diagnostic(node, text, diagnostics);
+                                used_same_line_message = true;
+                            }
                         }
                     }
                     break;
@@ -8600,17 +8604,34 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
     }
 }
 
-/// Returns true if the source between the end of `prev` and the start of
-/// `next` contains a `;`. tree-sitter-r's external `_semicolon` token is not
-/// a named sibling, so `prev_named_sibling` looks straight past it; this
-/// helper catches the case where a statement-terminating `;` already ended
-/// the `if` and the `else` is therefore a fresh statement, not a misplaced
-/// continuation.
+/// Returns true if a statement-terminating `;` sits between `prev` and
+/// `next`. tree-sitter-r's `_semicolon` is an anonymous *external* token
+/// that has no visible alias — it does not appear as a sibling node at
+/// all — so we have to look at the source text. To avoid mis-counting a
+/// `;` inside a comment (or any other sibling node's payload), we only
+/// scan the byte ranges *between* siblings, not through them.
 fn has_separator_between(prev: Node, next: Node, text: &str) -> bool {
-    let gap = text
-        .get(prev.end_byte()..next.start_byte())
-        .unwrap_or("");
-    gap.contains(';')
+    let mut last_end = prev.end_byte();
+    let mut cur = prev.next_sibling();
+    loop {
+        let stop_at = match cur {
+            Some(n) if n.id() != next.id() => n.start_byte(),
+            _ => next.start_byte(),
+        };
+        if let Some(gap) = text.get(last_end..stop_at) {
+            if gap.contains(';') {
+                return true;
+            }
+        }
+        match cur {
+            Some(n) if n.id() != next.id() => {
+                last_end = n.end_byte();
+                cur = n.next_sibling();
+            }
+            _ => break,
+        }
+    }
+    false
 }
 
 /// Returns true if `if_stmt` (a tree-sitter `if_statement` node) already
@@ -16548,6 +16569,56 @@ clean_data <- function(x) {
         assert!(
             diagnostics[0].message.contains("without a preceding"),
             "wrapped orphan-else should use the orphan message, not the same-line message; got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// `if (x) y\nelse z` — the `if` body has no braces, so the
+    /// "move else onto the closing `}` line" wording is wrong (there is no
+    /// `}`). The diagnostic must still fire (R rejects this), but with a
+    /// message that doesn't promise a `}`.
+    #[test]
+    fn test_orphan_else_after_braceless_if_uses_orphan_message() {
+        let code = "if (x) y\nelse z";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let msg = &diagnostics[0].message;
+        assert!(
+            !msg.contains("'}'") && !msg.contains("closing brace"),
+            "braceless if body has no `}}`; message must not mention one; got: {}",
+            msg
+        );
+    }
+
+    /// `if (x) { y } # ; oops\nelse { z }` — the `;` lives inside a comment,
+    /// not as a statement separator. The diagnostic should be the
+    /// "move else onto the same line" hint (this is the regular newline-else
+    /// case), not the orphan message. A naive byte-level `;` scan would
+    /// false-route here.
+    #[test]
+    fn test_else_newline_semicolon_inside_comment_does_not_trigger_orphan() {
+        let code = "if (x) { y } # ; oops\nelse { z }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        // Both messages mention "same line", but only the orphan one starts
+        // with "without a preceding". Use that as the distinguisher.
+        assert!(
+            !diagnostics[0].message.contains("without a preceding"),
+            "`;` inside a comment must not flip the message to orphan; got: {}",
             diagnostics[0].message
         );
     }
