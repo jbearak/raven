@@ -5525,13 +5525,36 @@ fn collect_undefined_variables_from_snapshot(
             byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
         let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
 
+        // If the name is defined later in this same file, point the user at
+        // the definition line. R does not hoist top-level bindings, so this is
+        // a forward reference rather than a truly undefined symbol. Functions
+        // are covered because `exported_interface` includes top-level
+        // function definitions.
+        let forward_ref_defined_line = snapshot
+            .artifacts_map
+            .get(uri)
+            .and_then(|artifacts| artifacts.exported_interface.get(name.as_str()))
+            .filter(|sym| {
+                (sym.defined_line, sym.defined_column) > (usage_line, usage_col_utf16)
+            })
+            .map(|sym| sym.defined_line);
+
+        let message = match forward_ref_defined_line {
+            Some(line) => format!(
+                "Undefined variable: {} (defined later on line {})",
+                name,
+                line + 1
+            ),
+            None => format!("Undefined variable: {}", name),
+        };
+
         diagnostics.push(Diagnostic {
             range: Range {
                 start: Position::new(usage_node.start_position().row as u32, start_col),
                 end: Position::new(usage_node.end_position().row as u32, end_col),
             },
             severity: Some(severity),
-            message: format!("Undefined variable: {}", name),
+            message,
             ..Default::default()
         });
     }
@@ -37663,6 +37686,95 @@ x <- 1
         assert!(diagnostics[0].message.contains("Undefined variable: x"));
         assert_eq!(diagnostics[0].range.start.line, 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        // Message must point at the line where the symbol is actually defined.
+        // x is defined on file line 3 (the trailing newline after `x` puts the
+        // definition on row 2, 1-indexed = 3).
+        assert_eq!(
+            diagnostics[0].message,
+            "Undefined variable: x (defined later on line 3)",
+            "Forward reference should mention the definition line",
+        );
+    }
+
+    /// Forward reference to a function should also report the definition line.
+    /// Issue #277 explicitly calls out that this must apply to functions, not
+    /// only values.
+    #[test]
+    fn test_diagnostics_forward_reference_to_function_mentions_definition_line() {
+        let mut state = create_test_state();
+        // Line 0: empty (leading newline)
+        // Line 1: greet()           ← usage before definition
+        // Line 2: greet <- function() "hi"  ← definition
+        let code = "
+greet()
+greet <- function() \"hi\"
+";
+        let uri = add_document(&mut state, "file:///test_fn.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let greet_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: greet"))
+            .collect();
+        assert_eq!(
+            greet_diags.len(),
+            1,
+            "Should have one forward-reference diagnostic for `greet`; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            greet_diags[0].message,
+            "Undefined variable: greet (defined later on line 3)",
+            "Forward reference to a function must mention the definition line",
+        );
+    }
+
+    /// A genuinely undefined symbol (never defined anywhere in the file) must
+    /// keep the plain `Undefined variable: <name>` message — the
+    /// forward-reference annotation must only appear when the symbol is
+    /// defined later in the same file.
+    #[test]
+    fn test_diagnostics_undefined_never_defined_uses_plain_message() {
+        let mut state = create_test_state();
+        let code = "
+totally_unknown
+";
+        let uri = add_document(&mut state, "file:///never.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
+        assert_eq!(
+            diagnostics[0].message, "Undefined variable: totally_unknown",
+            "Truly undefined symbols must use the plain message",
+        );
     }
 
     #[test]
