@@ -162,3 +162,16 @@ impl Default for LintConfig {
         }
     }
 }
+
+/// Master-switch tri-state. Parsed from `raven.linting.enabled` (and the
+/// `[linting] enabled` field in `raven.toml`).
+///
+/// `Auto` resolves to `true` when a `.lintr` is the discovered project config
+/// (preserving the implicit opt-in users had before #281), `false` otherwise.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LintEnabled {
+    #[default]
+    Auto,
+    On,
+    Off,
+}

@@ -83,7 +83,7 @@ mod rules;
 use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 
-pub use self::config::{AssignmentOperatorStyle, LintConfig, ObjectNameStyle, StringDelimiter};
+pub use self::config::{AssignmentOperatorStyle, LintConfig, LintEnabled, ObjectNameStyle, StringDelimiter};
 
 /// Source identifier set on every diagnostic produced by this module.
 ///
