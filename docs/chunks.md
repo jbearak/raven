@@ -41,9 +41,9 @@ In `.R` files, `Cmd+Shift+Enter` keeps its usual meaning of **Source File** — 
 | **Run Below Chunks** | Runs every R chunk whose header is strictly below the cursor. The current chunk is not included. |
 | **Run Current and Below Chunks** | Runs the chunk at the cursor plus every R chunk after it. |
 | **Run Previous Chunk** | Runs the R chunk immediately above the cursor (skipping non-R chunks). The cursor does not move. |
-| **Run Previous Chunk and Move** | Runs the previous R chunk and moves the cursor into its first body line. Quarto's "Run Previous Chunk" behavior. |
+| **Run Previous Chunk and Move** | Runs the previous R chunk and moves the cursor into its first body line (or the header line if the chunk is empty). Quarto's "Run Previous Chunk" behavior. |
 | **Run Next Chunk** | Runs the R chunk immediately below the cursor (skipping non-R chunks). The cursor does not move. |
-| **Run Next Chunk and Move** | Runs the next R chunk and moves the cursor into its first body line. Quarto's "Run Next Chunk" behavior. |
+| **Run Next Chunk and Move** | Runs the next R chunk and moves the cursor into its first body line (or the header line if the chunk is empty). Quarto's "Run Next Chunk" behavior. |
 | **Run All Chunks** | Runs every R chunk in the document, top to bottom. |
 | **Go to Next Chunk** | Moves the cursor to the body of the next R chunk. |
 | **Go to Previous Chunk** | Moves the cursor to the body of the previous R chunk. |
