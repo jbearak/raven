@@ -5918,7 +5918,7 @@ fn anchor_missing_position(
         !t.is_empty() && !t.starts_with('#')
     };
 
-    let raw_line_start = raw_byte.saturating_sub(raw_col).min(text.len());
+    let raw_line_start = raw_byte.saturating_sub(raw_col);
     let raw_line_end = text[raw_line_start..]
         .find('\n')
         .map(|i| raw_line_start + i)
@@ -6484,7 +6484,10 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod syntax_error_range_tests {
-    use super::{collect_syntax_errors, find_first_content_line, find_innermost_error};
+    use super::{
+        anchor_missing_position, collect_syntax_errors, find_first_content_line,
+        find_innermost_error,
+    };
     use tower_lsp::lsp_types::Diagnostic;
 
     fn parse_r(code: &str) -> tree_sitter::Tree {
@@ -6662,6 +6665,58 @@ mod syntax_error_range_tests {
             missing_close.range.end.line,
             missing_close.range.end.character,
         );
+    }
+
+    #[test]
+    fn anchor_missing_walks_back_past_blank_lines() {
+        // The MISSING node is reported on a trailing comment line; the walk
+        // should skip the comment and the two blank lines above it to land on
+        // the code line containing the unclosed expression.
+        let text = "x <-\n\n\n# more";
+        let (row, col) = anchor_missing_position(3, 6, 0, text.len(), text);
+        assert_eq!((row, col), (0, 4));
+    }
+
+    #[test]
+    fn anchor_missing_no_walk_when_raw_row_is_code() {
+        // When the MISSING's own row already has code, the fast path returns
+        // immediately without inspecting prior lines.
+        let text = "x <- mean(c(1, 2, 3";
+        let (row, col) = anchor_missing_position(0, 19, 0, 19, text);
+        assert_eq!((row, col), (0, 19));
+    }
+
+    #[test]
+    fn anchor_missing_lower_bound_clamps_walk() {
+        // With lower_bound = 2, the walk may not reach the code on row 0.
+        // The function falls back to the raw position rather than crossing the
+        // bound — this protects nested ERROR contexts from anchoring on code
+        // that's outside the enclosing node's span.
+        let text = "code()\n\n\n# bad";
+        let (row, col) = anchor_missing_position(3, 5, 2, text.len(), text);
+        assert_eq!((row, col), (3, 5));
+    }
+
+    #[test]
+    fn anchor_missing_handles_multibyte_utf8() {
+        // The `é` on row 0 is two bytes but one UTF-16 code unit. The byte
+        // arithmetic (`raw_byte - raw_col`) must land on a valid char boundary,
+        // and the returned column must be a UTF-16 offset, not a byte offset.
+        let text = "café <- 1\n\n\n# trailing";
+        let (row, col) = anchor_missing_position(3, 10, 0, text.len(), text);
+        // "café <- 1" has 10 bytes but 9 UTF-16 code units.
+        assert_eq!((row, col), (0, 9));
+    }
+
+    #[test]
+    fn anchor_missing_handles_crlf_line_endings() {
+        // Slicing on `\n` keeps a trailing `\r` in each line, but `trim_end`
+        // strips it before we measure the column, so the returned offset
+        // matches what `text.lines()` would have produced.
+        let text = "x()\r\n\r\n# eof\r\n";
+        // MISSING positioned at the end of "# eof" on row 2.
+        let (row, col) = anchor_missing_position(2, 5, 0, 12, text);
+        assert_eq!((row, col), (0, 3));
     }
 
     #[test]
