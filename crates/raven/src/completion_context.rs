@@ -124,6 +124,27 @@ fn is_inside_string(node: &Node) -> bool {
 ///
 /// For nested calls like `outer(inner(x))`, returns the innermost `call`
 /// whose argument list contains the cursor position.
+///
+/// Two complications beyond plain `call` nodes:
+///
+/// 1. Reserved keywords. `if(cond)`, `for(i in xs)`, `while(cond)`, and
+///    `function(args)` look like calls textually but tree-sitter-r parses
+///    them as dedicated nodes (`if_statement`, `for_statement`,
+///    `while_statement`, `function_definition`). When the cursor is between
+///    those `(` and `)` we must stop walking up and return the keyword —
+///    otherwise an outer call would wrongly claim the cursor as its arg.
+///
+/// 2. Malformed regions. tree-sitter recovers from syntax errors by
+///    inserting `ERROR` nodes, and inside those nodes bracket pairings are
+///    unreliable. For example `a(if(b, c))` parses `if(b` as an ERROR
+///    inside the outer call's arguments, so the AST groups the outer `)`
+///    with the outer `(` even though textually it pairs with the inner
+///    `(`. When we walk through an `ERROR` ancestor we bail to the
+///    heuristic. When we land in a `call` whose arguments subtree has
+///    parse errors, we cross-check the AST callee against the heuristic
+///    and prefer the heuristic on disagreement — but keep the AST result
+///    when the heuristic returns `None` (it can't extract backticked or
+///    non-ASCII names that the AST handles fine).
 fn find_enclosing_function_call(
     node: Node,
     text: &str,
@@ -135,7 +156,24 @@ fn find_enclosing_function_call(
     let mut current = node;
 
     loop {
-        if current.kind() == "call" {
+        let kind = current.kind();
+
+        // Inside an ERROR: bracket structure is unreliable. The
+        // bracket-heuristic FSM scans text and handles this more robustly.
+        if kind == "ERROR" {
+            return None;
+        }
+
+        // Keyword-headed parenthesised constructs (if/for/while/function).
+        if let Some(name) = keyword_construct_name(current, cursor_point) {
+            return Some(FunctionCallContext {
+                function_name: name.to_string(),
+                namespace: None,
+                is_internal: false,
+            });
+        }
+
+        if kind == "call" {
             // Check if cursor is inside the arguments (between `(` and `)`)
             if let Some(args_node) = current.child_by_field_name("arguments") {
                 let args_start = args_node.start_position();
@@ -144,12 +182,65 @@ fn find_enclosing_function_call(
                 // cursor must be after the opening `(` and before or at the closing `)`
                 if cursor_point > args_start && cursor_point <= args_end {
                     if let Some(func_node) = current.child_by_field_name("function") {
-                        return extract_call_info(func_node, text);
+                        let ast_ctx = extract_call_info(func_node, text);
+
+                        // When the argument subtree has parse errors,
+                        // tree-sitter's bracket recovery can mis-group `(`
+                        // with `)` (e.g. `a(if(b, c))` — the outer `)` is
+                        // grouped with the outer `(` at the AST level even
+                        // though textually it pairs with the inner `(`).
+                        // Cross-check against the bracket heuristic and
+                        // prefer it on disagreement — but keep the AST
+                        // result when the heuristic returns `None` or
+                        // agrees with it (the heuristic can't extract
+                        // backticked or non-ASCII function names that the
+                        // AST handles fine).
+                        if args_node.has_error() {
+                            if let Some(fallback) =
+                                detect_via_bracket_heuristic(text, position)
+                            {
+                                if ast_ctx.as_ref() != Some(&fallback) {
+                                    return Some(fallback);
+                                }
+                            }
+                        }
+                        return ast_ctx;
                     }
                 }
             }
         }
         current = current.parent()?;
+    }
+}
+
+/// If `node` is a keyword-headed construct (`if`, `for`, `while`, or
+/// `function`) and `cursor` sits between the construct's `(` and `)`,
+/// return the keyword. The parens live directly on the statement node for
+/// `if`/`for`/`while`, and on the `parameters` child for
+/// `function_definition`.
+///
+/// Cursor inclusivity: strictly after `(`, at or before `)`. We compare
+/// against `close.start_position()` rather than `close.end_position()`
+/// because the keyword construct's range extends past `)` into the body
+/// — without this, a cursor in the whitespace immediately after `)` would
+/// still walk up to `if_statement` and be claimed as the `if` header.
+/// (Ordinary `call` nodes don't have this hazard because the call node
+/// itself ends at `)`, so `descendant_for_point_range` filters past-`)`
+/// cursors out before the walk-up starts.)
+fn keyword_construct_name(node: Node, cursor: Point) -> Option<&'static str> {
+    let (keyword, paren_owner) = match node.kind() {
+        "if_statement" => ("if", node),
+        "for_statement" => ("for", node),
+        "while_statement" => ("while", node),
+        "function_definition" => ("function", node.child_by_field_name("parameters")?),
+        _ => return None,
+    };
+    let open = paren_owner.child_by_field_name("open")?;
+    let close = paren_owner.child_by_field_name("close")?;
+    if cursor > open.start_position() && cursor <= close.start_position() {
+        Some(keyword)
+    } else {
+        None
     }
 }
 
@@ -687,6 +778,215 @@ mod tests {
         assert_eq!(ctx, None);
     }
 
+    // --- Keyword-headed construct tests (if / for / while / function) ---
+    //
+    // These cover both well-formed code (where tree-sitter-r produces a
+    // dedicated `*_statement` / `function_definition` node with `open` and
+    // `close` fields) and malformed code where the keyword appears inside
+    // another call's arguments and parses as an ERROR.
+
+    fn keyword_ctx(name: &str) -> Option<FunctionCallContext> {
+        Some(FunctionCallContext {
+            function_name: name.to_string(),
+            namespace: None,
+            is_internal: false,
+        })
+    }
+
+    #[test]
+    fn test_keyword_if_returns_if() {
+        let code = "if(cond) body";
+        let tree = parse_r(code);
+        // Cursor right after `(`, on the `c` of cond
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 3)),
+            keyword_ctx("if")
+        );
+        // Cursor at `)` — still "inside" the parens by the same rule used
+        // for `call` nodes
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 7)),
+            keyword_ctx("if")
+        );
+        // Cursor past the parens, in the consequence body — not "if"
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 10)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_keyword_for_returns_for() {
+        let code = "for(i in xs) body";
+        let tree = parse_r(code);
+        // Cursor right after `(`, on the iterator variable
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 4)),
+            keyword_ctx("for")
+        );
+        // Cursor on the sequence expression
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 10)),
+            keyword_ctx("for")
+        );
+        // Cursor on the body — not "for"
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 14)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_keyword_while_returns_while() {
+        let code = "while(cond) body";
+        let tree = parse_r(code);
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 6)),
+            keyword_ctx("while")
+        );
+        // Cursor on the body — not "while"
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 13)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_keyword_function_returns_function() {
+        let code = "function(x, y) body";
+        let tree = parse_r(code);
+        // Cursor inside the parameter list
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 9)),
+            keyword_ctx("function")
+        );
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 12)),
+            keyword_ctx("function")
+        );
+        // Cursor on the body — not "function"
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 16)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_keyword_nested_inside_call_regression_274() {
+        // Regression: previously returned the outer call's name because
+        // tree-sitter-r parses `if(...)` inside arguments as an ERROR node
+        // and the AST walker walked through it up to the outer `call`.
+        //
+        // The bracket-heuristic fallback correctly identifies `if`, so the
+        // AST walker now bails when it would otherwise walk through an
+        // ERROR or land in a call whose arguments subtree has parse errors.
+        let code = "a(if(a, a, a))";
+        let tree = parse_r(code);
+        // Cursor right after the inner `(` — the position captured by the
+        // proptest seed
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 5)),
+            keyword_ctx("if")
+        );
+        // Cursor at the inner `)` position — still inside the inner header
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 12)),
+            keyword_ctx("if")
+        );
+    }
+
+    #[test]
+    fn test_keyword_for_nested_inside_call() {
+        let code = "wrap(for(i in xs) i)";
+        let tree = parse_r(code);
+        // Cursor inside the `for` parens
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 10));
+        assert_eq!(ctx, keyword_ctx("for"));
+    }
+
+    #[test]
+    fn test_keyword_while_nested_inside_call() {
+        let code = "wrap(while(cond) body)";
+        let tree = parse_r(code);
+        // Cursor inside the `while` parens
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 12));
+        assert_eq!(ctx, keyword_ctx("while"));
+    }
+
+    #[test]
+    fn test_keyword_function_nested_inside_call() {
+        // `lapply(xs, function(x) x + 1)` — cursor in the function parameter list
+        let code = "lapply(xs, function(x) x + 1)";
+        let tree = parse_r(code);
+        // Cursor at the `x` inside the parameter list
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 20));
+        assert_eq!(ctx, keyword_ctx("function"));
+    }
+
+    #[test]
+    fn test_keyword_cursor_immediately_past_close_paren() {
+        // The keyword construct's range extends past `)` into the body,
+        // unlike ordinary `call` nodes whose range ends at `)`. A cursor
+        // in the whitespace immediately after `)` must NOT be claimed by
+        // the keyword header.
+        let code = "if(cond) body";
+        let tree = parse_r(code);
+        // Cursor at col 8, one byte past the `)` (which is at col 7).
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 8)),
+            None
+        );
+
+        let code = "function(x) body";
+        let tree = parse_r(code);
+        // `)` of the parameter list is at col 10; col 11 is the space.
+        assert_eq!(
+            detect_function_call_context(&tree, code, Position::new(0, 11)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_keyword_nested_inside_call_middle_position() {
+        // Same regression as test_keyword_nested_inside_call_regression_274
+        // but at a middle position between the inner args. This is the
+        // path exercised by the `args_node.has_error()` cross-check: the
+        // cursor's AST ancestor chain doesn't pass through the inner ERROR
+        // (the cursor is on a comma that's a direct child of the outer
+        // call's `arguments`), so we have to disagree with the AST via the
+        // bracket-heuristic cross-check.
+        let code = "a(if(a, a, a))";
+        let tree = parse_r(code);
+        // Cursor between the second-and-third args of the (logical) inner if
+        for col in [6, 7, 8, 9, 10, 11] {
+            assert_eq!(
+                detect_function_call_context(&tree, code, Position::new(0, col)),
+                keyword_ctx("if"),
+                "Expected `if` at col {} in code {:?}",
+                col,
+                code,
+            );
+        }
+    }
+
+    #[test]
+    fn test_call_inside_keyword_body_returns_call() {
+        // Cursor inside a real call that lives in the body of an if. The
+        // call wins, not the keyword.
+        let code = "if(cond) print(x)";
+        let tree = parse_r(code);
+        // Cursor at the `x` argument of print
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 15));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "print".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
+    }
+
     // --- R Markdown gating tests ---
 
     #[test]
@@ -1143,6 +1443,71 @@ mod property_tests {
     /// Strategy to generate a list of argument expressions (0 to 4 args).
     fn r_arguments(min: usize, max: usize) -> impl Strategy<Value = Vec<String>> {
         prop::collection::vec(r_argument_expr(), min..=max)
+    }
+
+    /// Strategy: R identifiers that are NOT reserved keywords. Used when
+    /// the identifier needs to parse cleanly as an identifier in
+    /// `if(<x>) <y>` etc. — otherwise tree-sitter-r would re-grammar it
+    /// (e.g. as a nested `if_statement`) and skew the test.
+    fn r_non_keyword_identifier() -> impl Strategy<Value = String> {
+        r_identifier().prop_filter("must not be a reserved keyword", |s| {
+            !matches!(
+                s.as_str(),
+                "if" | "else"
+                    | "for"
+                    | "while"
+                    | "repeat"
+                    | "function"
+                    | "return"
+                    | "break"
+                    | "next"
+                    | "in"
+                    | "TRUE"
+                    | "FALSE"
+                    | "NULL"
+                    | "NA"
+                    | "Inf"
+                    | "NaN"
+                    | "T"
+                    | "F"
+            )
+        })
+    }
+
+    /// Build a well-formed keyword construct `<kw>(<inner>) <body>` and
+    /// return `(code, keyword_str, close_paren_col, body_col)`.
+    /// `kw_idx`: 0=if, 1=for, 2=while, 3=function.
+    fn build_keyword_construct(
+        kw_idx: u8,
+        inner: &str,
+        body: &str,
+    ) -> (String, &'static str, usize, usize) {
+        let (code, keyword, prefix_len) = match kw_idx {
+            0 => (format!("if({}) {}", inner, body), "if", "if(".len()),
+            // The for header is `for(i in <inner>)`. We hard-code `i` as
+            // the iterator variable and the strategy guarantees `inner`
+            // isn't a reserved keyword, so it parses cleanly.
+            1 => (
+                format!("for(i in {}) {}", inner, body),
+                "for",
+                "for(i in ".len(),
+            ),
+            2 => (
+                format!("while({}) {}", inner, body),
+                "while",
+                "while(".len(),
+            ),
+            _ => (
+                format!("function({}) {}", inner, body),
+                "function",
+                "function(".len(),
+            ),
+        };
+        let close_col = prefix_len + inner.len();
+        // Layout is "<header>) <body>", so the body starts two bytes past
+        // `)`: one for `)`, one for the space.
+        let body_col = close_col + 2;
+        (code, keyword, close_col, body_col)
     }
 
     /// Parse R code using the thread-local parser.
@@ -1604,6 +1969,73 @@ mod property_tests {
                 inner_name,
                 cursor_col,
                 code
+            );
+        }
+
+        // ============================================================================
+        // Feature: function-parameter-completions, Property 3: Keyword Construct Boundary
+        //
+        // For any well-formed `if(<x>) <y>` / `for(i in <x>) <y>` /
+        // `while(<x>) <y>` / `function(<x>) <y>`, the cursor AT the `)`
+        // position is inside the header (returns the keyword), the cursor
+        // immediately past `)` is OUTSIDE the header (returns None), and
+        // the cursor on the bare-identifier body is OUTSIDE (returns
+        // None).
+        //
+        // Closes a coverage gap from issue #274's adversarial review: the
+        // other properties don't generate keyword constructs with a real
+        // body and don't probe the boundary right at / immediately past
+        // `)` (where the keyword construct's AST range extends past `)`
+        // into the body, unlike plain calls).
+        // ============================================================================
+
+        #[test]
+        fn prop_keyword_construct_boundary(
+            kw_idx in 0u8..4,
+            inner in r_non_keyword_identifier(),
+            body in r_non_keyword_identifier(),
+        ) {
+            let (code, keyword, close_col, body_col) =
+                build_keyword_construct(kw_idx, &inner, &body);
+            let tree = parse_r(&code);
+
+            // 1. Cursor AT the `)` byte — inside the header.
+            let pos_close = Position::new(0, close_col as u32);
+            let ctx = detect_function_call_context(&tree, &code, pos_close);
+            prop_assert!(
+                ctx.is_some(),
+                "Expected context at `)` (col {}) in code {:?}",
+                close_col,
+                code,
+            );
+            let function_name = ctx.unwrap().function_name;
+            prop_assert_eq!(
+                function_name.as_str(),
+                keyword,
+                "Expected `{}` at `)` (col {}) in code {:?}",
+                keyword,
+                close_col,
+                code,
+            );
+
+            // 2. Cursor immediately past `)` (in the whitespace before
+            //    the body) — outside the header.
+            let pos_past = Position::new(0, (close_col + 1) as u32);
+            prop_assert!(
+                detect_function_call_context(&tree, &code, pos_past).is_none(),
+                "Expected None immediately past `)` (col {}) in code {:?}",
+                close_col + 1,
+                code,
+            );
+
+            // 3. Cursor on the bare-identifier body — outside the header
+            //    and not inside any call.
+            let pos_body = Position::new(0, body_col as u32);
+            prop_assert!(
+                detect_function_call_context(&tree, &code, pos_body).is_none(),
+                "Expected None on body (col {}) in code {:?}",
+                body_col,
+                code,
             );
         }
     }
