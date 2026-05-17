@@ -16,7 +16,7 @@ This spec replaces the singleton with a per-source-path registry: each `.Rmd` ge
 1. Knitting `A.Rmd` and `B.Rmd` in the same window produces two distinct panels, both visible until the user closes them.
 2. Re-knitting `A.Rmd` updates A's panel in place — the `Refresh` button on each panel remains bound to *its* source `.Rmd` for the life of the panel.
 3. New panels open in the same column as existing knit panels (they stack as tabs), so the user does not have to rearrange the workspace after each knit.
-4. No new commands, no new settings. The webview shell HTML, CSP, sandbox, message protocol, theme handling, and security model are unchanged.
+4. No new commands, no new settings. The CSP `<head>` placement, `localResourceRoots` confinement, theme-preference key, and `pickPrimaryOutput` semantics are unchanged from the implementation today. The sandbox attribute, loading mechanism, and message-protocol membership match the *implementation* (not the prior spec's text) — see "Security model" and "Per-instance behavior" for the precise inventory.
 
 ## Non-goals
 
@@ -37,7 +37,7 @@ editors/vscode/src/knit/
   ...
 ```
 
-No changes to `package.json`, settings schema, context keys, or the message protocol. No changes to the iframe shell HTML or CSP. No changes outside `knit-output-panel.ts` and its tests.
+No changes to `package.json`, settings schema, context keys, the message protocol, the iframe shell HTML template in `knit-output.ts`, or the CSP. The only production source file this work touches is `knit-output-panel.ts`. Test files are added or modified per the "Testing" section.
 
 ## State model
 
@@ -58,7 +58,7 @@ export class KnitOutputPanel {
 ```
 
 - **`instances` key**: `sourceUri.toString()`. Using the URI rather than `fsPath` gives free, platform-correct normalization (Windows drive-letter case, URI-encoding of spaces, etc.) and is the same value the rest of the extension keys on.
-- **`previewColumn`**: the concrete `vscode.ViewColumn` (1, 2, 3, …) that the first surviving knit panel was placed in. Used to anchor subsequent *new* panels. Reset to `undefined` whenever no surviving panel occupies it.
+- **`previewColumn`**: the concrete `vscode.ViewColumn` (1, 2, 3, …) that subsequent *new* knit panels anchor to. Initially `undefined`. On every state change (`onDidChangeViewState`, `onDidDispose`) `recomputePreviewColumn` runs: if any panel still occupies the recorded column, it stays put; otherwise it *adopts* the column of any surviving panel (so a dragged-away lone panel keeps siblings clustered with it); if the Map is empty, it resets to `undefined`. The full algorithm is shown in "Column tracking" below; the table in "Edge cases" enumerates the user-visible consequences.
 
 ## `showOrUpdate` flow
 
@@ -98,24 +98,41 @@ static async showOrUpdate(
 }
 ```
 
-## Column tracking
+## `create` registration
 
-Inside `create`, after `vscode.window.createWebviewPanel(...)`:
+`KnitOutputPanel.create` is the only path that constructs an instance. It must register the new instance in the static Map under `args.sourceUri.toString()` *before* returning, and must wire `onDidChangeViewState` / `onDidDispose` listeners. Equivalent to today's `KnitOutputPanel.instance = instance` line in the singleton implementation, but Map-keyed:
 
 ```ts
-const resolved = panel.viewColumn;
-if (resolved !== undefined && KnitOutputPanel.previewColumn === undefined) {
-    KnitOutputPanel.previewColumn = resolved;
+private static create(context, args, rootDir, column): KnitOutputPanel {
+    const key = args.sourceUri.toString();
+    const panel = vscode.window.createWebviewPanel(/* unchanged options */);
+    const instance = new KnitOutputPanel(context, panel, rootDir, args);
+    KnitOutputPanel.instances.set(key, instance);
+
+    // Anchor the preview column on the first panel that has one resolved.
+    const resolved = panel.viewColumn;
+    if (resolved !== undefined && KnitOutputPanel.previewColumn === undefined) {
+        KnitOutputPanel.previewColumn = resolved;
+    }
+
+    panel.onDidChangeViewState(() => KnitOutputPanel.recomputePreviewColumn());
+    panel.onDidDispose(() => {
+        if (KnitOutputPanel.instances.get(key) === instance) {
+            KnitOutputPanel.instances.delete(key);
+        }
+        KnitOutputPanel.recomputePreviewColumn();
+    });
+
+    instance.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
+    return instance;
 }
 ```
 
-The first surviving knit anchors the preview column. From then on, `previewColumn` stays put until the registry stops occupying it.
+Without the `instances.set(key, instance)` call, every knit would be treated as new (`existing` always `undefined`), re-knit would never reuse, and the registry would never function. The dispose handler's `===` guard prevents a stale dispose event for a replaced instance from evicting the replacement under the same key (see "rootDir-mismatch" edge case).
 
-**`onDidChangeViewState`** — when a panel is dragged to a different column:
+## Column tracking
 
-```ts
-panel.onDidChangeViewState(() => KnitOutputPanel.recomputePreviewColumn());
-```
+The `create` registration above wires `onDidChangeViewState` and `onDidDispose` and does the initial anchoring. This section specifies the shared recompute routine those listeners call.
 
 ```ts
 private static recomputePreviewColumn(): void {
@@ -145,23 +162,7 @@ private static recomputePreviewColumn(): void {
 }
 ```
 
-**`onDidDispose`** per instance:
-
-```ts
-panel.onDidDispose(() => {
-    // Guard against a stale dispose listener for an instance that has
-    // since been replaced under the same key (the rootDir-mismatch
-    // branch disposes the old panel and inserts a new one). VS Code's
-    // dispose() is synchronous today, but the guard makes the
-    // invariant explicit and survives any future async change.
-    if (KnitOutputPanel.instances.get(key) === instance) {
-        KnitOutputPanel.instances.delete(key);
-    }
-    KnitOutputPanel.recomputePreviewColumn();
-});
-```
-
-The dispose handler captures the instance it was registered for (closure over `instance`). The replacement panel registers its own `onDidDispose` for the *new* instance.
+The `onDidDispose` handler that calls this routine is shown in the `create` registration block above.
 
 ## Per-instance behavior (unchanged)
 
@@ -188,7 +189,7 @@ The dispose handler captures the instance it was registered for (closure over `i
 Each panel reuses the three-layer model already implemented in `knit-output-panel.ts` + `knit-output.ts`. Going from one to many panels does not widen the security surface; each layer is per-instance.
 
 1. **`iframe sandbox="allow-same-origin"`** — blocks scripts, forms, popups, and top-navigation in the rendered HTML. `allow-same-origin` is set (rather than the empty `sandbox=""` that the prior spec described) because an opaque-origin sandbox bypasses the VS Code webview service worker, causing `ERR_NAME_NOT_RESOLVED` on `vscode-cdn.net` resources; `allow-same-origin` re-enters the SW scope without enabling scripts or forms. The trade-off (rendered HTML inside the iframe can read its own DOM via JS that we would otherwise have allowed — but `sandbox` strips script execution regardless, so this is moot) is documented in the doc comment on `buildShellHtml`.
-2. **Outer-shell CSP** in `<head>` — `default-src 'none'`, `frame-src ${cspSource}`, `script-src 'nonce-${nonce}'`, `connect-src 'none'`.
+2. **Outer-shell CSP** in `<head>` — exactly the directives currently emitted by `buildShellHtml` (`knit-output.ts:139-145`): `default-src 'none'`, `frame-src ${cspSource}`, `img-src ${cspSource} https: data:`, `style-src ${cspSource} 'unsafe-inline'`, `font-src ${cspSource} https: data:`, `script-src 'nonce-${nonce}'`, `connect-src 'none'`. Subresource directives (`img-src` / `style-src` / `font-src`) are required for figures, themed CSS, and webfonts inside the rendered HTML to load — the prior spec's 4-directive summary was an abbreviation that would block all of them if implemented literally. `style-src 'unsafe-inline'` is required by rmarkdown's stock highlight themes; safe inside the iframe sandbox because the inline styles cannot reach the outer toolbar.
 3. **`localResourceRoots`** confined to *that panel's* `path.dirname(outputPath)`. Two panels for `A.Rmd` and `B.Rmd` whose outputs live in different directories receive different roots — neither can resolve resources from the other's directory.
 
 **Loading mechanism** (also unchanged from the implementation, but worth restating because the prior spec is imprecise): the rendered HTML is read from disk via `fs.readFileSync`, run through `rewriteFragmentAnchors` (see below), and embedded as `srcdoc` on the iframe, with a `<base href>` set to the webview URI of the output's directory so relative subresources resolve through `localResourceRoots`. This is *not* iframe `src` loading; the prior spec's `src="${asWebviewUri(outputPath)}"` text described a design that was changed during implementation to work around nested-iframe navigation issues with `webview.asWebviewUri`.
@@ -204,6 +205,7 @@ Same as the prior spec, scoped per source:
 | Condition | Surface |
 |--|--|
 | Rendered HTML not readable (`fs.access` fails) | `showOrUpdate` returns `{ ok: false, error }`. Caller in `knit-commands.ts` logs to the output channel and falls back to `revealFileInOS`. Other panels untouched. |
+| File deleted / becomes unreadable between `fs.access` (in `showOrUpdate`) and `fs.readFileSync` (in `updateContent`) | The `try { fs.readFileSync }` inside `updateContent` already catches and writes an inline error `<p>` into the panel ("Raven: Knit — could not read the rendered output. Use Open in Browser instead.") and logs the error to the channel. The panel is *not* disposed, so the user can still re-knit via the toolbar. `showOrUpdate` does **not** retroactively return `{ ok: false }` for this case — the panel has already been opened/revealed and shows the inline error. This matches the singleton's existing behavior at `knit-output-panel.ts:158-168`. |
 | Refresh on a file whose source `.Rmd` was deleted | `raven.knit` runs and fails its YAML parse / file-existence check; the panel stays visible showing the last successful render. |
 | `vscode.env.openExternal` returns false on Open in Browser | Warning toast + path written to the output channel. Unchanged. |
 
@@ -270,7 +272,15 @@ static recomputePreviewColumnForTesting(): void;
 static setPreviewColumnForTesting(col: vscode.ViewColumn | undefined): void;
 ```
 
-`setInstancesForTesting` installs lightweight stand-ins (objects shaped like `{ panel: { viewColumn } }`) into the static `instances` Map, bypassing real `createWebviewPanel`. The recompute logic only reads `inst.panel.viewColumn`, so duck-typing is sufficient. `disposeAllForTesting` clears the Map and `previewColumn` regardless of how entries were inserted (real or fake), so production tests can interleave with recompute tests.
+`setInstancesForTesting` installs lightweight stand-ins (objects shaped like `{ panel: { viewColumn } }`) into the static `instances` Map, bypassing real `createWebviewPanel`. The recompute logic only reads `inst.panel.viewColumn`, so duck-typing is sufficient.
+
+`disposeAllForTesting` semantics:
+
+1. For each entry in `instances`, if the entry has a real `vscode.WebviewPanel` (i.e. was not inserted via `setInstancesForTesting`), call `entry.panel.dispose()`. This is detected by `typeof entry.panel.dispose === 'function'` — fakes injected by `setInstancesForTesting` do not have `dispose`, so they are skipped.
+2. Clear the Map (`instances.clear()`) regardless of dispose results.
+3. Set `previewColumn = undefined`.
+
+This guarantees no live orphan `WebviewPanel` is left behind after tests that opened real panels, while still allowing recompute tests to reset their fake-instance fixtures cheaply. If a future test inserts a fake that *does* expose a `dispose` shim, that shim runs — fine, and the contract is "if you give me something disposable, I dispose it."
 
 The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed (`disposeAllForTesting` / `getInstancesForTesting`) and the existing test callers update accordingly.
 
@@ -293,6 +303,17 @@ The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed (`dis
 
 1. **`onDidChangeViewState` cost** — fires on every visibility / state change, not just column moves. The handler does an O(n) Map walk; with realistic n ≤ ~10, the overhead is negligible. If users report panel-switching jank with many panels, debounce or compare against a cached column before walking.
 2. **Tab grouping (drag-as-group)** — VS Code does not expose programmatic tab grouping. Users can manually group knit panels via the tab-strip context menu. Out of scope.
+
+## v3 → v4 changes (response to third Codex pass)
+
+| Codex finding | v4 disposition |
+| --            | --             |
+| #1 Stale "unchanged" framing in Goals / Architecture still claimed shell HTML, CSP, sandbox, message protocol unchanged | Goal #4 rewritten to enumerate what is *actually* unchanged (CSP placement, `localResourceRoots`, theme key, `pickPrimaryOutput`); Architecture paragraph rewritten to list the unchanged surfaces and point at the security/per-instance sections for the divergences. |
+| #2 `create` never specified to insert into `instances` Map | New "`create` registration" section shows the full `create` body including `instances.set(key, instance)`, the preview-column anchoring, and the wiring of `onDidChangeViewState` / `onDidDispose` with the identity-guarded delete. Without this, the registry would never function. |
+| #3 State-model "Reset to undefined whenever no surviving panel occupies it" contradicted the adopt-on-drag algorithm | State-model bullet rewritten to describe the actual three-step algorithm (occupied → stay; empty old / non-empty Map → adopt; empty Map → undefined). |
+| #4 CSP listed only 4 directives, would block figures/CSS/fonts | Security model now quotes the full 7-directive CSP from `knit-output.ts:139-145` verbatim and notes why each subresource directive is required. |
+| #5 No error surface for fs.access-then-readFileSync TOCTOU | New edge-case row documents the existing inline-error fallback in `updateContent` and notes `showOrUpdate` does *not* retroactively return `{ok: false}` for that case. |
+| #6 `disposeAllForTesting` did not say it disposes real panels before clearing | Test-only API section now spells out the three-step contract (dispose real panels detected by `typeof entry.panel.dispose === 'function'`, clear Map, reset previewColumn). |
 
 ## v2 → v3 changes (response to second Codex pass)
 
