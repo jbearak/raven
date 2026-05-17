@@ -6353,14 +6353,46 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 }
 
 fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let mut state = CollectState::default();
+    collect_syntax_errors_inner(node, text, diagnostics, &mut state);
+}
+
+fn collect_syntax_errors_inner(
+    node: Node,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    state: &mut CollectState,
+) {
     if node.is_error() {
-        let message = classify_error(node, text);
-        diagnostics.push(Diagnostic {
-            range: minimize_error_range(node, text),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message,
-            ..Default::default()
-        });
+        match classify_error(node, text, state) {
+            ErrorClassification::Whole(diag) => {
+                diagnostics.push(Diagnostic {
+                    range: diag.range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: diag.message,
+                    ..Default::default()
+                });
+            }
+            ErrorClassification::Multi(diags) if diags.is_empty() => {
+                // Fallback: generic "Syntax error" at the minimized range.
+                diagnostics.push(Diagnostic {
+                    range: minimize_error_range(node, text),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: "Syntax error".to_string(),
+                    ..Default::default()
+                });
+            }
+            ErrorClassification::Multi(diags) => {
+                for diag in diags {
+                    diagnostics.push(Diagnostic {
+                        range: diag.range,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: diag.message,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         // Don't recurse into ERROR children — the minimized range already
         // accounts for nested MISSING nodes, and recursing would produce
         // duplicate diagnostics for nested ERROR children.
@@ -6393,7 +6425,7 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_syntax_errors(child, text, diagnostics);
+        collect_syntax_errors_inner(child, text, diagnostics, state);
     }
 }
 
@@ -6454,8 +6486,9 @@ struct CollectState {
     covered_openers: std::collections::HashSet<usize>,
 }
 
-/// Classify an ERROR node into a specific, actionable message where possible,
-/// falling back to the generic "Syntax error" for unrecognised patterns.
+/// Classify an ERROR node into a specific, actionable diagnostic where possible,
+/// falling back to `ErrorClassification::Multi(vec![])` (the sentinel for
+/// "no classifier matched — caller emits a single generic 'Syntax error'").
 ///
 /// Checks (in priority order):
 /// 1. Unclosed string literal — lone `"` / `'` as a direct child.
@@ -6464,20 +6497,32 @@ struct CollectState {
 ///    non-matching bracket (detected through a nested ERROR child).
 /// 4. Fat-arrow typo — a lone `>` immediately following an `=` token, which
 ///    arises from writing `=>` (no such operator in R).
-fn classify_error(node: Node, text: &str) -> String {
+///
+/// Returns `ErrorClassification::Whole` when a single classifier matched, or
+/// `ErrorClassification::Multi(vec![])` when none matched. Future work (Task 5)
+/// will return non-empty `Multi` for delimiter-scan results.
+fn classify_error(node: Node, text: &str, _state: &mut CollectState) -> ErrorClassification {
+    let range = minimize_error_range(node, text);
+
     if has_unclosed_quote_child(node) {
-        return "Unclosed string literal".to_string();
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic {
+            message: "Unclosed string literal".to_string(),
+            range,
+        });
     }
     if let Some(msg) = detect_consecutive_pipe(node, text) {
-        return msg;
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
     if let Some(msg) = detect_mismatched_bracket(node, text) {
-        return msg;
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
     if let Some(msg) = detect_fat_arrow(node, text) {
-        return msg;
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
-    "Syntax error".to_string()
+    // No classifier matched. Caller falls back to a single generic
+    // "Syntax error" at the minimized range. Returning Multi(vec![]) is
+    // the sentinel for "delimiter scan / fallback".
+    ErrorClassification::Multi(Vec::new())
 }
 
 /// Returns a diagnostic message if `node` is an ERROR whose only non-trivial
