@@ -6456,6 +6456,36 @@ fn collect_syntax_errors_inner(
     }
 
     if node.is_missing() {
+        // Bracket-kind MISSING routes through the opener-anchoring helper
+        // unless the opener is already covered by a mismatched-bracket
+        // diagnostic emitted earlier in this traversal.
+        if matches!(node.kind(), ")" | "}" | "]" | "]]") {
+            if let Some((opener, range)) = find_opener_for_missing(node, text) {
+                if !state.covered_openers.contains(&opener.id()) {
+                    let opener_text = text
+                        .get(opener.start_byte()..opener.end_byte())
+                        .unwrap_or("");
+                    if let Some(k) = DelimiterKind::from_opener(opener_text) {
+                        diagnostics.push(Diagnostic {
+                            range,
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            message: format!(
+                                "Unclosed `{}`: missing matching `{}`",
+                                k.opener_str(),
+                                k.closer_str(),
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                }
+                return;
+            }
+            // Bracket-kind MISSING with no structural parent: fall through
+            // to the existing default branch.
+        }
+
+        // Existing default branch for non-bracket MISSING (e.g. identifier
+        // missing after `x <-`). PRESERVE BYTE-FOR-BYTE from Task 3.
         let (row, col) = anchor_missing_position(
             node.start_position().row,
             node.start_position().column,
@@ -7233,21 +7263,24 @@ mod syntax_error_range_tests {
         //
         // The diagnostic should anchor on line 0 (the line with the unmatched
         // `(`), so the user's eye lands on the broken expression.
+        //
+        // Message updated (Task 7): bracket-kind MISSING now emits
+        // "Unclosed `(`: missing matching `)`" via the opener-anchoring path.
         let code = "x <- mean(c(1, 2, 3)\n\n# Here is a comment\n";
         let diags = collect(code);
         assert!(!diags.is_empty(), "should produce a diagnostic");
         let missing_close = diags
             .iter()
-            .find(|d| d.message.contains("Missing") && d.message.contains(')'))
+            .find(|d| d.message.contains("Unclosed `(`"))
             .unwrap_or_else(|| {
                 panic!(
-                    "expected a 'Missing )' diagnostic, got: {:?}",
+                    "expected an 'Unclosed `(`: ...' diagnostic, got: {:?}",
                     diags.iter().map(|d| &d.message).collect::<Vec<_>>()
                 )
             });
         assert_eq!(
             missing_close.range.start.line, 0,
-            "Missing ) diagnostic should anchor on line 0 (the line with the \
+            "Unclosed `(` diagnostic should anchor on line 0 (the line with the \
              unclosed `(`), got line {}. Full range: ({},{})..({},{})",
             missing_close.range.start.line,
             missing_close.range.start.line,
@@ -7852,6 +7885,8 @@ mod syntax_error_range_tests {
     #[test]
     fn unclosed_library_call() {
         // `library(` — unclosed function call.
+        // Message updated (Task 7): bracket-kind MISSING now emits
+        // "Unclosed `(`: missing matching `)`" via the opener-anchoring path.
         let code = "library(";
         let diags = collect(code);
         assert!(
@@ -7859,10 +7894,12 @@ mod syntax_error_range_tests {
             "should produce at least one diagnostic for unclosed library call"
         );
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
-            "should produce a syntax/missing diagnostic, got: {:?}",
+            diags.iter().any(|d| {
+                d.message == "Syntax error"
+                    || d.message.starts_with("Missing")
+                    || d.message.starts_with("Unclosed")
+            }),
+            "should produce a syntax/missing/unclosed diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
@@ -8108,6 +8145,23 @@ mod syntax_error_range_tests {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if let Some(found) = find_error_at(child, row, col) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Find a MISSING node at the given (row, col) position via depth-first search.
+    fn find_missing_node_at<'a>(node: Node<'a>, row: u32, col: u32) -> Option<Node<'a>> {
+        if node.is_missing()
+            && node.start_position().row as u32 == row
+            && node.start_position().column as u32 == col
+        {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_missing_node_at(child, row, col) {
                 return Some(found);
             }
         }
@@ -8417,9 +8471,40 @@ mod syntax_error_range_tests {
             // 1. minimize_error_range Phase 1 (MISSING inside ERROR → "Syntax error")
             // 2. collect_syntax_errors direct MISSING handling (→ "Missing <kind>")
             //
-            // In either case, the diagnostic start position must match the MISSING
-            // node's position.
+            // Exception (Task 7): bracket-kind MISSING nodes (`)`, `}`, `]`, `]]`)
+            // are re-anchored to the opener position and emit "Unclosed `X`...".
+            // For those, we verify that at least one "Unclosed" diagnostic exists
+            // for the code, rather than checking the raw MISSING position.
+            let has_any_unclosed = diagnostics.iter().any(|d| d.message.starts_with("Unclosed `"));
+            let mut all_missing_are_bracket_kind = true;
+
             for &(m_row, m_col) in &missing_positions {
+                // Find the MISSING node at this position to check its kind.
+                // We use the tree to walk and identify it.
+                let missing_node = find_missing_node_at(root, m_row, m_col);
+                let is_bracket_missing = missing_node
+                    .map(|n| matches!(n.kind(), ")" | "}" | "]" | "]]"))
+                    .unwrap_or(false);
+
+                if is_bracket_missing {
+                    // Bracket-kind MISSING: diagnostic is at the opener, not the MISSING
+                    // position. Verify at least one "Unclosed" diagnostic was emitted.
+                    prop_assert!(
+                        has_any_unclosed,
+                        "Expected an 'Unclosed' diagnostic for bracket-kind MISSING at ({}, {}). \
+                         Code: {}, Diagnostics: {:?}",
+                        m_row,
+                        m_col,
+                        code,
+                        diagnostics
+                            .iter()
+                            .map(|d| &d.message)
+                            .collect::<Vec<_>>()
+                    );
+                    continue;
+                }
+                all_missing_are_bracket_kind = false;
+
                 let has_matching_diag = diagnostics.iter().any(|d| {
                     d.range.start.line == m_row && d.range.start.character == m_col
                 });
@@ -8444,6 +8529,7 @@ mod syntax_error_range_tests {
                         .collect::<Vec<_>>()
                 );
             }
+            let _ = all_missing_are_bracket_kind; // suppress unused warning
         }
 
         // ============================================================================
@@ -8715,8 +8801,23 @@ mod syntax_error_range_tests {
             // 1. "Missing <kind>" — from collect_syntax_errors direct MISSING handling
             // 2. "Syntax error" — from minimize_error_range Phase 1 (MISSING inside ERROR)
             //
-            // Both paths create a 1-column-wide range at the MISSING node's position.
+            // Exception (Task 7): bracket-kind MISSING nodes (`)`, `}`, `]`, `]]`)
+            // are re-anchored to the opener position and emit "Unclosed `X`...".
+            // The opener-anchored diagnostic range spans opener..EOL (not 1 column),
+            // so we skip the width check for bracket-kind MISSING.
             for &(m_row, m_col) in &missing_positions {
+                let missing_node = find_missing_node_at(root, m_row, m_col);
+                let is_bracket_missing = missing_node
+                    .map(|n| matches!(n.kind(), ")" | "}" | "]" | "]]"))
+                    .unwrap_or(false);
+
+                if is_bracket_missing {
+                    // Bracket-kind MISSING diagnostic is at the opener, not the MISSING
+                    // position. Width check does not apply; the "Unclosed" diagnostic
+                    // spans opener..EOL (see find_opener_for_missing). Skip.
+                    continue;
+                }
+
                 let matching_diag = diagnostics.iter().find(|d| {
                     d.range.start.line == m_row && d.range.start.character == m_col
                 });
@@ -9234,6 +9335,94 @@ mod syntax_error_range_tests {
             "got: {}",
             diags[0].0,
         );
+    }
+
+    // ========================================================================
+    // Bracket-kind MISSING anchor tests (Task 7)
+    // ========================================================================
+
+    #[test]
+    fn unclosed_paren_anchors_on_opener() {
+        // mean(c(1,2,3) — opener `(` of mean( at col 9, EOL of opener line at col 20
+        let diags = collect("x <- mean(c(1, 2, 3)\n\n# comment\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 9);
+        assert_eq!(target.range.end.line, 0);
+        assert_eq!(target.range.end.character, 20);
+    }
+
+    #[test]
+    fn unclosed_brace_anchors_on_opener() {
+        // f <- function() { ... — opener `{` at col 16, EOL at col 17
+        let diags = collect("f <- function() {\n  x <- 1\n  y <- 2\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `{`"))
+            .expect("expected Unclosed { diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 16);
+        assert_eq!(target.range.end.character, 17);
+    }
+
+    #[test]
+    fn unclosed_bracket_anchors_on_opener() {
+        let diags = collect("vec[1, 2\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `[`"))
+            .expect("expected Unclosed [ diagnostic");
+        assert_eq!(target.range.start.character, 3);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_double_bracket_anchors_on_opener() {
+        let diags = collect("vec[[1, 2\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `[[`"))
+            .expect("expected Unclosed [[ diagnostic");
+        assert_eq!(target.range.start.character, 3);
+        assert_eq!(target.range.end.character, 9);
+    }
+
+    #[test]
+    fn unclosed_paren_at_end_of_file() {
+        let diags = collect("library(");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 7);
+        assert_eq!(target.range.end.character, 8);
+    }
+
+    #[test]
+    fn unclosed_opener_with_trailing_comment() {
+        // `f( # comment\n` — opener `(` at col 1, range collapses to just `(`
+        let diags = collect("f( # comment\n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 1);
+        assert_eq!(target.range.end.character, 2);
+    }
+
+    #[test]
+    fn unclosed_opener_with_trailing_whitespace() {
+        let diags = collect("f(   \n");
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Unclosed `(`"))
+            .expect("expected Unclosed ( diagnostic");
+        assert_eq!(target.range.start.character, 1);
+        assert_eq!(target.range.end.character, 2);
     }
 
 }
