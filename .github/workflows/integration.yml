@@ -41,6 +41,7 @@ jobs:
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
 
       - name: Cache sccache storage and cargo registry
+        id: cargo-sccache-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
@@ -79,6 +80,11 @@ jobs:
           name: raven-test
           path: target/raven-test
           retention-days: 1
+
+      - name: Report cache status
+        if: always()
+        run: |
+          echo "::notice title=Cache status::cargo-sccache-hit=${{ steps.cargo-sccache-cache.outputs.cache-hit }}"
 
   # Run the full Rust test suite using the pre-compiled release binary.
   cargo:
@@ -135,10 +141,12 @@ jobs:
 
       - name: Display binary size
         run: |
-          echo "## Release Binary Size" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          ls -lh target/release/raven >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Release Binary Size"
+            echo '```'
+            ls -lh target/release/raven
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           ls -la target/release/raven
 
   # ── VS Code Mocha integration suite ────────────────────────────────────

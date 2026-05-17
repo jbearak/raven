@@ -36,6 +36,7 @@ jobs:
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
 
       - name: Cache sccache storage and cargo registry
+        id: cargo-sccache-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
@@ -82,6 +83,11 @@ jobs:
       - name: Run benchmarks (PR — compare against main)
         if: github.event_name == 'pull_request'
         run: cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
+
+      - name: Report cache status
+        if: always()
+        run: |
+          echo "::notice title=Cache status::cargo-sccache-hit=${{ steps.cargo-sccache-cache.outputs.cache-hit }}"
 
       # ── PR regression comment via critcmp ────────────────────────────────
       - name: Compare benchmarks against main baseline
