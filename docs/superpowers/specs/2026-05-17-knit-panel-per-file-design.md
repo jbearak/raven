@@ -119,16 +119,29 @@ panel.onDidChangeViewState(() => KnitOutputPanel.recomputePreviewColumn());
 
 ```ts
 private static recomputePreviewColumn(): void {
+    if (KnitOutputPanel.instances.size === 0) {
+        KnitOutputPanel.previewColumn = undefined;
+        return;
+    }
     const target = KnitOutputPanel.previewColumn;
-    if (target === undefined) return;
-    let stillThere = false;
-    for (const inst of KnitOutputPanel.instances.values()) {
-        if (inst.panel.viewColumn === target) {
-            stillThere = true;
-            break;
+    if (target !== undefined) {
+        for (const inst of KnitOutputPanel.instances.values()) {
+            if (inst.panel.viewColumn === target) return; // still occupied
         }
     }
-    if (!stillThere) KnitOutputPanel.previewColumn = undefined;
+    // Either no preview column was set, or the recorded one is no longer
+    // occupied. Adopt the column of any surviving panel so the next new
+    // knit lands next to the existing one rather than scattering to
+    // ViewColumn.Beside. (Pick the first iteration order; in practice all
+    // panels cluster in the same column.)
+    for (const inst of KnitOutputPanel.instances.values()) {
+        const col = inst.panel.viewColumn;
+        if (col !== undefined) {
+            KnitOutputPanel.previewColumn = col;
+            return;
+        }
+    }
+    KnitOutputPanel.previewColumn = undefined;
 }
 ```
 
@@ -136,20 +149,25 @@ private static recomputePreviewColumn(): void {
 
 ```ts
 panel.onDidDispose(() => {
-    KnitOutputPanel.instances.delete(key);
-    if (KnitOutputPanel.instances.size === 0) {
-        KnitOutputPanel.previewColumn = undefined;
-    } else {
-        KnitOutputPanel.recomputePreviewColumn();
+    // Guard against a stale dispose listener for an instance that has
+    // since been replaced under the same key (the rootDir-mismatch
+    // branch disposes the old panel and inserts a new one). VS Code's
+    // dispose() is synchronous today, but the guard makes the
+    // invariant explicit and survives any future async change.
+    if (KnitOutputPanel.instances.get(key) === instance) {
+        KnitOutputPanel.instances.delete(key);
     }
+    KnitOutputPanel.recomputePreviewColumn();
 });
 ```
+
+The dispose handler captures the instance it was registered for (closure over `instance`). The replacement panel registers its own `onDidDispose` for the *new* instance.
 
 ## Per-instance behavior (unchanged)
 
 - The constructor captures `context`, `panel`, `rootDir`, `sourceUri`, `outputPath`, `output` exactly as today.
 - `updateContent` regenerates the shell HTML each call. Title is `Knit Output: ${path.basename(outputPath)}` — same as today, which already disambiguates panels in the tab strip.
-- `handleMessage` dispatches `refresh`, `openInBrowser`, `themeChanged` against the captured `sourceUri` / `outputPath` of *that* instance. No registry lookups.
+- `handleMessage` dispatches three message types against the captured `sourceUri` / `outputPath` of *that* instance: `{type: 'refresh'}`, `{type: 'openInBrowser'}`, `{type: 'themeChanged', applied: boolean}`. No registry lookups. The `themeChanged` message updates the global theme preference (see below) and is *not* documented in the prior spec's protocol section (which lists only `refresh` / `openInBrowser`); it was added in `4270fc8 feat(knit): fix white iframe + overhaul panel UX`. This spec treats the implemented three-message protocol as authoritative.
 - Theme preference is global (lives in `context.globalState`, key `raven.knit.applyVSCodeTheme`). Changing the toggle on one panel does not retro-apply to other open panels in this session — applies on the next `updateContent` (i.e. the next knit of that file). Documented as the intentional shape, mirroring how the existing singleton already behaves across knits.
 
 ## Edge cases
@@ -158,7 +176,7 @@ panel.onDidDispose(() => {
 |--|--|
 | Knit `A.Rmd`, close A's editor, knit `A.Rmd` again via explorer context menu | Panel for A is found in the Map by `sourceUri.toString()` and reused. The closed editor is irrelevant. |
 | Same `.Rmd` opened in two VS Code windows | Each window has its own extension host and `instances` Map. No cross-window interference. |
-| User drags A's panel into the editor column (column 1) where A.Rmd lives | `onDidChangeViewState` fires; `recomputePreviewColumn` checks whether any other knit panel still occupies the old preview column. If not, `previewColumn = undefined` and the next *new* knit re-anchors to `Beside`. |
+| User drags A's panel into a different column (e.g. column 1 where A.Rmd lives) | `onDidChangeViewState` fires; `recomputePreviewColumn` runs. If any other knit panel still occupies the old preview column, `previewColumn` stays put (subsequent knits stack with the cluster that didn't move). If A was the only one, `previewColumn` *adopts* A's new column so the next knit lands next to A rather than scattering to `Beside`. |
 | Same `.Rmd` knit produces output to a different directory on the second run | A's existing panel is disposed and recreated in *its* current column (the `rootDir`-mismatch branch). Other panels are untouched. |
 | Multi-output knit (HTML + PDF) | Unchanged: HTML wins for the panel, additional paths go to the `Raven: Knit` output channel. The Map is keyed by source, not output. |
 | `Refresh` invoked while a knit of the same file is in flight | Existing `inFlight` Set in `knit-commands.ts` fires the "already being knitted" toast. Unchanged. |
@@ -167,13 +185,13 @@ panel.onDidDispose(() => {
 
 ## Security model
 
-Unchanged from `2026-05-17-knit-output-webview-design.md`. Each panel has the same three independent layers:
+Each panel reuses the three-layer model already implemented in `knit-output-panel.ts` + `knit-output.ts`. Going from one to many panels does not widen the security surface; each layer is per-instance.
 
-1. **`iframe sandbox=""`** — blocks scripts, forms, popups, top-navigation, same-origin access in the rendered HTML.
+1. **`iframe sandbox="allow-same-origin"`** — blocks scripts, forms, popups, and top-navigation in the rendered HTML. `allow-same-origin` is set (rather than the empty `sandbox=""` that the prior spec described) because an opaque-origin sandbox bypasses the VS Code webview service worker, causing `ERR_NAME_NOT_RESOLVED` on `vscode-cdn.net` resources; `allow-same-origin` re-enters the SW scope without enabling scripts or forms. The trade-off (rendered HTML inside the iframe can read its own DOM via JS that we would otherwise have allowed — but `sandbox` strips script execution regardless, so this is moot) is documented in the doc comment on `buildShellHtml`.
 2. **Outer-shell CSP** in `<head>` — `default-src 'none'`, `frame-src ${cspSource}`, `script-src 'nonce-${nonce}'`, `connect-src 'none'`.
-3. **`localResourceRoots`** confined to *that panel's* `path.dirname(outputPath)`.
+3. **`localResourceRoots`** confined to *that panel's* `path.dirname(outputPath)`. Two panels for `A.Rmd` and `B.Rmd` whose outputs live in different directories receive different roots — neither can resolve resources from the other's directory.
 
-Because each instance owns its own `localResourceRoots`, panels cannot read each other's output directories. Going from one to many panels does not widen the security surface.
+**Loading mechanism** (also unchanged from the implementation, but worth restating because the prior spec is imprecise): the rendered HTML is read from disk via `fs.readFileSync` and embedded as `srcdoc` on the iframe, with a `<base href>` set to the webview URI of the output's directory so relative subresources resolve through `localResourceRoots`. This is *not* iframe `src` loading; the prior spec's `src="${asWebviewUri(outputPath)}"` text described a design that was changed during implementation to work around nested-iframe navigation issues with `webview.asWebviewUri`. The security properties (sandbox + CSP + roots) hold for srcdoc the same way they hold for src.
 
 ## Error handling
 
@@ -209,8 +227,20 @@ No changes. `knit-output-shell.test.ts`, `knit-output-message.test.ts`, `knit-ou
 
 **New:**
 
-- **`knit-multi-panel.test.ts`** — knit `A.Rmd`, knit `B.Rmd`. Assert: `getInstancesForTesting().size === 2`, both panels share `viewColumn === previewColumn`. Re-knit `A.Rmd` and assert `instances.size === 2` still (no new panel for the same key) and that A's panel reference is identical to the pre-existing one.
+- **`knit-multi-panel.test.ts`** — knit `A.Rmd`, knit `B.Rmd` (with outputs under distinct directories). Assert:
+  - `getInstancesForTesting().size === 2`;
+  - both panels share `viewColumn === previewColumn`;
+  - A's and B's panels have *distinct* `webview.options.localResourceRoots`, each containing only its own output directory (per-panel isolation claim);
+  - re-knit `A.Rmd` and assert `instances.size === 2` still (no new panel for the same key) and that A's panel reference is identical to the pre-existing one.
 - **`knit-preview-column.test.ts`** — knit `A.Rmd`, capture the column VS Code assigned, dispose A's panel; knit `B.Rmd`, assert it opens in `ViewColumn.Beside` (preview column was reset on Map-empty). Then knit `A.Rmd` again and assert A's new panel lands in B's column (the new preview column).
+- **`knit-rootdir-change.test.ts`** — knit `A.Rmd` so its output lives under `/tmp/dir1/`. Assert the panel's `localResourceRoots` contains `/tmp/dir1`. Re-invoke `showOrUpdate` with the *same* sourceUri but an `outputPath` under `/tmp/dir2/`. Assert: the original panel is disposed (the `WebviewPanel` reference observed earlier is now disposed), a new panel exists for the same key, the new panel's `localResourceRoots` contains `/tmp/dir2`, the new panel's `viewColumn` matches the old panel's `viewColumn`, and `instances.size === 1`. This is the highest-risk lifecycle branch and was previously only manually smoked.
+- **`knit-recompute-preview-column.test.ts`** — unit test for `recomputePreviewColumn` driven through a test-only harness that injects fake instances with controlled `viewColumn` values. Cases:
+  - empty Map → `previewColumn = undefined`;
+  - one panel in column X, `previewColumn` was X → stays X;
+  - one panel in column X, `previewColumn` was Y (no panels at Y) → adopts X;
+  - two panels split between X and Y, `previewColumn` was X → stays X;
+  - two panels, both move to Z, `previewColumn` was X → adopts Z.
+  Drives the panel-drag scenario without needing VS Code to simulate a real drag.
 
 Test-only statics on `KnitOutputPanel`:
 
@@ -237,10 +267,25 @@ The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed and u
 
 - `docs/knit.md`, step 10 ("Reveal") — change "the **Knit Output** webview panel" to "a **Knit Output** webview panel for that `.Rmd`," and add one sentence: "Multiple `.Rmd` files can have panels open at once; new panels stack as tabs alongside any existing knit panels."
 - `docs/knit.md` non-goals — remove any wording implying the panel is a singleton.
-- `docs/development.md` — short note: `KnitOutputPanel` keeps a per-`sourceUri` registry and tracks a "preview column" for new panels. Cross-link from `help-panel.ts`'s doc comment (which remains singleton — distinct domain, only one R-help context per session).
+- `docs/development.md` — **supersedes** the singleton-panel pattern note that the prior 2026-05-17 spec added (so the two specs do not leave the development docs describing two contradictory architectures). New text: `KnitOutputPanel` keeps a per-`sourceUri` registry and tracks a "preview column" for new panels. Cross-link from `help-panel.ts`'s doc comment (which remains singleton — distinct domain, only one R-help context per session).
 - `docs/superpowers/specs/2026-05-17-knit-output-webview-design.md` — link this spec in the header as a successor for the singleton paragraphs.
 
 ## Open questions
 
 1. **`onDidChangeViewState` cost** — fires on every visibility / state change, not just column moves. The handler does an O(n) Map walk; with realistic n ≤ ~10, the overhead is negligible. If users report panel-switching jank with many panels, debounce or compare against a cached column before walking.
 2. **Tab grouping (drag-as-group)** — VS Code does not expose programmatic tab grouping. Users can manually group knit panels via the tab-strip context menu. Out of scope.
+
+## v1 → v2 changes (response to Codex adversarial review)
+
+| Codex finding | v2 disposition |
+| --            | --             |
+| #1 `sandbox=""` claim contradicts implementation's `allow-same-origin` | Security section rewritten to describe `sandbox="allow-same-origin"` and why (VS Code service-worker / `ERR_NAME_NOT_RESOLVED`). |
+| #2 Spec describes iframe `src` loading; implementation uses `srcdoc` + `<base href>` | New "Loading mechanism" paragraph explicitly documents `srcdoc` + `baseHref` and notes the security properties hold for both. |
+| #3 `themeChanged` message type not in prior protocol but used in implementation | Per-instance behavior section enumerates all three messages (`refresh`, `openInBrowser`, `themeChanged`) and points to the commit that introduced the third. |
+| #4 Prior spec's `Promise<void>` signature vs. current `{ok, error?}` union | Acknowledged as drift in the *prior* spec. This spec uses the current correct signature; no change needed here. |
+| #5 `previewColumn` resets to undefined when the only panel is dragged → scatters | `recomputePreviewColumn` now *adopts* a surviving panel's column instead of resetting to undefined whenever the Map is non-empty. Reset only happens when the Map is empty. Edge-case row updated to match. |
+| #6 `onDidDispose` could delete a replacement instance under the same key | Dispose handler now guards with `if (instances.get(key) === instance)` before deleting. Documented as defense-in-depth against any future async dispose. |
+| #7 Drag-recompute behavior only in manual smoke | New `knit-recompute-preview-column.test.ts` exercises `recomputePreviewColumn` directly via a test-only harness with controlled fake instances. |
+| #8 No automated test for `rootDir`-mismatch dispose-and-recreate | New `knit-rootdir-change.test.ts` covers the highest-risk lifecycle branch with `localResourceRoots` and column assertions. |
+| #9 `localResourceRoots` isolation claim untested | `knit-multi-panel.test.ts` now asserts each panel's `webview.options.localResourceRoots` contains only its own output directory. |
+| #10 `docs/development.md` contradicts the prior spec's singleton note | Doc-update section now explicitly *supersedes* the prior singleton note rather than adding alongside it. |
