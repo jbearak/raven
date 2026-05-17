@@ -90,6 +90,15 @@ pub fn resolve_lint_for_document(
     // on top, then re-parse. This keeps semantics identical to what the LSP
     // does at startup.
     let mut effective = base_section.clone();
+    // Stamp the base's indentation_unit into the JSON so overrides that don't
+    // explicitly set indentationUnit inherit the per-document value, not the
+    // stale client placeholder that may be in the raw section.
+    if let Some(map) = effective.as_object_mut() {
+        map.insert(
+            "indentationUnit".to_string(),
+            serde_json::json!(base.indentation_unit),
+        );
+    }
     let mut matched_any = false;
     for ov in overrides {
         if ov.matchers.iter().any(|m| m.is_match(rel)) {
@@ -301,6 +310,29 @@ mod tests {
         base.enabled = false;
         let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
         assert!(!effective.enabled, "override 'auto' should inherit base off");
+    }
+
+    #[test]
+    fn override_preserves_per_document_indentation_unit() {
+        // When the raw section has indentationUnit: 2 (the client placeholder)
+        // but base.indentation_unit = 4 (per-document tab size from the editor),
+        // an override that matches but doesn't set indentationUnit must not reset
+        // it back to the stale section value.
+        let mut base = LintConfig::default();
+        base.indentation_unit = 4;
+        let section = json!({ "indentationUnit": 2, "lineLength": 80, "enabled": true });
+        let root = PathBuf::from("/proj");
+        let overrides = make_overrides(
+            &root,
+            vec![("R/**/*.R", json!({ "lineLength": 120 }))],
+        );
+        let uri = Url::parse("file:///proj/R/foo.R").unwrap();
+        let out = resolve_lint_for_document(&base, &section, &overrides, &uri);
+        assert_eq!(
+            out.indentation_unit, 4,
+            "per-document indent unit must survive override re-parse"
+        );
+        assert_eq!(out.line_length, 120, "override line length must still apply");
     }
 
     #[test]

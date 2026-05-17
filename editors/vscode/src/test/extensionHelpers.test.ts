@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import {
     getUpdatedGlobalLanguageConfig,
     isRDocument,
+    resolveTabSizeForDocument,
 } from '../extensionHelpers';
 
 suite('Extension Helpers', () => {
@@ -82,6 +83,55 @@ suite('Extension Helpers', () => {
             ),
             null,
         );
+    });
+
+    test('resolveTabSizeForDocument passes language-scoped configuration scope', () => {
+        // The scope passed to getConfiguration must include `languageId` so
+        // VS Code resolves [r]-scoped overrides like `[r] { "editor.tabSize": 2 }`.
+        // A bare vscode.Uri scope only reads resource-scoped configuration and
+        // misses language-specific overrides.
+        const doc = {
+            uri: vscode.Uri.file('/proj/foo.R'),
+            languageId: 'r',
+        };
+
+        let capturedScope: vscode.ConfigurationScope | undefined;
+        resolveTabSizeForDocument(doc, (scope) => {
+            capturedScope = scope;
+            return {
+                get<T>(_key: string, defaultValue: T): T { return defaultValue; },
+                has: () => false,
+                inspect: () => undefined,
+                update: () => Promise.resolve(),
+            } as unknown as vscode.WorkspaceConfiguration;
+        });
+
+        assert.ok(
+            capturedScope !== undefined &&
+            typeof capturedScope === 'object' &&
+            !(capturedScope instanceof vscode.Uri) &&
+            'languageId' in capturedScope,
+            `getConfiguration scope must include languageId for language-scoped settings; got: ${JSON.stringify(capturedScope)}`,
+        );
+        assert.strictEqual(
+            (capturedScope as { languageId: string }).languageId,
+            'r',
+            'languageId in scope must match the document language',
+        );
+    });
+
+    test('resolveTabSizeForDocument returns tab size from configuration', () => {
+        const doc = { uri: vscode.Uri.file('/proj/foo.R'), languageId: 'r' };
+        const tabSize = resolveTabSizeForDocument(doc, () => ({
+            get<T>(key: string, defaultValue: T): T {
+                if (key === 'tabSize') return 4 as unknown as T;
+                return defaultValue;
+            },
+            has: () => true,
+            inspect: () => undefined,
+            update: () => Promise.resolve(),
+        } as unknown as vscode.WorkspaceConfiguration));
+        assert.strictEqual(tabSize, 4);
     });
 
     test('getUpdatedGlobalLanguageConfig ignores workspace-only overrides', () => {

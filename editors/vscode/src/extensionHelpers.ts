@@ -31,6 +31,23 @@ export function isRDocument(
     return R_DOCUMENT_EXTENSIONS.has(path.extname(document.uri.fsPath).toLowerCase());
 }
 
+/**
+ * Resolve the effective `editor.tabSize` for a document. The scope MUST
+ * include `languageId` so VS Code returns language-scoped overrides (e.g.
+ * `[r] { "editor.tabSize": 2 }`) instead of only the resource-scoped value.
+ *
+ * The optional `getCfg` parameter exists for unit testing; callers should
+ * omit it and let the default use `vscode.workspace.getConfiguration`.
+ */
+export function resolveTabSizeForDocument(
+    document: Pick<vscode.TextDocument, 'uri' | 'languageId'>,
+    getCfg: (scope: vscode.ConfigurationScope) => vscode.WorkspaceConfiguration = (scope) =>
+        vscode.workspace.getConfiguration('editor', scope),
+): number {
+    return getCfg({ uri: document.uri, languageId: document.languageId })
+        .get<number>('tabSize', 2);
+}
+
 export function getUpdatedGlobalLanguageConfig(
     inspection: LanguageConfigurationInspection | undefined,
     wordSeparators: string,

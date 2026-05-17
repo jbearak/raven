@@ -16,6 +16,7 @@ import {
 import {
     getUpdatedGlobalLanguageConfig,
     isRDocument,
+    resolveTabSizeForDocument,
 } from './extensionHelpers';
 import {
     shouldTriggerDirectivePathSuggest,
@@ -82,16 +83,6 @@ function getServerPath(context: vscode.ExtensionContext): string {
     const platform = process.platform;
     const binaryName = platform === 'win32' ? 'raven.exe' : 'raven';
     return path.join(context.extensionPath, 'bin', binaryName);
-}
-
-/**
- * Resolve the effective `editor.tabSize` for an R document, resource-scoped
- * so per-file and per-language overrides are honoured.
- */
-function resolveTabSizeForDocument(document: vscode.TextDocument): number {
-    const cfg = vscode.workspace.getConfiguration('editor', document.uri);
-    const tabSize = cfg.get<number>('tabSize', 2);
-    return tabSize;
 }
 
 /**
