@@ -6476,6 +6476,12 @@ fn collect_syntax_errors_inner(
                             ),
                             ..Default::default()
                         });
+                    } else {
+                        debug_assert!(
+                            false,
+                            "find_opener_for_missing returned opener text {:?} that DelimiterKind::from_opener does not recognize; this is a precondition violation",
+                            opener_text
+                        );
                     }
                 }
                 return;
@@ -8475,8 +8481,11 @@ mod syntax_error_range_tests {
             // are re-anchored to the opener position and emit "Unclosed `X`...".
             // For those, we verify that at least one "Unclosed" diagnostic exists
             // for the code, rather than checking the raw MISSING position.
+            // NOTE: weak global check — passes if ANY "Unclosed" diagnostic exists,
+            // not one per bracket-kind MISSING node. If `missing_node_code()` is later
+            // extended to produce multiple unclosed brackets per code string, tighten
+            // this to verify one "Unclosed" per distinct bracket-kind MISSING.
             let has_any_unclosed = diagnostics.iter().any(|d| d.message.starts_with("Unclosed `"));
-            let mut all_missing_are_bracket_kind = true;
 
             for &(m_row, m_col) in &missing_positions {
                 // Find the MISSING node at this position to check its kind.
@@ -8503,7 +8512,6 @@ mod syntax_error_range_tests {
                     );
                     continue;
                 }
-                all_missing_are_bracket_kind = false;
 
                 let has_matching_diag = diagnostics.iter().any(|d| {
                     d.range.start.line == m_row && d.range.start.character == m_col
@@ -8529,7 +8537,6 @@ mod syntax_error_range_tests {
                         .collect::<Vec<_>>()
                 );
             }
-            let _ = all_missing_are_bracket_kind; // suppress unused warning
         }
 
         // ============================================================================
