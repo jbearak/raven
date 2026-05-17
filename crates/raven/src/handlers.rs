@@ -6450,10 +6450,9 @@ fn has_unclosed_quote_child(node: Node) -> bool {
     false
 }
 
-/// One classified syntax-error diagnostic. After the bracket-diagnostics
-/// refactor (see `docs/superpowers/specs/2026-05-17-bracket-diagnostics-design.md`),
-/// `classify_error` will return this type instead of a bare `String` so the
-/// caller can attach `source`, `severity`, etc. without re-parsing the message.
+/// One classified syntax-error diagnostic produced by [`classify_error`].
+/// The caller in [`collect_syntax_errors_inner`] attaches `severity` and
+/// `source` when constructing the final [`Diagnostic`].
 #[derive(Debug, Clone)]
 struct ClassifiedSyntaxDiagnostic {
     message: String,
@@ -6501,6 +6500,9 @@ struct CollectState {
 /// Returns `ErrorClassification::Whole` when a single classifier matched, or
 /// `ErrorClassification::Multi(vec![])` when none matched. Future work (Task 5)
 /// will return non-empty `Multi` for delimiter-scan results.
+///
+/// `_state` is reserved for the delimiter-scan and mismatched-bracket coalescing
+/// tasks; rename to `state` and pass it through when those tasks land.
 fn classify_error(node: Node, text: &str, _state: &mut CollectState) -> ErrorClassification {
     let range = minimize_error_range(node, text);
 
