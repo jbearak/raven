@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   # Compile all Rust artifacts once in release profile and upload them.
-  # Both downstream jobs download what they need — no second compile.
+  # All downstream jobs download what they need — no second compile.
   # Release profile is required so that performance_budgets tests
   # (gated on `not(debug_assertions)`) are included and enforced.
   build:
@@ -54,16 +54,26 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get install -y --no-install-recommends mold
 
-      # Compile test binary without running it. `--features test-support`
-      # exposes `raven::test_utils` needed by `performance_budgets`.
-      # The cargo test output prints the path to the compiled executable;
-      # we capture it and copy to a stable name alongside the LSP binary.
-      - name: Compile (release)
+      # `cargo test --release --no-run` compiles the test binary (all tests,
+      # including performance_budgets) without running it. The path to the
+      # compiled executable is printed to stderr; we copy it to a stable name.
+      # The same binary serves both the cargo and time-budgets jobs (filtered
+      # by passing a test name prefix to the executable).
+      - name: Compile release test + LSP binaries
         run: |
           cargo test --release --no-run -p raven --features test-support 2>&1 | tee /tmp/cargo-test-build.txt
           TEST_BIN=$(grep -oE 'target/release/deps/raven-[a-f0-9]+' /tmp/cargo-test-build.txt | head -1)
           echo "TEST_BIN=$TEST_BIN"
           cp "$TEST_BIN" target/raven-test
+
+      # cargo bench --no-run compiles the bench binary without running it.
+      # We use the same grep strategy to find and rename it.
+      - name: Compile release bench binary
+        run: |
+          cargo bench --no-run -p raven --features test-support --bench startup 2>&1 | tee /tmp/cargo-bench-build.txt
+          BENCH_BIN=$(grep -oE 'target/release/deps/startup-[a-f0-9]+' /tmp/cargo-bench-build.txt | head -1)
+          echo "BENCH_BIN=$BENCH_BIN"
+          cp "$BENCH_BIN" target/raven-bench
 
       - name: Upload LSP binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -79,9 +89,14 @@ jobs:
           path: target/raven-test
           retention-days: 1
 
-  # Run the Rust test suite using the pre-compiled release binary.
-  # Runs in parallel with the build job is not possible (needs: build),
-  # but the download-and-run step is ~30s vs ~10min compile.
+      - name: Upload bench binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: raven-bench
+          path: target/raven-bench
+          retention-days: 1
+
+  # Run the full Rust test suite using the pre-compiled release binary.
   cargo:
     name: Cargo Tests
     needs: build
@@ -101,7 +116,197 @@ jobs:
           chmod +x target/raven-test
           target/raven-test
 
-  # Run the VS Code Mocha integration suite using the pre-compiled LSP binary.
+  # ── Time-budget regression tests (required check) ──────────────────────
+  # Re-uses the test binary from the build job, filtered to performance_budgets.
+  time-budgets:
+    name: Time-Budget Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Download test binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+        with:
+          name: raven-test
+          path: target/
+
+      - name: Run time-budget tests
+        run: |
+          chmod +x target/raven-test
+          target/raven-test performance_budgets
+
+  # ── Criterion benchmarks with baseline management ──────────────────────
+  benchmarks:
+    name: Criterion Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Download bench binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+        with:
+          name: raven-bench
+          path: target/
+
+      # Criterion baselines are stored under target/criterion/.
+      # We cache them so PR runs can compare against the main baseline.
+      - name: Restore Criterion baseline cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ runner.os }}-main-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-${{ runner.os }}-
+
+      - name: Install critcmp
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: critcmp-cache
+        with:
+          path: ~/.cargo/bin/critcmp
+          key: critcmp-${{ runner.os }}-v0.1
+
+      # critcmp itself is a small binary; only build if not cached.
+      # We still need the Rust toolchain for this install step.
+      - name: Install Rust toolchain (for critcmp install only)
+        if: steps.critcmp-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build critcmp
+        if: steps.critcmp-cache.outputs.cache-hit != 'true'
+        run: cargo install critcmp
+
+      # Criterion writes output to ./target/criterion/ relative to CWD.
+      # Create the directory so the bench binary can write its baseline.
+      # On push to main: save results as the new baseline.
+      # On PRs: compare against the main baseline.
+      - name: Run benchmarks (push to main — save baseline)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p target/criterion
+          chmod +x target/raven-bench
+          target/raven-bench --bench -- --save-baseline main
+
+      - name: Run benchmarks (PR — compare against main)
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p target/criterion
+          chmod +x target/raven-bench
+          target/raven-bench --bench -- --save-baseline pr
+
+      # ── PR regression comment via critcmp ────────────────────────────────
+      - name: Compare benchmarks against main baseline
+        if: github.event_name == 'pull_request'
+        id: critcmp
+        run: |
+          # If the main baseline doesn't exist, skip comparison
+          if ! critcmp --list 2>/dev/null | grep -q '^main$'; then
+            echo "No main baseline found — skipping comparison."
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            echo "no_baseline=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "no_baseline=false" >> "$GITHUB_OUTPUT"
+          # Compare PR results against main baseline, threshold 5%
+          if critcmp main pr --threshold 5 > /tmp/critcmp-output.txt 2>&1; then
+            if [ -s /tmp/critcmp-output.txt ]; then
+              echo "has_diff=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::critcmp failed; treating as diff to surface in PR comment"
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- raven-benchmark-comparison -->"
+          BODY_FILE=$(mktemp)
+          trap 'rm -f "$BODY_FILE"' EXIT
+
+          if [ "${{ steps.critcmp.outputs.no_baseline }}" = "true" ]; then
+            cat > "$BODY_FILE" <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          No `main` baseline found — benchmark comparison skipped.
+
+          A baseline will be created when this branch (or a future PR) is merged to `main`.
+          ENDOFBODY
+          elif [ "${{ steps.critcmp.outputs.has_diff }}" = "true" ]; then
+            {
+              cat <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          Showing benchmarks with **>5% change** vs `main`:
+
+          ```
+          ENDOFBODY
+              cat /tmp/critcmp-output.txt
+              cat <<'ENDOFBODY'
+          ```
+
+          _Generated by `critcmp --threshold 5`. Criterion baselines compared: `main` → `pr`._
+          ENDOFBODY
+            } > "$BODY_FILE"
+          else
+            cat > "$BODY_FILE" <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          No benchmarks changed by more than 5% vs `main`.
+
+          _Generated by `critcmp --threshold 5`._
+          ENDOFBODY
+          fi
+
+          EXISTING_COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate -q ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+            | head -1)
+
+          if [ -n "$EXISTING_COMMENT_ID" ]; then
+            jq -Rs '{"body": .}' < "$BODY_FILE" | \
+              gh api \
+                "repos/${{ github.repository }}/issues/comments/${EXISTING_COMMENT_ID}" \
+                -X PATCH --input -
+          else
+            gh pr comment "${PR_NUMBER}" --body-file "$BODY_FILE"
+          fi
+
+  # ── Release binary size tracking ───────────────────────────────────────
+  binary-size:
+    name: Binary Size
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download LSP binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+        with:
+          name: raven-release
+          path: target/release/
+
+      - name: Display binary size
+        run: |
+          echo "## Release Binary Size" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh target/release/raven >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -la target/release/raven
+
+  # ── VS Code Mocha integration suite ────────────────────────────────────
   vscode-mocha:
     name: VS Code Mocha Suite
     needs: build
