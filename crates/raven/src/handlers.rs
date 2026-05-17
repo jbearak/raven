@@ -6418,6 +6418,42 @@ fn has_unclosed_quote_child(node: Node) -> bool {
     false
 }
 
+/// One classified syntax-error diagnostic produced by `classify_error`.
+/// Kept separate from `tower_lsp::lsp_types::Diagnostic` so that the
+/// classifier doesn't need to fill in `source` / `severity` / etc. — the
+/// caller (`collect_syntax_errors_inner`) does that.
+#[derive(Debug, Clone)]
+struct ClassifiedSyntaxDiagnostic {
+    message: String,
+    range: Range,
+}
+
+/// Result of classifying an ERROR node. A single ERROR can now produce
+/// either one whole-error diagnostic (the existing classifiers) or
+/// multiple per-fault diagnostics (the new delimiter scan).
+#[derive(Debug, Clone)]
+enum ErrorClassification {
+    /// Single diagnostic describing the whole ERROR. Used by unclosed
+    /// string, consecutive pipe, mismatched bracket, fat-arrow.
+    Whole(ClassifiedSyntaxDiagnostic),
+    /// Zero or more diagnostics, each describing a distinct delimiter
+    /// fault inside the ERROR. An empty Vec means "no classifier matched
+    /// — caller falls back to a single generic 'Syntax error' at the
+    /// minimized range".
+    Multi(Vec<ClassifiedSyntaxDiagnostic>),
+}
+
+/// Per-traversal mutable state threaded through `collect_syntax_errors_inner`
+/// so that the mismatched-bracket coalescing rule can suppress a duplicate
+/// `Unclosed X` diagnostic for the same opener.
+#[derive(Default)]
+struct CollectState {
+    /// `Node::id()` values of opener tokens already covered by a
+    /// `Mismatched brackets` diagnostic. The MISSING-anchoring branch
+    /// skips emitting `Unclosed X` for any opener whose id appears here.
+    covered_openers: std::collections::HashSet<usize>,
+}
+
 /// Classify an ERROR node into a specific, actionable message where possible,
 /// falling back to the generic "Syntax error" for unrecognised patterns.
 ///
