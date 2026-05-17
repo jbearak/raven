@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache wraps rustc so unchanged crates are served from cache even
+  # when Cargo.lock changes (e.g. adding a new dep). SCCACHE_GHA_ENABLED
+  # tells the action to use the GHA cache backend rather than a local dir.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
 
 permissions:
   contents: read
@@ -18,9 +23,6 @@ concurrency:
 jobs:
   # Sibling job 1: the Rust test suite. Mirrors what `bun test` runs
   # locally as the first half of `tests/bun/workspace-suite.test.ts`.
-  # Runs in release profile so its `target/` cache lines up with the
-  # release LSP binary that the Mocha suite builds — same cache key
-  # means whichever job finishes first warms the other on subsequent runs.
   cargo:
     name: Cargo Tests
     runs-on: ubuntu-latest
@@ -31,16 +33,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry & build artifacts
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache cargo registry
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            integration-cargo-${{ runner.os }}-
+            cargo-registry-${{ runner.os }}-
 
       # `--features test-support` exposes `raven::test_utils`, which the
       # `performance_budgets` integration test imports. Without the flag,
@@ -61,16 +65,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry & build artifacts
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache cargo registry
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: integration-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            integration-cargo-${{ runner.os }}-
+            cargo-registry-${{ runner.os }}-
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
