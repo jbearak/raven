@@ -4,7 +4,7 @@ Raven reports problems in your R code as you type — undefined variables, missi
 
 Diagnostics are deferred until the workspace scan completes (in `auto` backward dependency mode), so cross-file warnings reflect the full project.
 
-Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, undefined variables, package and cross-file issues, assignment-target errors, and semantic warnings — are on by default whenever `raven.diagnostics.enabled` is true. Most categories expose a severity setting that can raise, lower, or silence them (set to `"off"`); a few (parse errors, assignment-target errors) have no per-category knob and respond only to the master switch. **Style lints** are subjective formatting rules and the whole group is off until you set `raven.linting.enabled` to `true`. If you're looking for a specific check, scan the categories below before reaching for [Linting](linting.md), which only covers the opt-in style group.
+Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, undefined variables, package and cross-file issues, assignment-target errors, and semantic warnings — are on by default whenever `raven.diagnostics.enabled` is true. Most categories expose a severity setting that can raise, lower, or silence them (set to `"off"`); a few (parse errors, assignment-target errors) have no per-category knob and respond only to the master switch. **Style lints** are subjective formatting rules gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in; see the [behavior matrix](linting.md#behavior-matrix)). If you're looking for a specific check, scan the categories below before reaching for [Linting](linting.md), which covers the style group in depth.
 
 ## Quick Reference
 
@@ -94,7 +94,7 @@ Always-on diagnostics that flag likely-wrong code — not style preferences. Act
 
 ### Style Lints
 
-Native, opt-in style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Off by default; enable with `raven.linting.enabled` and tune per rule via the `raven.linting.*` severities. All style lint rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
+Native style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in); tune per rule via the `raven.linting.*` severities. All style lint rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — master-switch matrix, quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|

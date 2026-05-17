@@ -96,7 +96,7 @@ export interface RavenInitializationOptions {
         style?: "rstudio" | "rstudio-minus" | "off";
     };
     linting?: {
-        enabled?: boolean;
+        enabled?: boolean | "auto" | "on" | "off";
         lineLength?: number;
         objectLength?: number;
         indentationUnit?: number;
@@ -369,7 +369,7 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
     // and the server treats absent keys as "preserve current value" — so the
     // previous state would persist until restart.
     options.linting = {
-        enabled: config.get<boolean>('linting.enabled', false),
+        enabled: config.get<boolean | 'auto' | 'on' | 'off'>('linting.enabled', 'auto'),
         lineLength: config.get<number>('linting.lineLength', 80),
         objectLength: config.get<number>('linting.objectLength', 30),
         indentationUnit: config.get<number>('linting.indentationUnit', 2),

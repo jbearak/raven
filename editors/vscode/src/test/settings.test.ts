@@ -75,7 +75,7 @@ const SETTINGS_MAPPING: Array<{
     vsCodeKey: string;
     jsonPath: string[];
     type: 'number' | 'boolean' | 'string' | 'enum' | 'array';
-    enumValues?: readonly string[];
+    enumValues?: readonly (string | boolean)[];
     defaultWhenUnconfigured?: unknown;
 }> = [
     // Cross-file depth settings
@@ -122,7 +122,7 @@ const SETTINGS_MAPPING: Array<{
     // Linting settings — always emitted using each key's package.json default
     // so that resetting a key propagates to the server instead of leaving
     // stale state active. Defaults below mirror package.json.
-    { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'boolean', defaultWhenUnconfigured: false },
+    { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'enum', enumValues: ['auto', 'on', 'off', true, false] as const, defaultWhenUnconfigured: 'auto' },
     { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number', defaultWhenUnconfigured: 80 },
     { vsCodeKey: 'linting.objectLength', jsonPath: ['linting', 'objectLength'], type: 'number', defaultWhenUnconfigured: 30 },
     { vsCodeKey: 'linting.indentationUnit', jsonPath: ['linting', 'indentationUnit'], type: 'number', defaultWhenUnconfigured: 2 },
