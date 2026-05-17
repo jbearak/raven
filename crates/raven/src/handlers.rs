@@ -6740,36 +6740,61 @@ fn extract_from_leaf(raw: &str, base_byte: usize, row: u32, out: &mut Vec<DelimE
         return;
     }
 
-    // Otherwise: tokenize per-character left-to-right, recognizing `]]`
-    // greedily.
+    // Per spec ("leaf whose text consists only of closer characters"):
+    // only byte-scan when every byte is a closer (`}`, `)`, `]`) or ASCII
+    // whitespace. Tree-sitter occasionally wraps multi-line closer runs in
+    // a single leaf ERROR (e.g. `}\n}`), so we allow whitespace between
+    // closer characters. Any other byte (identifier chars, `%`, etc.)
+    // means this leaf is a non-delimiter token (e.g. an unparseable
+    // special operator like `%]%`); emitting bracket events from such a
+    // leaf would produce misleading `Missing opening …` / `Unclosed …`
+    // diagnostics where the user's real problem is a different syntax
+    // error.
+    let allowed = !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|b| matches!(b, b'}' | b')' | b']' | b' ' | b'\t' | b'\n' | b'\r'));
+    if !allowed {
+        return;
+    }
+
+    // Tokenize per-character left-to-right, recognizing `]]` greedily.
+    // Only closer events are emitted from this path; openers only enter
+    // the stream as exact-match leaf tokens (handled by the fast path
+    // above), never from byte-scanning a mixed leaf.
+    //
+    // Track `current_row` through the loop so that a leaf containing an
+    // embedded newline (e.g. tree-sitter wrapping `}\n}` in a single
+    // ERROR leaf) emits each closer event on its actual row. Reusing the
+    // leaf's starting row for every emitted event would mis-anchor the
+    // downstream diagnostic.
+    let mut current_row = row;
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
+        if b == b'\n' {
+            current_row += 1;
+            i += 1;
+            continue;
+        }
         if b == b']' && i + 1 < bytes.len() && bytes[i + 1] == b']' {
             out.push(DelimEvent {
                 is_open: false,
                 kind: DelimiterKind::DoubleBracket,
                 range_bytes: base_byte + i..base_byte + i + 2,
-                row,
+                row: current_row,
             });
             i += 2;
             continue;
         }
         let one = std::str::from_utf8(&bytes[i..i + 1]).unwrap_or("");
-        if let Some(k) = DelimiterKind::from_opener(one) {
-            out.push(DelimEvent {
-                is_open: true,
-                kind: k,
-                range_bytes: base_byte + i..base_byte + i + 1,
-                row,
-            });
-        } else if let Some(k) = DelimiterKind::from_closer(one) {
+        if let Some(k) = DelimiterKind::from_closer(one) {
             out.push(DelimEvent {
                 is_open: false,
                 kind: k,
                 range_bytes: base_byte + i..base_byte + i + 1,
-                row,
+                row: current_row,
             });
         }
         i += 1;
@@ -6804,8 +6829,8 @@ fn classify_error(node: Node, text: &str, state: &mut CollectState) -> ErrorClas
     if let Some(msg) = detect_consecutive_pipe(node, text) {
         return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
-    if let Some(msg) = detect_mismatched_bracket(node, text) {
-        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
+    if let Some(diag) = detect_mismatched_bracket(node, text) {
+        return ErrorClassification::Whole(diag);
     }
     if let Some(diag) = detect_mismatched_via_structural_parent(node, text, state) {
         return ErrorClassification::Whole(diag);
@@ -7036,11 +7061,18 @@ fn detect_consecutive_pipe(node: Node, text: &str) -> Option<String> {
     None
 }
 
-/// Returns a diagnostic message if `node` is an ERROR that opens with a
-/// bracket (`(`, `[`, `[[`) and contains a nested ERROR child that is a
-/// non-matching closing bracket. Catches patterns like `c(1, 2]` where the
-/// programmer used the wrong closing delimiter.
-fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
+/// Detects ERROR nodes shaped like `c(1, 2]` — a single bracket opener
+/// (`(`, `[`, `[[`) as a direct child paired with a wrong-closer leaf in
+/// a nested ERROR child.
+///
+/// Returns the `Mismatched brackets` message together with a range
+/// anchored on the offending closer (per the design goal of pointing at
+/// the bad delimiter, not the whole expression). The range is
+/// single-line; the closer leaves tree-sitter produces here are always
+/// single tokens.
+fn detect_mismatched_bracket(node: Node, text: &str) -> Option<ClassifiedSyntaxDiagnostic> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
     let mut cursor = node.walk();
     let children: Vec<_> = node.children(&mut cursor).collect();
 
@@ -7066,16 +7098,32 @@ fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
         if !child.is_error() {
             continue;
         }
-        let child_text = text
-            .get(child.start_byte()..child.end_byte())
-            .unwrap_or("")
-            .trim();
-        if matches!(child_text, ")" | "]" | "]]") && child_text != expected_closer {
-            return Some(format!(
+        let child_raw = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+        let child_text = child_raw.trim();
+        if !matches!(child_text, ")" | "]" | "]]") || child_text == expected_closer {
+            continue;
+        }
+        // Locate the closer token's byte span within the (possibly
+        // whitespace-padded) child range, so the diagnostic range falls on
+        // the closer character itself.
+        let leading_ws = child_raw.len() - child_raw.trim_start().len();
+        let closer_start_byte = child.start_byte() + leading_ws;
+        let closer_end_byte = closer_start_byte + child_text.len();
+        let row = text[..closer_start_byte].bytes().filter(|&b| b == b'\n').count() as u32;
+        let line = text.lines().nth(row as usize).unwrap_or("");
+        let line_start = line_start_byte(text, row as usize);
+        let start_col = byte_offset_to_utf16_column(line, closer_start_byte - line_start);
+        let end_col = byte_offset_to_utf16_column(line, closer_end_byte - line_start);
+        return Some(ClassifiedSyntaxDiagnostic {
+            message: format!(
                 "Mismatched brackets: `{opener}` opened here; \
                  close with `{expected_closer}` not `{child_text}`."
-            ));
-        }
+            ),
+            range: Range {
+                start: Position::new(row, start_col),
+                end: Position::new(row, end_col),
+            },
+        });
     }
     None
 }
@@ -9549,6 +9597,67 @@ mod syntax_error_range_tests {
             .expect("expected Unclosed ( diagnostic");
         assert_eq!(target.range.start.character, 1);
         assert_eq!(target.range.end.character, 2);
+    }
+
+    // Regression: a leaf ERROR whose text spans multiple lines (e.g.
+    // tree-sitter wrapping `}\n}` into a single leaf) must emit each
+    // closer event on its actual row, not the leaf's starting row. With
+    // the wrong row, `classify_via_delimiter_scan` mis-anchors the
+    // downstream diagnostic (wrong line, zero-width column).
+    #[test]
+    fn multiline_closer_run_anchors_on_each_row() {
+        // `x <- 1\n}\n}` — two stray `}` on lines 1 and 2.
+        let diags = collect("x <- 1\n}\n}");
+        let close_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("Missing opening `{`"))
+            .collect();
+        assert_eq!(close_diags.len(), 2, "got: {diags:?}");
+        assert_eq!(close_diags[0].range.start.line, 1);
+        assert_eq!(close_diags[0].range.start.character, 0);
+        assert_eq!(close_diags[0].range.end.character, 1);
+        assert_eq!(close_diags[1].range.start.line, 2);
+        assert_eq!(close_diags[1].range.start.character, 0);
+        assert_eq!(close_diags[1].range.end.character, 1);
+    }
+
+    // Regression: leaves that aren't pure-closer runs must not produce
+    // bracket diagnostics. Unparseable special operators (`%]%`, `%(%`,
+    // etc.) parse as a single ERROR leaf whose text contains `%`;
+    // byte-scanning such a leaf used to emit spurious `Missing opening …`
+    // / `Unclosed …` events. The fix in `extract_from_leaf` guards the
+    // byte-scan with an "every byte is `}`/`)`/`]` or ASCII whitespace"
+    // precondition, so these leaves now fall back to the generic
+    // "Syntax error".
+    #[test]
+    fn special_operator_with_bracket_chars_no_spurious_bracket_diag() {
+        for code in &["x <- %]%", "x <- %}%", "x <- %(%", "x <- %[[%"] {
+            let diags = collect(code);
+            for d in &diags {
+                let m = &d.message;
+                assert!(
+                    !m.contains("Missing opening") && !m.contains("Unclosed"),
+                    "code {code:?} should not produce a bracket diagnostic; got: {m:?}"
+                );
+            }
+        }
+    }
+
+    // Regression: the `c(1, 2]` mismatched-bracket path used to return
+    // the whole minimized ERROR range. Per the design (anchor on the
+    // offending delimiter), the range must be the wrong closer's span.
+    #[test]
+    fn mismatched_bracket_range_anchors_on_wrong_closer() {
+        let code = "c(1, 2]";
+        let diags = collect(code);
+        let target = diags
+            .iter()
+            .find(|d| d.message.contains("Mismatched brackets"))
+            .expect("expected Mismatched diagnostic");
+        // `]` is at byte 6, column 6 in UTF-16.
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 6);
+        assert_eq!(target.range.end.character, 7);
     }
 
     #[test]
