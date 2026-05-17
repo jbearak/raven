@@ -5525,19 +5525,44 @@ fn collect_undefined_variables_from_snapshot(
             byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
         let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
 
-        // If the name is defined later in this same file, point the user at
-        // the definition line. R does not hoist top-level bindings, so this is
-        // a forward reference rather than a truly undefined symbol. Functions
-        // are covered because `exported_interface` includes top-level
-        // function definitions.
+        // If the name is defined later in this same file at top level, point
+        // the user at that line — R does not hoist top-level bindings, so the
+        // use is a forward reference rather than a truly undefined symbol.
+        //
+        // We walk the timeline rather than reading `exported_interface`
+        // directly because:
+        //   - `exported_interface` records the *last* assignment for each
+        //     name, so `x; x <- 1; x <- 2` would cite line 3 instead of the
+        //     first later definition on line 2.
+        //   - `exported_interface` also contains function-local assignments
+        //     (collected recursively), which are not visible at top level and
+        //     would mislead the user. Filtering by `function_scope: None`
+        //     keeps only top-level `Def` events.
+        // `@lsp-var` / `@lsp-func` directives produce `Declaration` events
+        // (not `Def`) and are naturally excluded.
         let forward_ref_defined_line = snapshot
             .artifacts_map
             .get(uri)
-            .and_then(|artifacts| artifacts.exported_interface.get(name.as_str()))
-            .filter(|sym| {
-                (sym.defined_line, sym.defined_column) > (usage_line, usage_col_utf16)
+            .and_then(|artifacts| {
+                artifacts
+                    .timeline
+                    .iter()
+                    .filter_map(|event| match event {
+                        scope::ScopeEvent::Def {
+                            symbol,
+                            function_scope: None,
+                            ..
+                        } if symbol.name.as_ref() == name.as_str()
+                            && (symbol.defined_line, symbol.defined_column)
+                                > (usage_line, usage_col_utf16) =>
+                        {
+                            Some((symbol.defined_line, symbol.defined_column))
+                        }
+                        _ => None,
+                    })
+                    .min()
             })
-            .map(|sym| sym.defined_line);
+            .map(|(line, _col)| line);
 
         let message = match forward_ref_defined_line {
             Some(line) => format!(
@@ -37740,6 +37765,103 @@ greet <- function() \"hi\"
             greet_diags[0].message,
             "Undefined variable: greet (defined later on line 3)",
             "Forward reference to a function must mention the definition line",
+        );
+    }
+
+    /// Codex review of #277 flagged this: a function-local assignment in a
+    /// later function body is in `exported_interface` (recursive collection)
+    /// but is *not* visible at top level. The forward-ref message must NOT
+    /// fire in this case — pointing the user at line 3 would be misleading
+    /// because that binding cannot satisfy the top-level use.
+    #[test]
+    fn test_diagnostics_function_local_definition_does_not_trigger_forward_ref_message() {
+        let mut state = create_test_state();
+        // Line 1: x                        ← top-level use, undefined
+        // Line 2: f <- function() {        ← function definition (covers x's later binding)
+        // Line 3:   x <- 1                 ← function-local, not visible at top level
+        // Line 4: }
+        let code = "
+x
+f <- function() {
+  x <- 1
+}
+";
+        let uri = add_document(&mut state, "file:///fn_local.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let x_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: x"))
+            .collect();
+        assert_eq!(
+            x_diags.len(),
+            1,
+            "Should have one diagnostic for top-level `x` use; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            x_diags[0].message, "Undefined variable: x",
+            "Function-local later assignment must NOT be cited as a forward \
+             reference — it is not visible at top level",
+        );
+    }
+
+    /// Codex review of #277 flagged this: with multiple top-level
+    /// reassignments, the message must cite the *first* later definition
+    /// (the earliest position after the use), not the last one. Using
+    /// `exported_interface` directly would cite the last assignment.
+    #[test]
+    fn test_diagnostics_forward_reference_cites_first_later_definition() {
+        let mut state = create_test_state();
+        // Line 1: x          ← use
+        // Line 2: x <- 1     ← first later definition (cite this)
+        // Line 3: x <- 2     ← later reassignment (do not cite)
+        let code = "
+x
+x <- 1
+x <- 2
+";
+        let uri = add_document(&mut state, "file:///redef.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let x_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: x"))
+            .collect();
+        assert_eq!(x_diags.len(), 1, "Should have one forward-ref diagnostic");
+        assert_eq!(
+            x_diags[0].message,
+            "Undefined variable: x (defined later on line 3)",
+            "Must cite the earliest later definition (line 3, 1-indexed), \
+             not the last reassignment (line 4)",
         );
     }
 
