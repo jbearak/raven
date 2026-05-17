@@ -16,6 +16,7 @@ import {
 import {
     getUpdatedGlobalLanguageConfig,
     isRDocument,
+    resolveTabSizeForDocument,
 } from './extensionHelpers';
 import {
     shouldTriggerDirectivePathSuggest,
@@ -83,6 +84,36 @@ function getServerPath(context: vscode.ExtensionContext): string {
     const platform = process.platform;
     const binaryName = platform === 'win32' ? 'raven.exe' : 'raven';
     return path.join(context.extensionPath, 'bin', binaryName);
+}
+
+/**
+ * Send raven/documentIndentUnitsChanged when `raven.linting.indentationUnit`
+ * is `"auto"`. Sends an empty list (clearing all overrides) when the setting
+ * is a fixed integer, so the server falls back to `lint_config.indentation_unit`.
+ */
+function sendDocumentIndentUnitsNotification() {
+    if (!client) {
+        return;
+    }
+
+    const ravenCfg = vscode.workspace.getConfiguration('raven');
+    const setting = ravenCfg.get<number | 'auto'>('linting.indentationUnit', 'auto');
+
+    if (setting !== 'auto') {
+        // Fixed integer: clear per-document overrides so the server uses the
+        // workspace-wide value it already received via initializationOptions.
+        client.sendNotification('raven/documentIndentUnitsChanged', { units: [] });
+        return;
+    }
+
+    const units = vscode.workspace.textDocuments
+        .filter(isRDocument)
+        .map(doc => ({
+            uri: doc.uri.toString(),
+            indentUnit: resolveTabSizeForDocument(doc),
+        }));
+
+    client.sendNotification('raven/documentIndentUnitsChanged', { units });
 }
 
 /**
@@ -285,7 +316,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     );
 
     if (binaryCheck.ok) {
-        client.start();
+        void client.start().then(() => {
+            // Send initial per-document indent units after the LSP handshake completes
+            // so the server has correct values for already-open R files when
+            // raven.linting.indentationUnit is "auto".
+            sendDocumentIndentUnitsNotification();
+        });
     } else {
         const detail = configuredPath
             ? `Raven LSP cannot start: configured raven.server.path "${serverPath}" is not a usable binary (${binaryCheck.reason}). Update raven.server.path or clear it to use the bundled binary.`
@@ -372,6 +408,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         vscode.commands.registerCommand('raven.restart', async () => {
             (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
             await client.restart();
+            sendDocumentIndentUnitsNotification();
         })
     );
 
@@ -448,6 +485,38 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
                 client.sendNotification('workspace/didChangeConfiguration', {
                     settings: settings
                 });
+            }
+            // editor.tabSize changes affect per-document indent units when
+            // raven.linting.indentationUnit is "auto".
+            if (
+                event.affectsConfiguration('raven.linting.indentationUnit') ||
+                event.affectsConfiguration('editor.tabSize')
+            ) {
+                sendDocumentIndentUnitsNotification();
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidOpenTextDocument((doc) => {
+            if (isRDocument(doc)) {
+                sendDocumentIndentUnitsNotification();
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidCloseTextDocument((doc) => {
+            if (isRDocument(doc)) {
+                sendDocumentIndentUnitsNotification();
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.window.onDidChangeTextEditorOptions((event) => {
+            if (isRDocument(event.textEditor.document)) {
+                sendDocumentIndentUnitsNotification();
             }
         })
     );

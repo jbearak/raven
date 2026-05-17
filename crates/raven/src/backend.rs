@@ -69,6 +69,29 @@ struct ActiveDocumentsChangedParams {
     timestamp_ms: u64,
 }
 
+/// One entry in the raven/documentIndentUnitsChanged notification.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentIndentUnit {
+    uri: String,
+    indent_unit: u32,
+}
+
+/// Parameters for the raven/documentIndentUnitsChanged notification.
+///
+/// The extension sends this whenever `raven.linting.indentationUnit` is
+/// `"auto"` and any open R document's resolved `editor.tabSize` changes.
+/// The map replaces the server's previous per-document overrides wholesale.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentIndentUnitsChangedParams {
+    units: Vec<DocumentIndentUnit>,
+}
+
+fn normalize_document_indent_unit(unit: u32) -> u32 {
+    unit.clamp(1, 8)
+}
+
 /// Parse cross-file configuration from LSP settings.
 ///
 /// Reads the top-level `crossFile`, `diagnostics`, and `packages` sections from a
@@ -6270,6 +6293,68 @@ impl Backend {
             .cross_file_activity
             .update(active_uri, visible_uris, params.timestamp_ms);
     }
+
+    /// Handle the raven/documentIndentUnitsChanged notification.
+    ///
+    /// Replaces the per-document indent unit map wholesale and triggers a
+    /// force-republish for every document whose effective indent unit changed.
+    async fn handle_document_indent_units_changed(
+        &self,
+        params: DocumentIndentUnitsChangedParams,
+    ) {
+        log::trace!(
+            "Received documentIndentUnitsChanged: {} entries",
+            params.units.len()
+        );
+
+        let new_map: std::collections::HashMap<String, u32> = params
+            .units
+            .into_iter()
+            .map(|e| (e.uri, normalize_document_indent_unit(e.indent_unit)))
+            .collect();
+
+        let affected_uris: Vec<Url> = {
+            let mut state = self.state.write().await;
+
+            // Collect URIs whose effective indent unit changed.
+            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+            let affected: Vec<Url> = open_uris
+                .into_iter()
+                .filter(|uri| {
+                    let key = uri.as_str();
+                    let old = state
+                        .per_document_indent_unit
+                        .get(key)
+                        .copied()
+                        .unwrap_or(state.lint_config.indentation_unit);
+                    let new = new_map
+                        .get(key)
+                        .copied()
+                        .unwrap_or(state.lint_config.indentation_unit);
+                    old != new
+                })
+                .collect();
+
+            state.per_document_indent_unit = new_map;
+
+            if !affected.is_empty() {
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(affected.iter());
+            }
+
+            affected
+        };
+
+        for uri in affected_uris {
+            Backend::publish_diagnostics_via_arc(
+                self.state.clone(),
+                self.client.clone(),
+                &uri,
+            )
+            .await;
+        }
+    }
 }
 
 /// Body of [`Backend::publish_diagnostics`], factored out so that
@@ -6452,6 +6537,10 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     .custom_method(
         "raven/activeDocumentsChanged",
         Backend::handle_active_documents_changed,
+    )
+    .custom_method(
+        "raven/documentIndentUnitsChanged",
+        Backend::handle_document_indent_units_changed,
     )
     .finish();
     let service = RequestCancellationService::new(service, request_cancellation);
@@ -6947,6 +7036,15 @@ async fn run_libpath_consumer(
 
 #[cfg(test)]
 mod tests {
+    mod document_indent_units {
+        #[test]
+        fn normalizes_client_supplied_indent_units() {
+            assert_eq!(super::super::normalize_document_indent_unit(0), 1);
+            assert_eq!(super::super::normalize_document_indent_unit(4), 4);
+            assert_eq!(super::super::normalize_document_indent_unit(99), 8);
+        }
+    }
+
     mod request_cancellation {
         use super::super::{
             Backend, CancellableRequestKind, RequestCancellationRegistry,

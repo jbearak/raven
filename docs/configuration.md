@@ -191,7 +191,7 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.enabled` | `"auto"` | Master switch (`"auto"` / `"on"` / `"off"` / `true` / `false`). See the [behavior matrix](linting.md#behavior-matrix). |
 | `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
-| `raven.linting.indentationUnit` | `2` | Spaces per indent level used by the indentation lint (clamped to `1..=8`) |
+| `raven.linting.indentationUnit` | `"auto"` | Spaces per indent level used by the indentation lint. In VS Code, `"auto"` tracks each file's resolved `editor.tabSize`; set an integer `1..=8` for a fixed unit. |
 | `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
 | `raven.linting.stringDelimiter` | `"\""` | Preferred string-literal delimiter (`"\""` or `"'"`); used by the quotes lint |
 | `raven.linting.lineLengthSeverity` | `"hint"` | Severity for over-long lines (or `"off"`) |
