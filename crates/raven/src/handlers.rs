@@ -8548,19 +8548,21 @@ mod semantic_warning_pipeline_tests {
 /// detection:
 ///
 /// - If the orphan `else` immediately follows an `if_statement` that does NOT
-///   already have its own `else` branch, and is on a later row than the
-///   `if`'s closing `}`, suggest moving `else` onto the same line as the `}`.
+///   already have its own `else` branch, is on a later row than the `if`'s
+///   closing `}`, and there is no statement-terminating `;` between them,
+///   suggest moving `else` onto the same line as the `}`.
 /// - In every other case (no preceding `if`, the preceding `if` already has
-///   its `else`, `else` wrapped in parens / pipes / a call, or `else` used as
-///   an argument / RHS), emit the orphan-`else` message.
+///   its `else`, semicolon-terminated, `else` wrapped in parens / pipes / a
+///   call, or `else` used as an argument / RHS), emit the orphan-`else`
+///   message.
 ///
-/// Case 2 (lines below the identifier-`else` branch) handles a related shape:
-/// when `else` IS consumed as a keyword child of `if_statement` (which
-/// happens inside `{ … }` blocks, where newlines are insignificant for
-/// tree-sitter-r) but is on a later row than the consequence's closing `}`.
-/// R still rejects this even though tree-sitter accepts it.
+/// Note that there is *no* "Case 2" looking at `else` keyword children of
+/// `if_statement`. tree-sitter-r's external scanner only binds `else` across
+/// a newline when the construct is inside a `{ … }` block — and inside a
+/// block R accepts that same binding (verified: `parse(text="{ if (x) {y}\n
+/// else {z} }")` succeeds; the function body `function() { if (x) {y}\nelse
+/// {z} }` runs). Flagging it would be a false positive.
 fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
-    // Case 1: bare `identifier(else)` — always orphan; classify for messaging.
     if node.kind() == "identifier" && node_text(node, text) == "else" && !node.is_error() {
         if let Some(parent) = node.parent() {
             if !parent.is_error() {
@@ -8571,7 +8573,10 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
                         prev = sibling.prev_named_sibling();
                         continue;
                     }
-                    if sibling.kind() == "if_statement" && !if_statement_has_else(sibling) {
+                    if sibling.kind() == "if_statement"
+                        && !if_statement_has_else(sibling)
+                        && !has_separator_between(sibling, node, text)
+                    {
                         let brace_line = find_closing_brace_line(&sibling, text);
                         let ref_line =
                             brace_line.unwrap_or_else(|| sibling.end_position().row);
@@ -8589,32 +8594,23 @@ fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Dia
         }
     }
 
-    // Case 2: `if_statement` whose `else` keyword child is on a later row than
-    // the consequence's closing `}`. Triggers inside `{ … }` blocks, where
-    // tree-sitter-r's external scanner accepts the cross-newline binding but
-    // R itself rejects it.
-    if node.kind() == "if_statement" {
-        let mut cursor = node.walk();
-        let mut consequence_end_line: Option<usize> = None;
-        let mut else_node: Option<Node> = None;
-        for child in node.children(&mut cursor) {
-            if child.kind() == "braced_expression" && else_node.is_none() {
-                consequence_end_line = Some(child.end_position().row);
-            } else if child.kind() == "else" {
-                else_node = Some(child);
-            }
-        }
-        if let (Some(brace_line), Some(else_kw)) = (consequence_end_line, else_node) {
-            if else_kw.start_position().row > brace_line {
-                emit_else_newline_diagnostic(else_kw, text, diagnostics);
-            }
-        }
-    }
-
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_else_newline_errors(child, text, diagnostics);
     }
+}
+
+/// Returns true if the source between the end of `prev` and the start of
+/// `next` contains a `;`. tree-sitter-r's external `_semicolon` token is not
+/// a named sibling, so `prev_named_sibling` looks straight past it; this
+/// helper catches the case where a statement-terminating `;` already ended
+/// the `if` and the `else` is therefore a fresh statement, not a misplaced
+/// continuation.
+fn has_separator_between(prev: Node, next: Node, text: &str) -> bool {
+    let gap = text
+        .get(prev.end_byte()..next.start_byte())
+        .unwrap_or("");
+    gap.contains(';')
 }
 
 /// Returns true if `if_stmt` (a tree-sitter `if_statement` node) already
@@ -16057,26 +16053,20 @@ clean_data <- function(x) {
     /// `if (a) { if (b) {c}\nelse {d} }` - inner else on new line after closing brace
     /// Validates: Requirement 2.5 - nested if-else with orphaned else should emit diagnostic
     #[test]
-    fn test_else_newline_nested_invalid_inner_else() {
+    fn test_else_newline_inside_braces_is_accepted_by_r() {
+        // R DOES accept `if (b) {c}\nelse {d}` inside `{ … }` because
+        // newlines are insignificant within a braced block. Tree-sitter-r
+        // binds the `else` as the `if_statement`'s keyword child, matching
+        // R's parse. Flagging this would be a false positive — we don't.
         let code = "if (a) { if (b) {c}\nelse {d} }";
         let tree = parse_r_code(code);
         let mut diagnostics = Vec::new();
         super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
 
-        assert_eq!(
-            diagnostics.len(),
-            1,
-            "Should emit exactly one diagnostic for orphaned inner else on new line (nested)"
-        );
-        assert_eq!(
-            diagnostics[0].severity,
-            Some(DiagnosticSeverity::ERROR),
-            "Diagnostic severity should be ERROR"
-        );
-        // The inner else is on line 1 (0-indexed)
-        assert_eq!(
-            diagnostics[0].range.start.line, 1,
-            "Diagnostic should be on line 1 (0-indexed) where the orphaned else is"
+        assert!(
+            diagnostics.is_empty(),
+            "newline `else` inside braces is valid R; must not emit, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
@@ -16105,18 +16095,22 @@ clean_data <- function(x) {
     /// Test that deeply nested if-else with multiple orphaned else keywords emits multiple diagnostics.
     /// Validates: Requirement 2.5 - all orphaned else at any nesting level should be detected
     #[test]
-    fn test_else_newline_deeply_nested_multiple_invalid() {
-        // Both inner and outer else are on new lines
+    fn test_else_newline_only_top_level_orphan_fires_in_nested_construct() {
+        // Inner `else` (line 1) is inside braces — R accepts it. Outer
+        // `else` (line 2) is at program level after a newline — R rejects
+        // and this collector should flag it. Net: exactly one diagnostic
+        // on the outer `else`.
         let code = "if (a) { if (b) {c}\nelse {d} }\nelse {e}";
         let tree = parse_r_code(code);
         let mut diagnostics = Vec::new();
         super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
-
         assert_eq!(
             diagnostics.len(),
-            2,
-            "Should emit two diagnostics for both orphaned else keywords (nested)"
+            1,
+            "only the outer top-level orphan `else` should fire, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+        assert_eq!(diagnostics[0].range.start.line, 2, "outer else is on line 2");
     }
 
     // ========================================================================
@@ -16555,6 +16549,47 @@ clean_data <- function(x) {
             diagnostics[0].message.contains("without a preceding"),
             "wrapped orphan-else should use the orphan message, not the same-line message; got: {}",
             diagnostics[0].message
+        );
+    }
+
+    /// `if (x) {y};\nelse {z}` — the `;` terminates the `if` as its own
+    /// statement, so the trailing `else` is fully orphan (R rejects with
+    /// "unexpected 'else'"). Without the separator check we'd incorrectly
+    /// route through "move else onto same line as }" because the hidden
+    /// `_semicolon` token is not a named sibling.
+    #[test]
+    fn test_orphan_else_after_semicolon_terminated_if() {
+        let code = "if (x) {y};\nelse {z}";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected one diagnostic, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            diagnostics[0].message.contains("without a preceding"),
+            "semicolon-separated else is orphan, not a same-line case; got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// `function() { if (x) {y}\nelse {z} }` — R accepts this; tree-sitter-r
+    /// agrees and binds `else` as the `if_statement`'s keyword child. There
+    /// is no orphan `identifier(else)` to flag, and the collector must not
+    /// invent one.
+    #[test]
+    fn test_else_newline_inside_function_body_is_accepted() {
+        let code = "function() { if (x) {y}\nelse {z} }";
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_else_newline_errors(tree.root_node(), code, &mut diagnostics);
+        assert!(
+            diagnostics.is_empty(),
+            "newline `else` inside a function body is valid R; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
