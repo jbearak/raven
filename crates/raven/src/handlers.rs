@@ -5903,7 +5903,12 @@ fn anchor_missing_position(
 ) -> (u32, u32) {
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    let line_at = |row: usize| -> &str { text.lines().nth(row).unwrap_or("") };
+    // Materialize lines `0..=raw_row` up front. Calling `text.lines().nth(row)`
+    // per iteration of the backwards walk is O(row) each, making the scan
+    // O(N²) on large files with long runs of blank/comment-only lines before
+    // a top-level MISSING token (see lower_bound=0 caller).
+    let lines: Vec<&str> = text.lines().take(raw_row.saturating_add(1)).collect();
+    let line_at = |row: usize| -> &str { lines.get(row).copied().unwrap_or("") };
     let is_code_line = |s: &str| {
         let t = s.trim_start();
         !t.is_empty() && !t.starts_with('#')
