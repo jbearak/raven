@@ -10,7 +10,10 @@ env:
   # sccache wraps rustc so unchanged crates are served from cache even
   # when Cargo.lock changes (e.g. adding a new dep). SCCACHE_GHA_ENABLED
   # tells the action to use the GHA cache backend rather than a local dir.
+  # SCCACHE_IGNORE_SERVER_IO_ERROR makes cache misses non-fatal so a
+  # transient GHA cache outage degrades gracefully (slower build, no fail).
   SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
   RUSTC_WRAPPER: sccache
 
 permissions:
