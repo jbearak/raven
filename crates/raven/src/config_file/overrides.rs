@@ -237,4 +237,85 @@ mod tests {
             &section, &overrides, Path::new("R/main.R")
         ));
     }
+
+    #[test]
+    fn enabled_string_off_in_override_is_detected() {
+        // String forms ("off", "false") must skip files the same way the
+        // boolean form does — tri-state vocabulary is uniform across the
+        // master switch and per-glob overrides (#281).
+        let section = json!({ "enabled": true });
+        let root = PathBuf::from("/proj");
+        let overrides = make_overrides(
+            &root,
+            vec![("vendor/**/*.R", json!({ "enabled": "off" }))],
+        );
+        assert!(is_skipped_by_overrides(
+            &section,
+            &overrides,
+            Path::new("vendor/foo.R")
+        ));
+
+        let overrides = make_overrides(
+            &root,
+            vec![("vendor/**/*.R", json!({ "enabled": "false" }))],
+        );
+        assert!(is_skipped_by_overrides(
+            &section,
+            &overrides,
+            Path::new("vendor/foo.R")
+        ));
+    }
+
+    #[test]
+    fn override_no_enabled_key_inherits_base_enabled() {
+        // Override that only tweaks lineLength must not flip enabled —
+        // the master switch is inherited from the resolved base (#281).
+        let mut base = LintConfig::default();
+        base.enabled = true;
+        let root = PathBuf::from("/proj");
+        let overrides = make_overrides(
+            &root,
+            vec![("**/*.R", json!({ "lineLength": 120 }))],
+        );
+        let uri = Url::parse("file:///proj/R/foo.R").unwrap();
+        let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
+        assert!(effective.enabled, "override without enabled should inherit base");
+        assert_eq!(effective.line_length, 120);
+    }
+
+    #[test]
+    fn override_auto_inherits_base_enabled() {
+        // Per-glob `enabled = "auto"` means "don't override the master
+        // switch"; it inherits whatever the base resolved to (#281).
+        let mut base = LintConfig::default();
+        base.enabled = true;
+        let root = PathBuf::from("/proj");
+        let overrides = make_overrides(
+            &root,
+            vec![("**/*.R", json!({ "enabled": "auto" }))],
+        );
+        let uri = Url::parse("file:///proj/x.R").unwrap();
+        let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
+        assert!(effective.enabled, "override 'auto' should inherit base on");
+
+        base.enabled = false;
+        let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
+        assert!(!effective.enabled, "override 'auto' should inherit base off");
+    }
+
+    #[test]
+    fn override_null_inherits_base_enabled() {
+        // `enabled = null` is semantically equivalent to absent — it must
+        // not flip the master switch (#281).
+        let mut base = LintConfig::default();
+        base.enabled = true;
+        let root = PathBuf::from("/proj");
+        let overrides = make_overrides(
+            &root,
+            vec![("**/*.R", json!({ "enabled": serde_json::Value::Null }))],
+        );
+        let uri = Url::parse("file:///proj/x.R").unwrap();
+        let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
+        assert!(effective.enabled, "override null should inherit base");
+    }
 }
