@@ -817,7 +817,7 @@ fn encode_semantic_tokens(mut absolute_tokens: Vec<AbsoluteSemanticToken>) -> Ve
 
 /// Delimiter character types used in banner-style section detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DelimiterKind {
+enum BannerDelimKind {
     Hash,
     Dash,
     Equals,
@@ -839,7 +839,7 @@ enum ModelCommentStyle {
 /// - `# ================` (leading `#` + space + 4+ of one delimiter)
 ///
 /// Returns `Some(kind)` if the line is a delimiter line, `None` otherwise.
-fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
+fn classify_delimiter_line(line: &str) -> Option<BannerDelimKind> {
     let trimmed = line.trim();
     let after_first_hash = trimmed.strip_prefix('#')?;
 
@@ -848,7 +848,7 @@ fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
         && after_first_hash.chars().all(|c| c == '#')
         && trimmed.len() >= 4
     {
-        return Some(DelimiterKind::Hash);
+        return Some(BannerDelimKind::Hash);
     }
 
     // Case 2: "# <delimiters>" — leading # then space then 4+ of one delimiter
@@ -864,11 +864,11 @@ fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
 
     let first_char = content.chars().next()?;
     let kind = match first_char {
-        '-' => DelimiterKind::Dash,
-        '=' => DelimiterKind::Equals,
-        '*' => DelimiterKind::Asterisk,
-        '+' => DelimiterKind::Plus,
-        '#' => DelimiterKind::Hash,
+        '-' => BannerDelimKind::Dash,
+        '=' => BannerDelimKind::Equals,
+        '*' => BannerDelimKind::Asterisk,
+        '+' => BannerDelimKind::Plus,
+        '#' => BannerDelimKind::Hash,
         _ => return None,
     };
 
@@ -920,7 +920,7 @@ fn strip_model_comment_prefix(line: &str, style: ModelCommentStyle) -> Option<&s
     }
 }
 
-fn classify_model_delimiter_line(line: &str, style: ModelCommentStyle) -> Option<DelimiterKind> {
+fn classify_model_delimiter_line(line: &str, style: ModelCommentStyle) -> Option<BannerDelimKind> {
     let content = strip_model_comment_prefix(line, style)?.trim();
     if content.len() < 4 {
         return None;
@@ -928,11 +928,11 @@ fn classify_model_delimiter_line(line: &str, style: ModelCommentStyle) -> Option
 
     let first_char = content.chars().next()?;
     let kind = match first_char {
-        '#' => DelimiterKind::Hash,
-        '-' => DelimiterKind::Dash,
-        '=' => DelimiterKind::Equals,
-        '*' => DelimiterKind::Asterisk,
-        '+' => DelimiterKind::Plus,
+        '#' => BannerDelimKind::Hash,
+        '-' => BannerDelimKind::Dash,
+        '=' => BannerDelimKind::Equals,
+        '*' => BannerDelimKind::Asterisk,
+        '+' => BannerDelimKind::Plus,
         _ => return None,
     };
 
@@ -6506,6 +6506,59 @@ fn has_unclosed_quote_child(node: Node) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelimiterKind {
+    Paren,         // ( )
+    Brace,         // { }
+    Bracket,       // [ ]
+    DoubleBracket, // [[ ]]
+}
+
+impl DelimiterKind {
+    fn opener_str(self) -> &'static str {
+        match self {
+            DelimiterKind::Paren => "(",
+            DelimiterKind::Brace => "{",
+            DelimiterKind::Bracket => "[",
+            DelimiterKind::DoubleBracket => "[[",
+        }
+    }
+    fn closer_str(self) -> &'static str {
+        match self {
+            DelimiterKind::Paren => ")",
+            DelimiterKind::Brace => "}",
+            DelimiterKind::Bracket => "]",
+            DelimiterKind::DoubleBracket => "]]",
+        }
+    }
+    fn from_opener(s: &str) -> Option<Self> {
+        match s {
+            "(" => Some(Self::Paren),
+            "{" => Some(Self::Brace),
+            "[" => Some(Self::Bracket),
+            "[[" => Some(Self::DoubleBracket),
+            _ => None,
+        }
+    }
+    fn from_closer(s: &str) -> Option<Self> {
+        match s {
+            ")" => Some(Self::Paren),
+            "}" => Some(Self::Brace),
+            "]" => Some(Self::Bracket),
+            "]]" => Some(Self::DoubleBracket),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DelimEvent {
+    is_open: bool,
+    kind: DelimiterKind,
+    range_bytes: std::ops::Range<usize>,
+    row: u32,
+}
+
 /// One classified syntax-error diagnostic produced by [`classify_error`].
 /// The caller in [`collect_syntax_errors_inner`] attaches `severity` and
 /// `source` when constructing the final [`Diagnostic`].
@@ -6539,6 +6592,150 @@ struct CollectState {
     /// `Mismatched brackets` diagnostic. The MISSING-anchoring branch
     /// skips emitting `Unclosed X` for any opener whose id appears here.
     covered_openers: std::collections::HashSet<usize>,
+}
+
+/// Walk an ERROR node's direct children and produce a flat stream of
+/// delimiter events. See bracket-diagnostics design spec.
+fn delimiter_events(error: Node, text: &str) -> Vec<DelimEvent> {
+    let mut out = Vec::new();
+    walk_for_delimiters(error, text, &mut out, /*allow_recurse_into_error=*/ true);
+    out
+}
+
+fn walk_for_delimiters(
+    node: Node,
+    text: &str,
+    out: &mut Vec<DelimEvent>,
+    allow_recurse_into_error: bool,
+) {
+    // Only the ROOT ERROR is walked with `allow_recurse_into_error=true`;
+    // we recurse one level into nested ERRORs but not into balanced
+    // semantic children.
+    //
+    // Tree-sitter sometimes represents a bare token run (e.g. `}}}`) as a
+    // leaf ERROR node (child_count=0) nested inside the outer ERROR.  When
+    // we arrive here with `allow_recurse_into_error=false` and the node
+    // itself has no children, treat the node as a leaf directly.
+    if node.child_count() == 0 {
+        let raw = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
+        extract_from_leaf(raw, node.start_byte(), node.start_position().row as u32, out);
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_error() && allow_recurse_into_error {
+            walk_for_delimiters(child, text, out, false);
+            continue;
+        }
+        if child.is_error() {
+            // Leaf-like ERROR child at the non-recurse level: treat as leaf.
+            if child.child_count() == 0 {
+                let raw = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+                extract_from_leaf(
+                    raw,
+                    child.start_byte(),
+                    child.start_position().row as u32,
+                    out,
+                );
+            }
+            // Non-leaf inner ERROR at this depth: skip (balanced subtree).
+            continue;
+        }
+        if child.child_count() == 0 {
+            let raw = text.get(child.start_byte()..child.end_byte()).unwrap_or("");
+            extract_from_leaf(
+                raw,
+                child.start_byte(),
+                child.start_position().row as u32,
+                out,
+            );
+            continue;
+        }
+        // Non-leaf, non-error child: skip.
+    }
+}
+
+/// Extract delimiter events from a raw leaf text slice. Implements the
+/// homogeneous-run rule (`}}}` → one event) and the mixed-run rule
+/// (`])` → per-character events with `]]` recognized greedily).
+fn extract_from_leaf(raw: &str, base_byte: usize, row: u32, out: &mut Vec<DelimEvent>) {
+    // Fast path: the leaf is exactly one opener or closer token.
+    if let Some(k) = DelimiterKind::from_opener(raw) {
+        out.push(DelimEvent {
+            is_open: true,
+            kind: k,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+    if let Some(k) = DelimiterKind::from_closer(raw) {
+        out.push(DelimEvent {
+            is_open: false,
+            kind: k,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+
+    // Homogeneous closer runs of `}` or `)` → one event.
+    let all_brace = !raw.is_empty() && raw.chars().all(|c| c == '}');
+    let all_paren = !raw.is_empty() && raw.chars().all(|c| c == ')');
+    if all_brace {
+        out.push(DelimEvent {
+            is_open: false,
+            kind: DelimiterKind::Brace,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+    if all_paren {
+        out.push(DelimEvent {
+            is_open: false,
+            kind: DelimiterKind::Paren,
+            range_bytes: base_byte..base_byte + raw.len(),
+            row,
+        });
+        return;
+    }
+
+    // Otherwise: tokenize per-character left-to-right, recognizing `]]`
+    // greedily.
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b']' && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            out.push(DelimEvent {
+                is_open: false,
+                kind: DelimiterKind::DoubleBracket,
+                range_bytes: base_byte + i..base_byte + i + 2,
+                row,
+            });
+            i += 2;
+            continue;
+        }
+        let one = std::str::from_utf8(&bytes[i..i + 1]).unwrap_or("");
+        if let Some(k) = DelimiterKind::from_opener(one) {
+            out.push(DelimEvent {
+                is_open: true,
+                kind: k,
+                range_bytes: base_byte + i..base_byte + i + 1,
+                row,
+            });
+        } else if let Some(k) = DelimiterKind::from_closer(one) {
+            out.push(DelimEvent {
+                is_open: false,
+                kind: k,
+                range_bytes: base_byte + i..base_byte + i + 1,
+                row,
+            });
+        }
+        i += 1;
+    }
 }
 
 /// Classify an ERROR node into a specific, actionable diagnostic where possible,
@@ -6686,8 +6883,8 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 #[cfg(test)]
 mod syntax_error_range_tests {
     use super::{
-        anchor_missing_position, collect_syntax_errors, end_of_meaningful_content,
-        find_first_content_line, find_innermost_error, find_opener_for_missing,
+        anchor_missing_position, collect_syntax_errors, delimiter_events, end_of_meaningful_content,
+        find_first_content_line, find_innermost_error, find_opener_for_missing, DelimiterKind,
     };
     use tower_lsp::lsp_types::Diagnostic;
 
@@ -8656,6 +8853,106 @@ mod syntax_error_range_tests {
         let missing = first_missing(&tree).unwrap();
         assert!(find_opener_for_missing(missing, code).is_none());
     }
+
+    // ------------------------------------------------------------------
+    // delimiter_events
+    // ------------------------------------------------------------------
+
+    fn find_first_error(tree: &tree_sitter::Tree) -> Option<tree_sitter::Node<'_>> {
+        fn walk<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+            if n.is_error() {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(e) = walk(child) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+        walk(tree.root_node())
+    }
+
+    #[test]
+    fn devents_flat_nested_openers() {
+        // f(g(h(  -> ERROR("(" "g" "(" "h" "(")
+        let code = "f(g(h(\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        assert_eq!(evs.len(), 3, "got: {evs:?}");
+        for ev in &evs {
+            assert!(ev.is_open);
+            assert_eq!(ev.kind, DelimiterKind::Paren);
+        }
+    }
+
+    #[test]
+    fn devents_stray_close_brace() {
+        let code = "x <- 1\n}\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        assert_eq!(evs.len(), 1);
+        assert!(!evs[0].is_open);
+        assert_eq!(evs[0].kind, DelimiterKind::Brace);
+    }
+
+    #[test]
+    fn devents_homogeneous_run() {
+        let code = "}}}\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        assert_eq!(evs.len(), 1);
+        assert!(!evs[0].is_open);
+        assert_eq!(evs[0].kind, DelimiterKind::Brace);
+        assert_eq!(evs[0].range_bytes, 0..3);
+    }
+
+    #[test]
+    fn devents_mixed_closer_run() {
+        let code = "f(])";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        let open_count = evs.iter().filter(|e| e.is_open).count();
+        let close_count = evs.iter().filter(|e| !e.is_open).count();
+        assert!(open_count >= 1, "expected ≥1 open event, got: {evs:?}");
+        assert!(close_count >= 2, "expected ≥2 close events, got: {evs:?}");
+        let mut closes = evs.iter().filter(|e| !e.is_open);
+        let first = closes.next().unwrap();
+        let second = closes.next().unwrap();
+        assert_eq!(first.kind, DelimiterKind::Bracket);
+        assert_eq!(second.kind, DelimiterKind::Paren);
+    }
+
+    #[test]
+    fn devents_double_bracket_run() {
+        let code = "]]]]\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        let closes: Vec<_> = evs.iter().filter(|e| !e.is_open).collect();
+        assert_eq!(closes.len(), 2, "got: {evs:?}");
+        for c in closes {
+            assert_eq!(c.kind, DelimiterKind::DoubleBracket);
+        }
+    }
+
+    #[test]
+    fn devents_triple_bracket_pairs_then_single() {
+        // `]]]` greedy left-to-right -> one `]]` event + one `]` event
+        let code = "]]]\n";
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).unwrap();
+        let evs = delimiter_events(err, code);
+        let closes: Vec<_> = evs.iter().filter(|e| !e.is_open).collect();
+        assert_eq!(closes.len(), 2, "got: {evs:?}");
+        assert_eq!(closes[0].kind, DelimiterKind::DoubleBracket);
+        assert_eq!(closes[1].kind, DelimiterKind::Bracket);
+    }
 }
 
 #[cfg(test)]
@@ -9086,6 +9383,7 @@ mod invalid_assignment_target_tests {
         assert_eq!(diags[0].range.start.character, 7);
         assert_eq!(diags[0].range.end.character, 11);
     }
+
 }
 
 /// Regression guard: semantic-warning rules must fire through `diagnostics_from_snapshot`
@@ -20612,13 +20910,13 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_all_hashes() {
         assert_eq!(
             classify_delimiter_line("################"),
-            Some(DelimiterKind::Hash)
+            Some(BannerDelimKind::Hash)
         );
     }
 
     #[test]
     fn test_classify_delimiter_line_min_hashes() {
-        assert_eq!(classify_delimiter_line("####"), Some(DelimiterKind::Hash));
+        assert_eq!(classify_delimiter_line("####"), Some(BannerDelimKind::Hash));
     }
 
     #[test]
@@ -20630,7 +20928,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_equals() {
         assert_eq!(
             classify_delimiter_line("# ================"),
-            Some(DelimiterKind::Equals)
+            Some(BannerDelimKind::Equals)
         );
     }
 
@@ -20638,7 +20936,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_dashes() {
         assert_eq!(
             classify_delimiter_line("# ----------------"),
-            Some(DelimiterKind::Dash)
+            Some(BannerDelimKind::Dash)
         );
     }
 
@@ -20646,7 +20944,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_asterisks() {
         assert_eq!(
             classify_delimiter_line("# ****************"),
-            Some(DelimiterKind::Asterisk)
+            Some(BannerDelimKind::Asterisk)
         );
     }
 
@@ -20654,7 +20952,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_plus() {
         assert_eq!(
             classify_delimiter_line("# ++++++++++++++++"),
-            Some(DelimiterKind::Plus)
+            Some(BannerDelimKind::Plus)
         );
     }
 
@@ -20662,7 +20960,7 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_hash_after_hash_space() {
         assert_eq!(
             classify_delimiter_line("# ################"),
-            Some(DelimiterKind::Hash)
+            Some(BannerDelimKind::Hash)
         );
     }
 
@@ -20695,11 +20993,11 @@ result <- data %>% filter(x > 0)
     fn test_classify_delimiter_line_leading_whitespace() {
         assert_eq!(
             classify_delimiter_line("  ################"),
-            Some(DelimiterKind::Hash)
+            Some(BannerDelimKind::Hash)
         );
         assert_eq!(
             classify_delimiter_line("  # ================"),
-            Some(DelimiterKind::Equals)
+            Some(BannerDelimKind::Equals)
         );
     }
 
