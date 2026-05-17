@@ -202,6 +202,49 @@ suite('Send to R → Terminal submenu: editor-title gating', () => {
             'raven.terminal.runLineOrSelection must have no `when` clause so it surfaces on .R, .Rmd, and .qmd alike',
         );
     });
+
+    test('terminal chunk commands mirror the main chunk set on .Rmd / .qmd', () => {
+        // The Terminal submenu should expose the same chunk operations the
+        // main menu does, so a user driving a tmux-hosted R session can run
+        // chunks without bouncing through the managed R terminal. Knit is
+        // intentionally excluded — knitr renders documents, not interactive
+        // chunks, and it always uses the managed flow.
+        const pkg = loadPackageJson();
+        const entries = pkg.contributes.menus['raven.sendToR.terminal'] ?? [];
+        for (const command of [
+            'raven.terminal.runCurrentChunk',
+            'raven.terminal.runCurrentChunkAndMove',
+            'raven.terminal.runAboveChunks',
+            'raven.terminal.runBelowChunks',
+            'raven.terminal.runAllChunks',
+        ]) {
+            const entry = findCommand(entries, command);
+            assert.ok(entry, `raven.sendToR.terminal must contain ${command}`);
+            assertShowsOnlyForRmdQmd(entry, command);
+        }
+    });
+
+    test('terminal chunk commands are declared in package.json', () => {
+        // Mirrors the main-menu chunk command set so the runtime registration
+        // in register_chunk_commands has matching `contributes.commands`
+        // entries. Without these the command palette would not surface them.
+        const pkg = loadPackageJson() as unknown as {
+            contributes: { commands: Array<{ command: string; title: string; category?: string }> };
+        };
+        const declared = new Set(pkg.contributes.commands.map((c) => c.command));
+        for (const command of [
+            'raven.terminal.runCurrentChunk',
+            'raven.terminal.runCurrentChunkAndMove',
+            'raven.terminal.runAboveChunks',
+            'raven.terminal.runBelowChunks',
+            'raven.terminal.runAllChunks',
+        ]) {
+            assert.ok(
+                declared.has(command),
+                `${command} must be declared in package.json contributes.commands`,
+            );
+        }
+    });
 });
 
 suite('Send to R: shift+enter chord on chunk-based documents', () => {
@@ -246,6 +289,34 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         );
     });
 
+    test('Knit keybinding requires the .Rmd extension on every branch', () => {
+        // A `.R` file whose language was overridden to `rmd` would satisfy
+        // `editorLangId == rmd` alone — but Knit invokes knitr against the
+        // physical file path and breaks if the on-disk extension is not
+        // .Rmd. The `when` clause must require the extension match outside
+        // any language-id alternation so no `editorLangId == rmd || …`
+        // branch can short-circuit the extension test.
+        const pkg = loadPackageJson();
+        const bindings = pkg.contributes.keybindings ?? [];
+        const entry = bindings.find(
+            (b) =>
+                b.command === 'raven.knit'
+                && b.key === 'ctrl+shift+enter'
+                && b.mac === 'cmd+shift+enter',
+        );
+        assert.ok(entry, 'expected a raven.knit keybinding bound to the Shift+Enter chord');
+        const when = entry.when ?? '';
+        // Reject any pattern like `editorLangId == rmd || …` that would
+        // accept `editorLangId == rmd` on its own. The extension test must
+        // sit outside the language alternation: a top-level `&&` joining
+        // `resourceExtname =~ …` to the language clause.
+        const top_level_and_with_ext = /&&\s*resourceExtname =~/;
+        assert.ok(
+            top_level_and_with_ext.test(when),
+            `raven.knit keybinding must AND the .Rmd extension test at the top level — not inside a language-id alternation. Got: ${when}`,
+        );
+    });
+
     test('Shift+Enter chord is bound to exactly one command on chunk-based docs', () => {
         // Only Knit holds the chord on chunk-based documents; no other Send
         // to R command may share it, otherwise VS Code annotates multiple
@@ -268,8 +339,10 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
     });
 
     test('Source File keybinding stays restricted to plain .R', () => {
-        // Pin the existing Source File gating so the new Knit / Run All Chunks
-        // bindings can coexist on .Rmd / .qmd without double-firing.
+        // Pin the existing Source File gating so it can coexist with the
+        // new Knit binding on the same chord without double-firing.
+        // On .qmd and .Rmd-with-Knit-disabled the chord is intentionally
+        // unbound — Run All Chunks is reachable via the toolbar or palette.
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
         const entry = bindings.find((b) => b.command === 'raven.sourceFile');
@@ -291,9 +364,8 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
 
     test('runCurrentChunk no longer holds the Shift+Enter chord', () => {
         // Previously raven.runCurrentChunk was bound to cmd+shift+enter for
-        // .Rmd / .qmd. With Knit and Run All Chunks taking that chord, the
-        // previous binding must be removed (not duplicated) to avoid both
-        // firing.
+        // .Rmd / .qmd. With Knit owning the chord on .Rmd, the previous
+        // binding must be removed (not duplicated) so it cannot double-fire.
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
         const conflict = bindings.find(
