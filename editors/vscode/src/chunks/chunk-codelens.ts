@@ -91,15 +91,31 @@ class ChunkCodeLensProvider implements vscode.CodeLensProvider {
         const lines: string[] = [];
         for (let i = 0; i < document.lineCount; i++) lines.push(document.lineAt(i).text);
         const chunks = detect_chunks(lines, kind);
+        // Pre-compute, for each chunk header line, whether any runnable
+        // chunk exists strictly before or after it. We need this to drop
+        // sibling-targeted lenses (Run Next/Previous &c.) on chunks
+        // that have no target — clicking them would otherwise produce
+        // a "no runnable chunk below the cursor" toast that talks
+        // about a cursor the CodeLens click did not place.
+        const runnable_indices: number[] = [];
+        for (let i = 0; i < chunks.length; i++) {
+            if (is_runnable_chunk(chunks[i])) runnable_indices.push(i);
+        }
+        const first_runnable_idx = runnable_indices[0] ?? -1;
+        const last_runnable_idx = runnable_indices[runnable_indices.length - 1] ?? -1;
         const lenses: vscode.CodeLens[] = [];
-        let chunk_index = 0;
-        for (const c of chunks) {
-            chunk_index++;
+        for (let i = 0; i < chunks.length; i++) {
+            const c = chunks[i];
+            const chunk_index = i + 1;
             if (!is_runnable_chunk(c)) continue;
+            const has_previous_runnable = i > first_runnable_idx;
+            const has_next_runnable = i < last_runnable_idx;
             const range = new vscode.Range(c.header_line, 0, c.header_line, 0);
             for (const id of lens_command_ids) {
                 const meta = CHUNK_LENS_COMMANDS[id];
                 if (!meta) continue;
+                if (meta.gate === 'requires_next_runnable' && !has_next_runnable) continue;
+                if (meta.gate === 'requires_previous_runnable' && !has_previous_runnable) continue;
                 const eval_suffix = meta.eval_aware && c.is_eval_false ? ' (eval = FALSE)' : '';
                 lenses.push(new vscode.CodeLens(range, {
                     title: `${meta.title}${eval_suffix}`,

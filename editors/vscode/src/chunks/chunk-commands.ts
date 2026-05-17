@@ -316,6 +316,15 @@ export interface ChunkLensCommand {
     readonly tooltip: string;
     /** Whether to append a `(eval = FALSE)` suffix when the chunk skips eval. */
     readonly eval_aware: boolean;
+    /**
+     * Optional gate. When set, the CodeLens provider suppresses the lens
+     * on chunks for which the gate would always fail at click time —
+     * e.g. "Run Next" on the last runnable chunk would have nowhere to
+     * go, so we drop the button rather than surface a confusing
+     * "no runnable chunk below the cursor" toast that talks about a
+     * cursor the user didn't use.
+     */
+    readonly gate?: 'requires_next_runnable' | 'requires_previous_runnable';
 }
 
 export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = Object.freeze({
@@ -354,24 +363,28 @@ export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = O
         title: '← Run Previous',
         tooltip: 'Run the R chunk immediately above this one',
         eval_aware: false,
+        gate: 'requires_previous_runnable',
     },
     'raven.runPreviousChunkAndMove': {
         positional_id: 'raven.runPreviousChunkAndMoveAt',
         title: '← Run Previous & Move',
         tooltip: 'Run the R chunk immediately above this one, then move the cursor into it',
         eval_aware: false,
+        gate: 'requires_previous_runnable',
     },
     'raven.runNextChunk': {
         positional_id: 'raven.runNextChunkAt',
         title: '→ Run Next',
         tooltip: 'Run the R chunk immediately below this one',
         eval_aware: false,
+        gate: 'requires_next_runnable',
     },
     'raven.runNextChunkAndMove': {
         positional_id: 'raven.runNextChunkAndMoveAt',
         title: '→ Run Next & Move',
         tooltip: 'Run the R chunk immediately below this one, then move the cursor into it',
         eval_aware: false,
+        gate: 'requires_next_runnable',
     },
     'raven.runAllChunks': {
         positional_id: 'raven.runAllChunksAt',

@@ -67,25 +67,55 @@ explorer-context-menu hook is opt-in via your own keybindings).
    instead of POSIX signals.
 10. **Reveal.** On a clean exit Raven parses `Output created: <path>`
     out of stdout. When the primary output is HTML (or there's any HTML
-    in a multi-output knit), Raven opens it in the **Knit Output**
-    webview panel beside the editor. The panel toolbar has two buttons:
+    in a multi-output knit), Raven opens it in a **Knit Output**
+    webview panel beside the editor — no success popover, the panel
+    itself is the signal. Each `.Rmd` gets its own panel; knitting a
+    second `.Rmd` opens a separate panel that stacks as a tab in the
+    same "preview" column rather than replacing the first. Re-knitting
+    the same `.Rmd` updates its panel in place. For multi-output knits
+    the additional output paths are written to the `Raven: Knit`
+    output channel. The panel toolbar has three buttons:
 
-    - **Refresh** — re-knits the source `.Rmd` (the same code path as
-      invoking `Raven: Knit` from the palette).
+    - **Knit again** — re-knits the source `.Rmd` (the same code path
+      as invoking `Raven: Knit` from the palette).
     - **Open in Browser** — opens the rendered file in your OS default
       browser. In remote workspaces (SSH, Codespaces, dev containers)
       this may not work because `file://` URIs target the remote
       machine; Raven warns and writes the path to the `Raven: Knit`
       output channel as a fallback.
+    - **Apply VS Code theme** — toggle that overlays the rendered
+      document with VS Code's active editor background, foreground,
+      and link colors. The button keeps its label and conveys the
+      active state visually (pressed-button styling, `aria-pressed`
+      for screen readers) — Rmd output doesn't have a "document
+      theme" to switch back to, so the toggle simply represents
+      whether the overlay is on. The preference is persisted to
+      `globalState` so subsequent knits restore it, and it tracks
+      VS Code theme switches in real time.
 
-    The rendered HTML loads inside an `<iframe sandbox="">` — scripts,
-    forms, and external navigation are blocked. Intra-document anchor
-    links (`#section`) work; clicking an external `<a>` does nothing
-    (use **Open in Browser** for full interactivity, including
-    htmlwidgets). For PDF / Word / etc., Raven still reveals the file
-    in your OS file browser. When the output-path parse fails Raven
-    surfaces "Knit succeeded (output path unknown)" — the subprocess
-    exit code is the ground truth.
+    Standard text copy works inside the rendered output:
+    Cmd/Ctrl-C copies the current iframe selection to the system
+    clipboard, Cmd/Ctrl-A selects all, and right-clicking opens a
+    small menu with **Copy**, **Select All**, and **Open in
+    Browser**. VS Code suppresses the browser's default context menu
+    and does not forward Cmd-C from a nested iframe to its own
+    clipboard command, so Raven wires these by hand on the iframe's
+    same-origin `contentWindow`.
+
+    The rendered HTML loads inside an `<iframe srcdoc="..."
+    sandbox="allow-same-origin">` — scripts, forms, popups, and
+    top-navigation are blocked. The HTML is inlined into the iframe
+    via `srcdoc` (a nested webview iframe cannot navigate to
+    `webview.asWebviewUri(...)` URLs — Electron's resource handler
+    does not intercept nested-frame navigations); a `<base href>`
+    injected at the top of the inlined HTML lets relative images,
+    CSS, and fonts resolve through the webview's resource handler.
+    Intra-document anchor links (`#section`) work; clicking an
+    external `<a>` does nothing (use **Open in Browser** for full
+    interactivity, including htmlwidgets). For PDF / Word / etc.,
+    Raven still reveals the file in your OS file browser. When the
+    output-path parse fails Raven surfaces "Knit succeeded (output
+    path unknown)" — the subprocess exit code is the ground truth.
 
 ## Settings
 

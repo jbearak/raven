@@ -49,6 +49,7 @@ import {
 import { registerKnit } from './knit';
 import { registerInstallNags } from './recommendations/install-nag';
 import { registerWalkthroughCommands } from './recommendations/walkthrough';
+import { validateServerBinary } from './server-binary-check';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -261,6 +262,13 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         clientOptions
     );
 
+    // Pre-check the binary before starting the LSP. vscode-languageclient's
+    // generic "couldn't create connection to server" toast hides the real
+    // cause (missing binary, no exec bit, wrong target). Surface the actual
+    // reason here and skip the start so the user gets one clear message.
+    const binaryCheck = validateServerBinary(serverPath);
+    const configuredPath = vscode.workspace.getConfiguration('raven').get<string>('server.path');
+
     // The server emits `raven/projectConfigLoaded` whenever it picks up (or
     // re-picks up) a portable `raven.toml` / `.lintr` — and now also when
     // the file is removed. `path: null` + `source: null` is the cleared
@@ -307,12 +315,20 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         },
     );
 
-    void client.start().then(() => {
-        // Send initial per-document indent units after the LSP handshake completes
-        // so the server has correct values for already-open R files when
-        // raven.linting.indentationUnit is "auto".
-        sendDocumentIndentUnitsNotification();
-    });
+    if (binaryCheck.ok) {
+        void client.start().then(() => {
+            // Send initial per-document indent units after the LSP handshake completes
+            // so the server has correct values for already-open R files when
+            // raven.linting.indentationUnit is "auto".
+            sendDocumentIndentUnitsNotification();
+        });
+    } else {
+        const detail = configuredPath
+            ? `Raven LSP cannot start: configured raven.server.path "${serverPath}" is not a usable binary (${binaryCheck.reason}). Update raven.server.path or clear it to use the bundled binary.`
+            : `Raven LSP cannot start: bundled binary at "${serverPath}" is unusable (${binaryCheck.reason}). Build it with "cargo build --release -p raven" and re-bundle the extension, or set raven.server.path to a built binary.`;
+        outputChannel.appendLine(detail);
+        void vscode.window.showErrorMessage(detail);
+    }
 
     // Activate help viewer (registers raven.openHelpPanel, raven.help.back, raven.help.forward).
     activateHelpViewer(context, client);
