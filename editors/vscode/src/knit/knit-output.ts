@@ -469,27 +469,37 @@ export function buildShellHtml(args: {
         const img = pendingImage;
         if (!img) return;
         const w = window;
-        if (!w.ClipboardItem || !navigator.clipboard || !navigator.clipboard.write) {
-          return;
+        const hasClipboardImage = !!(w.ClipboardItem
+          && navigator.clipboard && navigator.clipboard.write);
+        // Fall back to copying the URL when ClipboardItem is
+        // unavailable or when the image is cross-origin (canvas
+        // would taint and toBlob would throw). The user can still
+        // paste the URL into another tool to pick the image up.
+        function copyUrlFallback() {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(img.src).catch(function () { /* swallow */ });
+          }
         }
+        if (!hasClipboardImage) { copyUrlFallback(); return; }
         try {
           const canvas = document.createElement('canvas');
           canvas.width = img.naturalWidth || img.width;
           canvas.height = img.naturalHeight || img.height;
-          if (canvas.width === 0 || canvas.height === 0) return;
+          if (canvas.width === 0 || canvas.height === 0) { copyUrlFallback(); return; }
           const ctx = canvas.getContext('2d');
-          if (!ctx) return;
+          if (!ctx) { copyUrlFallback(); return; }
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          // canvas.toBlob throws SecurityError (or yields null
+          // depending on platform) when the canvas is tainted by a
+          // cross-origin image without CORS headers.
           canvas.toBlob(function (blob) {
-            if (!blob) return;
+            if (!blob) { copyUrlFallback(); return; }
             try {
               const item = new w.ClipboardItem({ 'image/png': blob });
-              navigator.clipboard.write([item]).catch(function () {
-                /* swallow — best-effort */
-              });
-            } catch (e) { /* swallow */ }
+              navigator.clipboard.write([item]).catch(copyUrlFallback);
+            } catch (e) { copyUrlFallback(); }
           }, 'image/png');
-        } catch (e) { /* swallow */ }
+        } catch (e) { copyUrlFallback(); }
       }
 
       function hideContextMenu() {
@@ -566,15 +576,19 @@ export function buildShellHtml(args: {
         // and silently trigger a single-key keybinding the user
         // may have configured in VS Code.
         win.addEventListener('keydown', function (e) {
-          const mod = e.metaKey || e.ctrlKey || e.altKey;
+          const mod = e.metaKey || e.ctrlKey;
           if (!mod) return;
+          // AltGr on Windows / many Linux layouts fires as Ctrl+Alt
+          // for typing characters like @, €, or accented letters.
+          // The platform reports the AltGraph modifier state on
+          // those keypresses; skip them so the user can type.
+          if (e.getModifierState && e.getModifierState('AltGraph')) return;
           const k = (e.key || '').toLowerCase();
-          const primary = e.metaKey || e.ctrlKey;
-          if (primary && k === 'c') {
+          if (k === 'c') {
             if (copyIframeSelection()) e.preventDefault();
             return;
           }
-          if (primary && k === 'a') {
+          if (k === 'a') {
             selectAllInIframe();
             e.preventDefault();
             return;

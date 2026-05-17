@@ -255,6 +255,26 @@ describe('buildShellHtml', () => {
         expect(html).toMatch(/if\s*\(!mod\)\s*return/);
     });
 
+    test('re-dispatch skips AltGr-typed characters', () => {
+        // AltGr on Windows / many Linux layouts fires as Ctrl+Alt
+        // when typing characters like @, €, or accented letters.
+        // The handler must consult getModifierState('AltGraph') and
+        // skip those keystrokes so users can type.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain("getModifierState('AltGraph')");
+    });
+
+    test('copy-image falls back to copying the URL for cross-origin images', () => {
+        // Drawing a cross-origin image without CORS headers onto a
+        // canvas taints the canvas, and toBlob then throws (or
+        // yields null on some platforms). The handler must catch
+        // and fall back to copying the image's src as plain text
+        // so the user can at least paste the URL.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('copyUrlFallback');
+        expect(html).toContain('writeText(img.src)');
+    });
+
     test('script wires Cmd/Ctrl-C and Cmd/Ctrl-A on the iframe', () => {
         // VS Code does not forward Cmd-C / Cmd-A from a nested
         // iframe to the host clipboard command, so we attach our
