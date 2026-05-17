@@ -6805,6 +6805,9 @@ fn classify_error(node: Node, text: &str, state: &mut CollectState) -> ErrorClas
     if let Some(msg) = detect_mismatched_bracket(node, text) {
         return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
+    if let Some(diag) = detect_mismatched_via_structural_parent(node, text, state) {
+        return ErrorClassification::Whole(diag);
+    }
     if let Some(msg) = detect_fat_arrow(node, text) {
         return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
@@ -7073,6 +7076,80 @@ fn detect_mismatched_bracket(node: Node, text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Detect `f(} y` / `vec[} y` style typos where the wrong closer is an
+/// ERROR child of `arguments` / `braced_expression` / `parenthesized_expression`
+/// and a MISSING closer of the expected kind sits at the parent's end.
+/// Emits a single `Mismatched brackets` diagnostic anchored on the wrong
+/// closer and records the parent's opener in `state.covered_openers` to
+/// suppress the MISSING follow-up.
+fn detect_mismatched_via_structural_parent(
+    node: Node,
+    text: &str,
+    state: &mut CollectState,
+) -> Option<ClassifiedSyntaxDiagnostic> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    // Only fire on ERROR nodes whose text (trimmed) is a single closer token.
+    let inner_text = text.get(node.start_byte()..node.end_byte())?.trim();
+    let wrong_kind = DelimiterKind::from_closer(inner_text)?;
+
+    // Walk up one level.
+    let parent = node.parent()?;
+    if !matches!(
+        parent.kind(),
+        "arguments" | "braced_expression" | "parenthesized_expression"
+    ) {
+        return None;
+    }
+
+    // Parent's first delimiter child is the opener.
+    let mut cursor = parent.walk();
+    let opener = parent
+        .children(&mut cursor)
+        .find(|n| {
+            let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
+            matches!(t, "(" | "{" | "[" | "[[")
+        })?;
+    let opener_text = text.get(opener.start_byte()..opener.end_byte())?;
+    let opener_kind = DelimiterKind::from_opener(opener_text)?;
+
+    if opener_kind == wrong_kind {
+        return None; // not actually a mismatch
+    }
+
+    // Parent must end with a MISSING closer of the expected kind.
+    let mut last_child = None;
+    let mut c2 = parent.walk();
+    for ch in parent.children(&mut c2) {
+        last_child = Some(ch);
+    }
+    let last = last_child?;
+    if !last.is_missing() || last.kind() != opener_kind.closer_str() {
+        return None;
+    }
+
+    state.covered_openers.insert(opener.id());
+
+    let row = node.start_position().row as u32;
+    let line = text.lines().nth(row as usize).unwrap_or("");
+    let line_start = line_start_byte(text, row as usize);
+    let start_col = byte_offset_to_utf16_column(line, node.start_byte() - line_start);
+    let end_col = byte_offset_to_utf16_column(line, node.end_byte() - line_start);
+
+    Some(ClassifiedSyntaxDiagnostic {
+        message: format!(
+            "Mismatched brackets: `{}` opened here; close with `{}` not `{}`.",
+            opener_kind.opener_str(),
+            opener_kind.closer_str(),
+            wrong_kind.closer_str(),
+        ),
+        range: Range {
+            start: Position::new(row, start_col),
+            end: Position::new(row, end_col),
+        },
+    })
 }
 
 /// Returns a diagnostic message if `node` is an ERROR consisting of a lone
@@ -9430,6 +9507,46 @@ mod syntax_error_range_tests {
             .expect("expected Unclosed ( diagnostic");
         assert_eq!(target.range.start.character, 1);
         assert_eq!(target.range.end.character, 2);
+    }
+
+    #[test]
+    fn coalesce_wrong_closer_in_arguments_with_trailing_arg() {
+        // f(} y  -> arguments("(" ERROR("}") argument MISSING ")")
+        let diags = collect("f(} y\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        let d = &diags[0];
+        assert!(
+            d.message.contains("Mismatched brackets")
+                && d.message.contains("`(`")
+                && d.message.contains("`}`"),
+            "got: {}",
+            d.message,
+        );
+    }
+
+    #[test]
+    fn coalesce_wrong_closer_for_subset() {
+        // vec[} y — analog for [
+        let diags = collect("vec[} y\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        let d = &diags[0];
+        assert!(
+            d.message.contains("Mismatched brackets")
+                && d.message.contains("`[`")
+                && d.message.contains("`}`"),
+            "got: {}",
+            d.message,
+        );
+    }
+
+    #[test]
+    fn coalesce_no_double_fire_unclosed_after_mismatch() {
+        // After coalescing, no separate "Unclosed (" follow-up
+        let diags = collect("f(} y\n");
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Unclosed `(`")),
+            "should NOT have a separate 'Unclosed (' diagnostic; got: {diags:?}"
+        );
     }
 
 }
