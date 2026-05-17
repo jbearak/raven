@@ -5885,6 +5885,54 @@ fn collect_identifier_usages_utf16<'a>(
     }
 }
 
+/// Anchor a MISSING node's reported position back to the offending source line.
+///
+/// Tree-sitter positions a MISSING node where the parser expected the missing
+/// token. For an unclosed opener (e.g. `mean(c(1, 2, 3)`) followed by blank
+/// lines and/or a trailing comment, that position can land on whitespace or on
+/// the next non-empty token — visually disconnected from the broken
+/// expression. When the MISSING node's row contains no code (blank or
+/// comment-only), walk back within `lower_bound..=raw_row` to the last line
+/// with non-comment, non-whitespace content and anchor at end-of-line there so
+/// the diagnostic squiggle lands on the offending expression. See issue #286.
+fn anchor_missing_position(
+    raw_row: usize,
+    raw_col: usize,
+    lower_bound: usize,
+    text: &str,
+) -> (u32, u32) {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    let line_at = |row: usize| -> &str { text.lines().nth(row).unwrap_or("") };
+    let is_code_line = |s: &str| {
+        let t = s.trim_start();
+        !t.is_empty() && !t.starts_with('#')
+    };
+
+    if is_code_line(line_at(raw_row)) {
+        return (
+            raw_row as u32,
+            byte_offset_to_utf16_column(line_at(raw_row), raw_col),
+        );
+    }
+
+    let lower = lower_bound.min(raw_row);
+    let mut r = raw_row;
+    while r > lower {
+        r -= 1;
+        if is_code_line(line_at(r)) {
+            let line = line_at(r);
+            let trimmed_len = line.trim_end().len();
+            return (r as u32, byte_offset_to_utf16_column(line, trimmed_len));
+        }
+    }
+
+    (
+        raw_row as u32,
+        byte_offset_to_utf16_column(line_at(raw_row), raw_col),
+    )
+}
+
 /// Find the first MISSING descendant inside a node (depth-first).
 fn find_first_missing_descendant(node: Node) -> Option<Node> {
     // Avoid recursion to prevent stack exhaustion on pathological/malicious trees.
@@ -6101,10 +6149,11 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 
     // Phase 1: If there's a MISSING descendant, point the diagnostic there.
     if let Some(missing) = find_first_missing_descendant(node) {
-        let m_row = missing.start_position().row as u32;
-        let m_col = byte_offset_to_utf16_column(
-            line_at(missing.start_position().row),
+        let (m_row, m_col) = anchor_missing_position(
+            missing.start_position().row,
             missing.start_position().column,
+            node.start_position().row,
+            text,
         );
         return Range {
             start: Position::new(m_row, m_col),
@@ -6217,8 +6266,6 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 }
 
 fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
-    use crate::cross_file::types::byte_offset_to_utf16_column;
-
     if node.is_error() {
         let message = classify_error(node, text);
         diagnostics.push(Diagnostic {
@@ -6234,9 +6281,12 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
     }
 
     if node.is_missing() {
-        let row = node.start_position().row as u32;
-        let line_text = text.lines().nth(node.start_position().row).unwrap_or("");
-        let col = byte_offset_to_utf16_column(line_text, node.start_position().column);
+        let (row, col) = anchor_missing_position(
+            node.start_position().row,
+            node.start_position().column,
+            0,
+            text,
+        );
         let message = if is_string_quote_kind(node.kind()) {
             "Unclosed string literal".to_string()
         } else {
@@ -6549,6 +6599,42 @@ mod syntax_error_range_tests {
             "should produce exactly one diagnostic, got {}: {:?}",
             diags.len(),
             diags
+        );
+    }
+
+    #[test]
+    fn unclosed_paren_diagnostic_anchors_on_offending_line() {
+        // Regression test for issue #286.
+        //
+        // For an unclosed call followed by blank lines and/or a comment, the
+        // tree-sitter MISSING `)` descendant is positioned past the end of the
+        // offending line (often on a blank line or the next comment). Using
+        // that raw position puts the diagnostic squiggle on whitespace or on
+        // the trailing comment — far from the line a user has to fix.
+        //
+        // The diagnostic should anchor on line 0 (the line with the unmatched
+        // `(`), so the user's eye lands on the broken expression.
+        let code = "x <- mean(c(1, 2, 3)\n\n# Here is a comment\n";
+        let diags = collect(code);
+        assert!(!diags.is_empty(), "should produce a diagnostic");
+        let missing_close = diags
+            .iter()
+            .find(|d| d.message.contains("Missing") && d.message.contains(')'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a 'Missing )' diagnostic, got: {:?}",
+                    diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            missing_close.range.start.line, 0,
+            "Missing ) diagnostic should anchor on line 0 (the line with the \
+             unclosed `(`), got line {}. Full range: ({},{})..({},{})",
+            missing_close.range.start.line,
+            missing_close.range.start.line,
+            missing_close.range.start.character,
+            missing_close.range.end.line,
+            missing_close.range.end.character,
         );
     }
 
