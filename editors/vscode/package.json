@@ -280,12 +280,6 @@
         "when": "editorTextFocus && raven.rConsoleEnabled && raven.rmdKnit.enabled && (editorLangId == rmd || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/))"
       },
       {
-        "command": "raven.runAllChunks",
-        "key": "ctrl+shift+enter",
-        "mac": "cmd+shift+enter",
-        "when": "editorTextFocus && raven.rConsoleEnabled && (editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(qmd|Qmd|QMD)$/) || (!raven.rmdKnit.enabled && (editorLangId == rmd || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/))))"
-      },
-      {
         "command": "raven.runAboveChunks",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p",

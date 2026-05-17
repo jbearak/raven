@@ -39,7 +39,6 @@ function loadPackageJson(): PackageJson {
 // stay locked to a single source of truth.
 const RMD_QMD_EXT = /\\\.\(rmd\|Rmd\|RMD\|qmd\|Qmd\|QMD\)\$/;
 const RMD_ONLY_EXT = /\\\.\(rmd\|Rmd\|RMD\)\$/;
-const QMD_ONLY_EXT = /\\\.\(qmd\|Qmd\|QMD\)\$/;
 
 function findCommand(entries: MenuEntry[], command: string): MenuEntry | undefined {
     return entries.find((entry) => entry.command === command);
@@ -247,46 +246,24 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         );
     });
 
-    test('Run All Chunks takes Shift+Enter when Knit does not apply', () => {
-        // The chord still has to do *something* useful on .qmd documents and
-        // on .Rmd documents where the user disabled Knit, so Run All Chunks
-        // is the fallback. The two keybindings must be mutually exclusive so
-        // they cannot both fire on the same buffer.
+    test('Shift+Enter chord is bound to exactly one command on chunk-based docs', () => {
+        // Only Knit holds the chord on chunk-based documents; no other Send
+        // to R command may share it, otherwise VS Code annotates multiple
+        // menu entries with the same shortcut and the UI is ambiguous.
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
-        const entry = bindings.find(
+        const sharers = bindings.filter(
             (b) =>
-                b.command === 'raven.runAllChunks'
-                && b.key === 'ctrl+shift+enter'
-                && b.mac === 'cmd+shift+enter',
+                b.command !== 'raven.sourceFile'
+                && b.command !== 'raven.knit'
+                && (b.key === 'ctrl+shift+enter' || b.mac === 'cmd+shift+enter'),
         );
-        assert.ok(
-            entry,
-            'expected a raven.runAllChunks keybinding bound to ctrl+shift+enter / cmd+shift+enter',
-        );
-        const when = entry.when ?? '';
-        assert.ok(
-            when.includes('editorLangId == quarto'),
-            `raven.runAllChunks keybinding must fire for editorLangId == quarto, got: ${when}`,
-        );
-        assert.ok(
-            QMD_ONLY_EXT.test(when),
-            `raven.runAllChunks keybinding must reference the .qmd-only extension family, got: ${when}`,
-        );
-        // The .Rmd branch is gated on `!raven.rmdKnit.enabled` so it cannot
-        // double-fire with Knit. We assert the negation is present alongside
-        // the rmd language id and Rmd-only extension family.
-        assert.ok(
-            when.includes('!raven.rmdKnit.enabled'),
-            `raven.runAllChunks keybinding must require !raven.rmdKnit.enabled on the .Rmd branch, got: ${when}`,
-        );
-        assert.ok(
-            when.includes('editorLangId == rmd'),
-            `raven.runAllChunks keybinding must include the .Rmd-knit-disabled fallback, got: ${when}`,
-        );
-        assert.ok(
-            RMD_ONLY_EXT.test(when),
-            `raven.runAllChunks keybinding must reference the .Rmd-only extension family for the knit-disabled branch, got: ${when}`,
+        assert.deepStrictEqual(
+            sharers,
+            [],
+            `no other command may bind the Shift+Enter chord — Knit owns it on chunk-based docs, Source File on plain .R. Sharing: ${sharers
+                .map((b) => b.command)
+                .join(', ')}`,
         );
     });
 
