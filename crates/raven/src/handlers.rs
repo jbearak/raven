@@ -5885,6 +5885,68 @@ fn collect_identifier_usages_utf16<'a>(
     }
 }
 
+/// Compute the UTF-16 column just past the last non-comment, non-whitespace
+/// character on `line`. Comment detection is string-aware: a `#` inside
+/// `"..."`, `'...'`, or `` `...` `` is not a comment. `\r` is treated as
+/// trailing whitespace.
+///
+/// Used to trim trailing comments and whitespace from the opener-line range
+/// of an `Unclosed X` diagnostic. See bracket-diagnostics design spec.
+fn end_of_meaningful_content(line: &str) -> u32 {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut in_backtick = false;
+    let mut escape = false;
+    let mut comment_byte: Option<usize> = None;
+
+    for (byte_idx, ch) in line.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_double {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_double = false,
+                _ => {}
+            }
+            continue;
+        }
+        if in_single {
+            match ch {
+                '\\' => escape = true,
+                '\'' => in_single = false,
+                _ => {}
+            }
+            continue;
+        }
+        if in_backtick {
+            if ch == '`' {
+                in_backtick = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_double = true,
+            '\'' => in_single = true,
+            '`' => in_backtick = true,
+            '#' => {
+                comment_byte = Some(byte_idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let cutoff_byte = comment_byte.unwrap_or(line.len());
+    let meaningful = &line[..cutoff_byte];
+    let trimmed = meaningful.trim_end_matches(|c: char| c.is_whitespace());
+
+    byte_offset_to_utf16_column(line, trimmed.len())
+}
+
 /// Anchor a MISSING node's reported position back to the offending source line.
 ///
 /// Tree-sitter positions a MISSING node where the parser expected the missing
@@ -6485,8 +6547,8 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 #[cfg(test)]
 mod syntax_error_range_tests {
     use super::{
-        anchor_missing_position, collect_syntax_errors, find_first_content_line,
-        find_innermost_error,
+        anchor_missing_position, collect_syntax_errors, end_of_meaningful_content,
+        find_first_content_line, find_innermost_error,
     };
     use tower_lsp::lsp_types::Diagnostic;
 
@@ -8313,6 +8375,73 @@ mod syntax_error_range_tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // end_of_meaningful_content
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn eomc_plain_content() {
+        assert_eq!(end_of_meaningful_content("f(x, y)"), 7);
+    }
+
+    #[test]
+    fn eomc_trailing_whitespace() {
+        assert_eq!(end_of_meaningful_content("f(   "), 2);
+    }
+
+    #[test]
+    fn eomc_trailing_comment() {
+        assert_eq!(end_of_meaningful_content("f( # comment"), 2);
+    }
+
+    #[test]
+    fn eomc_content_then_comment() {
+        // last meaningful char `)` at col 3; just past = 4
+        assert_eq!(end_of_meaningful_content("f(1) # tail"), 4);
+    }
+
+    #[test]
+    fn eomc_hash_inside_double_quoted_string() {
+        assert_eq!(end_of_meaningful_content("x <- \"a # b\""), 12);
+    }
+
+    #[test]
+    fn eomc_hash_inside_single_quoted_string() {
+        assert_eq!(end_of_meaningful_content("x <- 'a # b'"), 12);
+    }
+
+    #[test]
+    fn eomc_hash_inside_backticks() {
+        assert_eq!(end_of_meaningful_content("x <- `a # b`"), 12);
+    }
+
+    #[test]
+    fn eomc_crlf_carriage_return_trimmed() {
+        assert_eq!(end_of_meaningful_content("f(\r"), 2);
+    }
+
+    #[test]
+    fn eomc_only_comment() {
+        assert_eq!(end_of_meaningful_content("# nothing here"), 0);
+    }
+
+    #[test]
+    fn eomc_empty_line() {
+        assert_eq!(end_of_meaningful_content(""), 0);
+    }
+
+    #[test]
+    fn eomc_non_ascii_identifier() {
+        // line "é <- 1" — last meaningful char `1` at UTF-16 col 5; just past = 6
+        assert_eq!(end_of_meaningful_content("é <- 1"), 6);
+    }
+
+    #[test]
+    fn eomc_astral_emoji() {
+        // 😀 = 2 UTF-16 code units; "😀 <- 1" — `1` at UTF-16 col 6; just past = 7
+        assert_eq!(end_of_meaningful_content("😀 <- 1"), 7);
     }
 }
 
