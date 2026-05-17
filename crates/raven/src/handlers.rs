@@ -6809,8 +6809,9 @@ fn classify_via_delimiter_scan(
 
     // For mismatched-bracket coalescing we need the opener's tree-sitter
     // Node id. Map an opener event's start byte back to a Node by scanning
-    // the error subtree (one level into nested ERRORs, matching how
-    // delimiter_events extracted the leaf).
+    // the error subtree, recursing up to two levels deep into nested
+    // ERROR children (matches the two-level wrapping pattern tree-sitter
+    // uses for closer-runs like `}}}` — see Task 5 probe finding).
     fn find_node_by_byte<'a>(
         root: Node<'a>,
         target: usize,
@@ -6894,6 +6895,9 @@ fn classify_via_delimiter_scan(
                         ),
                     },
                 });
+                // Task 7 reads `covered_openers` from the MISSING-handling branch of
+                // `collect_syntax_errors_inner` to suppress the duplicate `Unclosed X`
+                // diagnostic that would otherwise fire for the same opener.
                 if opener_node_id != 0 {
                     state.covered_openers.insert(opener_node_id);
                 }
