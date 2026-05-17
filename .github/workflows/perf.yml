@@ -1,0 +1,168 @@
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Criterion benchmarks with baseline management ──────────────────────
+  benchmarks:
+    name: Criterion Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache sccache storage and cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-sccache-${{ runner.os }}-
+
+      - name: Install mold linker
+        run: sudo apt-get install -y --no-install-recommends mold
+
+      # Criterion baselines are stored under target/criterion/.
+      # We cache them so PR runs can compare against the main baseline.
+      - name: Restore Criterion baseline cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ runner.os }}-main-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-${{ runner.os }}-
+
+      - name: Install critcmp
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: critcmp-cache
+        with:
+          path: ~/.cargo/bin/critcmp
+          key: critcmp-${{ runner.os }}-v0.1
+
+      - name: Build critcmp
+        if: steps.critcmp-cache.outputs.cache-hit != 'true'
+        run: cargo install critcmp
+
+      # On push to main: save results as the new baseline.
+      # On PRs: compare against the main baseline.
+      # Only the startup bench is tracked for CI regressions — it's the
+      # fastest and most representative. cross_file and lsp_operations
+      # can be run locally with `cargo bench`.
+      - name: Run benchmarks (push to main — save baseline)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline main
+
+      - name: Run benchmarks (PR — compare against main)
+        if: github.event_name == 'pull_request'
+        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
+
+      # ── PR regression comment via critcmp ────────────────────────────────
+      - name: Compare benchmarks against main baseline
+        if: github.event_name == 'pull_request'
+        id: critcmp
+        run: |
+          if ! critcmp --list 2>/dev/null | grep -q '^main$'; then
+            echo "No main baseline found — skipping comparison."
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            echo "no_baseline=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "no_baseline=false" >> "$GITHUB_OUTPUT"
+          if critcmp main pr --threshold 5 > /tmp/critcmp-output.txt 2>&1; then
+            if [ -s /tmp/critcmp-output.txt ]; then
+              echo "has_diff=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::critcmp failed; treating as diff to surface in PR comment"
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- raven-benchmark-comparison -->"
+          BODY_FILE=$(mktemp)
+          trap 'rm -f "$BODY_FILE"' EXIT
+
+          if [ "${{ steps.critcmp.outputs.no_baseline }}" = "true" ]; then
+            cat > "$BODY_FILE" <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          No `main` baseline found — benchmark comparison skipped.
+
+          A baseline will be created when this branch (or a future PR) is merged to `main`.
+          ENDOFBODY
+          elif [ "${{ steps.critcmp.outputs.has_diff }}" = "true" ]; then
+            {
+              cat <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          Showing benchmarks with **>5% change** vs `main`:
+
+          ```
+          ENDOFBODY
+              cat /tmp/critcmp-output.txt
+              cat <<'ENDOFBODY'
+          ```
+
+          _Generated by `critcmp --threshold 5`. Criterion baselines compared: `main` → `pr`._
+          ENDOFBODY
+            } > "$BODY_FILE"
+          else
+            cat > "$BODY_FILE" <<'ENDOFBODY'
+          <!-- raven-benchmark-comparison -->
+          ## Benchmark Comparison
+
+          No benchmarks changed by more than 5% vs `main`.
+
+          _Generated by `critcmp --threshold 5`._
+          ENDOFBODY
+          fi
+
+          EXISTING_COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate -q ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+            | head -1)
+
+          if [ -n "$EXISTING_COMMENT_ID" ]; then
+            jq -Rs '{"body": .}' < "$BODY_FILE" | \
+              gh api \
+                "repos/${{ github.repository }}/issues/comments/${EXISTING_COMMENT_ID}" \
+                -X PATCH --input -
+          else
+            gh pr comment "${PR_NUMBER}" --body-file "$BODY_FILE"
+          fi
