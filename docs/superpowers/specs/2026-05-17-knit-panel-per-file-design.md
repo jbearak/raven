@@ -57,7 +57,7 @@ export class KnitOutputPanel {
 }
 ```
 
-- **`instances` key**: `sourceUri.toString()`. Using the URI rather than `fsPath` gives free, platform-correct normalization (Windows drive-letter case, URI-encoding of spaces, etc.) and is the same value the rest of the extension keys on.
+- **`instances` key**: `sourceUri.fsPath`. This matches the in-flight gate in `knit-commands.ts:228-235` (the `inFlight: Set<string>` keyed by `fsPath`, with the comment "fsPath so the same file under different relative URIs collapses"). Keeping the two keying strategies aligned is load-bearing: a `Refresh` from a panel calls `vscode.commands.executeCommand('raven.knit', sourceUri)`, which then consults `inFlight` via `fsPath`; if the panel registry keyed by `sourceUri.toString()` while the in-flight gate keyed by `fsPath`, the same `.Rmd` reached via two slightly different URIs (e.g. `vscode://…` redirects, explorer vs. active-editor variants) would produce two panels but a single in-flight slot. Use the same key the in-flight tracker uses. `fsPath` is platform-correct for case-sensitive filesystems; on case-insensitive ones it has the same limitation the in-flight tracker already has (the user-visible behavior is consistent across both surfaces — out of scope to fix here).
 - **`previewColumn`**: the concrete `vscode.ViewColumn` (1, 2, 3, …) that subsequent *new* knit panels anchor to. Initially `undefined`. On every state change (`onDidChangeViewState`, `onDidDispose`) `recomputePreviewColumn` runs: if any panel still occupies the recorded column, it stays put; otherwise it *adopts* the column of any surviving panel (so a dragged-away lone panel keeps siblings clustered with it); if the Map is empty, it resets to `undefined`. The full algorithm is shown in "Column tracking" below; the table in "Edge cases" enumerates the user-visible consequences.
 
 ## `showOrUpdate` flow
@@ -73,7 +73,7 @@ static async showOrUpdate(
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
 
-    const key = args.sourceUri.toString();
+    const key = args.sourceUri.fsPath;
     const rootDir = path.dirname(args.outputPath);
     const existing = KnitOutputPanel.instances.get(key);
 
@@ -100,11 +100,11 @@ static async showOrUpdate(
 
 ## `create` registration
 
-`KnitOutputPanel.create` is the only path that constructs an instance. It must register the new instance in the static Map under `args.sourceUri.toString()` *before* returning, and must wire `onDidChangeViewState` / `onDidDispose` listeners. Equivalent to today's `KnitOutputPanel.instance = instance` line in the singleton implementation, but Map-keyed:
+`KnitOutputPanel.create` is the only path that constructs an instance. It must register the new instance in the static Map under `args.sourceUri.fsPath` *before* returning, and must wire `onDidChangeViewState` / `onDidDispose` listeners. Equivalent to today's `KnitOutputPanel.instance = instance` line in the singleton implementation, but Map-keyed:
 
 ```ts
 private static create(context, args, rootDir, column): KnitOutputPanel {
-    const key = args.sourceUri.toString();
+    const key = args.sourceUri.fsPath;
     const panel = vscode.window.createWebviewPanel(/* unchanged options */);
     const instance = new KnitOutputPanel(context, panel, rootDir, args);
     KnitOutputPanel.instances.set(key, instance);
@@ -175,7 +175,7 @@ The `onDidDispose` handler that calls this routine is shown in the `create` regi
 
 | Scenario | Behavior |
 |--|--|
-| Knit `A.Rmd`, close A's editor, knit `A.Rmd` again via explorer context menu | Panel for A is found in the Map by `sourceUri.toString()` and reused. The closed editor is irrelevant. |
+| Knit `A.Rmd`, close A's editor, knit `A.Rmd` again via explorer context menu | Panel for A is found in the Map by `sourceUri.fsPath` and reused. The closed editor is irrelevant. |
 | Same `.Rmd` opened in two VS Code windows | Each window has its own extension host and `instances` Map. No cross-window interference. |
 | User drags A's panel into a different column (e.g. column 1 where A.Rmd lives) | `onDidChangeViewState` fires; `recomputePreviewColumn` runs. If any other knit panel still occupies the old preview column, `previewColumn` stays put (subsequent knits stack with the cluster that didn't move). If A was the only one, `previewColumn` *adopts* A's new column so the next knit lands next to A rather than scattering to `Beside`. |
 | Same `.Rmd` knit produces output to a different directory on the second run | A's existing panel is disposed and recreated in *its* current column (the `rootDir`-mismatch branch). Other panels are untouched. |
@@ -303,6 +303,13 @@ The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed (`dis
 
 1. **`onDidChangeViewState` cost** — fires on every visibility / state change, not just column moves. The handler does an O(n) Map walk; with realistic n ≤ ~10, the overhead is negligible. If users report panel-switching jank with many panels, debounce or compare against a cached column before walking.
 2. **Tab grouping (drag-as-group)** — VS Code does not expose programmatic tab grouping. Users can manually group knit panels via the tab-strip context menu. Out of scope.
+
+## v4 → v5 changes (response to fourth Codex pass)
+
+| Codex finding | v5 disposition |
+| --            | --             |
+| #2 Registry key `sourceUri.toString()` diverged from `inFlight: Set<string>` keyed by `fsPath` in `knit-commands.ts:228-235` | Registry key changed to `sourceUri.fsPath` throughout. State-model bullet now explains the alignment with the in-flight tracker and why it is load-bearing for `Refresh` round-trips. All in-spec snippets and edge-case rows updated. |
+| #1 v3→v4 row #2 phrasing slightly overclaimed "the full `create` body" | Acknowledged as cosmetic; left in place. The section *does* show the full body relative to the singleton equivalent (`createWebviewPanel` options identical to today's are not duplicated). |
 
 ## v3 → v4 changes (response to third Codex pass)
 
