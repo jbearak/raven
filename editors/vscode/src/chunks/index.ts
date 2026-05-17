@@ -28,7 +28,8 @@ export function register_chunks_navigation_and_highlight(
  *
  *   - Run commands (`raven.runCurrentChunk` and friends, plus the positional
  *     variants the CodeLens invokes).
- *   - The `▷ Run Chunk` / `↥ Run Above` CodeLens provider.
+ *   - The chunk CodeLens provider (button set is user-configurable via
+ *     `raven.chunks.codeLens.commands`).
  *
  * Callers must only invoke this when Raven's R console is enabled (i.e. inside
  * the `r_console_resolved === 'enabled'` branch of `activate()`), otherwise

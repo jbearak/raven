@@ -23,7 +23,9 @@ export type RunMode =
     | 'currentAndBelow'
     | 'below'
     | 'previous'
-    | 'next';
+    | 'previousAndMove'
+    | 'next'
+    | 'nextAndMove';
 
 function get_document_lines(document: vscode.TextDocument): string[] {
     const lines: string[] = [];
@@ -70,6 +72,30 @@ function find_visible_editor(uri: vscode.Uri): vscode.TextEditor | undefined {
     );
 }
 
+/**
+ * Move the cursor to the first body line of `chunk` and reveal it.
+ *
+ * Reused by every `…AndMove` variant: `runCurrentChunkAndMove` jumps to the
+ * chunk *after* the one that was run (relay-the-baton), while the issue-#280
+ * `runNextChunkAndMove` / `runPreviousChunkAndMove` variants jump *into* the
+ * chunk that was just run (Quarto's Run-Next-and-Move behavior). The single
+ * primitive handles both — callers compute which chunk to land in.
+ *
+ * Empty chunks (`end_line === header_line`) have no body line — for an empty
+ * Rmd chunk, `header_line + 1` is the closing fence; for an empty `# %%` cell
+ * it's the next cell marker (i.e. a different cell). In both cases we fall
+ * back to `header_line` itself so the cursor stays associated with this
+ * chunk.
+ */
+function place_cursor_in_chunk(editor: vscode.TextEditor, chunk: Chunk): void {
+    const has_body_line = chunk.end_line > chunk.header_line;
+    const ideal_line = has_body_line ? chunk.header_line + 1 : chunk.header_line;
+    const target_line = Math.min(ideal_line, editor.document.lineCount - 1);
+    const pos = new vscode.Position(target_line, 0);
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos));
+}
+
 function move_cursor_to_next_chunk(
     editor: vscode.TextEditor,
     chunks: Chunk[],
@@ -77,10 +103,7 @@ function move_cursor_to_next_chunk(
 ): void {
     const next = chunks.find((c) => c.header_line > current.header_line && is_runnable_chunk(c));
     if (!next) return;
-    const target_line = Math.min(next.header_line + 1, editor.document.lineCount - 1);
-    const pos = new vscode.Position(target_line, 0);
-    editor.selection = new vscode.Selection(pos, pos);
-    editor.revealRange(new vscode.Range(pos, pos));
+    place_cursor_in_chunk(editor, next);
 }
 
 async function run_chunk_at(
@@ -128,7 +151,7 @@ async function run_chunk_at(
         return;
     }
 
-    if (mode === 'previous') {
+    if (mode === 'previous' || mode === 'previousAndMove') {
         const previous = previous_runnable_chunk(chunks, cursor_line);
         if (!previous) {
             vscode.window.showInformationMessage('Raven: no runnable chunk above the cursor.');
@@ -137,13 +160,15 @@ async function run_chunk_at(
         const code = extract_chunk_code(lines, previous);
         if (code.trim().length === 0) {
             vscode.window.showInformationMessage('Raven: previous chunk is empty.');
+            if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
             return;
         }
         await send_to_r(code);
+        if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
         return;
     }
 
-    if (mode === 'next') {
+    if (mode === 'next' || mode === 'nextAndMove') {
         const next = next_runnable_chunk(chunks, cursor_line);
         if (!next) {
             vscode.window.showInformationMessage('Raven: no runnable chunk below the cursor.');
@@ -152,9 +177,11 @@ async function run_chunk_at(
         const code = extract_chunk_code(lines, next);
         if (code.trim().length === 0) {
             vscode.window.showInformationMessage('Raven: next chunk is empty.');
+            if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
             return;
         }
         await send_to_r(code);
+        if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
         return;
     }
 
@@ -237,12 +264,13 @@ async function run_chunk_at_command(
  *
  * `eval_aware` lenses append a `(eval = FALSE)` suffix to their title when
  * the chunk header sets `eval = FALSE`, matching the existing "Run Chunk"
- * behavior. Multi-chunk lenses don't add the suffix: for `above` / `below` /
- * `previous` / `next` / `all` the chunk under the lens isn't even part of the
- * execution; for `currentAndBelow` it is, but the suffix would still be
- * misleading because the chunks after it would still run regardless of this
- * one's `eval` flag, so the lens's title shouldn't make any single chunk's
- * eval state look load-bearing.
+ * behavior. Multi-chunk / sibling-chunk lenses don't add the suffix: for
+ * `above` / `below` / `previous` / `previousAndMove` / `next` / `nextAndMove`
+ * / `all` the chunk under the lens isn't even part of the execution; for
+ * `currentAndBelow` it is, but the suffix would still be misleading because
+ * the chunks after it would still run regardless of this one's `eval` flag,
+ * so the lens's title shouldn't make any single chunk's eval state look
+ * load-bearing.
  */
 export interface ChunkLensCommand {
     /** Command id dispatched by the CodeLens click (positional variant). */
@@ -292,10 +320,22 @@ export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = O
         tooltip: 'Run the R chunk immediately above this one',
         eval_aware: false,
     },
+    'raven.runPreviousChunkAndMove': {
+        positional_id: 'raven.runPreviousChunkAndMoveAt',
+        title: '← Run Previous & Move',
+        tooltip: 'Run the R chunk immediately above this one, then move the cursor into it',
+        eval_aware: false,
+    },
     'raven.runNextChunk': {
         positional_id: 'raven.runNextChunkAt',
         title: '→ Run Next',
         tooltip: 'Run the R chunk immediately below this one',
+        eval_aware: false,
+    },
+    'raven.runNextChunkAndMove': {
+        positional_id: 'raven.runNextChunkAndMoveAt',
+        title: '→ Run Next & Move',
+        tooltip: 'Run the R chunk immediately below this one, then move the cursor into it',
         eval_aware: false,
     },
     'raven.runAllChunks': {
@@ -315,7 +355,9 @@ export function register_chunk_commands(context: vscode.ExtensionContext): void 
         ['raven.runCurrentAndBelowChunks', 'currentAndBelow'],
         ['raven.runBelowChunks', 'below'],
         ['raven.runPreviousChunk', 'previous'],
+        ['raven.runPreviousChunkAndMove', 'previousAndMove'],
         ['raven.runNextChunk', 'next'],
+        ['raven.runNextChunkAndMove', 'nextAndMove'],
     ];
     for (const [id, mode] of handlers) {
         context.subscriptions.push(
@@ -332,7 +374,9 @@ export function register_chunk_commands(context: vscode.ExtensionContext): void 
         ['raven.runCurrentAndBelowChunksAt', 'currentAndBelow'],
         ['raven.runBelowChunksAt', 'below'],
         ['raven.runPreviousChunkAt', 'previous'],
+        ['raven.runPreviousChunkAndMoveAt', 'previousAndMove'],
         ['raven.runNextChunkAt', 'next'],
+        ['raven.runNextChunkAndMoveAt', 'nextAndMove'],
     ];
     for (const [id, mode] of positional) {
         context.subscriptions.push(

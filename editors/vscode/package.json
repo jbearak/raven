@@ -155,8 +155,18 @@
         "category": "Raven"
       },
       {
+        "command": "raven.runPreviousChunkAndMove",
+        "title": "Run Previous Chunk and Move",
+        "category": "Raven"
+      },
+      {
         "command": "raven.runNextChunk",
         "title": "Run Next Chunk",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.runNextChunkAndMove",
+        "title": "Run Next Chunk and Move",
         "category": "Raven"
       },
       {
@@ -1435,12 +1445,15 @@
               "raven.runCurrentAndBelowChunks",
               "raven.runBelowChunks",
               "raven.runPreviousChunk",
+              "raven.runPreviousChunkAndMove",
               "raven.runNextChunk",
+              "raven.runNextChunkAndMove",
               "raven.runAllChunks"
             ]
           },
           "default": [
             "raven.runCurrentChunk",
+            "raven.runNextChunkAndMove",
             "raven.runAboveChunks"
           ],
           "markdownDescription": "Ordered list of run commands shown as CodeLens buttons above every R chunk header. Set to `[]` to hide all lenses while keeping the underlying commands available from the palette and keybindings. Unknown command ids are ignored."
