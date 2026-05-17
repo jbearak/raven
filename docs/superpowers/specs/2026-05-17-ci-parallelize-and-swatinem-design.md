@@ -37,11 +37,14 @@ Two distinct slow paths matter to the user:
 
 ## Goal
 
-- `integration.yml` critical path: ~5.5m cold, **~3m warm**.
+- `integration.yml` critical path: ~5.5m cold, **~3m warm when the cache-
+  fallback assumption (§2) holds**.
 - `perf.yml` `benchmarks` job: fast on second-and-later runs (criterion warm
-  in cache).
+  in `benchmarks`'s own cache, typically populated by a prior `main` run).
 - No paid infrastructure (free GitHub-hosted runners only).
 - No code-level changes to tests or benchmarks; CI-config only.
+- Cache health is monitorable post-deploy (§6), so regressions to cold runs
+  surface in the UI rather than going unnoticed.
 
 ## Design
 
@@ -56,11 +59,12 @@ t=0 ┬─ build         cargo build --release -p raven               ~3m cold, 
     ├─ cargo         cargo test --release -p raven                 ~4m cold, ~30–60s warm
     │                  --features test-support
     │
-    └─ time-budgets  cargo test --release -p raven                 ~3m cold, ~3m every run
+    └─ time-budgets  cargo test --release -p raven                 ~3m cold, ~30–40s warm
                        --features test-support
-                       --test performance_budgets                  (intentionally uncached)
+                       --test performance_budgets
 
-Critical path: Build → vscode-mocha = ~5.5m cold, ~3m warm
+Critical path (warm-cache assumption holding):
+  Build → vscode-mocha = ~5.5m cold, ~3m warm
 ```
 
 Changes from the uncommitted diff:
@@ -73,7 +77,7 @@ Changes from the uncommitted diff:
 ### 2. Cache strategy
 
 Replace `sccache` + `actions/cache` with `Swatinem/rust-cache` on the
-**three** Rust-compiling jobs we want to keep fast: `build`, `cargo`, and
+**four** Rust-compiling jobs: `build`, `cargo`, `time-budgets`, and
 `benchmarks` (in `perf.yml`).
 
 **Why Swatinem over sccache:**
@@ -97,26 +101,45 @@ cached job's `target/` content differs legitimately:
 
 - `build`: contains compiled LSP binary + production deps.
 - `cargo`: contains LSP + tests + all dev-deps (including criterion).
+- `time-budgets`: contains LSP + the `performance_budgets` test binary.
 - `benchmarks`: contains LSP + benches + criterion.
 
 Cross-job sharing of `target/` is not safe (Cargo wouldn't know what
 to do with foreign artifacts), so each job's cache is independent.
+**Notably, `cargo`'s criterion compilation cannot warm `perf.yml`'s
+`benchmarks` job** — `benchmarks` only warms from `benchmarks`'s own
+prior runs (typically on `main`). Inside a single workflow run, each
+cached job is also independent of the others — there is no within-run
+warming.
 
 **Jobs we do NOT cache:**
 
-- `time-budgets`: compiles a single integration test target every run
-  (~3 min). Not on the critical path — `vscode-mocha` already takes ~3 min
-  warm, so caching `time-budgets` does not move the wall-time floor. Skipping
-  the cache here saves ~500 MB–1 GB of GitHub cache storage.
 - `vscode-mocha`, `binary-size`: no Rust compilation in these jobs.
 
-**Branch-scoping note:**
+**Branch-scoping note (best-effort, not a guarantee):**
 
 GitHub Actions scopes caches by branch, but caches saved on the default
 branch (`main`) are readable from any branch. `perf.yml` already runs on
-`push: branches: [main]`, so feature branches inherit a warm criterion
-cache on first run as long as `main` has run recently. No additional
-scheduling needed.
+`push: branches: [main]`, so feature branches *can* inherit a warm
+criterion cache from `main` — but only when `main` has a fresh cache
+entry under the same key.
+
+This main-branch fallback is fragile under realistic conditions:
+
+- GitHub's 10 GB-per-repo cache is LRU-evicted. With four cached jobs in
+  `integration.yml` (~2–3 GB per branch) plus `benchmarks` in `perf.yml`
+  (~500 MB–1 GB per branch), a handful of active feature branches can
+  evict `main`'s entries.
+- `Cargo.lock` changes, `rustc` version bumps, and Swatinem internal
+  cache-version bumps each produce new cache keys, making prior entries
+  unreachable even if still stored.
+- A feature branch's first run on a new key is cold (~3m criterion
+  compile in `perf.yml`, ~3m test compile in `time-budgets` and `cargo`).
+
+The architecture does not require additional scheduling, but the warm-
+cache claims in §4 are *expected* outcomes, not guaranteed ones. The
+monitoring step in §6 makes the assumption falsifiable rather than
+asserted.
 
 ### 3. Workflow file changes
 
@@ -141,10 +164,14 @@ scheduling needed.
 - **`time-budgets` job:**
   - **Remove `needs: build`**.
   - Drop the `Set up sccache` step.
-  - **Drop the cache step entirely** — this job is intentionally uncached.
-  - Keep mold install and `cargo test --release --test performance_budgets`.
+  - Replace `actions/cache` block with
+    `Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1`.
+  - Keep mold install and `cargo test --release -p raven --features test-support --test performance_budgets`.
 - **`vscode-mocha`, `binary-size`:** unchanged (they already only download
   the artifact and have no cargo/cache setup).
+- **Each cached job** gets the Swatinem step assigned an `id` and a
+  follow-up `Report cache status` step (see §6) so cache-hit outcomes
+  are visible in run timelines.
 
 #### `.github/workflows/perf.yml`
 
@@ -158,33 +185,86 @@ scheduling needed.
 
 ### 4. Expected timings
 
+These are point estimates derived from prior runs on this branch and from
+typical Swatinem warm/cold behavior. They are not guarantees — the warm
+rows assume the cache-fallback assumption in §2 holds.
+
 | Scenario | Build | Cargo | Time-Budgets | VSCode Mocha | **Wall time** |
 |---|---|---|---|---|---|
-| Cold first run on a branch (new `Cargo.lock`) | 3m | 4m | 3m | Build+2.5m=5.5m | **5.5m** ← VSCode critical |
-| Warm cache on same branch | 30s | 1m | 3m | 3m | **3m** ← tie VSCode/time-budgets |
-| Warm cache, with `main` warm but new feature branch | 30s | 1m | 3m | 3m | **3m** ← same |
+| Cold first run (new `Cargo.lock` or evicted key) | 3m | 4m | 3m | Build+2.5m=5.5m | **~5.5m** ← VSCode critical |
+| Warm cache on same branch | 30s | 1m | 30–40s | 3m | **~3m** ← VSCode critical with margin |
+| New feature branch, `main` cache present and matching | 30s | 1m | 30–40s | 3m | **~3m** ← same |
+| Warm-cache fallback fails partway (e.g. `cargo` cold, others warm) | 30s | 4m | 30–40s | 3m | **~4m** ← cargo critical until repopulated |
 
-`perf.yml` `benchmarks` job: ~3m cold, ~30s–1m warm.
+`perf.yml` `benchmarks` job: ~3m cold, ~30s–1m warm. Same fallback caveats.
 
 ### 5. Risks and trade-offs
 
-- **Cold-cache compute duplication.** With `build`, `cargo`, and `benchmarks`
-  running in parallel and each with its own cache, prod-dep crates compile
-  three times on the first cold run. This is wall-time-neutral (they run in
-  parallel) but consumes ~3× CPU-minutes. Once caches warm, sccache-like
-  dedup is replaced by Swatinem's per-job `target/` cache.
-- **Cache size.** Three Swatinem caches at ~500 MB–1 GB each = ~2–3 GB total
-  per branch. GitHub's 10 GB-per-repo cap evicts oldest entries; no manual
-  management needed.
-- **Time-budgets job stays slow (~3m every run).** Acceptable because it is
-  not on the critical path — the warm-cache wall time is set by VSCode
-  Mocha (~3m), and `time-budgets` running in parallel finishes at roughly
-  the same time. If `vscode-mocha` is ever sped up below 3m, revisit
-  caching `time-budgets`.
-- **First push after `Cargo.lock` change on `main`.** That single `main`
-  build runs cold (~5.5m). Subsequent PRs warm from it.
+- **Cold-cache compute duplication.** With `build`, `cargo`, `time-budgets`,
+  and `benchmarks` (in `perf.yml`) running in parallel and each with its
+  own cache, prod-dep crates compile four times on the first cold run.
+  This is wall-time-neutral (they run in parallel) but consumes ~4× CPU-
+  minutes. Once caches warm, this disappears.
+- **Cache size and eviction.** Four Swatinem caches at ~500 MB–1 GB each =
+  ~2.5–4 GB total per branch (integration.yml). Adding `perf.yml`'s
+  `benchmarks` cache puts a single branch in the 3–5 GB range. With several
+  active branches, this can crowd `main`'s entries out of GitHub's 10 GB
+  per-repo cap. If feature-branch cache-hit rates trend down post-merge
+  (§6 monitoring will show this), consider narrowing the cache scope —
+  dropping the `cargo` cache is the most defensible candidate, since
+  `cargo` is not on the critical path.
+- **Cold-cache triggers are broader than just `Cargo.lock` changes.**
+  Cache misses can also happen from: `rustc` version bumps, Swatinem
+  internal cache-version bumps, or GitHub LRU eviction of `main`'s
+  entries under branch churn. Any such cold run takes ~5.5m. The next
+  run on that key repopulates the cache and subsequent runs warm again.
+  This is the most likely silent regression vector — §6 cache-hit
+  logging is the mitigation.
 
-### 6. Out of scope
+### 6. Validation and monitoring
+
+The cache assumptions in this spec (especially "main warms feature branches"
+and "warm cache holds across normal repo activity") are *expected* outcomes,
+not guaranteed ones. To make them falsifiable rather than asserted:
+
+1. **Log Swatinem cache-hit status per cached job.** Swatinem's action
+   exposes `cache-hit` and `cache-key` outputs. Each cached job adds:
+
+   ```yaml
+   - name: Rust cache
+     id: rust-cache
+     uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+   # …other steps…
+
+   - name: Report cache status
+     if: always()
+     run: |
+       echo "::notice title=Cache status::hit=${{ steps.rust-cache.outputs.cache-hit }} key=${{ steps.rust-cache.outputs.cache-key }}"
+   ```
+
+   `::notice` surfaces the status in the Actions UI summary, so cold-run
+   regressions are visible without parsing wall-time tables.
+
+2. **Establish baseline timings post-merge.** Within ~1 week of merging,
+   capture p50 wall times per job across PR runs. Decisions to be revisited
+   if observed:
+
+   - `time-budgets` p50 trending above VSCode Mocha → no action; this is
+     the case the cache was supposed to prevent, and Codex's prediction
+     would be wrong.
+   - Feature-branch first-run cache-hit rate < ~50% on any cached job
+     (`build`, `cargo`, `time-budgets`, `benchmarks`) → the main-branch
+     fallback is being evicted; narrow the cache scope per the eviction
+     risk in §5.
+   - Build job p50 over ~1m on warm runs → Swatinem isn't delivering its
+     promised gain; consider reverting to sccache with the local backend.
+
+3. **No new performance claims without measurement.** Future tuning
+   (e.g., dropping the `cargo` cache, adding `shared-key`, switching back
+   to sccache) must be motivated by observed timings, not estimates.
+
+### 7. Out of scope
 
 - **Mocha test execution time (1m51s of pure test running).** Reducing it
   requires test-level changes (parallel mode, sharding, suite splitting)
@@ -201,13 +281,18 @@ scheduling needed.
 After implementation, validate by:
 
 1. Push the change and confirm `Build (release)` drops below 4 min on the
-   first run (cold cache).
+   first run (cold cache). The cache-status notice (§6) should show
+   `cache-hit=false` on every cached job.
 2. Push a no-op commit on the same branch; confirm `Build` drops to <1 min
-   and total wall time to ~3 min.
+   and total wall time to ~3 min. Cache-status notices should show
+   `cache-hit=true` on all four cached jobs (`build`, `cargo`,
+   `time-budgets`, `benchmarks`).
 3. Confirm `Cargo Tests` and `Time-Budget Tests` start at `t=0` (no
    `needs: build`) in the run timeline.
 4. Push to `main` (or merge the PR), then open a fresh branch from `main`
-   and confirm its first run warms from `main`'s cache (Build ~30s, not 3
-   min).
+   and confirm its first run warms from `main`'s cache: `cache-hit=true`
+   on at least the `build` and `cargo` jobs, and Build ~30s rather than
+   3m. If `cache-hit=false`, the main-branch fallback didn't work for this
+   branch — record the run for the §6 baseline.
 5. Confirm `perf.yml`'s `benchmarks` job drops below 1 min on its second
-   run after a `Cargo.lock`-stable push.
+   run after a `Cargo.lock`-stable push, with `cache-hit=true`.
