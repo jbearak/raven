@@ -6739,8 +6739,7 @@ fn extract_from_leaf(raw: &str, base_byte: usize, row: u32, out: &mut Vec<DelimE
 }
 
 /// Classify an ERROR node into a specific, actionable diagnostic where possible,
-/// falling back to `ErrorClassification::Multi(vec![])` (the sentinel for
-/// "no classifier matched — caller emits a single generic 'Syntax error'").
+/// falling back to the delimiter scan which produces per-fault diagnostics.
 ///
 /// Checks (in priority order):
 /// 1. Unclosed string literal — lone `"` / `'` as a direct child.
@@ -6749,14 +6748,13 @@ fn extract_from_leaf(raw: &str, base_byte: usize, row: u32, out: &mut Vec<DelimE
 ///    non-matching bracket (detected through a nested ERROR child).
 /// 4. Fat-arrow typo — a lone `>` immediately following an `=` token, which
 ///    arises from writing `=>` (no such operator in R).
+/// 5. Delimiter scan — stack-based processing of the event stream; emits
+///    zero or more per-fault diagnostics. An empty result causes the caller
+///    to fall back to a single generic `"Syntax error"`.
 ///
 /// Returns `ErrorClassification::Whole` when a single classifier matched, or
-/// `ErrorClassification::Multi(vec![])` when none matched. Future work (Task 5)
-/// will return non-empty `Multi` for delimiter-scan results.
-///
-/// `_state` is reserved for the delimiter-scan and mismatched-bracket coalescing
-/// tasks; rename to `state` and pass it through when those tasks land.
-fn classify_error(node: Node, text: &str, _state: &mut CollectState) -> ErrorClassification {
+/// `ErrorClassification::Multi` with the scan's results otherwise.
+fn classify_error(node: Node, text: &str, state: &mut CollectState) -> ErrorClassification {
     let range = minimize_error_range(node, text);
 
     if has_unclosed_quote_child(node) {
@@ -6774,10 +6772,199 @@ fn classify_error(node: Node, text: &str, _state: &mut CollectState) -> ErrorCla
     if let Some(msg) = detect_fat_arrow(node, text) {
         return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
     }
-    // No classifier matched. Caller falls back to a single generic
-    // "Syntax error" at the minimized range. Returning Multi(vec![]) is
-    // the sentinel for "delimiter scan / fallback".
-    ErrorClassification::Multi(Vec::new())
+
+    // Delimiter scan: produces zero or more per-fault diagnostics. An
+    // empty Vec falls back to a single "Syntax error" in the caller.
+    let scan = classify_via_delimiter_scan(node, text, state);
+    ErrorClassification::Multi(scan)
+}
+
+/// Process the delimiter event stream from an ERROR node and produce per-fault
+/// diagnostics. Each distinct fault gets its own range and message:
+///
+/// - Stray closer with empty stack → `Missing opening X` at the closer's range.
+/// - Closer matching the stack top → pop silently (balanced pair).
+/// - Closer mismatching the stack top → `Mismatched brackets` at the closer's
+///   range; the opener's id is recorded in `state.covered_openers`.
+/// - Unclosed openers remaining at end → `Unclosed X: missing matching Y`
+///   with non-overlapping ranges derived from the next-opener-on-same-line
+///   tie-breaking rule.
+fn classify_via_delimiter_scan(
+    error: Node,
+    text: &str,
+    state: &mut CollectState,
+) -> Vec<ClassifiedSyntaxDiagnostic> {
+    use crate::cross_file::types::byte_offset_to_utf16_column;
+
+    struct StackItem {
+        kind: DelimiterKind,
+        row: u32,
+        start_byte: usize,
+        node_id: usize,
+    }
+
+    let events = delimiter_events(error, text);
+    let mut stack: Vec<StackItem> = Vec::new();
+    let mut out: Vec<ClassifiedSyntaxDiagnostic> = Vec::new();
+
+    // For mismatched-bracket coalescing we need the opener's tree-sitter
+    // Node id. Map an opener event's start byte back to a Node by scanning
+    // the error subtree (one level into nested ERRORs, matching how
+    // delimiter_events extracted the leaf).
+    fn find_node_by_byte<'a>(
+        root: Node<'a>,
+        target: usize,
+        depth: usize,
+    ) -> Option<Node<'a>> {
+        if depth > 2 {
+            return None;
+        }
+        let mut c = root.walk();
+        for ch in root.children(&mut c) {
+            if ch.start_byte() == target && ch.child_count() == 0 {
+                return Some(ch);
+            }
+            if ch.is_error() {
+                if let Some(found) = find_node_by_byte(ch, target, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    for ev in &events {
+        if ev.is_open {
+            stack.push(StackItem {
+                kind: ev.kind,
+                row: ev.row,
+                start_byte: ev.range_bytes.start,
+                node_id: find_node_by_byte(error, ev.range_bytes.start, 0)
+                    .map(|n| n.id())
+                    .unwrap_or(0),
+            });
+            continue;
+        }
+        // closer
+        match stack.last() {
+            None => {
+                let line = text.lines().nth(ev.row as usize).unwrap_or("");
+                let line_start = line_start_byte(text, ev.row as usize);
+                let start_col_byte = ev.range_bytes.start - line_start;
+                let end_col_byte = ev.range_bytes.end - line_start;
+                out.push(ClassifiedSyntaxDiagnostic {
+                    message: format!("Missing opening `{}`", ev.kind.opener_str()),
+                    range: Range {
+                        start: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, start_col_byte),
+                        ),
+                        end: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, end_col_byte),
+                        ),
+                    },
+                });
+            }
+            Some(top) if top.kind == ev.kind => {
+                stack.pop();
+            }
+            Some(top) => {
+                let opener_kind = top.kind;
+                let opener_node_id = top.node_id;
+                let line = text.lines().nth(ev.row as usize).unwrap_or("");
+                let line_start = line_start_byte(text, ev.row as usize);
+                let start_col_byte = ev.range_bytes.start - line_start;
+                let end_col_byte = ev.range_bytes.end - line_start;
+                out.push(ClassifiedSyntaxDiagnostic {
+                    message: format!(
+                        "Mismatched brackets: `{}` opened here; close with `{}` not `{}`.",
+                        opener_kind.opener_str(),
+                        opener_kind.closer_str(),
+                        ev.kind.closer_str(),
+                    ),
+                    range: Range {
+                        start: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, start_col_byte),
+                        ),
+                        end: Position::new(
+                            ev.row,
+                            byte_offset_to_utf16_column(line, end_col_byte),
+                        ),
+                    },
+                });
+                if opener_node_id != 0 {
+                    state.covered_openers.insert(opener_node_id);
+                }
+                stack.pop();
+            }
+        }
+    }
+
+    // Unclosed openers remaining on the stack: emit "Unclosed X" with
+    // the next-opener-on-same-line tie-breaking rule.
+    if !stack.is_empty() {
+        let row_of: Vec<u32> = stack.iter().map(|s| s.row).collect();
+        let start_byte_of: Vec<usize> = stack.iter().map(|s| s.start_byte).collect();
+
+        for (i, item) in stack.iter().enumerate() {
+            let line = text.lines().nth(item.row as usize).unwrap_or("");
+            let line_start = line_start_byte(text, item.row as usize);
+            let start_col_utf16 =
+                byte_offset_to_utf16_column(line, item.start_byte - line_start);
+
+            // Next opener at a later byte on the SAME row
+            let next_on_row = (i + 1..stack.len())
+                .find(|&j| row_of[j] == item.row && start_byte_of[j] > item.start_byte)
+                .map(|j| byte_offset_to_utf16_column(line, start_byte_of[j] - line_start));
+
+            let eomc = end_of_meaningful_content(line);
+            let mut end_col = next_on_row.unwrap_or(eomc).min(eomc);
+            if end_col <= start_col_utf16 {
+                // Collapse to opener-token width
+                let opener_len_utf16 = match item.kind {
+                    DelimiterKind::DoubleBracket => 2,
+                    _ => 1,
+                };
+                end_col = start_col_utf16 + opener_len_utf16;
+            }
+
+            out.push(ClassifiedSyntaxDiagnostic {
+                message: format!(
+                    "Unclosed `{}`: missing matching `{}`",
+                    item.kind.opener_str(),
+                    item.kind.closer_str(),
+                ),
+                range: Range {
+                    start: Position::new(item.row, start_col_utf16),
+                    end: Position::new(item.row, end_col),
+                },
+            });
+        }
+    }
+
+    out
+}
+
+/// Byte offset of the start of line `row` in `text` (0-indexed row).
+fn line_start_byte(text: &str, row: usize) -> usize {
+    let mut start = 0;
+    let mut current_row = 0;
+    for (idx, b) in text.bytes().enumerate() {
+        if current_row == row {
+            return start;
+        }
+        if b == b'\n' {
+            current_row += 1;
+            start = idx + 1;
+        }
+    }
+    if current_row == row {
+        start
+    } else {
+        text.len()
+    }
 }
 
 /// Returns a diagnostic message if `node` is an ERROR whose only non-trivial
@@ -6883,8 +7070,9 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 #[cfg(test)]
 mod syntax_error_range_tests {
     use super::{
-        anchor_missing_position, collect_syntax_errors, delimiter_events, end_of_meaningful_content,
-        find_first_content_line, find_innermost_error, find_opener_for_missing, DelimiterKind,
+        anchor_missing_position, classify_via_delimiter_scan, collect_syntax_errors,
+        delimiter_events, end_of_meaningful_content, find_first_content_line, find_innermost_error,
+        find_opener_for_missing, CollectState, DelimiterKind,
     };
     use tower_lsp::lsp_types::Diagnostic;
 
@@ -8953,6 +9141,97 @@ mod syntax_error_range_tests {
         assert_eq!(closes[0].kind, DelimiterKind::DoubleBracket);
         assert_eq!(closes[1].kind, DelimiterKind::Bracket);
     }
+
+    // ------------------------------------------------------------------
+    // classify_via_delimiter_scan (stack processing)
+    // ------------------------------------------------------------------
+
+    fn run_scan(code: &str) -> Vec<(String, tower_lsp::lsp_types::Range)> {
+        let tree = parse_r(code);
+        let err = find_first_error(&tree).expect("expected ERROR node");
+        let mut state = CollectState::default();
+        classify_via_delimiter_scan(err, code, &mut state)
+            .into_iter()
+            .map(|d| (d.message, d.range))
+            .collect()
+    }
+
+    #[test]
+    fn scan_stray_close_brace() {
+        let diags = run_scan("x <- 1\n}\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `{`"), "got: {}", diags[0].0);
+        assert_eq!(diags[0].1.start.line, 1);
+        assert_eq!(diags[0].1.start.character, 0);
+        assert_eq!(diags[0].1.end.character, 1);
+    }
+
+    #[test]
+    fn scan_stray_close_paren() {
+        let diags = run_scan("x <- 1\n)\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `(`"));
+    }
+
+    #[test]
+    fn scan_stray_close_bracket() {
+        let diags = run_scan("x <- 1\n]\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `[`"));
+    }
+
+    #[test]
+    fn scan_stray_double_close_bracket() {
+        let diags = run_scan("x <- 1\n]]\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].0.contains("Missing opening `[[`"));
+        assert_eq!(diags[0].1.start.character, 0);
+        assert_eq!(diags[0].1.end.character, 2);
+    }
+
+    #[test]
+    fn scan_homogeneous_brace_run_single_diagnostic() {
+        let diags = run_scan("}}}\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(diags[0].0.contains("Missing opening `{`"));
+        assert_eq!(diags[0].1.start.character, 0);
+        assert_eq!(diags[0].1.end.character, 3);
+    }
+
+    #[test]
+    fn scan_flat_nested_openers_three_diagnostics() {
+        let diags = run_scan("f(g(h(\n");
+        assert_eq!(diags.len(), 3, "got: {diags:?}");
+        for d in &diags {
+            assert!(d.0.contains("Unclosed `(`"));
+        }
+        let mut sorted = diags.clone();
+        sorted.sort_by_key(|d| d.1.start.character);
+        // Per spec: cols 1..3, 3..5, 5..6 (non-overlapping)
+        assert_eq!(sorted[0].1.start.character, 1);
+        assert_eq!(sorted[0].1.end.character, 3);
+        assert_eq!(sorted[1].1.start.character, 3);
+        assert_eq!(sorted[1].1.end.character, 5);
+        assert_eq!(sorted[2].1.start.character, 5);
+        assert_eq!(sorted[2].1.end.character, 6);
+    }
+
+    #[test]
+    fn scan_flat_error_mismatched_close_coalesces() {
+        // f(}  -> outer ERROR contains "(" and ERROR("}") (or similar)
+        // Inside the delimiter scan, top-of-stack is `(`, incoming closer is `}`
+        // → mismatched-bracket sub-rule fires, one diagnostic.
+        let diags = run_scan("f(}\n");
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(
+            diags[0].0.contains("Mismatched brackets")
+                && diags[0].0.contains("`(`")
+                && diags[0].0.contains("`}`"),
+            "got: {}",
+            diags[0].0,
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -43272,7 +43551,10 @@ result <- undefined_var
                 .iter()
                 .any(|d| d.message.to_lowercase().contains("error")
                     || d.message.to_lowercase().contains("syntax")
-                    || d.message.to_lowercase().contains("unexpected")),
+                    || d.message.to_lowercase().contains("unexpected")
+                    || d.message.starts_with("Unclosed")
+                    || d.message.starts_with("Missing opening")
+                    || d.message.starts_with("Missing")),
             "Should contain syntax-related diagnostics, got: {:?}",
             result_enabled
                 .iter()
