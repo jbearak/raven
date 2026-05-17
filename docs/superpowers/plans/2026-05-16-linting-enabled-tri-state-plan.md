@@ -1079,12 +1079,13 @@ Expected: success.
 - [ ] **Step 5: Verify the CLI behaves correctly with a fresh repro of #281**
 
 ```bash
+RAVEN_BIN="${RAVEN_BIN:-$(pwd)/target/release/raven}"
 TMP=$(mktemp -d)
 echo 'linters: linters_with_defaults()' > "$TMP/.lintr"
 cat > "$TMP/test.R" <<EOF
 x = 1  # would trigger assignment_operator if linting is on
 EOF
-cd "$TMP" && "${RAVEN_BIN:-./target/release/raven}" lint test.R --format text
+cd "$TMP" && "$RAVEN_BIN" lint test.R --format text
 ```
 
 Expected: lint diagnostics appear (because `.lintr` was discovered, `"auto"` resolved to on). Then verify the off path:
@@ -1095,7 +1096,7 @@ cat > raven.toml <<EOF
 [linting]
 enabled = false
 EOF
-"${RAVEN_BIN:-./target/release/raven}" lint test.R --format text
+"$RAVEN_BIN" lint test.R --format text
 ```
 
 Expected: no diagnostics; `raven.toml`'s explicit `false` wins, and `.lintr` is not consulted (raven.toml wins discovery).
