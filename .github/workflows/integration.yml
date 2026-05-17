@@ -23,10 +23,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Compile both artifacts once, upload them. Downstream jobs download and
-  # execute without recompiling — avoids paying the full compile cost twice.
+  # Build the release LSP binary once and upload it. Only vscode-mocha needs
+  # a release binary (the LSP must start/stop fast enough to satisfy test
+  # timeouts); cargo tests use a debug build and run in parallel with this job.
   build:
-    name: Build
+    name: Build (release)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -45,62 +46,63 @@ jobs:
             ~/.cache/sccache
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-sccache-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-sccache-${{ runner.os }}-
+            cargo-sccache-release-${{ runner.os }}-
 
       - name: Install mold linker
         run: sudo apt-get install -y --no-install-recommends mold
 
-      # Compile the debug test binary without running it. `--features
-      # test-support` exposes `raven::test_utils` needed by
-      # `performance_budgets`. The cargo test output prints the path to the
-      # compiled executable; we capture it and copy to stable names.
-      # The same debug binary (`target/debug/raven`) is also used by the
-      # vscode-mocha job — debug is sufficient for correctness testing and
-      # compiles significantly faster than release.
-      - name: Compile (debug)
-        run: |
-          cargo test --no-run -p raven --features test-support 2>&1 | tee /tmp/cargo-test-build.txt
-          TEST_BIN=$(grep -oE 'target/debug/deps/raven-[a-f0-9]+' /tmp/cargo-test-build.txt | head -1)
-          echo "TEST_BIN=$TEST_BIN"
-          cp "$TEST_BIN" target/raven-test
+      - name: Build LSP binary (release)
+        run: cargo build --release -p raven
 
-      - name: Upload LSP binary
+      - name: Upload release binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: raven-debug
-          path: target/debug/raven
+          name: raven-release
+          path: target/release/raven
           retention-days: 1
 
-      - name: Upload test binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: raven-test
-          path: target/raven-test
-          retention-days: 1
-
-  # Run the Rust test suite using the pre-compiled binary from the build job.
+  # Run the Rust test suite in debug profile (fast compile, sufficient for
+  # correctness testing). Runs in parallel with the build job — no dependency.
   cargo:
     name: Cargo Tests
-    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Download test binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache sccache storage and cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          name: raven-test
-          path: target/
+          path: |
+            ~/.cache/sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-sccache-debug-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-sccache-debug-${{ runner.os }}-
 
+      - name: Install mold linker
+        run: sudo apt-get install -y --no-install-recommends mold
+
+      # `--features test-support` exposes `raven::test_utils`, which the
+      # `performance_budgets` integration test imports. Without the flag,
+      # the test binary fails to compile (E0433: cannot find `test_utils`).
+      # Debug profile (no --release) is sufficient for correctness testing
+      # and compiles significantly faster than release.
       - name: Run cargo tests
-        run: |
-          chmod +x target/raven-test
-          target/raven-test
+        run: cargo test -p raven --features test-support
 
-  # Run the VS Code Mocha integration suite using the pre-compiled LSP binary.
+  # Run the VS Code Mocha integration suite using the pre-compiled release
+  # binary from the build job. Avoids a second release compile on a separate
+  # runner.
   vscode-mocha:
     name: VS Code Mocha Suite
     needs: build
@@ -109,11 +111,11 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Download LSP binary
+      - name: Download release binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
         with:
-          name: raven-debug
-          path: target/debug/
+          name: raven-release
+          path: target/release/
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -195,9 +197,7 @@ jobs:
       - name: Bundle extension and place LSP binary
         working-directory: editors/vscode
         run: |
-          mkdir -p bin
-          cp "$GITHUB_WORKSPACE/target/debug/raven" bin/raven
-          chmod +x bin/raven
+          chmod +x "$GITHUB_WORKSPACE/target/release/raven"
           bun run vscode:prepublish
 
       - name: Compile tests
