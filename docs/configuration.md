@@ -188,7 +188,7 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.linting.enabled` | `"auto"` | Master switch (`"auto"` / `true` / `false`). See the [behavior matrix](linting.md#behavior-matrix). |
+| `raven.linting.enabled` | `"auto"` | Master switch (`"auto"` / `"on"` / `"off"` / `true` / `false`). See the [behavior matrix](linting.md#behavior-matrix). |
 | `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
 | `raven.linting.indentationUnit` | `2` | Spaces per indent level used by the indentation lint (clamped to `1..=8`) |

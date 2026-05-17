@@ -435,56 +435,15 @@ pub(crate) fn parse_cross_file_config(
     Ok(Some(config))
 }
 
-/// Parse linting configuration from LSP settings.
-///
-/// Reads the `linting` section and constructs a [`LintConfig`]. Returns
-/// `None` when the section is absent so callers can fall back to defaults
-/// without losing the "section never seen" signal.
-///
-/// Recognised keys:
-/// * `enabled` (bool) — master switch.
-/// * `lineLength` (number) — max line length; clamped to `[20, 10_000]`.
-/// * `objectLength` (number) — max identifier length; clamped to `[5, 1_000]`.
-/// * `indentationUnit` (number) — spaces per indent level for the
-///   indentation lint; clamped to `[1, 8]`.
-/// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
-/// * `stringDelimiter` (`"\""` or `"'"`) — preferred string delimiter.
-/// * `objectNameStyleFunction`, `objectNameStyleVariable`,
-///   `objectNameStyleArgument` (string, one of `"snake_case" | "camelCase" |
-///   "dotted.case" | "UPPER_CASE" | "lowercase" | "any"`) — naming scheme
-///   for each symbol kind. `"any"` disables that kind without disabling the
-///   rule entirely.
-/// * Per-rule severities (string, `"error" | "warning" | "information" |
-///   "hint" | "off"`):
-///   - `lineLengthSeverity`
-///   - `trailingWhitespaceSeverity`
-///   - `noTabSeverity`
-///   - `trailingBlankLinesSeverity`
-///   - `assignmentOperatorSeverity`
-///   - `objectNameSeverity`
-///   - `infixSpacesSeverity`
-///   - `commentedCodeSeverity`
-///   - `quotesSeverity`
-///   - `commasSeverity`
-///   - `tAndFSymbolSeverity`
-///   - `semicolonSeverity`
-///   - `equalsNaSeverity`
-///   - `objectLengthSeverity`
-///   - `vectorLogicSeverity`
-///   - `functionLeftParenthesesSeverity`
-///   - `spacesInsideSeverity`
-///   - `indentationSeverity`
-/// Variant of `parse_lint_config` that takes the `[linting]` section directly
-/// (not wrapped in a top-level object). Used by per-document override resolution
-/// where we've already extracted the section.
+/// Variant of [`parse_lint_config`] that takes the `[linting]` section
+/// directly (not wrapped in a top-level object). Used by per-document
+/// override resolution where the section has already been extracted; the
+/// override inherits `base_enabled` instead of re-resolving `Auto` from
+/// discovery state. See spec section 6.
 pub(crate) fn parse_lint_config_from_section(
     section: &serde_json::Value,
     base_enabled: bool,
 ) -> Option<crate::linting::LintConfig> {
-    // Wrap into the shape `parse_lint_config` expects and delegate. The
-    // override path inherits `base_enabled` for `Auto` resolution: an override
-    // that doesn't mention `enabled` (or sets it to `"auto"` / `null`) keeps
-    // the base's already-resolved value. See spec section 6.
     let wrapped = serde_json::json!({ "linting": section });
     parse_lint_config(&wrapped, base_enabled)
 }
@@ -524,6 +483,51 @@ fn parse_lint_enabled(raw: Option<&serde_json::Value>) -> crate::linting::LintEn
     }
 }
 
+/// Parse linting configuration from merged client + project settings.
+///
+/// Reads the `linting` section and constructs a [`LintConfig`]. The
+/// `enabled` field is tri-state (see [`crate::linting::LintEnabled`]):
+/// `Auto` (the default) resolves to `lintr_discovered`; `On` and `Off`
+/// always win. When `linting` is absent or non-object, returns
+/// `Some(LintConfig::default())` with `enabled = lintr_discovered` if a
+/// `.lintr` was the discovered project config (preserves the implicit
+/// opt-in for `.lintr` files with no recognised content) and `None`
+/// otherwise (so callers can fall back to defaults without losing the
+/// "section never seen" signal).
+///
+/// Recognised keys:
+/// * `enabled` (`"auto"` / `"on"` / `"off"` / `true` / `false`) — master switch.
+/// * `lineLength` (number) — max line length; clamped to `[20, 10_000]`.
+/// * `objectLength` (number) — max identifier length; clamped to `[5, 1_000]`.
+/// * `indentationUnit` (number) — spaces per indent level for the
+///   indentation lint; clamped to `[1, 8]`.
+/// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
+/// * `stringDelimiter` (`"\""` or `"'"`) — preferred string delimiter.
+/// * `objectNameStyleFunction`, `objectNameStyleVariable`,
+///   `objectNameStyleArgument` (string, one of `"snake_case" | "camelCase" |
+///   "dotted.case" | "UPPER_CASE" | "lowercase" | "any"`) — naming scheme
+///   for each symbol kind. `"any"` disables that kind without disabling the
+///   rule entirely.
+/// * Per-rule severities (string, `"error" | "warning" | "information" |
+///   "hint" | "off"`):
+///   - `lineLengthSeverity`
+///   - `trailingWhitespaceSeverity`
+///   - `noTabSeverity`
+///   - `trailingBlankLinesSeverity`
+///   - `assignmentOperatorSeverity`
+///   - `objectNameSeverity`
+///   - `infixSpacesSeverity`
+///   - `commentedCodeSeverity`
+///   - `quotesSeverity`
+///   - `commasSeverity`
+///   - `tAndFSymbolSeverity`
+///   - `semicolonSeverity`
+///   - `equalsNaSeverity`
+///   - `objectLengthSeverity`
+///   - `vectorLogicSeverity`
+///   - `functionLeftParenthesesSeverity`
+///   - `spacesInsideSeverity`
+///   - `indentationSeverity`
 pub(crate) fn parse_lint_config(
     settings: &serde_json::Value,
     lintr_discovered: bool,
