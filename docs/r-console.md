@@ -27,8 +27,8 @@ The selected program must be available on your PATH.
 
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
-| `Cmd+Enter` | `Ctrl+Enter` | Run line or selection |
-| `Shift+Cmd+Enter` | `Shift+Ctrl+Enter` | Source file |
+| `Cmd+Enter` | `Ctrl+Enter` | Run line or selection (every supported file type) |
+| `Shift+Cmd+Enter` | `Shift+Ctrl+Enter` | Source file (`.R`) or Knit (`.Rmd` when `raven.rmdKnit.enabled`) |
 
 > [!TIP]
 > You can also access these commands via the editor toolbar menu (`▶` button) or the command palette (`Cmd+Shift+P`).
@@ -61,17 +61,19 @@ Single-line wrapped expressions go straight to the terminal via direct paste; if
 
 ## Editor Toolbar
 
-A toolbar button (▶) appears in the editor title bar for R files, providing quick access to all send commands. The menu is organized into two sections:
+A toolbar button (▶) appears in the editor title bar for `.R`, `.Rmd`, and `.qmd` files, providing quick access to send commands relevant to the open file's type. The menu is organized into two sections:
 
 - **Main commands** — Send code to the managed R terminal. If no R terminal is open, one is created automatically.
 - **Terminal submenu** — Send code to whatever terminal is currently active in VS Code, regardless of type. This is useful for sending commands to R running inside `tmux`, a Docker container, or any other terminal session that isn't the extension's built-in R terminal.
+
+For `.R` files, the menu shows **Run Line or Selection**, **Run Upward Lines**, **Run Downward Lines**, **Source File**, and the **Terminal** submenu (which mirrors the same four entries against the active terminal). Chunk commands are reserved for chunk-based documents — `.R` files with `# %%` cells access **Run Current Chunk** etc. through the CodeLens or the command palette, not the toolbar. For `.Rmd` and `.qmd` files, the entries that auto-include prose or YAML — **Run Upward Lines**, **Run Downward Lines**, and **Source File** — are hidden, and the menu shows **Run Line or Selection**, the current-chunk pair (**Run Current Chunk**, **Run Current Chunk and Move**), the directional pair (**Run Above Chunks**, **Run Below Chunks**), the whole-document pair (**Run All Chunks**, plus **Knit** for `.Rmd` files when `raven.rmdKnit.enabled` is on), and the **Terminal** submenu. Inside the Terminal submenu the same chunk pairs mirror the main menu (sans Knit, since knitr always renders against the document on disk rather than the active terminal). The Source-File keyboard shortcut (`Shift+Cmd+Enter` / `Shift+Ctrl+Enter`) is repurposed on `.Rmd` files with Knit enabled to invoke **Knit** instead of `source()`. On `.qmd` or `.Rmd` with Knit disabled the chord is unbound — invoke **Run All Chunks** from the toolbar menu, the command palette, or your own keybinding.
 
 Code sent via the Terminal submenu follows the same send method as the main commands. By default, Raven pastes short blocks directly and writes longer blocks to a temporary file, executing them with `source()`. **Terminal: Source File** runs `source()` directly against the document's saved path on disk (saving first if the buffer has unsaved changes).
 
 > [!TIP]
 > **Remote sessions and long-running jobs** — If you're connected to a remote host via VS Code Remote Development and want an R session that survives disconnections (closing your laptop, losing internet, etc.), launch a terminal multiplexer like `tmux` and start R inside it. Then use the Terminal submenu to send code to that tmux-hosted R session. Because tmux keeps running on the remote host independently of your VS Code connection, you can disconnect and reconnect hours or days later with your session — and any long-running computation (MCMC sampling in Stan or JAGS, large simulations, etc.) — still intact.
 
-The Terminal submenu commands (`raven.terminal.runLineOrSelection`, `raven.terminal.runUpwardLines`, `raven.terminal.runDownwardLines`, `raven.terminal.sourceFile`) ship without default keybindings — assign your own in `keybindings.json` if you want keyboard access. A common convention is to mirror the main send shortcuts with `Option` (Mac) or `Alt` (Windows/Linux) in place of `Cmd`/`Ctrl`, e.g. binding `alt+enter` (or `option+enter`) to `raven.terminal.runLineOrSelection`.
+The Terminal submenu commands — `raven.terminal.runLineOrSelection`, `raven.terminal.runUpwardLines`, `raven.terminal.runDownwardLines`, `raven.terminal.sourceFile`, plus the chunk-mode counterparts `raven.terminal.runCurrentChunk`, `raven.terminal.runCurrentChunkAndMove`, `raven.terminal.runAboveChunks`, `raven.terminal.runBelowChunks`, and `raven.terminal.runAllChunks` — ship without default keybindings. Assign your own in `keybindings.json` if you want keyboard access. A common convention is to mirror the main send shortcuts with `Option` (Mac) or `Alt` (Windows/Linux) in place of `Cmd`/`Ctrl`, e.g. binding `alt+enter` (or `option+enter`) to `raven.terminal.runLineOrSelection`.
 
 ## Statement Detection
 

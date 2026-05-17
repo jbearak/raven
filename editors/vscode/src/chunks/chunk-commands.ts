@@ -54,10 +54,35 @@ function combined_code(lines: string[], chunks: Chunk[]): string {
     return parts.join('\n');
 }
 
-async function send_to_r(code: string): Promise<void> {
+/**
+ * Target terminal for a chunk run. `managed` reuses Raven's built-in R
+ * terminal (creating it if necessary); `active` sends to whatever terminal
+ * the user has focused right now, exactly like the `raven.terminal.*` Send
+ * to R commands. The split lets the Terminal submenu offer the same chunk
+ * operations as the main menu without forcing them through the managed
+ * terminal — useful for `tmux`-hosted R, Docker containers, etc.
+ */
+type TerminalTarget = 'managed' | 'active';
+
+async function resolve_target_terminal(
+    target: TerminalTarget,
+): Promise<vscode.Terminal | null> {
+    if (target === 'managed') {
+        return get_or_create_r_terminal();
+    }
+    const active = vscode.window.activeTerminal;
+    if (!active) {
+        vscode.window.showErrorMessage('No active terminal. Open a terminal first.');
+        return null;
+    }
+    return active;
+}
+
+async function send_to_r(code: string, target: TerminalTarget): Promise<void> {
     if (code.trim().length === 0) return;
     try {
-        const terminal = await get_or_create_r_terminal();
+        const terminal = await resolve_target_terminal(target);
+        if (!terminal) return;
         terminal.show(true);
         send_code(terminal, code, get_send_options());
     } catch (err) {
@@ -110,7 +135,17 @@ async function run_chunk_at(
     mode: RunMode,
     document: vscode.TextDocument,
     cursor_line: number,
+    target: TerminalTarget = 'managed',
 ): Promise<void> {
+    // Active-terminal path: bail upfront if there is no terminal to send
+    // into. Otherwise the `…AndMove` variants would still advance the
+    // cursor after `send_to_r` short-circuited on the "no active terminal"
+    // error, leaving the user with a moved cursor and nothing sent.
+    if (target === 'active' && !vscode.window.activeTerminal) {
+        vscode.window.showErrorMessage('No active terminal. Open a terminal first.');
+        return;
+    }
+
     const editor = find_visible_editor(document.uri);
     const lines = get_document_lines(document);
     const chunks = chunks_for_document(document);
@@ -125,7 +160,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: no runnable R chunks to execute.');
             return;
         }
-        await send_to_r(code);
+        await send_to_r(code, target);
         return;
     }
 
@@ -136,7 +171,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: no runnable chunks above the cursor.');
             return;
         }
-        await send_to_r(code);
+        await send_to_r(code, target);
         return;
     }
 
@@ -147,7 +182,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: no runnable chunks below the cursor.');
             return;
         }
-        await send_to_r(code);
+        await send_to_r(code, target);
         return;
     }
 
@@ -163,7 +198,7 @@ async function run_chunk_at(
             if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
             return;
         }
-        await send_to_r(code);
+        await send_to_r(code, target);
         if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
         return;
     }
@@ -180,7 +215,7 @@ async function run_chunk_at(
             if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
             return;
         }
-        await send_to_r(code);
+        await send_to_r(code, target);
         if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
         return;
     }
@@ -206,7 +241,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: current chunk and chunks below are empty.');
             return;
         }
-        await send_to_r(code);
+        await send_to_r(code, target);
         return;
     }
 
@@ -216,14 +251,14 @@ async function run_chunk_at(
         if (mode === 'currentAndMove' && editor) move_cursor_to_next_chunk(editor, chunks, current);
         return;
     }
-    await send_to_r(code);
+    await send_to_r(code, target);
     if (mode === 'currentAndMove' && editor) move_cursor_to_next_chunk(editor, chunks, current);
 }
 
-async function run_chunk(mode: RunMode): Promise<void> {
+async function run_chunk(mode: RunMode, target: TerminalTarget = 'managed'): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
-    await run_chunk_at(mode, editor.document, editor.selection.active.line);
+    await run_chunk_at(mode, editor.document, editor.selection.active.line, target);
 }
 
 async function run_chunk_at_command(
@@ -361,7 +396,23 @@ export function register_chunk_commands(context: vscode.ExtensionContext): void 
     ];
     for (const [id, mode] of handlers) {
         context.subscriptions.push(
-            vscode.commands.registerCommand(id, () => run_chunk(mode))
+            vscode.commands.registerCommand(id, () => run_chunk(mode, 'managed'))
+        );
+    }
+
+    // Terminal-mode counterparts: send the same chunk payload to the
+    // active terminal instead of the managed R terminal, mirroring the
+    // raven.terminal.runLineOrSelection / runUpwardLines / … family.
+    const terminal_handlers: Array<[string, RunMode]> = [
+        ['raven.terminal.runCurrentChunk', 'current'],
+        ['raven.terminal.runCurrentChunkAndMove', 'currentAndMove'],
+        ['raven.terminal.runAboveChunks', 'above'],
+        ['raven.terminal.runAllChunks', 'all'],
+        ['raven.terminal.runBelowChunks', 'below'],
+    ];
+    for (const [id, mode] of terminal_handlers) {
+        context.subscriptions.push(
+            vscode.commands.registerCommand(id, () => run_chunk(mode, 'active'))
         );
     }
 
