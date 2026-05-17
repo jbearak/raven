@@ -296,7 +296,7 @@ The existing `disposeForTesting()` / `getInstanceForTesting()` are renamed (`dis
 
 - `docs/knit.md`, step 10 ("Reveal") — change "the **Knit Output** webview panel" to "a **Knit Output** webview panel for that `.Rmd`," and add one sentence: "Multiple `.Rmd` files can have panels open at once; new panels stack as tabs alongside any existing knit panels."
 - `docs/knit.md` non-goals — remove any wording implying the panel is a singleton.
-- `docs/development.md` — **supersedes** the singleton-panel pattern note that the prior 2026-05-17 spec added (so the two specs do not leave the development docs describing two contradictory architectures). New text: `KnitOutputPanel` keeps a per-`sourceUri` registry and tracks a "preview column" for new panels. Cross-link from `help-panel.ts`'s doc comment (which remains singleton — distinct domain, only one R-help context per session).
+- `docs/development.md` — **supersedes** the singleton-panel pattern note that the prior 2026-05-17 spec added (so the two specs do not leave the development docs describing two contradictory architectures). New text: `KnitOutputPanel` keeps a registry of panels keyed by `sourceUri.fsPath` (aligned with the in-flight gate in `knit-commands.ts`) and tracks a "preview column" for new panels. Cross-link from `help-panel.ts`'s doc comment (which remains singleton — distinct domain, only one R-help context per session).
 - `docs/superpowers/specs/2026-05-17-knit-output-webview-design.md` — link this spec in the header as a successor for the singleton paragraphs.
 
 ## Open questions
