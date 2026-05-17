@@ -1,6 +1,8 @@
-# Tests can see R/ symbols (one-way visibility)
+# Tests can see R/ symbols (one-way visibility), testthat exports (because
+# `Suggests: testthat` plus the tests/testthat.R runner), and helper-*.R
+# top-level defs (here, demo_fixture_input from helper-fixtures.R).
 test_that("run_analysis works", {
-  result <- run_analysis(c(1, 2, 3))
+  result <- run_analysis(demo_fixture_input)
   expect_equal(result, 2)
 })
 

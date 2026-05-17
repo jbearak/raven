@@ -300,6 +300,14 @@ pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>>
     Ok(parse_description_field(&content, "Depends"))
 }
 
+/// Public wrapper around `parse_description_field` for use from other modules
+/// that need to inspect dependency lists (e.g., the package-mode derivation
+/// querying `Suggests:` / `Imports:` / `Depends:` for implicit attachment in
+/// `tests/testthat/`). Strips version constraints and the special `R` entry.
+pub fn parse_description_field_pub(content: &str, field_name: &str) -> Vec<String> {
+    parse_description_field(content, field_name)
+}
+
 /// Extracts the value of a named field from DESCRIPTION (DCF) content and parses it into package names.
 ///
 /// The function locates `field_name:` at the start of a line, accumulates its value including continuation

@@ -78,6 +78,11 @@ When making significant changes:
   - `config_file::recompute_parsed_configs(state)` is the only function that should write to `state.lint_config` / `cross_file_config` / etc. after a settings change.
   - Callers (`initialize`, `did_change_configuration`, `did_change_watched_files`) must mutate the raw layers and then call `recompute_parsed_configs`, never the parsers directly.
 
+- **Package-mode scope contribution**
+  - `PackageScopeContribution`'s `r_internal_symbols`, `imported_symbols`, `test_helper_symbols`, and `test_attached_packages` are injected into the queried file's scope by `append_package_contribution` (recursive path, depth 0) and `ScopeStream::snapshot()` (streaming path). Both gate on `is_r_source_path(uri, root)`: files under `R/` see `r_internal_symbols` + `imported_symbols`; files under `tests/testthat/` see those PLUS `test_helper_symbols` (per-helper-path keyed so a helper does not self-inject) PLUS `test_attached_packages` (added to `scope.inherited_packages`, modelling `testthat::test_check`'s implicit `library(testthat)`). Files outside `R/` / `tests/testthat/` get NO contribution.
+  - `ScopeStream::is_visible` and `symbol_for` must consult the pre-computed `contribution_symbol_names` after frame/prefix checks, otherwise out-of-scope diagnostics misattribute contribution-provided names to forward `source()` calls.
+  - Test-only contributions (`test_helper_symbols`, `test_attached_packages`) MUST stay invisible to `R/` files. Mirror the gate by branching on `RFileKind::Test` inside the injection helpers, not by re-deriving the test-dir check from the path.
+
 ## Quick commands
 
 - Debug build: `cargo build -p raven`

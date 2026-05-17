@@ -691,5 +691,442 @@ mod package_testthat_visibility_tests {
             symbols.keys().collect::<Vec<_>>()
         );
     }
+
+    // ------------------------------------------------------------------
+    // Test C: helper-*.R defs visible to peer test files (issue #275)
+    // ------------------------------------------------------------------
+
+    /// End-to-end: a top-level def in `tests/testthat/helper-fixtures.R`
+    /// is visible when resolving scope inside `tests/testthat/test-foo.R`.
+    #[test]
+    fn helper_top_level_def_visible_in_peer_test_file_end_to_end() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/tests/testthat/helper-fixtures.R", root)),
+                    RFileKind::Test,
+                    "fixture <- function() 1\n",
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/test-foo.R", root)),
+                    RFileKind::Test,
+                    "result <- fixture()\n",
+                ),
+            ],
+        );
+
+        // Helper symbol must be carried in `test_helper_symbols`.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .test_helper_symbols
+                .values()
+                .any(|syms| syms.contains("fixture")),
+            "fixture must appear in test_helper_symbols, got: {:?}",
+            state.package_state.scope_contribution().test_helper_symbols,
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-foo.R").unwrap();
+        let test_arts = make_artifacts(&test_uri, "result <- fixture()\n");
+
+        let symbols = resolve_symbols(
+            &test_uri,
+            test_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+
+        assert!(
+            symbols.contains_key("fixture"),
+            "helper top-level def must be visible in peer tests/testthat/ test file. \
+             visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test D: helper-*.R defs NOT visible in R/ files (asymmetry holds)
+    // ------------------------------------------------------------------
+
+    /// End-to-end: a top-level def in `tests/testthat/helper-fixtures.R` is
+    /// NOT visible when resolving scope inside `R/main.R` — preserves the
+    /// existing one-way visibility (tests/testthat/ → R/, never the reverse).
+    #[test]
+    fn helper_top_level_def_not_visible_in_r_dir_end_to_end() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/R/main.R", root)),
+                    RFileKind::Source,
+                    "result <- fixture()\n",
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/helper-fixtures.R", root)),
+                    RFileKind::Test,
+                    "fixture <- function() 1\n",
+                ),
+            ],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_arts = make_artifacts(&main_uri, "result <- fixture()\n");
+
+        let symbols = resolve_symbols(
+            &main_uri,
+            main_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+
+        assert!(
+            !symbols.contains_key("fixture"),
+            "helper top-level def must NOT be visible in R/main.R. \
+             visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test E: testthat implicit attachment under tests/testthat/ (issue #275)
+    // ------------------------------------------------------------------
+
+    /// End-to-end: when `testthat` is declared in `DESCRIPTION` (Suggests:),
+    /// scope resolution for a file under `tests/testthat/` lists `testthat`
+    /// in `inherited_packages` — modelling the implicit `library(testthat)`
+    /// that `tests/testthat.R` does before sourcing test files.
+    #[test]
+    fn testthat_attached_to_test_file_scope_when_in_suggests() {
+        use crate::package_state::{DescriptionInput, PackageInputDelta};
+
+        let root = "/work/pkg";
+        let mut state = WorldState::new(vec![]);
+        state.package_inputs.workspace_root = Some(PathBuf::from(root));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: foo\nSuggests: testthat\n".into(),
+        });
+        let test_path = PathBuf::from(format!("{}/tests/testthat/test-foo.R", root));
+        let test_text: Arc<str> = "expect_equal(1, 1)\n".into();
+        state.package_inputs.r_files.insert(
+            test_path,
+            crate::package_state::RFileInput {
+                kind: RFileKind::Test,
+                text: test_text.clone(),
+                content_digest: crate::package_state::ContentDigest::of(&test_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // The derived contribution must list testthat as an attached package.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .test_attached_packages
+                .contains("testthat"),
+            "testthat must appear in test_attached_packages, got: {:?}",
+            state.package_state.scope_contribution().test_attached_packages,
+        );
+
+        // Resolved scope under tests/testthat/ must carry testthat in inherited_packages.
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-foo.R").unwrap();
+        let test_arts = make_artifacts(&test_uri, &test_text);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &test_uri { Some(test_arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+        let graph = DependencyGraph::new();
+
+        let scope = scope_at_position_with_graph(
+            &test_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            TEST_MAX_CHAIN_DEPTH,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(state.package_state.scope_contribution()),
+        );
+
+        assert!(
+            scope.inherited_packages.contains("testthat"),
+            "testthat must be in inherited_packages for a file under tests/testthat/. \
+             got: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    /// End-to-end: testthat must NOT be attached to scope for a file under R/
+    /// even if declared in DESCRIPTION — package mode keeps R/ free of
+    /// test-only attachments so legitimate undefined-variable diagnostics fire.
+    #[test]
+    #[allow(non_snake_case)]
+    fn testthat_not_attached_to_R_file_scope() {
+        use crate::package_state::{DescriptionInput, PackageInputDelta};
+
+        let root = "/work/pkg";
+        let mut state = WorldState::new(vec![]);
+        state.package_inputs.workspace_root = Some(PathBuf::from(root));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: foo\nSuggests: testthat\n".into(),
+        });
+        let r_path = PathBuf::from(format!("{}/R/main.R", root));
+        let r_text: Arc<str> = "f <- function() 1\n".into();
+        state.package_inputs.r_files.insert(
+            r_path,
+            crate::package_state::RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: crate::package_state::ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_arts = make_artifacts(&main_uri, &r_text);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri { Some(main_arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+        let graph = DependencyGraph::new();
+
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            TEST_MAX_CHAIN_DEPTH,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(state.package_state.scope_contribution()),
+        );
+
+        assert!(
+            !scope.inherited_packages.contains("testthat"),
+            "testthat must NOT leak into inherited_packages for files under R/. \
+             got: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test F: a helper file does NOT see its own top-level defs via the
+    //         contribution (Codex review, issue 1)
+    // ------------------------------------------------------------------
+
+    /// End-to-end regression: a helper file must NOT see its OWN later
+    /// top-level def via the package contribution. With per-helper-path
+    /// keying in `test_helper_symbols`, the scope-injection layer skips
+    /// the queried helper's own entry — so a `use_x()` call earlier than
+    /// the `x <- ...` definition in the same helper still triggers the
+    /// forward-reference / undefined-variable diagnostic. Peer helpers
+    /// and `test-*.R` siblings continue to see all helper defs because
+    /// they have a different path.
+    ///
+    /// Layout:
+    ///   helper-a.R line 0: (empty: query position)
+    ///   helper-a.R line 1: `fixture_a <- function() 1`
+    ///   helper-b.R line 0: `fixture_b <- function() 2`
+    ///
+    /// Querying helper-a at line 0 col 0 should see `fixture_b` (peer helper),
+    /// NOT `fixture_a` (self-contribution skipped).
+    #[test]
+    fn helper_file_does_not_see_own_top_level_defs_via_contribution() {
+        let root = "/work/pkg";
+        let helper_a_text = "\nfixture_a <- function() 1\n";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/tests/testthat/helper-a.R", root)),
+                    RFileKind::Test,
+                    helper_a_text,
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/helper-b.R", root)),
+                    RFileKind::Test,
+                    "fixture_b <- function() 2\n",
+                ),
+            ],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let helper_a_uri =
+            Url::parse("file:///work/pkg/tests/testthat/helper-a.R").unwrap();
+        let helper_a_arts = make_artifacts(&helper_a_uri, helper_a_text);
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &helper_a_uri {
+                Some(helper_a_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<Arc<crate::cross_file::types::CrossFileMetadata>> {
+                None
+            };
+        let graph = DependencyGraph::new();
+
+        // Query at line 0 col 0 — strictly before the local Def at line 1.
+        let scope = scope_at_position_with_graph(
+            &helper_a_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            TEST_MAX_CHAIN_DEPTH,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(state.package_state.scope_contribution()),
+        );
+
+        assert!(
+            !scope.symbols.contains_key("fixture_a"),
+            "helper-a.R must NOT see its own `fixture_a` via the package contribution \
+             at line 0 (before the local Def at line 1). symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>(),
+        );
+        // helper-a.R is alphabetically before helper-b.R, so helper-a does
+        // NOT see helper-b's defs (testthat sources helpers via
+        // `sort()`-then-source, so helper-b runs strictly later).
+        assert!(
+            !scope.symbols.contains_key("fixture_b"),
+            "helper-a.R must NOT see alphabetically-later helper-b.R's `fixture_b`. \
+             symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test G: helper sourcing order — helper-b sees helper-a (earlier),
+    //         test-foo sees both (all helpers sourced first).
+    //         Codex follow-up review, issue 1.
+    // ------------------------------------------------------------------
+
+    /// `testthat::source_test_helpers` sources `^helper.*\\.[rR]$` files in
+    /// `sort()` order, so a later helper sees earlier ones but not vice
+    /// versa. Non-helper test files run after all helpers have been
+    /// sourced, so they see all helpers.
+    #[test]
+    fn helper_sourcing_order_matches_testthat_sort_semantics() {
+        let root = "/work/pkg";
+        let helper_a_text = "fixture_a <- function() 1\n";
+        let helper_b_text = "\nfixture_b <- function() 2\n";
+        let state = build_state_with_files(
+            root,
+            vec![
+                (
+                    PathBuf::from(format!("{}/tests/testthat/helper-a.R", root)),
+                    RFileKind::Test,
+                    helper_a_text,
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/helper-b.R", root)),
+                    RFileKind::Test,
+                    helper_b_text,
+                ),
+                (
+                    PathBuf::from(format!("{}/tests/testthat/test-foo.R", root)),
+                    RFileKind::Test,
+                    "result <- fixture_a() + fixture_b()\n",
+                ),
+            ],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+
+        // helper-b.R MUST see fixture_a (helper-a sorts before helper-b).
+        // Query at line 0 col 0 so the local Def for fixture_b (line 1) is
+        // NOT yet applied — that isolates the contribution path.
+        let helper_b_uri = Url::parse("file:///work/pkg/tests/testthat/helper-b.R").unwrap();
+        let helper_b_arts = make_artifacts(&helper_b_uri, helper_b_text);
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &helper_b_uri {
+                Some(helper_b_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<Arc<crate::cross_file::types::CrossFileMetadata>> { None };
+        let graph = DependencyGraph::new();
+        let scope_b = scope_at_position_with_graph(
+            &helper_b_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            TEST_MAX_CHAIN_DEPTH,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(state.package_state.scope_contribution()),
+        );
+        let symbols_b = scope_b.symbols;
+        assert!(
+            symbols_b.contains_key("fixture_a"),
+            "helper-b.R must see fixture_a from alphabetically-earlier helper-a.R. \
+             symbols: {:?}",
+            symbols_b.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            !symbols_b.contains_key("fixture_b"),
+            "helper-b.R must NOT see its own fixture_b at (0,0), before the local def \
+             at line 1. symbols: {:?}",
+            symbols_b.keys().collect::<Vec<_>>(),
+        );
+
+        // test-foo.R MUST see both fixture_a and fixture_b (all helpers
+        // sourced before any test file runs).
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-foo.R").unwrap();
+        let test_arts = make_artifacts(&test_uri, "result <- fixture_a() + fixture_b()\n");
+        let symbols_test = resolve_symbols(
+            &test_uri,
+            test_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+        assert!(
+            symbols_test.contains_key("fixture_a"),
+            "test-foo.R must see fixture_a from helper-a.R. symbols: {:?}",
+            symbols_test.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            symbols_test.contains_key("fixture_b"),
+            "test-foo.R must see fixture_b from helper-b.R. symbols: {:?}",
+            symbols_test.keys().collect::<Vec<_>>(),
+        );
+    }
 }
 
