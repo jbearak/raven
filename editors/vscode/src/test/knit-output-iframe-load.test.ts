@@ -41,7 +41,7 @@ suite('KnitOutputPanel iframe loads rendered HTML', () => {
     });
 
     test('rendered HTML content is inlined into the webview shell', async function () {
-        this.timeout(20000);
+        this.timeout(30000);
         await activate();
 
         const marker = 'RAVEN-IFRAME-TEST-MARKER';
@@ -103,7 +103,15 @@ suite('KnitOutputPanel iframe loads rendered HTML', () => {
                 'raw fragment-only href should not survive into the srcdoc',
             );
 
-            const probeResult = await probeIframe(panel.webview, 10000);
+            // Force the panel to the front of its tab group before
+            // probing — when this test runs after the per-source-
+            // panel suites (knit-multi-panel, knit-rootdir-change,
+            // etc.) have already churned several webviews, the new
+            // panel can be created hidden, and VS Code throttles
+            // message delivery to hidden webviews.
+            panel.reveal(panel.viewColumn ?? vscode.ViewColumn.Beside, false);
+            // 25s probe budget within the 30s mocha timeout.
+            const probeResult = await probeIframe(panel.webview, 25000);
             assert.ok(
                 probeResult.loadFired,
                 `iframe never fired a 'load' event. Diagnostics: ${JSON.stringify(probeResult)}`,

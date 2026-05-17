@@ -10,6 +10,19 @@ describe('isKnitOutputMessage', () => {
         expect(isKnitOutputMessage({ type: 'openInBrowser' })).toBe(true);
     });
 
+    // Keyboard shortcuts that the iframe captures (Cmd+J to toggle
+    // the panel, Cmd+= / Cmd+- to zoom, etc.) are re-dispatched on
+    // the outer shell document as synthetic KeyboardEvents — VS
+    // Code's keybinding handler matches them the same way as native
+    // editor keystrokes. No extension-side message is needed; the
+    // round-trip is entirely inside the webview. See
+    // knit-output-shell.test.ts for the structural assertions.
+
+    // Image copy is handled in-iframe via the async Clipboard API
+    // (ClipboardItem with image/* MIME) — no extension-side message
+    // round-trip is needed. The Copy image button lives in the
+    // existing context menu (asserted in knit-output-shell.test.ts).
+
     test('rejects unknown type', () => {
         expect(isKnitOutputMessage({ type: 'evil' })).toBe(false);
     });

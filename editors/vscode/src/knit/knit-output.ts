@@ -285,6 +285,7 @@ export function buildShellHtml(args: {
           title="Rendered output: ${safeName}"></iframe>
   <div id="raven-knit-context-menu" role="menu" hidden>
     <button type="button" role="menuitem" data-action="copy">Copy</button>
+    <button type="button" role="menuitem" data-action="copy-image">Copy image</button>
     <button type="button" role="menuitem" data-action="select-all">Select All</button>
     <button type="button" role="menuitem" data-action="open-in-browser">Open in Browser</button>
   </div>
@@ -401,6 +402,11 @@ export function buildShellHtml(args: {
       // the selection.
       const ctxMenu = document.getElementById('raven-knit-context-menu');
       const ctxCopyBtn = ctxMenu.querySelector('[data-action="copy"]');
+      const ctxCopyImageBtn = ctxMenu.querySelector('[data-action="copy-image"]');
+      // Source URL of the <img> the user right-clicked, captured at
+      // contextmenu time. Cleared when the menu hides so a stale src
+      // can't leak into a follow-up Copy from a text selection.
+      let pendingImageSrc = null;
 
       function copyIframeSelection() {
         const win = iframe.contentWindow;
@@ -443,15 +449,50 @@ export function buildShellHtml(args: {
         }
       }
 
-      function hideContextMenu() {
-        ctxMenu.hidden = true;
+      // Copy the image at pendingImageSrc onto the system clipboard.
+      // Uses the async Clipboard API's ClipboardItem flavor so that
+      // the OS clipboard receives a real image bitmap (paste into
+      // Slack / Preview / Photoshop yields the image, not the URL).
+      // We fetch the URL — it resolves through the webview's
+      // localResourceRoots since rendered figures live in the
+      // panel's rootDir.
+      function copyImageFromIframe() {
+        const src = pendingImageSrc;
+        if (!src) return;
+        // navigator.clipboard.write is gated behind a user gesture;
+        // the contextmenu click satisfies that. ClipboardItem itself
+        // is widely supported in Electron-based webviews.
+        const w = window;
+        if (!w.ClipboardItem || !navigator.clipboard || !navigator.clipboard.write) {
+          return;
+        }
+        fetch(src)
+          .then(function (r) { return r.blob(); })
+          .then(function (blob) {
+            const type = blob.type || 'image/png';
+            const item = new w.ClipboardItem({ [type]: blob });
+            return navigator.clipboard.write([item]);
+          })
+          .catch(function () { /* swallow — best-effort */ });
       }
 
-      function showContextMenu(clientX, clientY, hasSelection) {
+      function hideContextMenu() {
+        ctxMenu.hidden = true;
+        pendingImageSrc = null;
+      }
+
+      function showContextMenu(clientX, clientY, hasSelection, imageSrc) {
         if (hasSelection) {
           ctxCopyBtn.removeAttribute('disabled');
         } else {
           ctxCopyBtn.setAttribute('disabled', 'true');
+        }
+        if (imageSrc) {
+          ctxCopyImageBtn.removeAttribute('disabled');
+          pendingImageSrc = imageSrc;
+        } else {
+          ctxCopyImageBtn.setAttribute('disabled', 'true');
+          pendingImageSrc = null;
         }
         // Render off-screen first to measure, then clamp into the
         // viewport so the menu never spills past the right/bottom
@@ -476,6 +517,7 @@ export function buildShellHtml(args: {
         if (!btn || btn.hasAttribute('disabled')) return;
         const action = btn.getAttribute('data-action');
         if (action === 'copy') copyIframeSelection();
+        else if (action === 'copy-image') copyImageFromIframe();
         else if (action === 'select-all') selectAllInIframe();
         else if (action === 'open-in-browser') vscode.postMessage({ type: 'openInBrowser' });
         hideContextMenu();
@@ -496,18 +538,47 @@ export function buildShellHtml(args: {
         const doc = iframe.contentDocument;
         if (!win || !doc) return;
         // Cmd/Ctrl-C and Cmd/Ctrl-A while the iframe has focus.
+        // For every other shortcut we synthesize the keydown event
+        // on the outer shell document so VS Code's keybinding
+        // handler sees it. The iframe is sandboxed and keystrokes
+        // that fire inside it don't reach VS Code's chrome
+        // otherwise; the same-origin sandbox lets us reach across
+        // the document boundary to re-dispatch.
         win.addEventListener('keydown', function (e) {
           const mod = e.metaKey || e.ctrlKey;
-          if (!mod) return;
           const k = (e.key || '').toLowerCase();
-          if (k === 'c') {
+          if (mod && k === 'c') {
             if (copyIframeSelection()) e.preventDefault();
             return;
           }
-          if (k === 'a') {
+          if (mod && k === 'a') {
             selectAllInIframe();
             e.preventDefault();
+            return;
           }
+          // Re-dispatch on the outer shell document. We clone the
+          // relevant fields so VS Code's keybinding matcher receives
+          // an equivalent event. The synthetic event has
+          // isTrusted=false, but VS Code's webview keybinding
+          // handler matches on key fields rather than the trust
+          // flag, so this is enough to make Cmd+J / Cmd+= / Cmd+- /
+          // Cmd+B / Cmd+P / Cmd+S / etc. behave the same way as
+          // when the focus is in a regular editor.
+          const cloned = new KeyboardEvent('keydown', {
+            key: e.key,
+            code: e.code,
+            keyCode: e.keyCode,
+            which: e.which,
+            ctrlKey: e.ctrlKey,
+            metaKey: e.metaKey,
+            shiftKey: e.shiftKey,
+            altKey: e.altKey,
+            repeat: e.repeat,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+          });
+          document.dispatchEvent(cloned);
         });
         // Right-click → custom menu in the outer shell. Use mousedown
         // for the dismiss handler ordering; contextmenu still fires
@@ -519,7 +590,12 @@ export function buildShellHtml(args: {
           const y = e.clientY + rect.top;
           const sel = win.getSelection();
           const hasSel = !!(sel && sel.toString().length > 0);
-          showContextMenu(x, y, hasSel);
+          // If the user right-clicked on an <img>, capture its src
+          // so the Copy image action knows what to fetch.
+          let imageSrc = null;
+          const tgt = e.target;
+          if (tgt && tgt.tagName === 'IMG' && tgt.src) imageSrc = tgt.src;
+          showContextMenu(x, y, hasSel, imageSrc);
         });
         // A new click inside the iframe should dismiss the menu so
         // it does not linger after the user moves on.

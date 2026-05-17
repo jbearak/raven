@@ -114,6 +114,28 @@ suite('KnitOutputPanel multi-panel registry', () => {
                 panelB,
                 'B\'s panel is untouched by re-knit of A',
             );
+
+            // User closes A's panel directly (not via the testing
+            // helper). The instance's `onDidDispose` handler must
+            // run and remove A from the registry without touching B.
+            panelA.dispose();
+            // onDidDispose is synchronous, but allow a tick for any
+            // listener queue to drain.
+            await sleep(50);
+            const instances3 = KnitOutputPanel.getInstancesForTesting();
+            assert.strictEqual(
+                instances3.size, 1,
+                'user-closed panel A is removed from the registry',
+            );
+            assert.strictEqual(
+                instances3.get(srcA.fsPath), undefined,
+                'A\'s entry is gone after panelA.dispose()',
+            );
+            assert.strictEqual(
+                instances3.get(srcB.fsPath)?.getPanelForTesting(),
+                panelB,
+                'B\'s panel is untouched by A\'s dispose',
+            );
         } finally {
             output.dispose();
         }

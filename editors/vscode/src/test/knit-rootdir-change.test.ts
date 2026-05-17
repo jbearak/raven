@@ -3,8 +3,20 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { activate } from './helper';
+import { activate, sleep } from './helper';
 import { KnitOutputPanel } from '../knit/knit-output-panel';
+
+async function waitForPanelColumn(
+    panel: vscode.WebviewPanel,
+    timeoutMs = 2000,
+): Promise<vscode.ViewColumn> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (panel.viewColumn !== undefined) return panel.viewColumn;
+        await sleep(50);
+    }
+    throw new Error(`panel.viewColumn never resolved within ${timeoutMs}ms`);
+}
 
 /**
  * Highest-risk lifecycle branch: same source URI, different `rootDir`.
@@ -48,7 +60,7 @@ suite('KnitOutputPanel rootDir change recreates panel in place', () => {
             const inst1 = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst1);
             const panel1 = inst1.getPanelForTesting();
-            const col1 = panel1.viewColumn;
+            const col1 = await waitForPanelColumn(panel1);
             const rootsBefore = panel1.webview.options.localResourceRoots!;
             assert.strictEqual(rootsBefore[0].fsPath, dir1);
 
@@ -69,8 +81,9 @@ suite('KnitOutputPanel rootDir change recreates panel in place', () => {
                 panel2, panel1,
                 'a new WebviewPanel was created (old was disposed)',
             );
+            const col2 = await waitForPanelColumn(panel2);
             assert.strictEqual(
-                panel2.viewColumn, col1,
+                col2, col1,
                 'replacement panel lands in the same column as the disposed one',
             );
 

@@ -178,6 +178,59 @@ describe('buildShellHtml', () => {
         expect(html).toContain('role="menuitem" data-action="open-in-browser"');
     });
 
+    test('script re-dispatches unhandled keystrokes on the outer document', () => {
+        // VS Code-level shortcuts (Cmd+J, Cmd+=, Cmd+-, Cmd+\, etc.)
+        // are eaten by the iframe when it has keyboard focus because
+        // VS Code's chrome never sees keystrokes that fire inside a
+        // nested iframe. The webview re-dispatches a synthetic
+        // KeyboardEvent on the outer shell document so VS Code's
+        // keybinding handler matches it just like a native keystroke.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toMatch(/new KeyboardEvent\(\s*['"]keydown['"]/);
+        expect(html).toMatch(/document\.dispatchEvent\(/);
+        // The relevant modifier and identity fields must be cloned
+        // so VS Code's keybinding matcher sees an equivalent event.
+        expect(html).toContain('key: e.key');
+        expect(html).toContain('metaKey: e.metaKey');
+        expect(html).toContain('ctrlKey: e.ctrlKey');
+        expect(html).toContain('shiftKey: e.shiftKey');
+        expect(html).toContain('altKey: e.altKey');
+    });
+
+    test('re-dispatch does not eat the C and A handlers', () => {
+        // C / A are still handled in-iframe (copy / select all of the
+        // iframe selection). They must not also be re-dispatched.
+        const html = buildShellHtml(args('/work/report.html'));
+        const dispatchIdx = html.indexOf('document.dispatchEvent(');
+        const handleCIdx = html.indexOf("k === 'c'");
+        const handleAIdx = html.indexOf("k === 'a'");
+        expect(handleCIdx).toBeGreaterThan(0);
+        expect(handleAIdx).toBeGreaterThan(0);
+        expect(dispatchIdx).toBeGreaterThan(handleCIdx);
+        expect(dispatchIdx).toBeGreaterThan(handleAIdx);
+    });
+
+    test('context menu exposes a Copy image action', () => {
+        // Right-clicking an <img> in the rendered output offers a
+        // Copy image action in addition to the text-selection Copy /
+        // Select All / Open in Browser items.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('data-action="copy-image"');
+        expect(html).toContain('>Copy image<');
+    });
+
+    test('contextmenu listener detects image targets', () => {
+        // The handler must read e.target and check whether the
+        // right-clicked element is an HTMLImageElement so the
+        // Copy image button can be enabled / disabled and so the
+        // image src is captured for the copy action.
+        const html = buildShellHtml(args('/work/report.html'));
+        // The webview script must reach for the image src via the
+        // target element; a regex check on the source pattern is the
+        // structural guarantee.
+        expect(html).toMatch(/tagName[\s\S]*?===[\s\S]*?['"]IMG['"]/i);
+    });
+
     test('script wires Cmd/Ctrl-C and Cmd/Ctrl-A on the iframe', () => {
         // VS Code does not forward Cmd-C / Cmd-A from a nested
         // iframe to the host clipboard command, so we attach our

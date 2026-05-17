@@ -46,6 +46,17 @@ export class KnitOutputPanel {
     private sourceUri: vscode.Uri;
     private outputPath: string;
     private readonly output: vscode.OutputChannel;
+    /**
+     * The most recent concrete `ViewColumn` this panel was observed in.
+     * `panel.viewColumn` is documented as "only set if the webview is
+     * in one of the editor view columns" — it can transiently be
+     * `undefined` (newly created panel, mid-drag) even when the panel
+     * is in a real column. We snapshot the column whenever VS Code
+     * reports a defined value, so reuse / reveal logic and the
+     * preview-column recompute can fall back to "where the panel
+     * last was" instead of `ViewColumn.Beside`.
+     */
+    private lastKnownColumn: vscode.ViewColumn | undefined;
 
     /**
      * Open or update the panel for `args.sourceUri`. Returns
@@ -73,23 +84,53 @@ export class KnitOutputPanel {
 
         if (existing && existing.rootDir === rootDir) {
             existing.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
-            existing.panel.reveal(existing.panel.viewColumn ?? vscode.ViewColumn.Beside, true);
+            // Prefer the panel's *current* column; fall back to the
+            // last-known column so re-knitting a hidden panel does
+            // not relocate it to `Beside` (which moves the panel
+            // away from its prior tab group).
+            const revealCol =
+                existing.panel.viewColumn
+                ?? existing.lastKnownColumn
+                ?? vscode.ViewColumn.Beside;
+            existing.panel.reveal(revealCol, true);
             return { ok: true };
         }
 
         if (existing) {
             // localResourceRoots is immutable post-creation — dispose
             // and recreate in the same column. Scoped to this source;
-            // other panels untouched.
-            const column = existing.panel.viewColumn ?? vscode.ViewColumn.Beside;
+            // other panels untouched. Same column fallback chain as
+            // the reuse branch above.
+            const column =
+                existing.panel.viewColumn
+                ?? existing.lastKnownColumn
+                ?? vscode.ViewColumn.Beside;
             existing.panel.dispose();
             KnitOutputPanel.create(context, args, rootDir, column);
             return { ok: true };
         }
 
-        const column = KnitOutputPanel.previewColumn ?? vscode.ViewColumn.Beside;
+        // Anchor priority for a brand-new panel:
+        //  1. recorded `previewColumn` (already resolved by at least
+        //     one prior knit's `onDidChangeViewState`)
+        //  2. any surviving instance's panel.viewColumn or
+        //     lastKnownColumn (handles back-to-back knits before the
+        //     first panel's column has resolved yet)
+        //  3. `ViewColumn.Beside`
+        const column =
+            KnitOutputPanel.previewColumn
+            ?? KnitOutputPanel.findExistingColumn()
+            ?? vscode.ViewColumn.Beside;
         KnitOutputPanel.create(context, args, rootDir, column);
         return { ok: true };
+    }
+
+    private static findExistingColumn(): vscode.ViewColumn | undefined {
+        for (const inst of KnitOutputPanel.instances.values()) {
+            const col = inst.panel.viewColumn ?? inst.lastKnownColumn;
+            if (col !== undefined) return col;
+        }
+        return undefined;
     }
 
     /** Visible only for tests. */
@@ -186,11 +227,18 @@ export class KnitOutputPanel {
         // resolved column. Subsequent new panels open in this column
         // so they stack as tabs rather than scattering to Beside.
         const resolved = panel.viewColumn;
-        if (resolved !== undefined && KnitOutputPanel.previewColumn === undefined) {
-            KnitOutputPanel.previewColumn = resolved;
+        if (resolved !== undefined) {
+            instance.lastKnownColumn = resolved;
+            if (KnitOutputPanel.previewColumn === undefined) {
+                KnitOutputPanel.previewColumn = resolved;
+            }
         }
 
-        panel.onDidChangeViewState(() => KnitOutputPanel.recomputePreviewColumn());
+        panel.onDidChangeViewState(() => {
+            const col = panel.viewColumn;
+            if (col !== undefined) instance.lastKnownColumn = col;
+            KnitOutputPanel.recomputePreviewColumn();
+        });
         panel.onDidDispose(() => {
             // Guard against a stale dispose listener for an instance
             // that has since been replaced under the same key (the
@@ -209,7 +257,12 @@ export class KnitOutputPanel {
     }
 
     /**
-     * Three-step preview-column recompute:
+     * Three-step preview-column recompute. Uses
+     * `panel.viewColumn ?? lastKnownColumn` so a panel that is hidden
+     * behind another tab (and therefore has `viewColumn === undefined`
+     * per the VS Code API contract) still counts as occupying its
+     * column.
+     *
      *  - empty registry  → previewColumn = undefined
      *  - previewColumn still occupied by some panel → stays put
      *  - otherwise → adopts any surviving panel's column (so a
@@ -223,11 +276,12 @@ export class KnitOutputPanel {
         const target = KnitOutputPanel.previewColumn;
         if (target !== undefined) {
             for (const inst of KnitOutputPanel.instances.values()) {
-                if (inst.panel.viewColumn === target) return;
+                const col = inst.panel.viewColumn ?? inst.lastKnownColumn;
+                if (col === target) return;
             }
         }
         for (const inst of KnitOutputPanel.instances.values()) {
-            const col = inst.panel.viewColumn;
+            const col = inst.panel.viewColumn ?? inst.lastKnownColumn;
             if (col !== undefined) {
                 KnitOutputPanel.previewColumn = col;
                 return;
