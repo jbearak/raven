@@ -66,11 +66,26 @@ explorer-context-menu hook is opt-in via your own keybindings).
    (`raven.knit.timeoutMs = 600000`). Windows uses `taskkill /T /F`
    instead of POSIX signals.
 10. **Reveal.** On a clean exit Raven parses `Output created: <path>`
-    out of stdout and offers an `Open` button. `.html` / `.htm` open
-    via `vscode.open` (which routes through Simple Browser in remote
-    workspaces); everything else opens via `revealFileInOS`. When the
-    parse fails Raven still surfaces "Knit succeeded (output path
-    unknown)" — the subprocess exit code is the ground truth.
+    out of stdout. When the primary output is HTML (or there's any HTML
+    in a multi-output knit), Raven opens it in the **Knit Output**
+    webview panel beside the editor. The panel toolbar has two buttons:
+
+    - **Refresh** — re-knits the source `.Rmd` (the same code path as
+      invoking `Raven: Knit` from the palette).
+    - **Open in Browser** — opens the rendered file in your OS default
+      browser. In remote workspaces (SSH, Codespaces, dev containers)
+      this may not work because `file://` URIs target the remote
+      machine; Raven warns and writes the path to the `Raven: Knit`
+      output channel as a fallback.
+
+    The rendered HTML loads inside an `<iframe sandbox="">` — scripts,
+    forms, and external navigation are blocked. Intra-document anchor
+    links (`#section`) work; clicking an external `<a>` does nothing
+    (use **Open in Browser** for full interactivity, including
+    htmlwidgets). For PDF / Word / etc., Raven still reveals the file
+    in your OS file browser. When the output-path parse fails Raven
+    surfaces "Knit succeeded (output path unknown)" — the subprocess
+    exit code is the ground truth.
 
 ## Settings
 
@@ -86,6 +101,7 @@ explorer-context-menu hook is opt-in via your own keybindings).
 | Capability | Where it lives |
 |---|---|
 | Live preview of `.Rmd` or `.qmd` | `quarto.quarto`'s `Quarto: Preview` |
+| Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Output panel is a static viewer with a manual Refresh button — not a live recompile. |
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | `.Rmd` grammar | `REditorSupport.r-syntax` or `REditorSupport.r` |
