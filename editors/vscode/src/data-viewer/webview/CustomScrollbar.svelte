@@ -18,9 +18,11 @@
         /** Maximum physical scrollTop = MAX_SCROLL_PX + rowHeight - viewportHeight. */
         maxPhysical: number;
         /** Callback invoked when the user's drag or click changes the
-         *  desired scrollTop. The parent should set viewportEl.scrollTop
-         *  to this value; the browser's onScroll handler does the rest. */
-        onScrollTo: (newScrollTop: number) => void;
+         *  desired scrollTop. `atBottom` is true when the thumb itself
+         *  hit the bottom of the custom track, so the parent can honor
+         *  that user intent even if Chromium reports a shy physical
+         *  scrollTop. */
+        onScrollTo: (newScrollTop: number, atBottom?: boolean) => void;
     }
 
     let { trackHeight, scrollTop, nrow, rowHeight, maxPhysical, onScrollTo }: Props = $props();
@@ -60,8 +62,12 @@
         // a drag doesn't desynchronize pointer Y from track Y.
         const trackTopAbsolute = trackEl.getBoundingClientRect().top;
         const rawThumbTop = e.clientY - trackTopAbsolute - dragOffset;
-        const clampedThumbTop = Math.max(0, Math.min(trackHeight - thumbHeight, rawThumbTop));
-        onScrollTo(customScrollTopFromThumbTop(clampedThumbTop, trackHeight, thumbHeight, maxPhysical));
+        const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+        const clampedThumbTop = Math.max(0, Math.min(maxThumbTop, rawThumbTop));
+        onScrollTo(
+            customScrollTopFromThumbTop(clampedThumbTop, trackHeight, thumbHeight, maxPhysical),
+            clampedThumbTop >= maxThumbTop,
+        );
     }
 
     function endDrag(e: PointerEvent): void {
@@ -96,7 +102,7 @@
         if (clickY >= thumbTop && clickY <= thumbTop + thumbHeight) return;
         // Page up if click is above the thumb, down if below.
         const direction = clickY < thumbTop ? -1 : 1;
-        onScrollTo(scrollTop + direction * trackHeight);
+        onScrollTo(scrollTop + direction * trackHeight, false);
     }
 </script>
 

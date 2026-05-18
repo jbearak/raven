@@ -76,6 +76,16 @@ export class DataViewerManager {
         return this.panels.get(panelName)?.getVisibleRange();
     }
 
+    /** Latest on-screen row range for a named panel, excluding overscan. */
+    getPanelViewportRange(panelName: string): { start: number; end: number } | undefined {
+        return this.panels.get(panelName)?.getViewportRange();
+    }
+
+    /** Latest selected focus cell for a named panel. */
+    getPanelFocusCell(panelName: string): { row: number; col: number } | undefined {
+        return this.panels.get(panelName)?.getFocusCell();
+    }
+
     /** Test-only: dispatch a synthetic key event in a named panel's
      *  webview. Awaiting waits for the message to be queued, not for any
      *  reply; tests should poll `getPanelVisibleRange()` to observe

@@ -19,6 +19,8 @@ export type Rect = {
 
 export type SelectionKind = 'cells' | 'columns' | 'rows' | 'all';
 
+export type CellPosition = { row: number; col: number };
+
 export class Selection {
     private a: { row: number; col: number } | null = null;
     private f: { row: number; col: number } | null = null;
@@ -80,6 +82,10 @@ export class Selection {
      *  caller derives from rect()'s [colStart, colEnd) span. */
     colIndices(): number[] | null {
         return this.explicitCols ? [...this.explicitCols] : null;
+    }
+
+    focusCell(): CellPosition | null {
+        return this.f ? { ...this.f } : null;
     }
 
     kind(): SelectionKind { return this.k; }

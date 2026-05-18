@@ -40,6 +40,15 @@ describe('Selection.kind / includesHeader', () => {
         expect(s.kind()).toBe('columns');
     });
 
+    test('focusCell returns the active focus cell', () => {
+        const s = new Selection();
+        expect(s.focusCell()).toBeNull();
+        s.anchor(2, 3);
+        expect(s.focusCell()).toEqual({ row: 2, col: 3 });
+        s.focus(5, 7);
+        expect(s.focusCell()).toEqual({ row: 5, col: 7 });
+    });
+
     test('a new cell anchor switches kind back to cells', () => {
         const s = new Selection();
         s.selectAll(10, [0, 1, 2]);

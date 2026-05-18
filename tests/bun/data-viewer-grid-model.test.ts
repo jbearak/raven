@@ -4,10 +4,14 @@ import {
     coalesceScroll,
     MAX_SCROLL_PX,
     cappedScrollHeight,
+    estimatedMaxPhysicalScrollTop,
     logicalScrollTop,
     visualOffsetPx,
+    visualRowsOffsetPx,
     MIN_THUMB_PX,
+    HEADER_ROW_PX,
     HORIZONTAL_GUTTER_PX,
+    shouldForceLogicalBottomAfterScroll,
     customThumbHeight,
     customThumbTop,
     customScrollTopFromThumbTop,
@@ -64,6 +68,9 @@ describe('scroll height capping', () => {
     test('cappedScrollHeight: large dataset is capped', () => {
         expect(cappedScrollHeight(LARGE)).toBe(MAX_SCROLL_PX);
     });
+    test('estimatedMaxPhysicalScrollTop: uses capped content height plus row sentinel', () => {
+        expect(estimatedMaxPhysicalScrollTop(LARGE, VH, RH)).toBe(maxPhysical);
+    });
 
     test('logicalScrollTop: identity when content fits', () => {
         expect(logicalScrollTop(1234, SMALL, VH, RH)).toBe(1234);
@@ -116,6 +123,98 @@ describe('scroll height capping', () => {
             rowHeight: RH, nrow, overscan: 8,
         });
         expect(range.end).toBe(nrow);
+    });
+
+    test('bottom: near-bottom physical scroll snaps to the logical last row', () => {
+        const nrow = 10_000_000;
+        const totalGridHeight = nrow * RH;
+        const logical = logicalScrollTop(
+            maxPhysical - (3 * RH), totalGridHeight, VH, RH, maxPhysical,
+        );
+        const range = visibleRange({
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 8,
+        });
+        expect(range.end).toBe(nrow);
+        expect(logical).toBe(totalGridHeight + RH - VH);
+    });
+
+    test('bottom: explicit bottom drag reaches the logical last row even if physical scroll is shy', () => {
+        const nrow = 10_000_000;
+        const totalGridHeight = nrow * RH;
+        const logical = logicalScrollTop(
+            maxPhysical - (50 * RH), totalGridHeight, VH, RH, maxPhysical, true,
+        );
+        const range = visibleRange({
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 8,
+        });
+        expect(range.end).toBe(nrow);
+        expect(logical).toBe(totalGridHeight + RH - VH);
+    });
+
+    test('bottom: browser-clamped scroll event preserves explicit custom-thumb bottom intent', () => {
+        const chromiumClamp = maxPhysical * 0.932;
+        expect(shouldForceLogicalBottomAfterScroll({
+            scrollTop: chromiumClamp,
+            maxPhysical,
+            rowHeight: RH,
+            previousForceBottom: true,
+            pendingBottomIntent: true,
+        })).toBe(true);
+    });
+
+    test('bottom: ordinary upward scroll clears prior bottom intent', () => {
+        const notNearBottom = maxPhysical * 0.932;
+        expect(shouldForceLogicalBottomAfterScroll({
+            scrollTop: notNearBottom,
+            maxPhysical,
+            rowHeight: RH,
+            previousForceBottom: true,
+            pendingBottomIntent: false,
+        })).toBe(false);
+    });
+
+    test('bottom: measured DOM max below model max still reaches the last row', () => {
+        const nrow = 10_000_000;
+        const totalGridHeight = nrow * RH;
+        const measuredMaxPhysical = maxPhysical * 0.932;
+        const logical = logicalScrollTop(
+            measuredMaxPhysical, totalGridHeight, VH, RH, measuredMaxPhysical,
+        );
+        const range = visibleRange({
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 8,
+        });
+        expect(range.end).toBe(nrow);
+        expect(visualOffsetPx(
+            range.start * RH, totalGridHeight, VH, RH, measuredMaxPhysical,
+        )).toBeLessThanOrEqual(measuredMaxPhysical);
+    });
+
+    test('visualRowsOffsetPx: bottom window keeps the last row on screen', () => {
+        const nrow = 10_000_000;
+        const totalGridHeight = nrow * RH;
+        const measuredMaxPhysical = maxPhysical * 0.932;
+        const logical = logicalScrollTop(
+            measuredMaxPhysical, totalGridHeight, VH, RH, measuredMaxPhysical,
+        );
+        const range = visibleRange({
+            scrollTop: logical, viewportHeight: VH,
+            rowHeight: RH, nrow, overscan: 8,
+        });
+        const renderedRowsHeight = (range.end - range.start) * RH;
+        const rowsTop = HEADER_ROW_PX + visualRowsOffsetPx(
+            range.start * RH,
+            renderedRowsHeight,
+            totalGridHeight,
+            VH,
+            RH,
+            measuredMaxPhysical,
+        ) - measuredMaxPhysical;
+
+        expect(rowsTop + renderedRowsHeight).toBeLessThanOrEqual(VH);
+        expect(rowsTop + renderedRowsHeight).toBeGreaterThanOrEqual(VH - 1);
     });
 
     test('logicalScrollTop: clamps overshoot above maxPhysical to maxLogical (large)', () => {

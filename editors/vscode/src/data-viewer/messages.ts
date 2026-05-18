@@ -129,6 +129,16 @@ export type WebviewToExtension =
         /** End row index of the currently rendered window (exclusive).
          *  Equal to visibleRangeStart + visibleRows. */
         visibleRangeEnd: number;
+        /** Start row index of the rows actually visible within the
+         *  viewport (inclusive), excluding overscan rows above or below
+         *  the viewport. Used by integration tests that need to prove the
+         *  last row is on screen, not merely fetched. */
+        viewportRangeStart: number;
+        /** End row index of the rows actually visible within the
+         *  viewport (exclusive). */
+        viewportRangeEnd: number;
+        /** Active selection focus cell, or null when no cell is selected. */
+        focusCell: { row: number; col: number } | null;
         timestamp: number;
     }
     | {

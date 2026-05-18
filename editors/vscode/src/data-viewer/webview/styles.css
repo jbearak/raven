@@ -195,6 +195,7 @@ html, body, #root {
     position: sticky;
     top: 0;
     display: flex;
+    box-sizing: border-box;
     background: var(--vscode-editor-background, #fff);
     border-bottom: 1px solid var(--vscode-panel-border, #ccc);
     z-index: 2;
@@ -209,6 +210,7 @@ html, body, #root {
 
 .data-row {
     display: flex;
+    box-sizing: border-box;
     border-bottom: 1px solid var(--vscode-tree-tableColumnsBorder, #f0f0f0);
 }
 .data-row:hover {

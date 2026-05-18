@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte';
+    import { onDestroy, onMount, tick } from 'svelte';
     import type {
         ExtensionToWebview,
         Layout,
@@ -10,8 +10,10 @@
     import type { ColumnSchema } from '../arrow-reader';
     import {
         visibleRange, coalesceScroll,
-        cappedScrollHeight, logicalScrollTop, visualOffsetPx,
-        MAX_SCROLL_PX, HORIZONTAL_GUTTER_PX,
+        cappedScrollHeight, logicalScrollTop, visualOffsetPx, visualRowsOffsetPx,
+        estimatedMaxPhysicalScrollTop,
+        shouldForceLogicalBottomAfterScroll,
+        MAX_SCROLL_PX, HORIZONTAL_GUTTER_PX, HEADER_ROW_PX, BOTTOM_SNAP_ROWS,
     } from './grid-model';
     import { RowCache } from './row-cache';
     import { Selection } from './selection-model';
@@ -72,6 +74,9 @@
     let scrollTop = $state(0);
     let viewportHeight = $state(600);
     const ROW_HEIGHT = 24;
+    let maxPhysicalScrollTop = $state(0);
+    let forceLogicalBottom = $state(false);
+    let pendingBottomIntent = false;
     let viewportGeneration = 0;
     let nextRequestId = 0;
     /** Outstanding row requests keyed by requestId. */
@@ -117,7 +122,67 @@
     let copyStatusTimer: ReturnType<typeof setTimeout> | null = null;
     function bumpSelection() { selectionVersion++; }
 
+    function viewportRenderedRange(): { start: number; end: number } {
+        if (visibleRows.length <= 0) {
+            return { start: visibleRangeStart, end: visibleRangeStart };
+        }
+        const rowsTop = HEADER_ROW_PX + rowsVisualOffsetPx() - scrollTop;
+        const firstOffset = Math.max(
+            0,
+            Math.floor((HEADER_ROW_PX - rowsTop) / ROW_HEIGHT),
+        );
+        const endOffset = Math.max(
+            firstOffset,
+            Math.min(visibleRows.length, Math.ceil((viewportHeight - rowsTop) / ROW_HEIGHT)),
+        );
+        return {
+            start: visibleRangeStart + firstOffset,
+            end: visibleRangeStart + endOffset,
+        };
+    }
+
+    function rowsVisualOffsetPx(): number {
+        const renderedRowsHeight = visibleRows.length * ROW_HEIGHT;
+        const offset = visualRowsOffsetPx(
+            visibleRangeStart * ROW_HEIGHT,
+            renderedRowsHeight,
+            totalGridHeight,
+            viewportHeight,
+            ROW_HEIGHT,
+            maxPhysicalScrollTop,
+        );
+        if (
+            visibleRows.length > 0
+            && visibleRangeStart + visibleRows.length >= nrow
+            && (forceLogicalBottom || maxPhysicalScrollTop - scrollTop <= ROW_HEIGHT * 4)
+        ) {
+            const bottomAligned = scrollTop + viewportHeight - HEADER_ROW_PX - renderedRowsHeight;
+            return Math.min(offset, bottomAligned);
+        }
+        return offset;
+    }
+
+    function viewportRenderedRangeFromDom(): { start: number; end: number } | undefined {
+        if (!viewportEl) return undefined;
+        const viewportRect = viewportEl.getBoundingClientRect();
+        const header = viewportEl.querySelector<HTMLElement>('.header-row');
+        const top = header?.getBoundingClientRect().bottom ?? viewportRect.top + HEADER_ROW_PX;
+        const bottom = viewportRect.top + viewportEl.clientHeight;
+        let start: number | undefined;
+        let end: number | undefined;
+        for (const row of viewportEl.querySelectorAll<HTMLElement>('.data-row[data-row-index]')) {
+            const rowIndex = Number(row.dataset.rowIndex);
+            if (!Number.isFinite(rowIndex)) continue;
+            const rowRect = row.getBoundingClientRect();
+            if (rowRect.bottom <= top || rowRect.top >= bottom) continue;
+            start ??= rowIndex;
+            end = rowIndex + 1;
+        }
+        return start === undefined || end === undefined ? undefined : { start, end };
+    }
+
     function postLifecycle(event: string): void {
+        const viewportRange = viewportRenderedRangeFromDom() ?? viewportRenderedRange();
         vscode.postMessage({
             type: 'lifecycle',
             event,
@@ -127,8 +192,28 @@
             visibleRows: visibleRows.length,
             visibleRangeStart,
             visibleRangeEnd: visibleRangeStart + visibleRows.length,
+            viewportRangeStart: viewportRange.start,
+            viewportRangeEnd: viewportRange.end,
+            focusCell: selection.focusCell(),
             timestamp: Date.now(),
         });
+    }
+
+    function postLifecycleAfterDom(event: string): void {
+        void tick().then(() => postLifecycle(event));
+    }
+
+    function fallbackMaxPhysicalScrollTop(): number {
+        return estimatedMaxPhysicalScrollTop(totalGridHeight, viewportHeight, ROW_HEIGHT);
+    }
+
+    function refreshMaxPhysicalScrollTop(): void {
+        if (!viewportEl) {
+            maxPhysicalScrollTop = fallbackMaxPhysicalScrollTop();
+            return;
+        }
+        viewportHeight = viewportEl.clientHeight;
+        maxPhysicalScrollTop = Math.max(0, viewportEl.scrollHeight - viewportEl.clientHeight);
     }
 
     // ----- Pending getLabels for high-cardinality columns -----------------
@@ -159,12 +244,11 @@
                     return;
                 case 'testKey':
                     // Test-only: dispatch a synthetic KeyboardEvent on
-                    // `window` so the same onKeyDown handler a real
-                    // keypress would invoke runs end-to-end. The
-                    // <svelte:window onkeydown={onKeyDown}> binding
-                    // listens at the window level, so window.dispatchEvent
-                    // is the canonical delivery path for synthetic events.
-                    window.dispatchEvent(new KeyboardEvent('keydown', {
+                    // the focused viewport so the direct grid key handler
+                    // runs before the window-level fallback, matching real
+                    // keyboard navigation inside the webview.
+                    focusViewport();
+                    (viewportEl ?? window).dispatchEvent(new KeyboardEvent('keydown', {
                         key: m.key,
                         code: m.key,
                         bubbles: true,
@@ -322,7 +406,10 @@
         inflight.delete(m.requestId);
         rowCache.put(m.start, m.end, m.rows);
         const range = visibleRange({
-            scrollTop: logicalScrollTop(scrollTop, totalGridHeight, viewportHeight, ROW_HEIGHT),
+            scrollTop: logicalScrollTop(
+                scrollTop, totalGridHeight, viewportHeight, ROW_HEIGHT,
+                maxPhysicalScrollTop, forceLogicalBottom,
+            ),
             viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
         });
         if (range.start === m.start && range.end === m.end) {
@@ -330,6 +417,7 @@
             visibleRangeStart = m.start;
             persistWebviewState();
             postLifecycle('rows');
+            postLifecycleAfterDom('rows-dom');
         }
     }
 
@@ -359,8 +447,12 @@
 
     // ----- Fetching -------------------------------------------------------
     const scheduleFetchVisible = coalesceScroll(() => {
+        refreshMaxPhysicalScrollTop();
         const range = visibleRange({
-            scrollTop: logicalScrollTop(scrollTop, totalGridHeight, viewportHeight, ROW_HEIGHT),
+            scrollTop: logicalScrollTop(
+                scrollTop, totalGridHeight, viewportHeight, ROW_HEIGHT,
+                maxPhysicalScrollTop, forceLogicalBottom,
+            ),
             viewportHeight, rowHeight: ROW_HEIGHT, nrow, overscan: 8,
         });
         if (range.end <= range.start) {
@@ -384,6 +476,7 @@
             // never tell the host its range changed, leaving the polling
             // test stuck on a stale lastVisibleRange.
             postLifecycle('cache-hit');
+            postLifecycleAfterDom('cache-hit-dom');
             return;
         }
         viewportGeneration += 1;
@@ -403,7 +496,16 @@
 
     function onScroll(e: Event): void {
         const target = e.target as HTMLDivElement;
+        refreshMaxPhysicalScrollTop();
         scrollTop = target.scrollTop;
+        forceLogicalBottom = shouldForceLogicalBottomAfterScroll({
+            scrollTop,
+            maxPhysical: maxPhysicalScrollTop,
+            rowHeight: ROW_HEIGHT,
+            previousForceBottom: forceLogicalBottom,
+            pendingBottomIntent,
+        });
+        pendingBottomIntent = false;
         scheduleFetchVisible();
     }
 
@@ -506,6 +608,80 @@
         };
     }
 
+    function currentFocusCell(): { row: number; col: number } | null {
+        const focus = selection.focusCell();
+        if (focus) return focus;
+        if (nrow <= 0 || visibleCols.length === 0) return null;
+        const row = Math.max(0, Math.min(nrow - 1, visibleRangeStart));
+        return { row, col: visibleCols[0] };
+    }
+
+    function nextVisibleCol(currentCol: number, delta: number): number {
+        if (visibleCols.length === 0) return currentCol;
+        const currentIndex = visibleCols.indexOf(currentCol);
+        const fallbackIndex = visibleCols.findIndex(c => c >= currentCol);
+        const index = currentIndex >= 0
+            ? currentIndex
+            : fallbackIndex >= 0 ? fallbackIndex : visibleCols.length - 1;
+        return visibleCols[Math.max(0, Math.min(visibleCols.length - 1, index + delta))];
+    }
+
+    function scrollToRowStart(rowStart: number): void {
+        if (!viewportEl || nrow <= 0) return;
+        const clamped = Math.max(0, Math.min(nrow - 1, rowStart));
+        forceLogicalBottom = clamped >= nrow - 1;
+        pendingBottomIntent = forceLogicalBottom;
+        const nextScrollTop = forceLogicalBottom
+            ? maxPhysicalScrollTop
+            : visualOffsetPx(
+                clamped * ROW_HEIGHT,
+                totalGridHeight,
+                viewportHeight,
+                ROW_HEIGHT,
+                maxPhysicalScrollTop,
+            );
+        scrollTop = nextScrollTop;
+        viewportEl.scrollTop = nextScrollTop;
+        scheduleFetchVisible();
+    }
+
+    function revealCell(row: number, col: number): void {
+        const range = viewportRenderedRangeFromDom() ?? viewportRenderedRange();
+        const visibleCount = Math.max(1, range.end - range.start);
+        if (row < range.start) {
+            scrollToRowStart(row);
+        } else if (row >= range.end) {
+            scrollToRowStart(row - visibleCount + 1);
+        }
+
+        void tick().then(() => {
+            if (!viewportEl) return;
+            const cell = viewportEl.querySelector<HTMLElement>(
+                `[data-grid-target="cell"][data-row="${row}"][data-col="${col}"]`,
+            );
+            if (!cell) return;
+            const viewportRect = viewportEl.getBoundingClientRect();
+            const cellRect = cell.getBoundingClientRect();
+            if (cellRect.left < viewportRect.left) {
+                viewportEl.scrollLeft -= viewportRect.left - cellRect.left;
+            } else if (cellRect.right > viewportRect.right) {
+                viewportEl.scrollLeft += cellRect.right - viewportRect.right;
+            }
+        });
+    }
+
+    function moveFocusBy(rowDelta: number, colDelta: number): void {
+        const focus = currentFocusCell();
+        if (!focus) return;
+        const row = Math.max(0, Math.min(nrow - 1, focus.row + rowDelta));
+        const col = colDelta === 0 ? focus.col : nextVisibleCol(focus.col, colDelta);
+        selection.anchor(row, col, 'cells');
+        bumpSelection();
+        focusViewport();
+        revealCell(row, col);
+        postLifecycleAfterDom('selection-key');
+    }
+
     function onWindowPointerUp(): void {
         const wasResizing = dragMode === 'resize' && resizeDrag !== null;
         dragMode = null;
@@ -537,6 +713,7 @@
     }
 
     function onKeyDown(e: KeyboardEvent): void {
+        if (e.defaultPrevented) return;
         const meta = e.metaKey || e.ctrlKey;
         if (e.key === 'Escape' && contextMenu) {
             closeContextMenu();
@@ -564,8 +741,26 @@
         );
         if (!meta && !e.shiftKey && !e.altKey && !onFormControl && viewportEl) {
             switch (e.key) {
+                case 'ArrowUp':
+                    e.preventDefault();
+                    moveFocusBy(-1, 0);
+                    return;
+                case 'ArrowDown':
+                    e.preventDefault();
+                    moveFocusBy(1, 0);
+                    return;
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    moveFocusBy(0, -1);
+                    return;
+                case 'ArrowRight':
+                    e.preventDefault();
+                    moveFocusBy(0, 1);
+                    return;
                 case 'End':
                     e.preventDefault();
+                    forceLogicalBottom = true;
+                    pendingBottomIntent = true;
                     // scrollHeight - clientHeight is the canonical
                     // browser-clamped maximum. The inner .grid div is
                     // height-capped at MAX_SCROLL_PX + ROW_HEIGHT, so
@@ -573,17 +768,25 @@
                     // logicalScrollTop's clamp absorbs any DOM-vs-model
                     // rounding mismatch.
                     viewportEl.scrollTop = viewportEl.scrollHeight - viewportEl.clientHeight;
+                    scrollTop = viewportEl.scrollTop;
+                    scheduleFetchVisible();
                     return;
                 case 'Home':
                     e.preventDefault();
+                    forceLogicalBottom = false;
+                    pendingBottomIntent = false;
                     viewportEl.scrollTop = 0;
+                    scrollTop = viewportEl.scrollTop;
+                    scheduleFetchVisible();
                     return;
                 case 'PageDown':
                     e.preventDefault();
+                    pendingBottomIntent = false;
                     viewportEl.scrollTop += viewportEl.clientHeight;
                     return;
                 case 'PageUp':
                     e.preventDefault();
+                    pendingBottomIntent = false;
                     viewportEl.scrollTop -= viewportEl.clientHeight;
                     return;
             }
@@ -850,13 +1053,26 @@
     $effect(() => {
         if (!viewportEl) return;
         const ro = new ResizeObserver(entries => {
-            for (const entry of entries) {
-                viewportHeight = entry.contentRect.height;
+            for (const _entry of entries) {
+                refreshMaxPhysicalScrollTop();
                 scheduleFetchVisible();
             }
         });
         ro.observe(viewportEl);
         return () => ro.disconnect();
+    });
+
+    $effect(() => {
+        if (!viewportEl) {
+            maxPhysicalScrollTop = fallbackMaxPhysicalScrollTop();
+            return;
+        }
+        nrow;
+        viewportHeight;
+        requestAnimationFrame(() => {
+            refreshMaxPhysicalScrollTop();
+            scheduleFetchVisible();
+        });
     });
 
     function rangeFilter(start: number, end: number, all: number[]): number[] {
@@ -899,13 +1115,14 @@
     {#if copyStatus !== ''}
         <div class="toast toast-{copyStatus}">{copyStatusMsg}</div>
     {/if}
-    <div class="viewport-wrapper">
+    <div class="viewport-wrapper" onpointerdown={focusViewport}>
         <div class="viewport"
              class:using-custom-scrollbar={useCustomScrollbar}
              role="grid"
              aria-rowcount={nrow}
              bind:this={viewportEl}
              onscroll={onScroll}
+             onkeydown={onKeyDown}
              tabindex="0">
             <div class="grid" style="height: {cappedScrollHeight(totalGridHeight) + ROW_HEIGHT}px;">
                 <!-- Header row (sticky top) -->
@@ -937,10 +1154,12 @@
                 {/each}
             </div>
             <!-- Data rows -->
-            <div class="rows" style="transform: translateY({visualOffsetPx(visibleRangeStart * ROW_HEIGHT, totalGridHeight, viewportHeight, ROW_HEIGHT)}px);">
+            <div class="rows" style="transform: translateY({rowsVisualOffsetPx()}px);">
                 {#each visibleRows as rowCells, rowOffset (visibleRangeStart + rowOffset)}
                     {@const absRow = visibleRangeStart + rowOffset}
-                    <div class="data-row" style="height: {ROW_HEIGHT}px;">
+                    <div class="data-row"
+                         data-row-index={absRow}
+                         style="height: {ROW_HEIGHT}px;">
                         <div class="cell rowname-col row-header
                                 {isRowSelected(absRow) ? 'selected-header' : ''}"
                              data-grid-target="row-header"
@@ -988,12 +1207,20 @@
     {#if useCustomScrollbar}
         <CustomScrollbar
             trackHeight={Math.max(0, viewportHeight - HORIZONTAL_GUTTER_PX)}
-            scrollTop={scrollTop}
+            scrollTop={forceLogicalBottom ? maxPhysicalScrollTop : scrollTop}
             nrow={nrow}
             rowHeight={ROW_HEIGHT}
-            maxPhysical={MAX_SCROLL_PX + ROW_HEIGHT - viewportHeight}
-            onScrollTo={(newScrollTop) => {
-                if (viewportEl) viewportEl.scrollTop = newScrollTop;
+            maxPhysical={maxPhysicalScrollTop}
+            onScrollTo={(newScrollTop, atBottom = false) => {
+                forceLogicalBottom = atBottom;
+                pendingBottomIntent = atBottom;
+                if (viewportEl) {
+                    viewportEl.scrollTop = newScrollTop;
+                    scrollTop = viewportEl.scrollTop;
+                } else {
+                    scrollTop = newScrollTop;
+                }
+                scheduleFetchVisible();
             }}
         />
     {/if}

@@ -7,19 +7,46 @@
  *  above that we remap logical ↔ visual coordinates. */
 export const MAX_SCROLL_PX = 15_000_000;
 
+/** Pixel height of the sticky header row. Must match `.header-row` in
+ *  styles.css. Rows remain in normal flow after the header, so bottom
+ *  clamping must reserve this height when positioning the rendered row
+ *  block inside the scroll content. */
+export const HEADER_ROW_PX = 28;
+
+/** If Chromium or a drag gesture lands within this many row-heights of
+ *  the physical bottom, treat it as the bottom. Large capped scroll
+ *  ranges amplify tiny physical misses into many logical rows; this
+ *  keeps "drag to bottom" from stopping just shy of the last row. */
+export const BOTTOM_SNAP_ROWS = 4;
+
 /** Height to assign to the scroll-content div. Capped so the browser's
  *  pixel-height limit never truncates the scrollbar range. */
 export function cappedScrollHeight(totalGridHeight: number): number {
     return Math.min(totalGridHeight, MAX_SCROLL_PX);
 }
 
+/** Best-effort model of the capped container's maximum scrollTop.
+ *
+ *  In the webview, callers should prefer the measured DOM value
+ *  `viewport.scrollHeight - viewport.clientHeight`: Chromium/Electron can
+ *  clamp the realized scroll range below the CSS height we request. This
+ *  helper is the deterministic fallback for tests and for the brief mount
+ *  window before the viewport exists. */
+export function estimatedMaxPhysicalScrollTop(
+    totalGridHeight: number,
+    viewportHeight: number,
+    rowHeight: number,
+): number {
+    return Math.max(0, cappedScrollHeight(totalGridHeight) + rowHeight - viewportHeight);
+}
+
 /** Map a physical scrollTop (in the capped container) to the logical
  *  scrollTop that visibleRange() expects. Identity-shaped when content fits.
  *
- *  The physical scroll range is [0, MAX_SCROLL_PX + rowHeight - viewportHeight]
+ *  The physical scroll range is [0, maxPhysical]
  *  and the logical scroll range is [0, totalGridHeight + rowHeight - viewportHeight],
- *  so we scale between those two maxima (not between MAX_SCROLL_PX and
- *  totalGridHeight) to reach the very last row when scrolled to the bottom.
+ *  so we scale between those two maxima to reach the very last row when
+ *  scrolled to the bottom.
  *
  *  Both branches clamp to [0, maxLogical]. macOS rubber-band can briefly
  *  push scrollTop above maxPhysical; without the clamp the scaled value
@@ -32,14 +59,18 @@ export function logicalScrollTop(
     totalGridHeight: number,
     viewportHeight: number,
     rowHeight: number,
+    maxPhysical = estimatedMaxPhysicalScrollTop(totalGridHeight, viewportHeight, rowHeight),
+    forceBottom = false,
 ): number {
     if (totalGridHeight <= MAX_SCROLL_PX) {
         const maxLogicalSmall = Math.max(0, totalGridHeight + rowHeight - viewportHeight);
         return Math.max(0, Math.min(maxLogicalSmall, scrollTop));
     }
-    const maxPhysical = MAX_SCROLL_PX + rowHeight - viewportHeight;
     if (maxPhysical <= 0) return 0;
     const maxLogical = totalGridHeight + rowHeight - viewportHeight;
+    if (forceBottom || maxPhysical - scrollTop <= rowHeight * BOTTOM_SNAP_ROWS) {
+        return maxLogical;
+    }
     const scaled = (scrollTop / maxPhysical) * maxLogical;
     return Math.max(0, Math.min(maxLogical, scaled));
 }
@@ -51,12 +82,62 @@ export function visualOffsetPx(
     totalGridHeight: number,
     viewportHeight: number,
     rowHeight: number,
+    maxPhysical = estimatedMaxPhysicalScrollTop(totalGridHeight, viewportHeight, rowHeight),
 ): number {
     if (totalGridHeight <= MAX_SCROLL_PX) return logicalOffsetPx;
     const maxLogical = totalGridHeight + rowHeight - viewportHeight;
     if (maxLogical <= 0) return 0;
-    const maxPhysical = MAX_SCROLL_PX + rowHeight - viewportHeight;
     return (logicalOffsetPx / maxLogical) * maxPhysical;
+}
+
+/** Visual translateY for the rendered row block.
+ *
+ *  `visualOffsetPx()` maps the first rendered row into the capped
+ *  scroll space. Near the bottom, however, the rendered block includes
+ *  overscan rows above the viewport and then lays subsequent rows out at
+ *  full row height. That can make the block's bottom extend below the
+ *  scroll content, leaving the true last row just out of view even though
+ *  the fetched range ends at nrow. Clamp the block top so its bottom
+ *  cannot hang below the measured scroll content bottom. */
+export function visualRowsOffsetPx(
+    logicalOffsetPx: number,
+    renderedRowsHeight: number,
+    totalGridHeight: number,
+    viewportHeight: number,
+    rowHeight: number,
+    maxPhysical = estimatedMaxPhysicalScrollTop(totalGridHeight, viewportHeight, rowHeight),
+): number {
+    const raw = visualOffsetPx(
+        logicalOffsetPx, totalGridHeight, viewportHeight, rowHeight, maxPhysical,
+    );
+    if (renderedRowsHeight <= 0) return raw;
+    const scrollContentBottom = maxPhysical + viewportHeight;
+    const maxRowsTop = Math.max(0, scrollContentBottom - HEADER_ROW_PX - renderedRowsHeight);
+    return Math.min(raw, maxRowsTop);
+}
+
+export type BottomIntentArgs = {
+    scrollTop: number;
+    maxPhysical: number;
+    rowHeight: number;
+    previousForceBottom: boolean;
+    pendingBottomIntent: boolean;
+};
+
+/** Decide whether a native scroll event should keep logical-bottom mode.
+ *
+ *  Dragging the custom thumb to the bottom is a logical action, but
+ *  Chromium may clamp the assigned `viewport.scrollTop` well below the
+ *  requested model maximum. The follow-up native `scroll` event must not
+ *  reinterpret that clamped value as "not bottom"; otherwise a 10M-row
+ *  table lands around row 9.32M. A one-shot pending intent preserves the
+ *  user's bottom drag through that browser-clamped event, while ordinary
+ *  later upward scrolling clears the mode. */
+export function shouldForceLogicalBottomAfterScroll(args: BottomIntentArgs): boolean {
+    if (args.pendingBottomIntent && args.previousForceBottom) {
+        return true;
+    }
+    return args.maxPhysical - args.scrollTop <= args.rowHeight * BOTTOM_SNAP_ROWS;
 }
 
 export type VisibleArgs = {

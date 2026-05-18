@@ -116,6 +116,43 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         );
     });
 
+    test('Arrow keys move the selected cell by one row or column', async function () {
+        if (!api.getDataViewerPanelNames().includes('mtcars')) {
+            await api.sendToRTerminal('View(mtcars)');
+            const appeared = await pollForPanel(api, 'mtcars');
+            assert.ok(appeared, 'data viewer panel "mtcars" did not appear');
+        }
+
+        await api.pressDataViewerKey('mtcars', 'Home');
+        await api.pressDataViewerKey('mtcars', 'ArrowDown');
+        const down = await pollFor(() => {
+            const cell = api.getDataViewerPanelFocusCell('mtcars');
+            return cell && cell.row === 1 && cell.col === 0 ? cell : undefined;
+        }, 5000);
+        assert.deepStrictEqual(down, { row: 1, col: 0 });
+
+        await api.pressDataViewerKey('mtcars', 'ArrowRight');
+        const right = await pollFor(() => {
+            const cell = api.getDataViewerPanelFocusCell('mtcars');
+            return cell && cell.row === 1 && cell.col === 1 ? cell : undefined;
+        }, 5000);
+        assert.deepStrictEqual(right, { row: 1, col: 1 });
+
+        await api.pressDataViewerKey('mtcars', 'ArrowUp');
+        const up = await pollFor(() => {
+            const cell = api.getDataViewerPanelFocusCell('mtcars');
+            return cell && cell.row === 0 && cell.col === 1 ? cell : undefined;
+        }, 5000);
+        assert.deepStrictEqual(up, { row: 0, col: 1 });
+
+        await api.pressDataViewerKey('mtcars', 'ArrowLeft');
+        const left = await pollFor(() => {
+            const cell = api.getDataViewerPanelFocusCell('mtcars');
+            return cell && cell.row === 0 && cell.col === 0 ? cell : undefined;
+        }, 5000);
+        assert.deepStrictEqual(left, { row: 0, col: 0 });
+    });
+
     test('View(head(mtcars, 5)) opens a second panel without replacing "mtcars"', async function () {
         await api.sendToRTerminal('View(head(mtcars, 5))');
 
@@ -268,6 +305,50 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         assert.ok(bottomRange,
             `Drag-to-bottom did not reach the last row within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
+    });
+
+    test('Drag scrollbar to bottom reaches last row in 10M-row data frame', async function () {
+        // This is the real large-table regression: webview scrollbar
+        // clamping can be lower than the model's nominal capped height,
+        // so the custom scrollbar must map the measured physical bottom
+        // to the logical last row.
+        this.timeout(360000);
+        const N = 10_000_000;
+        const panelName = `huge_scroll_${Date.now()}`;
+
+        await api.sendToRTerminal(
+            `${panelName} <- data.frame(col1 = seq_len(${N})); View(${panelName})`,
+        );
+        const appeared = await pollForPanel(api, panelName, 180000);
+        assert.ok(appeared, `panel "${panelName}" did not appear within 180 s`);
+
+        await api.pressDataViewerKey(panelName, 'Home');
+        const topRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange(panelName);
+            return r && r.end > 0 && r.end < N / 2 ? r : undefined;
+        }, 60000);
+        assert.ok(topRange,
+            `pre-drag Home reset did not land at the top within 60 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange(panelName))}`);
+
+        await api.dragDataViewerScrollbar(panelName, 1.0);
+
+        const bottomRange = await pollFor(() => {
+            const r = api.getDataViewerPanelVisibleRange(panelName);
+            return r && r.end === N ? r : undefined;
+        }, 60000);
+        assert.ok(bottomRange,
+            `10M-row drag-to-bottom did not reach the last row within 60 s; `
+            + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange(panelName))}`);
+
+        const viewportRange = await pollFor(() => {
+            const r = api.getDataViewerPanelViewportRange(panelName);
+            return r && r.end === N ? r : undefined;
+        }, 60000);
+        assert.ok(viewportRange,
+            `10M-row drag-to-bottom fetched the last row but did not render it on screen; `
+            + `last viewport range: ${JSON.stringify(api.getDataViewerPanelViewportRange(panelName))}; `
+            + `last fetched range: ${JSON.stringify(api.getDataViewerPanelVisibleRange(panelName))}`);
     });
 
     test('Drag scrollbar to 50% lands near row N/2 in 700K-row data frame', async function () {

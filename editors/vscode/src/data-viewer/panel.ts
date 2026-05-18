@@ -44,6 +44,11 @@ export class DataViewerPanel {
      *  message arrives; cleared on `replace()` so a stale range from the
      *  previous dataset is never returned for the new one. */
     private lastVisibleRange: { start: number; end: number } | undefined;
+    /** Latest on-screen row range observed via lifecycle events. This
+     *  excludes fetched-but-hidden overscan rows. */
+    private lastViewportRange: { start: number; end: number } | undefined;
+    /** Latest selected focus cell observed via lifecycle events. */
+    private lastFocusCell: { row: number; col: number } | undefined;
 
     private constructor(
         panelName: string,
@@ -114,6 +119,8 @@ export class DataViewerPanel {
         // dataset is never returned for the new one. The next lifecycle
         // event from the webview will repopulate it.
         this.lastVisibleRange = undefined;
+        this.lastViewportRange = undefined;
+        this.lastFocusCell = undefined;
         const prevReader = this.reader;
         const prevPath = this.filePath;
         this.reader = reader;
@@ -246,6 +253,9 @@ export class DataViewerPanel {
                 visibleRows: m.visibleRows,
                 visibleRangeStart: m.visibleRangeStart,
                 visibleRangeEnd: m.visibleRangeEnd,
+                viewportRangeStart: m.viewportRangeStart,
+                viewportRangeEnd: m.viewportRangeEnd,
+                focusCell: m.focusCell,
                 timestamp: m.timestamp,
             });
             // Cache the range only when both fields are finite numbers.
@@ -259,6 +269,21 @@ export class DataViewerPanel {
                     start: m.visibleRangeStart,
                     end: m.visibleRangeEnd,
                 };
+            }
+            if (m.panelGeneration === this.generation
+                && Number.isFinite(m.viewportRangeStart)
+                && Number.isFinite(m.viewportRangeEnd)) {
+                this.lastViewportRange = {
+                    start: m.viewportRangeStart,
+                    end: m.viewportRangeEnd,
+                };
+            }
+            if (m.panelGeneration === this.generation) {
+                this.lastFocusCell = m.focusCell
+                    && Number.isFinite(m.focusCell.row)
+                    && Number.isFinite(m.focusCell.col)
+                    ? { row: m.focusCell.row, col: m.focusCell.col }
+                    : undefined;
             }
             return;
         }
@@ -422,6 +447,21 @@ export class DataViewerPanel {
             : undefined;
     }
 
+    /** Latest on-screen row range from the most recent lifecycle message,
+     *  excluding overscan rows. */
+    getViewportRange(): { start: number; end: number } | undefined {
+        return this.lastViewportRange
+            ? { ...this.lastViewportRange }
+            : undefined;
+    }
+
+    /** Latest selected focus cell from the most recent lifecycle message. */
+    getFocusCell(): { row: number; col: number } | undefined {
+        return this.lastFocusCell
+            ? { ...this.lastFocusCell }
+            : undefined;
+    }
+
     /** Test-only: post a `testKey` message to the webview so it dispatches
      *  a synthetic KeyboardEvent on `window`. Awaiting the returned promise
      *  waits for the message to be queued, not for any reply; tests should
@@ -510,4 +550,3 @@ function build_html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 </body>
 </html>`;
 }
-

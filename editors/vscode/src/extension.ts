@@ -171,6 +171,14 @@ export interface RavenExtensionApi {
      *  position. */
     getDataViewerPanelVisibleRange(panelName: string):
         { start: number; end: number } | undefined;
+    /** Latest on-screen row range for a data viewer panel, excluding
+     *  fetched overscan rows. Used by integration tests. */
+    getDataViewerPanelViewportRange(panelName: string):
+        { start: number; end: number } | undefined;
+    /** Latest selected focus cell for a data viewer panel. Used by
+     *  integration tests. */
+    getDataViewerPanelFocusCell(panelName: string):
+        { row: number; col: number } | undefined;
     /** Test-only: dispatch a synthetic key event in a data viewer panel.
      *  Used by integration tests to drive End / Home / PageDown / PageUp.
      *  Awaiting waits for the message to be queued; poll
@@ -558,6 +566,10 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             data_viewer_manager?.getPanelColumnNames(panelName),
         getDataViewerPanelVisibleRange: (panelName: string) =>
             data_viewer_manager?.getPanelVisibleRange(panelName),
+        getDataViewerPanelViewportRange: (panelName: string) =>
+            data_viewer_manager?.getPanelViewportRange(panelName),
+        getDataViewerPanelFocusCell: (panelName: string) =>
+            data_viewer_manager?.getPanelFocusCell(panelName),
         pressDataViewerKey: async (panelName: string, key: string) => {
             await data_viewer_manager?.pressKeyOnPanel(panelName, key);
         },
