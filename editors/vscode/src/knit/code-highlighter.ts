@@ -25,7 +25,6 @@
 
 import type { GrammarRegistry, ScopeToken } from './grammar-registry';
 import {
-    colorFor,
     githubDark,
     githubLight,
     scopeToRole,
@@ -231,7 +230,11 @@ function paintLine(args: {
     overlays: readonly SemanticOverlay[];
     palette: GithubPalette;
 }): string {
-    const { line, lineStart, tokens, overlays, palette } = args;
+    // `palette` is no longer read here — spans use CSS variables now
+    // (see comment on the `<span>` emit below). It stays in the
+    // argument shape because `highlightCodeBlock` callers still pass
+    // it and may want to depend on this signature.
+    const { line, lineStart, tokens, overlays } = args;
     if (line.length === 0) return '';
 
     // Project overlays that intersect this line into (line-relative)
@@ -281,7 +284,16 @@ function paintLine(args: {
         if (role === null) {
             out.push(escapeHtml(slice));
         } else {
-            out.push(`<span style="color:${colorFor(palette, role)}">${escapeHtml(slice)}</span>`);
+            // Reference the `--raven-c-${role}` CSS variable rather
+            // than a baked-in palette hex. The standalone (browser)
+            // stylesheet swaps these variables under `@media
+            // (prefers-color-scheme: dark)`; an inline `color:#xxx`
+            // would override that swap and leave spans on the light
+            // palette in dark mode. The in-VS Code panel path also
+            // defines the variables, so the same var() form works
+            // for standalone-light, standalone-dark, panel-light,
+            // and panel-dark uniformly.
+            out.push(`<span style="color:var(--raven-c-${role})">${escapeHtml(slice)}</span>`);
         }
     }
     return out.join('');

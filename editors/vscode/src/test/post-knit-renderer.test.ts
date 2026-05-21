@@ -97,18 +97,23 @@ suite('runPostKnitRender end-to-end', () => {
         );
 
         // Inside <pre><code class="language-r">…</code></pre> we
-        // expect multiple distinct hex colours (the grammar paints
+        // expect multiple distinct token roles painted via
+        // `var(--raven-c-XXX)` references (the grammar paints
         // operators / strings / punctuation / etc. with different
-        // palette entries) and specifically the function colour
-        // (#8250df in the light palette) on `library`. This is the
-        // canary for the bug fixed in the same commit: VS Code's
-        // `markdown.api.render` pre-runs each code block through
-        // markdown-it's highlight.js hook and emits inline
-        // `<span class="hljs-…">` wrappers inside `<code>`. If
-        // `decodeCodeBlock` doesn't strip those wrappers before
-        // handing the body to vscode-textmate, the grammar tokenizes
-        // the literal HTML markup as R source and the resulting
-        // output ends up monochrome.
+        // role variables) and specifically the function role on
+        // `library`. This is the canary for the bug fixed in an
+        // earlier commit: VS Code's `markdown.api.render` pre-runs
+        // each code block through markdown-it's highlight.js hook
+        // and emits inline `<span class="hljs-…">` wrappers inside
+        // `<code>`. If `decodeCodeBlock` doesn't strip those
+        // wrappers before handing the body to vscode-textmate, the
+        // grammar tokenizes the literal HTML markup as R source and
+        // the resulting output ends up monochrome.
+        //
+        // Spans use CSS variables (not baked-in hex) so the
+        // stylesheet's palette swap — both the `prefers-color-scheme:
+        // dark` swap on the standalone file and the panel theme
+        // swap — actually reaches the highlighted spans.
         const blockMatch = html.match(
             /<pre><code class="language-r">([\s\S]*?)<\/code><\/pre>/i,
         );
@@ -117,20 +122,20 @@ suite('runPostKnitRender end-to-end', () => {
             'expected a <pre><code class="language-r">...</code></pre> block in the output',
         );
         const body = blockMatch![1];
-        const colours = new Set<string>();
-        const reColour = /color:(#[0-9a-fA-F]{3,8})/g;
+        const roleVars = new Set<string>();
+        const reRoleVar = /color:var\((--raven-c-[a-z]+)\)/g;
         let m: RegExpExecArray | null;
-        while ((m = reColour.exec(body)) !== null) {
-            colours.add(m[1].toLowerCase());
+        while ((m = reRoleVar.exec(body)) !== null) {
+            roleVars.add(m[1]);
         }
         assert.ok(
-            colours.size >= 2,
-            `expected multiple distinct hex colours inside the R block, got ` +
-                `${colours.size} (${[...colours].join(', ')})\n---body---\n${body}`,
+            roleVars.size >= 2,
+            `expected multiple distinct --raven-c-* role variables inside the R block, got ` +
+                `${roleVars.size} (${[...roleVars].join(', ')})\n---body---\n${body}`,
         );
         assert.ok(
-            body.toLowerCase().includes('color:#8250df">library'),
-            `expected #8250df (function colour) on library; body:\n${body}`,
+            body.includes('color:var(--raven-c-function)">library'),
+            `expected --raven-c-function (function role) on library; body:\n${body}`,
         );
     });
 

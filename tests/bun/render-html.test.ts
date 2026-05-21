@@ -147,9 +147,12 @@ describe('renderKnitHtml', () => {
             registry: fakeRegistry({ r: toyRTokenizer }),
         });
 
-        // The body must include a span with the function color.
+        // The body must include a function-role span. Spans
+        // reference the palette via the `--raven-c-${role}` CSS
+        // variable so the surrounding stylesheet's palette swap
+        // (e.g. browser dark-mode `@media` swap) reaches them.
         expect(out).toContain(
-            `<span style="color:${githubLight.roles.function}">library</span>`,
+            `<span style="color:var(--raven-c-function)">library</span>`,
         );
         // Surrounding prose is preserved.
         expect(out).toContain('<p>prose</p>');
@@ -189,7 +192,7 @@ describe('renderKnitHtml', () => {
         });
 
         expect(out).toContain(
-            `<span style="color:${githubLight.roles.function}">library</span>`,
+            `<span style="color:var(--raven-c-function)">library</span>`,
         );
     });
 
@@ -247,7 +250,7 @@ describe('renderKnitHtml', () => {
         // re-encoding code-block text for HTML safety). The
         // `<span>` wrapper around `f` MUST appear at start.
         expect(out).toContain(
-            `<span style="color:${githubLight.roles.function}">f</span>`,
+            `<span style="color:var(--raven-c-function)">f</span>`,
         );
         expect(out).toContain('&lt;-');
     });
@@ -260,11 +263,58 @@ describe('renderKnitHtml', () => {
             registry: fakeRegistry({ r: toyRTokenizer }),
             themeClasses: 'vscode-dark',
         });
+        // The span itself references the CSS variable (uniform shape
+        // across all themes). The "this is dark" property lives in
+        // the stylesheet: under `vscode-dark`, `composeStylesheet`
+        // only emits the dark palette into `:root`, so the var()
+        // references resolve to the dark function color.
         expect(out).toContain(
-            `<span style="color:${githubDark.roles.function}">library</span>`,
+            `<span style="color:var(--raven-c-function)">library</span>`,
         );
+        expect(out).toContain(`--raven-c-function: ${githubDark.roles.function};`);
+        expect(out).not.toContain(`--raven-c-function: ${githubLight.roles.function};`);
         expect(out).toContain(githubDark.background);
         expect(out).not.toContain(githubLight.background);
+    });
+
+    test('standalone output paints spans via CSS variables so browser dark-mode reaches them', async () => {
+        // Regression: opening the rendered `<basename>.html` in a
+        // browser that resolves `prefers-color-scheme: dark` was
+        // flipping the page background to dark but leaving the
+        // syntax-highlighted code spans on the LIGHT palette colors.
+        //
+        // The `composeStylesheet(null)` path emits both palettes and
+        // swaps `--raven-c-*` variables inside an `@media (prefers-
+        // color-scheme: dark)` block, but spans were emitting
+        // `style="color:#8250df"` (the light function hex) baked at
+        // render time. An inline `style="color:..."` always wins over
+        // the variable-resolved palette rule, so the swap had no
+        // effect on the code spans.
+        //
+        // Spans MUST therefore reference the CSS variable rather than
+        // baked hex so the dark-palette swap actually reaches them.
+        const fakeHtml = '<pre><code class="language-r">library</code></pre>';
+        const out = await renderKnitHtml({
+            markdownSource: 'x',
+            renderMarkdown: async () => fakeHtml,
+            registry: fakeRegistry({ r: toyRTokenizer }),
+            themeClasses: null, // standalone (Open in Browser path)
+        });
+
+        // Function-role span MUST resolve its color through the
+        // CSS variable, not a static palette hex.
+        expect(out).toContain(
+            '<span style="color:var(--raven-c-function)">library</span>',
+        );
+        // Sanity: it must NOT bake the light-palette function hex
+        // into the span — that's the symptom of the bug.
+        expect(out).not.toContain(
+            `<span style="color:${githubLight.roles.function}">library</span>`,
+        );
+        // Sanity: the dark-palette `@media` swap is the thing the
+        // CSS variable resolves through under dark mode.
+        expect(out).toMatch(/@media\s*\(\s*prefers-color-scheme:\s*dark\s*\)/);
+        expect(out).toContain(`--raven-c-function: ${githubDark.roles.function};`);
     });
 
     test('falls back to grammar-only when fetchRSemanticTokens throws', async () => {
@@ -280,7 +330,7 @@ describe('renderKnitHtml', () => {
         // The toy tokenizer scopes letters as functions, so we still
         // get a function span — the overlay just isn't applied.
         expect(out).toContain(
-            `<span style="color:${githubLight.roles.function}">library</span>`,
+            `<span style="color:var(--raven-c-function)">library</span>`,
         );
     });
 });

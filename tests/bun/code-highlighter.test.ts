@@ -232,13 +232,18 @@ describe('highlightCodeBlock', () => {
             registry,
         });
         // `add` → function, `<-` → operator, `1` → number, spaces stay
-        // bare. Spans nest correctly and surrounding spaces escape clean.
+        // bare. Spans nest correctly and surrounding spaces escape
+        // clean. Span colors are emitted as `var(--raven-c-${role})`
+        // so the surrounding stylesheet's palette swap (e.g. the
+        // standalone-file `@media (prefers-color-scheme: dark)` rule)
+        // can flip colors without re-rendering — see `paintLine` in
+        // `code-highlighter.ts`.
         expect(html).toBe(
-            `<span style="color:${githubLight.roles.function}">add</span>` +
+            `<span style="color:var(--raven-c-function)">add</span>` +
             ` ` +
-            `<span style="color:${githubLight.roles.operator}">&lt;-</span>` +
+            `<span style="color:var(--raven-c-operator)">&lt;-</span>` +
             ` ` +
-            `<span style="color:${githubLight.roles.number}">1</span>`,
+            `<span style="color:var(--raven-c-number)">1</span>`,
         );
     });
 
@@ -262,7 +267,7 @@ describe('highlightCodeBlock', () => {
         });
         // The overlay must beat the grammar's `variable` role.
         expect(html).toBe(
-            `<span style="color:${githubLight.roles.function}">library</span>`,
+            `<span style="color:var(--raven-c-function)">library</span>`,
         );
     });
 
@@ -275,8 +280,8 @@ describe('highlightCodeBlock', () => {
             registry,
         });
         expect(html).toBe(
-            `<span style="color:${githubLight.roles.function}">a</span>\n` +
-            `<span style="color:${githubLight.roles.function}">b</span>`,
+            `<span style="color:var(--raven-c-function)">a</span>\n` +
+            `<span style="color:var(--raven-c-function)">b</span>`,
         );
     });
 

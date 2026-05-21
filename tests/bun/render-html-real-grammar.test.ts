@@ -6,10 +6,15 @@
  * test reproduces the symptom against the real grammar.
  *
  * Assertions:
- *   - the produced HTML contains multiple distinct hex colours inside
- *     `<pre><code class="language-r">`
- *   - `library` is painted with the function-role colour (#8250df) in
- *     the light palette
+ *   - the produced HTML contains multiple distinct
+ *     `var(--raven-c-XXX)` references inside `<pre><code
+ *     class="language-r">` (one per distinct token role the grammar
+ *     resolved to — that's the canary for "the grammar actually
+ *     painted multiple roles")
+ *   - `library` is painted with the `--raven-c-function` variable
+ *     (which the stylesheet's `:root` rule binds to the palette's
+ *     function color — light or dark depending on
+ *     `prefers-color-scheme`)
  *
  * The test loads vscode-textmate + vscode-oniguruma from the real
  * `editors/vscode/node_modules`. No VS Code launch needed.
@@ -20,7 +25,6 @@ import * as path from 'path';
 
 import { createGrammarRegistry } from '../../editors/vscode/src/knit/grammar-registry';
 import { renderKnitHtml } from '../../editors/vscode/src/knit/render-html';
-import { githubLight } from '../../editors/vscode/src/knit/code-highlighter';
 import type * as vscode from 'vscode';
 
 const VSCODE_R_PATH =
@@ -109,30 +113,34 @@ describe('renderKnitHtml against the real R grammar', () => {
         expect(blockMatch).not.toBeNull();
         const body = blockMatch![1];
 
-        // Collect every distinct `color:#xxxxxx` in the body.
-        const colors = new Set<string>();
-        for (const m of body.matchAll(/color:(#[0-9a-fA-F]{3,8})/g)) {
-            colors.add(m[1].toLowerCase());
+        // Collect every distinct `color:var(--raven-c-XXX)` in the
+        // body. Spans now use CSS variables (so the stylesheet's
+        // palette can be swapped under `prefers-color-scheme: dark`
+        // without re-rendering); the "different roles got painted"
+        // canary therefore looks for distinct variable references
+        // rather than distinct hex colors.
+        const roleVars = new Set<string>();
+        for (const m of body.matchAll(/color:var\((--raven-c-[a-z]+)\)/g)) {
+            roleVars.add(m[1]);
         }
 
         // Symptom assertions — these should all be true under a
         // working highlighter.
         expect(
-            colors.size,
-            `expected multiple distinct hex colours inside the R code block but found ${
-                colors.size
-            } (${[...colors].join(', ')})\n---HTML body---\n${body}`,
+            roleVars.size,
+            `expected multiple distinct --raven-c-* role references inside the R code block but found ${
+                roleVars.size
+            } (${[...roleVars].join(', ')})\n---HTML body---\n${body}`,
         ).toBeGreaterThanOrEqual(2);
 
         // `library` should resolve to the function role — either via
         // the grammar's scope chain or via Raven's LSP overlay (not
-        // exercised here). We assert the light-palette function
-        // colour from `github-colors.ts`.
-        const functionColor = githubLight.roles.function.toLowerCase(); // #8250df
+        // exercised here). We assert the function-role CSS variable
+        // appears on the `library` span.
         expect(
-            body.toLowerCase(),
-            `expected ${functionColor} (the function colour) somewhere in the R block\n---HTML body---\n${body}`,
-        ).toContain(`color:${functionColor}">library`);
+            body,
+            `expected --raven-c-function (the function role) on the library span\n---HTML body---\n${body}`,
+        ).toContain('color:var(--raven-c-function)">library');
     });
 
     itLive('grammar registry can prime the R language', async () => {
