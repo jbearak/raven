@@ -15,6 +15,7 @@ import {
     ValidatePathError,
 } from './r-expression';
 import { runKnit } from './knit-engine';
+import { computeMdOutputPath } from './knit-paths';
 import { resolveRConsoleActivation } from '../r-console-activation';
 import { KnitOutputPanel } from './knit-output-panel';
 import {
@@ -212,10 +213,17 @@ async function runKnitCommand(
     const { knitRootDir, cwd } = knitDirResult;
 
     // [6] Build R expression.
+    // Predict the intermediate .md path. knitr's default is "strip
+    // the .Rmd extension, append .md". We pass it explicitly so the
+    // TS-side renderer doesn't have to re-derive — and so any future
+    // user-overridable output location can flow through one place.
+    const mdOutputPath = computeMdOutputPath(fsPath);
+
     let expression: string;
     try {
         expression = buildKnitExpression({
             filePath: fsPath,
+            outputPath: mdOutputPath,
             format,
             knitRootDir,
         });
