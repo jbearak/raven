@@ -195,16 +195,34 @@ export function extractLanguageId(codeAttrs: string): string | null {
 }
 
 /**
- * Decode HTML-escaped code-block body back to its raw source. The
- * five HTML metacharacters that `markdown-it` escapes (`&`, `<`, `>`,
- * `"`, `'`) need to be reversed before we feed the text to
- * vscode-textmate.
+ * Decode HTML-escaped code-block body back to its raw source.
  *
- * Order matters: `&` must be reversed LAST so a literal `&amp;lt;`
- * (the escape sequence for `&lt;`) round-trips correctly.
+ * Two layers to reverse:
+ *
+ *   1. Inline highlighter markup. VS Code's `markdown.api.render`
+ *      runs each code block through markdown-it's `highlight` hook,
+ *      which on the preview pipeline pre-tokenizes via highlight.js
+ *      and emits `<span class="hljs-...">…</span>` wrappers inside
+ *      the `<code>`. Those tags are part of the markup, not of the
+ *      source. We strip them first so the inner text reads as a
+ *      verbatim copy of what the user wrote.
+ *
+ *   2. The five HTML metacharacters that the renderer escapes
+ *      (`&`, `<`, `>`, `"`, `'`) need to be reversed before we feed
+ *      the text to vscode-textmate.
+ *
+ * Stripping tags BEFORE entity-decoding is essential: in the
+ * rendered inner content every literal `<` from the source code has
+ * already been escaped to `&lt;`, so any remaining `<` is part of a
+ * highlighter tag. Decoding first would conflate the two.
+ *
+ * Entity-reversal order also matters: `&amp;` must be reversed LAST
+ * so a literal `&amp;lt;` (the escape sequence for the text `&lt;`)
+ * round-trips correctly.
  */
 export function decodeCodeBlock(encoded: string): string {
     return encoded
+        .replace(/<[^>]*>/g, '')
         .replace(/&lt;/gi, '<')
         .replace(/&gt;/gi, '>')
         .replace(/&quot;/gi, '"')

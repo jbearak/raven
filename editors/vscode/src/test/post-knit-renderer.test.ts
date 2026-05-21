@@ -95,6 +95,43 @@ suite('runPostKnitRender end-to-end', () => {
             /\bkatex\b/i.test(html),
             'KaTeX CSS should be inlined from vscode.markdown-math',
         );
+
+        // Inside <pre><code class="language-r">…</code></pre> we
+        // expect multiple distinct hex colours (the grammar paints
+        // operators / strings / punctuation / etc. with different
+        // palette entries) and specifically the function colour
+        // (#8250df in the light palette) on `library`. This is the
+        // canary for the bug fixed in the same commit: VS Code's
+        // `markdown.api.render` pre-runs each code block through
+        // markdown-it's highlight.js hook and emits inline
+        // `<span class="hljs-…">` wrappers inside `<code>`. If
+        // `decodeCodeBlock` doesn't strip those wrappers before
+        // handing the body to vscode-textmate, the grammar tokenizes
+        // the literal HTML markup as R source and the resulting
+        // output ends up monochrome.
+        const blockMatch = html.match(
+            /<pre><code class="language-r">([\s\S]*?)<\/code><\/pre>/i,
+        );
+        assert.ok(
+            blockMatch,
+            'expected a <pre><code class="language-r">...</code></pre> block in the output',
+        );
+        const body = blockMatch![1];
+        const colours = new Set<string>();
+        const reColour = /color:(#[0-9a-fA-F]{3,8})/g;
+        let m: RegExpExecArray | null;
+        while ((m = reColour.exec(body)) !== null) {
+            colours.add(m[1].toLowerCase());
+        }
+        assert.ok(
+            colours.size >= 2,
+            `expected multiple distinct hex colours inside the R block, got ` +
+                `${colours.size} (${[...colours].join(', ')})\n---body---\n${body}`,
+        );
+        assert.ok(
+            body.toLowerCase().includes('color:#8250df">library'),
+            `expected #8250df (function colour) on library; body:\n${body}`,
+        );
     });
 
     test('writes atomically via a temp-and-rename, leaving no stray .tmp files', async function () {

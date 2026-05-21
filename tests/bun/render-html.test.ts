@@ -58,6 +58,36 @@ describe('decodeCodeBlock', () => {
         // `&amp;lt;` should decode to `&lt;`, not `<`.
         expect(decodeCodeBlock('&amp;lt;')).toBe('&lt;');
     });
+
+    test('strips inline highlight.js wrapper spans before decoding entities', () => {
+        // VS Code's `markdown.api.render` pre-tokenizes code blocks
+        // via markdown-it's `highlight` hook (highlight.js by
+        // default), so the `<code>` body we receive contains nested
+        // `<span class="hljs-...">…</span>` wrappers. Those tags are
+        // markup, not source — they must be stripped before we
+        // hand the text to vscode-textmate or the grammar will
+        // tokenize the literal HTML markup as code.
+        const encoded =
+            'library<span class="hljs-punctuation">(</span>' +
+            'ggplot2<span class="hljs-punctuation">)</span>';
+        expect(decodeCodeBlock(encoded)).toBe('library(ggplot2)');
+    });
+
+    test('preserves user-source `<` (entity-escaped) after stripping markup', () => {
+        // Source `x <- 1` arrives as `x <span class="hljs-keyword">&lt;-</span> 1`.
+        // After stripping spans + decoding entities we should be left
+        // with `x <- 1` exactly.
+        const encoded = 'x <span class="hljs-keyword">&lt;-</span> 1';
+        expect(decodeCodeBlock(encoded)).toBe('x <- 1');
+    });
+
+    test('does not eat literal `&lt;span&gt;` text inside the source', () => {
+        // Pathological: the source itself literally contains `<span>`.
+        // The renderer escapes it to `&lt;span&gt;`. After our pass
+        // there are no real tags to strip, and entity-decoding
+        // restores the literal text.
+        expect(decodeCodeBlock('foo &lt;span&gt; bar')).toBe('foo <span> bar');
+    });
 });
 
 describe('composeStylesheet', () => {
