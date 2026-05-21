@@ -34,6 +34,7 @@ Code (authoritative for behavior):
 - Linting (style/lint diagnostics): `crates/raven/src/linting/` — opt-in lintr-equivalent rules in Rust, gated by `state.lint_config`. Honors `# nolint` / `# nolint start/end` and `# @lsp-ignore` / `# @lsp-ignore-next`.
 - Packages: `crates/raven/src/package_library.rs`, `crates/raven/src/r_subprocess.rs`
 - Diagnostic collectors: `crates/raven/src/handlers.rs` — `is_structural_non_reference` predicate is the single source of truth for "structural identifier; not a reference".
+- Knit pipeline: `editors/vscode/src/knit/` — `yaml-frontmatter.ts` (gate), `r-expression.ts` (knitr::knit call), `knit-engine.ts` (subprocess), `post-knit-renderer.ts` (live VS Code wiring), `render-html.ts` (pure orchestration), `grammar-registry.ts` (vscode-textmate lookup), `code-highlighter.ts` (GitHub palette + LSP overlay), `knit-paths.ts` (file-name derivation), `knit-output-panel.ts` (webview shell).
 
 ## Documentation requirements
 
@@ -77,6 +78,17 @@ When making significant changes:
   - `WorldState` stores both `raw_client_settings` and `raw_project_settings` as `serde_json::Value`s.
   - `config_file::recompute_parsed_configs(state)` is the only function that should write to `state.lint_config` / `cross_file_config` / etc. after a settings change.
   - Callers (`initialize`, `did_change_configuration`, `did_change_watched_files`) must mutate the raw layers and then call `recompute_parsed_configs`, never the parsers directly.
+
+- **Knit pipeline (HTML-only)**
+  - `Raven: Knit` only supports HTML outputs. The supported allow-list lives in `editors/vscode/src/knit/yaml-frontmatter.ts` (`SUPPORTED_HTML_FORMATS`). Anything else is refused via a synthesized `Blocker` (`buildNonHtmlFormatBlocker` in `knit-commands.ts`) with a copy-paste `rmarkdown::render` command. The blocker's R command MUST escape the YAML `format` through `escapeRString` — never interpolate raw.
+  - The R subprocess calls `knitr::knit` directly (not `rmarkdown::render`). The expression sets `knitr::opts_knit$set(root.dir = <root or getwd()>)`, runs `knitr::knit(input = ..., output = ..., envir = new.env(), quiet = TRUE)`, and emits `cat('Output created: ', out, '\n', sep = '')` so the existing `parseRenderedOutputPath` regex keeps working.
+  - The post-knit `<basename>.html` is written via temp-file + `fs.promises.rename` (in `post-knit-renderer.ts:writeFileAtomic`). Direct `fs.writeFile` to the destination is forbidden — a concurrent re-knit could overlap the panel's sync `readFileSync` and yield a truncated read.
+  - `createGrammarRegistry` is cached process-wide and invalidated by `vscode.extensions.onDidChange`. Don't rebuild per knit; the WASM init is expensive.
+  - R-grammar resolution priority MUST flow through both `pickContribution` AND the `byScopeName` map. Two passes in `collectGrammarContributions` ensure `Registry.loadGrammar(scopeName)` resolves the same contribution that `scopeNameFor` would pick.
+
+- **Rmd/Quarto semantic tokens**
+  - `semantic_tokens_for_rmd_document` (in `crates/raven/src/handlers.rs`) walks chunks via `chunks::detect_chunks`, parses each R chunk body in isolation with `tree_sitter_r`, and rebases each token's line by `header_line + 1`. Lines are split on `\n` with trailing `\r` stripped so CRLF documents flow cleanly through the parser. Non-R chunk languages (`is_r_chunk_language` matches only `"r"` and `"rscript"`) are skipped — never widen this without explicit thought about what knitr engines actually evaluate as R.
+  - The custom request `raven/semanticTokensForRString` exists for the knit-output webview pipeline to tokenize rendered code blocks without requiring the source document to be open as an LSP document. Keep its legend (single `function` entry) in sync with `textDocument/semanticTokens/full`.
 
 - **Package-mode scope contribution**
   - `PackageScopeContribution`'s `r_internal_symbols`, `imported_symbols`, `test_helper_symbols`, and `test_attached_packages` are injected into the queried file's scope by `append_package_contribution` (recursive path, depth 0) and `ScopeStream::snapshot()` (streaming path). Both gate on `is_r_source_path(uri, root)`: files under `R/` see `r_internal_symbols` + `imported_symbols`; files under `tests/testthat/` see those PLUS `test_helper_symbols` (per-helper-path keyed so a helper does not self-inject) PLUS `test_attached_packages` (added to `scope.inherited_packages`, modelling `testthat::test_check`'s implicit `library(testthat)`). Files outside `R/` / `tests/testthat/` get NO contribution.
