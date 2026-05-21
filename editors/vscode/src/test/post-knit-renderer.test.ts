@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { activate } from './helper';
-import { runPostKnitRender } from '../knit/post-knit-renderer';
+import { runPostKnitRender, __resetRegistryCacheForTesting } from '../knit/post-knit-renderer';
 
 /**
  * End-to-end test for the post-knit render pipeline. Drives the full
@@ -27,10 +27,12 @@ suite('runPostKnitRender end-to-end', () => {
 
     setup(() => {
         tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-post-knit-render-'));
+        __resetRegistryCacheForTesting();
     });
 
     teardown(() => {
         try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* noop */ }
+        __resetRegistryCacheForTesting();
     });
 
     test('writes a self-contained HTML file with the GitHub palette and a highlighted R code block', async function () {
@@ -92,6 +94,45 @@ suite('runPostKnitRender end-to-end', () => {
         assert.ok(
             /\bkatex\b/i.test(html),
             'KaTeX CSS should be inlined from vscode.markdown-math',
+        );
+    });
+
+    test('writes atomically via a temp-and-rename, leaving no stray .tmp files', async function () {
+        this.timeout(30000);
+        await activate();
+
+        const mdPath = path.join(tmp, 'atomic.md');
+        const htmlPath = path.join(tmp, 'atomic.html');
+        fs.writeFileSync(mdPath, '# Hello\n', 'utf-8');
+
+        const ravenExt = vscode.extensions.getExtension('jbearak.raven-r');
+        assert.ok(ravenExt);
+        const fakeContext = {
+            extensionUri: ravenExt.extensionUri,
+            subscriptions: [],
+        } as unknown as vscode.ExtensionContext;
+
+        await runPostKnitRender({
+            mdPath,
+            htmlPath,
+            context: fakeContext,
+            client: undefined,
+        });
+
+        const html = fs.readFileSync(htmlPath, 'utf-8');
+        // Sanity: it's a complete document, not a truncated write.
+        assert.match(html, /^<!doctype html>/i);
+        assert.ok(html.endsWith('</html>'));
+
+        // No stray temp files — they live in the same dir with a
+        // leading `.` and the `.tmp` suffix.
+        const stragglers = fs.readdirSync(tmp).filter((name) =>
+            name.startsWith('.atomic.html.') && name.endsWith('.tmp'),
+        );
+        assert.deepStrictEqual(
+            stragglers,
+            [],
+            `expected no stray .tmp files in ${tmp}, found ${JSON.stringify(stragglers)}`,
         );
     });
 

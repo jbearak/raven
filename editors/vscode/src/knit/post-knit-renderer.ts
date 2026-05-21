@@ -24,12 +24,59 @@
  *   7. Call `renderKnitHtml` and write the result to `htmlPath`.
  */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
-import { createGrammarRegistry } from './grammar-registry';
+import { createGrammarRegistry, type GrammarRegistry } from './grammar-registry';
 import { renderKnitHtml } from './render-html';
+
+/**
+ * Process-wide grammar registry cache.
+ *
+ * `vscode-oniguruma`'s WASM regex engine is a heavy initialisation
+ * cost (~5-10 ms by itself, plus per-grammar loads on top). The
+ * registry is functionally pure — it depends only on the currently-
+ * installed extensions' grammar contributions — so caching across
+ * knits is safe.
+ *
+ * Invalidation: `vscode.extensions.onDidChange` fires when an
+ * extension is installed, uninstalled, enabled, or disabled. We drop
+ * the cached registry on that signal so a user who installs (say)
+ * REditorSupport.r-syntax mid-session gets the new grammar on their
+ * next knit without restarting VS Code.
+ */
+let cachedRegistry: GrammarRegistry | null = null;
+let extensionsChangeListener: vscode.Disposable | null = null;
+
+function getOrCreateRegistry(context: vscode.ExtensionContext): GrammarRegistry {
+    if (extensionsChangeListener === null) {
+        extensionsChangeListener = vscode.extensions.onDidChange(() => {
+            cachedRegistry = null;
+        });
+        // The disposable's owner is the extension's lifetime — if
+        // anyone calls `runPostKnitRender` they're inside the
+        // extension activation, so subscribing the disposable here
+        // is safe.
+        context.subscriptions.push(extensionsChangeListener);
+    }
+    if (cachedRegistry !== null) return cachedRegistry;
+    const onigWasmPath = resolveOnigWasmPath(context);
+    cachedRegistry = createGrammarRegistry({
+        extensions: vscode.extensions.all,
+        getExtensionById: (id) => vscode.extensions.getExtension(id),
+        onigWasmPath,
+    });
+    return cachedRegistry;
+}
+
+/** Visible only for tests — drop the cached registry on demand. */
+export function __resetRegistryCacheForTesting(): void {
+    cachedRegistry = null;
+    extensionsChangeListener?.dispose();
+    extensionsChangeListener = null;
+}
 
 /**
  * Public entry point for stage 4c — call this from `renderOutcome`
@@ -60,12 +107,7 @@ export async function runPostKnitRender(args: {
     const markdownSource = await fs.promises.readFile(mdPath, 'utf-8');
 
     await activateMarkdownPipelineExtensions();
-    const onigWasmPath = resolveOnigWasmPath(context);
-    const registry = createGrammarRegistry({
-        extensions: vscode.extensions.all,
-        getExtensionById: (id) => vscode.extensions.getExtension(id),
-        onigWasmPath,
-    });
+    const registry = getOrCreateRegistry(context);
 
     const katexCss = await readKatexCss();
     const renderMarkdown = async (src: string): Promise<string> => {
@@ -106,7 +148,48 @@ export async function runPostKnitRender(args: {
         themeClasses: themeClasses ?? null,
     });
 
-    await fs.promises.writeFile(htmlPath, finalHtml, 'utf-8');
+    await writeFileAtomic(htmlPath, finalHtml);
+}
+
+/**
+ * Write `content` to `destPath` atomically.
+ *
+ * Two failure modes the naïve `writeFile` exposes:
+ *   1. Partial write — if the process dies (or the disk fills) mid-
+ *      write, the destination is truncated and the panel reads a
+ *      half-baked file.
+ *   2. Concurrent-write race — a second knit of the same source
+ *      could overlap the first knit's panel read. The panel uses
+ *      `fs.readFileSync`, so a write that happens to clobber the
+ *      file at the same moment can yield a partial read.
+ *
+ * Standard fix: write to a sibling temp file in the destination's
+ * directory, then `rename` over the destination. POSIX rename is
+ * atomic, and Node's `fs.promises.rename` uses MoveFileExW with
+ * `MOVEFILE_REPLACE_EXISTING` on Windows. The destination is either
+ * the previous version or the new complete version — never a
+ * truncation.
+ *
+ * Temp file lives next to the destination so the rename is on the
+ * same filesystem (cross-device rename would fall back to copy +
+ * unlink, losing the atomicity guarantee).
+ */
+async function writeFileAtomic(destPath: string, content: string): Promise<void> {
+    const dir = path.dirname(destPath);
+    const tmp = path.join(
+        dir,
+        `.${path.basename(destPath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`,
+    );
+    try {
+        await fs.promises.writeFile(tmp, content, 'utf-8');
+        await fs.promises.rename(tmp, destPath);
+    } catch (err) {
+        // Best-effort cleanup of the temp file on any failure. The
+        // rename may have succeeded after a partial-write — in which
+        // case unlinking the (now-orphaned) temp is the right move.
+        try { await fs.promises.unlink(tmp); } catch { /* ignore */ }
+        throw err;
+    }
 }
 
 /**
