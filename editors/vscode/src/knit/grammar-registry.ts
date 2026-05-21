@@ -126,6 +126,8 @@ export function createGrammarRegistry(args: {
     importOniguruma?: () => Promise<typeof import('vscode-oniguruma')>;
     /** Override grammar file reads for tests. */
     readGrammarFile?: (absolutePath: string) => Promise<string>;
+    /** Override onig.wasm reads for tests (default reads from `onigWasmPath`). */
+    readOnigWasm?: () => Promise<ArrayBuffer>;
 }): GrammarRegistry {
     const contributions = collectGrammarContributions(args.extensions);
 
@@ -140,14 +142,25 @@ export function createGrammarRegistry(args: {
     const importOniguruma = args.importOniguruma ?? (async () => import('vscode-oniguruma'));
     const readGrammarFile = args.readGrammarFile
         ?? (async (p: string) => fs.promises.readFile(p, 'utf-8'));
+    const readOnigWasm: () => Promise<ArrayBuffer> = args.readOnigWasm
+        ?? (async () => {
+            const buf = await fs.promises.readFile(args.onigWasmPath);
+            // Slice copies the relevant bytes into a fresh ArrayBuffer,
+            // preserving WASM-loader compatibility regardless of Node /
+            // bun / browser Buffer-backing differences.
+            return buf.buffer.slice(
+                buf.byteOffset,
+                buf.byteOffset + buf.byteLength,
+            ) as ArrayBuffer;
+        });
 
     async function ensureRegistry(): Promise<RegistryType> {
         if (registryPromise) return registryPromise;
         registryPromise = (async () => {
             const textmate = await importTextmate();
             const oniguruma = await importOniguruma();
-            const onigBuffer = await fs.promises.readFile(args.onigWasmPath);
-            await oniguruma.loadWASM(onigBuffer.buffer);
+            const onigBuffer = await readOnigWasm();
+            await oniguruma.loadWASM(onigBuffer);
             const onigLib: Promise<IOnigLib> = Promise.resolve({
                 createOnigScanner: (patterns: string[]) => oniguruma.createOnigScanner(patterns),
                 createOnigString: (s: string) => oniguruma.createOnigString(s),
@@ -221,6 +234,13 @@ export function createGrammarRegistry(args: {
  * Walk all installed extensions, collect every `contributes.grammars`
  * entry that maps a language ID we might tokenize. Returns lookup
  * tables keyed by lower-cased language ID and by scopeName.
+ *
+ * The `byScopeName` map is built in a second pass so it reflects the
+ * SAME priority logic as `pickContribution`. Without that, a user
+ * with both `vscode.r` and `REditorSupport.r-syntax` installed could
+ * have the wrong grammar loaded when `vscode-textmate` looks up
+ * `source.r` — the priority order would only affect language-ID
+ * lookups, not the scope-name path that `Registry.loadGrammar` takes.
  */
 function collectGrammarContributions(
     extensions: readonly vscode.Extension<unknown>[],
@@ -229,7 +249,6 @@ function collectGrammarContributions(
     byScopeName: Map<string, ResolvedContribution>;
 } {
     const byLanguage = new Map<string, ResolvedContribution[]>();
-    const byScopeName = new Map<string, ResolvedContribution>();
 
     for (const ext of extensions) {
         const grammars = readGrammarContributions(ext);
@@ -252,20 +271,47 @@ function collectGrammarContributions(
                 absolutePath,
                 embeddedLanguages: g.embeddedLanguages,
             };
-            // First contribution wins for byScopeName (multiple
-            // extensions contributing the same scopeName would be a
-            // mis-configuration on the user's side; we don't try to
-            // arbitrate).
-            if (!byScopeName.has(resolved.scopeName)) {
-                byScopeName.set(resolved.scopeName, resolved);
-            }
             const bucket = byLanguage.get(resolved.languageId);
             if (bucket) bucket.push(resolved);
             else byLanguage.set(resolved.languageId, [resolved]);
         }
     }
 
+    // Second pass: pick the canonical contribution per language using
+    // the priority logic, then index those by scopeName. If two
+    // languages happen to share a scopeName (rare but legal), the
+    // first language encountered wins — there is no priority signal
+    // across language IDs.
+    const byScopeName = new Map<string, ResolvedContribution>();
+    for (const [languageId, bucket] of byLanguage) {
+        const canonical = pickContributionFromBucket(languageId, bucket);
+        if (!canonical) continue;
+        if (!byScopeName.has(canonical.scopeName)) {
+            byScopeName.set(canonical.scopeName, canonical);
+        }
+    }
+
     return { byLanguage, byScopeName };
+}
+
+/**
+ * Internal: pick the canonical contribution from a per-language
+ * bucket using the same priority logic `pickContribution` exposes.
+ * Factored out so both byScopeName construction and lookup-time
+ * resolution share one source of truth.
+ */
+function pickContributionFromBucket(
+    languageId: string,
+    bucket: readonly ResolvedContribution[],
+): ResolvedContribution | null {
+    if (bucket.length === 0) return null;
+    if (languageId === 'r') {
+        for (const preferred of R_GRAMMAR_PRIORITY) {
+            const hit = bucket.find((b) => b.extensionId.toLowerCase() === preferred);
+            if (hit) return hit;
+        }
+    }
+    return bucket[0];
 }
 
 function readGrammarContributions(
@@ -300,18 +346,6 @@ function pickContribution(
     languageId: string,
 ): ResolvedContribution | null {
     const bucket = contributions.byLanguage.get(languageId);
-    if (!bucket || bucket.length === 0) return null;
-    if (languageId === 'r') {
-        // Prefer the R-grammar provider in priority order. We compare
-        // extension IDs case-insensitively because VS Code preserves
-        // the publisher's casing.
-        for (const preferred of R_GRAMMAR_PRIORITY) {
-            const hit = bucket.find((b) => b.extensionId.toLowerCase() === preferred);
-            if (hit) return hit;
-        }
-        // Fall through to first-wins. A user with neither REditorSupport
-        // nor vscode.r is unusual, but if they have a different R
-        // grammar installed we'd rather highlight than refuse.
-    }
-    return bucket[0];
+    if (!bucket) return null;
+    return pickContributionFromBucket(languageId, bucket);
 }

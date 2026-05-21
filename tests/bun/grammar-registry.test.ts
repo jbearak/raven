@@ -176,4 +176,65 @@ describe('GrammarRegistry.primeForLanguage', () => {
         const reg = buildRegistry([]);
         expect(await reg.primeForLanguage('nope')).toBe(false);
     });
+
+    /**
+     * Regression for the Codex stage-3 finding that priority ran
+     * only through `scopeNameFor` while the actual `Registry.loadGrammar`
+     * call resolved through a first-wins `byScopeName` map. Two
+     * extensions contributing the same `source.r` scope but at
+     * different priorities must resolve through the preferred one's
+     * grammar file (not whichever was enumerated first).
+     *
+     * We can't drive a real `vscode-textmate` load without onig.wasm,
+     * so we observe the priority by injecting a `readGrammarFile`
+     * stub that captures the resolved absolute path. The stub
+     * deliberately fails the read so `primeForLanguage` returns
+     * false, but it lets us assert WHICH file we tried to read.
+     */
+    test('R loadGrammar resolves through the priority-preferred extension when scopeNames collide', async () => {
+        const extensions: vscode.Extension<unknown>[] = [
+            fakeExtension('vscode.r', '/vsr', [
+                { language: 'r', scopeName: 'source.r', path: 'syntaxes/r.tmLanguage.json' },
+            ]),
+            fakeExtension('REditorSupport.r-syntax', '/syntax', [
+                { language: 'r', scopeName: 'source.r', path: 'syntaxes/r.tmLanguage.json' },
+            ]),
+        ];
+
+        const readAttempts: string[] = [];
+        const reg = createGrammarRegistry({
+            extensions,
+            getExtensionById: (id) => extensions.find((e) => e.id === id),
+            onigWasmPath: '/dummy/onig.wasm',
+            importTextmate: async () => ({
+                parseRawGrammar: () => ({} as any),
+                Registry: class FakeRegistry {
+                    constructor(public opts: any) {}
+                    async loadGrammar(scopeName: string) {
+                        // The Registry callback is what consults
+                        // `byScopeName` indirectly via the opts.loadGrammar
+                        // hook we provided. Call it so the readAttempts
+                        // capture fires.
+                        const raw = await this.opts.loadGrammar(scopeName);
+                        return raw ? ({ tokenizeLine: () => ({ tokens: [], ruleStack: null }) } as any) : null;
+                    }
+                },
+            } as any),
+            importOniguruma: async () => ({
+                loadWASM: async () => undefined,
+                createOnigScanner: () => ({}) as any,
+                createOnigString: () => ({}) as any,
+            } as any),
+            readGrammarFile: async (absolutePath: string) => {
+                readAttempts.push(absolutePath);
+                return '{"name":"r","scopeName":"source.r","patterns":[]}';
+            },
+            readOnigWasm: async () => new ArrayBuffer(0),
+        });
+
+        await reg.primeForLanguage('r');
+
+        expect(readAttempts).toHaveLength(1);
+        expect(readAttempts[0]).toBe('/syntax/syntaxes/r.tmLanguage.json');
+    });
 });

@@ -136,6 +136,38 @@ describe('semanticOverlaysFromLspData', () => {
             { start: 0, end: 3, role: 'function' },
         ] satisfies SemanticOverlay[]);
     });
+
+    test('drops tokens whose column overflows past the line\'s EOL', () => {
+        // Regression for Codex stage-3 finding: `lineStarts[N] + col`
+        // would land in line N+1's content when col overflows the
+        // intended line. Source: `ab\nfoo`. A token claiming
+        // (line=0, col=3, length=1) used to paint the `f` on line 1.
+        const source = 'ab\nfoo';
+        const data = [0, 3, 1, 0, 0];
+        expect(semanticOverlaysFromLspData(data, source)).toEqual([]);
+    });
+
+    test('clips a partial overflow to the line\'s EOL', () => {
+        // Source: `ab\nfoo`. A token claiming (line=0, col=1, length=5)
+        // starts validly on line 0 but extends past it; clip to the
+        // line's content (which ends just before the `\n`).
+        const source = 'ab\nfoo';
+        const data = [0, 1, 5, 0, 0];
+        expect(semanticOverlaysFromLspData(data, source)).toEqual([
+            { start: 1, end: 2, role: 'function' },
+        ] satisfies SemanticOverlay[]);
+    });
+
+    test('handles surrogate-pair UTF-16 columns correctly', () => {
+        // `😀` is 2 UTF-16 code units. A token at (line=0, col=2,
+        // length=4) should pick up `func` after the emoji on the same
+        // line, not roll over to the next line.
+        const source = '😀func\nbar';
+        const data = [0, 2, 4, 0, 0];
+        expect(semanticOverlaysFromLspData(data, source)).toEqual([
+            { start: 2, end: 6, role: 'function' },
+        ] satisfies SemanticOverlay[]);
+    });
 });
 
 describe('highlightCodeBlock', () => {

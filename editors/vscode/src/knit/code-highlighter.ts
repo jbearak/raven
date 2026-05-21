@@ -103,9 +103,18 @@ export function semanticOverlaysFromLspData(
 
         if (tokenType !== want) continue;
         if (line >= lineStarts.length) continue;
+        // Clip to the declared line so a maliciously-shaped or
+        // off-by-one server response can never paint into the wrong
+        // line. The line's content ends at the position of its
+        // trailing `\n` (one before `lineStarts[line + 1]`), or at
+        // `source.length` if this is the last line.
+        const lineEndExclusive =
+            line + 1 < lineStarts.length
+                ? lineStarts[line + 1] - 1
+                : source.length;
         const start = lineStarts[line] + col;
-        if (start < 0 || start >= source.length) continue;
-        const end = Math.min(start + length, source.length);
+        if (start < 0 || start >= lineEndExclusive) continue;
+        const end = Math.min(start + length, lineEndExclusive);
         if (end <= start) continue;
         overlays.push({ start, end, role });
     }
