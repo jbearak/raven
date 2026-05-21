@@ -15,7 +15,9 @@ import {
     ValidatePathError,
 } from './r-expression';
 import { runKnit } from './knit-engine';
-import { computeMdOutputPath } from './knit-paths';
+import { computeHtmlOutputPath, computeMdOutputPath } from './knit-paths';
+import { runPostKnitRender } from './post-knit-renderer';
+import type { LanguageClient } from 'vscode-languageclient/node';
 import { resolveRConsoleActivation } from '../r-console-activation';
 import { KnitOutputPanel } from './knit-output-panel';
 import {
@@ -39,6 +41,17 @@ type WorkingDirectoryMode = 'document' | 'project' | 'current';
 export interface KnitDeps {
     runKnit: typeof runKnit;
     showOrUpdatePanel: typeof KnitOutputPanel.showOrUpdate;
+    /**
+     * The live LSP client used by `runPostKnitRender` to fetch
+     * Raven's `function` semantic tokens. `undefined` is tolerated
+     * (the renderer falls back to grammar-only highlighting).
+     */
+    getLanguageClient: () => LanguageClient | undefined;
+    /**
+     * Post-knit render step. Defaults to `runPostKnitRender`; tests
+     * override to avoid touching the filesystem and the markdown API.
+     */
+    runPostKnitRender: typeof runPostKnitRender;
 }
 
 /**
@@ -52,6 +65,8 @@ export function registerKnitCommands(
     const resolved: KnitDeps = {
         runKnit: deps?.runKnit ?? runKnit,
         showOrUpdatePanel: deps?.showOrUpdatePanel ?? KnitOutputPanel.showOrUpdate,
+        getLanguageClient: deps?.getLanguageClient ?? (() => undefined),
+        runPostKnitRender: deps?.runPostKnitRender ?? runPostKnitRender,
     };
 
     let outputChannel: vscode.OutputChannel | undefined;
@@ -308,6 +323,8 @@ async function runKnitCommand(
         timeoutMs,
         context,
         showOrUpdatePanel: deps.showOrUpdatePanel,
+        getLanguageClient: deps.getLanguageClient,
+        runPostKnitRender: deps.runPostKnitRender,
     });
 }
 
@@ -321,6 +338,8 @@ interface RenderOutcomeCtx {
     timeoutMs: number;
     context: vscode.ExtensionContext;
     showOrUpdatePanel: KnitDeps['showOrUpdatePanel'];
+    getLanguageClient: KnitDeps['getLanguageClient'];
+    runPostKnitRender: KnitDeps['runPostKnitRender'];
 }
 
 /**
@@ -377,7 +396,13 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         return;
     }
 
-    // ok branch — multi-output handling prefers HTML.
+    // ok branch — `knitr::knit` writes an intermediate `.md` and the
+    // R expression emits one `Output created:` line pointing at it.
+    // Our post-knit renderer turns that `.md` into the final `.html`
+    // by running it through VS Code's markdown pipeline + Raven's
+    // syntax highlighter. The panel shows the resulting `.html`;
+    // "Open in Browser" opens the same `.html` so styling is
+    // consistent across surfaces.
     const base = outcome.cwd ?? path.dirname(ctx.fsPath);
     const absolutized = outcome.parsedOutputs.map((p) => absolutizeFromCwd(p, base));
     const primary = pickPrimaryOutput(absolutized);
@@ -387,50 +412,48 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         return;
     }
 
-    const ext = path.extname(primary).toLowerCase();
-    const baseLabel = path.basename(primary);
-    const isHtml = ext === '.html' || ext === '.htm';
-    const SHOW_ALL = 'Show All';
-    const OPEN = 'Open';
-
-    if (isHtml) {
-        const panelResult = await ctx.showOrUpdatePanel(ctx.context, {
-            sourceUri: ctx.sourceUri,
-            outputPath: primary,
-            output: ctx.output,
+    const mdPath = primary;
+    const htmlPath = computeHtmlOutputPath(ctx.fsPath);
+    try {
+        await ctx.runPostKnitRender({
+            mdPath,
+            htmlPath,
+            context: ctx.context,
+            client: ctx.getLanguageClient(),
         });
-        if (!panelResult.ok) {
-            ctx.output.appendLine(`[panel] ${panelResult.error}`);
-            // Fall through to the non-HTML reveal path.
-            void revealKnitOutput(primary);
-            return;
-        }
-        // No success popover here: the panel itself is the success
-        // signal, and a toast with a "Show Output Panel" button just
-        // points at content that's already on screen. For multi-
-        // output knits we still want the additional output paths
-        // discoverable — log them to the channel so the user can
-        // find them via `Raven: Knit — Show Output Channel` or by
-        // clicking the channel directly.
-        if (absolutized.length > 1) {
-            ctx.output.appendLine(
-                `[outputs] knit produced ${absolutized.length} files; primary shown in panel:`,
-            );
-            for (const p of absolutized) {
-                ctx.output.appendLine(`  - ${p}${p === primary ? ' (primary)' : ''}`);
-            }
-        }
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.output.appendLine(`[render] post-knit render failed: ${message}`);
+        ctx.output.show(true);
+        void vscode.window.showErrorMessage(
+            `Raven: Knit produced ${path.basename(mdPath)} but the HTML render step failed. See Raven: Knit output.`,
+        );
         return;
     }
 
-    // Non-HTML: PDF, Word, plain text, etc.
-    const buttons = absolutized.length > 1 ? [OPEN, SHOW_ALL] : [OPEN];
-    const label = absolutized.length > 1
-        ? `Raven: Knit succeeded: ${baseLabel} (and ${absolutized.length - 1} more).`
-        : `Raven: Knit succeeded: ${baseLabel}.`;
-    const choice = await vscode.window.showInformationMessage(label, ...buttons);
-    if (choice === OPEN) await revealKnitOutput(primary);
-    else if (choice === SHOW_ALL) ctx.output.show(true);
+    const panelResult = await ctx.showOrUpdatePanel(ctx.context, {
+        sourceUri: ctx.sourceUri,
+        outputPath: htmlPath,
+        output: ctx.output,
+    });
+    if (!panelResult.ok) {
+        ctx.output.appendLine(`[panel] ${panelResult.error}`);
+        void revealKnitOutput(htmlPath);
+        return;
+    }
+    // No success popover here: the panel itself is the success
+    // signal, and a toast with a "Show Output Panel" button just
+    // points at content that's already on screen. If knit produced
+    // additional outputs (rare under the new pipeline since we only
+    // run knitr::knit, which writes exactly one .md), log them.
+    if (absolutized.length > 1) {
+        ctx.output.appendLine(
+            `[outputs] knit produced ${absolutized.length} files; HTML shown in panel:`,
+        );
+        for (const p of absolutized) {
+            ctx.output.appendLine(`  - ${p}${p === primary ? ' (primary)' : ''}`);
+        }
+    }
 }
 
 /**
