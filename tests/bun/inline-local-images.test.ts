@@ -160,4 +160,57 @@ describe('inlineLocalImagesAsDataUrls', () => {
             expect(out).toContain('src="data:image/png;base64,');
         });
     });
+
+    test('inlines through a ?query cache-buster suffix', () => {
+        // htmlwidgets and similar markdown renderers append a
+        // version-style query to defeat HTTP caching. With the
+        // suffix landing inside `path.extname`, the inline pass
+        // used to bail out (MIME lookup fails on `.png?v=1`) and
+        // the broken-image icon appeared in the nested iframe.
+        // Splitting on `?` recovers the real file path.
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'figure'));
+            fs.writeFileSync(path.join(dir, 'figure', 'plot.png'), TINY_PNG);
+            const html = '<img src="figure/plot.png?v=1">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+            // The query suffix rides along on the data URL. It's
+            // meaningless to a data URL processor but harmless
+            // (and it preserves round-trip fidelity if anything
+            // downstream inspects the URL).
+            expect(out).toMatch(/src="data:image\/png;base64,[^"]+\?v=1"/);
+        });
+    });
+
+    test('preserves a #fragment suffix on the rewritten data URL', () => {
+        // `<img src="diagram.svg#layer-1">` is a real SVG view
+        // identifier — browsers honor fragments on SVG `img`
+        // sources to scroll to a named `<view>` element. The
+        // fragment MUST survive the inline rewrite or the
+        // panel's rendering of the image will differ from the
+        // standalone HTML opened in a browser.
+        withTempDir((dir) => {
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">' +
+                '<view id="layer-1" viewBox="0 0 1 1"/></svg>';
+            fs.writeFileSync(path.join(dir, 'diagram.svg'), svg);
+            const html = '<img src="diagram.svg#layer-1">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/svg+xml;base64,');
+            expect(out).toMatch(/src="data:image\/svg\+xml;base64,[^"]+#layer-1"/);
+        });
+    });
+
+    test('handles both ?query and #fragment together', () => {
+        // Cover the case where both appear (`?v=1#frag`). We
+        // split on the first `?` or `#` so the entire suffix
+        // (`?v=1#frag`) rides along on the data URL.
+        withTempDir((dir) => {
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+            fs.writeFileSync(path.join(dir, 'icon.svg'), svg);
+            const html = '<img src="icon.svg?v=1#frag">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/svg+xml;base64,');
+            expect(out).toMatch(/src="data:image\/svg\+xml;base64,[^"]+\?v=1#frag"/);
+        });
+    });
 });

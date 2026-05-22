@@ -81,9 +81,36 @@ export function inlineLocalImagesAsDataUrls(
         // don't read out-of-doc files, even when they're absolute.
         if (path.isAbsolute(src)) return match;
 
+        // Split src into the path portion and any trailing
+        // `?query` / `#fragment` suffix. htmlwidgets and similar
+        // markdown renderers sometimes emit cache-busters
+        // (`figure/plot.png?v=1`) and SVG view fragments
+        // (`diagram.svg#layer-1`). If we feed the whole src to
+        // `path.resolve` / `path.extname`, the suffix lands inside
+        // the filename and:
+        //   - the file-resolution `path.resolve(docDir, 'foo.png?v=1')`
+        //     points at a non-existent file (silent failure: the
+        //     src is returned unchanged and the broken-image icon
+        //     still surfaces in the nested iframe);
+        //   - `path.extname` returns `.png?v=1`, which doesn't map
+        //     to a MIME and the inline pass bails out.
+        //
+        // Splitting on the first `?` or `#` recovers the original
+        // file path. The fragment portion is re-attached to the
+        // emitted data URL because SVG fragment identifiers can
+        // navigate to a specific `<view>` element when used in
+        // `<img src="x.svg#viewname">`. The query portion is
+        // meaningless on a data URL (the URL itself IS the
+        // content, so there's nothing to cache-bust) but is also
+        // preserved for round-trip honesty — the cost is just a
+        // few extra bytes in the rewritten HTML.
+        const suffixStart = src.search(/[?#]/);
+        const srcPath = suffixStart >= 0 ? src.slice(0, suffixStart) : src;
+        const srcSuffix = suffixStart >= 0 ? src.slice(suffixStart) : '';
+
         // Strip a leading `./` (doesn't change semantics, just keeps
         // the path-traversal check simpler).
-        const relative = src.replace(/^\.\//, '');
+        const relative = srcPath.replace(/^\.\//, '');
         const resolved = path.resolve(docDir, relative);
         const docDirNorm = path.resolve(docDir) + path.sep;
         if (!(resolved + path.sep).startsWith(docDirNorm)) return match;
@@ -104,7 +131,7 @@ export function inlineLocalImagesAsDataUrls(
             return match;
         }
 
-        const dataUrl = `data:${mime};base64,${bytes.toString('base64')}`;
+        const dataUrl = `data:${mime};base64,${bytes.toString('base64')}${srcSuffix}`;
         const rewrittenAttrs = attrs.replace(srcMatch[0], `src="${dataUrl}"`);
         return `<img${rewrittenAttrs}>`;
     });

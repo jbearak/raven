@@ -19,12 +19,12 @@ import { open as fsOpen } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { AsyncRecordBatchFileReader } from 'apache-arrow';
 import {
-    Cell,
     encodeNumber,
     encodeString,
     encodeDate,
     encodeTimestampMicros,
 } from './wire-format';
+import type { Cell } from './wire-format';
 import { formatDeclaresInteger } from './format-string';
 
 /** Default cardinality threshold above which a dictionary is not shipped
