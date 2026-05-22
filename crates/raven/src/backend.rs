@@ -88,6 +88,23 @@ struct DocumentIndentUnitsChangedParams {
     units: Vec<DocumentIndentUnit>,
 }
 
+/// Parameters for the raven/semanticTokensForRString custom request.
+///
+/// Lets the Knit Output webview pipeline (`editors/vscode/src/knit/...`)
+/// fetch Raven's function-token classification for an arbitrary R code-block
+/// body, without requiring the source Rmd to be open as an LSP document. The
+/// returned tokens are encoded in the same LSP delta format as the
+/// standard `textDocument/semanticTokens/full` response, and use the same
+/// single-entry legend (`function`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SemanticTokensForRStringParams {
+    /// The raw R source text to tokenize. Treated as a single document for
+    /// parsing; multi-line input is supported. Line / column positions in
+    /// the response are relative to this string.
+    text: String,
+}
+
 fn normalize_document_indent_unit(unit: u32) -> u32 {
     unit.clamp(1, 8)
 }
@@ -4966,24 +4983,41 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        let (tree, text) = {
+        enum Mode {
+            // Live document, whole-document R tree already parsed by the
+            // document store. Used for plain `.R` / `.r` files.
+            FullR(tree_sitter::Tree, String),
+            // R Markdown / Quarto: the whole-document R tree spans prose +
+            // YAML + non-R chunks and is full of errors, so we route through
+            // a chunk-aware path that re-parses each R chunk body in
+            // isolation.
+            Rmd(String),
+        }
+        let mode = {
             let state = self.state.read().await;
             let doc = match state.get_document(&params.text_document.uri) {
                 Some(doc) => doc,
                 None => return Ok(None),
             };
-            if doc.file_type != crate::file_type::FileType::R || doc.is_rmd_document() {
+            if doc.file_type != crate::file_type::FileType::R {
                 return Ok(None);
             }
-            let tree = match &doc.tree {
-                Some(tree) => tree.clone(),
-                None => return Ok(None),
-            };
-            (tree, doc.text())
+            if doc.is_rmd_document() {
+                Mode::Rmd(doc.text())
+            } else {
+                let tree = match &doc.tree {
+                    Some(tree) => tree.clone(),
+                    None => return Ok(None),
+                };
+                Mode::FullR(tree, doc.text())
+            }
         };
-        match tokio::task::spawn_blocking(move || handlers::semantic_tokens_full(&tree, &text))
-            .await
-        {
+        let join = tokio::task::spawn_blocking(move || match mode {
+            Mode::FullR(tree, text) => handlers::semantic_tokens_full(&tree, &text),
+            Mode::Rmd(text) => handlers::semantic_tokens_for_rmd_document(&text),
+        })
+        .await;
+        match join {
             Ok(tokens) => Ok(Some(SemanticTokensResult::Tokens(tokens))),
             Err(e) => {
                 log::trace!("semantic_tokens_full: spawn_blocking failed: {e}");
@@ -6294,6 +6328,36 @@ impl Backend {
             .update(active_uri, visible_uris, params.timestamp_ms);
     }
 
+    /// Handle the raven/semanticTokensForRString custom request.
+    ///
+    /// Tokenizes a raw R source string using Raven's tree-sitter based
+    /// function-token detector and returns the result in the same LSP delta
+    /// format as `textDocument/semanticTokens/full`. The single-entry legend
+    /// (`function`) is identical to the live-document path, so the client
+    /// can reuse the same decoder.
+    ///
+    /// Used by the Knit Output webview pipeline: when rendering an R code
+    /// block in the Rmd preview, the extension calls this with the block's
+    /// raw text and overlays the resulting function spans on top of the
+    /// vscode-textmate grammar tokens. This sidesteps the source-to-HTML
+    /// position-mapping problem (pandoc may hide / reformat / reorder
+    /// chunks) by tokenizing each rendered block independently.
+    async fn handle_semantic_tokens_for_r_string(
+        &self,
+        params: SemanticTokensForRStringParams,
+    ) -> tower_lsp::jsonrpc::Result<SemanticTokens> {
+        let text = params.text;
+        match tokio::task::spawn_blocking(move || handlers::semantic_tokens_for_r_string(&text))
+            .await
+        {
+            Ok(tokens) => Ok(tokens),
+            Err(e) => {
+                log::trace!("semantic_tokens_for_r_string: spawn_blocking failed: {e}");
+                Err(tower_lsp::jsonrpc::Error::internal_error())
+            }
+        }
+    }
+
     /// Handle the raven/documentIndentUnitsChanged notification.
     ///
     /// Replaces the per-document indent unit map wholesale and triggers a
@@ -6541,6 +6605,10 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     .custom_method(
         "raven/documentIndentUnitsChanged",
         Backend::handle_document_indent_units_changed,
+    )
+    .custom_method(
+        "raven/semanticTokensForRString",
+        Backend::handle_semantic_tokens_for_r_string,
     )
     .finish();
     let service = RequestCancellationService::new(service, request_cancellation);

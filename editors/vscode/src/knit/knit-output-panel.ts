@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { buildShellHtml, isKnitOutputMessage } from './knit-output';
+import { inlineLocalImagesAsDataUrls } from './inline-images';
 
 /**
  * Webview panel that renders a single `.Rmd`'s rendered HTML output in
@@ -337,9 +338,26 @@ export class KnitOutputPanel {
         // The trailing slash is required so relative paths like
         // `img.png` resolve to `${dir}/img.png` rather than replacing
         // the last URL segment.
+        const docDir = path.dirname(args.outputPath);
         const baseHref = this.panel.webview
-            .asWebviewUri(vscode.Uri.file(path.dirname(args.outputPath) + path.sep))
+            .asWebviewUri(vscode.Uri.file(docDir + path.sep))
             .toString();
+        // Inline relative `<img>` sources as data URLs. VS Code's
+        // resource handler does NOT intercept subresource fetches
+        // issued from a nested `<iframe>` (the same restriction the
+        // srcdoc workaround handles for top-level navigation), so the
+        // `webview-resource://…/figure/plot-1.png` URL the `<base>`
+        // resolves an `<img src>` to escapes the protocol handler and
+        // hits the real network stack — yielding a broken-image icon
+        // even though the file exists on disk and the browser-open
+        // path renders it correctly. Inlining the bytes as
+        // `data:image/png;base64,…` sidesteps the resource handler
+        // entirely. The on-disk `.html` written by the post-knit
+        // renderer still references images by relative path, so
+        // "Open in Browser" stays self-contained without an inflated
+        // base64 payload. The mutation only touches the in-memory
+        // copy handed to the iframe.
+        htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output);
         this.panel.webview.html = buildShellHtml({
             htmlContent,
             baseHref,

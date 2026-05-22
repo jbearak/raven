@@ -48,6 +48,8 @@ suite('knit success: no popover when HTML output is shown', () => {
                 stderr: '',
             })) as KnitDeps['runKnit'],
             showOrUpdatePanel: (async () => ({ ok: true })) as KnitDeps['showOrUpdatePanel'],
+            getLanguageClient: () => undefined,
+            runPostKnitRender: (async () => undefined) as KnitDeps['runPostKnitRender'],
         };
 
         try {
@@ -116,6 +118,8 @@ suite('knit success: no popover when HTML output is shown', () => {
                 stderr: '',
             })) as KnitDeps['runKnit'],
             showOrUpdatePanel: (async () => ({ ok: true })) as KnitDeps['showOrUpdatePanel'],
+            getLanguageClient: () => undefined,
+            runPostKnitRender: (async () => undefined) as KnitDeps['runPostKnitRender'],
         };
 
         try {

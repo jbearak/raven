@@ -1830,7 +1830,9 @@
     "apache-arrow": "^21.1.0",
     "js-yaml": "^4.1.1",
     "jsonc-parser": "^3.3.1",
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^9.0.1",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.0"
   },
   "overrides": {
     "serialize-javascript": "^7.0.3",

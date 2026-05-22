@@ -1,4 +1,5 @@
 // Two-pass esbuild: extension bundle + webview bundles (Svelte).
+const fs = require('fs');
 const path = require('path');
 const esbuild = require('esbuild');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -65,6 +66,23 @@ async function buildSvelteWebview(name, entry) {
     });
 }
 
+/**
+ * Copy the bundled `onig.wasm` from `vscode-oniguruma` into `dist/` so
+ * the Knit Output rendering pipeline can load it at runtime via
+ * `extensionUri`. esbuild can't bundle .wasm into a CJS module, and
+ * `vscode-oniguruma`'s `loadWASM(buffer)` accepts the raw bytes — we
+ * read the file at runtime and pass them in. Keeping the asset in
+ * `dist/` (rather than `node_modules/`) ensures it stays in the
+ * shipped VSIX and resolves correctly from the bundled extension.
+ */
+function copyOnigWasm() {
+    const src = require.resolve('vscode-oniguruma/release/onig.wasm');
+    const dest = path.join(dist, 'onig.wasm');
+    if (!fs.existsSync(dist)) fs.mkdirSync(dist, { recursive: true });
+    fs.copyFileSync(src, dest);
+    console.log(`Copied ${path.relative(root, src)} -> ${path.relative(root, dest)}`);
+}
+
 (async () => {
     try {
         await Promise.all([
@@ -82,6 +100,7 @@ async function buildSvelteWebview(name, entry) {
                 path.join(root, 'src', 'data-viewer', 'webview', 'main.ts'),
             ),
         ]);
+        copyOnigWasm();
     } catch (err) {
         console.error(err);
         process.exit(1);
