@@ -1,10 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
     escapeHtml,
-    githubDark,
-    githubLight,
     highlightCodeBlock,
-    paletteForThemeClasses,
     scopeToRole,
     semanticOverlaysFromLspData,
     type SemanticOverlay,
@@ -66,23 +63,6 @@ describe('scopeToRole', () => {
 
     test('support.function maps to function', () => {
         expect(scopeToRole(['source.r', 'support.function.r'])).toBe('function');
-    });
-});
-
-describe('paletteForThemeClasses', () => {
-    test('null (browser) defaults to light palette', () => {
-        expect(paletteForThemeClasses(null)).toBe(githubLight);
-    });
-
-    test('vscode-light → light', () => {
-        expect(paletteForThemeClasses('vscode-light')).toBe(githubLight);
-        expect(paletteForThemeClasses('vscode-high-contrast-light extra-class')).toBe(githubLight);
-    });
-
-    test('default and dark → dark', () => {
-        expect(paletteForThemeClasses('vscode-dark')).toBe(githubDark);
-        expect(paletteForThemeClasses('vscode-high-contrast')).toBe(githubDark);
-        expect(paletteForThemeClasses('something-else')).toBe(githubDark);
     });
 });
 
@@ -228,7 +208,6 @@ describe('highlightCodeBlock', () => {
         const html = await highlightCodeBlock({
             source: 'add <- 1',
             languageId: 'r',
-            palette: githubLight,
             registry,
         });
         // `add` → function, `<-` → operator, `1` → number, spaces stay
@@ -261,7 +240,6 @@ describe('highlightCodeBlock', () => {
         const html = await highlightCodeBlock({
             source: 'library',
             languageId: 'r',
-            palette: githubLight,
             registry: flatRegistry,
             overlays: [{ start: 0, end: 7, role: 'function' }],
         });
@@ -276,7 +254,6 @@ describe('highlightCodeBlock', () => {
         const html = await highlightCodeBlock({
             source: 'a\nb',
             languageId: 'r',
-            palette: githubLight,
             registry,
         });
         expect(html).toBe(
@@ -301,7 +278,6 @@ describe('highlightCodeBlock', () => {
         const html = await highlightCodeBlock({
             source: '',
             languageId: 'r',
-            palette: githubLight,
             registry,
         });
         expect(html).toBe('');
@@ -313,7 +289,6 @@ describe('highlightCodeBlock', () => {
         const html = await highlightCodeBlock({
             source: 'a < b > c',
             languageId: 'no-such-language',
-            palette: githubLight,
             registry,
         });
         expect(html).toBe('a &lt; b &gt; c');

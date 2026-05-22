@@ -121,31 +121,14 @@ export function semanticOverlaysFromLspData(
 }
 
 /**
- * Resolve the active palette. `vscode-light` and high-contrast-light
- * map to `githubLight`; everything else (default dark, vscode-dark,
- * hc-black) maps to `githubDark`. The Knit Output webview shell sets a
- * `body.vscode-light` / `body.vscode-dark` / `body.vscode-high-contrast-light`
- * class which the caller passes in via `themeClasses`.
- *
- * For the standalone HTML file that `Open in Browser` opens, the
- * caller passes `null` here and emits both palettes wrapped in
- * `@media (prefers-color-scheme: ...)` rules. See `render-html.ts`.
- */
-export function paletteForThemeClasses(themeClasses: string | null): GithubPalette {
-    if (themeClasses === null) return githubLight; // browser default — light
-    if (/\bvscode-(light|high-contrast-light)\b/.test(themeClasses)) return githubLight;
-    return githubDark;
-}
-
-/**
  * Highlight a single code block.
  *
  * `languageId` is the lower-cased language tag (from
  * `<code class="language-XXX">`). When the grammar registry can't
  * produce a grammar for it (e.g. an obscure language not contributed
  * by any installed extension), the source is HTML-escaped and emitted
- * with no per-token coloring — the palette's `foreground` covers the
- * default text color via the surrounding `<pre>` style.
+ * with no per-token coloring — the surrounding `<pre>` palette
+ * variables cover the default text color.
  *
  * The output is a plain HTML string — no extra `<pre>` or `<code>`
  * wrappers, no whitespace munging — meant to be placed inside the
@@ -154,11 +137,10 @@ export function paletteForThemeClasses(themeClasses: string | null): GithubPalet
 export async function highlightCodeBlock(args: {
     source: string;
     languageId: string;
-    palette: GithubPalette;
     registry: GrammarRegistry;
     overlays?: readonly SemanticOverlay[];
 }): Promise<string> {
-    const { source, languageId, palette, registry, overlays = [] } = args;
+    const { source, languageId, registry, overlays = [] } = args;
 
     // Empty input → empty output. vscode-textmate handles empty
     // strings but the early return saves a grammar fetch.
@@ -203,7 +185,6 @@ export async function highlightCodeBlock(args: {
                 lineStart: lineStarts[lineIdx],
                 tokens: result.tokens,
                 overlays,
-                palette,
             }),
         );
         if (lineIdx + 1 < lines.length) out.push('\n');
@@ -228,12 +209,7 @@ function paintLine(args: {
     lineStart: number;
     tokens: readonly ScopeToken[];
     overlays: readonly SemanticOverlay[];
-    palette: GithubPalette;
 }): string {
-    // `palette` is no longer read here — spans use CSS variables now
-    // (see comment on the `<span>` emit below). It stays in the
-    // argument shape because `highlightCodeBlock` callers still pass
-    // it and may want to depend on this signature.
     const { line, lineStart, tokens, overlays } = args;
     if (line.length === 0) return '';
 

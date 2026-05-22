@@ -136,12 +136,3 @@ function roleForScope(scope: string): TokenRole | null {
     ) return 'constant';
     return null;
 }
-
-/**
- * Render a single CSS color for a role under the given palette. Falls
- * back to the palette foreground when `role` is null.
- */
-export function colorFor(palette: GithubPalette, role: TokenRole | null): string {
-    if (role === null) return palette.foreground;
-    return palette.roles[role];
-}
