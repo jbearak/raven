@@ -387,7 +387,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // invocation and surfaces a clear info message if the gate is
     // closed. Setting `raven.rmdKnit.enabled` to match the resolved gate
     // gates the command-palette entry.
-    registerKnit(context, r_console_resolved === 'enabled');
+    registerKnit(context, r_console_resolved === 'enabled', () => client);
 
     // Install nags (one-time recommendations to install quarto.quarto for .qmd
     // and REditorSupport.r-syntax for .Rmd grammar) and the Get-Started

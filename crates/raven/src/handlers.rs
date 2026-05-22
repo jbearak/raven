@@ -637,6 +637,133 @@ pub fn semantic_tokens_full(tree: &tree_sitter::Tree, text: &str) -> SemanticTok
     semantic_tokens_for_r_tree(tree.root_node(), text)
 }
 
+/// Compute full-document semantic tokens for a raw R source string.
+///
+/// Parses the string with `tree_sitter_r`, then runs the same function-token
+/// collector used for live LSP documents. Returns an empty token stream on
+/// parse failure. Used by:
+///
+/// * the chunk-aware Rmd/Quarto path (which feeds chunk bodies through this
+///   helper and rebases line numbers), and
+/// * the custom `raven/semanticTokensForRString` request, which lets the
+///   Knit Output webview pipeline tokenize each rendered R code block
+///   without needing the source document open as an LSP document.
+pub fn semantic_tokens_for_r_string(text: &str) -> SemanticTokens {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .is_err()
+    {
+        return SemanticTokens {
+            result_id: None,
+            data: Vec::new(),
+        };
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return SemanticTokens {
+            result_id: None,
+            data: Vec::new(),
+        };
+    };
+    semantic_tokens_for_r_tree(tree.root_node(), text)
+}
+
+/// Compute semantic tokens for an R Markdown / Quarto document.
+///
+/// Walks the document's R code chunks (via `chunks::detect_chunks(..., Rmd)`),
+/// parses each chunk body in isolation with `tree_sitter_r`, collects function
+/// tokens, then rebases each token's line by `chunk.header_line + 1` so the
+/// resulting positions are correct relative to the whole document. Non-R
+/// chunks (Python, SQL, etc.) and chunks with no body are skipped.
+///
+/// This handles the case the whole-document parser can't: the prose, YAML
+/// front matter, and embedded non-R chunks would all be reported as syntax
+/// errors by the R parser, so feeding the full Rmd text to
+/// `semantic_tokens_full` would produce garbage. Per-chunk parses give the
+/// parser clean inputs.
+///
+/// The legend stays the same as the live-document path: a single `function`
+/// entry, no modifiers.
+pub fn semantic_tokens_for_rmd_document(text: &str) -> SemanticTokens {
+    let chunks = crate::chunks::detect_chunks(text, crate::chunks::ChunkKind::Rmd);
+    let mut absolute_tokens: Vec<AbsoluteSemanticToken> = Vec::new();
+
+    // Split on '\n' (not `text.lines()`) so we keep one entry per source
+    // line. We trim a trailing `\r` off each line so CRLF documents do
+    // not surface the `\r` to tree-sitter — `chunks::detect_chunks` itself
+    // uses `text.lines()` which already strips CRLF, so chunk indices
+    // continue to line up with `document_lines` indexing.
+    let document_lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let total_lines = document_lines.len() as u32;
+
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .is_err()
+    {
+        return SemanticTokens {
+            result_id: None,
+            data: Vec::new(),
+        };
+    }
+
+    for chunk in &chunks {
+        if !is_r_chunk_language(&chunk.language) {
+            continue;
+        }
+        // Body lines: lines after the header fence, up to but not including the
+        // closing fence (end_line is the last content line, inclusive). When
+        // body_start > end_line the chunk is empty — skip it.
+        let body_start = chunk.header_line.saturating_add(1);
+        if body_start > chunk.end_line {
+            continue;
+        }
+        if body_start >= total_lines {
+            continue;
+        }
+        let end_line = chunk.end_line.min(total_lines.saturating_sub(1));
+        let body_lines = &document_lines[body_start as usize..=end_line as usize];
+        let body_text = body_lines.join("\n");
+        if body_text.is_empty() {
+            continue;
+        }
+        let Some(tree) = parser.parse(&body_text, None) else {
+            continue;
+        };
+        let mut chunk_tokens: Vec<AbsoluteSemanticToken> = Vec::new();
+        let chunk_body_lines: Vec<&str> = body_text.split('\n').collect();
+        collect_r_function_semantic_tokens(
+            tree.root_node(),
+            &body_text,
+            &chunk_body_lines,
+            &mut chunk_tokens,
+        );
+        for token in chunk_tokens {
+            absolute_tokens.push(AbsoluteSemanticToken {
+                line: token.line.saturating_add(body_start),
+                start: token.start,
+                length: token.length,
+            });
+        }
+    }
+
+    SemanticTokens {
+        result_id: None,
+        data: encode_semantic_tokens(absolute_tokens),
+    }
+}
+
+/// True for chunk language tags that should be tokenized as R. Pandoc/knitr
+/// permit a few aliases (`r`, `R`, plus the rare `Rscript`). The chunk
+/// detector lower-cases the tag before storing it, so a simple ASCII compare
+/// is sufficient here.
+fn is_r_chunk_language(language: &str) -> bool {
+    matches!(language, "r" | "rscript")
+}
+
 fn semantic_tokens_for_r_tree(root: Node, text: &str) -> SemanticTokens {
     let mut absolute_tokens = Vec::new();
     let lines: Vec<&str> = text.split('\n').collect();
@@ -15348,6 +15475,167 @@ mod tests {
     fn test_semantic_tokens_use_utf16_columns() {
         let code = "x <- \"😀\"; mean(1)";
         assert_eq!(semantic_token_spans(code), vec![(0, 11, 4)]);
+    }
+
+    /// Decode a `SemanticTokens` delta stream into `(line, start, length)`
+    /// tuples for ergonomic assertions in Rmd test cases.
+    fn decode_rmd_tokens(text: &str) -> Vec<(u32, u32, u32)> {
+        let tokens = semantic_tokens_for_rmd_document(text).data;
+        let mut spans = Vec::new();
+        let mut line = 0u32;
+        let mut start = 0u32;
+        for token in tokens {
+            line += token.delta_line;
+            start = if token.delta_line == 0 {
+                start + token.delta_start
+            } else {
+                token.delta_start
+            };
+            spans.push((line, start, token.length));
+        }
+        spans
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_emits_for_r_chunks() {
+        let rmd = "---\n\
+                   title: \"Demo\"\n\
+                   ---\n\
+                   \n\
+                   Some prose.\n\
+                   \n\
+                   ```{r setup}\n\
+                   library(ggplot2)\n\
+                   ```\n";
+        assert_eq!(
+            decode_rmd_tokens(rmd),
+            vec![(7, 0, 7)], // `library` on the line below the fence
+        );
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_skips_non_r_chunks() {
+        let rmd = "```{python}\n\
+                   import math\n\
+                   ```\n\
+                   \n\
+                   ```{r}\n\
+                   mean(1)\n\
+                   ```\n";
+        assert_eq!(
+            decode_rmd_tokens(rmd),
+            vec![(5, 0, 4)], // `mean`, the python chunk is skipped
+        );
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_handles_function_definitions() {
+        let rmd = "```{r}\n\
+                   f <- function(x) x + 1\n\
+                   g(1)\n\
+                   ```\n";
+        assert_eq!(
+            decode_rmd_tokens(rmd),
+            vec![
+                (1, 0, 1), // `f` definition
+                (2, 0, 1), // `g` call
+            ],
+        );
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_handles_multiple_chunks() {
+        let rmd = "```{r setup, include=FALSE}\n\
+                   library(ggplot2)\n\
+                   ```\n\
+                   \n\
+                   prose\n\
+                   \n\
+                   ```{r analysis}\n\
+                   mtcars |> head()\n\
+                   ```\n";
+        assert_eq!(
+            decode_rmd_tokens(rmd),
+            vec![
+                (1, 0, 7), // `library` in the first chunk
+                (7, 10, 4), // `head` in the second chunk
+            ],
+        );
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_recognizes_capital_r_lang_tag() {
+        // The fence header re lower-cases the language tag, so `{R}` /
+        // `{Rscript}` are treated the same as `{r}`. Regression test for
+        // the case-sensitivity gate.
+        let rmd = "```{R}\n\
+                   mean(1)\n\
+                   ```\n";
+        assert_eq!(decode_rmd_tokens(rmd), vec![(1, 0, 4)]);
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_empty_chunk_is_no_op() {
+        let rmd = "```{r}\n```\n";
+        assert!(decode_rmd_tokens(rmd).is_empty());
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_no_chunks_is_no_op() {
+        let rmd = "# Just prose\n\nNo code blocks here.\n";
+        assert!(decode_rmd_tokens(rmd).is_empty());
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_unclosed_chunk_runs_to_eof() {
+        // Mirrors `detect_rmd_chunks`'s tolerance for missing fences. We
+        // still want function tokens to come through from whatever R is in
+        // an unclosed chunk so the editor experience degrades gracefully.
+        let rmd = "```{r}\n\
+                   library(ggplot2)\n";
+        assert_eq!(decode_rmd_tokens(rmd), vec![(1, 0, 7)]);
+    }
+
+    #[test]
+    fn test_semantic_tokens_for_r_string_matches_full_path() {
+        let code = "add <- function(x) x\nadd(1)";
+        let from_string = semantic_tokens_for_r_string(code);
+        let tree = parse_r_code(code);
+        let from_tree = semantic_tokens_for_r_tree(tree.root_node(), code);
+        assert_eq!(from_string.data, from_tree.data);
+    }
+
+    #[test]
+    fn test_semantic_tokens_for_r_string_empty_input() {
+        let tokens = semantic_tokens_for_r_string("");
+        assert!(tokens.data.is_empty());
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_crlf_document() {
+        // Windows-style line endings: the chunk detector strips `\r\n`
+        // via `text.lines()`, but `semantic_tokens_for_rmd_document`
+        // splits on `\n` to keep indices aligned, so it has to trim
+        // trailing `\r` itself before feeding text to tree-sitter.
+        // Otherwise `library` would be `library\r` and tree-sitter
+        // would refuse to recognize it as a call head.
+        let rmd = "```{r}\r\nlibrary(ggplot2)\r\n```\r\n";
+        assert_eq!(decode_rmd_tokens(rmd), vec![(1, 0, 7)]);
+    }
+
+    #[test]
+    fn test_rmd_semantic_tokens_does_not_tokenize_non_r_engines() {
+        // Engines whose code is NOT R must be skipped. `rcpp` compiles
+        // C++, `sql` is the SQL engine, `bash`/`python`/`julia` speak
+        // their own languages. Lower-cased here because the chunk
+        // detector lower-cases the language tag.
+        for lang in ["rcpp", "sql", "bash", "python", "julia", "stan", "cpp"] {
+            let rmd = format!("```{{{lang}}}\nlibrary(ggplot2)\n```\n");
+            assert!(
+                decode_rmd_tokens(&rmd).is_empty(),
+                "language `{lang}` should not emit semantic tokens",
+            );
+        }
     }
 
     #[test]

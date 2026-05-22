@@ -5,6 +5,7 @@ import {
     detectBlockers,
     detectFormat,
     extractFrontmatter,
+    isSupportedHtmlFormat,
     parseFrontmatter,
 } from './yaml-frontmatter';
 import {
@@ -14,6 +15,9 @@ import {
     ValidatePathError,
 } from './r-expression';
 import { runKnit } from './knit-engine';
+import { computeHtmlOutputPath, computeMdOutputPath } from './knit-paths';
+import { runPostKnitRender } from './post-knit-renderer';
+import type { LanguageClient } from 'vscode-languageclient/node';
 import { resolveRConsoleActivation } from '../r-console-activation';
 import { KnitOutputPanel } from './knit-output-panel';
 import {
@@ -37,6 +41,17 @@ type WorkingDirectoryMode = 'document' | 'project' | 'current';
 export interface KnitDeps {
     runKnit: typeof runKnit;
     showOrUpdatePanel: typeof KnitOutputPanel.showOrUpdate;
+    /**
+     * The live LSP client used by `runPostKnitRender` to fetch
+     * Raven's `function` semantic tokens. `undefined` is tolerated
+     * (the renderer falls back to grammar-only highlighting).
+     */
+    getLanguageClient: () => LanguageClient | undefined;
+    /**
+     * Post-knit render step. Defaults to `runPostKnitRender`; tests
+     * override to avoid touching the filesystem and the markdown API.
+     */
+    runPostKnitRender: typeof runPostKnitRender;
 }
 
 /**
@@ -50,6 +65,8 @@ export function registerKnitCommands(
     const resolved: KnitDeps = {
         runKnit: deps?.runKnit ?? runKnit,
         showOrUpdatePanel: deps?.showOrUpdatePanel ?? KnitOutputPanel.showOrUpdate,
+        getLanguageClient: deps?.getLanguageClient ?? (() => undefined),
+        runPostKnitRender: deps?.runPostKnitRender ?? runPostKnitRender,
     };
 
     let outputChannel: vscode.OutputChannel | undefined;
@@ -182,6 +199,23 @@ async function runKnitCommand(
     // [4] Format detection.
     const format = detectFormat(parsed.value);
 
+    // [4a] Reject non-HTML output formats. `Raven: Knit` is scoped to
+    // HTML in this version; other formats (pdf_document, word_document,
+    // ioslides, custom output formats) should run through
+    // `rmarkdown::render` in the R console, which surfaces full pandoc
+    // behavior that we don't reproduce. We synthesize a Blocker so the
+    // user gets the same "Copy command" UX as the other refusal paths
+    // (custom knit:, runtime: shiny, site:).
+    //
+    // Ordering note: this gate runs AFTER `detectBlockers`, so a
+    // document that also declares `runtime: shiny` or `site:` will
+    // surface those (more-fundamental) blockers first. Format mismatch
+    // is the right thing to refuse only once those have been ruled out.
+    if (!isSupportedHtmlFormat(format)) {
+        await showBlocker(buildNonHtmlFormatBlocker(format), fsPath);
+        return;
+    }
+
     // [5] Resolve working directory.
     const workingDirectoryMode = vscode.workspace
         .getConfiguration('raven.knit')
@@ -194,10 +228,17 @@ async function runKnitCommand(
     const { knitRootDir, cwd } = knitDirResult;
 
     // [6] Build R expression.
+    // Predict the intermediate .md path. knitr's default is "strip
+    // the .Rmd extension, append .md". We pass it explicitly so the
+    // TS-side renderer doesn't have to re-derive — and so any future
+    // user-overridable output location can flow through one place.
+    const mdOutputPath = computeMdOutputPath(fsPath);
+
     let expression: string;
     try {
         expression = buildKnitExpression({
             filePath: fsPath,
+            outputPath: mdOutputPath,
             format,
             knitRootDir,
         });
@@ -282,6 +323,8 @@ async function runKnitCommand(
         timeoutMs,
         context,
         showOrUpdatePanel: deps.showOrUpdatePanel,
+        getLanguageClient: deps.getLanguageClient,
+        runPostKnitRender: deps.runPostKnitRender,
     });
 }
 
@@ -295,6 +338,8 @@ interface RenderOutcomeCtx {
     timeoutMs: number;
     context: vscode.ExtensionContext;
     showOrUpdatePanel: KnitDeps['showOrUpdatePanel'];
+    getLanguageClient: KnitDeps['getLanguageClient'];
+    runPostKnitRender: KnitDeps['runPostKnitRender'];
 }
 
 /**
@@ -351,7 +396,13 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         return;
     }
 
-    // ok branch — multi-output handling prefers HTML.
+    // ok branch — `knitr::knit` writes an intermediate `.md` and the
+    // R expression emits one `Output created:` line pointing at it.
+    // Our post-knit renderer turns that `.md` into the final `.html`
+    // by running it through VS Code's markdown pipeline + Raven's
+    // syntax highlighter. The panel shows the resulting `.html`;
+    // "Open in Browser" opens the same `.html` so styling is
+    // consistent across surfaces.
     const base = outcome.cwd ?? path.dirname(ctx.fsPath);
     const absolutized = outcome.parsedOutputs.map((p) => absolutizeFromCwd(p, base));
     const primary = pickPrimaryOutput(absolutized);
@@ -361,50 +412,82 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         return;
     }
 
-    const ext = path.extname(primary).toLowerCase();
-    const baseLabel = path.basename(primary);
-    const isHtml = ext === '.html' || ext === '.htm';
-    const SHOW_ALL = 'Show All';
-    const OPEN = 'Open';
-
-    if (isHtml) {
-        const panelResult = await ctx.showOrUpdatePanel(ctx.context, {
-            sourceUri: ctx.sourceUri,
-            outputPath: primary,
-            output: ctx.output,
+    const mdPath = primary;
+    const htmlPath = computeHtmlOutputPath(ctx.fsPath);
+    try {
+        await ctx.runPostKnitRender({
+            mdPath,
+            htmlPath,
+            context: ctx.context,
+            client: ctx.getLanguageClient(),
+            // Pass VS Code's active theme through so the rendered
+            // `<basename>.html` paints panel-side code spans with
+            // the editor theme rather than the user's OS color
+            // scheme. The standalone "Open in Browser" surface
+            // still gets the `prefers-color-scheme` swap because
+            // the .html embeds both palettes when `themeClasses`
+            // doesn't pin one — but here we DO want the panel to
+            // follow VS Code, so we pin the matching class.
+            themeClasses: themeClassesForActiveTheme(),
         });
-        if (!panelResult.ok) {
-            ctx.output.appendLine(`[panel] ${panelResult.error}`);
-            // Fall through to the non-HTML reveal path.
-            void revealKnitOutput(primary);
-            return;
-        }
-        // No success popover here: the panel itself is the success
-        // signal, and a toast with a "Show Output Panel" button just
-        // points at content that's already on screen. For multi-
-        // output knits we still want the additional output paths
-        // discoverable — log them to the channel so the user can
-        // find them via `Raven: Knit — Show Output Channel` or by
-        // clicking the channel directly.
-        if (absolutized.length > 1) {
-            ctx.output.appendLine(
-                `[outputs] knit produced ${absolutized.length} files; primary shown in panel:`,
-            );
-            for (const p of absolutized) {
-                ctx.output.appendLine(`  - ${p}${p === primary ? ' (primary)' : ''}`);
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.output.appendLine(`[render] post-knit render failed: ${message}`);
+        ctx.output.show(true);
+        // Knit itself succeeded — `mdPath` exists and is readable.
+        // Only the HTML render step failed. Offer the user a way
+        // to still see the markdown so a render-step regression
+        // (e.g. KaTeX CSS read failure, grammar registry init
+        // error) doesn't strand a successful knit with "no output
+        // at all" reported to the UI.
+        const OPEN_MD = 'Open Markdown';
+        const SHOW_OUTPUT = 'Show Output';
+        const choice = await vscode.window.showErrorMessage(
+            `Raven: Knit produced ${path.basename(mdPath)} but the HTML render step failed. ` +
+                `See Raven: Knit output for details.`,
+            OPEN_MD,
+            SHOW_OUTPUT,
+        );
+        if (choice === OPEN_MD) {
+            try {
+                const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(mdPath));
+                await vscode.window.showTextDocument(doc, { preview: false });
+            } catch (openErr) {
+                const openMsg = openErr instanceof Error ? openErr.message : String(openErr);
+                ctx.output.appendLine(`[render] failed to open ${mdPath}: ${openMsg}`);
+                void vscode.window.showErrorMessage(
+                    `Raven: Knit — could not open ${path.basename(mdPath)}: ${openMsg}`,
+                );
             }
+        } else if (choice === SHOW_OUTPUT) {
+            ctx.output.show(true);
         }
         return;
     }
 
-    // Non-HTML: PDF, Word, plain text, etc.
-    const buttons = absolutized.length > 1 ? [OPEN, SHOW_ALL] : [OPEN];
-    const label = absolutized.length > 1
-        ? `Raven: Knit succeeded: ${baseLabel} (and ${absolutized.length - 1} more).`
-        : `Raven: Knit succeeded: ${baseLabel}.`;
-    const choice = await vscode.window.showInformationMessage(label, ...buttons);
-    if (choice === OPEN) await revealKnitOutput(primary);
-    else if (choice === SHOW_ALL) ctx.output.show(true);
+    const panelResult = await ctx.showOrUpdatePanel(ctx.context, {
+        sourceUri: ctx.sourceUri,
+        outputPath: htmlPath,
+        output: ctx.output,
+    });
+    if (!panelResult.ok) {
+        ctx.output.appendLine(`[panel] ${panelResult.error}`);
+        void revealKnitOutput(htmlPath);
+        return;
+    }
+    // No success popover here: the panel itself is the success
+    // signal, and a toast with a "Show Output Panel" button just
+    // points at content that's already on screen. If knit produced
+    // additional outputs (rare under the new pipeline since we only
+    // run knitr::knit, which writes exactly one .md), log them.
+    if (absolutized.length > 1) {
+        ctx.output.appendLine(
+            `[outputs] knit produced ${absolutized.length} files; HTML shown in panel:`,
+        );
+        for (const p of absolutized) {
+            ctx.output.appendLine(`  - ${p}${p === primary ? ' (primary)' : ''}`);
+        }
+    }
 }
 
 /**
@@ -505,6 +588,71 @@ function readTimeoutMs(): number {
 function absolutizeFromCwd(raw: string, cwd: string): string {
     if (path.isAbsolute(raw)) return raw;
     return path.resolve(cwd, raw);
+}
+
+/**
+ * Map VS Code's active color theme to the body-class string the
+ * knit render pipeline expects. The string flows through
+ * `runPostKnitRender` → `renderKnitHtml` → `composeStylesheet`,
+ * whose regex matches `vscode-(light|high-contrast-light)` for the
+ * light branch and treats everything else as dark. We emit the
+ * canonical body-class name for each `ColorThemeKind` so future
+ * stylesheet rules can target high-contrast variants distinctly if
+ * they want to.
+ *
+ * Captured at render time only — the rendered `.html` is a snapshot
+ * on disk and does NOT re-render when the user flips themes. That
+ * gap is acceptable for an `Raven: Knit` invocation: the user has
+ * to re-knit to see updated R output anyway, and the standalone
+ * "Open in Browser" surface already covers OS-level dark mode via
+ * the embedded `prefers-color-scheme` swap when `themeClasses` is
+ * null.
+ */
+function themeClassesForActiveTheme(): string {
+    switch (vscode.window.activeColorTheme.kind) {
+        case vscode.ColorThemeKind.Light:
+            return 'vscode-light';
+        case vscode.ColorThemeKind.Dark:
+            return 'vscode-dark';
+        case vscode.ColorThemeKind.HighContrast:
+            return 'vscode-high-contrast';
+        case vscode.ColorThemeKind.HighContrastLight:
+            return 'vscode-high-contrast-light';
+        default:
+            // Future-proof: a new `ColorThemeKind` should default to
+            // the dark branch (which composeStylesheet uses as its
+            // catch-all) rather than crashing.
+            return 'vscode-dark';
+    }
+}
+
+/**
+ * Build the `Blocker` we surface when YAML `output:` resolves to a
+ * format Raven's HTML-only knit pipeline doesn't render (`pdf_document`,
+ * `word_document`, `ioslides_presentation`, custom output formats, …).
+ *
+ * Exported so the unit tests can exercise the escaping behavior without
+ * having to drive the full `runKnitCommand` flow. `format` is parsed
+ * out of YAML and can contain arbitrary characters (the map-key form
+ * isn't constrained), so the `copyCommand` MUST escape it through
+ * `escapeRString`: an unescaped value like `x'); system('rm -rf ~'); #`
+ * would otherwise close the outer R single-quoted literal and inject a
+ * follow-up call into the clipboard payload.
+ *
+ * Ordering note: this runs AFTER `detectBlockers`, so a document with
+ * `runtime: shiny` + a non-HTML `output:` surfaces the (more
+ * fundamental) shiny blocker first and never reaches this code path.
+ */
+export function buildNonHtmlFormatBlocker(format: string): Blocker {
+    const safeFormat = escapeRString(format);
+    return {
+        kind: 'non-html-format',
+        message:
+            `Raven: Knit only renders to HTML. The YAML \`output:\` field ` +
+            `requests \`${format}\`, which Raven doesn't handle in this version. ` +
+            `Run the equivalent in the R console.`,
+        copyCommand: `rmarkdown::render('FILENAME', output_format = ${safeFormat})`,
+    };
 }
 
 async function showBlocker(blocker: Blocker, fsPath: string): Promise<void> {

@@ -52,6 +52,8 @@ suite('knit progress lifecycle', () => {
                 };
             }) as KnitDeps['runKnit'],
             showOrUpdatePanel: (async () => ({ ok: true })) as KnitDeps['showOrUpdatePanel'],
+            getLanguageClient: () => undefined,
+            runPostKnitRender: (async () => undefined) as KnitDeps['runPostKnitRender'],
         };
 
         try {
@@ -97,6 +99,8 @@ suite('knit progress lifecycle', () => {
                     };
                 }) as KnitDeps['runKnit'],
                 showOrUpdatePanel: (async () => ({ ok: true })) as KnitDeps['showOrUpdatePanel'],
+            getLanguageClient: () => undefined,
+            runPostKnitRender: (async () => undefined) as KnitDeps['runPostKnitRender'],
             };
             const secondPromise = __runKnitCommandForTest({
                 uri: docUri,

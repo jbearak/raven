@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { LanguageClient } from 'vscode-languageclient/node';
 import { registerKnitCommands } from './knit-commands';
 
 /**
@@ -12,15 +13,24 @@ import { registerKnitCommands } from './knit-commands';
  * The `raven.rmdKnit.enabled` context key controls whether the
  * command-palette entry is visible — set from the *resolved* gate, not
  * the raw setting.
+ *
+ * `getLanguageClient` is a thunk over the (singleton) LSP client so
+ * the post-knit renderer can fetch Raven's `function` semantic tokens
+ * for R code blocks at render time, after the LSP has finished
+ * activating. The thunk pattern handles the activation race: knit can
+ * be invoked from a walkthrough button before the LSP fully starts,
+ * and the renderer tolerates `undefined` by falling back to
+ * grammar-only highlighting.
  */
 export function registerKnit(
     context: vscode.ExtensionContext,
     enabledFromGate: boolean,
+    getLanguageClient?: () => LanguageClient | undefined,
 ): void {
     void vscode.commands.executeCommand(
         'setContext',
         'raven.rmdKnit.enabled',
         enabledFromGate,
     );
-    registerKnitCommands(context);
+    registerKnitCommands(context, getLanguageClient ? { getLanguageClient } : undefined);
 }

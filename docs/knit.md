@@ -1,12 +1,30 @@
 # R Markdown knit
 
-Raven ships a single command, `Raven: Knit`, that runs
-[`rmarkdown::render`](https://rmarkdown.rstudio.com/) in a fresh R
-subprocess against the active `.Rmd` document and reveals the rendered
-output. It is intentionally narrow: previewing, `.qmd` rendering, and
-the RStudio "Knit to ..." dropdown are all out of scope. See
-[docs/coexistence.md](coexistence.md) for the surfaces Raven defers to
-other extensions (most notably `quarto.quarto` and
+Raven ships a single command, `Raven: Knit`, that renders the active
+`.Rmd` document to HTML and reveals the result in a webview panel.
+The pipeline is intentionally narrow:
+
+- HTML output only. Documents whose YAML `output:` resolves to
+  `pdf_document`, `word_document`, `ioslides_presentation`, custom
+  formats, etc. are refused with a copy-paste `rmarkdown::render(...)`
+  command. Run those formats manually in the R console.
+- No live preview. The Knit Output panel is a static viewer with a
+  Refresh button — not a live recompile.
+- No `.qmd` rendering. That belongs to `quarto.quarto`'s
+  `Quarto: Render`.
+
+For HTML, Raven calls
+[`knitr::knit`](https://yihui.org/knitr/) directly — not
+[`rmarkdown::render`](https://rmarkdown.rstudio.com/) — and renders
+the post-knit markdown through VS Code's built-in markdown pipeline
+(KaTeX math, image rewriting, registered `markdown-it` plugins).
+Code blocks are re-highlighted with the GitHub light/dark palette
+using whichever R / Python / SQL / Bash grammar your installed VS
+Code extensions contribute, with Raven's `function` semantic-token
+overlay layered on top of R blocks.
+
+See [docs/coexistence.md](coexistence.md) for the surfaces Raven
+defers to other extensions (most notably `quarto.quarto` and
 `REditorSupport.r-syntax`).
 
 ## When the command is available
@@ -30,28 +48,38 @@ explorer-context-menu hook is opt-in via your own keybindings).
 2. **YAML front matter parse.** Raven parses the `---` ... `---` block
    with the YAML failsafe schema. Malformed YAML opens the
    `Raven: Knit` output channel with the parse error.
-3. **Deferred-feature detection.** Raven refuses three document shapes
+3. **Deferred-feature detection.** Raven refuses four document shapes
    it doesn't implement — `runtime: shiny`, a custom YAML `knit:` hook,
-   and the `site:` field for `rmarkdown::render_site` /
-   `bookdown::bookdown_site`. Each refusal includes a copy-pasteable R
-   command you can run yourself in the R console.
-4. **Format detection.** The first key under `output:` (or the string
-   value of `output:` if it's a single string, e.g.
-   `output: pdf_document`) is forwarded to `rmarkdown::render`. When
-   `output:` is absent Raven defaults to `html_document`.
+   the `site:` field for `rmarkdown::render_site` /
+   `bookdown::bookdown_site`, and any non-HTML output format. Each
+   refusal includes a copy-pasteable R command you can run yourself in
+   the R console.
+4. **Format gate.** The first key under `output:` (or the string value
+   of `output:` if it's a single string) must resolve to an HTML
+   format (`html_document`, `html_notebook`, `html_vignette`,
+   `html_fragment`, or one of the popular namespaced flavors from
+   `bookdown`, `distill`, `pkgdown`, `rmdformats`, `tufte`, and
+   `prettydoc`). Any other value is refused with a copy-paste
+   `rmarkdown::render('FILENAME', output_format = '...')` command.
+   When `output:` is absent Raven defaults to `html_document`.
 5. **Working-directory resolution.** Controlled by
    `raven.knit.workingDirectory`:
    - `document` (default) — directory containing the `.Rmd`.
    - `project` — workspace folder containing the `.Rmd`. Refuses if
      the document is outside every workspace folder.
-   - `current` — don't pass `knit_root_dir`; R uses its startup
-     working directory.
-6. **R expression construction.** Raven validates the file path and
-   format identifier (rejecting NUL, most control characters, DEL, and
-   any format outside `[A-Za-z0-9_:.-]+`) and escapes each interpolated
-   value as a single-quoted R literal. The result is one expression:
+   - `current` — substitutes `getwd()` for `root.dir`, so chunks
+     evaluate from R's startup working directory.
+6. **R expression construction.** Raven validates the file and output
+   paths (rejecting NUL, most control characters, DEL) and escapes
+   each interpolated value as a single-quoted R literal. The result
+   is one expression:
    ```r
-   rmarkdown::render(input = '...', output_format = '...', knit_root_dir = '...')
+   local({
+     knitr::opts_knit$set(root.dir = '...');
+     out <- knitr::knit(input = '...', output = '....md',
+                        envir = new.env(), quiet = TRUE);
+     cat('Output created: ', out, '\n', sep = '')
+   })
    ```
 7. **Subprocess spawn.** Raven spawns `R --no-save --no-restore -e
    <expression>` via `child_process.spawn` (never a shell), inheriting
@@ -65,16 +93,38 @@ explorer-context-menu hook is opt-in via your own keybindings).
    5 s. The default timeout is 10 minutes
    (`raven.knit.timeoutMs = 600000`). Windows uses `taskkill /T /F`
    instead of POSIX signals.
-10. **Reveal.** On a clean exit Raven parses `Output created: <path>`
-    out of stdout. When the primary output is HTML (or there's any HTML
-    in a multi-output knit), Raven opens it in a **Knit Output**
+10. **Post-knit render.** `knitr::knit` writes `<basename>.md` next to
+    the source. Raven reads that markdown, calls VS Code's
+    `markdown.api.render` to convert it to HTML (KaTeX math, image
+    rewriting, scroll-sync metadata, and any registered `markdown-it`
+    plugins all happen here), and then walks the result for
+    `<pre><code class="language-X">` blocks. Each block is
+    re-highlighted using:
+
+    - the GitHub light/dark palette (selected by VS Code's active
+      theme variant when shown in the panel; by
+      `prefers-color-scheme` when the same file is opened in a
+      browser);
+    - whichever TextMate grammar your installed VS Code extensions
+      contribute for the chunk's language. For R the resolution
+      priority is `REditorSupport.r-syntax` →
+      `REditorSupport.r` → the built-in `vscode.r`;
+    - Raven's `function` LSP semantic-token overlay on top of R
+      blocks, so function definitions and call heads pick up the
+      `function` color even when the TextMate grammar doesn't
+      classify them.
+
+    The result is written atomically to `<basename>.html` via a
+    temp-and-rename next to the source, so a concurrent re-knit
+    can never expose a half-written file to the panel.
+
+11. **Reveal.** Raven opens the rendered HTML in a **Knit Output**
     webview panel beside the editor — no success popover, the panel
     itself is the signal. Each `.Rmd` gets its own panel; knitting a
     second `.Rmd` opens a separate panel that stacks as a tab in the
     same "preview" column rather than replacing the first. Re-knitting
-    the same `.Rmd` updates its panel in place. For multi-output knits
-    the additional output paths are written to the `Raven: Knit`
-    output channel. The panel toolbar has three buttons:
+    the same `.Rmd` updates its panel in place. The panel toolbar
+    has three buttons:
 
     - **Knit again** — re-knits the source `.Rmd` (the same code path
       as invoking `Raven: Knit` from the palette).
@@ -112,10 +162,22 @@ explorer-context-menu hook is opt-in via your own keybindings).
     CSS, and fonts resolve through the webview's resource handler.
     Intra-document anchor links (`#section`) work; clicking an
     external `<a>` does nothing (use **Open in Browser** for full
-    interactivity, including htmlwidgets). For PDF / Word / etc.,
-    Raven still reveals the file in your OS file browser. When the
-    output-path parse fails Raven surfaces "Knit succeeded (output
-    path unknown)" — the subprocess exit code is the ground truth.
+    interactivity, including htmlwidgets). When the output-path
+    parse fails Raven surfaces "Knit succeeded (output path
+    unknown)" — the subprocess exit code is the ground truth.
+
+    The on-disk artifacts after a successful knit are:
+
+    - `<basename>.md` — the intermediate markdown knitr wrote.
+      Kept on disk because it's useful for debugging: if a chunk
+      output looks wrong, the `.md` is the ground truth for what
+      knitr produced before the rendering step touched it.
+    - `<basename>.html` — the final rendered HTML the panel and
+      **Open in Browser** open.
+    - `<basename>_files/figure-md/` — figures emitted by knitr's
+      chunk hooks (plots, images), referenced from the `.md` by
+      relative path so they resolve in both the webview and the
+      browser.
 
 ## Settings
 
@@ -135,11 +197,12 @@ explorer-context-menu hook is opt-in via your own keybindings).
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | `.Rmd` grammar | `REditorSupport.r-syntax` or `REditorSupport.r` |
-| Knit-to-... format picker | `quarto render foo.Rmd --to <fmt>` |
+| Non-HTML output (`pdf_document`, `word_document`, `ioslides`, …) | `rmarkdown::render('FILENAME', output_format = '...')` in the R console (Raven shows the exact command via the "Copy command" affordance) |
 | Custom YAML `knit:` hook dispatch | Run the hook function manually in the R console |
 | Knit-with-Parameters dialog | Edit YAML defaults, or call `rmarkdown::render(params = list(...))` |
 | `runtime: shiny` documents | `rmarkdown::run('foo.Rmd')` in the R console |
 | `rmarkdown::render_site` | Run `rmarkdown::render_site()` in the R console |
+| YAML output options (`toc`, `theme`, `code_folding`, …) | Out of scope for the current HTML-only pipeline. Raven ignores them and emits its own minimal HTML shell. To honor the full template, run `rmarkdown::render(...)` in the R console. |
 
 A walkthrough ("Get started with Raven for R Markdown") in
 **Welcome ▸ Walkthroughs** wires installation of the recommended

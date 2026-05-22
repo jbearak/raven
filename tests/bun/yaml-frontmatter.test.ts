@@ -4,6 +4,7 @@ import {
     parseFrontmatter,
     detectFormat,
     detectBlockers,
+    isSupportedHtmlFormat,
 } from '../../editors/vscode/src/knit/yaml-frontmatter';
 
 describe('extractFrontmatter', () => {
@@ -82,6 +83,46 @@ describe('detectFormat', () => {
         expect(detectFormat({ output: null })).toBe('html_document');
         expect(detectFormat({ output: ['html_document', 'pdf_document'] }))
             .toBe('html_document');
+    });
+});
+
+describe('isSupportedHtmlFormat', () => {
+    test('accepts the rmarkdown default html_document', () => {
+        expect(isSupportedHtmlFormat('html_document')).toBe(true);
+    });
+
+    test('accepts common HTML variants', () => {
+        expect(isSupportedHtmlFormat('html_notebook')).toBe(true);
+        expect(isSupportedHtmlFormat('html_vignette')).toBe(true);
+        expect(isSupportedHtmlFormat('html_fragment')).toBe(true);
+    });
+
+    test('accepts namespaced HTML formats from common packages', () => {
+        expect(isSupportedHtmlFormat('bookdown::html_document2')).toBe(true);
+        expect(isSupportedHtmlFormat('distill::distill_article')).toBe(true);
+        expect(isSupportedHtmlFormat('tufte::tufte_html')).toBe(true);
+    });
+
+    test('rejects non-HTML formats', () => {
+        expect(isSupportedHtmlFormat('pdf_document')).toBe(false);
+        expect(isSupportedHtmlFormat('word_document')).toBe(false);
+        expect(isSupportedHtmlFormat('ioslides_presentation')).toBe(false);
+        expect(isSupportedHtmlFormat('revealjs::revealjs_presentation')).toBe(false);
+        expect(isSupportedHtmlFormat('bookdown::pdf_document2')).toBe(false);
+    });
+
+    test('rejects empty and unknown formats', () => {
+        // Empty format defaults to html_document elsewhere; here we are
+        // asserting the predicate's own behavior is "default to false on
+        // unknown". An empty / whitespace-only input is definitely
+        // unrecognized.
+        expect(isSupportedHtmlFormat('')).toBe(false);
+        expect(isSupportedHtmlFormat('   ')).toBe(false);
+        expect(isSupportedHtmlFormat('something_made_up')).toBe(false);
+    });
+
+    test('tolerates surrounding whitespace', () => {
+        expect(isSupportedHtmlFormat('  html_document  ')).toBe(true);
     });
 });
 

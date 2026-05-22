@@ -673,12 +673,35 @@ export function buildShellHtml(args: {
           // sentinel so the extension treats it as success.
           locationHref = 'cross-origin-blocked';
         }
+        // Inspect every <img> in the rendered iframe and report
+        // whether the browser actually fetched the bytes. Used by
+        // the diagnostic test that gates regressions for the
+        // "subresource loads from a nested iframe inside a VS Code
+        // webview" failure mode.
+        var imageStates = [];
+        try {
+          var idoc = iframe.contentDocument;
+          if (idoc) {
+            var imgs = idoc.querySelectorAll('img');
+            for (var i = 0; i < imgs.length; i++) {
+              var im = imgs[i];
+              imageStates.push({
+                src: im.getAttribute('src') || '',
+                resolvedSrc: im.src || '',
+                complete: !!im.complete,
+                naturalWidth: im.naturalWidth || 0,
+                naturalHeight: im.naturalHeight || 0,
+              });
+            }
+          }
+        } catch (e) { /* same-origin failure — leave empty */ }
         vscode.postMessage({
           type: 'iframeProbe',
           locationHref: locationHref,
           loadFired: loadFired,
           errorFired: errorFired,
           src: iframe.getAttribute('src'),
+          imageStates: imageStates,
         });
       });
       // Surface CSP violations so the test/diagnostic layer can

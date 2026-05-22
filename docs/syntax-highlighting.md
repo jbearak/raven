@@ -1,6 +1,6 @@
 # Syntax Highlighting
 
-Raven contributes syntax highlighting in two ways: LSP semantic tokens for R function names, plus TextMate grammars for JAGS, Stan, and R package development files. For R, Raven augments whatever TextMate grammar is already loaded rather than replacing it. For JAGS, Stan, and the package infrastructure files, Raven ships the grammar itself because VS Code doesn't bundle one.
+Raven contributes syntax highlighting in three ways: LSP semantic tokens for R function names (including inside R chunks of `.Rmd` / `.qmd` documents), TextMate grammars for JAGS, Stan, and R package development files, and a GitHub-themed highlighter for the rendered HTML output of `Raven: Knit`. For R in the editor, Raven augments whatever TextMate grammar is already loaded rather than replacing it. For JAGS, Stan, and the package infrastructure files, Raven ships the grammar itself because VS Code doesn't bundle one.
 
 ## R
 
@@ -11,7 +11,21 @@ Raven emits LSP semantic tokens for R function names. The token legend contains 
 
 This is intentionally narrow. The goal is to catch call and definition sites reliably via the tree-sitter AST, then let the TextMate grammar handle everything else (comments, strings, numbers, operators, roxygen tags, constants, storage types, brackets). Semantic tokens augment the grammar; they don't replace it.
 
+Semantic tokens fire inside `R` chunks of `.Rmd` / `.qmd` documents too. Raven walks the document chunk-by-chunk (via the same chunk detector used for the document outline), parses each R chunk body in isolation with tree-sitter, and rebases the tokens onto the full document so VS Code paints them in the editor. Non-R chunks (Python, SQL, Bash, etc.) are intentionally skipped — Raven is an R language server.
+
 Raven isn't the only R language server that emits semantic tokens — the one bundled with the full `REditorSupport.r` extension (distinct from the grammar-only `REditorSupport.r-syntax` discussed below) also does, with broader coverage. See [Coexistence](./coexistence.md) if you're running both.
+
+## Rendered HTML (Raven: Knit)
+
+`Raven: Knit` produces a self-contained `.html` next to the source `.Rmd`. Code blocks in that HTML are re-highlighted with a GitHub light/dark palette using whichever VS Code grammar contributes the chunk's language:
+
+- For R chunks, Raven walks the installed extensions in priority order — `REditorSupport.r-syntax`, then `REditorSupport.r`, then VS Code's built-in `vscode.r` — and uses the first grammar it finds. Function names get an additional `function` color via Raven's LSP semantic-token overlay, layered on top of the grammar's TextMate scopes. Without any of those extensions installed, R chunks render as plain monospace.
+- For non-R chunks (Python, SQL, Bash, Julia, …), Raven uses whichever grammar VS Code's installed extensions contribute for that language. Unknown languages render as plain monospace.
+- Untagged fences (``` ``` ``` without a language tag) are left as-is — same convention as the editor.
+
+The palette is picked at render time: the in-VS-Code panel uses the variant matching VS Code's body class (`vscode-light` or `vscode-dark`), and the standalone file (used by **Open in Browser**) ships both variants behind a `@media (prefers-color-scheme: dark)` query so the browser picks based on the system theme.
+
+Math (`$x$`, `$$x = y$$`, LaTeX environments) is rendered through VS Code's built-in `vscode.markdown-math` extension, which bundles KaTeX. Raven inlines that CSS into the standalone HTML so math also renders when the file is opened directly in a browser.
 
 ### VS Code's built-in R grammar vs. REditorSupport.r-syntax
 

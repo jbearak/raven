@@ -20,7 +20,7 @@ export type ParseResult =
     | { ok: true; value: FrontmatterDoc }
     | { ok: false; error: string };
 
-export type BlockerKind = 'knit-hook' | 'shiny' | 'site';
+export type BlockerKind = 'knit-hook' | 'shiny' | 'site' | 'non-html-format';
 
 export interface Blocker {
     kind: BlockerKind;
@@ -82,6 +82,41 @@ export function parseFrontmatter(body: string): ParseResult {
 }
 
 /**
+ * Format identifiers that Raven's HTML-only knit pipeline accepts.
+ *
+ * The new pipeline renders only HTML (via knitr + VS Code's markdown
+ * renderer + Raven's syntax highlighter). PDF / Word / slides / custom
+ * formats are explicitly out of scope; we surface a Blocker with a
+ * copy-paste R command instead. Aliases like `bookdown::html_document2`
+ * stay on the supported list because they ultimately produce HTML.
+ */
+const SUPPORTED_HTML_FORMATS: ReadonlySet<string> = new Set([
+    'html_document',
+    'html_notebook',
+    'html_vignette',
+    'html_fragment',
+    'bookdown::html_document2',
+    'distill::distill_article',
+    'pkgdown::html_document',
+    'rmdformats::readthedown',
+    'rmdformats::material',
+    'rmdformats::html_clean',
+    'rmdformats::html_docco',
+    'tufte::tufte_html',
+    'prettydoc::html_pretty',
+]);
+
+/**
+ * True when `format` produces HTML through the existing rmarkdown +
+ * pandoc pipeline AND would also produce HTML through the new
+ * knitr-direct pipeline. Unknown formats default to `false`; we err on
+ * the side of refusing rather than silently producing broken output.
+ */
+export function isSupportedHtmlFormat(format: string): boolean {
+    return SUPPORTED_HTML_FORMATS.has(format.trim());
+}
+
+/**
  * Format identifier the knit subprocess should pass to
  * `rmarkdown::render`'s `output_format` argument. Returns
  * `"html_document"` whenever the document doesn't specify a format we
@@ -95,7 +130,14 @@ export function detectFormat(fm: FrontmatterDoc): string {
     if (typeof output === 'object' && !Array.isArray(output)) {
         const keys = Object.keys(output as Record<string, unknown>);
         if (keys.length === 0) return 'html_document';
-        return keys[0];
+        // Trim object keys for consistency with the scalar-output path.
+        // Without this trim, a YAML map like `{" html_document ": {}}`
+        // would yield a value that the HTML-format predicate trims (and
+        // would otherwise accept) but that downstream
+        // `validateFormatIdentifier` rejects — the gate and the render
+        // path would disagree about the same string.
+        const trimmed = keys[0].trim();
+        return trimmed || 'html_document';
     }
     return 'html_document';
 }

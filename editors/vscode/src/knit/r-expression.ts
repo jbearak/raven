@@ -108,30 +108,86 @@ export function escapeRString(value: string): string {
 }
 
 export interface KnitExpressionInput {
+    /** Absolute path of the .Rmd file being knitted. */
     filePath: string;
-    format: string;
+    /**
+     * The intermediate Markdown file knitr writes. We pass it
+     * explicitly so the post-knit renderer doesn't have to guess
+     * where knitr's default-derived path landed.
+     */
+    outputPath: string;
+    /**
+     * Working directory for chunk evaluation. `null` means inherit
+     * the subprocess CWD (the user's `current` mode).
+     */
     knitRootDir: string | null;
+    /**
+     * The validated output-format identifier from YAML. The HTML-only
+     * pipeline doesn't pass this to R (knitr::knit doesn't care about
+     * formats; the .md → .html step is ours), but we keep it on the
+     * input shape so the caller's gate-check + validation remain
+     * symmetric with the previous `rmarkdown::render` flow. The
+     * format is still validated for shape so a bad value short-
+     * circuits before we spawn R.
+     */
+    format: string;
 }
 
 /**
- * Build the single-line R expression passed to `R -e`. Each interpolated
- * value is validated before escaping (see module docstring), so the
- * caller can rely on a clean throw rather than a half-escaped string if
- * the inputs are wrong.
+ * Build the single-line R expression passed to `R -e`.
+ *
+ * The new pipeline calls `knitr::knit` directly — not
+ * `rmarkdown::render` — because we render the resulting markdown to
+ * HTML ourselves via VS Code's `markdown.api.render`. This skips
+ * pandoc entirely for HTML output.
+ *
+ * Behavior:
+ *   - `knitr::opts_knit$set(root.dir = …)` mirrors what
+ *     `rmarkdown::render(knit_root_dir = …)` did before. When
+ *     `knitRootDir` is null we pin `root.dir` to `getwd()` so chunk
+ *     evaluation happens in the subprocess CWD (matches the `current`
+ *     mode contract).
+ *   - `output = …` makes the .md path deterministic so the TS-side
+ *     renderer knows where to find it.
+ *   - `envir = new.env()` isolates chunk evaluation, matching
+ *     rmarkdown's default.
+ *   - `quiet = TRUE` suppresses knitr's per-chunk progress output;
+ *     the output channel still records the final `Output created:`
+ *     line we emit.
+ *   - `cat('Output created: …')` keeps the existing
+ *     `parseRenderedOutputPath` contract — the classifier doesn't
+ *     care that knitr (not pandoc) is the producer.
+ *
+ * Each interpolated value is validated before escaping (see module
+ * docstring), so the caller can rely on a clean throw rather than a
+ * half-escaped string if the inputs are wrong.
  */
 export function buildKnitExpression(input: KnitExpressionInput): string {
     validatePathForRExpression(input.filePath);
+    validatePathForRExpression(input.outputPath);
     validateFormatIdentifier(input.format);
     if (input.knitRootDir !== null) {
         validatePathForRExpression(input.knitRootDir);
     }
 
-    const parts = [
-        `input = ${escapeRString(input.filePath)}`,
-        `output_format = ${escapeRString(input.format)}`,
-    ];
-    if (input.knitRootDir !== null) {
-        parts.push(`knit_root_dir = ${escapeRString(input.knitRootDir)}`);
-    }
-    return `rmarkdown::render(${parts.join(', ')})`;
+    const rootDirLiteral = input.knitRootDir !== null
+        ? escapeRString(input.knitRootDir)
+        : 'getwd()';
+
+    // One long expression, multiple statements joined with `;` so R
+    // can run it under a single `-e`. We wrap in `local({…})` to
+    // contain bindings and to keep the `out` variable from leaking.
+    const inputLit = escapeRString(input.filePath);
+    const outputLit = escapeRString(input.outputPath);
+    return [
+        'local({',
+        ` knitr::opts_knit$set(root.dir = ${rootDirLiteral});`,
+        ` out <- knitr::knit(`,
+        `input = ${inputLit},`,
+        ` output = ${outputLit},`,
+        ` envir = new.env(),`,
+        ` quiet = TRUE);`,
+        ` cat('Output created: ', out, '\\n', sep = '')`,
+        ' })',
+    ].join('');
 }

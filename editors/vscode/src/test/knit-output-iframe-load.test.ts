@@ -138,7 +138,92 @@ suite('KnitOutputPanel iframe loads rendered HTML', () => {
             output.dispose();
         }
     });
+
+    test('relative <img> in the rendered HTML loads inside the iframe', async function () {
+        this.timeout(30000);
+        await activate();
+
+        // Drop a real PNG (smallest valid PNG: 1×1 transparent) next
+        // to the rendered HTML. Knit output references it via a
+        // relative path the same way the post-knit pipeline emits
+        // `figure/plot-1.png` for actual knitr chunks.
+        const figDir = path.join(tmp, 'figure');
+        fs.mkdirSync(figDir, { recursive: true });
+        const pngBytes = Buffer.from(
+            '89504e470d0a1a0a0000000d4948445200000001000000010806000000' +
+            '1f15c4890000000d49444154789c63000100000005000174ec61e30000' +
+            '0000049454e44ae426082',
+            'hex',
+        );
+        const pngPath = path.join(figDir, 'plot-1.png');
+        fs.writeFileSync(pngPath, pngBytes);
+
+        const body = '<!doctype html><html><body>'
+            + '<img src="figure/plot-1.png" alt="diagnostic-marker">'
+            + '</body></html>';
+        const outputPath = path.join(tmp, 'analysis.html');
+        fs.writeFileSync(outputPath, body, 'utf-8');
+
+        const src = vscode.Uri.file(path.join(tmp, 'src.Rmd'));
+        const output = vscode.window.createOutputChannel('Knit Test');
+        try {
+            const r = await KnitOutputPanel.showOrUpdate(
+                {} as vscode.ExtensionContext,
+                { sourceUri: src, outputPath, output },
+            );
+            assert.deepStrictEqual(r, { ok: true });
+            const inst = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
+            assert.ok(inst);
+            const panel = inst.getPanelForTesting();
+
+            panel.reveal(panel.viewColumn ?? vscode.ViewColumn.Beside, false);
+            const probeResult = await probeIframe(panel.webview, 25000);
+
+            assert.ok(
+                probeResult.loadFired,
+                `iframe never fired load. ${JSON.stringify(probeResult)}`,
+            );
+            // The single <img> in the rendered HTML should be in the
+            // probe's imageStates with non-zero natural dimensions —
+            // meaning the browser actually fetched and decoded it.
+            assert.strictEqual(
+                probeResult.imageStates.length,
+                1,
+                `expected one <img> in the iframe, got ${JSON.stringify(probeResult.imageStates)}`,
+            );
+            const img = probeResult.imageStates[0];
+            // The panel inlines relative <img> sources as data URLs
+            // to work around the nested-iframe subresource issue: VS
+            // Code's resource handler doesn't intercept subresource
+            // fetches issued from a nested `<iframe srcdoc>`, so the
+            // webview-resource URL the `<base>` resolves them to
+            // escapes the handler and fails with a real DNS lookup.
+            // Inlining the bytes as `data:image/png;base64,…` removes
+            // the resource fetch entirely.
+            assert.ok(
+                img.src.startsWith('data:image/png;base64,'),
+                `expected the panel to inline the image as a data URL, got src=${img.src}`,
+            );
+            assert.ok(
+                img.naturalWidth > 0 && img.naturalHeight > 0,
+                `image did NOT load — complete=${img.complete}, ` +
+                    `naturalWidth=${img.naturalWidth}, ` +
+                    `resolvedSrc=${img.resolvedSrc.slice(0, 80)}…, ` +
+                    `cspViolations=${JSON.stringify(probeResult.cspViolations)}`,
+            );
+        } finally {
+            output.dispose();
+        }
+    });
 });
+
+interface ImageState {
+    src: string;
+    resolvedSrc: string;
+    complete: boolean;
+    naturalWidth: number;
+    naturalHeight: number;
+}
 
 interface ProbeResult {
     locationHref: string;
@@ -146,6 +231,7 @@ interface ProbeResult {
     errorFired: boolean;
     src: string | null;
     cspViolations: Array<{ violatedDirective: string; blockedURI: string }>;
+    imageStates: ImageState[];
 }
 
 /**
@@ -195,12 +281,20 @@ async function probeIframe(
             if (msg.type === 'iframeProbe') {
                 if (settled) return;
                 cleanup();
+                const rawStates = Array.isArray(msg.imageStates) ? msg.imageStates : [];
                 resolve({
                     locationHref: String(msg.locationHref ?? ''),
                     loadFired: Boolean(msg.loadFired),
                     errorFired: Boolean(msg.errorFired),
                     src: msg.src == null ? null : String(msg.src),
                     cspViolations: violations,
+                    imageStates: rawStates.map((s: Record<string, unknown>): ImageState => ({
+                        src: String(s.src ?? ''),
+                        resolvedSrc: String(s.resolvedSrc ?? ''),
+                        complete: Boolean(s.complete),
+                        naturalWidth: Number(s.naturalWidth ?? 0),
+                        naturalHeight: Number(s.naturalHeight ?? 0),
+                    })),
                 });
             }
         });
