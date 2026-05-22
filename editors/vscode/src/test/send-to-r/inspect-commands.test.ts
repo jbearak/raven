@@ -4,6 +4,7 @@ import {
     INSPECTION_COMMANDS,
     get_inspection_target,
 } from '../../send-to-r/inspect-commands';
+import { awaitActive } from '../helper';
 
 suite('quick inspection commands', () => {
     test('INSPECTION_COMMANDS wraps target in the documented R calls', () => {
@@ -135,6 +136,13 @@ suite('quick inspection commands', () => {
             return Promise.resolve(undefined);
         };
         try {
+            // `executeCommand` reads `vscode.window.activeTextEditor` to
+            // pick the document to inspect. `showTextDocument`'s promise
+            // resolves before VS Code finishes promoting the new editor to
+            // active under suite-cumulative load, so wait until our editor
+            // is actually active before firing the command — otherwise the
+            // assertion below may misattribute a stale R-editor's response.
+            await awaitActive(editor);
             await vscode.commands.executeCommand('raven.inspect.nrow');
         } finally {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any

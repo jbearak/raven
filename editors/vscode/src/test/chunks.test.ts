@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
+import { awaitActive } from './helper';
 
 const CHUNK_COMMANDS = [
     'raven.runCurrentChunk',
@@ -77,20 +78,49 @@ async function open_doc(
     content: string,
     language: 'rmd' | 'r' = 'rmd',
 ): Promise<vscode.TextEditor> {
+    let editor: vscode.TextEditor;
     if (language === 'rmd') {
         const tmp = path.join(os.tmpdir(), `raven-chunks-${randomUUID()}.rmd`);
         fs.writeFileSync(tmp, content);
         TEMP_FIXTURE_FILES.push(tmp);
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(tmp));
-        return vscode.window.showTextDocument(doc);
+        editor = await vscode.window.showTextDocument(doc);
+    } else {
+        const doc = await vscode.workspace.openTextDocument({ language, content });
+        editor = await vscode.window.showTextDocument(doc);
     }
-    const doc = await vscode.workspace.openTextDocument({ language, content });
-    return vscode.window.showTextDocument(doc);
+    // Without this wait, `vscode.window.activeTextEditor` can still point at
+    // a prior test's editor (or a webview-focused `undefined`) when the next
+    // `executeCommand` runs — chunk handlers then read the wrong document and
+    // produce "no R chunks found in this document". See `awaitActive` doc.
+    await awaitActive(editor);
+    return editor;
 }
 
 function place_cursor(editor: vscode.TextEditor, line: number, char = 0): void {
     const pos = new vscode.Position(line, char);
     editor.selection = new vscode.Selection(pos, pos);
+}
+
+/**
+ * Re-pin `editor` as the active editor, then invoke a Raven command.
+ *
+ * Every chunk command we exercise here reads
+ * `vscode.window.activeTextEditor` to find the document to operate on
+ * (`run_chunk` in `chunk-commands.ts`, the chunk-navigation handlers).
+ * Any await between `open_doc` and the command call (e.g.
+ * `dispose_any_cached_r_terminal`'s 200 ms sleep) is an opportunity for
+ * VS Code to steal focus, leaving `activeTextEditor` `undefined` or
+ * pointing at a different editor. When that happens the command runs
+ * against the wrong document and silently produces "no R chunks found
+ * in this document". Re-pinning right before the call closes that race.
+ */
+async function execute_chunk_command(
+    editor: vscode.TextEditor,
+    command: string,
+): Promise<void> {
+    await awaitActive(editor);
+    await vscode.commands.executeCommand(command);
 }
 
 interface MessageStub {
@@ -320,11 +350,11 @@ suite('chunk commands: registration and behavior', () => {
         if (r_console_disabled) return; // command not registered in this env
         const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 0); // before any chunk
-        await vscode.commands.executeCommand('raven.goToNextChunk');
+        await execute_chunk_command(editor, 'raven.goToNextChunk');
         // First chunk header is line 6 ("```{r setup, ...}"), body starts at line 7.
         assert.strictEqual(editor.selection.active.line, 7);
 
-        await vscode.commands.executeCommand('raven.goToNextChunk');
+        await execute_chunk_command(editor, 'raven.goToNextChunk');
         // Second runnable chunk header is the python one at 12, but navigation walks
         // every chunk regardless of language — the next chunk is python at 12, so
         // cursor lands on line 13 (body of the python chunk). That's intentional:
@@ -338,7 +368,7 @@ suite('chunk commands: registration and behavior', () => {
         if (r_console_disabled) return;
         const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the second R chunk body
-        await vscode.commands.executeCommand('raven.goToPreviousChunk');
+        await execute_chunk_command(editor, 'raven.goToPreviousChunk');
         // Previous chunk is python at line 12 → body line 13.
         assert.strictEqual(editor.selection.active.line, 13);
     });
@@ -349,7 +379,7 @@ suite('chunk commands: registration and behavior', () => {
         if (r_console_disabled) return;
         const editor = await open_doc(RMD_FIXTURE, 'rmd');
         place_cursor(editor, 17); // inside the "second" R chunk
-        await vscode.commands.executeCommand('raven.selectCurrentChunk');
+        await execute_chunk_command(editor, 'raven.selectCurrentChunk');
         const text = editor.document.getText(editor.selection);
         assert.strictEqual(text, 'x <- 1\ny <- 2');
     });
@@ -362,7 +392,7 @@ suite('chunk commands: registration and behavior', () => {
         place_cursor(editor, 4); // prose line, not in a chunk
         const stub = stub_information_message();
         try {
-            await vscode.commands.executeCommand('raven.runCurrentChunk');
+            await execute_chunk_command(editor, 'raven.runCurrentChunk');
         } finally {
             stub.restore();
         }
@@ -380,7 +410,7 @@ suite('chunk commands: registration and behavior', () => {
         place_cursor(editor, 13); // inside the python chunk
         const stub = stub_information_message();
         try {
-            await vscode.commands.executeCommand('raven.runCurrentChunk');
+            await execute_chunk_command(editor, 'raven.runCurrentChunk');
         } finally {
             stub.restore();
         }
@@ -398,7 +428,7 @@ suite('chunk commands: registration and behavior', () => {
         place_cursor(editor, 0);
         const stub = stub_information_message();
         try {
-            await vscode.commands.executeCommand('raven.runCurrentChunk');
+            await execute_chunk_command(editor, 'raven.runCurrentChunk');
         } finally {
             stub.restore();
         }
@@ -421,7 +451,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runCurrentChunk');
+            await execute_chunk_command(editor, 'raven.runCurrentChunk');
         } finally {
             term.restore();
         }
@@ -448,7 +478,7 @@ suite('chunk commands: registration and behavior', () => {
         if (r_console_disabled) return;
         const editor = await open_doc(R_CELL_FIXTURE, 'r');
         place_cursor(editor, 1); // inside cell "one"
-        await vscode.commands.executeCommand('raven.selectCurrentChunk');
+        await execute_chunk_command(editor, 'raven.selectCurrentChunk');
         const text = editor.document.getText(editor.selection);
         assert.strictEqual(text, 'a <- 1\nb <- 2');
     });
@@ -480,7 +510,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runNextChunk');
+            await execute_chunk_command(editor, 'raven.runNextChunk');
         } finally {
             term.restore();
         }
@@ -502,7 +532,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runPreviousChunk');
+            await execute_chunk_command(editor, 'raven.runPreviousChunk');
         } finally {
             term.restore();
         }
@@ -523,7 +553,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runBelowChunks');
+            await execute_chunk_command(editor, 'raven.runBelowChunks');
         } finally {
             term.restore();
         }
@@ -549,7 +579,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runCurrentAndBelowChunks');
+            await execute_chunk_command(editor, 'raven.runCurrentAndBelowChunks');
         } finally {
             term.restore();
         }
@@ -572,7 +602,7 @@ suite('chunk commands: registration and behavior', () => {
         place_cursor(editor, 22); // after the last chunk
         const stub = stub_information_message();
         try {
-            await vscode.commands.executeCommand('raven.runNextChunk');
+            await execute_chunk_command(editor, 'raven.runNextChunk');
         } finally {
             stub.restore();
         }
@@ -590,7 +620,7 @@ suite('chunk commands: registration and behavior', () => {
         place_cursor(editor, 0); // before any chunk
         const stub = stub_information_message();
         try {
-            await vscode.commands.executeCommand('raven.runPreviousChunk');
+            await execute_chunk_command(editor, 'raven.runPreviousChunk');
         } finally {
             stub.restore();
         }
@@ -611,7 +641,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runNextChunkAndMove');
+            await execute_chunk_command(editor, 'raven.runNextChunkAndMove');
         } finally {
             term.restore();
         }
@@ -638,7 +668,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runPreviousChunkAndMove');
+            await execute_chunk_command(editor, 'raven.runPreviousChunkAndMove');
         } finally {
             term.restore();
         }
@@ -663,7 +693,7 @@ suite('chunk commands: registration and behavior', () => {
         place_cursor(editor, 22); // inside the last (noeval) chunk; no chunk below
         const stub = stub_information_message();
         try {
-            await vscode.commands.executeCommand('raven.runNextChunkAndMove');
+            await execute_chunk_command(editor, 'raven.runNextChunkAndMove');
         } finally {
             stub.restore();
         }
@@ -686,7 +716,7 @@ suite('chunk commands: registration and behavior', () => {
         place_cursor(editor, 0); // before any chunk
         const stub = stub_information_message();
         try {
-            await vscode.commands.executeCommand('raven.runPreviousChunkAndMove');
+            await execute_chunk_command(editor, 'raven.runPreviousChunkAndMove');
         } finally {
             stub.restore();
         }
@@ -710,7 +740,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runNextChunk');
+            await execute_chunk_command(editor, 'raven.runNextChunk');
         } finally {
             term.restore();
         }
@@ -743,7 +773,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runNextChunkAndMove');
+            await execute_chunk_command(editor, 'raven.runNextChunkAndMove');
         } finally {
             term.restore();
         }
@@ -765,7 +795,7 @@ suite('chunk commands: registration and behavior', () => {
         await dispose_any_cached_r_terminal();
         const term = stub_create_terminal();
         try {
-            await vscode.commands.executeCommand('raven.runPreviousChunk');
+            await execute_chunk_command(editor, 'raven.runPreviousChunk');
         } finally {
             term.restore();
         }
