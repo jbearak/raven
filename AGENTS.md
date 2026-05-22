@@ -117,7 +117,8 @@ Items here have no natural code home. For invariants tied to a specific function
 
 ### Environment / tooling
 
-- **macOS FSEvents** callbacks don't fire when the process is sandboxed by Claude Code; integration tests that depend on filesystem notifications require the sandbox to be disabled for the test runner (they pass fine in normal CI).
+- **macOS FSEvents** callbacks don't fire when the process is sandboxed by Claude Code; integration tests that depend on filesystem notifications require the sandbox to be disabled for the test runner (they pass fine in normal CI). Tests that genuinely cannot run under the sandbox (e.g. the 700K-row data-viewer scroll smoke tests, the knit iframe-load probe) self-skip via `isClaudeCodeSandbox()` in `editors/vscode/src/test/helper.ts` so a local run reports "skipped (sandbox)" rather than a flaky timeout failure.
+- **VS Code suite cumulative state** can make `vscode.window.activeTextEditor` racy: `showTextDocument(doc)`'s promise resolves before VS Code finishes promoting the editor to active, and a focused webview can leave `activeTextEditor` `undefined`. Tests whose command handlers read `activeTextEditor` (e.g. the chunks suite's `run_chunk`) must call `awaitActive(editor)` after `showTextDocument` and before each `executeCommand`. See the helper in `editors/vscode/src/test/helper.ts` and the `execute_chunk_command` wrapper in `chunks.test.ts`.
 - **Linux inotify**: libpath watching is recursive (one watch per descendant directory, ~10–20 per installed package). On old distros capped at the legacy 8192 default, warn users to raise `fs.inotify.max_user_watches`.
 
 ### Test harness
