@@ -112,7 +112,6 @@ async function rewriteCodeBlocks(
         themeClasses?: string | null;
     },
 ): Promise<string> {
-    const palette = paletteForTheme(args.themeClasses ?? null);
     const out: string[] = [];
     let cursor = 0;
     // Loose regex: VS Code's pipeline emits attributes in different
@@ -159,7 +158,6 @@ async function rewriteCodeBlocks(
         const highlighted = await highlightCodeBlock({
             source: rawSource,
             languageId,
-            palette,
             registry: args.registry,
             overlays,
         });
@@ -352,10 +350,4 @@ code {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 `.trim();
-}
-
-function paletteForTheme(themeClasses: string | null): GithubPalette {
-    if (themeClasses === null) return githubLight;
-    if (/\bvscode-(light|high-contrast-light)\b/.test(themeClasses)) return githubLight;
-    return githubDark;
 }
