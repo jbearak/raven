@@ -29,7 +29,26 @@ import type * as vscode from 'vscode';
 
 const VSCODE_R_PATH =
     '/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/r';
-const ONIG_WASM = require.resolve('vscode-oniguruma/release/onig.wasm');
+
+/**
+ * Resolve `vscode-oniguruma/release/onig.wasm` lazily and tolerate
+ * its absence. The resolution can throw `MODULE_NOT_FOUND` at
+ * load time if the dep is missing (e.g. fresh checkout where
+ * `editors/vscode/node_modules` hasn't been installed yet, or CI
+ * environments that skip the VS Code extension toolchain). Letting
+ * that bubble up takes the whole test file out, including the
+ * `itLive` skips. Wrapping the require here lets the file load,
+ * and `rExtensionAvailable()` then skips every live test cleanly.
+ */
+function resolveOnigWasm(): string | undefined {
+    try {
+        return require.resolve('vscode-oniguruma/release/onig.wasm');
+    } catch {
+        return undefined;
+    }
+}
+
+const ONIG_WASM = resolveOnigWasm();
 
 function makeRExtension(): vscode.Extension<unknown> {
     const pkg = JSON.parse(
@@ -43,6 +62,7 @@ function makeRExtension(): vscode.Extension<unknown> {
 }
 
 function rExtensionAvailable(): boolean {
+    if (ONIG_WASM === undefined) return false;
     try {
         fs.accessSync(path.join(VSCODE_R_PATH, 'syntaxes', 'r.tmLanguage.json'));
         fs.accessSync(ONIG_WASM);
@@ -60,7 +80,9 @@ describe('renderKnitHtml against the real R grammar', () => {
         const registry = createGrammarRegistry({
             extensions: [rExt],
             getExtensionById: (id) => (id === 'vscode.r' ? rExt : undefined),
-            onigWasmPath: ONIG_WASM,
+            // `itLive` only runs when `rExtensionAvailable()` is
+            // true, which guarantees `ONIG_WASM` is defined here.
+            onigWasmPath: ONIG_WASM as string,
         });
 
         // Mimic what `markdown.api.render` produces for an R fenced
@@ -148,7 +170,9 @@ describe('renderKnitHtml against the real R grammar', () => {
         const registry = createGrammarRegistry({
             extensions: [rExt],
             getExtensionById: (id) => (id === 'vscode.r' ? rExt : undefined),
-            onigWasmPath: ONIG_WASM,
+            // `itLive` only runs when `rExtensionAvailable()` is
+            // true, which guarantees `ONIG_WASM` is defined here.
+            onigWasmPath: ONIG_WASM as string,
         });
         expect(await registry.primeForLanguage('r')).toBe(true);
     });
@@ -158,7 +182,9 @@ describe('renderKnitHtml against the real R grammar', () => {
         const registry = createGrammarRegistry({
             extensions: [rExt],
             getExtensionById: (id) => (id === 'vscode.r' ? rExt : undefined),
-            onigWasmPath: ONIG_WASM,
+            // `itLive` only runs when `rExtensionAvailable()` is
+            // true, which guarantees `ONIG_WASM` is defined here.
+            onigWasmPath: ONIG_WASM as string,
         });
         const tokenization = await registry.tokenizeLineForLanguage(
             'r',

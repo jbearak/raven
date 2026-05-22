@@ -217,10 +217,30 @@ export function extractLanguageId(codeAttrs: string): string | null {
  * Entity-reversal order also matters: `&amp;` must be reversed LAST
  * so a literal `&amp;lt;` (the escape sequence for the text `&lt;`)
  * round-trips correctly.
+ *
+ * The tag-strip runs in a fixed-point loop. CodeQL's "incomplete
+ * multi-character sanitization" rule (alert /security/code-scanning/17
+ * against this function) flags any single-pass `<[^>]*>` strip:
+ * adversarial markup like `<scr<tag>ipt>` survives one pass as
+ * `script>` because removing the inner tag re-creates an opening
+ * sequence. Looping until the string stabilises closes that gap.
+ *
+ * Belt-and-braces: the decoded source is never emitted as HTML
+ * directly — it's tokenized by vscode-textmate and every slice is
+ * re-escaped via `escapeHtml` before reaching the rendered output —
+ * so the practical injection surface is already nil. We still
+ * defend at this layer because (a) the alert is real against the
+ * abstract function, and (b) future callers of `decodeCodeBlock`
+ * should not have to rely on the downstream escape to be safe.
  */
 export function decodeCodeBlock(encoded: string): string {
-    return encoded
-        .replace(/<[^>]*>/g, '')
+    let prev: string;
+    let stripped = encoded;
+    do {
+        prev = stripped;
+        stripped = stripped.replace(/<[^>]*>/g, '');
+    } while (stripped !== prev);
+    return stripped
         .replace(/&lt;/gi, '<')
         .replace(/&gt;/gi, '>')
         .replace(/&quot;/gi, '"')

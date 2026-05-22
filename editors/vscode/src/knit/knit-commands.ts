@@ -420,14 +420,48 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
             htmlPath,
             context: ctx.context,
             client: ctx.getLanguageClient(),
+            // Pass VS Code's active theme through so the rendered
+            // `<basename>.html` paints panel-side code spans with
+            // the editor theme rather than the user's OS color
+            // scheme. The standalone "Open in Browser" surface
+            // still gets the `prefers-color-scheme` swap because
+            // the .html embeds both palettes when `themeClasses`
+            // doesn't pin one — but here we DO want the panel to
+            // follow VS Code, so we pin the matching class.
+            themeClasses: themeClassesForActiveTheme(),
         });
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         ctx.output.appendLine(`[render] post-knit render failed: ${message}`);
         ctx.output.show(true);
-        void vscode.window.showErrorMessage(
-            `Raven: Knit produced ${path.basename(mdPath)} but the HTML render step failed. See Raven: Knit output.`,
+        // Knit itself succeeded — `mdPath` exists and is readable.
+        // Only the HTML render step failed. Offer the user a way
+        // to still see the markdown so a render-step regression
+        // (e.g. KaTeX CSS read failure, grammar registry init
+        // error) doesn't strand a successful knit with "no output
+        // at all" reported to the UI.
+        const OPEN_MD = 'Open Markdown';
+        const SHOW_OUTPUT = 'Show Output';
+        const choice = await vscode.window.showErrorMessage(
+            `Raven: Knit produced ${path.basename(mdPath)} but the HTML render step failed. ` +
+                `See Raven: Knit output for details.`,
+            OPEN_MD,
+            SHOW_OUTPUT,
         );
+        if (choice === OPEN_MD) {
+            try {
+                const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(mdPath));
+                await vscode.window.showTextDocument(doc, { preview: false });
+            } catch (openErr) {
+                const openMsg = openErr instanceof Error ? openErr.message : String(openErr);
+                ctx.output.appendLine(`[render] failed to open ${mdPath}: ${openMsg}`);
+                void vscode.window.showErrorMessage(
+                    `Raven: Knit — could not open ${path.basename(mdPath)}: ${openMsg}`,
+                );
+            }
+        } else if (choice === SHOW_OUTPUT) {
+            ctx.output.show(true);
+        }
         return;
     }
 
@@ -554,6 +588,42 @@ function readTimeoutMs(): number {
 function absolutizeFromCwd(raw: string, cwd: string): string {
     if (path.isAbsolute(raw)) return raw;
     return path.resolve(cwd, raw);
+}
+
+/**
+ * Map VS Code's active color theme to the body-class string the
+ * knit render pipeline expects. The string flows through
+ * `runPostKnitRender` → `renderKnitHtml` → `composeStylesheet`,
+ * whose regex matches `vscode-(light|high-contrast-light)` for the
+ * light branch and treats everything else as dark. We emit the
+ * canonical body-class name for each `ColorThemeKind` so future
+ * stylesheet rules can target high-contrast variants distinctly if
+ * they want to.
+ *
+ * Captured at render time only — the rendered `.html` is a snapshot
+ * on disk and does NOT re-render when the user flips themes. That
+ * gap is acceptable for an `Raven: Knit` invocation: the user has
+ * to re-knit to see updated R output anyway, and the standalone
+ * "Open in Browser" surface already covers OS-level dark mode via
+ * the embedded `prefers-color-scheme` swap when `themeClasses` is
+ * null.
+ */
+function themeClassesForActiveTheme(): string {
+    switch (vscode.window.activeColorTheme.kind) {
+        case vscode.ColorThemeKind.Light:
+            return 'vscode-light';
+        case vscode.ColorThemeKind.Dark:
+            return 'vscode-dark';
+        case vscode.ColorThemeKind.HighContrast:
+            return 'vscode-high-contrast';
+        case vscode.ColorThemeKind.HighContrastLight:
+            return 'vscode-high-contrast-light';
+        default:
+            // Future-proof: a new `ColorThemeKind` should default to
+            // the dark branch (which composeStylesheet uses as its
+            // catch-all) rather than crashing.
+            return 'vscode-dark';
+    }
 }
 
 /**

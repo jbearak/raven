@@ -211,7 +211,7 @@ what the live grammar is actually emitting.
 
 ## Commits on the branch (in order)
 
-```
+```text
 9c4b6b01 docs(knit): document the HTML-only knit pipeline and the new highlighter
 45b54964 fix(knit): atomic .html write and process-wide grammar registry cache
 dba8e4e0 feat(knit): wire post-knit HTML rendering into Raven: Knit

@@ -88,6 +88,27 @@ describe('decodeCodeBlock', () => {
         // restores the literal text.
         expect(decodeCodeBlock('foo &lt;span&gt; bar')).toBe('foo <span> bar');
     });
+
+    test('does not leave any `<...>` tag shape behind for nested or adversarial markup', () => {
+        // CodeQL alert 17 ("Incomplete multi-character sanitization")
+        // flagged the single-pass `replace(/<[^>]*>/g, '')` as
+        // potentially leaving residual tag-shape substrings on
+        // adversarial input. Our greedy + global regex already
+        // strips everything in one pass for the inputs we've
+        // observed, but `decodeCodeBlock` now loops the strip to a
+        // fixed point so the invariant survives future regex
+        // tweaks. The contract locked down here is the survival
+        // invariant — no remaining `<[^>]*>` substring — not the
+        // exact textual remnant.
+        for (const input of [
+            '<scr<x>ipt>alert(1)</scr<x>ipt>',
+            '<a<b<c<d>>>>',
+            '<<>>',
+            'a<<b>>c',
+        ]) {
+            expect(decodeCodeBlock(input)).not.toMatch(/<[^>]*>/);
+        }
+    });
 });
 
 describe('composeStylesheet', () => {
