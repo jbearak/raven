@@ -545,6 +545,16 @@ export class KnitOutputPanel {
             // a third-party theme's tokenColors look like.
             if (!this.themePaletteLogged) {
                 this.themePaletteLogged = true;
+                // If any earlier candidate failed before the picked
+                // one, surface that — otherwise a quietly-failing
+                // first candidate (e.g. a theme with invalid JSON)
+                // looks indistinguishable from "first candidate
+                // didn't match the bg" in the output.
+                for (const f of outcome.candidateFailures) {
+                    this.output.appendLine(
+                        `[theme] candidate "${f.themeId}" failed (${f.reason}): ${f.detail}`,
+                    );
+                }
                 this.output.appendLine(
                     `[theme] resolved palette for "${outcome.themeId}" ` +
                     `(isLight=${outcome.isLight}): ${JSON.stringify(outcome.palette)}`,

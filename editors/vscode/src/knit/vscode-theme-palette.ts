@@ -72,6 +72,20 @@ export interface ThemePaletteSuccess {
     themeId: string;
     /** Whether the theme is light. From the caller's ColorThemeKind. */
     isLight: boolean;
+    /**
+     * Per-candidate failures encountered before reaching the picked
+     * theme. Empty if the first candidate loaded cleanly. Surfaced so
+     * the panel can log a user-visible breadcrumb like
+     * "Tokyo Night Light failed (parse-error): ...; fell back to
+     * Dark 2026". Without this, a quietly-failing first candidate
+     * looks indistinguishable from "the user only configured one
+     * theme".
+     */
+    candidateFailures: ReadonlyArray<{
+        themeId: string;
+        reason: ThemeFailureReason;
+        detail: string;
+    }>;
 }
 
 export interface ThemePaletteFailure {
@@ -303,15 +317,17 @@ export async function resolveActiveThemePalette(
     let bgMatched:
         | { located: LocatedTheme; mergedDoc: ParsedThemeDocument }
         | null = null;
-    let lastFailureReason: ThemeFailureReason = 'theme-not-found';
-    let lastFailureDetail = `none of [${args.candidateThemeIds.join(', ')}] resolved`;
+    const candidateFailures: Array<{ themeId: string; reason: ThemeFailureReason; detail: string }> = [];
 
     for (const candidate of args.candidateThemeIds) {
         if (!candidate) continue;
         const located = locateThemeFile(candidate, args.extensions);
         if (!located) {
-            lastFailureReason = 'theme-not-found';
-            lastFailureDetail = `no contributed theme matches "${candidate}"`;
+            candidateFailures.push({
+                themeId: candidate,
+                reason: 'theme-not-found',
+                detail: `no contributed theme matches "${candidate}"`,
+            });
             continue;
         }
         let mergedDoc: ParsedThemeDocument;
@@ -322,12 +338,16 @@ export async function resolveActiveThemePalette(
                 realPath,
             });
         } catch (err) {
-            lastFailureReason =
+            const reason: ThemeFailureReason =
                 err instanceof UnsupportedFormatError ? 'unsupported-format'
                 : err instanceof ThemeCycleError ? 'cycle-detected'
                 : err instanceof ParseError ? 'parse-error'
                 : 'read-error';
-            lastFailureDetail = err instanceof Error ? err.message : String(err);
+            candidateFailures.push({
+                themeId: candidate,
+                reason,
+                detail: err instanceof Error ? err.message : String(err),
+            });
             continue;
         }
         firstLoaded ??= { located, mergedDoc };
@@ -342,7 +362,16 @@ export async function resolveActiveThemePalette(
 
     const picked = bgMatched ?? firstLoaded;
     if (!picked) {
-        return { ok: false, reason: lastFailureReason, detail: lastFailureDetail };
+        // All candidates failed. Use the last failure (most-recent
+        // attempt) for the surfaced reason — usually the most useful
+        // because earlier failures may be "theme not installed"
+        // boilerplate.
+        const last = candidateFailures[candidateFailures.length - 1];
+        return {
+            ok: false,
+            reason: last?.reason ?? 'theme-not-found',
+            detail: last?.detail ?? `none of [${args.candidateThemeIds.join(', ')}] resolved`,
+        };
     }
     const located = picked.located;
     const mergedDoc = picked.mergedDoc;
@@ -427,7 +456,13 @@ export async function resolveActiveThemePalette(
         },
     };
 
-    return { ok: true, palette, themeId: located.id, isLight: args.isLight };
+    return {
+        ok: true,
+        palette,
+        themeId: located.id,
+        isLight: args.isLight,
+        candidateFailures,
+    };
 }
 
 // ---------------------------------------------------------------------
@@ -641,17 +676,29 @@ function normalizeThemeSetting(entry: unknown): ThemeSetting | null {
 }
 
 /**
- * Strip line/block comments from JSON-with-comments. VS Code's
- * built-in themes (and many community themes) ship `.jsonc` files
- * with `//` and `/* *\/` blocks that JSON.parse rejects.
+ * Strip line/block comments AND trailing commas from JSON-with-comments.
+ * VS Code's built-in themes (and many community themes) ship `.jsonc`
+ * files with both — `//`, `/* *\/` blocks, and stray `,` before the
+ * closing `}` or `]` of an object or array (e.g. Tokyo Night Light).
  *
- * The strip is minimal — it does not handle trailing commas. If a
- * theme uses them and our parse fails, we surface a `parse-error`
- * outcome and the caller falls back to the GitHub palette. We avoid
- * pulling in a full JSONC dependency for that case; the overwhelming
- * majority of themes round-trip cleanly through this stripper.
+ * Two passes to keep each pass simple. Pass 1 removes comments while
+ * preserving string literals verbatim. Pass 2 walks the comment-free
+ * source and drops any `,` whose next non-whitespace character is
+ * `}` or `]`. Doing it in two passes (rather than one) means the
+ * trailing-comma check never needs to consider whether the comma sits
+ * between a value and a comment vs between a value and the closing
+ * brace — the comment is already gone.
+ *
+ * The stripper is JSONC-lite: it doesn't handle every edge case the
+ * jsonc-parser library does (e.g. it doesn't recognize unescaped
+ * newlines in strings — but standard JSON forbids those anyway). For
+ * the themes we've encountered, this is enough.
  */
 function stripJsonWithComments(raw: string): string {
+    return stripTrailingCommas(stripJsonComments(raw));
+}
+
+function stripJsonComments(raw: string): string {
     const out: string[] = [];
     let i = 0;
     const n = raw.length;
@@ -684,6 +731,43 @@ function stripJsonWithComments(raw: string): string {
                 i += 2;
                 while (i + 1 < n && !(raw[i] === '*' && raw[i + 1] === '/')) i++;
                 i = Math.min(n, i + 2);
+                continue;
+            }
+        }
+        out.push(ch);
+        i++;
+    }
+    return out.join('');
+}
+
+/**
+ * Drop trailing commas — any `,` whose next non-whitespace character
+ * is `}` or `]`. String-aware so we never strip a comma inside a
+ * string literal (e.g. a value like `"foo, bar"`).
+ */
+function stripTrailingCommas(raw: string): string {
+    const out: string[] = [];
+    let i = 0;
+    const n = raw.length;
+    while (i < n) {
+        const ch = raw[i];
+        if (ch === '"') {
+            const start = i;
+            i++;
+            while (i < n) {
+                if (raw[i] === '\\' && i + 1 < n) { i += 2; continue; }
+                if (raw[i] === '"') { i++; break; }
+                i++;
+            }
+            out.push(raw.slice(start, i));
+            continue;
+        }
+        if (ch === ',') {
+            let j = i + 1;
+            while (j < n && (raw[j] === ' ' || raw[j] === '\t' || raw[j] === '\n' || raw[j] === '\r')) j++;
+            if (j < n && (raw[j] === '}' || raw[j] === ']')) {
+                // Trailing comma — skip.
+                i++;
                 continue;
             }
         }

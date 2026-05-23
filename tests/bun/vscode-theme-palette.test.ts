@@ -268,6 +268,64 @@ describe('resolveActiveThemePalette — parsing', () => {
         }
     });
 
+    test('strips trailing commas (some themes ship .jsonc with them)', async () => {
+        // Regression for Tokyo Night Light, which has trailing
+        // commas before `}` in its `colors` block. Without stripping,
+        // JSON.parse rejects the file and the theme falls back to
+        // GitHub palette.
+        const ext = fakeThemeExtension({
+            extensionPath: '/exts',
+            label: 'Trailing Comma',
+            themeRelativePath: 'theme.json',
+        });
+        const file = '/exts/theme.json';
+        // Both kinds of trailing comma: object-trailing and array-trailing.
+        const themeJson = `{
+            "type": "dark",
+            "tokenColors": [
+                { "scope": "keyword", "settings": { "foreground": "#aaa" } },
+            ],
+            "colors": {
+                "editor.background": "#101010",
+                "editor.foreground": "#cccccc",
+            }
+        }`;
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Trailing Comma'],
+            extensions: [ext],
+            readFile: readFileFrom({ [file]: themeJson }),
+        }));
+        expect(out.ok).toBe(true);
+        if (out.ok) {
+            expect(out.palette.background).toBe('#101010');
+            expect(out.palette.foreground).toBe('#cccccc');
+        }
+    });
+
+    test('does NOT strip commas inside string literals', async () => {
+        // The trailing-comma pass must be string-aware. A value like
+        // `"foo, "` ends with `,` then ` "`, which superficially
+        // resembles a trailing comma but is INSIDE a string literal.
+        const ext = fakeThemeExtension({
+            extensionPath: '/exts',
+            label: 'String Comma',
+            themeRelativePath: 'theme.json',
+        });
+        const file = '/exts/theme.json';
+        const themeJson = `{
+            "type": "dark",
+            "name": "foo, bar",
+            "tokenColors": [],
+            "colors": {}
+        }`;
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['String Comma'],
+            extensions: [ext],
+            readFile: readFileFrom({ [file]: themeJson }),
+        }));
+        expect(out.ok).toBe(true);
+    });
+
     test('preserves // inside string literals (does not strip them)', async () => {
         const ext = fakeThemeExtension({
             extensionPath: '/exts',
