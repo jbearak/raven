@@ -854,6 +854,19 @@ export function buildShellHtml(args: {
           applyTheme();
           return;
         }
+        if (data.__ravenRequestThemeContext === true) {
+          // The host asked us to re-report the current editor.bg.
+          // Fires on theme changes that the MutationObserver above
+          // doesn't catch — specifically, swaps between two themes
+          // of the same kind (e.g. Solarized Dark <-> Dark 2026,
+          // both kind=Dark). Body class stays the same, so the
+          // MutationObserver doesn't fire, so the host's cached
+          // latestEditorBackground would stay on the old theme's
+          // bg. The host invalidates its cache and then pokes us
+          // here; we read the current bg and post it back.
+          reportThemeContext();
+          return;
+        }
         if (data.__ravenKnitProbe !== true) return;
         var locationHref = '';
         try {

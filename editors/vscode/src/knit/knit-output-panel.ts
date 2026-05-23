@@ -100,13 +100,16 @@ export class KnitOutputPanel {
     private themeResolveWarned = false;
 
     /**
-     * Tracks whether we've already logged the successfully-resolved
-     * palette for this panel session. Like `themeResolveWarned`, this
-     * gates one log line — useful for debugging "the colors look
-     * wrong" reports without flooding the channel on every theme
-     * switch.
+     * The id of the theme our last successful resolution picked. Used
+     * to deduplicate `[theme]` log lines: we re-log only when the
+     * resolved theme actually changes (e.g. because the user swapped
+     * themes or the webview just delivered the active editor.bg).
+     * Without dedup the channel fills up on every body-class flip;
+     * without ALWAYS-logging, the user sees only the FIRST resolution
+     * — which is invariably the "no-bg-yet" guess that gets corrected
+     * a few ms later.
      */
-    private themePaletteLogged = false;
+    private lastLoggedThemeId: string | undefined;
 
     /**
      * The webview's most recently reported `--vscode-editor-background`,
@@ -331,9 +334,28 @@ export class KnitOutputPanel {
         // webview, so the user sees their newly selected theme's
         // colors without re-knitting. Bound to the panel's lifetime
         // via `perPanelDisposables`.
-        const onTheme = vscode.window.onDidChangeActiveColorTheme(
-            () => { void instance.pushVscodeThemePalette(); },
-        );
+        //
+        // Cross-kind theme swaps (e.g. Solarized Dark ↔ Dark 2026,
+        // both kind=Dark) are the tricky case. The outer-shell body
+        // class doesn't change because the kind is the same, so the
+        // webview's MutationObserver doesn't fire — meaning the
+        // webview NEVER re-reports its bg, and our cached
+        // `latestEditorBackground` would stay on the OLD theme's
+        // value. The resolver's disambiguation would then pick the
+        // wrong candidate (matching the stale bg instead of the new
+        // one).
+        //
+        // Fix: invalidate the cached bg on every theme change AND
+        // poke the webview to re-report. The webview's CSS variables
+        // have already updated to the new theme by the time this
+        // listener fires (VS Code updates webview CSS vars
+        // synchronously on theme change), so the next
+        // `reportThemeContext` call returns the new bg.
+        const onTheme = vscode.window.onDidChangeActiveColorTheme(() => {
+            instance.latestEditorBackground = undefined;
+            void instance.panel.webview.postMessage({ __ravenRequestThemeContext: true });
+            void instance.pushVscodeThemePalette();
+        });
         const onConfig = vscode.workspace.onDidChangeConfiguration((e) => {
             if (
                 e.affectsConfiguration('workbench.colorTheme')
@@ -343,6 +365,8 @@ export class KnitOutputPanel {
                 || e.affectsConfiguration('editor.tokenColorCustomizations')
                 || e.affectsConfiguration('editor.semanticTokenColorCustomizations')
             ) {
+                instance.latestEditorBackground = undefined;
+                void instance.panel.webview.postMessage({ __ravenRequestThemeContext: true });
                 void instance.pushVscodeThemePalette();
             }
         });
@@ -493,32 +517,6 @@ export class KnitOutputPanel {
      */
     private async pushVscodeThemePalette(): Promise<void> {
         if (this.disposed) return;
-        // Diagnostic: log the inputs the resolver is about to consume.
-        // Lets us tell apart "the panel is resolving a stale theme"
-        // from "VS Code is reporting a stale kind" from "settings
-        // disagree with what the user expects". Logged once per panel
-        // session along with the resolved-palette line.
-        if (!this.themePaletteLogged) {
-            const root = vscode.workspace.getConfiguration();
-            const kind = vscode.window.activeColorTheme.kind;
-            const kindName =
-                kind === vscode.ColorThemeKind.Light ? 'Light'
-                : kind === vscode.ColorThemeKind.Dark ? 'Dark'
-                : kind === vscode.ColorThemeKind.HighContrast ? 'HighContrast'
-                : 'HighContrastLight';
-            const isLight =
-                kind === vscode.ColorThemeKind.Light
-                || kind === vscode.ColorThemeKind.HighContrastLight;
-            this.output.appendLine(
-                `[theme] inputs: activeColorTheme.kind=${kindName}, ` +
-                `autoDetectColorScheme=${root.get('window.autoDetectColorScheme')}, ` +
-                `workbench.colorTheme=${JSON.stringify(root.get('workbench.colorTheme'))}, ` +
-                `preferredLight=${JSON.stringify(root.get('workbench.preferredLightColorTheme'))}, ` +
-                `preferredDark=${JSON.stringify(root.get('workbench.preferredDarkColorTheme'))}, ` +
-                `candidates=${JSON.stringify(KnitOutputPanel.candidateThemeIds(isLight))}, ` +
-                `activeEditorBackground=${JSON.stringify(this.latestEditorBackground)}`,
-            );
-        }
         // The whole resolve path can throw if the extension context
         // is a sparse test stub (e.g. `{} as vscode.ExtensionContext`)
         // or if the cached grammar registry fails to init. Treat any
@@ -538,18 +536,33 @@ export class KnitOutputPanel {
         let css: string | null = null;
         if (outcome.ok) {
             css = paletteCssDeclarations(outcome.palette);
-            // Log the resolved palette once per panel session. The
-            // line is cheap and lets users (or maintainers) verify
-            // what colors the toggle is applying when something
-            // looks off — far easier to diagnose than guessing what
-            // a third-party theme's tokenColors look like.
-            if (!this.themePaletteLogged) {
-                this.themePaletteLogged = true;
-                // If any earlier candidate failed before the picked
-                // one, surface that — otherwise a quietly-failing
-                // first candidate (e.g. a theme with invalid JSON)
-                // looks indistinguishable from "first candidate
-                // didn't match the bg" in the output.
+            // Log when the resolved theme id CHANGES, so the channel
+            // shows the truth of what's currently applied (the most
+            // recent successful resolution) rather than only the
+            // initial "no-bg-yet" guess. Dedup-by-id prevents the
+            // channel filling up on body-class flips that re-resolve
+            // to the same theme.
+            if (this.lastLoggedThemeId !== outcome.themeId) {
+                this.lastLoggedThemeId = outcome.themeId;
+                const root = vscode.workspace.getConfiguration();
+                const kind = vscode.window.activeColorTheme.kind;
+                const kindName =
+                    kind === vscode.ColorThemeKind.Light ? 'Light'
+                    : kind === vscode.ColorThemeKind.Dark ? 'Dark'
+                    : kind === vscode.ColorThemeKind.HighContrast ? 'HighContrast'
+                    : 'HighContrastLight';
+                const isLight =
+                    kind === vscode.ColorThemeKind.Light
+                    || kind === vscode.ColorThemeKind.HighContrastLight;
+                this.output.appendLine(
+                    `[theme] inputs: activeColorTheme.kind=${kindName}, ` +
+                    `autoDetectColorScheme=${root.get('window.autoDetectColorScheme')}, ` +
+                    `workbench.colorTheme=${JSON.stringify(root.get('workbench.colorTheme'))}, ` +
+                    `preferredLight=${JSON.stringify(root.get('workbench.preferredLightColorTheme'))}, ` +
+                    `preferredDark=${JSON.stringify(root.get('workbench.preferredDarkColorTheme'))}, ` +
+                    `candidates=${JSON.stringify(KnitOutputPanel.candidateThemeIds(isLight))}, ` +
+                    `activeEditorBackground=${JSON.stringify(this.latestEditorBackground)}`,
+                );
                 for (const f of outcome.candidateFailures) {
                     this.output.appendLine(
                         `[theme] candidate "${f.themeId}" failed (${f.reason}): ${f.detail}`,
