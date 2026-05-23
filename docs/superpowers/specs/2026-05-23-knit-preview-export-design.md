@@ -132,8 +132,8 @@ Settings sync touch-points (per CLAUDE.md): `editors/vscode/package.json` schema
 ### Temp directory layout
 
 ```text
-<os.tmpdir()>/raven-knit/<workspaceHash>/
-  ├── preview/<sha256(absRmdPath)>/        ← stable, one per .Rmd
+<os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/
+  ├── preview/<sha256(absRmdPath)>/        ← stable, one per .Rmd, scoped to this VS Code window
   │     ├── <basename>.md
   │     ├── <basename>.html
   │     └── figure/                        ← knitr-generated plots
@@ -142,6 +142,7 @@ Settings sync touch-points (per CLAUDE.md): `editors/vscode/package.json` schema
 ```
 
 - `<workspaceHash>` is `sha256` of the first workspace folder's URI (stable per workspace, distinct across workspaces sharing the same machine). If no workspace is open (the user opened a single `.Rmd` directly), we fall back to `sha256` of the .Rmd's parent directory absolute path.
+- **`<sessionId>` is a per-extension-host UUID generated at activation** (closes Codex finding #5). Two VS Code windows open on the same workspace get isolated `sessionId` subdirs, so one window's `deactivate()` cleanup cannot delete temp dirs the other window is still using.
 - Preview subdirs are stable so the iframe can keep referencing the same paths across re-knits, and `figure/` artifacts stay alive while the panel is open.
 - Editor-toolbar export subdirs are throwaway.
 
@@ -151,8 +152,8 @@ Settings sync touch-points (per CLAUDE.md): `editors/vscode/package.json` schema
 |---|---|
 | `KnitOutputPanel.onDidDispose` | Mark that source's `preview/<sha256>/` for deletion; remove immediately if no in-flight exports reference it, otherwise defer until refcount drops to 0. |
 | Successful or failed export | Decrement preview-dir refcount; remove `export/<uuid>/` in `finally`. |
-| Extension `deactivate()` | Remove the whole `raven-knit/<workspaceHash>/` dir. |
-| Extension `activate()` | Sweep `raven-knit/*` orphans with mtime > 7 days. |
+| Extension `deactivate()` | Remove only **this session's** dir: `raven-knit/<workspaceHash>/<sessionId>/`. Sibling sessions' dirs are left alone. |
+| Extension `activate()` | Sweep `raven-knit/*/*` orphans (any `<workspaceHash>/<sessionId>` dir with mtime > 7 days). |
 
 **Preview-dir pinning**: each in-flight export that consumes `preview/<sha256>/` (the webview-export path) increments a refcount on that subdir for the duration of the Pandoc subprocess. Closing the panel mid-export is allowed but the temp dir is preserved until the refcount drops to 0, then deleted. This closes the race where panel disposal removes the `.md` and `figure/` while Pandoc is still reading them.
 
@@ -176,21 +177,30 @@ The notification's native Cancel button is the canonical "stop this now" afforda
 
 ### Operation controller (replaces the current in-flight Set)
 
-`knit-commands.ts` currently tracks in-flight knits as a bare `Set<string>` of source paths. The export feature needs richer state — toolbar button needs to know what op is running, the webview needs to display the spinner, and `cancelExport` messages need a handle to call into. So we replace the Set with a per-source `OperationController` registry:
+`knit-commands.ts` currently tracks in-flight knits as a bare `Set<string>` of source paths keyed by normalized `fsPath`. The export feature needs richer state — toolbar buttons need to know what op + phase is running, the webview needs to display the spinner, and `cancelExport` messages need a handle to call into. So we replace the Set with an `OperationController` registry:
 
 ```typescript
+type OpKind = 'knit-preview' | 'export-html' | 'export-pdf' | 'export-docx' | 'knit-then-export';
+type OpPhase = 'starting' | 'knitting' | 'converting' | 'finalizing';
+
 interface OperationController {
-  source: vscode.Uri;
-  kind: 'knit' | 'export-html' | 'export-pdf' | 'export-docx';
+  /** Normalized fsPath key. NEVER raw URI string — see registry rules. */
+  key: string;
+  kind: OpKind;
+  phase: OpPhase;
   cancellation: vscode.CancellationTokenSource;
   promise: Promise<void>;          // resolves on cleanup, even after cancel
-  broadcastToPanel: (state: 'starting' | 'running' | 'done' | 'cancelled') => void;
+  broadcastToPanel: (phase: OpPhase | 'done' | 'cancelled') => void;
 }
 ```
 
-- One controller per source URI at a time (the existing one-per-source invariant).
-- New ops await the previous one's `promise` after invoking `cancellation.cancel()` to avoid resource overlap.
-- The webview Export button posts `{ type: 'cancelExport' }`; the host looks up the controller for the current panel's source and calls `cancellation.cancel()`.
+**Registry contract (closes Codex finding #1):**
+
+1. **Canonical key**: `path.normalize(uri.fsPath)`, lowercased on Windows (since NTFS is case-insensitive). The same `.Rmd` opened under different URI casings or relative paths must collapse to one controller. Defined as a single shared `canonicalOpKey(uri: vscode.Uri): string` helper, used everywhere.
+2. **Synchronous register-before-await**: the entry point (command handler or webview-message handler) MUST call `registry.beginOp(key, kind)` *before* its first `await`. `beginOp` either inserts a `pending` controller and returns it, or — if a controller for `key` already exists — returns `{ existing: <controller> }` so the caller can show the conflict toast. Any async work (Pandoc detection, save, quickpick) runs only after registration succeeds. This closes the two-clicks-race finding.
+3. **One controller per key at a time** (the existing one-per-source invariant). New ops on the same key must `await previous.promise` after calling `previous.cancellation.cancel()`, before inserting their own controller.
+4. The webview Export button posts `{ type: 'cancelExport' }`; the host looks up the controller for the panel's source key and calls `cancellation.cancel()`.
+5. **Test**: `knit-op-registry-race.test.ts` — two `vscode.commands.executeCommand('raven.knit.exportPdf', uri)` calls fired without awaiting either; assert exactly one Pandoc invocation occurs and the second call surfaces the busy-toast.
 
 ### Conflicting operations
 
@@ -222,16 +232,16 @@ interface OutputOptions {
     fig_width?: number; fig_height?: number; fig_retina?: number;
     dpi?: number; dev?: string;
   };
-  // Pandoc-mappable (export only)
+  // Pandoc-mappable (export only). pandoc_args is NOT included in v1 — see
+  // honored-keys table below. Adding it later requires an allowlist gate.
   pandocFlags: {
     toc?: boolean; toc_depth?: number;
     number_sections?: boolean;
     highlight?: string;
     self_contained?: boolean;
     css?: string[]; mathjax?: boolean;
-    pandoc_args?: string[];
   };
-  ignored: string[];  // logged-but-not-applied keys
+  ignored: string[];  // logged-but-not-applied keys (includes pandoc_args)
 }
 ```
 
@@ -252,8 +262,10 @@ If multiple formats are listed (`output: { pdf_document: {...}, word_document: {
 | `number_sections: true` | `--number-sections` |
 | `highlight: <style>` | `--highlight-style=<style>` (style validated against Pandoc's known list) |
 | `self_contained: true` | `--embed-resources --standalone` |
-| `css: [file.css]` | `--css=file.css` (one flag per file; each file path validated to be relative or inside the .Rmd's workspace folder) |
+| `css: [file.css]` | `--css=<absolute path>` — see CSS path resolution rule below |
 | `mathjax: <bool>` | `--mathjax` or omit |
+
+**CSS path resolution (closes Codex finding #2):** since Pandoc's `cwd` is the temp `.md` directory (not the source `.Rmd` directory), source-relative paths in YAML's `css:` list would resolve against the wrong directory. We resolve each entry against the source `.Rmd`'s parent directory, validate that the resolved absolute path is inside that directory's workspace folder (no `../` traversal escapes), reject anything that fails validation (logged as ignored, just like `pandoc_args`), and pass the absolute path to Pandoc. Same rule applies to `--reference-doc` if ever added.
 
 **`pandoc_args` is NOT honored in v1** (security: a document could pass `--output`, `--lua-filter`, `--metadata-file`, `--extract-media`, or other flags that bypass Raven's controlled destination or execute external code). Tracked in follow-up issue #2 with a defined allowlist/blocklist as a prerequisite.
 
@@ -360,12 +372,12 @@ A new `pandocConvert(mdPath, format, args, opts)` in `editors/vscode/src/knit/pa
 
 ### Webview message trust boundary (security)
 
-Adding `requestExport` requires updating the existing trust boundary in `knit-output.ts` and `knit-output-panel.ts`:
+Adding `requestExport` requires updating the existing trust boundary in `knit-output.ts` and `knit-output-panel.ts`. **Validation rule: exact key-set match** — the message object MUST contain only `type`, and nothing else. Any additional keys cause the message to be rejected. (Earlier draft had a self-contradictory rule that both rejected and ignored extra keys; Codex finding #3 prompted picking one.)
 
-- Add `'requestExport'` to the `KnitOutputMessage` discriminated union with a typed payload: `{ type: 'requestExport' }` (no fields from the webview — format choice is collected via the native quickpick the host opens, so untrusted payload surface is zero).
-- Extend `isKnitOutputMessage` to validate the new shape.
-- Add unit tests proving (a) a malformed `{ type: 'requestExport', format: '../etc/passwd' }` is rejected, and (b) the host ignores any payload fields beyond `type`.
-- A user cancelling an export via the toolbar uses a new message `{ type: 'cancelExport' }` with no extra fields. Same validation rule.
+- Add `'requestExport'` and `'cancelExport'` to the `KnitOutputMessage` discriminated union with payload shape `{ type: 'requestExport' }` / `{ type: 'cancelExport' }` — no other fields. The native quickpick the host opens collects the format choice; format never crosses the webview boundary, so untrusted payload surface is zero.
+- Extend `isKnitOutputMessage` to validate the exact key set (`Object.keys(msg).length === 1 && msg.type in [...]`).
+- Add unit test asserting `{ type: 'requestExport', format: '../etc/passwd' }` is rejected (extra key violates exact-match).
+- Add unit test asserting `{ type: 'requestExport' }` with no extra keys is accepted and dispatches the host's quickpick.
 
 ## Post-export feedback
 
@@ -430,10 +442,14 @@ async function openExportedFile(savedUri: vscode.Uri, format: 'html' | 'pdf' | '
 - `knit-export-yaml-merge.test.ts` — YAML with both `html_document:` and `pdf_document:` blocks; exporting to PDF picks only `pdf_document:` options (not `html_document:`).
 - `knit-export-remote-fallback.test.ts` — mock `vscode.env.openExternal` to return false; assert warning toast shown and the output path appears in the knit channel.
 - `knit-multi-root-isolation.test.ts` — two workspace folders contain `analysis.Rmd` files at different absolute paths; assert their temp subdirs hash to different `preview/<sha256>/` paths and neither knit reads the other's `.md`.
+- `knit-multi-window-isolation.test.ts` — simulate two extension-host sessions on the same workspace; assert their temp subdirs are under different `<sessionId>` paths and one session's `deactivate()` doesn't delete the other's preview/export dirs.
+- `knit-op-registry-race.test.ts` — fire two `raven.knit.exportPdf` commands on the same URI without awaiting; assert exactly one Pandoc invocation and the second call triggers the busy-toast.
+- `knit-export-css-resolution.test.ts` — `output.html_document.css: ['style.css']` with `style.css` next to the .Rmd; assert Pandoc receives `--css=<absolute-path-to-style.css>`. With `css: ['../../etc/passwd']`, assert the entry is dropped and logged as ignored.
+- `knit-figpath-modes.test.ts` — integration test that knits a chunk producing a plot, under each of the three `raven.knit.workingDirectory` modes (`document`, `project`, `current`); assert the plot file lands in the per-document preview `figure/` subdir and not in any source-tree location.
 
 ### Pure-function unit tests
 
-- `buildPandocArgs.test.ts` — exhaustive cases for honored keys + `pandoc_args` pass-through allowlist.
+- `buildPandocArgs.test.ts` — exhaustive cases for honored keys. Asserts `pandoc_args` from YAML is dropped and surfaces in `ignored`.
 - `output-options-parse.test.ts` — new structured extraction in `yaml-frontmatter.ts`. Edge cases: object vs string output form, multiple formats listed, key collisions.
 
 ### Sandbox-skip
@@ -467,11 +483,13 @@ Tests that spawn Pandoc or that depend on subprocess signal delivery self-skip v
 
 ## Codex adversarial review
 
-The spec was reviewed against the criteria in the user's `feedback_codex_adversarial_review` memory. Ten findings; all addressed inline above:
+The spec was reviewed against the criteria in the user's `feedback_codex_adversarial_review` memory. Two passes; all findings addressed inline above.
+
+**Pass 1 — 10 original findings:**
 
 | # | Severity | Topic | Addressed in |
 |---|---|---|---|
-| 1 | Critical | `pandoc_args` verbatim passthrough is unsafe | Honored-keys table; follow-up #2 |
+| 1 | Critical | `pandoc_args` verbatim passthrough is unsafe | Honored-keys table; `OutputOptions` struct; follow-up #2 |
 | 2 | Critical | Export destination not atomic | Subprocess invocation section; invariant #7 |
 | 3 | High | Temp-dir cleanup races webview export | Cleanup section + refcount; invariant #8 |
 | 4 | High | Stale source-dir artifacts shadow temp figures | Subprocess invocation `cwd`; invariant #6 |
@@ -481,3 +499,15 @@ The spec was reviewed against the criteria in the user's `feedback_codex_adversa
 | 8 | Medium | No operation registry | Operation controller section |
 | 9 | Medium | Remote-workspace `openExternal` fallback missing | Post-export feedback section |
 | 10 | Low | Test plan omitted critical failure modes | Six new test files added |
+
+**Pass 2 — 7 follow-on findings from reviewing Pass 1 fixes:**
+
+| # | Severity | Topic | Addressed in |
+|---|---|---|---|
+| P2-1 | High | OperationController keying + sync-register contract | Registry contract subsection + race test |
+| P2-2 | High | CSS path resolution broken by Pandoc cwd change | CSS path resolution rule + `knit-export-css-resolution.test.ts` |
+| P2-3 | High | Trust-boundary self-contradiction (reject vs ignore extras) | Exact key-set match rule |
+| P2-4 | Medium | `pandoc_args` still in `OutputOptions` struct/tests | Removed from `pandocFlags`; only in `ignored` |
+| P2-5 | Medium | Multi-window deactivate race | `<sessionId>` subdir + `knit-multi-window-isolation.test.ts` |
+| P2-6 | Medium | knit-then-export needs `kind`/`phase` model | Updated `OperationController` shape |
+| P2-7 | Low | `fig.path` claim needs explicit verification test | `knit-figpath-modes.test.ts` added |
