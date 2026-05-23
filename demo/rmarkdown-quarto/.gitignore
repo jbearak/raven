@@ -1,5 +1,12 @@
 # Rendered outputs from knit / quarto render — sources (.Rmd, .qmd) are the
-# tracked artifacts; the rendered HTML and its companion asset directory are
-# regenerated locally and should not be committed.
+# tracked artifacts; the rendered HTML, the knitr-intermediate .md, and the
+# companion asset directories are regenerated locally and should not be
+# committed.
+#
+# knitr produces `<basename>.md` (the intermediate markdown) and `figure/`
+# (default chunk-plot output dir) next to the .Rmd; Quarto produces
+# `<basename>_files/` next to the .qmd.
 *.html
+*.md
+figure/
 *_files/
