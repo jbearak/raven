@@ -107,6 +107,8 @@ export function escapeRString(value: string): string {
     return out;
 }
 
+import type { ChunkOpts } from './output-options';
+
 export interface KnitExpressionInput {
     /** Absolute path of the .Rmd file being knitted. */
     filePath: string;
@@ -131,7 +133,38 @@ export interface KnitExpressionInput {
      * circuits before we spawn R.
      */
     format: string;
+    /**
+     * Base directory for knitr's plot output (figures land relative to
+     * this directory). Set via `opts_knit$set(base.dir = …)` — distinct
+     * from `root.dir`, which is where chunks run. This lets us direct
+     * figures to a temp folder while leaving the user's chunks running
+     * in their configured working directory.
+     */
+    baseDir: string;
+    /**
+     * Relative path inside `baseDir` where figures go, e.g. 'figure/'.
+     * Set via `opts_chunk$set(fig.path = …)`. Must include the trailing
+     * separator to match knitr's expectation (it concatenates this
+     * prefix directly with chunk labels).
+     */
+    figPath: string;
+    /**
+     * Optional knitr chunk-level overrides from YAML's `output:` block
+     * (`fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev`). Applied
+     * via a single `opts_chunk$set(...)` call before `knitr::knit`.
+     */
+    chunkOpts: ChunkOpts;
 }
+
+/**
+ * Whitelisted plot device strings — anything else from YAML is rejected
+ * before reaching `escapeRString`, so a malicious `dev` value cannot
+ * carry an arbitrary R string into the subprocess even if the front-
+ * matter parser somehow let it through.
+ */
+const DEV_ALLOWLIST: ReadonlySet<string> = new Set([
+    'png', 'pdf', 'svg', 'jpeg', 'cairo_pdf',
+]);
 
 /**
  * Build the single-line R expression passed to `R -e`.
@@ -165,9 +198,14 @@ export interface KnitExpressionInput {
 export function buildKnitExpression(input: KnitExpressionInput): string {
     validatePathForRExpression(input.filePath);
     validatePathForRExpression(input.outputPath);
+    validatePathForRExpression(input.baseDir);
+    validatePathForRExpression(input.figPath);
     validateFormatIdentifier(input.format);
     if (input.knitRootDir !== null) {
         validatePathForRExpression(input.knitRootDir);
+    }
+    if (input.chunkOpts.dev !== undefined && !DEV_ALLOWLIST.has(input.chunkOpts.dev)) {
+        throw new ValidatePathError(`Chunk dev value not in allowlist: ${input.chunkOpts.dev}`);
     }
 
     const rootDirLiteral = input.knitRootDir !== null
@@ -179,9 +217,39 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
     // contain bindings and to keep the `out` variable from leaking.
     const inputLit = escapeRString(input.filePath);
     const outputLit = escapeRString(input.outputPath);
+    const baseDirLit = escapeRString(input.baseDir);
+    const figPathLit = escapeRString(input.figPath);
+
+    // Optional `opts_chunk$set(...)` for YAML-supplied chunk-level
+    // options. We emit a single call with comma-separated pairs to
+    // keep the expression short; an empty chunkOpts gives an empty
+    // segment.
+    const chunkParts: string[] = [];
+    const co = input.chunkOpts;
+    if (co.fig_width !== undefined && Number.isFinite(co.fig_width)) {
+        chunkParts.push(`fig.width = ${co.fig_width}`);
+    }
+    if (co.fig_height !== undefined && Number.isFinite(co.fig_height)) {
+        chunkParts.push(`fig.height = ${co.fig_height}`);
+    }
+    if (co.fig_retina !== undefined && Number.isFinite(co.fig_retina)) {
+        chunkParts.push(`fig.retina = ${co.fig_retina}`);
+    }
+    if (co.dpi !== undefined && Number.isInteger(co.dpi)) {
+        chunkParts.push(`dpi = ${co.dpi}L`);
+    }
+    if (co.dev !== undefined) {
+        chunkParts.push(`dev = ${escapeRString(co.dev)}`);
+    }
+    const yamlOptsChunk = chunkParts.length > 0
+        ? ` knitr::opts_chunk$set(${chunkParts.join(', ')});`
+        : '';
+
     return [
         'local({',
-        ` knitr::opts_knit$set(root.dir = ${rootDirLiteral});`,
+        ` knitr::opts_knit$set(root.dir = ${rootDirLiteral}, base.dir = ${baseDirLit});`,
+        ` knitr::opts_chunk$set(fig.path = ${figPathLit});`,
+        yamlOptsChunk,
         ` out <- knitr::knit(`,
         `input = ${inputLit},`,
         ` output = ${outputLit},`,

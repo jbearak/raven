@@ -7,6 +7,7 @@ import {
     extractFrontmatter,
     parseFrontmatter,
 } from './yaml-frontmatter';
+import { parseOutputOptions } from './output-options';
 import {
     buildKnitExpression,
     escapeRString,
@@ -262,6 +263,16 @@ async function runKnitCommand(
     // user-overridable output location can flow through one place.
     const mdOutputPath = computeMdOutputPath(fsPath);
 
+    // YAML output: block — chunk-level options come from here. The
+    // preview target is always 'html' (preview is HTML regardless of
+    // YAML output:).
+    const outputOpts = parseOutputOptions(parsed.value, 'html');
+    if (outputOpts.ignored.length > 0) {
+        for (const key of outputOpts.ignored) {
+            output.appendLine(`[knit] Ignored output: option '${key}'`);
+        }
+    }
+
     let expression: string;
     try {
         expression = buildKnitExpression({
@@ -269,6 +280,14 @@ async function runKnitCommand(
             outputPath: mdOutputPath,
             format,
             knitRootDir,
+            // For now, base.dir mirrors the .md's parent directory so
+            // figures land alongside it. Phase 11 will switch this to
+            // the per-session temp dir; here we keep the existing
+            // co-located figure/ behavior so the migration is reviewable
+            // in isolation.
+            baseDir: path.dirname(mdOutputPath),
+            figPath: 'figure/',
+            chunkOpts: outputOpts.chunkOpts,
         });
     } catch (err) {
         const isPathError = err instanceof ValidatePathError;
