@@ -37,9 +37,18 @@ import type {
     IGrammar,
     IRawGrammar,
     IOnigLib,
+    IRawTheme,
     Registry as RegistryType,
     StateStack,
 } from 'vscode-textmate';
+
+/**
+ * Element type of `IRawTheme.settings`. The interface itself isn't
+ * exported from vscode-textmate but the array shape is, so we derive
+ * the element type. This keeps us in lockstep with whatever upstream's
+ * setting shape is without redeclaring it.
+ */
+export type ThemeSetting = IRawTheme['settings'][number];
 
 /** Public shape — small enough that a fake registry fits in tests. */
 export interface GrammarRegistry {
@@ -61,6 +70,52 @@ export interface GrammarRegistry {
 
     /** Eagerly load the grammar so a tokenize call hits a warm cache. */
     primeForLanguage(languageId: string): Promise<boolean>;
+
+    /**
+     * Atomically apply `themeSettings` to the underlying registry, then
+     * invoke `inner` while the theme is active. Returns whatever `inner`
+     * returns.
+     *
+     * Why a callback rather than three separate methods (`setTheme`,
+     * `tokenizeLine2`, `getColorMap`):
+     *
+     *   1. **Serialization.** `Registry.setTheme` is a registry-wide
+     *      mutation. Concurrent extractors would clobber each other's
+     *      theme between `setTheme` and the matching `tokenizeLine2`
+     *      reads, yielding colors from the wrong theme. The callback
+     *      shape lets us queue extractions through one promise chain,
+     *      so each extractor sees a stable theme for its full window.
+     *
+     *   2. **Decoupling from the highlighter.** The Knit highlighter
+     *      uses `tokenizeLineForLanguage` (raw scope chains), which is
+     *      unaffected by `setTheme`. Hiding the theme-aware path
+     *      behind `extractWithTheme` keeps that invariant obvious.
+     *
+     * The api exposed to `inner` carries the active colorMap and a
+     * thin `tokenizeLine2` wrapper. `inner` must not retain references
+     * past its return; the registry's state may change after.
+     */
+    extractWithTheme<T>(
+        themeSettings: readonly ThemeSetting[],
+        inner: (api: ThemeExtractionApi) => Promise<T>,
+    ): Promise<T>;
+}
+
+/**
+ * Theme-aware surface handed to `extractWithTheme`'s inner callback.
+ * The `colorMap` is a snapshot taken after `setTheme` returns; the
+ * entry at index N is the hex string for tokens whose metadata
+ * foreground field equals N. `tokenizeLine2` returns binary tokens
+ * encoded per vscode-textmate's bit layout (see
+ * `vscode-theme-palette.ts` for the foreground-decoding helper).
+ */
+export interface ThemeExtractionApi {
+    readonly colorMap: readonly string[];
+    tokenizeLine2ForLanguage(
+        languageId: string,
+        line: string,
+        state?: unknown,
+    ): Promise<{ tokens: Uint32Array; ruleStack: unknown } | null>;
 }
 
 /**
@@ -205,6 +260,13 @@ export function createGrammarRegistry(args: {
         return promise;
     }
 
+    // Serialization queue for `extractWithTheme`. Concurrent callers
+    // chain off this promise so each `setTheme` + tokenize window is
+    // atomic. The previous value is awaited inside the closure so a
+    // throw inside one extraction does not poison the queue for the
+    // next.
+    let themeOpQueue: Promise<unknown> = Promise.resolve();
+
     return {
         async tokenizeLineForLanguage(languageId, line, state) {
             const grammar = await loadGrammar(languageId);
@@ -226,6 +288,35 @@ export function createGrammarRegistry(args: {
         async primeForLanguage(languageId) {
             const grammar = await loadGrammar(languageId);
             return grammar !== null;
+        },
+        async extractWithTheme<T>(
+            themeSettings: readonly ThemeSetting[],
+            inner: (api: ThemeExtractionApi) => Promise<T>,
+        ): Promise<T> {
+            // Tail-await the queue (ignore prior errors — they belong to
+            // a previous extraction's caller, not this one), then run.
+            const prev = themeOpQueue.catch(() => undefined);
+            const run = (async (): Promise<T> => {
+                await prev;
+                const registry = await ensureRegistry();
+                registry.setTheme({ settings: [...themeSettings] });
+                const colorMap = registry.getColorMap();
+                const api: ThemeExtractionApi = {
+                    colorMap,
+                    async tokenizeLine2ForLanguage(languageId, line, state) {
+                        const grammar = await loadGrammar(languageId);
+                        if (!grammar) return null;
+                        const result = grammar.tokenizeLine2(
+                            line,
+                            (state ?? null) as StateStack | null,
+                        );
+                        return { tokens: result.tokens, ruleStack: result.ruleStack };
+                    },
+                };
+                return inner(api);
+            })();
+            themeOpQueue = run;
+            return run;
         },
     };
 }

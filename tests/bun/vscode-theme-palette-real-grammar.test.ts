@@ -1,0 +1,321 @@
+/**
+ * Real-grammar integration tests for `resolveActiveThemePalette`.
+ *
+ * These tests use the actual REditorSupport-style R grammar (whichever
+ * `vscode.r` ships with the current VS Code install) together with
+ * vscode-textmate's real `Registry.setTheme` + `tokenizeLine2`
+ * machinery. They catch a class of bugs the fake-registry tests can't:
+ * specifically, what vscode-textmate's `colorMap` actually contains
+ * when a probe matches the theme's "no rule for this scope" default,
+ * which differs from the simulated index-0 case our fake uses.
+ *
+ * Symptom this test guards against: a theme whose `tokenColors` array
+ * has rules for SOME scopes but no top-level empty-scope default rule.
+ * vscode-textmate uses a hardcoded `#000000` foreground for tokens
+ * that don't match any rule. If the extractor naively returns that
+ * color for a probe that fell through to the default, the user sees
+ * near-invisible black text on the dark code-block background.
+ */
+import { describe, test, expect } from 'bun:test';
+import * as fs from 'fs';
+import * as path from 'path';
+
+import { createGrammarRegistry } from '../../editors/vscode/src/knit/grammar-registry';
+import {
+    resolveActiveThemePalette,
+    type ExtensionLike,
+} from '../../editors/vscode/src/knit/vscode-theme-palette';
+import type * as vscode from 'vscode';
+
+const VSCODE_R_PATH =
+    '/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/r';
+
+function resolveOnigWasm(): string | undefined {
+    try {
+        return require.resolve('vscode-oniguruma/release/onig.wasm');
+    } catch {
+        return undefined;
+    }
+}
+
+const ONIG_WASM = resolveOnigWasm();
+
+function makeRExtension(): vscode.Extension<unknown> {
+    const pkg = JSON.parse(
+        fs.readFileSync(path.join(VSCODE_R_PATH, 'package.json'), 'utf-8'),
+    );
+    return {
+        id: 'vscode.r',
+        extensionPath: VSCODE_R_PATH,
+        packageJSON: pkg,
+    } as unknown as vscode.Extension<unknown>;
+}
+
+function rExtensionAvailable(): boolean {
+    if (ONIG_WASM === undefined) return false;
+    try {
+        fs.accessSync(path.join(VSCODE_R_PATH, 'syntaxes', 'r.tmLanguage.json'));
+        fs.accessSync(ONIG_WASM);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+const itLive = rExtensionAvailable() ? test : test.skip;
+
+/**
+ * Build a real R-grammar registry mirroring the production wiring.
+ */
+function makeRegistry() {
+    const rExt = makeRExtension();
+    return createGrammarRegistry({
+        extensions: [rExt],
+        getExtensionById: (id) => (id === 'vscode.r' ? rExt : undefined),
+        // `itLive` gates on `rExtensionAvailable()`, which guarantees
+        // ONIG_WASM is defined here.
+        onigWasmPath: ONIG_WASM as string,
+    });
+}
+
+/**
+ * Theme contribution shape `vscode-theme-palette.ts` expects. The
+ * theme JSON lives on disk so the extractor's `readFile` injection can
+ * read it.
+ */
+function makeThemeExtension(themePath: string): ExtensionLike {
+    return {
+        id: 'test.themes',
+        extensionPath: path.dirname(themePath),
+        packageJSON: {
+            contributes: {
+                themes: [
+                    {
+                        label: 'Test Dark Sparse',
+                        path: path.basename(themePath),
+                    },
+                ],
+            },
+        },
+    };
+}
+
+describe('resolveActiveThemePalette — against the real R grammar', () => {
+    itLive(
+        'roles whose probe scope has NO theme rule must NOT return the theme default foreground',
+        async () => {
+            // Sparse theme: only `string` and `comment` have token
+            // rules. `keyword`, `function`, `number`, `operator`,
+            // `variable`, `type`, `punctuation`, `constant` have NO
+            // matching rule. There is NO top-level empty-scope default
+            // rule in `tokenColors` either — only `colors.editor.*`
+            // sets editor background/foreground.
+            //
+            // Without the extractor's "default-foreground filter",
+            // vscode-textmate falls back to `#000000` for the
+            // no-match tokens. Our probe would store `#000000` for
+            // each of those roles, and the rendered code block ends
+            // up with black-on-dark-blue text — invisible.
+            //
+            // The expected behavior is that probes whose scope had no
+            // theme rule return null (so the caller fills in the
+            // GitHub palette fallback color), NOT the theme default
+            // and NOT `#000000`.
+            const tmpDir = fs.mkdtempSync(
+                path.join(require('os').tmpdir(), 'raven-theme-palette-'),
+            );
+            const themePath = path.join(tmpDir, 'sparse.json');
+            try {
+                fs.writeFileSync(
+                    themePath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#0e1116',
+                            'editor.foreground': '#c9d1d9',
+                        },
+                        tokenColors: [
+                            {
+                                scope: 'string',
+                                settings: { foreground: '#a5d6ff' },
+                            },
+                            {
+                                scope: 'comment',
+                                settings: { foreground: '#8b949e' },
+                            },
+                        ],
+                    }),
+                    'utf-8',
+                );
+
+                const registry = makeRegistry();
+                const out = await resolveActiveThemePalette({
+                    workbenchColorThemeId: 'Test Dark Sparse',
+                    isLight: false,
+                    extensions: [makeThemeExtension(themePath)],
+                    tokenColorCustomizations: undefined,
+                    semanticTokenColorCustomizations: undefined,
+                    registry,
+                    readFile: (p) => fs.promises.readFile(p, 'utf-8'),
+                });
+                expect(out.ok).toBe(true);
+                if (!out.ok) return;
+
+                // The rules we DID supply should round-trip.
+                expect(out.palette.roles.string).toBe('#a5d6ff');
+                expect(out.palette.roles.comment).toBe('#8b949e');
+
+                // The rules we DID NOT supply must NOT be `#000000`
+                // (vscode-textmate's hardcoded default) and must NOT
+                // be `#c9d1d9` (the theme's editor.foreground —
+                // visible enough, but not what a user expects for a
+                // keyword vs an identifier vs a literal). They must
+                // fall back to the bundled GitHub-dark palette.
+                const githubDark = {
+                    keyword: '#ff7b72',
+                    number: '#79c0ff',
+                    function: '#d2a8ff',
+                    type: '#ffa657',
+                    variable: '#ffa657',
+                    operator: '#79c0ff',
+                    punctuation: '#c9d1d9',
+                    constant: '#79c0ff',
+                };
+                for (const role of Object.keys(githubDark) as Array<keyof typeof githubDark>) {
+                    expect(
+                        out.palette.roles[role].toLowerCase(),
+                        `role=${role} resolved to ${out.palette.roles[role]} (expected GitHub fallback ${githubDark[role]}, NOT #000000 or editor.foreground)`,
+                    ).toBe(githubDark[role].toLowerCase());
+                }
+            } finally {
+                try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        },
+    );
+
+    itLive(
+        'roles whose probe scope DOES have a theme rule return the theme color',
+        async () => {
+            const tmpDir = fs.mkdtempSync(
+                path.join(require('os').tmpdir(), 'raven-theme-palette-'),
+            );
+            const themePath = path.join(tmpDir, 'sparse.json');
+            try {
+                fs.writeFileSync(
+                    themePath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#0e1116',
+                            'editor.foreground': '#c9d1d9',
+                        },
+                        tokenColors: [
+                            {
+                                scope: ['keyword', 'keyword.control'],
+                                settings: { foreground: '#deadbe' },
+                            },
+                            {
+                                scope: 'comment',
+                                settings: { foreground: '#cafe11' },
+                            },
+                            {
+                                scope: ['entity.name.function', 'support.function', 'meta.function-call entity.name.function'],
+                                settings: { foreground: '#abcdef' },
+                            },
+                        ],
+                    }),
+                    'utf-8',
+                );
+
+                const registry = makeRegistry();
+                const out = await resolveActiveThemePalette({
+                    workbenchColorThemeId: 'Test Dark Sparse',
+                    isLight: false,
+                    extensions: [makeThemeExtension(themePath)],
+                    tokenColorCustomizations: undefined,
+                    semanticTokenColorCustomizations: undefined,
+                    registry,
+                    readFile: (p) => fs.promises.readFile(p, 'utf-8'),
+                });
+                expect(out.ok).toBe(true);
+                if (!out.ok) return;
+
+                expect(out.palette.roles.keyword.toLowerCase()).toBe('#deadbe');
+                expect(out.palette.roles.comment.toLowerCase()).toBe('#cafe11');
+                expect(out.palette.roles.function.toLowerCase()).toBe('#abcdef');
+                expect(out.palette.background).toBe('#0e1116');
+                expect(out.palette.foreground).toBe('#c9d1d9');
+            } finally {
+                try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        },
+    );
+
+    itLive(
+        'theme with an explicit empty-scope default rule still routes no-match probes through the GitHub fallback',
+        async () => {
+            // Some themes DO supply an empty-scope default rule that
+            // sets the global foreground/background. The extractor's
+            // filter must still skip probes that match THAT default —
+            // not just the editor.foreground from `colors`. This
+            // exercises the "default rule exists in tokenColors with
+            // a non-editor.foreground color" case.
+            const tmpDir = fs.mkdtempSync(
+                path.join(require('os').tmpdir(), 'raven-theme-palette-'),
+            );
+            const themePath = path.join(tmpDir, 'with-default.json');
+            try {
+                fs.writeFileSync(
+                    themePath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#0e1116',
+                            'editor.foreground': '#c9d1d9',
+                        },
+                        tokenColors: [
+                            // Empty-scope default rule with a
+                            // foreground that differs from
+                            // editor.foreground. vscode-textmate uses
+                            // THIS for no-match tokens.
+                            {
+                                settings: {
+                                    foreground: '#deadbe',
+                                    background: '#0e1116',
+                                },
+                            },
+                            {
+                                scope: 'string',
+                                settings: { foreground: '#a5d6ff' },
+                            },
+                        ],
+                    }),
+                    'utf-8',
+                );
+
+                const registry = makeRegistry();
+                const out = await resolveActiveThemePalette({
+                    workbenchColorThemeId: 'Test Dark Sparse',
+                    isLight: false,
+                    extensions: [makeThemeExtension(themePath)],
+                    tokenColorCustomizations: undefined,
+                    semanticTokenColorCustomizations: undefined,
+                    registry,
+                    readFile: (p) => fs.promises.readFile(p, 'utf-8'),
+                });
+                expect(out.ok).toBe(true);
+                if (!out.ok) return;
+
+                // `string` has an explicit rule — keeps the theme color.
+                expect(out.palette.roles.string.toLowerCase()).toBe('#a5d6ff');
+                // `keyword` falls through to the empty-scope default
+                // (#deadbe), which is the "all my tokens look the
+                // same" symptom. The extractor must detect this and
+                // fall back to GitHub.
+                expect(out.palette.roles.keyword.toLowerCase()).toBe('#ff7b72');
+            } finally {
+                try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        },
+    );
+});

@@ -79,6 +79,22 @@ export function __resetRegistryCacheForTesting(): void {
 }
 
 /**
+ * Public access to the cached `GrammarRegistry`. The Knit Output panel
+ * uses this to probe the active VS Code theme via
+ * `vscode-theme-palette.ts` — the same registry the post-knit
+ * renderer uses, so we reuse its loaded grammars and the cost-amortized
+ * onig WASM load.
+ *
+ * Safe to call concurrently with `runPostKnitRender`: the registry's
+ * theme-aware path (`extractWithTheme`) is serialized internally, and
+ * the highlighter path (`tokenizeLineForLanguage`) is not affected by
+ * theme state.
+ */
+export function getKnitGrammarRegistry(context: vscode.ExtensionContext): GrammarRegistry {
+    return getOrCreateRegistry(context);
+}
+
+/**
  * Public entry point for stage 4c — call this from `renderOutcome`
  * after a successful knit. Throws on read / write / render errors so
  * the caller can surface a single error toast and fall back to

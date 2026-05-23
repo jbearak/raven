@@ -137,16 +137,35 @@ explorer-context-menu hook is opt-in via your own keybindings).
       document with VS Code's active editor background, foreground,
       and link colors. Code blocks (both fenced and inline `<code>`)
       pick up the theme's `textCodeBlock` shading so they match the
-      rest of the surface instead of staying on the GitHub palette;
-      syntax-token colors continue to use Raven's light/dark
-      palette so highlighting remains readable. The button keeps
-      its label and conveys the active state visually (pressed-
-      button styling, `aria-pressed` for screen readers) — Rmd
-      output doesn't have a "document theme" to switch back to, so
-      the toggle simply represents whether the overlay is on. The
-      preference is persisted to `globalState` so subsequent knits
-      restore it, and it tracks VS Code theme switches in real
-      time.
+      rest of the surface. Syntax-token colors are extracted from
+      the active theme's TextMate `tokenColors` (plus any
+      `semanticTokenColors` entries that map to one of Raven's
+      coarse roles, plus your `editor.tokenColorCustomizations`)
+      and applied to the rendered code spans. If Raven cannot
+      resolve the active theme's JSON — for example because the
+      theme ships in tmTheme XML format, has an unresolvable
+      `include` chain, or fails JSON parsing — the toggle falls
+      back to Raven's bundled light/dark GitHub palette and a
+      single line is written to the `Raven: Knit` output channel.
+      The button keeps its label and conveys the active state
+      visually (pressed-button styling, `aria-pressed` for screen
+      readers) — Rmd output doesn't have a "document theme" to
+      switch back to, so the toggle simply represents whether the
+      overlay is on. The preference is persisted to `globalState`
+      so subsequent knits restore it, and the panel tracks VS Code
+      theme switches and changes to
+      `editor.tokenColorCustomizations` /
+      `editor.semanticTokenColorCustomizations` in real time —
+      no re-knit required.
+
+      The role mapping is coarse (ten roles: keyword, string,
+      number, comment, function, type, variable, operator,
+      punctuation, constant). Semantic-token selectors with
+      modifiers (`function.declaration`, `*.defaultLibrary`) are
+      not honored; only bare type names are. The result is
+      "theme-tinted" highlighting that matches the editor's mood
+      and broad role palette, not a pixel-identical rendering of
+      VS Code's own code coloring.
 
     Standard text copy works inside the rendered output:
     Cmd/Ctrl-C copies the current iframe selection to the system

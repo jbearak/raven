@@ -8,6 +8,27 @@ export type KnitOutputMessage =
     | { type: 'themeChanged'; applied: boolean };
 
 /**
+ * Marker key on `postMessage` payloads from the extension host to the
+ * outer-shell script. We discriminate via a property instead of a
+ * `type:` field because the existing in-iframe probe path also uses
+ * `event.data.__ravenKnitProbe`, and a shared discriminator field
+ * would risk silent collision with that or with VS Code-injected
+ * message shapes.
+ */
+export const VSCODE_PALETTE_UPDATE_KEY = '__ravenVscodeThemePalette';
+
+export interface VscodeThemePaletteUpdate {
+    /** Marker — must equal `true`. */
+    __ravenVscodeThemePalette: true;
+    /**
+     * Pre-built CSS declarations matching `paletteCssDeclarations` for
+     * the VS Code theme. `null` clears the override so the toggle
+     * falls back to the GitHub variant.
+     */
+    css: string | null;
+}
+
+/**
  * Strict type-narrowing for messages posted from the Knit Output webview.
  * The webview is a trust boundary; reject anything we did not explicitly
  * shape. Additional unknown properties on a recognized type are allowed
@@ -77,7 +98,7 @@ export function classify(
  * baked-at-knit `--raven-c-*` tokens on the original variant — e.g.
  * dark tokens on a light shade.
  */
-function paletteCssDeclarations(palette: GithubPalette): string {
+export function paletteCssDeclarations(palette: GithubPalette): string {
     return [
         `--raven-bg: ${palette.background};`,
         `--raven-fg: ${palette.foreground};`,
@@ -152,8 +173,26 @@ export function buildShellHtml(args: {
      * recreation between knits.
      */
     initialThemeApplied: boolean;
+    /**
+     * Pre-built CSS declarations for the active VS Code theme's
+     * resolved palette, matching the same shape
+     * `paletteCssDeclarations` returns. When non-null, the toggle's
+     * applyTheme() prefers these colors over the GitHub variant. If
+     * the resolver failed (theme JSON not found, parse error, etc.)
+     * the caller passes `null` and the toggle falls back to the
+     * GitHub variant — same behavior as before this feature shipped.
+     */
+    vscodeThemePaletteCss?: string | null;
 }): string {
-    const { htmlContent, baseHref, cspSource, outputPath, nonce, initialThemeApplied } = args;
+    const {
+        htmlContent,
+        baseHref,
+        cspSource,
+        outputPath,
+        nonce,
+        initialThemeApplied,
+        vscodeThemePaletteCss,
+    } = args;
     // path.basename handles both POSIX and Windows separators.
     const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
     const basename = lastSep >= 0 ? outputPath.slice(lastSep + 1) : outputPath;
@@ -374,6 +413,18 @@ export function buildShellHtml(args: {
         dark: ${JSON.stringify(darkPaletteCss)},
       };
 
+      // Resolved VS Code theme palette. When non-null, the toggle
+      // paints these colors instead of the GitHub variant. The
+      // extension host posts replacement values whenever the active
+      // theme or relevant editor.* settings change; the receiver
+      // below applies the update and re-runs applyTheme so the
+      // change shows up immediately without a re-knit.
+      let vscodePaletteCss = ${
+          typeof vscodeThemePaletteCss === 'string' && vscodeThemePaletteCss.length > 0
+              ? JSON.stringify(vscodeThemePaletteCss)
+              : 'null'
+      };
+
       function activePaletteVariant() {
         // Mirror the regex used by render-html.ts:composeStylesheet
         // so the overlay-time variant choice matches the bake-time
@@ -382,6 +433,15 @@ export function buildShellHtml(args: {
         // is the light one.
         const cls = document.body.className || '';
         return /\\bvscode-(light|high-contrast-light)\\b/.test(cls) ? 'light' : 'dark';
+      }
+
+      function activePaletteCss() {
+        // VS Code-extracted palette wins over the GitHub default.
+        // Falling through to GitHub when the resolver failed lets
+        // the toggle still produce a coherent code-block look
+        // matching the live background.
+        if (vscodePaletteCss !== null) return vscodePaletteCss;
+        return RAVEN_PALETTE_CSS[activePaletteVariant()];
       }
 
       function syncThemeBtn() {
@@ -445,7 +505,7 @@ export function buildShellHtml(args: {
         // (resolved live from the outer shell) while leaving token
         // colors on the baked-at-knit variant — i.e. dark tokens
         // on a light background, or vice versa.
-        const variantCss = RAVEN_PALETTE_CSS[activePaletteVariant()];
+        const variantCss = activePaletteCss();
         style.textContent =
           ':root { ' + variantCss + ' }'
           + ' html, body { background: ' + c.bg + ' !important; '
@@ -741,12 +801,33 @@ export function buildShellHtml(args: {
         attributes: true, attributeFilter: ['class'],
       });
       syncThemeBtn();
-      // Diagnostic probe — the extension host can verify the iframe
-      // successfully navigated to the rendered file rather than
-      // silently staying on about:blank.
+
+      // VS Code theme palette updates from the extension host. We
+      // accept the css string only when it round-trips through a
+      // strict shape check — the field is concatenated into
+      // style.textContent, so a malformed value (or one bearing CSS
+      // that escapes the var-declaration form) would corrupt the
+      // iframe stylesheet. The regex matches the exact declaration
+      // sequence paletteCssDeclarations emits; anything else is
+      // dropped and the toggle falls back to the GitHub variant.
+      // Mirror vscode-theme-palette.ts:HEX_COLOR_RE — accept only
+      // the four CSS-spec hex lengths (3, 4, 6, 8). The wider {3,8}
+      // form would silently pass 5/7-digit malformed values that no
+      // current code path emits but a future refactor could.
+      var RAVEN_PALETTE_CSS_RE = /^(?:--raven-(?:bg|fg|c-[a-z]+): #(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6,8}); ?)+$/;
       window.addEventListener('message', function (event) {
         var data = event && event.data;
-        if (!data || data.__ravenKnitProbe !== true) return;
+        if (!data) return;
+        if (data.__ravenVscodeThemePalette === true) {
+          if (typeof data.css === 'string' && RAVEN_PALETTE_CSS_RE.test(data.css)) {
+            vscodePaletteCss = data.css;
+          } else {
+            vscodePaletteCss = null;
+          }
+          applyTheme();
+          return;
+        }
+        if (data.__ravenKnitProbe !== true) return;
         var locationHref = '';
         try {
           locationHref = iframe.contentWindow ? iframe.contentWindow.location.href : '';

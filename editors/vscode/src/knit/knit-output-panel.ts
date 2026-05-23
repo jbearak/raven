@@ -2,8 +2,18 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { buildShellHtml, isKnitOutputMessage } from './knit-output';
+import {
+    buildShellHtml,
+    isKnitOutputMessage,
+    paletteCssDeclarations,
+    type VscodeThemePaletteUpdate,
+} from './knit-output';
 import { inlineLocalImagesAsDataUrls } from './inline-images';
+import { getKnitGrammarRegistry } from './post-knit-renderer';
+import {
+    resolveActiveThemePalette,
+    type ThemePaletteOutcome,
+} from './vscode-theme-palette';
 
 /**
  * Webview panel that renders a single `.Rmd`'s rendered HTML output in
@@ -58,6 +68,36 @@ export class KnitOutputPanel {
      * last was" instead of `ViewColumn.Beside`.
      */
     private lastKnownColumn: vscode.ViewColumn | undefined;
+
+    /**
+     * Disposables tied to this panel's lifetime — VS Code theme +
+     * configuration listeners that drive the live "Apply VS Code
+     * theme" palette refresh. We dispose them in `onDidDispose` so
+     * they never outlive the panel (otherwise a knit-and-close
+     * cycle in a long session would accumulate closures over
+     * disposed webviews and slowly leak the underlying postMessage
+     * channel).
+     */
+    private readonly perPanelDisposables: vscode.Disposable[] = [];
+
+    /**
+     * Set to true the moment VS Code reports the panel has been
+     * disposed. Theme/config listeners check this flag before
+     * posting to the webview — a race where the user closes the
+     * panel while a re-resolve is in flight would otherwise call
+     * `webview.postMessage` on a disposed webview, which VS Code
+     * tolerates but logs as a warning.
+     */
+    private disposed = false;
+
+    /**
+     * Tracks whether we've already logged a "could not resolve VS
+     * Code theme" line to the output channel for THIS panel session.
+     * One log line per panel is enough; further failures during the
+     * same session are silent (the toggle still falls back cleanly
+     * to the GitHub palette).
+     */
+    private themeResolveWarned = false;
 
     /**
      * Open or update the panel for `args.sourceUri`. Returns
@@ -251,7 +291,36 @@ export class KnitOutputPanel {
                 KnitOutputPanel.instances.delete(key);
             }
             KnitOutputPanel.recomputePreviewColumn();
+            // Run per-panel disposables so theme / config listeners
+            // stop holding references to this panel. Set `disposed`
+            // BEFORE running them so any listener mid-flight sees
+            // the flag and short-circuits its postMessage call.
+            instance.disposed = true;
+            for (const d of instance.perPanelDisposables) {
+                try { d.dispose(); } catch { /* swallow */ }
+            }
+            instance.perPanelDisposables.length = 0;
         });
+
+        // Listen for VS Code theme changes and the editor.* settings
+        // that drive token coloring. Each event re-resolves the
+        // palette and pushes a replacement CSS string into the
+        // webview, so the user sees their newly selected theme's
+        // colors without re-knitting. Bound to the panel's lifetime
+        // via `perPanelDisposables`.
+        const onTheme = vscode.window.onDidChangeActiveColorTheme(
+            () => { void instance.pushVscodeThemePalette(); },
+        );
+        const onConfig = vscode.workspace.onDidChangeConfiguration((e) => {
+            if (
+                e.affectsConfiguration('workbench.colorTheme')
+                || e.affectsConfiguration('editor.tokenColorCustomizations')
+                || e.affectsConfiguration('editor.semanticTokenColorCustomizations')
+            ) {
+                void instance.pushVscodeThemePalette();
+            }
+        });
+        instance.perPanelDisposables.push(onTheme, onConfig);
 
         instance.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
         return instance;
@@ -365,8 +434,113 @@ export class KnitOutputPanel {
             outputPath: args.outputPath,
             nonce,
             initialThemeApplied: KnitOutputPanel.readThemePreference(this.context),
+            // Resolved palette is delivered out-of-band via
+            // postMessage from `pushVscodeThemePalette` — the
+            // initial value defaults to null so the webview boots
+            // without a VS Code palette and falls back to the
+            // GitHub variant until the resolve completes. This
+            // avoids blocking the shell render on a theme JSON
+            // read (which involves filesystem IO and grammar
+            // priming).
+            vscodeThemePaletteCss: null,
         });
         this.panel.title = `Knit Output: ${path.basename(args.outputPath)}`;
+        // Fire-and-forget: re-render the shell first, then resolve
+        // and push the palette. The webview applies it as soon as
+        // the message arrives (the initial render also runs
+        // applyTheme(), so the toggle is visually responsive even
+        // while we're still resolving).
+        void this.pushVscodeThemePalette();
+    }
+
+    /**
+     * Resolve the active VS Code theme's palette and push it into the
+     * webview. Idempotent — repeated calls during rapid theme flips
+     * or settings changes coalesce naturally because each postMessage
+     * triggers the webview's `applyTheme` once.
+     *
+     * Returns silently on failure: the webview already falls back to
+     * the GitHub-variant palette when no VS Code palette is set, so
+     * a resolve failure is visually equivalent to the pre-feature
+     * behavior. The first failure per panel session is logged to the
+     * Knit output channel; subsequent failures are silent.
+     */
+    private async pushVscodeThemePalette(): Promise<void> {
+        if (this.disposed) return;
+        // The whole resolve path can throw if the extension context
+        // is a sparse test stub (e.g. `{} as vscode.ExtensionContext`)
+        // or if the cached grammar registry fails to init. Treat any
+        // throw as "fallback to GitHub palette" — the webview already
+        // handles a null css gracefully, and the toggle stays usable.
+        let outcome: ThemePaletteOutcome;
+        try {
+            outcome = await this.resolveCurrentPalette();
+        } catch (err) {
+            outcome = {
+                ok: false,
+                reason: 'read-error',
+                detail: err instanceof Error ? err.message : String(err),
+            };
+        }
+        if (this.disposed) return;
+        let css: string | null = null;
+        if (outcome.ok) {
+            css = paletteCssDeclarations(outcome.palette);
+        } else if (!this.themeResolveWarned) {
+            this.themeResolveWarned = true;
+            this.output.appendLine(
+                `[theme] could not resolve VS Code theme palette (${outcome.reason}): ${outcome.detail}. ` +
+                'Falling back to GitHub palette.',
+            );
+        }
+        const message: VscodeThemePaletteUpdate = {
+            __ravenVscodeThemePalette: true,
+            css,
+        };
+        try {
+            await this.panel.webview.postMessage(message);
+        } catch (err) {
+            // postMessage can reject if the panel was disposed
+            // between our check and the call — that's not a real
+            // error, just lost-update.
+            if (this.disposed) return;
+            this.output.appendLine(
+                `[theme] postMessage failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+        }
+    }
+
+    /**
+     * Read the current VS Code state and resolve the active theme's
+     * palette. Production wiring lives here so the extractor stays
+     * pure (and unit-testable without spinning up VS Code).
+     *
+     * The grammar registry is shared with the post-knit renderer's
+     * cached instance; reusing it amortizes the vscode-textmate +
+     * onig.wasm initialisation across the panel and the renderer.
+     */
+    private async resolveCurrentPalette(): Promise<ThemePaletteOutcome> {
+        const registry = getKnitGrammarRegistry(this.context);
+        const editor = vscode.workspace.getConfiguration('editor');
+        const workbench = vscode.workspace.getConfiguration('workbench');
+        const kind = vscode.window.activeColorTheme.kind;
+        const isLight =
+            kind === vscode.ColorThemeKind.Light
+            || kind === vscode.ColorThemeKind.HighContrastLight;
+        return resolveActiveThemePalette({
+            workbenchColorThemeId: workbench.get<string>('colorTheme', '') ?? '',
+            isLight,
+            extensions: vscode.extensions.all.map((e) => ({
+                id: e.id,
+                extensionPath: e.extensionPath,
+                packageJSON: e.packageJSON,
+            })),
+            tokenColorCustomizations: editor.get('tokenColorCustomizations'),
+            semanticTokenColorCustomizations: editor.get('semanticTokenColorCustomizations'),
+            registry,
+            readFile: (absPath) => fs.promises.readFile(absPath, 'utf-8'),
+            realPath: (absPath) => fs.promises.realpath(absPath),
+        });
     }
 
     /**
