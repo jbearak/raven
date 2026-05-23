@@ -265,7 +265,9 @@ If multiple formats are listed (`output: { pdf_document: {...}, word_document: {
 | `css: [file.css]` | `--css=<absolute path>` — see CSS path resolution rule below |
 | `mathjax: <bool>` | `--mathjax` or omit |
 
-**CSS path resolution (closes Codex finding #2):** since Pandoc's `cwd` is the temp `.md` directory (not the source `.Rmd` directory), source-relative paths in YAML's `css:` list would resolve against the wrong directory. We resolve each entry against the source `.Rmd`'s parent directory, validate that the resolved absolute path is inside that directory's workspace folder (no `../` traversal escapes), reject anything that fails validation (logged as ignored, just like `pandoc_args`), and pass the absolute path to Pandoc. Same rule applies to `--reference-doc` if ever added.
+**CSS path resolution (closes Codex finding #2):** since Pandoc's `cwd` is the temp `.md` directory (not the source `.Rmd` directory), source-relative paths in YAML's `css:` list would resolve against the wrong directory. We resolve each entry against the source `.Rmd`'s parent directory, validate that the resolved absolute path is inside a **containment root**, reject anything that fails validation (logged as ignored, just like `pandoc_args`), and pass the absolute path to Pandoc. Same rule applies to `--reference-doc` if ever added.
+
+**Containment root**: the workspace folder containing the `.Rmd`. If the user has no workspace open (opened the `.Rmd` directly as a single file), the containment root falls back to the `.Rmd`'s parent directory. This matches the temp-dir layout's no-workspace fallback (`<workspaceHash>` falls back to the .Rmd parent dir), so a `style.css` next to the `.Rmd` is accepted in both single-file and workspace contexts.
 
 **`pandoc_args` is NOT honored in v1** (security: a document could pass `--output`, `--lua-filter`, `--metadata-file`, `--extract-media`, or other flags that bypass Raven's controlled destination or execute external code). Tracked in follow-up issue #2 with a defined allowlist/blocklist as a prerequisite.
 
@@ -372,12 +374,28 @@ A new `pandocConvert(mdPath, format, args, opts)` in `editors/vscode/src/knit/pa
 
 ### Webview message trust boundary (security)
 
-Adding `requestExport` requires updating the existing trust boundary in `knit-output.ts` and `knit-output-panel.ts`. **Validation rule: exact key-set match** — the message object MUST contain only `type`, and nothing else. Any additional keys cause the message to be rejected. (Earlier draft had a self-contradictory rule that both rejected and ignored extra keys; Codex finding #3 prompted picking one.)
+Adding `requestExport` requires updating the existing trust boundary in `knit-output.ts` and `knit-output-panel.ts`. **Validation rule: exact-schema match per message type** — for each known `type`, the validator declares the exact allowed key set, and any message with extra/missing/misnamed keys is rejected. (Earlier draft had two contradictory rules — reject *and* ignore extras — Codex P2-3 picked exact-match; P3-1 then noted the rule must be per-type, since existing messages legitimately carry payloads.)
+
+The full per-type schema after this change:
+
+| `type` value | Allowed key set |
+|---|---|
+| `requestExport` | `{ type }` |
+| `cancelExport` | `{ type }` |
+| `refresh` | `{ type }` |
+| `openInBrowser` | `{ type }` |
+| `themeChanged` | `{ type, applied }` |
+| `themeContext` | `{ type, editorBackground }` |
+| `paletteRequest` | `{ type }` |
+| `fontRequest` | `{ type }` |
+
+(The four `themeChanged`/`themeContext`/`paletteRequest`/`fontRequest` rows reflect what the validator already does; restating them ensures `isKnitOutputMessage` stays consistent after the change. Existing tests already cover these; the new tests below cover the two new types.)
 
 - Add `'requestExport'` and `'cancelExport'` to the `KnitOutputMessage` discriminated union with payload shape `{ type: 'requestExport' }` / `{ type: 'cancelExport' }` — no other fields. The native quickpick the host opens collects the format choice; format never crosses the webview boundary, so untrusted payload surface is zero.
-- Extend `isKnitOutputMessage` to validate the exact key set (`Object.keys(msg).length === 1 && msg.type in [...]`).
+- Extend `isKnitOutputMessage` so each known `type` checks `Object.keys(msg).sort()` against that type's allowed key set (sorted) for exact equality.
 - Add unit test asserting `{ type: 'requestExport', format: '../etc/passwd' }` is rejected (extra key violates exact-match).
 - Add unit test asserting `{ type: 'requestExport' }` with no extra keys is accepted and dispatches the host's quickpick.
+- Add a regression unit test asserting existing payloaded messages (`themeChanged`, `themeContext`) still validate after the change.
 
 ## Post-export feedback
 
@@ -444,7 +462,9 @@ async function openExportedFile(savedUri: vscode.Uri, format: 'html' | 'pdf' | '
 - `knit-multi-root-isolation.test.ts` — two workspace folders contain `analysis.Rmd` files at different absolute paths; assert their temp subdirs hash to different `preview/<sha256>/` paths and neither knit reads the other's `.md`.
 - `knit-multi-window-isolation.test.ts` — simulate two extension-host sessions on the same workspace; assert their temp subdirs are under different `<sessionId>` paths and one session's `deactivate()` doesn't delete the other's preview/export dirs.
 - `knit-op-registry-race.test.ts` — fire two `raven.knit.exportPdf` commands on the same URI without awaiting; assert exactly one Pandoc invocation and the second call triggers the busy-toast.
-- `knit-export-css-resolution.test.ts` — `output.html_document.css: ['style.css']` with `style.css` next to the .Rmd; assert Pandoc receives `--css=<absolute-path-to-style.css>`. With `css: ['../../etc/passwd']`, assert the entry is dropped and logged as ignored.
+- `knit-export-css-resolution.test.ts` — assert that:
+  - With a workspace: `output.html_document.css: ['style.css']` next to the .Rmd → Pandoc receives `--css=<absolute-path>`. `css: ['../../etc/passwd']` is dropped and logged.
+  - Without a workspace (single .Rmd opened directly): `style.css` next to the .Rmd is still accepted. `../style.css` is rejected as it escapes the .Rmd parent dir.
 - `knit-figpath-modes.test.ts` — integration test that knits a chunk producing a plot, under each of the three `raven.knit.workingDirectory` modes (`document`, `project`, `current`); assert the plot file lands in the per-document preview `figure/` subdir and not in any source-tree location.
 
 ### Pure-function unit tests
@@ -511,3 +531,10 @@ The spec was reviewed against the criteria in the user's `feedback_codex_adversa
 | P2-5 | Medium | Multi-window deactivate race | `<sessionId>` subdir + `knit-multi-window-isolation.test.ts` |
 | P2-6 | Medium | knit-then-export needs `kind`/`phase` model | Updated `OperationController` shape |
 | P2-7 | Low | `fig.path` claim needs explicit verification test | `knit-figpath-modes.test.ts` added |
+
+**Pass 3 — 2 wording-precision findings:**
+
+| # | Severity | Topic | Addressed in |
+|---|---|---|---|
+| P3-1 | Medium | Trust-boundary "only `type`" rule would break existing payloaded messages | Per-type exact-schema table |
+| P3-2 | Medium | CSS containment root undefined for no-workspace files | Explicit fallback to .Rmd parent dir; test added |
