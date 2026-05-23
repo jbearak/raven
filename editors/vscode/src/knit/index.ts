@@ -1,7 +1,16 @@
+import * as crypto from 'crypto';
+import * as os from 'os';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { registerKnitCommands } from './knit-commands';
 import { disposeKnitGrammarRegistryForDeactivation } from './post-knit-renderer';
+import {
+    cleanupCurrentSession,
+    initSessionState,
+    maybeCurrentSession,
+    sweepStaleSessions,
+} from './session-state';
 
 export { disposeKnitGrammarRegistryForDeactivation };
 
@@ -24,6 +33,11 @@ export { disposeKnitGrammarRegistryForDeactivation };
  * be invoked from a walkthrough button before the LSP fully starts,
  * and the renderer tolerates `undefined` by falling back to
  * grammar-only highlighting.
+ *
+ * Also initializes the per-session knit state (workspaceHash +
+ * sessionId) so the temp-dir layout under `<tmpdir>/raven-knit/...`
+ * isolates this VS Code window from concurrent ones, and kicks off a
+ * background sweep of stale (>7 day) sibling sessions.
  */
 export function registerKnit(
     context: vscode.ExtensionContext,
@@ -35,5 +49,23 @@ export function registerKnit(
         'raven.rmdKnit.enabled',
         enabledFromGate,
     );
+
+    // Idempotency guard — if the extension is re-activated within the
+    // same process (rare, but happens in dev with reload-extension)
+    // we don't want to clobber the existing session id.
+    if (maybeCurrentSession() === null) {
+        const workspaceUri =
+            vscode.workspace.workspaceFolders?.[0]?.uri.toString()
+            ?? vscode.workspace.workspaceFile?.toString()
+            ?? null;
+        initSessionState({ sessionId: crypto.randomUUID(), workspaceUri });
+        context.subscriptions.push({
+            dispose: () => { void cleanupCurrentSession(); },
+        });
+        // Non-blocking sweep of orphaned sibling sessions. Best effort —
+        // errors are swallowed inside `sweepStaleSessions`.
+        void sweepStaleSessions(path.join(os.tmpdir(), 'raven-knit'));
+    }
+
     registerKnitCommands(context, getLanguageClient ? { getLanguageClient } : undefined);
 }

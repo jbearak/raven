@@ -15,7 +15,10 @@ import {
     ValidatePathError,
 } from './r-expression';
 import { runKnit } from './knit-engine';
-import { computeHtmlOutputPath, computeMdOutputPath } from './knit-paths';
+import { computeHtmlOutputPath } from './knit-paths';
+import { previewArtifactPaths } from './raven-knit-paths';
+import { currentSession } from './session-state';
+import * as fs from 'fs';
 import { runPostKnitRender } from './post-knit-renderer';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { resolveRConsoleActivation } from '../r-console-activation';
@@ -257,11 +260,24 @@ async function runKnitCommand(
     const { knitRootDir, cwd } = knitDirResult;
 
     // [6] Build R expression.
-    // Predict the intermediate .md path. knitr's default is "strip
-    // the .Rmd extension, append .md". We pass it explicitly so the
-    // TS-side renderer doesn't have to re-derive — and so any future
-    // user-overridable output location can flow through one place.
-    const mdOutputPath = computeMdOutputPath(fsPath);
+    // Resolve the per-session temp paths now. Knit Preview writes its
+    // intermediate `.md`, final `.html`, and `figure/` artifacts into
+    // <tmpdir>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/
+    // — never next to the source `.Rmd`. We must ensure the directory
+    // exists before R runs, since knitr won't `mkdir -p` for us.
+    const previewPaths = previewArtifactPaths(fsPath, currentSession());
+    const mdOutputPath = previewPaths.mdPath;
+    try {
+        await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        output.show(true);
+        output.appendLine(`[knit] Failed to create temp dir ${previewPaths.previewDir}: ${message}`);
+        await vscode.window.showErrorMessage(
+            `Raven: Knit could not create temp directory. See output for details.`,
+        );
+        return;
+    }
 
     // YAML output: block — chunk-level options come from here. The
     // preview target is always 'html' (preview is HTML regardless of
@@ -280,12 +296,14 @@ async function runKnitCommand(
             outputPath: mdOutputPath,
             format,
             knitRootDir,
-            // For now, base.dir mirrors the .md's parent directory so
-            // figures land alongside it. Phase 11 will switch this to
-            // the per-session temp dir; here we keep the existing
-            // co-located figure/ behavior so the migration is reviewable
-            // in isolation.
-            baseDir: path.dirname(mdOutputPath),
+            // base.dir is the preview temp dir so knitr's plots land
+            // under <previewDir>/figure/ alongside the .md. The
+            // relative fig.path lets the .md reference figures as
+            // `figure/<chunk>-N.png`, and Pandoc's `cwd` (set during
+            // export to `previewDir`) resolves those relative paths
+            // against the freshly-generated figures — never against
+            // stale source-directory artifacts.
+            baseDir: previewPaths.previewDir,
             figPath: 'figure/',
             chunkOpts: outputOpts.chunkOpts,
         });

@@ -68,3 +68,33 @@ export function previewDirFor(workspaceHash: string, sessionId: string, sourceHa
 export function exportDirFor(workspaceHash: string, sessionId: string, uuid: string): string {
     return path.join(sessionRoot(workspaceHash, sessionId), 'export', uuid);
 }
+
+export interface PreviewArtifactPaths {
+    previewDir: string;
+    mdPath: string;
+    htmlPath: string;
+    figDir: string;
+    /** SHA-256 of the absolute .Rmd path. Used as the refcount key in OperationRegistry. */
+    previewKey: string;
+}
+
+/**
+ * Resolve every per-source artifact path for the given .Rmd.
+ *
+ * Requires `initSessionState` to have been called (i.e., the extension
+ * is active). For pure unit tests, use the lower-level helpers
+ * (`computeWorkspaceHash`, `computeSourceHash`, `previewDirFor`) and
+ * pass the components explicitly.
+ */
+export function previewArtifactPaths(rmdAbsPath: string, sessionInfo: { workspaceHash: string; sessionId: string }): PreviewArtifactPaths {
+    const sourceHash = computeSourceHash(rmdAbsPath);
+    const previewDir = previewDirFor(sessionInfo.workspaceHash, sessionInfo.sessionId, sourceHash);
+    const baseName = path.basename(rmdAbsPath).replace(/\.[Rr][Mm][Dd]$/, '');
+    return {
+        previewDir,
+        mdPath: path.join(previewDir, `${baseName}.md`),
+        htmlPath: path.join(previewDir, `${baseName}.html`),
+        figDir: path.join(previewDir, 'figure'),
+        previewKey: sourceHash,
+    };
+}
