@@ -27,7 +27,10 @@ import {
 } from '../../editors/vscode/src/knit/vscode-theme-palette';
 import type * as vscode from 'vscode';
 
+// Default to the macOS install location. Override with `VSCODE_R_PATH`
+// to point at Linux/Windows installs (e.g. `/usr/share/code/resources/app/extensions/r`).
 const VSCODE_R_PATH =
+    process.env.VSCODE_R_PATH ??
     '/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/r';
 
 function resolveOnigWasm(): string | undefined {
