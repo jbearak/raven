@@ -16,7 +16,8 @@ import {
 } from './r-expression';
 import { runKnit } from './knit-engine';
 import { computeHtmlOutputPath } from './knit-paths';
-import { previewArtifactPaths } from './raven-knit-paths';
+import { canonicalOpKey, previewArtifactPaths } from './raven-knit-paths';
+import { OperationRegistry } from './operation-controller';
 import * as fs from 'fs';
 import { runPostKnitRender } from './post-knit-renderer';
 import type { LanguageClient } from 'vscode-languageclient/node';
@@ -62,6 +63,14 @@ export interface KnitDeps {
      * "Show Knit Output" command reveals a single source of truth.
      */
     sharedOutput?: vscode.OutputChannel;
+    /**
+     * Optional shared OperationRegistry. When provided (production
+     * calls it that way), knit and export ops share one per-source
+     * gate so an in-flight knit blocks export and vice versa. When
+     * omitted, `registerKnitCommands` creates a private registry —
+     * legacy / test-only behavior.
+     */
+    sharedRegistry?: OperationRegistry;
 }
 
 /**
@@ -94,17 +103,18 @@ export function registerKnitCommands(
         return outputChannel;
     };
 
-    // Per-file in-flight set. A second knit against a file that's
-    // already rendering would race on the same output and confuse the
-    // user; we surface a clear info message instead. Keyed by the
-    // resolved fsPath after the up-front gate/extension checks.
-    const inFlight = new Set<string>();
+    // Per-source operation registry. Shared with the export pipeline
+    // when `deps.sharedRegistry` is supplied (production path). The
+    // shared registry ensures an in-flight knit blocks a same-source
+    // export and vice versa. When omitted (tests), we keep a private
+    // registry per `registerKnitCommands` call.
+    const registry = deps?.sharedRegistry ?? new OperationRegistry();
 
     context.subscriptions.push(
         vscode.commands.registerCommand(
             'raven.knit',
             async (uri?: vscode.Uri) => {
-                await runKnitCommand(uri, getOutput(), inFlight, context, resolved);
+                await runKnitCommand(uri, getOutput(), registry, context, resolved);
             },
         ),
         vscode.commands.registerCommand(
@@ -119,7 +129,7 @@ export function registerKnitCommands(
 async function runKnitCommand(
     explicitUri: vscode.Uri | undefined,
     output: vscode.OutputChannel,
-    inFlight: Set<string>,
+    registry: OperationRegistry,
     context: vscode.ExtensionContext,
     deps: KnitDeps,
 ): Promise<void> {
@@ -342,18 +352,32 @@ async function runKnitCommand(
     const timeoutMs = readTimeoutMs();
     const baseName = path.basename(fsPath);
 
-    // Concurrent-knit guard. Re-invoking the command on a file that's
-    // already rendering produces two progress notifications, two R
-    // subprocesses, and interleaved output into the shared channel.
-    // Surface a clear info message instead. The key is the absolute
-    // fsPath so the same file under different relative URIs collapses.
-    if (inFlight.has(fsPath)) {
+    // Concurrent-op guard. The shared OperationRegistry tracks both
+    // knit-preview and export-* ops; a busy result here means either
+    // another knit is in flight on the same source (the legacy case)
+    // or an export is mid-Pandoc on this file (so the cached .md is
+    // being consumed and a fresh knit would race). The canonical key
+    // collapses different URI shapes of the same file (e.g., case
+    // differences on Windows) onto a single slot.
+    const opKey = canonicalOpKey(docUri);
+    const begin = registry.beginOp(opKey, 'knit-preview');
+    if (begin.kind === 'busy') {
+        const what =
+            begin.existing.kind === 'knit-preview'
+                ? 'being knitted'
+                : begin.existing.kind === 'export-html'
+                    ? 'exporting to HTML'
+                    : begin.existing.kind === 'export-pdf'
+                        ? 'exporting to PDF'
+                        : begin.existing.kind === 'export-docx'
+                            ? 'exporting to Word'
+                            : 'busy';
         await vscode.window.showInformationMessage(
-            `Raven: Knit — ${baseName} is already being knitted.`,
+            `Raven: Knit — ${baseName} is already ${what}.`,
         );
         return;
     }
-    inFlight.add(fsPath);
+    const controller = begin.controller;
 
     output.appendLine(`---`);
     output.appendLine(`Knitting ${fsPath}`);
@@ -383,14 +407,14 @@ async function runKnitCommand(
             },
         );
     } finally {
-        // Critical: inFlight.delete runs the moment withProgress resolves,
+        // Critical: registry.endOp runs the moment withProgress resolves,
         // BEFORE any user-facing toast is awaited. This is the Piece A
-        // fix — under the previous code, awaiting showInformationMessage
-        // inside the withProgress callback held both the progress
-        // notification AND the inFlight gate open until the user
-        // dismissed the toast, causing a spurious "already being knitted"
-        // on rapid re-invocation.
-        inFlight.delete(fsPath);
+        // fix — under the previous code (a bare Set<string>), awaiting
+        // showInformationMessage inside the withProgress callback held
+        // both the progress notification AND the in-flight gate open
+        // until the user dismissed the toast, causing a spurious
+        // "already being knitted" on rapid re-invocation.
+        registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
     }
 
     await renderOutcome(outcome, {
@@ -589,8 +613,12 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
  * Test-only entry point that bypasses the registered `raven.knit`
  * command. Exposes the same code path with caller-controlled deps.
  * Used by `knit-progress-lifecycle.test.ts` to verify the Piece A
- * invariant: `inFlight.delete` runs the moment `withProgress` resolves,
- * NOT when the user dismisses the success toast.
+ * invariant: the registry slot is released the moment `withProgress`
+ * resolves, NOT when the user dismisses the success toast.
+ *
+ * Accepts either a `Set<string>` (legacy — existing tests still pass
+ * one in; it's adapted to an internal OperationRegistry) or a real
+ * `OperationRegistry`. New tests should prefer the registry.
  *
  * The `__` prefix signals "test-only"; do not call from production
  * code.
@@ -598,11 +626,13 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
 export async function __runKnitCommandForTest(args: {
     uri: vscode.Uri | undefined;
     output: vscode.OutputChannel;
-    inFlight: Set<string>;
+    inFlight: Set<string> | OperationRegistry;
     context: vscode.ExtensionContext;
     deps: KnitDeps;
 }): Promise<void> {
-    await runKnitCommand(args.uri, args.output, args.inFlight, args.context, args.deps);
+    const registry =
+        args.inFlight instanceof OperationRegistry ? args.inFlight : new OperationRegistry();
+    await runKnitCommand(args.uri, args.output, registry, args.context, args.deps);
 }
 
 interface KnitDirOk {

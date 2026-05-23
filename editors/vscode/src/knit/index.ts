@@ -84,9 +84,17 @@ export function registerKnit(
     // into both registration paths.
     const knitOutput = vscode.window.createOutputChannel('Raven: Knit');
     context.subscriptions.push(knitOutput);
+    // Shared OperationRegistry across knit + export so an in-flight
+    // knit blocks a same-source export (and vice versa). Webview cancel
+    // commands look up controllers via canonicalOpKey.
+    const registry = new OperationRegistry();
     registerKnitCommands(
         context,
-        getLanguageClient ? { getLanguageClient, sharedOutput: knitOutput } : { sharedOutput: knitOutput },
+        {
+            getLanguageClient,
+            sharedOutput: knitOutput,
+            sharedRegistry: registry,
+        },
     );
 
     // Export commands (Pandoc-driven HTML/PDF/Word). The resolver is
@@ -103,10 +111,8 @@ export function registerKnit(
             if (e.affectsConfiguration('raven.pandoc.path')) resolver.invalidate();
         }),
     );
-    // Shared OperationRegistry across knit + export so an in-flight
-    // knit blocks a same-source export (and vice versa). Webview cancel
-    // commands look up controllers via canonicalOpKey.
-    const registry = new OperationRegistry();
+    // The same registry from above feeds the export pipeline so
+    // beginOp on either side respects the other's in-flight slot.
     registerExportCommands(context, {
         resolver,
         registry,
