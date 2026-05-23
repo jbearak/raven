@@ -101,10 +101,11 @@ explorer-context-menu hook is opt-in via your own keybindings).
     `<pre><code class="language-X">` blocks. Each block is
     re-highlighted using:
 
-    - the GitHub light/dark palette (selected by VS Code's active
-      theme variant when shown in the panel; by
-      `prefers-color-scheme` when the same file is opened in a
-      browser);
+    - the GitHub light/dark palette, selected by
+      `@media (prefers-color-scheme: dark)` so the same file
+      auto-detects the OS color scheme when opened in a browser
+      and follows VS Code's editor theme (which usually mirrors
+      the OS) when shown in the panel iframe;
     - whichever TextMate grammar your installed VS Code extensions
       contribute for the chunk's language. For R the resolution
       priority is `REditorSupport.r-syntax` →
