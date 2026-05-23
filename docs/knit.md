@@ -1,15 +1,22 @@
 # R Markdown knit
 
-Raven ships a single command, `Raven: Knit`, that renders the active
-`.Rmd` document to HTML and reveals the result in a webview panel.
-The pipeline is intentionally narrow:
+Raven ships **`Raven: Knit Preview`** for previewing R Markdown and
+three companion **export** commands (`Knit: Export to HTML…`,
+`Knit: Export to PDF…`, `Knit: Export to Word…`) for saving the
+rendered document next to the source `.Rmd`. The pipeline is
+intentionally narrow:
 
-- HTML output only. Documents whose YAML `output:` resolves to
-  `pdf_document`, `word_document`, `ioslides_presentation`, custom
-  formats, etc. are refused with a copy-paste `rmarkdown::render(...)`
-  command. Run those formats manually in the R console.
-- No live preview. The Knit Output panel is a static viewer with a
-  Refresh button — not a live recompile.
+- The preview is always HTML, regardless of the YAML `output:`
+  field. `pdf_document`, `word_document`, etc. still preview as HTML;
+  the `output:` field only affects the named formats during export.
+- The preview is a static viewer with a manual Refresh button — not a
+  live recompile. Click **Knit again** to re-render after editing.
+- The preview is saved to a per-session temp directory under
+  `<os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/`,
+  so the `.Rmd`'s own directory stays clean. Export commands write the
+  final file (HTML / PDF / DOCX) next to the `.Rmd`.
+- Export commands shell out to Pandoc. PDF export additionally needs a
+  LaTeX engine (`xelatex` by default).
 - No `.qmd` rendering. That belongs to `quarto.quarto`'s
   `Quarto: Render`.
 
@@ -48,20 +55,15 @@ explorer-context-menu hook is opt-in via your own keybindings).
 2. **YAML front matter parse.** Raven parses the `---` ... `---` block
    with the YAML failsafe schema. Malformed YAML opens the
    `Raven: Knit` output channel with the parse error.
-3. **Deferred-feature detection.** Raven refuses four document shapes
-   it doesn't implement — `runtime: shiny`, a custom YAML `knit:` hook,
-   the `site:` field for `rmarkdown::render_site` /
-   `bookdown::bookdown_site`, and any non-HTML output format. Each
-   refusal includes a copy-pasteable R command you can run yourself in
-   the R console.
-4. **Format gate.** The first key under `output:` (or the string value
-   of `output:` if it's a single string) must resolve to an HTML
-   format (`html_document`, `html_notebook`, `html_vignette`,
-   `html_fragment`, or one of the popular namespaced flavors from
-   `bookdown`, `distill`, `pkgdown`, `rmdformats`, `tufte`, and
-   `prettydoc`). Any other value is refused with a copy-paste
-   `rmarkdown::render('FILENAME', output_format = '...')` command.
-   When `output:` is absent Raven defaults to `html_document`.
+3. **Deferred-feature detection.** Raven refuses three document
+   shapes it doesn't implement — `runtime: shiny`, a custom YAML
+   `knit:` hook, and the `site:` field for `rmarkdown::render_site` /
+   `bookdown::bookdown_site`. Each refusal includes a copy-pasteable
+   R command you can run yourself in the R console.
+4. **YAML output options.** Any `output:` format (`html_document`,
+   `pdf_document`, `word_document`, `bookdown::pdf_document2`, etc.)
+   previews as HTML. Nested options are partially honored — see the
+   "YAML output options honored / ignored" section below.
 5. **Working-directory resolution.** Controlled by
    `raven.knit.workingDirectory`:
    - `document` (default) — directory containing the `.Rmd`.
@@ -197,18 +199,68 @@ explorer-context-menu hook is opt-in via your own keybindings).
     parse fails Raven surfaces "Knit succeeded (output path
     unknown)" — the subprocess exit code is the ground truth.
 
-    The on-disk artifacts after a successful knit are:
+    The on-disk artifacts after a successful preview are:
 
-    - `<basename>.md` — the intermediate markdown knitr wrote.
-      Kept on disk because it's useful for debugging: if a chunk
-      output looks wrong, the `.md` is the ground truth for what
-      knitr produced before the rendering step touched it.
-    - `<basename>.html` — the final rendered HTML the panel and
-      **Open in Browser** open.
-    - `<basename>_files/figure-md/` — figures emitted by knitr's
-      chunk hooks (plots, images), referenced from the `.md` by
-      relative path so they resolve in both the webview and the
-      browser.
+    ```text
+    <os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/
+      <basename>.md     — intermediate markdown knitr wrote
+      <basename>.html   — final rendered HTML the panel reads
+      figure/           — knitr-generated plots
+    ```
+
+    Where `<workspaceHash>` is a SHA-256 of the first workspace folder
+    URI (or the `.Rmd`'s parent directory when no workspace is open),
+    `<sessionId>` is a UUID generated at extension activation so two
+    VS Code windows on the same workspace are isolated, and
+    `<sourceHash>` is a SHA-256 of the `.Rmd`'s absolute path. The
+    whole directory is removed when the panel is disposed; the entire
+    session subtree is removed when VS Code exits. Stale sibling
+    sessions (>7 days) are swept on activation.
+
+## Exporting
+
+The webview's `Export ▾` button and the editor-title Raven menu both
+expose `Export to HTML…`, `Export to PDF…`, and `Export to Word…`.
+The webview button reuses the cached preview `.md` — so it's fast and
+won't re-run R chunks. The editor-title commands always knit fresh
+(they don't peek at panel state).
+
+Both paths shell out to Pandoc, which is resolved lazily on first use
+from `raven.pandoc.path`, then from `PATH`, then from standard install
+locations (Homebrew, RStudio's bundled Pandoc, etc.). If Pandoc is
+missing Raven shows an actionable error with an "Install Pandoc…"
+button.
+
+The exported file is written next to the source `.Rmd` as
+`<basename>.{html,pdf,docx}`. Writes are atomic (temp file + rename),
+so a cancelled or failed export never corrupts a prior successful
+output. A notification offers an "Open in Browser" / "View PDF" /
+"Open in Word" button on success.
+
+PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
+(default `xelatex`). If the engine isn't found Raven surfaces an
+"Install TinyTeX…" hint.
+
+### YAML output options honored / ignored
+
+| Key | Where it's applied |
+|---|---|
+| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting |
+| `toc`, `toc_depth` | Pandoc `--toc` / `--toc-depth` (export only) |
+| `number_sections` | Pandoc `--number-sections` (export only) |
+| `highlight` | Pandoc `--highlight-style` (export only; validated against the known list) |
+| `self_contained` | Pandoc `--embed-resources --standalone` |
+| `css` | Pandoc `--css=<absolute path>` (containment-checked against the workspace folder / .Rmd parent) |
+| `mathjax` | Pandoc `--mathjax` |
+
+Keys **not honored**: `theme`, `code_folding`, `df_print`,
+`code_download`, `template`, `includes`, `pandoc_args`. They are logged
+to the `Raven: Knit` output channel when present in your YAML. The
+omissions are deliberate — most are html_document-specific Bootstrap /
+JS runtime features that Raven's preview pipeline can't reproduce
+without becoming `rmarkdown::html_document`. `pandoc_args` is excluded
+on security grounds (a document could otherwise inject `--output`,
+`--lua-filter`, etc., bypassing Raven's controlled destination).
 
 ## Settings
 
@@ -216,9 +268,12 @@ explorer-context-menu hook is opt-in via your own keybindings).
 |---|---|---|
 | `raven.rConsole.activation` | `auto` | Gates the knit command (and the R console / plot / data viewers / chunk run commands). |
 | `raven.knit.workingDirectory` | `document` | `document` / `project` / `current`. |
-| `raven.knit.timeoutMs` | `600000` | Hard timeout (ms). On expiry Raven escalates the kill ladder. |
+| `raven.knit.timeoutMs` | `600000` | Hard timeout (ms) for the knit R subprocess. |
+| `raven.knit.export.timeoutMs` | `120000` | Hard timeout (ms) for the Pandoc subprocess during export. |
 | `raven.knit.fontFamily` | `""` | Body/prose font for the preview. Empty inherits `markdown.preview.fontFamily`. |
 | `raven.knit.monospaceFontFamily` | `""` | Monospace font for code chunks and output. Empty inherits `editor.fontFamily`. |
+| `raven.pandoc.path` | `""` | Absolute path to a Pandoc binary. Empty uses PATH + standard install locations. |
+| `raven.pandoc.pdfEngine` | `xelatex` | LaTeX engine for PDF export (`xelatex`, `pdflatex`, `lualatex`, `tectonic`, `wkhtmltopdf`). |
 | `raven.packages.rPath` | (auto) | Path to the R binary. Empty means "search PATH". |
 
 ### Fonts
@@ -300,12 +355,12 @@ those checks live in the runtime sanitizer only.
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | `.Rmd` grammar | `REditorSupport.r-syntax` or `REditorSupport.r` |
-| Non-HTML output (`pdf_document`, `word_document`, `ioslides`, …) | `rmarkdown::render('FILENAME', output_format = '...')` in the R console (Raven shows the exact command via the "Copy command" affordance) |
-| Custom YAML `knit:` hook dispatch | Run the hook function manually in the R console |
-| Knit-with-Parameters dialog | Edit YAML defaults, or call `rmarkdown::render(params = list(...))` |
-| `runtime: shiny` documents | `rmarkdown::run('foo.Rmd')` in the R console |
-| `rmarkdown::render_site` | Run `rmarkdown::render_site()` in the R console |
-| YAML output options (`toc`, `theme`, `code_folding`, …) | Out of scope for the current HTML-only pipeline. Raven ignores them and emits its own minimal HTML shell. To honor the full template, run `rmarkdown::render(...)` in the R console. |
+| html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |
+| `pandoc_args:` passthrough | Cut on security grounds — could inject `--output`, `--lua-filter`, etc. A safer audited subset may land later; track follow-up issues. |
+| Custom YAML `knit:` hook dispatch | Run the hook function manually in the R console. |
+| Knit-with-Parameters dialog | Edit YAML defaults, or call `rmarkdown::render(params = list(...))`. |
+| `runtime: shiny` documents | `rmarkdown::run('foo.Rmd')` in the R console. |
+| `rmarkdown::render_site` | Run `rmarkdown::render_site()` in the R console. |
 
 A walkthrough ("Get started with Raven for R Markdown") in
 **Welcome ▸ Walkthroughs** wires installation of the recommended
