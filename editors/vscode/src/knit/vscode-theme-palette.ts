@@ -347,11 +347,14 @@ export async function resolveActiveThemePalette(
     const located = picked.located;
     const mergedDoc = picked.mergedDoc;
 
-    const tokenColors = mergeCustomizations({
-        baseTokenColors: mergedDoc.tokenColors,
-        tokenColorCustomizations: args.tokenColorCustomizations,
-        activeThemeLabel: located.label,
-    });
+    const tokenColors = synthesizeDefaultRule(
+        mergeCustomizations({
+            baseTokenColors: mergedDoc.tokenColors,
+            tokenColorCustomizations: args.tokenColorCustomizations,
+            activeThemeLabel: located.label,
+        }),
+        mergedDoc.editorColors,
+    );
 
     // Probe via vscode-textmate using the merged TextMate settings.
     const rGrammarReady = await args.registry.primeForLanguage('r');
@@ -913,6 +916,51 @@ async function probeRoleColors(args: {
         }
         return out;
     });
+}
+
+/**
+ * Synthesize an empty-scope default rule from the theme's
+ * `colors.editor.foreground` / `colors.editor.background` when the
+ * theme's `tokenColors` doesn't already contain one.
+ *
+ * Why: vscode-textmate's `resolveParsedThemeRules` uses the LAST
+ * empty-scope rule as the theme's defaults, falling back to a
+ * hardcoded `#000000` foreground when none exist. VS Code's editor
+ * does NOT use that hardcoded value — it uses `editor.foreground`
+ * from the workbench-level `colors` section. So a theme that styles
+ * specific scopes but leaves a default rule off (e.g. Dark 2026)
+ * shows unstyled tokens (punctuation, plain identifiers) in
+ * `editor.foreground` in the editor — but vscode-textmate, called
+ * directly with that theme's raw `tokenColors`, would return
+ * `#000000` for them.
+ *
+ * Prepending a synthetic empty-scope rule with the editor.foreground/
+ * background values makes our resolver mirror the editor's behavior.
+ * If `tokenColors` already has a default rule, return unchanged — that
+ * rule wins per "last empty-scope rule wins" anyway, and prepending
+ * a synthetic earlier wouldn't change the outcome.
+ */
+function synthesizeDefaultRule(
+    tokenColors: readonly ThemeSetting[],
+    editorColors: Record<string, string>,
+): ThemeSetting[] {
+    if (tokenColors.some((rule) => isEmptyScope(rule.scope))) {
+        return [...tokenColors];
+    }
+    const fg = pickValidColor(editorColors['editor.foreground']);
+    const bg = pickValidColor(editorColors['editor.background']);
+    if (!fg && !bg) return [...tokenColors];
+    const synthesized: ThemeSetting = {
+        settings: {
+            ...(fg ? { foreground: fg } : {}),
+            ...(bg ? { background: bg } : {}),
+        },
+    };
+    // Prepend so any explicit rules in tokenColors (which don't have
+    // empty scope by definition once we've ruled that out above) get
+    // a chance to override; this synthetic rule only fires for
+    // tokens that match nothing else.
+    return [synthesized, ...tokenColors];
 }
 
 /**

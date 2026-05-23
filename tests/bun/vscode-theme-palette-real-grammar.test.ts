@@ -164,13 +164,13 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
                 expect(out.palette.roles.comment).toBe('#8b949e');
 
                 // The rules we DID NOT supply must fall back to
-                // `#000000` — vscode-textmate's hardcoded default
-                // when no empty-scope rule exists in tokenColors.
-                // That's what the editor itself shows for these
-                // tokens, so our rendering should match. The previous
-                // GitHub-palette fallback would have produced colors
-                // (#ff7b72, #d2a8ff, ...) the editor never produces.
-                const noMatchFg = '#000000';
+                // `colors.editor.foreground` (`#c9d1d9` here) —
+                // matching what VS Code's editor renders for tokens
+                // with no specific theme rule. The synthesized
+                // empty-scope rule turns vscode-textmate's hardcoded
+                // `#000000` default into the theme's actual default
+                // text color.
+                const noMatchFg = '#c9d1d9';
                 const unstyled: Array<keyof typeof out.palette.roles> = [
                     'keyword', 'number', 'function', 'type',
                     'variable', 'operator', 'punctuation', 'constant',
@@ -178,7 +178,7 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
                 for (const role of unstyled) {
                     expect(
                         out.palette.roles[role].toLowerCase(),
-                        `role=${role} resolved to ${out.palette.roles[role]} (expected noMatchFg ${noMatchFg})`,
+                        `role=${role} resolved to ${out.palette.roles[role]} (expected ${noMatchFg})`,
                     ).toBe(noMatchFg);
                 }
             } finally {
@@ -306,10 +306,11 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
                 // punctuation role is NOT '#a5d6ff' — that would mean
                 // commas / parens get painted as if they were inside
                 // a string. With no clean punctuation rule in the
-                // theme, the role falls back to noMatchFg (#000000
-                // when no empty-scope rule), matching what the editor
-                // would render for unstyled punctuation.
-                expect(out.palette.roles.punctuation).toBe('#000000');
+                // theme, the role falls back to the editor.foreground
+                // (#c9d1d9), matching what the editor would render
+                // for unstyled punctuation. The synthesized empty-
+                // scope default rule keeps this from being #000000.
+                expect(out.palette.roles.punctuation).toBe('#c9d1d9');
             } finally {
                 try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
             }
@@ -530,6 +531,76 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
                 expect(out.palette.background).toBe('#002b36');
                 expect(out.themeId).toBe('Theme A');
                 expect(out.palette.roles.keyword.toLowerCase()).toBe('#859900');
+            } finally {
+                try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        },
+    );
+
+    itLive(
+        'theme with NO empty-scope rule falls back to colors.editor.foreground (not #000000) for unstyled roles',
+        async () => {
+            // Regression for the Dark-2026 scenario: when a theme has
+            // SOME tokenColors rules but no empty-scope default rule,
+            // vscode-textmate falls back to its hardcoded #000000 for
+            // unmatched tokens. But VS Code's editor uses
+            // colors.editor.foreground for those tokens. The
+            // resolver must mirror the editor: synthesize an empty-
+            // scope rule from editor.foreground so vscode-textmate
+            // returns editor.foreground for unstyled tokens, matching
+            // what the user sees in the editor.
+            const tmpDir = fs.mkdtempSync(
+                path.join(require('os').tmpdir(), 'raven-theme-palette-'),
+            );
+            const themePath = path.join(tmpDir, 'no-default.json');
+            try {
+                fs.writeFileSync(
+                    themePath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#121314',
+                            'editor.foreground': '#bbbebf',
+                        },
+                        tokenColors: [
+                            // Some styled scopes; NO empty-scope rule.
+                            { scope: 'keyword', settings: { foreground: '#c586c0' } },
+                            { scope: 'string', settings: { foreground: '#a5d6ff' } },
+                        ],
+                    }),
+                    'utf-8',
+                );
+
+                const registry = makeRegistry();
+                const out = await resolveActiveThemePalette({
+                    candidateThemeIds: ['No-Default Theme'],
+                    isLight: false,
+                    extensions: [{
+                        id: 'test.no-default',
+                        extensionPath: tmpDir,
+                        packageJSON: {
+                            contributes: {
+                                themes: [{ label: 'No-Default Theme', path: 'no-default.json' }],
+                            },
+                        },
+                    }],
+                    tokenColorCustomizations: undefined,
+                    semanticTokenColorCustomizations: undefined,
+                    registry,
+                    readFile: (p) => fs.promises.readFile(p, 'utf-8'),
+                });
+                expect(out.ok).toBe(true);
+                if (!out.ok) return;
+
+                // Styled roles round-trip.
+                expect(out.palette.roles.keyword.toLowerCase()).toBe('#c586c0');
+                expect(out.palette.roles.string.toLowerCase()).toBe('#a5d6ff');
+                // Unstyled roles get editor.foreground, NOT #000000.
+                // This is the Dark-2026 bug: without the synthesized
+                // empty-scope rule, vscode-textmate's tokenizeLine2
+                // would paint punctuation/variable/etc. as #000000.
+                expect(out.palette.roles.punctuation.toLowerCase()).toBe('#bbbebf');
+                expect(out.palette.roles.variable.toLowerCase()).toBe('#bbbebf');
             } finally {
                 try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
             }
