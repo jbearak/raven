@@ -161,6 +161,14 @@ export class KnitOutputPanel {
     private lastLoggedCandidateFailuresKey: string | undefined;
 
     /**
+     * The last known languageId of the source document. Cached so that
+     * font resolution continues to work correctly after the user closes
+     * the source buffer while the preview panel remains open. Updated
+     * whenever we successfully locate the source document.
+     */
+    private cachedSourceLanguageId: string = 'rmd';
+
+    /**
      * Open or update the panel for `args.sourceUri`. Returns
      * `{ ok: true }` on success, `{ ok: false, error }` if the rendered
      * file cannot be accessed (caller should fall back to
@@ -497,6 +505,15 @@ export class KnitOutputPanel {
         this.sourceUri = args.sourceUri;
         this.outputPath = args.outputPath;
         this.output = args.output;
+
+        // Initialize cached languageId if the source document is already open
+        const fsPath = args.sourceUri.fsPath;
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.uri.fsPath === fsPath) {
+                this.cachedSourceLanguageId = doc.languageId;
+                break;
+            }
+        }
 
         this.panel.webview.onDidReceiveMessage((msg: unknown) => this.handleMessage(msg));
     }
@@ -937,9 +954,13 @@ export class KnitOutputPanel {
     private lookupSourceLanguageId(): string {
         const fsPath = this.sourceUri.fsPath;
         for (const doc of vscode.workspace.textDocuments) {
-            if (doc.uri.fsPath === fsPath) return doc.languageId;
+            if (doc.uri.fsPath === fsPath) {
+                // Cache the languageId so it persists after the document closes
+                this.cachedSourceLanguageId = doc.languageId;
+                return doc.languageId;
+            }
         }
-        return 'rmd';
+        return this.cachedSourceLanguageId;
     }
 
     /**

@@ -1067,15 +1067,14 @@ export function buildShellHtml(args: {
       // Font payload accept-regex and required-name set. Mirrors the
       // palette pattern but for the two --raven-font-* declarations.
       //
-      // Inner value class \`[^;{}<>()\\\\\\n\\r\\t\\f\\v\\0]+\` mirrors
-      // \`render-html.ts:BANNED_CHAR_RE\` exactly: every character the
-      // host sanitizer rejects is also rejected here. Combined with
-      // the explicit declaration shape (\`--raven-font-(?:text|mono): \`)
-      // and the requirement that BOTH names appear via
-      // \`fontCssIsComplete\`, the webview can only inject the precise
-      // two-declaration sequence \`fontsCssDeclarations\` is contracted
-      // to emit.
-      var RAVEN_FONT_CSS_RE = /^(?:--raven-font-(?:text|mono): [^;{}<>()\\\\\\n\\r\\t\\f\\v\\0]+; ?){2}$/;
+      // Inner value class \`[^;{}<>\\\\\\n\\r\\t\\f\\v\\0]+\` allows
+      // parentheses so font families like "Aptos (Body)" pass validation.
+      // Combined with the explicit declaration shape
+      // (\`--raven-font-(?:text|mono): \`) and the requirement that BOTH
+      // names appear via \`fontCssIsComplete\`, the webview can only
+      // inject the precise two-declaration sequence
+      // \`fontsCssDeclarations\` is contracted to emit.
+      var RAVEN_FONT_CSS_RE = /^(?:--raven-font-(?:text|mono): [^;{}<>\\\\\\n\\r\\t\\f\\v\\0]+; ?){2}$/;
       var RAVEN_FONT_REQUIRED_NAMES = [
         '--raven-font-text',
         '--raven-font-mono',
