@@ -252,6 +252,126 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
     );
 
     itLive(
+        'punctuation role is NOT poisoned by string-delimiter "punctuation" tokens',
+        async () => {
+            // Regression for the corpus-vote bug: the `"` in a string
+            // literal has scope chain ending in
+            // `punctuation.definition.string.begin.r`, so scopeToRole
+            // classifies it as punctuation. But vscode-textmate's
+            // selector matcher resolves its color via the outer
+            // `string.quoted.double.r` scope — meaning the theme paints
+            // it the string color. A naive vote would attribute the
+            // string color to the punctuation role and paint ALL
+            // punctuation (commas, parens) with the string color.
+            //
+            // The fix: ambiguous tokens (non-string/non-comment role
+            // with string/comment in their chain) are filtered out of
+            // voting.
+            const tmpDir = fs.mkdtempSync(
+                path.join(require('os').tmpdir(), 'raven-theme-palette-'),
+            );
+            const themePath = path.join(tmpDir, 'string-bias.json');
+            try {
+                fs.writeFileSync(
+                    themePath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#0e1116',
+                            'editor.foreground': '#c9d1d9',
+                        },
+                        tokenColors: [
+                            // Only the `string` selector is defined.
+                            // Naively, every `"` in the corpus would
+                            // contribute a punctuation-role vote of
+                            // '#a5d6ff'.
+                            {
+                                scope: 'string',
+                                settings: { foreground: '#a5d6ff' },
+                            },
+                        ],
+                    }),
+                    'utf-8',
+                );
+
+                const registry = makeRegistry();
+                const out = await resolveActiveThemePalette({
+                    workbenchColorThemeId: 'Test Dark Sparse',
+                    isLight: false,
+                    extensions: [makeThemeExtension(themePath)],
+                    tokenColorCustomizations: undefined,
+                    semanticTokenColorCustomizations: undefined,
+                    registry,
+                    readFile: (p) => fs.promises.readFile(p, 'utf-8'),
+                });
+                expect(out.ok).toBe(true);
+                if (!out.ok) return;
+
+                // string role still resolves to the theme color.
+                expect(out.palette.roles.string).toBe('#a5d6ff');
+                // punctuation role is NOT '#a5d6ff' — that would mean
+                // commas / parens get painted as if they were inside
+                // a string. With no clean punctuation rule in the
+                // theme, the role must fall back to the GitHub
+                // punctuation color (`#c9d1d9` for dark).
+                expect(out.palette.roles.punctuation).toBe('#c9d1d9');
+            } finally {
+                try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        },
+    );
+
+    itLive(
+        'theme that styles entity.name.function colors the function role from the function declaration in the corpus',
+        async () => {
+            // The corpus contains `square <- function(arg) { ... }`,
+            // which the R grammar tokenizes with `entity.name.function.r`
+            // on `square`. A theme that styles `entity.name.function`
+            // should color the function role accordingly, even if
+            // `support.function` (the builtin selector) is absent.
+            const tmpDir = fs.mkdtempSync(
+                path.join(require('os').tmpdir(), 'raven-theme-palette-'),
+            );
+            const themePath = path.join(tmpDir, 'declared.json');
+            try {
+                fs.writeFileSync(
+                    themePath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#0e1116',
+                            'editor.foreground': '#c9d1d9',
+                        },
+                        tokenColors: [
+                            {
+                                scope: 'entity.name.function',
+                                settings: { foreground: '#facade' },
+                            },
+                        ],
+                    }),
+                    'utf-8',
+                );
+
+                const registry = makeRegistry();
+                const out = await resolveActiveThemePalette({
+                    workbenchColorThemeId: 'Test Dark Sparse',
+                    isLight: false,
+                    extensions: [makeThemeExtension(themePath)],
+                    tokenColorCustomizations: undefined,
+                    semanticTokenColorCustomizations: undefined,
+                    registry,
+                    readFile: (p) => fs.promises.readFile(p, 'utf-8'),
+                });
+                expect(out.ok).toBe(true);
+                if (!out.ok) return;
+                expect(out.palette.roles.function.toLowerCase()).toBe('#facade');
+            } finally {
+                try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        },
+    );
+
+    itLive(
         'theme with an explicit empty-scope default rule still routes no-match probes through the GitHub fallback',
         async () => {
             // Some themes DO supply an empty-scope default rule that

@@ -39,10 +39,11 @@ import * as path from 'path';
 import {
     githubLight,
     githubDark,
+    scopeToRole,
     type GithubPalette,
     type TokenRole,
 } from './github-colors';
-import type { GrammarRegistry, ThemeSetting } from './grammar-registry';
+import type { GrammarRegistry, ScopeToken, ThemeSetting } from './grammar-registry';
 
 /**
  * Minimal `vscode.Extension` surface the extractor consumes. Defined
@@ -116,9 +117,12 @@ export interface ThemePaletteArgs {
     /**
      * Grammar registry to drive scope-selector matching. The registry
      * must be capable of tokenizing the R language; otherwise we
-     * return `grammar-unavailable`.
+     * return `grammar-unavailable`. We use both `tokenizeLineForLanguage`
+     * (to recover per-token scope chains; theme-independent) and
+     * `extractWithTheme` (to apply the merged theme and read per-
+     * token foreground colors via `tokenizeLine2`).
      */
-    registry: Pick<GrammarRegistry, 'extractWithTheme' | 'primeForLanguage'>;
+    registry: Pick<GrammarRegistry, 'extractWithTheme' | 'primeForLanguage' | 'tokenizeLineForLanguage'>;
 
     /** File reader for theme JSONs. Absolute paths only. */
     readFile: (absolutePath: string) => Promise<string>;
@@ -133,57 +137,50 @@ export interface ThemePaletteArgs {
 }
 
 /**
- * Canonical R snippets used to probe the theme for each TokenRole.
+ * A small R-code corpus that exercises tokens of every `TokenRole`
+ * across the variety of scope chains a real R grammar produces.
  *
- * The probe relies on the active R grammar producing a specific scope
- * chain for one specific character offset in each snippet. The
- * snippets were chosen by inspecting vscode.r's `r.tmLanguage.json`
- * (which mirrors REditorSupport.r-syntax) so each probe lands on a
- * token that grammar tags with a well-known TextMate scope:
+ * Why a corpus and not a canonical probe-per-role:
  *
- *   - keyword:     `if (TRUE) {}`     offset 0 → `keyword.control.conditional.if.r`
- *   - string:      `"x"`              offset 1 → `string.quoted.double.r` (body inside the quotes)
- *   - number:      `42`               offset 0 → `constant.numeric.float.decimal.r`
- *   - comment:     `# x`              offset 0 → `comment.line.number-sign.r`
- *   - function:    `library(x)`       offset 0 → `support.function.r`
- *                  vscode.r only tags builtin function names with a
- *                  function scope; plain `foo(x)` would leave `foo`
- *                  unscoped, fall through to the theme default, and
- *                  produce invisible text. `library` is a hardcoded
- *                  builtin in every R grammar shipped since
- *                  REditorSupport.r-syntax existed.
- *   - type:        `list(1)`          offset 0 → `storage.type.r`
- *                  vscode.r's `storage-type` rule tags the names of
- *                  base data-shape constructors (`list`, `character`,
- *                  `integer`, etc.) with `storage.type.r`.
- *   - variable:    `x`                offset 0
- *                  R grammars typically do NOT tag bare identifiers
- *                  with a `variable.*` scope. We probe anyway so a
- *                  theme that DOES (e.g. semantic-token overrides) can
- *                  win; otherwise the probe falls through to the
- *                  default and the resolver fills in the GitHub
- *                  fallback.
- *   - operator:    `1 + 2`            offset 2 → `keyword.operator.arithmetic.r`
- *   - punctuation: `f()`              offset 2 → `punctuation.definition.arguments.end.r`
- *   - constant:    `TRUE`             offset 0 → `constant.language.r`
+ * Themes don't all target the same scopes. Some style
+ * `entity.name.function` (function declarations), others target
+ * `support.function` (builtins), yet others rely on the broader
+ * `meta.function-call`. A single canonical probe per role can only
+ * land on ONE of those scopes — whichever it doesn't pick, the
+ * theme's specific styling for it is invisible to us.
+ *
+ * Instead, the corpus contains a handful of representative lines
+ * whose tokenization (by the active R grammar) yields a mix of the
+ * usual TextMate scopes. We then ask vscode-textmate to color each
+ * token under the active theme, map each token's scope chain to a
+ * `TokenRole` via the same `scopeToRole` the highlighter uses, and
+ * tally colors per role. The most-voted non-default color wins.
+ *
+ * This way:
+ *
+ *   - Themes that style `support.function` color `library` / `summary` /
+ *     `list` tokens.
+ *   - Themes that style `entity.name.function` color the `foo` in
+ *     `foo <- function(...)`.
+ *   - Themes that style `meta.function-call` color every function-call
+ *     identifier whether builtin or not.
+ *   - Themes that style `variable.parameter` color named arguments.
+ *
+ * The "no rule matched" fall-through color (either an empty-scope
+ * default rule's foreground or vscode-textmate's hardcoded `#000000`)
+ * is filtered out per-vote, so it can never win a role even if it
+ * appears more often than any specific color.
  */
-interface ProbeSample {
-    snippet: string;
-    probeOffset: number;
-}
-
-const PROBE_SAMPLES: Record<TokenRole, ProbeSample> = {
-    keyword: { snippet: 'if (TRUE) {}', probeOffset: 0 },
-    string: { snippet: '"x"', probeOffset: 1 },
-    number: { snippet: '42', probeOffset: 0 },
-    comment: { snippet: '# x', probeOffset: 0 },
-    function: { snippet: 'library(x)', probeOffset: 0 },
-    type: { snippet: 'list(1)', probeOffset: 0 },
-    variable: { snippet: 'x', probeOffset: 0 },
-    operator: { snippet: '1 + 2', probeOffset: 2 },
-    punctuation: { snippet: 'f()', probeOffset: 2 },
-    constant: { snippet: 'TRUE', probeOffset: 0 },
-};
+const SAMPLE_CORPUS: readonly string[] = [
+    '# a representative comment',
+    'library(ggplot2)',
+    'data <- mtcars',
+    'summary(data$mpg)',
+    'square <- function(arg) { arg * 2 }',
+    'if (TRUE) NULL else FALSE',
+    'list(1, 2.5e-3, "text")',
+    'pkg::fun(name = value)',
+];
 
 /**
  * Bit layout encoded into `Uint32Array` metadata by vscode-textmate's
@@ -755,7 +752,7 @@ function readSemanticOverrides(args: {
 // ---------------------------------------------------------------------
 
 async function probeRoleColors(args: {
-    registry: Pick<GrammarRegistry, 'extractWithTheme'>;
+    registry: Pick<GrammarRegistry, 'extractWithTheme' | 'tokenizeLineForLanguage'>;
     tokenColors: readonly ThemeSetting[];
 }): Promise<Partial<Record<TokenRole, string>>> {
     // The "no rule matched" foreground that vscode-textmate will use
@@ -770,27 +767,83 @@ async function probeRoleColors(args: {
     //      hardcodes `#000000` as the foreground default.
     //
     // We compute this BEFORE setTheme so the inner callback can
-    // filter probe results that match it — preventing roles whose
-    // scope had no specific theme rule from inheriting an invisible
-    // (#000000) or undifferentiated (editor.foreground) color and
-    // overriding the legible GitHub fallback.
+    // filter votes that match it — preventing a role whose scope had
+    // no specific theme rule from inheriting an invisible (`#000000`)
+    // or undifferentiated (editor.foreground) color.
     const noMatchFg = effectiveDefaultForeground(args.tokenColors);
 
+    // Pre-tokenize the corpus to capture scope chains. This is
+    // theme-independent (vscode-textmate's `tokenizeLine` does not
+    // consult the theme), so we can do it outside the
+    // `extractWithTheme` callback's serialization window and avoid
+    // double-tokenizing the same lines inside the lock.
+    const corpus: Array<{ line: string; tokens: readonly ScopeToken[] }> = [];
+    for (const line of SAMPLE_CORPUS) {
+        const result = await args.registry.tokenizeLineForLanguage('r', line, null);
+        if (!result) continue;
+        corpus.push({ line, tokens: result.tokens });
+    }
+    if (corpus.length === 0) return {};
+
     return args.registry.extractWithTheme(args.tokenColors, async (api) => {
+        // Per-role vote map: color → count.
+        const votes: Record<TokenRole, Map<string, number>> = {
+            keyword: new Map(),
+            string: new Map(),
+            number: new Map(),
+            comment: new Map(),
+            function: new Map(),
+            type: new Map(),
+            variable: new Map(),
+            operator: new Map(),
+            punctuation: new Map(),
+            constant: new Map(),
+        };
+
+        for (const { line, tokens } of corpus) {
+            const colorResult = await api.tokenizeLine2ForLanguage('r', line);
+            if (!colorResult) continue;
+            for (const tok of tokens) {
+                const role = scopeToRole(tok.scopes);
+                if (!role) continue;
+                // `scopeToRole` walks innermost-first, so the `"` in
+                // `"text"` (scope chain ending in
+                // `punctuation.definition.string.*`) is classified as
+                // punctuation. The theme's selector matcher, however,
+                // resolves the color via the outer `string.*` scope —
+                // so vscode-textmate paints that `"` the string color.
+                // Voting that color into the punctuation role would
+                // poison every other punctuation token (commas, parens)
+                // with the string color. Skip these "wrong-role"
+                // votes: a non-string/non-comment role whose chain
+                // contains a string/comment scope is misclassified
+                // for the purpose of role-color attribution.
+                if (isWrongRoleForChain(role, tok.scopes)) continue;
+                const color = colorAtOffset(colorResult.tokens, tok.startIndex, api.colorMap);
+                if (color === null) continue;
+                const normalized = color.toLowerCase();
+                // Skip tokens whose color is the theme's no-rule
+                // default — those add no information and we don't
+                // want them outvoting a specific role color.
+                if (normalized === noMatchFg) continue;
+                const m = votes[role];
+                m.set(normalized, (m.get(normalized) ?? 0) + 1);
+            }
+        }
+
         const out: Partial<Record<TokenRole, string>> = {};
-        const roles = Object.keys(PROBE_SAMPLES) as TokenRole[];
-        for (const role of roles) {
-            const sample = PROBE_SAMPLES[role];
-            const result = await api.tokenizeLine2ForLanguage('r', sample.snippet);
-            if (!result) continue;
-            const color = colorAtOffset(result.tokens, sample.probeOffset, api.colorMap);
-            if (color === null) continue;
-            const normalized = color.toLowerCase();
-            // Skip probes that matched the theme's no-rule default.
-            // The role is "not specifically themed for R" — fall
-            // through to the GitHub palette so it stays legible.
-            if (normalized === noMatchFg) continue;
-            out[role] = normalized;
+        for (const role of Object.keys(votes) as TokenRole[]) {
+            const voteMap = votes[role];
+            if (voteMap.size === 0) continue;
+            let bestColor: string | null = null;
+            let bestCount = 0;
+            for (const [color, count] of voteMap) {
+                if (count > bestCount) {
+                    bestColor = color;
+                    bestCount = count;
+                }
+            }
+            if (bestColor) out[role] = bestColor;
         }
         return out;
     });
@@ -814,6 +867,26 @@ function effectiveDefaultForeground(tokenColors: readonly ThemeSetting[]): strin
         if (HEX_COLOR_RE.test(lower)) defaultFg = lower;
     }
     return defaultFg;
+}
+
+/**
+ * True when the token's scope chain contains a "dominating" string or
+ * comment scope but `scopeToRole` classified it as something else (per
+ * its innermost-first walk). vscode-textmate's selector matcher will
+ * resolve such a token's color via the dominant scope, so attributing
+ * that color to the token's innermost role is misleading.
+ *
+ * The asymmetry: tokens classified AS `string` or `comment` are
+ * trustworthy by construction (their scope chain must start with the
+ * matching prefix). It's the other roles — punctuation, keyword,
+ * operator — that can get hijacked by an enclosing string/comment.
+ */
+function isWrongRoleForChain(role: TokenRole, scopes: readonly string[]): boolean {
+    if (role === 'string' || role === 'comment') return false;
+    for (const s of scopes) {
+        if (s.startsWith('string.') || s.startsWith('comment.')) return true;
+    }
+    return false;
 }
 
 function isEmptyScope(scope: string | string[] | undefined): boolean {

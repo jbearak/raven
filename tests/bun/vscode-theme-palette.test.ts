@@ -6,6 +6,8 @@ import {
 } from '../../editors/vscode/src/knit/vscode-theme-palette';
 import type {
     GrammarRegistry,
+    LineTokenization,
+    ScopeToken,
     ThemeSetting,
     ThemeExtractionApi,
 } from '../../editors/vscode/src/knit/grammar-registry';
@@ -23,20 +25,46 @@ import type {
  * Uint32Array where each role's probe yields the index the caller
  * specifies via `roleColors`. The `colorMap` is also caller-controlled.
  */
+/**
+ * Fake registry. The corpus-based extractor calls
+ * `tokenizeLineForLanguage` (theme-independent, before
+ * `extractWithTheme`) to recover scope chains, then
+ * `tokenizeLine2ForLanguage` (inside the theme lock) to read colors.
+ *
+ * For most structural tests we don't care about per-role color
+ * resolution (those scenarios live in the real-grammar test file),
+ * so the fake's default `tokenStream` returns no tokens — the
+ * corpus iterates with zero votes and the resolver falls back to
+ * the GitHub palette. Tests that DO want to drive role-color votes
+ * supply a `tokenStream` that returns tokens with specific scope
+ * chains for specific lines.
+ */
 function fakeRegistry(opts: {
-    /** Per-snippet → foreground color index map. */
-    snippetIndex: (snippet: string) => number;
-    colorMap: readonly string[];
     /**
-     * If set, `extractWithTheme` saves the merged settings here so
-     * tests can assert on what got threaded through.
+     * Per-line scope tokens. Called by `tokenizeLineForLanguage`.
+     * Default: empty array for every line.
      */
+    tokenStream?: (line: string) => readonly ScopeToken[];
+    /**
+     * Per-line color index for the first token. Called by
+     * `tokenizeLine2ForLanguage`. The fake produces one binary
+     * token at offset 0 with this fg index.
+     */
+    snippetIndex?: (line: string) => number;
+    colorMap?: readonly string[];
     recordedSettings?: { value: readonly ThemeSetting[] };
     primeForR?: boolean;
-}): Pick<GrammarRegistry, 'extractWithTheme' | 'primeForLanguage'> {
+}): Pick<GrammarRegistry, 'extractWithTheme' | 'primeForLanguage' | 'tokenizeLineForLanguage'> {
+    const tokenStream = opts.tokenStream ?? (() => []);
+    const snippetIndex = opts.snippetIndex ?? (() => 0);
+    const colorMap = opts.colorMap ?? [];
     return {
         async primeForLanguage(_lang: string) {
             return opts.primeForR ?? true;
+        },
+        async tokenizeLineForLanguage(_lang, line, _state) {
+            const tokens = tokenStream(line);
+            return { tokens, ruleStack: null } satisfies LineTokenization;
         },
         async extractWithTheme<T>(
             settings: readonly ThemeSetting[],
@@ -44,11 +72,11 @@ function fakeRegistry(opts: {
         ): Promise<T> {
             if (opts.recordedSettings) opts.recordedSettings.value = settings;
             const api: ThemeExtractionApi = {
-                colorMap: opts.colorMap,
+                colorMap,
                 async tokenizeLine2ForLanguage(_lang, line, _state) {
-                    const fgIndex = opts.snippetIndex(line);
-                    // Encode `(startIndex=0, metadata)` where metadata
-                    // has the foreground bits set. Layout matches
+                    const fgIndex = snippetIndex(line);
+                    // One binary token at offset 0 with the given
+                    // fg index. Metadata layout matches
                     // vscode-textmate's MetadataConsts: fg is bits
                     // 15..23.
                     const metadata = (fgIndex & 0x1ff) << 15;
@@ -58,6 +86,14 @@ function fakeRegistry(opts: {
             return inner(api);
         },
     };
+}
+
+/**
+ * Build a scope-token stream for one specific corpus line. Helper for
+ * tests that want to drive role-color votes deterministically.
+ */
+function singleTokenAtOffset(scopes: readonly string[]): readonly ScopeToken[] {
+    return [{ startIndex: 0, endIndex: 1, scopes }];
 }
 
 /**
@@ -110,7 +146,7 @@ function baseArgs(overrides: Partial<ThemePaletteArgs>): ThemePaletteArgs {
         extensions: [],
         tokenColorCustomizations: undefined,
         semanticTokenColorCustomizations: undefined,
-        registry: fakeRegistry({ snippetIndex: () => 0, colorMap: [] }),
+        registry: fakeRegistry({}),
         readFile: async () => { throw new Error('readFile must not be called'); },
         ...overrides,
     };
@@ -516,94 +552,46 @@ describe('resolveActiveThemePalette — color extraction', () => {
 });
 
 describe('resolveActiveThemePalette — vscode-textmate probing', () => {
-    test('reads role colors from the registry colorMap when probes hit non-default indices', async () => {
+    test('one corpus token contributes one vote for the matching role', async () => {
+        // Drive a single corpus line ('# a representative comment')
+        // through the fake so it yields a token with the comment
+        // scope. Color index 2 maps to '#aabbcc'. Every other corpus
+        // line yields no tokens, so the comment role gets exactly one
+        // vote at '#aabbcc'.
         const ext = fakeThemeExtension({
             extensionPath: '/e',
             label: 'Test Dark',
             themeRelativePath: 'theme.json',
         });
-        // The fake yields different indices per snippet so we can
-        // assert the resolver wired the right one into each role.
-        // colorMap[0] is default (treated as "no theme color").
-        // colorMap[0] is reserved; colorMap[1] is the default fg.
-        // Probes that fall through to the default are filtered, so
-        // colorMap[1] = '#aabbcc' acts as the "no rule matched"
-        // sentinel here. Every other index is a distinct role color.
-        const colorMap = ['', '#aabbcc', '#aa0000', '#00aa00', '#0000aa', '#aaaa00', '#aa00aa', '#00aaaa'];
-        const snippetIndex = (snippet: string): number => {
-            if (snippet.startsWith('if ')) return 2;          // keyword
-            if (snippet === '"x"') return 3;                  // string
-            if (snippet === '42') return 4;                   // number
-            if (snippet === '# x') return 5;                  // comment
-            if (snippet === 'library(x)') return 6;           // function (probe snippet)
-            if (snippet === 'list(1)') return 7;              // type (probe snippet)
-            return 1;  // default fg — filtered by extractor
-        };
         const out = await resolveActiveThemePalette(baseArgs({
             extensions: [ext],
             readFile: readFileFrom({
-                '/e/theme.json': JSON.stringify({
-                    type: 'dark',
-                    // Empty-scope default rule with foreground
-                    // matching colorMap[1]. This sets the
-                    // extractor's noMatchFg so the filter knows
-                    // which color to drop.
-                    tokenColors: [
-                        { settings: { foreground: '#aabbcc', background: '#101010' } },
-                    ],
-                    colors: { 'editor.background': '#101010' },
-                }),
-            }),
-            registry: fakeRegistry({ snippetIndex, colorMap }),
-        }));
-        expect(out.ok).toBe(true);
-        if (out.ok) {
-            expect(out.palette.roles.keyword).toBe('#aa0000');
-            expect(out.palette.roles.string).toBe('#00aa00');
-            expect(out.palette.roles.number).toBe('#0000aa');
-            expect(out.palette.roles.comment).toBe('#aaaa00');
-            expect(out.palette.roles.function).toBe('#aa00aa');
-            expect(out.palette.roles.type).toBe('#00aaaa');
-            // variable: probe falls through to default → filtered →
-            // GitHub fallback (#ffa657 for dark).
-            expect(out.palette.roles.variable).toBe('#ffa657');
-        }
-    });
-
-    test('roles whose probe yields index 0 (default fg) fall through to GitHub palette', async () => {
-        const ext = fakeThemeExtension({
-            extensionPath: '/e',
-            label: 'Test Dark',
-            themeRelativePath: 'theme.json',
-        });
-        // Every probe returns index 0 — no theme rule matched.
-        const out = await resolveActiveThemePalette(baseArgs({
-            extensions: [ext],
-            readFile: readFileFrom({
-                '/e/theme.json': JSON.stringify({
-                    type: 'dark', tokenColors: [], colors: {},
-                }),
+                '/e/theme.json': JSON.stringify({ type: 'dark', tokenColors: [], colors: {} }),
             }),
             registry: fakeRegistry({
-                snippetIndex: () => 0,
-                colorMap: ['#000000'],
+                tokenStream: (line) =>
+                    line === '# a representative comment'
+                        ? singleTokenAtOffset(['source.r', 'comment.line.r'])
+                        : [],
+                snippetIndex: (line) =>
+                    line === '# a representative comment' ? 2 : 0,
+                colorMap: ['', '#000000', '#aabbcc'],
             }),
         }));
         expect(out.ok).toBe(true);
         if (out.ok) {
-            // githubDark colors for every role.
+            expect(out.palette.roles.comment).toBe('#aabbcc');
+            // Other roles got no votes → GitHub fallback.
             expect(out.palette.roles.keyword).toBe('#ff7b72');
-            expect(out.palette.roles.string).toBe('#a5d6ff');
         }
     });
 
-    test('filters out probes that match the theme\'s empty-scope default foreground', async () => {
-        // Theme has no rules for our probe scopes but DOES have an
-        // empty-scope default rule (`{ settings: { foreground: '#deadbe' } }`).
-        // vscode-textmate uses #deadbe for any token whose scope didn't
-        // match a specific rule. Without the filter we'd paint every
-        // role with #deadbe — the screenshot regression that motivated
-        // this fix. With the filter, every role falls back to GitHub.
+    test('the no-match foreground is filtered out and never wins a role vote', async () => {
+        // Theme has an empty-scope default rule with foreground
+        // '#deadbe'. The fake makes EVERY token's color resolve to
+        // '#deadbe' (the no-match default). The filter must drop
+        // every vote — no role gets a theme color; all fall back to
+        // GitHub.
         const ext = fakeThemeExtension({
             extensionPath: '/e',
             label: 'Test Dark',
@@ -614,90 +602,19 @@ describe('resolveActiveThemePalette — vscode-textmate probing', () => {
             readFile: readFileFrom({
                 '/e/theme.json': JSON.stringify({
                     type: 'dark',
-                    tokenColors: [
-                        // Empty-scope default rule.
-                        { settings: { foreground: '#deadbe', background: '#111111' } },
-                    ],
+                    tokenColors: [{ settings: { foreground: '#deadbe' } }],
                     colors: {},
                 }),
             }),
-            // Every probe returns the empty-scope default foreground.
             registry: fakeRegistry({
+                tokenStream: () => singleTokenAtOffset(['source.r', 'keyword.control.r']),
                 snippetIndex: () => 1,
                 colorMap: ['', '#deadbe'],
             }),
         }));
         expect(out.ok).toBe(true);
         if (out.ok) {
-            // All roles filtered → GitHub fallback.
-            expect(out.palette.roles.keyword).toBe('#ff7b72');
-            expect(out.palette.roles.function).toBe('#d2a8ff');
-            expect(out.palette.roles.comment).toBe('#8b949e');
-        }
-    });
-
-    test('filters out probes that match #000000 when the theme has no empty-scope default rule', async () => {
-        // Theme has SOME tokenColors rules but no empty-scope default.
-        // vscode-textmate falls back to its hardcoded #000000 for any
-        // unmatched scope. Without the filter, those roles would
-        // render as black text on dark backgrounds — the original bug.
-        const ext = fakeThemeExtension({
-            extensionPath: '/e',
-            label: 'Test Dark',
-            themeRelativePath: 'theme.json',
-        });
-        const out = await resolveActiveThemePalette(baseArgs({
-            extensions: [ext],
-            readFile: readFileFrom({
-                '/e/theme.json': JSON.stringify({
-                    type: 'dark',
-                    tokenColors: [
-                        { scope: 'string', settings: { foreground: '#a5d6ff' } },
-                    ],
-                    colors: { 'editor.foreground': '#c9d1d9' },
-                }),
-            }),
-            // Probes for non-string roles return colorMap[1] = '#000000'
-            // (vscode-textmate's hardcoded default when no empty-scope
-            // rule exists). The string probe returns colorMap[2].
-            registry: fakeRegistry({
-                snippetIndex: (s) => s === '"x"' ? 2 : 1,
-                colorMap: ['', '#000000', '#a5d6ff'],
-            }),
-        }));
-        expect(out.ok).toBe(true);
-        if (out.ok) {
-            expect(out.palette.roles.string).toBe('#a5d6ff');
-            // Every other role falls back to GitHub (#000000 was
-            // filtered out as "no rule matched").
-            expect(out.palette.roles.keyword).toBe('#ff7b72');
-            expect(out.palette.roles.function).toBe('#d2a8ff');
-        }
-    });
-
-    test('discards colorMap entries that fail the hex regex', async () => {
-        const ext = fakeThemeExtension({
-            extensionPath: '/e',
-            label: 'Test Dark',
-            themeRelativePath: 'theme.json',
-        });
-        const out = await resolveActiveThemePalette(baseArgs({
-            extensions: [ext],
-            readFile: readFileFrom({
-                '/e/theme.json': JSON.stringify({
-                    type: 'dark', tokenColors: [], colors: {},
-                }),
-            }),
-            registry: fakeRegistry({
-                snippetIndex: () => 1,
-                // index 1 is a bogus value that should fail validation
-                // and route the role through the GitHub fallback.
-                colorMap: ['#000000', 'url(steal-data)'],
-            }),
-        }));
-        expect(out.ok).toBe(true);
-        if (out.ok) {
-            // Every role falls back to githubDark.
+            // Every vote was #deadbe → filtered → GitHub fallback.
             expect(out.palette.roles.keyword).toBe('#ff7b72');
         }
     });
@@ -715,11 +632,7 @@ describe('resolveActiveThemePalette — vscode-textmate probing', () => {
                     type: 'dark', tokenColors: [], colors: {},
                 }),
             }),
-            registry: fakeRegistry({
-                snippetIndex: () => 0,
-                colorMap: [],
-                primeForR: false,
-            }),
+            registry: fakeRegistry({ primeForR: false }),
         }));
         expect(out.ok).toBe(false);
         if (!out.ok) expect(out.reason).toBe('grammar-unavailable');
