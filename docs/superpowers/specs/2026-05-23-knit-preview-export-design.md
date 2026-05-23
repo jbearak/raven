@@ -386,10 +386,10 @@ The full per-type schema after this change:
 | `openInBrowser` | `{ type }` |
 | `themeChanged` | `{ type, applied }` |
 | `themeContext` | `{ type, editorBackground }` |
-| `paletteRequest` | `{ type }` |
-| `fontRequest` | `{ type }` |
+| `requestPalette` | `{ type }` |
+| `requestFonts` | `{ type }` |
 
-(The four `themeChanged`/`themeContext`/`paletteRequest`/`fontRequest` rows reflect what the validator already does; restating them ensures `isKnitOutputMessage` stays consistent after the change. Existing tests already cover these; the new tests below cover the two new types.)
+(The four `themeChanged`/`themeContext`/`requestPalette`/`requestFonts` rows reflect what the validator already does; restating them ensures `isKnitOutputMessage` stays consistent after the change. Existing tests already cover these; the new tests below cover the two new types.)
 
 - Add `'requestExport'` and `'cancelExport'` to the `KnitOutputMessage` discriminated union with payload shape `{ type: 'requestExport' }` / `{ type: 'cancelExport' }` — no other fields. The native quickpick the host opens collects the format choice; format never crosses the webview boundary, so untrusted payload surface is zero.
 - Extend `isKnitOutputMessage` so each known `type` checks `Object.keys(msg).sort()` against that type's allowed key set (sorted) for exact equality.
@@ -452,7 +452,7 @@ async function openExportedFile(savedUri: vscode.Uri, format: 'html' | 'pdf' | '
 - `knit-export-pandoc-missing.test.ts` — mock `resolvePandoc` to throw ENOENT; assert dialog with "Install Pandoc…" / "Set path…" actions.
 - `knit-export-yaml-args.test.ts` — `output.pdf_document.toc: true` produces `--toc`; `theme:` is logged as ignored.
 - `knit-export-busy.test.ts` — clicking Export during an in-flight knit shows the `[Cancel and re-knit] / [Wait]` toast; cancel restarts.
-- `knit-temp-dir-cleanup.test.ts` — closing the panel removes the per-source preview subdir; deactivating removes the workspace root.
+- `knit-temp-dir-cleanup.test.ts` — closing the panel removes the per-source preview subdir; deactivating removes only `raven-knit/<workspaceHash>/<sessionId>/` (the current session's dir), leaving sibling session dirs untouched.
 - `knit-export-atomic.test.ts` — pre-existing good `<basename>.docx` next to .Rmd; export is cancelled mid-Pandoc; assert the existing file is untouched and no `.tmp` sibling remains.
 - `knit-export-pinning.test.ts` — start a webview export, dispose the panel mid-export, assert temp dir survives until Pandoc exits, then is cleaned up.
 - `knit-export-stale-figures.test.ts` — pre-existing `figure/old.png` in the .Rmd's directory; new knit produces a different plot in temp `figure/`; assert exported PDF references the new plot, not the stale one.
