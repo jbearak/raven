@@ -4,10 +4,16 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import {
     buildShellHtml,
+    fontsCssDeclarations,
     isKnitOutputMessage,
     paletteCssDeclarations,
+    type FontFamiliesUpdate,
     type VscodeThemePaletteUpdate,
 } from './knit-output';
+import {
+    resolveFontFamilies,
+    type ResolvedFonts,
+} from './render-html';
 import { inlineLocalImagesAsDataUrls } from './inline-images';
 import { getKnitGrammarRegistry } from './post-knit-renderer';
 import {
@@ -421,6 +427,17 @@ export class KnitOutputPanel {
             ) {
                 onThemeChange();
             }
+            // Live-font listener: re-push the resolved fonts on any
+            // change to the four settings that feed
+            // `resolveFontFamilies`. The `this.sourceUri` argument makes
+            // `affectsConfiguration` honor per-folder overrides so a
+            // change scoped to a different folder doesn't waste a
+            // postMessage on this panel.
+            if (
+                instance.affectsAnyFontConfig(e)
+            ) {
+                void instance.pushFontFamilies();
+            }
         });
         instance.perPanelDisposables.push(onTheme, onConfig);
 
@@ -545,6 +562,14 @@ export class KnitOutputPanel {
             // read (which involves filesystem IO and grammar
             // priming).
             vscodeThemePaletteCss: null,
+            // Resolved fonts ARE cheap (pure string handling, no IO)
+            // so we compute them synchronously and bake the override
+            // into the shell. This eliminates the single-frame flash
+            // where the iframe would otherwise paint with the baked
+            // (potentially-stale) fonts before the request/push round
+            // trip lands. Falls back to null if resolution throws so
+            // a panic here doesn't break the rest of the shell.
+            vscodeFontFamiliesCss: this.resolveCurrentFontsCss(),
         });
         this.panel.title = `Knit Output: ${path.basename(args.outputPath)}`;
         // Fire-and-forget: re-render the shell first, then resolve
@@ -832,6 +857,135 @@ export class KnitOutputPanel {
             void this.pushVscodeThemePalette();
             return;
         }
+        if (msg.type === 'requestFonts') {
+            // Same pattern as `requestPalette` — the fresh shell pulls
+            // the current font CSS, closing the panel-reuse race where
+            // a host-initiated push could land before the new
+            // listener is wired up.
+            void this.pushFontFamilies();
+            return;
+        }
+    }
+
+    /**
+     * Resolve the current font settings for this panel's source URI
+     * and push them into the webview as a `__ravenFontFamilies` CSS
+     * declaration string. Mirrors `pushVscodeThemePalette` shape but
+     * has no generation counter — font resolution is synchronous and
+     * idempotent, so the last call wins naturally.
+     *
+     * Returns silently on failure: the webview already falls back to
+     * the fonts baked into the on-disk `.html` when no override is
+     * set, so a resolve failure is visually equivalent to the
+     * pre-feature behavior.
+     */
+    private async pushFontFamilies(): Promise<void> {
+        if (this.disposed) return;
+        let css: string | null;
+        try {
+            css = fontsCssDeclarations(this.resolveCurrentFonts());
+        } catch (err) {
+            this.output.appendLine(
+                `[fonts] resolve failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            css = null;
+        }
+        if (this.disposed) return;
+        const message: FontFamiliesUpdate = {
+            __ravenFontFamilies: true,
+            css,
+        };
+        try {
+            await this.panel.webview.postMessage(message);
+        } catch (err) {
+            if (this.disposed) return;
+            this.output.appendLine(
+                `[fonts] postMessage failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+        }
+    }
+
+    /**
+     * Synchronous helper that reads the current font configuration for
+     * this panel's source URI (and the source's languageId, for
+     * `[rmd]`/`[quarto]`/`[markdown]` language-scoped
+     * `editor.fontFamily` overrides) and returns the resolved fonts.
+     *
+     * Source languageId is read live from the open `TextDocument` if
+     * any; we fall back to `'rmd'` (the only languageId `Raven: Knit`
+     * acts on today) when the document is closed. The fallback covers
+     * the case where the user closes the .Rmd buffer while the
+     * preview panel is still open — they'd otherwise see a font
+     * mismatch on the next setting change.
+     */
+    private resolveCurrentFonts(): ResolvedFonts {
+        const languageId = this.lookupSourceLanguageId();
+        const knitConfig = vscode.workspace.getConfiguration('raven.knit', this.sourceUri);
+        const mdPreviewConfig = vscode.workspace.getConfiguration('markdown.preview', this.sourceUri);
+        const editorConfig = vscode.workspace.getConfiguration(
+            'editor',
+            { uri: this.sourceUri, languageId },
+        );
+        return resolveFontFamilies(
+            knitConfig.get<string>('fontFamily', ''),
+            knitConfig.get<string>('monospaceFontFamily', ''),
+            mdPreviewConfig.get<string>('fontFamily', ''),
+            editorConfig.get<string>('fontFamily', ''),
+        );
+    }
+
+    private lookupSourceLanguageId(): string {
+        const fsPath = this.sourceUri.fsPath;
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.uri.fsPath === fsPath) return doc.languageId;
+        }
+        return 'rmd';
+    }
+
+    /**
+     * Synchronous helper used by `updateContent` to bake the live font
+     * override into the shell HTML on first paint. Mirrors what
+     * `pushFontFamilies` does over postMessage but produces the CSS
+     * string directly. Falls back to null on any failure so the shell
+     * still renders.
+     */
+    private resolveCurrentFontsCss(): string | null {
+        try {
+            return fontsCssDeclarations(this.resolveCurrentFonts());
+        } catch (err) {
+            this.output.appendLine(
+                `[fonts] initial resolve failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            return null;
+        }
+    }
+
+    /**
+     * Returns `true` when a configuration change affects any of the
+     * four settings `resolveFontFamilies` reads — `raven.knit.fontFamily`,
+     * `raven.knit.monospaceFontFamily`, `markdown.preview.fontFamily`,
+     * `editor.fontFamily` — scoped to this panel's source URI AND
+     * the source document's languageId so a change scoped to a
+     * different folder or a different language (e.g. `[markdown]:
+     * editor.fontFamily` while this panel is on an `.rmd`) does NOT
+     * trigger a postMessage here.
+     *
+     * The languageId match matters for `editor.fontFamily`: a user
+     * who sets `[r]` and `[rmd]` to different fonts should see only
+     * their `[rmd]` change reach this panel when the source is an
+     * `.Rmd`. Passing only the URI lets `affectsConfiguration` apply
+     * the broader resource-scope check, which can fire spuriously for
+     * unrelated language overrides.
+     */
+    private affectsAnyFontConfig(e: vscode.ConfigurationChangeEvent): boolean {
+        const scope: vscode.ConfigurationScope = {
+            uri: this.sourceUri,
+            languageId: this.lookupSourceLanguageId(),
+        };
+        return e.affectsConfiguration('raven.knit.fontFamily', scope)
+            || e.affectsConfiguration('raven.knit.monospaceFontFamily', scope)
+            || e.affectsConfiguration('markdown.preview.fontFamily', scope)
+            || e.affectsConfiguration('editor.fontFamily', scope);
     }
 }
 

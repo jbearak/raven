@@ -16,7 +16,17 @@ export type KnitOutputMessage =
      * fresh shell's `addEventListener('message')` and be silently
      * dropped. Having the new shell pull instead avoids the race.
      */
-    | { type: 'requestPalette' };
+    | { type: 'requestPalette' }
+    /**
+     * Same pull pattern as `requestPalette`, but for the live font
+     * override. The webview asks the host to re-resolve the user's
+     * font settings and push `__ravenFontFamilies`, so the iframe-
+     * rebuild race after `panel.webview.html = …` cannot leave the
+     * webview without the override that the on-disk `.html` no
+     * longer carries (the baked declarations are still there, but the
+     * webview's <style> override always wins on the cascade).
+     */
+    | { type: 'requestFonts' };
 
 /**
  * Marker key on `postMessage` payloads from the extension host to the
@@ -40,6 +50,48 @@ export interface VscodeThemePaletteUpdate {
 }
 
 /**
+ * Marker key for the live-font override channel. Same shape and trust
+ * boundary as `VSCODE_PALETTE_UPDATE_KEY` (host posts a complete CSS
+ * declaration string, webview's accept-regex enforces the exact
+ * declaration shape before injecting). Distinct key so the webview can
+ * tell theme updates from font updates and route each into its own
+ * `<style>` element — clobbering between channels would lose either
+ * theme colors or fonts.
+ */
+export const FONT_FAMILIES_UPDATE_KEY = '__ravenFontFamilies';
+
+export interface FontFamiliesUpdate {
+    /** Marker — must equal `true`. */
+    __ravenFontFamilies: true;
+    /**
+     * Pre-built CSS declarations matching `fontsCssDeclarations`:
+     * `--raven-font-text: …; --raven-font-mono: …;` — both declarations,
+     * in that order, separated by a single space. `null` clears any
+     * prior override so the iframe falls back to the fonts baked into
+     * the on-disk `.html`.
+     */
+    css: string | null;
+}
+
+/**
+ * Build the CSS variable declarations for the live-font override. Same
+ * shape `render-html.ts:fontsAsCssVars` emits when baking the rendered
+ * document, joined with a single space so the whole payload fits on one
+ * line — the webview's accept-regex (`RAVEN_FONT_CSS_RE` in
+ * `buildShellHtml`) checks for that exact shape as the trust boundary
+ * between extension-host string assembly and `style.textContent`
+ * injection.
+ *
+ * Inputs are trusted: callers MUST pass the output of
+ * `resolveFontFamilies` (which sanitizes every candidate). Anything
+ * else can corrupt the iframe stylesheet — see
+ * `render-html.ts:sanitizeFontFamily` for the threat model.
+ */
+export function fontsCssDeclarations(fonts: { text: string; mono: string }): string {
+    return `--raven-font-text: ${fonts.text}; --raven-font-mono: ${fonts.mono};`;
+}
+
+/**
  * Strict type-narrowing for messages posted from the Knit Output webview.
  * The webview is a trust boundary; reject anything we did not explicitly
  * shape. Additional unknown properties on a recognized type are allowed
@@ -52,6 +104,7 @@ export function isKnitOutputMessage(msg: unknown): msg is KnitOutputMessage {
     if (m.type === 'themeChanged' && typeof m.applied === 'boolean') return true;
     if (m.type === 'themeContext' && typeof m.editorBackground === 'string') return true;
     if (m.type === 'requestPalette') return true;
+    if (m.type === 'requestFonts') return true;
     return false;
 }
 
@@ -196,6 +249,15 @@ export function buildShellHtml(args: {
      * GitHub variant — same behavior as before this feature shipped.
      */
     vscodeThemePaletteCss?: string | null;
+    /**
+     * Pre-built CSS declarations for the live-font override, matching
+     * `fontsCssDeclarations`. When non-null, the webview applies these
+     * fonts on first paint so the iframe never flashes the baked
+     * (potentially-stale) fonts that are still in the on-disk `.html`.
+     * The host re-pushes via `__ravenFontFamilies` on every
+     * `onDidChangeConfiguration` event.
+     */
+    vscodeFontFamiliesCss?: string | null;
 }): string {
     const {
         htmlContent,
@@ -205,6 +267,7 @@ export function buildShellHtml(args: {
         nonce,
         initialThemeApplied,
         vscodeThemePaletteCss,
+        vscodeFontFamiliesCss,
     } = args;
     // path.basename handles both POSIX and Windows separators.
     const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
@@ -438,6 +501,20 @@ export function buildShellHtml(args: {
               : 'null'
       };
 
+      // Live font override. The on-disk .html has its own
+      // \`--raven-font-text\` / \`--raven-font-mono\` baked into the
+      // iframe's :root; this script appends a SECOND :root rule in a
+      // dedicated <style id="raven-vscode-font-overrides"> element so
+      // the live value wins on the cascade (last-equal-specificity
+      // wins). Re-applies on iframe load + on every
+      // \`__ravenFontFamilies\` postMessage so the setting takes effect
+      // without a re-knit.
+      let vscodeFontCss = ${
+          typeof vscodeFontFamiliesCss === 'string' && vscodeFontFamiliesCss.length > 0
+              ? JSON.stringify(vscodeFontFamiliesCss)
+              : 'null'
+      };
+
       function activePaletteVariant() {
         // Mirror the regex used by render-html.ts:composeStylesheet
         // so the overlay-time variant choice matches the bake-time
@@ -589,6 +666,37 @@ export function buildShellHtml(args: {
       if (iframe.contentDocument
           && iframe.contentDocument.readyState !== 'loading') {
         applyTheme();
+      }
+
+      // Live-font override is independent of the VS Code-theme toggle:
+      // fonts always track the user setting (no UX dial), while colors
+      // require explicit opt-in via themeBtn. Apply on every iframe
+      // (re)load so a panel.webview.html swap re-injects the override
+      // into the fresh document.
+      function applyFonts() {
+        const doc = iframe.contentDocument;
+        if (!doc || !doc.documentElement) return;
+        const host = doc.head || doc.documentElement;
+        let style = doc.getElementById('raven-vscode-font-overrides');
+        if (vscodeFontCss === null) {
+          if (style) style.remove();
+          return;
+        }
+        if (!style) {
+          style = doc.createElement('style');
+          style.id = 'raven-vscode-font-overrides';
+          host.appendChild(style);
+        }
+        // CSS specificity for two equal-specificity :root selectors:
+        // last-wins. Our override is appended AFTER the baked
+        // declarations, so this rule wins for both --raven-font-text
+        // and --raven-font-mono.
+        style.textContent = ':root { ' + vscodeFontCss + ' }';
+      }
+      iframe.addEventListener('load', applyFonts);
+      if (iframe.contentDocument
+          && iframe.contentDocument.readyState !== 'loading') {
+        applyFonts();
       }
 
       // --- Copy / Select All / context menu ------------------------
@@ -878,6 +986,12 @@ export function buildShellHtml(args: {
       // Pulling once from this fully-booted state guarantees we
       // never see the stale baked palette permanently.
       vscode.postMessage({ type: 'requestPalette' });
+      // Same race-avoidance pattern for the live-font override. The
+      // initial \`vscodeFontCss\` captured at template-render time is
+      // already applied via applyFonts above; this pull asks the host
+      // to re-resolve and push the CURRENT value, covering a panel
+      // reuse where settings changed between renders.
+      vscode.postMessage({ type: 'requestFonts' });
       // Re-apply when VS Code switches its active theme. The outer
       // shell body class flips between vscode-light, vscode-dark, or
       // vscode-high-contrast, which updates the CSS variables read
@@ -949,6 +1063,38 @@ export function buildShellHtml(args: {
         for (var k in seen) count++;
         return count === RAVEN_PALETTE_REQUIRED_NAMES.length;
       }
+
+      // Font payload accept-regex and required-name set. Mirrors the
+      // palette pattern but for the two --raven-font-* declarations.
+      //
+      // Inner value class \`[^;{}<>()\\\\\\n\\r\\t\\f\\v\\0]+\` mirrors
+      // \`render-html.ts:BANNED_CHAR_RE\` exactly: every character the
+      // host sanitizer rejects is also rejected here. Combined with
+      // the explicit declaration shape (\`--raven-font-(?:text|mono): \`)
+      // and the requirement that BOTH names appear via
+      // \`fontCssIsComplete\`, the webview can only inject the precise
+      // two-declaration sequence \`fontsCssDeclarations\` is contracted
+      // to emit.
+      var RAVEN_FONT_CSS_RE = /^(?:--raven-font-(?:text|mono): [^;{}<>()\\\\\\n\\r\\t\\f\\v\\0]+; ?){2}$/;
+      var RAVEN_FONT_REQUIRED_NAMES = [
+        '--raven-font-text',
+        '--raven-font-mono',
+      ];
+      function fontCssIsComplete(css) {
+        var seen = Object.create(null);
+        var pat = /--raven-font-(?:text|mono)(?=:)/g;
+        var m;
+        while ((m = pat.exec(css)) !== null) {
+          if (seen[m[0]]) return false;
+          seen[m[0]] = true;
+        }
+        for (var j = 0; j < RAVEN_FONT_REQUIRED_NAMES.length; j++) {
+          if (!seen[RAVEN_FONT_REQUIRED_NAMES[j]]) return false;
+        }
+        var count2 = 0;
+        for (var k2 in seen) count2++;
+        return count2 === RAVEN_FONT_REQUIRED_NAMES.length;
+      }
       window.addEventListener('message', function (event) {
         var data = event && event.data;
         if (!data) return;
@@ -961,6 +1107,22 @@ export function buildShellHtml(args: {
             vscodePaletteCss = null;
           }
           applyTheme();
+          return;
+        }
+        if (data.__ravenFontFamilies === true) {
+          // Accept only the exact two-declaration shape
+          // \`fontsCssDeclarations\` emits, with both required names,
+          // no duplicates, and no extras. Anything else clears the
+          // override so the baked fonts in the on-disk .html show
+          // through — same fail-safe model as the palette path.
+          if (typeof data.css === 'string'
+              && RAVEN_FONT_CSS_RE.test(data.css)
+              && fontCssIsComplete(data.css)) {
+            vscodeFontCss = data.css;
+          } else {
+            vscodeFontCss = null;
+          }
+          applyFonts();
           return;
         }
         if (data.__ravenRequestThemeContext === true) {

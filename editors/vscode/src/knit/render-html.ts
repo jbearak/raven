@@ -81,6 +81,49 @@ const GENERIC_FAMILY_KEYWORDS = new Set([
 ]);
 
 /**
+ * CSS-wide value keywords. We REJECT these as the entire user font
+ * value because they don't behave usefully in the knit-output iframe:
+ * the iframe's <body> has no meaningful author-controlled parent for
+ * `inherit` to pull from, and `initial` / `unset` / `revert` would
+ * undo the very styling the user is trying to configure. Treating
+ * them as banned shapes makes the sanitizer reject them up front so
+ * the user falls through to a working fallback rather than seeing
+ * UA-default Times Roman.
+ */
+const CSS_WIDE_KEYWORDS = new Set([
+    'inherit',
+    'initial',
+    'unset',
+    'revert',
+    'revert-layer',
+]);
+
+/**
+ * Banned characters in a user-supplied font-family value. The regex
+ * forms the structural trust boundary between settings input and the
+ * `<style>` block this module emits.
+ *
+ * Coverage rationale (each char neutralises a specific CSS attack
+ * surface — see `sanitizeFontFamily`'s doc comment for the threat
+ * model):
+ *
+ *   `; { } < > ( ) \\`  — break out of the declaration, the rule
+ *                          block, the `<style>` element, or a
+ *                          function-token's value via unmatched paren.
+ *   `\n \r`              — newline forms in CSS Syntax L3 §3.3 — any
+ *                          would terminate a string token or property.
+ *   `\t \f \v`           — whitespace that CSS preprocesses or
+ *                          tokenises in ways that split unquoted
+ *                          family names (`\f` is a CSS newline; `\t`
+ *                          and `\v` whitespace inside an identifier
+ *                          breaks it).
+ *   `\0`                 — CSS Syntax L3 §3.3 replaces NUL with U+FFFD;
+ *                          rejecting it up-front keeps the sanitizer's
+ *                          textual ban-set stable across that rewrite.
+ */
+const BANNED_CHAR_RE = /[;{}<>()\\\n\r\t\f\v\0]/;
+
+/**
  * Render a post-knit `.md` source string into the final HTML body
  * we'll show in the panel and write to disk for "Open in Browser".
  *
@@ -373,12 +416,12 @@ export function composeStylesheet(
     // the variant-conditional inner-:root (the
     // `prefers-color-scheme: dark` media query below, and the
     // body-class branch for the in-VS-Code panel) keeps shipping
-    // colors only. Existing callers without `fonts` get the
-    // hardcoded historical defaults so legacy unit tests don't break.
-    const resolvedFonts: ResolvedFonts = fonts ?? {
-        text: `${TEXT_HARDCODED_FALLBACK}`,
-        mono: `${MONO_HARDCODED_FALLBACK}`,
-    };
+    // colors only. Callers without `fonts` get the hardcoded
+    // historical defaults routed through `resolveFontFamilies` so the
+    // terminator-append invariant lives in one place — changing a
+    // hardcoded constant cannot silently strip the generic-family
+    // fallback from the emitted CSS.
+    const resolvedFonts: ResolvedFonts = fonts ?? resolveFontFamilies('', '', '', '');
     const fontVars = fontsAsCssVars(resolvedFonts);
 
     if (themeClasses === null) {
@@ -429,32 +472,111 @@ export interface ResolvedFonts {
  * `'JetBrains Mono', "Source Sans Pro", monospace`). We can't validate
  * the grammar usefully — too many shapes — but we can reject the
  * specific characters that would let the string break out of the CSS
- * value, escape the `<style>` block, or smuggle a comment that
- * survives into the rendered stylesheet.
+ * value, escape the `<style>` block, smuggle a comment that survives
+ * into the rendered stylesheet, OR survive into the rendered CSS as a
+ * value that the browser will silently treat as invalid (causing the
+ * font-family property to drop via IACVT and revert to the UA default).
  *
- * Banned: `;` `{` `}` `<` `>` `\` newline, carriage-return, NUL,
- * and the comment sequences `/*` / `*\/`.
+ * Banned shapes:
+ *   - Length > 500 chars (DoS / accidental paste of unrelated content).
+ *   - Banned characters per `BANNED_CHAR_RE` (see that constant).
+ *   - CSS comment sequences `/`+`*` / `*`+`/`.
+ *   - Unbalanced quotes — a stray `"` or `'` would open a CSS string
+ *     that runs until the next quote of the same kind or until EOF /
+ *     newline, swallowing adjacent declarations as part of the
+ *     bad-string recovery.
+ *   - Trailing or consecutive commas — `Foo,` becomes `Foo,, sans-serif`
+ *     after our terminator is appended; var() substitution then makes
+ *     the font-family declaration invalid and the property is dropped
+ *     at IACVT. Reject empty top-level entries up front so the user
+ *     falls through to a working fallback.
+ *   - The CSS-wide keywords (`inherit` / `initial` / `unset` / `revert`
+ *     / `revert-layer`) as the entire value. They don't behave usefully
+ *     in the knit-output iframe and should fall through to a real font.
  *
  * Returns the trimmed input on success, or `null` if the input is
- * empty, too long, or contains a banned shape.
+ * rejected. A `null` return is interpreted as "try the next layer of
+ * the fallback chain" by `resolveSlot`.
  */
 export function sanitizeFontFamily(input: string): string | null {
     if (typeof input !== 'string') return null;
     const trimmed = input.trim();
     if (trimmed.length === 0) return null;
     if (trimmed.length > 500) return null;
-    // Single banned-character class. `\` is included because CSS
-    // unicode escapes (`\3b ;`) could otherwise smuggle a semicolon
-    // past the `;` check on parsers that resolve escapes before
-    // applying our regex. Newlines and `\0` would break the property
-    // line entirely.
-    if (/[;{}<>\\\n\r\0]/.test(trimmed)) return null;
+    if (BANNED_CHAR_RE.test(trimmed)) return null;
     // CSS comment sequences. A literal `/*` opens a comment that
     // extends until `*\/`, which would let an attacker comment out
     // every property between the font-family and the next legitimate
     // closing brace.
     if (trimmed.includes('/*') || trimmed.includes('*/')) return null;
+    if (!hasBalancedQuotes(trimmed)) return null;
+    if (hasEmptyTopLevelSegment(trimmed)) return null;
+    if (CSS_WIDE_KEYWORDS.has(trimmed.toLowerCase())) return null;
     return trimmed;
+}
+
+/**
+ * Walk a font-family list and verify every `"` and `'` has a matching
+ * close. Mixed quote types are fine (`'…' "…"`); each opens its own
+ * scope.
+ *
+ * Returns `false` if the value ends with an open quote — that would
+ * survive into the emitted CSS as an unterminated string token,
+ * triggering bad-string-token recovery that swallows the sibling
+ * declaration on the next line.
+ */
+function hasBalancedQuotes(value: string): boolean {
+    let quote: '"' | "'" | null = null;
+    for (let i = 0; i < value.length; i++) {
+        const ch = value[i];
+        if (quote) {
+            if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'") quote = ch as '"' | "'";
+    }
+    return quote === null;
+}
+
+/**
+ * Returns `true` if any top-level entry in the comma-separated list is
+ * empty (or a degenerate empty-quoted name like `""` / `''`) after
+ * trimming. Trailing comma, leading comma, and consecutive commas all
+ * produce an empty entry; once `appendGenericTerminator` appends
+ * `, sans-serif` the resulting value becomes invalid font-family syntax
+ * (`Foo,, sans-serif`) and the browser drops the declaration via
+ * IACVT. Empty quoted entries (`""`) are also rejected because CSS
+ * treats them as a custom family with the empty string for a name,
+ * which no font matches — the user's intent was almost certainly
+ * something else.
+ *
+ * Top-level means outside `"…"` or `'…'` quoted family names —
+ * `"Comma, Foundry"` is a single entry.
+ */
+function hasEmptyTopLevelSegment(value: string): boolean {
+    let quote: '"' | "'" | null = null;
+    let segmentStart = 0;
+    for (let i = 0; i <= value.length; i++) {
+        const ch = i < value.length ? value[i] : ',';
+        if (quote) {
+            if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = ch as '"' | "'";
+            continue;
+        }
+        if (ch === ',' || i === value.length) {
+            const segment = value.slice(segmentStart, i).trim();
+            if (segment.length === 0) return true;
+            // Empty quoted-string family name (e.g. `""` or `''`) —
+            // CSS would treat this as a custom family with no name,
+            // which is never what the user meant.
+            if (segment === '""' || segment === "''") return true;
+            segmentStart = i + 1;
+        }
+    }
+    return false;
 }
 
 /**

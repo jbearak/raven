@@ -147,6 +147,22 @@ describe('composeStylesheet', () => {
         expect(css).not.toContain(githubLight.background);
     });
 
+    test.each(['vscode-light', 'vscode-dark'])(
+        'themed branch (themeClasses=%p) still emits font vars',
+        (themeClasses) => {
+            // Today's production call site hardcodes themeClasses=null
+            // so the themed branch's `${fontVars}` interpolation is
+            // dead-by-call-site; pin coverage so a future themed-knits
+            // PR doesn't silently regress fonts.
+            const css = composeStylesheet(themeClasses, {
+                text: 'Georgia, serif',
+                mono: 'Menlo, monospace',
+            });
+            expect(css).toContain('--raven-font-text: Georgia, serif;');
+            expect(css).toContain('--raven-font-mono: Menlo, monospace;');
+        },
+    );
+
     test('emits font CSS variables alongside the palette and body/code reference them', () => {
         const css = composeStylesheet(null, {
             text: '"Source Sans Pro", sans-serif',
@@ -207,7 +223,10 @@ describe('sanitizeFontFamily', () => {
         expect(sanitizeFontFamily('a'.repeat(500))).toBe('a'.repeat(500));
     });
 
-    test.each([';', '{', '}', '<', '>', '\\', '\n', '\r', '\0'])(
+    test.each([
+        ';', '{', '}', '<', '>', '(', ')', '\\',
+        '\n', '\r', '\t', '\f', '\v', '\0',
+    ])(
         'rejects banned character %p',
         (banned) => {
             expect(sanitizeFontFamily(`Georgia${banned}serif`)).toBeNull();
@@ -218,6 +237,73 @@ describe('sanitizeFontFamily', () => {
         expect(sanitizeFontFamily('Georgia /* sneaky */ serif')).toBeNull();
         expect(sanitizeFontFamily('Georgia /*')).toBeNull();
         expect(sanitizeFontFamily('Georgia */ serif')).toBeNull();
+    });
+
+    test('rejects unmatched double quote', () => {
+        // An unclosed `"` in the value would survive into the emitted
+        // CSS as an open string token; recovery skips to the next `;`
+        // and silently consumes the sibling --raven-font-mono
+        // declaration. Reject up front.
+        expect(sanitizeFontFamily('"Source Sans Pro')).toBeNull();
+        expect(sanitizeFontFamily('Georgia, "Helvetica')).toBeNull();
+    });
+
+    test('rejects unmatched single quote', () => {
+        // Same bad-string-token recovery hazard as the double-quote
+        // case, just for the `'` form.
+        expect(sanitizeFontFamily("Menlo, 'Andale Mono")).toBeNull();
+        expect(sanitizeFontFamily("'Andale Mono")).toBeNull();
+    });
+
+    test('accepts mixed but balanced quotes', () => {
+        expect(sanitizeFontFamily(`'JetBrains Mono', "Source Sans Pro"`))
+            .toBe(`'JetBrains Mono', "Source Sans Pro"`);
+    });
+
+    test('rejects trailing comma', () => {
+        // `Foo,` becomes `Foo,, sans-serif` after the resolver appends
+        // a generic, which makes the var() substitution invalid and
+        // the font-family declaration is dropped at IACVT.
+        expect(sanitizeFontFamily('Georgia,')).toBeNull();
+        expect(sanitizeFontFamily('Georgia, ')).toBeNull();
+    });
+
+    test('rejects leading and consecutive commas', () => {
+        expect(sanitizeFontFamily(',Arial')).toBeNull();
+        expect(sanitizeFontFamily('Arial,,Times')).toBeNull();
+        expect(sanitizeFontFamily('Arial, , Times')).toBeNull();
+    });
+
+    test('rejects empty quoted family entries', () => {
+        // `""` and `''` are degenerate — CSS treats them as a
+        // custom family with no name, which no font matches and the
+        // user almost certainly did not mean.
+        expect(sanitizeFontFamily('""')).toBeNull();
+        expect(sanitizeFontFamily("''")).toBeNull();
+        expect(sanitizeFontFamily('"", monospace')).toBeNull();
+        expect(sanitizeFontFamily('Arial, ""')).toBeNull();
+    });
+
+    test.each([
+        'inherit', 'initial', 'unset', 'revert', 'revert-layer',
+        'INHERIT', 'Initial', 'Unset', 'Revert', 'Revert-Layer',
+    ])(
+        'rejects bare CSS-wide keyword %p',
+        (keyword) => {
+            // CSS-wide keywords are only valid as the sole value of a
+            // property; the iframe has no useful parent for `inherit`
+            // to pull from. Reject so the user falls through to a
+            // real font instead of seeing UA-default Times.
+            expect(sanitizeFontFamily(keyword)).toBeNull();
+        },
+    );
+
+    test('accepts CSS-wide keyword in a list (treated as bare identifier)', () => {
+        // `Foo, inherit` is valid CSS — `inherit` becomes a literal
+        // (unknown) family name and the browser falls through. We do
+        // NOT reject this because the list shape is well-formed and
+        // the user's other entries still work.
+        expect(sanitizeFontFamily('Foo, inherit')).toBe('Foo, inherit');
     });
 
     test('non-string input is rejected', () => {
@@ -291,10 +377,13 @@ describe('resolveFontFamilies', () => {
     });
 
     test('recognizes all CSS generic-family keywords as terminators', () => {
+        // Mirror the GENERIC_FAMILY_KEYWORDS set in render-html.ts —
+        // adding/removing an entry there should be reflected here so
+        // a stale set silently introduces double-terminators.
         for (const generic of [
             'monospace', 'sans-serif', 'serif', 'system-ui',
-            'ui-monospace', 'ui-sans-serif', 'ui-serif',
-            'cursive', 'fantasy',
+            'ui-monospace', 'ui-sans-serif', 'ui-serif', 'ui-rounded',
+            'cursive', 'fantasy', 'emoji', 'math', 'fangsong',
         ]) {
             const out = resolveFontFamilies(`Foo, ${generic}`, `Bar, ${generic}`, '', '');
             expect(out.text).toBe(`Foo, ${generic}`);
