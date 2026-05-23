@@ -1,4 +1,6 @@
+import * as child_process from 'child_process';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -11,8 +13,13 @@ import {
     maybeCurrentSession,
     sweepStaleSessions,
 } from './session-state';
+import { PandocResolver } from './pandoc-detect';
+import { OperationRegistry } from './operation-controller';
+import { registerExportCommands } from './export-commands';
 
 export { disposeKnitGrammarRegistryForDeactivation };
+export { runExport } from './export-commands';
+export type { ExportDeps } from './export-commands';
 
 /**
  * Register `Raven: Knit` and its output-channel command. The commands
@@ -68,4 +75,44 @@ export function registerKnit(
     }
 
     registerKnitCommands(context, getLanguageClient ? { getLanguageClient } : undefined);
+
+    // Export commands (Pandoc-driven HTML/PDF/Word). The resolver is
+    // shared across export invocations so the once-per-session probe is
+    // amortized; settings changes invalidate the cache.
+    const exportOutput = vscode.window.createOutputChannel('Raven: Knit');
+    context.subscriptions.push(exportOutput);
+    const resolver = new PandocResolver({
+        getConfigured: () =>
+            vscode.workspace.getConfiguration('raven').get<string>('pandoc.path', ''),
+        access: (p) => fs.promises.access(p, fs.constants.X_OK),
+        spawn: (bin) => probePandocBinary(bin),
+    });
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration('raven.pandoc.path')) resolver.invalidate();
+        }),
+    );
+    // The OperationRegistry tracks both knit and export ops. For now,
+    // the existing knit command uses its own Set<string> guard; the
+    // export commands use this registry. A follow-up commit can
+    // unify both paths once the knit command is migrated.
+    const registry = new OperationRegistry();
+    registerExportCommands(context, {
+        resolver,
+        registry,
+        getOutput: () => exportOutput,
+        runKnit: async (uri) => {
+            await vscode.commands.executeCommand('raven.knit', uri);
+        },
+    });
+}
+
+function probePandocBinary(bin: string): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+        const child = child_process.spawn(bin, ['--version']);
+        let out = '';
+        child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+        child.on('error', reject);
+        child.on('close', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(`pandoc exit ${code}`))));
+    });
 }
