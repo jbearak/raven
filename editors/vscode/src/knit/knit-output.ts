@@ -513,7 +513,18 @@ export function buildShellHtml(args: {
           + ' html, body { background: ' + c.bg + ' !important; '
           + 'color: ' + c.fg + ' !important; }'
           + ' a { color: ' + c.link + ' !important; }'
-          + ' pre, code, pre code { background: ' + c.codeBg + ' !important; }';
+          + ' pre, code, pre code { background: ' + c.codeBg + ' !important; }'
+          // Defensive: ensure code-block spans never carry an
+          // inherited or theme-injected background. Our highlighter
+          // only sets color:var(--raven-c-X) on each span, but some
+          // VS Code webview rendering paths apply a subtle background
+          // to highlighted text — visible with themes whose tokens
+          // contrast sharply against the code-block background (e.g.
+          // Solarized Dark's bright blue on its dark teal bg). Forcing
+          // span backgrounds to transparent keeps the rendered code
+          // looking like the editor.
+          + ' pre code span, code span { background: transparent !important; '
+          + 'text-shadow: none !important; border: 0 !important; }';
         // Paint the iframe element itself too so the brief flash
         // before the inner document parses also matches the theme.
         iframe.style.background = c.bg;
