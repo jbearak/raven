@@ -61,6 +61,10 @@ export function registerKnit(
     // same process (rare, but happens in dev with reload-extension)
     // we don't want to clobber the existing session id.
     if (maybeCurrentSession() === null) {
+        // First workspace folder URI wins; falls back to the workspace
+        // file URI (for `.code-workspace` setups); falls back to `null`
+        // which `initSessionState` then interprets as "single-file mode"
+        // and asks the caller to provide a fallback per source.
         const workspaceUri =
             vscode.workspace.workspaceFolders?.[0]?.uri.toString()
             ?? vscode.workspace.workspaceFile?.toString()
@@ -74,13 +78,20 @@ export function registerKnit(
         void sweepStaleSessions(path.join(os.tmpdir(), 'raven-knit'));
     }
 
-    registerKnitCommands(context, getLanguageClient ? { getLanguageClient } : undefined);
+    // One shared output channel for both knit and export. Two
+    // independently-named "Raven: Knit" channels would confuse the
+    // "Show Knit Output" command, so we create it here and inject it
+    // into both registration paths.
+    const knitOutput = vscode.window.createOutputChannel('Raven: Knit');
+    context.subscriptions.push(knitOutput);
+    registerKnitCommands(
+        context,
+        getLanguageClient ? { getLanguageClient, sharedOutput: knitOutput } : { sharedOutput: knitOutput },
+    );
 
     // Export commands (Pandoc-driven HTML/PDF/Word). The resolver is
     // shared across export invocations so the once-per-session probe is
     // amortized; settings changes invalidate the cache.
-    const exportOutput = vscode.window.createOutputChannel('Raven: Knit');
-    context.subscriptions.push(exportOutput);
     const resolver = new PandocResolver({
         getConfigured: () =>
             vscode.workspace.getConfiguration('raven').get<string>('pandoc.path', ''),
@@ -92,15 +103,14 @@ export function registerKnit(
             if (e.affectsConfiguration('raven.pandoc.path')) resolver.invalidate();
         }),
     );
-    // The OperationRegistry tracks both knit and export ops. For now,
-    // the existing knit command uses its own Set<string> guard; the
-    // export commands use this registry. A follow-up commit can
-    // unify both paths once the knit command is migrated.
+    // Shared OperationRegistry across knit + export so an in-flight
+    // knit blocks a same-source export (and vice versa). Webview cancel
+    // commands look up controllers via canonicalOpKey.
     const registry = new OperationRegistry();
     registerExportCommands(context, {
         resolver,
         registry,
-        getOutput: () => exportOutput,
+        getOutput: () => knitOutput,
         runKnit: async (uri) => {
             await vscode.commands.executeCommand('raven.knit', uri);
         },

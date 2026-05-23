@@ -16,11 +16,17 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { computeWorkspaceHash, sessionRoot } from './raven-knit-paths';
+import { computeSourceHash, computeWorkspaceHash, sessionRoot } from './raven-knit-paths';
 
 export interface SessionInfo {
     sessionId: string;
-    workspaceHash: string;
+    /**
+     * Hash of the first workspace folder URI when a workspace is open.
+     * `null` when no workspace is open — in single-file mode we defer
+     * computing `workspaceHash` until a knit-time `.Rmd` is known, then
+     * substitute `sha256(parentDir(rmdAbsPath))` per the spec.
+     */
+    workspaceHash: string | null;
 }
 
 let state: SessionInfo | null = null;
@@ -32,9 +38,24 @@ export interface InitSessionStateOpts {
 }
 
 export function initSessionState(opts: InitSessionStateOpts): SessionInfo {
-    const workspaceHash = computeWorkspaceHash(opts.workspaceUri ?? 'no-workspace');
+    const workspaceHash = opts.workspaceUri ? computeWorkspaceHash(opts.workspaceUri) : null;
     state = { sessionId: opts.sessionId, workspaceHash };
     return state;
+}
+
+/**
+ * Resolve the workspace hash to use for a particular `.Rmd`. Honors
+ * the configured workspace when one is open; falls back to a hash of
+ * the .Rmd's parent directory in single-file mode. This keeps two
+ * single-file `.Rmd` files in different directories isolated from each
+ * other while still producing a deterministic path.
+ */
+export function workspaceHashFor(rmdAbsPath: string): string {
+    if (!state) {
+        throw new Error('Raven knit session state not initialized.');
+    }
+    if (state.workspaceHash !== null) return state.workspaceHash;
+    return computeSourceHash(path.dirname(rmdAbsPath));
 }
 
 export function currentSession(): SessionInfo {
@@ -57,6 +78,20 @@ export function __resetSessionStateForTests(): void {
 
 export async function cleanupCurrentSession(): Promise<void> {
     if (!state) return;
+    if (state.workspaceHash === null) {
+        // Single-file mode — per-`.Rmd` parent-dir hashes were used.
+        // We can't enumerate them at cleanup without keeping a registry,
+        // so we sweep the whole sessionId by walking every workspaceHash
+        // directory that contains our sessionId subdir. Best effort.
+        const knitRoot = path.join(require('os').tmpdir(), 'raven-knit');
+        let workspaceDirs: string[];
+        try { workspaceDirs = await fs.promises.readdir(knitRoot); } catch { return; }
+        for (const wd of workspaceDirs) {
+            const sessionPath = path.join(knitRoot, wd, state.sessionId);
+            try { await fs.promises.rm(sessionPath, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+        return;
+    }
     const root = sessionRoot(state.workspaceHash, state.sessionId);
     try {
         await fs.promises.rm(root, { recursive: true, force: true });

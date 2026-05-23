@@ -42,7 +42,6 @@ import { pandocConvert } from './pandoc-engine';
 import { PandocResolver, PandocNotFoundError } from './pandoc-detect';
 import { OperationRegistry, type OpKind, type OperationController } from './operation-controller';
 import { canonicalOpKey, previewArtifactPaths } from './raven-knit-paths';
-import { currentSession } from './session-state';
 import { openExportedFile, type ExportFormat } from './open-exported-file';
 
 export interface ExportDeps {
@@ -167,7 +166,7 @@ async function runExportInner(
     onPin: (previewKey: string) => void,
 ): Promise<void> {
     const output = deps.getOutput();
-    const previewPaths = previewArtifactPaths(rmd.fsPath, currentSession());
+    const previewPaths = previewArtifactPaths(rmd.fsPath);
 
     // [1] Ensure we have a .md to feed Pandoc.
     if (opts.entry === 'webview') {
@@ -229,7 +228,10 @@ async function runExportInner(
     const baseName = path.basename(rmd.fsPath).replace(/\.[Rr][Mm][Dd]$/, '');
     const destPath = path.join(sourceDir, `${baseName}.${EXPORT_EXTENSION[format]}`);
 
-    const pdfEngine = vscode.workspace.getConfiguration('raven').get<string>('pandoc.pdfEngine', 'xelatex');
+    const pdfEngine = resolvePdfEngineSetting(
+        vscode.workspace.getConfiguration('raven').get<string>('pandoc.pdfEngine', 'xelatex'),
+        output,
+    );
     const detailed = buildPandocArgs.detailed(outOpts, format, {
         mdPath: previewPaths.mdPath,
         outPath: destPath,
@@ -266,6 +268,30 @@ async function runExportInner(
 
 function formatToExport(f: TargetFormat): ExportFormat {
     return f;
+}
+
+/**
+ * Allowlist of Pandoc PDF engines that match the `package.json` enum.
+ * `getConfiguration().get<string>(...)` returns whatever the user wrote
+ * in `settings.json`, bypassing the JSON-schema enum check, so we
+ * re-validate here before handing the value to Pandoc as a flag. An
+ * untrusted workspace could otherwise steer export at an attacker-
+ * controlled binary via `--pdf-engine=<bogus>`.
+ */
+const PDF_ENGINE_ALLOWLIST: ReadonlySet<string> = new Set([
+    'xelatex',
+    'pdflatex',
+    'lualatex',
+    'tectonic',
+    'wkhtmltopdf',
+]);
+
+function resolvePdfEngineSetting(raw: string, output: vscode.OutputChannel): string {
+    if (PDF_ENGINE_ALLOWLIST.has(raw)) return raw;
+    output.appendLine(
+        `[Export] Ignored raven.pandoc.pdfEngine = ${JSON.stringify(raw)} (not in allowlist); falling back to xelatex.`,
+    );
+    return 'xelatex';
 }
 
 async function offerPandocInstall(): Promise<void> {

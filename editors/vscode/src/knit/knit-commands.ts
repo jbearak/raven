@@ -17,7 +17,6 @@ import {
 import { runKnit } from './knit-engine';
 import { computeHtmlOutputPath } from './knit-paths';
 import { previewArtifactPaths } from './raven-knit-paths';
-import { currentSession } from './session-state';
 import * as fs from 'fs';
 import { runPostKnitRender } from './post-knit-renderer';
 import type { LanguageClient } from 'vscode-languageclient/node';
@@ -55,16 +54,30 @@ export interface KnitDeps {
      * override to avoid touching the filesystem and the markdown API.
      */
     runPostKnitRender: typeof runPostKnitRender;
+    /**
+     * Optional shared "Raven: Knit" output channel. When omitted,
+     * `registerKnitCommands` creates and owns one. When provided
+     * (production calls it that way from `knit/index.ts`), the same
+     * channel is used by both knit and Pandoc export logs so the
+     * "Show Knit Output" command reveals a single source of truth.
+     */
+    sharedOutput?: vscode.OutputChannel;
 }
 
 /**
- * Top-level registration. Creates the lazy OutputChannel and registers
- * the two commands listed in `package.json`.
+ * Top-level registration. Creates the lazy OutputChannel (unless one
+ * is injected via `deps.sharedOutput`) and registers the two commands
+ * listed in `package.json`.
+ *
+ * `sharedOutput` lets callers (currently `knit/index.ts`) inject one
+ * "Raven: Knit" channel shared with the export pipeline, so both knit
+ * and Pandoc logs appear in the same place that `raven.knit.openOutputChannel`
+ * reveals.
  */
 export function registerKnitCommands(
     context: vscode.ExtensionContext,
     deps?: Partial<KnitDeps>,
-): void {
+): vscode.OutputChannel {
     const resolved: KnitDeps = {
         runKnit: deps?.runKnit ?? runKnit,
         showOrUpdatePanel: deps?.showOrUpdatePanel ?? KnitOutputPanel.showOrUpdate,
@@ -72,7 +85,7 @@ export function registerKnitCommands(
         runPostKnitRender: deps?.runPostKnitRender ?? runPostKnitRender,
     };
 
-    let outputChannel: vscode.OutputChannel | undefined;
+    let outputChannel: vscode.OutputChannel | undefined = deps?.sharedOutput;
     const getOutput = (): vscode.OutputChannel => {
         if (!outputChannel) {
             outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
@@ -99,6 +112,8 @@ export function registerKnitCommands(
             () => getOutput().show(true),
         ),
     );
+
+    return getOutput();
 }
 
 async function runKnitCommand(
@@ -265,7 +280,7 @@ async function runKnitCommand(
     // <tmpdir>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/
     // — never next to the source `.Rmd`. We must ensure the directory
     // exists before R runs, since knitr won't `mkdir -p` for us.
-    const previewPaths = previewArtifactPaths(fsPath, currentSession());
+    const previewPaths = previewArtifactPaths(fsPath);
     const mdOutputPath = previewPaths.mdPath;
     try {
         await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });

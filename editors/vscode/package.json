@@ -33,7 +33,9 @@
         "raven.rTerminal.program",
         "raven.server.path",
         "raven.packages.rPath",
-        "raven.packages.additionalLibraryPaths"
+        "raven.packages.additionalLibraryPaths",
+        "raven.pandoc.path",
+        "raven.pandoc.pdfEngine"
       ]
     }
   },

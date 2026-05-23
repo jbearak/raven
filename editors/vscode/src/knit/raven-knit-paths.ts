@@ -82,13 +82,22 @@ export interface PreviewArtifactPaths {
  * Resolve every per-source artifact path for the given .Rmd.
  *
  * Requires `initSessionState` to have been called (i.e., the extension
- * is active). For pure unit tests, use the lower-level helpers
- * (`computeWorkspaceHash`, `computeSourceHash`, `previewDirFor`) and
- * pass the components explicitly.
+ * is active). The optional `sessionInfo` parameter accepts an explicit
+ * `(workspaceHash, sessionId)` pair so unit tests can drive the
+ * function without going through `session-state.ts` — production
+ * callers should omit it and let the function consult the live session.
+ *
+ * `workspaceHash` is resolved via `workspaceHashFor(rmdAbsPath)` when
+ * no explicit pair is given, which means single-file mode (no
+ * workspace) cleanly falls back to a per-`.Rmd`-parent-dir hash.
  */
-export function previewArtifactPaths(rmdAbsPath: string, sessionInfo: { workspaceHash: string; sessionId: string }): PreviewArtifactPaths {
+export function previewArtifactPaths(
+    rmdAbsPath: string,
+    sessionInfo?: { workspaceHash: string; sessionId: string },
+): PreviewArtifactPaths {
     const sourceHash = computeSourceHash(rmdAbsPath);
-    const previewDir = previewDirFor(sessionInfo.workspaceHash, sessionInfo.sessionId, sourceHash);
+    const resolved = sessionInfo ?? resolveSessionForSource(rmdAbsPath);
+    const previewDir = previewDirFor(resolved.workspaceHash, resolved.sessionId, sourceHash);
     const baseName = path.basename(rmdAbsPath).replace(/\.[Rr][Mm][Dd]$/, '');
     return {
         previewDir,
@@ -97,4 +106,15 @@ export function previewArtifactPaths(rmdAbsPath: string, sessionInfo: { workspac
         figDir: path.join(previewDir, 'figure'),
         previewKey: sourceHash,
     };
+}
+
+/**
+ * Late-bound import to avoid a circular dependency between
+ * `raven-knit-paths` and `session-state` (the latter already imports
+ * `computeSourceHash` from this module).
+ */
+function resolveSessionForSource(rmdAbsPath: string): { workspaceHash: string; sessionId: string } {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { currentSession, workspaceHashFor } = require('./session-state') as typeof import('./session-state');
+    return { workspaceHash: workspaceHashFor(rmdAbsPath), sessionId: currentSession().sessionId };
 }

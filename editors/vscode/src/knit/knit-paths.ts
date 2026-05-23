@@ -12,12 +12,11 @@
  */
 
 import { previewArtifactPaths } from './raven-knit-paths';
-import { currentSession } from './session-state';
 
 export function computeMdOutputPath(rmdFsPath: string): string {
-    return previewArtifactPaths(rmdFsPath, currentSession()).mdPath;
+    return previewArtifactPaths(rmdFsPath).mdPath;
 }
 
 export function computeHtmlOutputPath(rmdFsPath: string): string {
-    return previewArtifactPaths(rmdFsPath, currentSession()).htmlPath;
+    return previewArtifactPaths(rmdFsPath).htmlPath;
 }
