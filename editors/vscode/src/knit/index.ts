@@ -161,7 +161,7 @@ export function registerKnit(
         resolver,
         registry,
         getOutput: () => knitOutput,
-        runKnit: async (uri) => {
+        runKnit: async (uri, exportController) => {
             await runKnitWithExistingController(
                 uri,
                 knitOutput,
@@ -172,6 +172,7 @@ export function registerKnit(
                     getLanguageClient: getLanguageClient ?? (() => undefined),
                     runPostKnitRender: postKnitRender,
                 },
+                exportController,
             );
         },
     });

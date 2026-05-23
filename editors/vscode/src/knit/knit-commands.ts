@@ -133,14 +133,22 @@ export function registerKnitCommands(
  * `beginOp` would falsely report "busy"). The caller MUST already
  * own the registry slot for the source URI; otherwise use the
  * registered command surface instead.
+ *
+ * The `externalController` is the caller's already-running operation
+ * controller. We bridge its `cancelled` flag into the knit subprocess
+ * via a CancellationTokenSource so cancelling the outer export
+ * actually stops the underlying R subprocess. We also skip the
+ * nested `withProgress` — the outer caller already shows progress;
+ * a second notification would clutter the UX.
  */
 export async function runKnitWithExistingController(
     explicitUri: vscode.Uri | undefined,
     output: vscode.OutputChannel,
     context: vscode.ExtensionContext,
     deps: KnitDeps,
+    externalController: OperationController,
 ): Promise<void> {
-    await runKnitCommand(explicitUri, output, /* registry */ null, context, deps);
+    await runKnitCommand(explicitUri, output, /* registry */ null, context, deps, externalController);
 }
 
 async function runKnitCommand(
@@ -149,6 +157,7 @@ async function runKnitCommand(
     registry: OperationRegistry | null,
     context: vscode.ExtensionContext,
     deps: KnitDeps,
+    externalController: OperationController | null = null,
 ): Promise<void> {
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
@@ -415,24 +424,51 @@ async function runKnitCommand(
 
     let outcome: KnitOutcome;
     try {
-        outcome = await vscode.window.withProgress<KnitOutcome>(
-            {
-                location: vscode.ProgressLocation.Notification,
-                title: `Knitting ${baseName}…`,
-                cancellable: true,
-            },
-            async (_progress, token) => {
+        if (externalController !== null) {
+            // Re-entry path: the export pipeline already owns a progress
+            // notification and a registry slot. Skip a second `withProgress`
+            // (a nested notification would clutter the UX) and bridge the
+            // export controller's `cancelled` flag into the R subprocess
+            // via a CancellationTokenSource. Polling once per 100ms is
+            // cheap and matches `pandoc-engine.ts`'s cancellation cadence.
+            const cts = new vscode.CancellationTokenSource();
+            const cancelPoll = setInterval(() => {
+                if (externalController.cancelled) cts.cancel();
+            }, 100);
+            try {
                 const result = await deps.runKnit({
                     rBinary,
                     expression,
                     cwd,
                     timeoutMs,
                     output,
-                    cancellation: token,
+                    cancellation: cts.token,
                 });
-                return classify(result, { cwd });
-            },
-        );
+                outcome = classify(result, { cwd });
+            } finally {
+                clearInterval(cancelPoll);
+                cts.dispose();
+            }
+        } else {
+            outcome = await vscode.window.withProgress<KnitOutcome>(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: `Knitting ${baseName}…`,
+                    cancellable: true,
+                },
+                async (_progress, token) => {
+                    const result = await deps.runKnit({
+                        rBinary,
+                        expression,
+                        cwd,
+                        timeoutMs,
+                        output,
+                        cancellation: token,
+                    });
+                    return classify(result, { cwd });
+                },
+            );
+        }
     } finally {
         // Critical: registry.endOp runs the moment withProgress resolves,
         // BEFORE any user-facing toast is awaited. This is the Piece A

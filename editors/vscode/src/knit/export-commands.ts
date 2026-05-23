@@ -50,10 +50,13 @@ export interface ExportDeps {
     getOutput: () => vscode.OutputChannel;
     /**
      * Invoked to run a fresh knit when the editor-toolbar entry needs
-     * one. Production wires this to `vscode.commands.executeCommand('raven.knit', uri)`;
-     * tests override.
+     * one. Receives the export's OperationController so the inner
+     * subprocess can listen to the export's cancellation signal —
+     * cancelling the export must stop the R subprocess mid-knit, not
+     * let it run to completion. Production wires this to
+     * `runKnitWithExistingController`; tests override.
      */
-    runKnit: (uri: vscode.Uri) => Promise<void>;
+    runKnit: (uri: vscode.Uri, exportController: OperationController) => Promise<void>;
 }
 
 const EXPORT_OP_KIND: Record<TargetFormat, OpKind> = {
@@ -203,7 +206,7 @@ async function runExportInner(
         }
         controller.updatePhase('knitting');
         try {
-            await deps.runKnit(rmd);
+            await deps.runKnit(rmd, controller);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             output.appendLine(`[Export] knit failed: ${msg}`);
