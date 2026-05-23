@@ -161,6 +161,46 @@ describe('buildShellHtml', () => {
         expect(html).toContain('--vscode-textLink-foreground');
     });
 
+    test('theme overlay repaints code-block backgrounds from the theme', () => {
+        // The GitHub-palette base stylesheet paints pre/code with
+        // --raven-bg, which clashes with the VS Code editor bg when
+        // the theme overlay is applied. The overlay must also read
+        // --vscode-textCodeBlock-background and inject a `pre, code`
+        // background override so code blocks pick up the theme's
+        // shading rather than staying on the GitHub palette.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('--vscode-textCodeBlock-background');
+        // The injected stylesheet must paint both <pre> and inner
+        // <code> so syntax-highlight wrappers and inline code in
+        // prose pick up the same shading.
+        expect(html).toMatch(/pre,\s*code,\s*pre code\s*\{\s*background:/);
+    });
+
+    test('theme overlay re-emits GitHub palette variant on :root', () => {
+        // The rendered document bakes --raven-c-* / --raven-fg /
+        // --raven-bg at knit time from a single GitHub palette
+        // variant. When the user switches VS Code themes after the
+        // overlay was enabled, MutationObserver re-runs applyTheme,
+        // which updates the code-block background (resolved live
+        // from --vscode-textCodeBlock-background). The overlay must
+        // also re-emit the matching GitHub palette variant on the
+        // iframe's :root so syntax-token colors stay readable on
+        // the new code-block background — otherwise dark tokens
+        // could end up painted onto a light shade or vice versa.
+        const html = buildShellHtml(args('/work/report.html'));
+        // Both variants must be baked into the shell so the script
+        // can pick at runtime without a network/build step.
+        expect(html).toContain('--raven-c-keyword: #cf222e'); // light
+        expect(html).toContain('--raven-c-keyword: #ff7b72'); // dark
+        // The variant chooser must consult the same body-class
+        // regex render-html.ts:composeStylesheet uses, so the
+        // overlay-time variant matches the bake-time one.
+        expect(html).toMatch(/vscode-\(light\|high-contrast-light\)/);
+        // The injected stylesheet must write the chosen variant
+        // into :root so var()-referencing token spans pick it up.
+        expect(html).toMatch(/:root\s*\{\s*'\s*\+\s*variantCss/);
+    });
+
     test('script observes outer-shell body class for theme switches', () => {
         // VS Code flips body classList between vscode-light /
         // vscode-dark / vscode-high-contrast on theme change. We

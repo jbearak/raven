@@ -1,5 +1,6 @@
 import * as path from 'path';
 import { parseRenderedOutputPath } from './output-path';
+import { githubDark, githubLight, type GithubPalette } from './github-colors';
 
 export type KnitOutputMessage =
     | { type: 'refresh' }
@@ -62,6 +63,35 @@ export function classify(
     const parsed = parseRenderedOutputPath(result.stdout + '\n' + result.stderr).paths;
     if (parsed.length === 0) return { kind: 'noOutput' };
     return { kind: 'ok', parsedOutputs: parsed, cwd: ctx.cwd };
+}
+
+/**
+ * Build the CSS variable declarations for a single GitHub palette
+ * variant, in the same shape `render-html.ts:paletteAsCssVars` emits
+ * when baking the rendered document. Used by the theme overlay to
+ * re-emit `--raven-bg` / `--raven-fg` / `--raven-c-*` at overlay time
+ * so the syntax-highlight palette tracks VS Code theme switches in
+ * lockstep with the code-block background. Without this re-emit, a
+ * theme switch after knit would update `--vscode-textCodeBlock-
+ * background` (resolved live from the outer shell) while leaving the
+ * baked-at-knit `--raven-c-*` tokens on the original variant — e.g.
+ * dark tokens on a light shade.
+ */
+function paletteCssDeclarations(palette: GithubPalette): string {
+    return [
+        `--raven-bg: ${palette.background};`,
+        `--raven-fg: ${palette.foreground};`,
+        `--raven-c-keyword: ${palette.roles.keyword};`,
+        `--raven-c-string: ${palette.roles.string};`,
+        `--raven-c-number: ${palette.roles.number};`,
+        `--raven-c-comment: ${palette.roles.comment};`,
+        `--raven-c-function: ${palette.roles.function};`,
+        `--raven-c-type: ${palette.roles.type};`,
+        `--raven-c-variable: ${palette.roles.variable};`,
+        `--raven-c-operator: ${palette.roles.operator};`,
+        `--raven-c-punctuation: ${palette.roles.punctuation};`,
+        `--raven-c-constant: ${palette.roles.constant};`,
+    ].join(' ');
 }
 
 /**
@@ -128,6 +158,13 @@ export function buildShellHtml(args: {
     const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
     const basename = lastSep >= 0 ? outputPath.slice(lastSep + 1) : outputPath;
     const safeName = escapeHtml(basename);
+    // Baked-in CSS strings for the two GitHub palette variants. The
+    // overlay script picks one at runtime based on VS Code's current
+    // theme variant (read from `document.body.className`) and writes
+    // it into the iframe's `:root` so syntax-token colors stay in
+    // sync with the live code-block background.
+    const lightPaletteCss = paletteCssDeclarations(githubLight);
+    const darkPaletteCss = paletteCssDeclarations(githubDark);
 
     // about:srcdoc bypasses `frame-src` per CSP3, but VS Code's webview
     // can occasionally route the inline document through a real URL
@@ -325,6 +362,28 @@ export function buildShellHtml(args: {
       // show cycle leaves the in-memory variable intact.
       let themeApplied = ${initialThemeApplied ? 'true' : 'false'};
 
+      // GitHub palette variants serialized at build time. We pick
+      // one at overlay-apply time based on the active VS Code
+      // theme variant so the syntax-token colors (which the
+      // rendered document references via --raven-c-*) match the
+      // live code-block background. Without this swap, switching
+      // themes after knit could leave e.g. dark-palette tokens on
+      // a light textCodeBlock background.
+      const RAVEN_PALETTE_CSS = {
+        light: ${JSON.stringify(lightPaletteCss)},
+        dark: ${JSON.stringify(darkPaletteCss)},
+      };
+
+      function activePaletteVariant() {
+        // Mirror the regex used by render-html.ts:composeStylesheet
+        // so the overlay-time variant choice matches the bake-time
+        // logic. vscode-high-contrast (no -light suffix) is the
+        // dark high-contrast variant; vscode-high-contrast-light
+        // is the light one.
+        const cls = document.body.className || '';
+        return /\\bvscode-(light|high-contrast-light)\\b/.test(cls) ? 'light' : 'dark';
+      }
+
       function syncThemeBtn() {
         // Rmd output has no "document theme" — the toggle just
         // controls whether VS Code theming is overlaid. Keep the
@@ -339,10 +398,18 @@ export function buildShellHtml(args: {
           const x = cs.getPropertyValue(name).trim();
           return x.length > 0 ? x : fallback;
         }
+        const bg = v('--vscode-editor-background', '#1e1e1e');
         return {
-          bg: v('--vscode-editor-background', '#1e1e1e'),
+          bg: bg,
           fg: v('--vscode-editor-foreground', '#cccccc'),
           link: v('--vscode-textLink-foreground', '#3794ff'),
+          // textCodeBlock-background is the variable VS Code's own
+          // markdown preview uses for code-block shading; it's
+          // defined by most themes with a subtle tint relative to
+          // the editor background. Fall back to editor-background
+          // for themes that don't set it so the block bg at least
+          // matches the surrounding surface.
+          codeBg: v('--vscode-textCodeBlock-background', bg),
         };
       }
 
@@ -365,10 +432,26 @@ export function buildShellHtml(args: {
           host.appendChild(style);
         }
         const c = readThemeColors();
+        // The GitHub-palette base stylesheet paints both <pre> and
+        // its inner <code> with --raven-bg. Override both so the
+        // syntax-highlight wrapper and any inline <code> in prose
+        // pick up the theme's code-block shading. We ALSO re-emit
+        // the matching GitHub palette variant on :root: token spans
+        // reference --raven-c-* via var(), so updating those vars
+        // here cascades into them automatically and keeps the
+        // syntax-token foreground in lockstep with the live code-
+        // block background. Without this, a VS Code theme switch
+        // after knit would update --vscode-textCodeBlock-background
+        // (resolved live from the outer shell) while leaving token
+        // colors on the baked-at-knit variant — i.e. dark tokens
+        // on a light background, or vice versa.
+        const variantCss = RAVEN_PALETTE_CSS[activePaletteVariant()];
         style.textContent =
-          'html, body { background: ' + c.bg + ' !important; '
+          ':root { ' + variantCss + ' }'
+          + ' html, body { background: ' + c.bg + ' !important; '
           + 'color: ' + c.fg + ' !important; }'
-          + ' a { color: ' + c.link + ' !important; }';
+          + ' a { color: ' + c.link + ' !important; }'
+          + ' pre, code, pre code { background: ' + c.codeBg + ' !important; }';
         // Paint the iframe element itself too so the brief flash
         // before the inner document parses also matches the theme.
         iframe.style.background = c.bg;

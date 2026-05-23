@@ -135,13 +135,18 @@ explorer-context-menu hook is opt-in via your own keybindings).
       output channel as a fallback.
     - **Apply VS Code theme** — toggle that overlays the rendered
       document with VS Code's active editor background, foreground,
-      and link colors. The button keeps its label and conveys the
-      active state visually (pressed-button styling, `aria-pressed`
-      for screen readers) — Rmd output doesn't have a "document
-      theme" to switch back to, so the toggle simply represents
-      whether the overlay is on. The preference is persisted to
-      `globalState` so subsequent knits restore it, and it tracks
-      VS Code theme switches in real time.
+      and link colors. Code blocks (both fenced and inline `<code>`)
+      pick up the theme's `textCodeBlock` shading so they match the
+      rest of the surface instead of staying on the GitHub palette;
+      syntax-token colors continue to use Raven's light/dark
+      palette so highlighting remains readable. The button keeps
+      its label and conveys the active state visually (pressed-
+      button styling, `aria-pressed` for screen readers) — Rmd
+      output doesn't have a "document theme" to switch back to, so
+      the toggle simply represents whether the overlay is on. The
+      preference is persisted to `globalState` so subsequent knits
+      restore it, and it tracks VS Code theme switches in real
+      time.
 
     Standard text copy works inside the rendered output:
     Cmd/Ctrl-C copies the current iframe selection to the system
