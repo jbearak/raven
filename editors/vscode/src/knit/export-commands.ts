@@ -178,6 +178,29 @@ async function runExportInner(
         onPin(previewPaths.previewKey);
     } else {
         // editor-toolbar: re-knit fresh.
+        //
+        // Critical: `runKnit` (= `vscode.commands.executeCommand('raven.knit', uri)`)
+        // does NOT throw on knit failure — the command handler in
+        // `knit-commands.ts` surfaces errors via `vscode.window.showErrorMessage`
+        // and returns. Without the pre-delete below, a stale `.md`
+        // left over from a previous successful knit would silently
+        // satisfy the existence check and we'd export an outdated
+        // document. Delete first, then knit, then verify the .md was
+        // re-created. If knit didn't run / aborted / failed the
+        // existence check now correctly fails the export.
+        try {
+            await fs.promises.unlink(previewPaths.mdPath);
+        } catch (err) {
+            // ENOENT is fine — there was nothing to delete. Anything
+            // else (EACCES, etc.) is fatal: continuing would risk
+            // exporting whichever file happened to be there.
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                output.appendLine(
+                    `[Export] could not remove stale preview .md at ${previewPaths.mdPath}: ${(err as Error).message}`,
+                );
+                return;
+            }
+        }
         controller.updatePhase('knitting');
         try {
             await deps.runKnit(rmd);
@@ -187,7 +210,7 @@ async function runExportInner(
             return;
         }
         if (!fs.existsSync(previewPaths.mdPath)) {
-            output.appendLine(`[Export] knit produced no .md at ${previewPaths.mdPath}`);
+            output.appendLine(`[Export] knit did not produce a .md at ${previewPaths.mdPath} (knit was likely refused or failed); aborting export.`);
             return;
         }
     }
