@@ -100,6 +100,15 @@ export class KnitOutputPanel {
     private themeResolveWarned = false;
 
     /**
+     * Tracks whether we've already logged the successfully-resolved
+     * palette for this panel session. Like `themeResolveWarned`, this
+     * gates one log line — useful for debugging "the colors look
+     * wrong" reports without flooding the channel on every theme
+     * switch.
+     */
+    private themePaletteLogged = false;
+
+    /**
      * Open or update the panel for `args.sourceUri`. Returns
      * `{ ok: true }` on success, `{ ok: false, error }` if the rendered
      * file cannot be accessed (caller should fall back to
@@ -486,6 +495,18 @@ export class KnitOutputPanel {
         let css: string | null = null;
         if (outcome.ok) {
             css = paletteCssDeclarations(outcome.palette);
+            // Log the resolved palette once per panel session. The
+            // line is cheap and lets users (or maintainers) verify
+            // what colors the toggle is applying when something
+            // looks off — far easier to diagnose than guessing what
+            // a third-party theme's tokenColors look like.
+            if (!this.themePaletteLogged) {
+                this.themePaletteLogged = true;
+                this.output.appendLine(
+                    `[theme] resolved palette for "${outcome.themeId}" ` +
+                    `(isLight=${outcome.isLight}): ${JSON.stringify(outcome.palette)}`,
+                );
+            }
         } else if (!this.themeResolveWarned) {
             this.themeResolveWarned = true;
             this.output.appendLine(
