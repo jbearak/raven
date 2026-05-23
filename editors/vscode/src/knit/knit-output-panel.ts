@@ -323,6 +323,9 @@ export class KnitOutputPanel {
         const onConfig = vscode.workspace.onDidChangeConfiguration((e) => {
             if (
                 e.affectsConfiguration('workbench.colorTheme')
+                || e.affectsConfiguration('workbench.preferredLightColorTheme')
+                || e.affectsConfiguration('workbench.preferredDarkColorTheme')
+                || e.affectsConfiguration('window.autoDetectColorScheme')
                 || e.affectsConfiguration('editor.tokenColorCustomizations')
                 || e.affectsConfiguration('editor.semanticTokenColorCustomizations')
             ) {
@@ -543,13 +546,12 @@ export class KnitOutputPanel {
     private async resolveCurrentPalette(): Promise<ThemePaletteOutcome> {
         const registry = getKnitGrammarRegistry(this.context);
         const editor = vscode.workspace.getConfiguration('editor');
-        const workbench = vscode.workspace.getConfiguration('workbench');
         const kind = vscode.window.activeColorTheme.kind;
         const isLight =
             kind === vscode.ColorThemeKind.Light
             || kind === vscode.ColorThemeKind.HighContrastLight;
         return resolveActiveThemePalette({
-            workbenchColorThemeId: workbench.get<string>('colorTheme', '') ?? '',
+            workbenchColorThemeId: KnitOutputPanel.activeThemeId(isLight),
             isLight,
             extensions: vscode.extensions.all.map((e) => ({
                 id: e.id,
@@ -562,6 +564,47 @@ export class KnitOutputPanel {
             readFile: (absPath) => fs.promises.readFile(absPath, 'utf-8'),
             realPath: (absPath) => fs.promises.realpath(absPath),
         });
+    }
+
+    /**
+     * Resolve the id of the currently-active VS Code theme.
+     *
+     * `workbench.colorTheme` alone is not the answer: when the user
+     * has `window.autoDetectColorScheme: true`, VS Code switches the
+     * active theme between `workbench.preferredLightColorTheme` and
+     * `workbench.preferredDarkColorTheme` based on the OS appearance,
+     * while leaving `workbench.colorTheme` set to whatever the user
+     * last picked manually. Reading only `workbench.colorTheme` in
+     * that mode yields the WRONG theme — for example, a user whose
+     * dark preference is "Dark 2026" but who is currently in macOS
+     * light mode sees Solarized Light in the editor while we'd be
+     * extracting Dark 2026's palette.
+     *
+     * The public API does not expose the active theme's id
+     * (`vscode.window.activeColorTheme` only carries `.kind`), so we
+     * reconstruct it from settings:
+     *
+     *   1. If auto-detect is enabled, use the preferred-*-color-theme
+     *      that matches the active `kind`.
+     *   2. Otherwise (or as a fallback), use `workbench.colorTheme`.
+     *
+     * `isLight` is computed from the live `activeColorTheme.kind` —
+     * the source of truth for "which variant is showing right now".
+     */
+    private static activeThemeId(isLight: boolean): string {
+        const root = vscode.workspace.getConfiguration();
+        const autoDetect = root.get<boolean>('window.autoDetectColorScheme', false);
+        if (autoDetect) {
+            const preferred = isLight
+                ? root.get<string>('workbench.preferredLightColorTheme')
+                : root.get<string>('workbench.preferredDarkColorTheme');
+            if (typeof preferred === 'string' && preferred.length > 0) {
+                return preferred;
+            }
+        }
+        return vscode.workspace
+            .getConfiguration('workbench')
+            .get<string>('colorTheme', '') ?? '';
     }
 
     /**
