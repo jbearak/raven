@@ -102,7 +102,7 @@ function makeThemeExtension(themePath: string): ExtensionLike {
 
 describe('resolveActiveThemePalette — against the real R grammar', () => {
     itLive(
-        'roles whose probe scope has NO theme rule fall back to noMatchFg (matches editor)',
+        'roles whose probe scope has NO theme rule must NOT return the theme default foreground',
         async () => {
             // Sparse theme: only `string` and `comment` have token
             // rules. `keyword`, `function`, `number`, `operator`,
@@ -111,14 +111,16 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
             // rule in `tokenColors` either — only `colors.editor.*`
             // sets editor background/foreground.
             //
-            // What the EDITOR would show for these unstyled tokens:
-            // vscode-textmate falls back to `#000000` (its hardcoded
-            // default when no empty-scope rule exists). So the editor
-            // paints them `#000000`.
+            // Without the extractor's "default-foreground filter",
+            // vscode-textmate falls back to `#000000` for the
+            // no-match tokens. Our probe would store `#000000` for
+            // each of those roles, and the rendered code block ends
+            // up with black-on-dark-blue text — invisible.
             //
-            // Our resolver must mirror that — paint unstyled roles
-            // with `#000000` too, not with GitHub palette colors that
-            // the editor would never produce.
+            // The expected behavior is that probes whose scope had no
+            // theme rule return null (so the caller fills in the
+            // GitHub palette fallback color), NOT the theme default
+            // and NOT `#000000`.
             const tmpDir = fs.mkdtempSync(
                 path.join(require('os').tmpdir(), 'raven-theme-palette-'),
             );
@@ -163,23 +165,27 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
                 expect(out.palette.roles.string).toBe('#a5d6ff');
                 expect(out.palette.roles.comment).toBe('#8b949e');
 
-                // The rules we DID NOT supply must fall back to
-                // `#000000` — vscode-textmate's hardcoded default
-                // when no empty-scope rule exists in tokenColors.
-                // That's what the editor itself shows for these
-                // tokens, so our rendering should match. The previous
-                // GitHub-palette fallback would have produced colors
-                // (#ff7b72, #d2a8ff, ...) the editor never produces.
-                const noMatchFg = '#000000';
-                const unstyled: Array<keyof typeof out.palette.roles> = [
-                    'keyword', 'number', 'function', 'type',
-                    'variable', 'operator', 'punctuation', 'constant',
-                ];
-                for (const role of unstyled) {
+                // The rules we DID NOT supply must NOT be `#000000`
+                // (vscode-textmate's hardcoded default) and must NOT
+                // be `#c9d1d9` (the theme's editor.foreground —
+                // visible enough, but not what a user expects for a
+                // keyword vs an identifier vs a literal). They must
+                // fall back to the bundled GitHub-dark palette.
+                const githubDark = {
+                    keyword: '#ff7b72',
+                    number: '#79c0ff',
+                    function: '#d2a8ff',
+                    type: '#ffa657',
+                    variable: '#ffa657',
+                    operator: '#79c0ff',
+                    punctuation: '#c9d1d9',
+                    constant: '#79c0ff',
+                };
+                for (const role of Object.keys(githubDark) as Array<keyof typeof githubDark>) {
                     expect(
                         out.palette.roles[role].toLowerCase(),
-                        `role=${role} resolved to ${out.palette.roles[role]} (expected noMatchFg ${noMatchFg})`,
-                    ).toBe(noMatchFg);
+                        `role=${role} resolved to ${out.palette.roles[role]} (expected GitHub fallback ${githubDark[role]}, NOT #000000 or editor.foreground)`,
+                    ).toBe(githubDark[role].toLowerCase());
                 }
             } finally {
                 try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
@@ -306,10 +312,9 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
                 // punctuation role is NOT '#a5d6ff' — that would mean
                 // commas / parens get painted as if they were inside
                 // a string. With no clean punctuation rule in the
-                // theme, the role falls back to noMatchFg (#000000
-                // when no empty-scope rule), matching what the editor
-                // would render for unstyled punctuation.
-                expect(out.palette.roles.punctuation).toBe('#000000');
+                // theme, the role must fall back to the GitHub
+                // punctuation color (`#c9d1d9` for dark).
+                expect(out.palette.roles.punctuation).toBe('#c9d1d9');
             } finally {
                 try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
             }
@@ -367,14 +372,14 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
     );
 
     itLive(
-        'theme with an explicit empty-scope default rule uses THAT color (not GitHub) for unstyled roles',
+        'theme with an explicit empty-scope default rule still routes no-match probes through the GitHub fallback',
         async () => {
             // Some themes DO supply an empty-scope default rule that
-            // sets a foreground different from `colors.editor.foreground`.
-            // vscode-textmate uses that empty-scope-rule color for any
-            // unmatched token — so that's what the EDITOR shows for
-            // unstyled tokens, and what our resolver must use as the
-            // fallback for unstyled roles.
+            // sets the global foreground/background. The extractor's
+            // filter must still skip probes that match THAT default —
+            // not just the editor.foreground from `colors`. This
+            // exercises the "default rule exists in tokenColors with
+            // a non-editor.foreground color" case.
             const tmpDir = fs.mkdtempSync(
                 path.join(require('os').tmpdir(), 'raven-theme-palette-'),
             );
@@ -423,13 +428,11 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
 
                 // `string` has an explicit rule — keeps the theme color.
                 expect(out.palette.roles.string.toLowerCase()).toBe('#a5d6ff');
-                // `keyword` has no specific rule → falls through to
-                // the empty-scope default (#deadbe). vscode-textmate
-                // paints unmatched tokens with #deadbe, so the editor
-                // shows them as #deadbe. Our role fallback must use
-                // the SAME color so the rendered output matches the
-                // editor — not a GitHub palette color.
-                expect(out.palette.roles.keyword.toLowerCase()).toBe('#deadbe');
+                // `keyword` falls through to the empty-scope default
+                // (#deadbe), which is the "all my tokens look the
+                // same" symptom. The extractor must detect this and
+                // fall back to GitHub.
+                expect(out.palette.roles.keyword.toLowerCase()).toBe('#ff7b72');
             } finally {
                 try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
             }

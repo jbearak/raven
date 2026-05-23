@@ -581,22 +581,17 @@ describe('resolveActiveThemePalette — vscode-textmate probing', () => {
         expect(out.ok).toBe(true);
         if (out.ok) {
             expect(out.palette.roles.comment).toBe('#aabbcc');
-            // Other roles got no votes → noMatchFg fallback (#000000
-            // here since tokenColors has no empty-scope rule). This
-            // matches what vscode-textmate paints unmatched tokens, so
-            // the rendered output matches the editor.
-            expect(out.palette.roles.keyword).toBe('#000000');
+            // Other roles got no votes → GitHub fallback.
+            expect(out.palette.roles.keyword).toBe('#ff7b72');
         }
     });
 
-    test('the no-match foreground is filtered out of voting, then used as the role fallback', async () => {
+    test('the no-match foreground is filtered out and never wins a role vote', async () => {
         // Theme has an empty-scope default rule with foreground
         // '#deadbe'. The fake makes EVERY token's color resolve to
-        // '#deadbe' (the no-match default). The filter drops every
-        // vote — no role gets a theme-specific color — and each role
-        // falls back to the empty-scope-rule color (#deadbe), which
-        // is exactly what vscode-textmate would paint these tokens
-        // and what the editor would render.
+        // '#deadbe' (the no-match default). The filter must drop
+        // every vote — no role gets a theme color; all fall back to
+        // GitHub.
         const ext = fakeThemeExtension({
             extensionPath: '/e',
             label: 'Test Dark',
@@ -619,11 +614,8 @@ describe('resolveActiveThemePalette — vscode-textmate probing', () => {
         }));
         expect(out.ok).toBe(true);
         if (out.ok) {
-            // Every vote was #deadbe → filtered out → role falls
-            // back to noMatchFg (#deadbe per the empty-scope rule).
-            // The rendered output matches the editor: unstyled
-            // tokens are painted #deadbe in both.
-            expect(out.palette.roles.keyword).toBe('#deadbe');
+            // Every vote was #deadbe → filtered → GitHub fallback.
+            expect(out.palette.roles.keyword).toBe('#ff7b72');
         }
     });
 
