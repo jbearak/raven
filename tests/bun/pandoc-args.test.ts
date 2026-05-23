@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
-import { buildPandocArgs } from './pandoc-args';
-import type { OutputOptions } from './output-options';
+import { buildPandocArgs } from '../../editors/vscode/src/knit/pandoc-args';
+import type { OutputOptions } from '../../editors/vscode/src/knit/output-options';
 
 const emptyOpts: OutputOptions = { chunkOpts: {}, pandocFlags: {}, ignored: [] };
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { OperationRegistry } from './operation-controller';
+import { OperationRegistry } from '../../editors/vscode/src/knit/operation-controller';
 
 describe('OperationRegistry', () => {
     it('beginOp registers and returns a started controller', () => {

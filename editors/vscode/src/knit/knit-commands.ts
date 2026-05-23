@@ -5,7 +5,6 @@ import {
     detectBlockers,
     detectFormat,
     extractFrontmatter,
-    isSupportedHtmlFormat,
     parseFrontmatter,
 } from './yaml-frontmatter';
 import {
@@ -229,24 +228,21 @@ async function runKnitCommand(
     }
 
     // [4] Format detection.
-    const format = detectFormat(parsed.value);
-
-    // [4a] Reject non-HTML output formats. `Raven: Knit` is scoped to
-    // HTML in this version; other formats (pdf_document, word_document,
-    // ioslides, custom output formats) should run through
-    // `rmarkdown::render` in the R console, which surfaces full pandoc
-    // behavior that we don't reproduce. We synthesize a Blocker so the
-    // user gets the same "Copy command" UX as the other refusal paths
-    // (custom knit:, runtime: shiny, site:).
     //
-    // Ordering note: this gate runs AFTER `detectBlockers`, so a
-    // document that also declares `runtime: shiny` or `site:` will
-    // surface those (more-fundamental) blockers first. Format mismatch
-    // is the right thing to refuse only once those have been ruled out.
-    if (!isSupportedHtmlFormat(format)) {
-        await showBlocker(buildNonHtmlFormatBlocker(format), fsPath);
-        return;
-    }
+    // Knit Preview ignores the YAML `output:` block when deciding how
+    // to render — we always produce an HTML preview into the per-
+    // session temp dir, regardless of `output: pdf_document`,
+    // `output: word_document`, etc. The format identifier is still
+    // computed (and passed through validation downstream) for logging,
+    // but no longer gates execution.
+    //
+    // Why ignore it? `knitr::knit` doesn't read the `output:` block —
+    // that's an rmarkdown concept consumed by `rmarkdown::render`.
+    // Honoring it would require switching to rmarkdown (requires
+    // Pandoc on the preview path) and losing Raven's TextMate-based
+    // syntax highlighting + theme overlay. Trade-off documented in
+    // the design spec at docs/superpowers/specs/2026-05-23-knit-preview-export-design.md.
+    const format = detectFormat(parsed.value);
 
     // [5] Resolve working directory.
     const workingDirectoryMode = vscode.workspace
@@ -637,35 +633,6 @@ function absolutizeFromCwd(raw: string, cwd: string): string {
     return path.resolve(cwd, raw);
 }
 
-
-/**
- * Build the `Blocker` we surface when YAML `output:` resolves to a
- * format Raven's HTML-only knit pipeline doesn't render (`pdf_document`,
- * `word_document`, `ioslides_presentation`, custom output formats, …).
- *
- * Exported so the unit tests can exercise the escaping behavior without
- * having to drive the full `runKnitCommand` flow. `format` is parsed
- * out of YAML and can contain arbitrary characters (the map-key form
- * isn't constrained), so the `copyCommand` MUST escape it through
- * `escapeRString`: an unescaped value like `x'); system('rm -rf ~'); #`
- * would otherwise close the outer R single-quoted literal and inject a
- * follow-up call into the clipboard payload.
- *
- * Ordering note: this runs AFTER `detectBlockers`, so a document with
- * `runtime: shiny` + a non-HTML `output:` surfaces the (more
- * fundamental) shiny blocker first and never reaches this code path.
- */
-export function buildNonHtmlFormatBlocker(format: string): Blocker {
-    const safeFormat = escapeRString(format);
-    return {
-        kind: 'non-html-format',
-        message:
-            `Raven: Knit only renders to HTML. The YAML \`output:\` field ` +
-            `requests \`${format}\`, which Raven doesn't handle in this version. ` +
-            `Run the equivalent in the R console.`,
-        copyCommand: `rmarkdown::render('FILENAME', output_format = ${safeFormat})`,
-    };
-}
 
 async function showBlocker(blocker: Blocker, fsPath: string): Promise<void> {
     const COPY = 'Copy command';

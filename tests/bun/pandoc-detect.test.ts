@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { PandocResolver, PandocNotFoundError, defaultFallbacks } from './pandoc-detect';
+import { PandocResolver, PandocNotFoundError, defaultFallbacks } from '../../editors/vscode/src/knit/pandoc-detect';
 
 const okAccess = (_: string) => Promise.resolve();
 const enoent = () => Object.assign(new Error('ENOENT'), { code: 'ENOENT' });

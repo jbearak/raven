@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { isKnitOutputMessage } from './knit-output';
+import { isKnitOutputMessage } from '../../editors/vscode/src/knit/knit-output';
 
 describe('isKnitOutputMessage — webview trust boundary', () => {
     it('accepts {type: refresh}', () => {

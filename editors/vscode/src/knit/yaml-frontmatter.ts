@@ -20,7 +20,7 @@ export type ParseResult =
     | { ok: true; value: FrontmatterDoc }
     | { ok: false; error: string };
 
-export type BlockerKind = 'knit-hook' | 'shiny' | 'site' | 'non-html-format';
+export type BlockerKind = 'knit-hook' | 'shiny' | 'site';
 
 export interface Blocker {
     kind: BlockerKind;

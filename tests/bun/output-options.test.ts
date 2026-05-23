@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { parseOutputOptions } from './output-options';
+import { parseOutputOptions } from '../../editors/vscode/src/knit/output-options';
 
 describe('parseOutputOptions', () => {
     it('handles missing output: as empty', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { chooseTempPath, interpretExitResult } from './pandoc-engine-helpers';
+import { chooseTempPath, interpretExitResult } from '../../editors/vscode/src/knit/pandoc-engine-helpers';
 
 describe('chooseTempPath', () => {
     it('places the temp file next to the destination', () => {

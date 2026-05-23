@@ -7,7 +7,7 @@ import {
     sessionRoot,
     previewDirFor,
     exportDirFor,
-} from './raven-knit-paths';
+} from '../../editors/vscode/src/knit/raven-knit-paths';
 
 describe('canonicalOpKey', () => {
     it('normalizes posix paths unchanged on darwin/linux', () => {
