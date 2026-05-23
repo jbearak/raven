@@ -72,7 +72,11 @@ const EXPORT_EXTENSION: Record<TargetFormat, string> = {
 export function registerExportCommands(context: vscode.ExtensionContext, deps: ExportDeps): void {
     const register = (id: string, format: TargetFormat): void => {
         context.subscriptions.push(
-            vscode.commands.registerCommand(id, async (uri?: vscode.Uri) => {
+            // Second positional arg is an optional `{ entry }` hint passed by
+            // the panel when the user clicks Export ▾ in the webview.
+            // Default is `editor-toolbar`, which re-knits fresh; `webview`
+            // reuses the cached preview .md without re-running R chunks.
+            vscode.commands.registerCommand(id, async (uri?: vscode.Uri, opts?: Partial<RunExportOpts>) => {
                 const target = uri ?? vscode.window.activeTextEditor?.document.uri;
                 if (!target) {
                     void vscode.window.showWarningMessage('No .Rmd file selected to export.');
@@ -82,13 +86,29 @@ export function registerExportCommands(context: vscode.ExtensionContext, deps: E
                     void vscode.window.showWarningMessage(`Cannot export ${path.basename(target.fsPath)} — not an .Rmd file.`);
                     return;
                 }
-                await runExport(target, format, deps, { entry: 'editor-toolbar' });
+                const entry: RunExportOpts['entry'] = opts?.entry ?? 'editor-toolbar';
+                await runExport(target, format, deps, { entry });
             }),
         );
     };
     register('raven.knit.exportHtml', 'html');
     register('raven.knit.exportPdf', 'pdf');
     register('raven.knit.exportDocx', 'docx');
+
+    // Cancel-export command. The webview's Export ▾ button dispatches
+    // this when the user clicks it while an export is already in flight
+    // (the button's busy state). The registry is the single source of
+    // truth for "is there a running export"; we look up the controller
+    // for the source URI and `cancel()` it. No-op when nothing is
+    // running.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.knit.cancelExport', (uri?: vscode.Uri) => {
+            const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+            if (!target) return;
+            const op = deps.registry.current(canonicalOpKey(target));
+            if (op && op.kind.startsWith('export-')) op.cancel();
+        }),
+    );
 }
 
 export interface RunExportOpts {

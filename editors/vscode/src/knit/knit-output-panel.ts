@@ -884,6 +884,52 @@ export class KnitOutputPanel {
             void this.pushFontFamilies();
             return;
         }
+        if (msg.type === 'requestExport') {
+            void this.openExportQuickPick();
+            return;
+        }
+        if (msg.type === 'cancelExport') {
+            // Cancellation is routed via the OperationRegistry that
+            // `export-commands.ts` owns. We dispatch the dedicated
+            // command so the panel doesn't need a direct registry
+            // reference; the export module is the single source of
+            // truth for "is there a running export and how do I cancel
+            // it." The command is no-op if there's no in-flight export.
+            void vscode.commands.executeCommand('raven.knit.cancelExport', this.sourceUri);
+            return;
+        }
+    }
+
+    /**
+     * Open the native QuickPick that drives the webview's `Export ▾`
+     * button. Format choice is collected by VS Code's quickpick UI
+     * (never crosses the webview trust boundary, which is why the
+     * `requestExport` message has an empty payload), then routed into
+     * `raven.knit.export*` commands with the entry mode forced to
+     * `webview` so the cached preview .md is reused.
+     */
+    private async openExportQuickPick(): Promise<void> {
+        const items: vscode.QuickPickItem[] = [
+            { label: '$(file-code) Export to HTML…', description: 'Pandoc HTML' },
+            { label: '$(file-pdf) Export to PDF…', description: 'Pandoc PDF' },
+            { label: '$(file) Export to Word…', description: 'Pandoc DOCX' },
+        ];
+        const choice = await vscode.window.showQuickPick(items, {
+            placeHolder: `Export ${this.sourceUri.path.split('/').pop() ?? this.sourceUri.fsPath}`,
+        });
+        if (!choice) return;
+        // The webview entry reuses the cached preview .md. We dispatch
+        // through `raven.knit.export*` so any caller-supplied wiring
+        // (test harness, etc.) gets the same entry point as the
+        // editor-toolbar invocations — `runExport` then differentiates
+        // entry-mode by the optional second argument.
+        if (choice.label.includes('HTML')) {
+            await vscode.commands.executeCommand('raven.knit.exportHtml', this.sourceUri, { entry: 'webview' });
+        } else if (choice.label.includes('PDF')) {
+            await vscode.commands.executeCommand('raven.knit.exportPdf', this.sourceUri, { entry: 'webview' });
+        } else if (choice.label.includes('Word')) {
+            await vscode.commands.executeCommand('raven.knit.exportDocx', this.sourceUri, { entry: 'webview' });
+        }
     }
 
     /**

@@ -468,6 +468,7 @@ export function buildShellHtml(args: {
   <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit output">
     <button id="raven-knit-refresh" type="button" title="Re-knit the source document">Knit again</button>
     <button id="raven-knit-open-browser" type="button" title="Open the rendered file in your default browser">Open in Browser</button>
+    <button id="raven-knit-export" type="button" title="Export as HTML, PDF, or Word">Export ▾</button>
     <button id="raven-knit-theme" type="button"
             aria-pressed="${initialThemeApplied ? 'true' : 'false'}"
             title="Toggle VS Code editor colors on the rendered output">Apply VS Code theme</button>
@@ -496,6 +497,17 @@ export function buildShellHtml(args: {
       });
       document.getElementById('raven-knit-open-browser').addEventListener('click', function () {
         vscode.postMessage({ type: 'openInBrowser' });
+      });
+      // Export button: idle state opens the format quickpick (host opens it
+      // natively so the format choice never crosses the trust boundary);
+      // busy state cancels the in-flight export.
+      const exportBtn = document.getElementById('raven-knit-export');
+      exportBtn.addEventListener('click', function () {
+        if (exportBtn.dataset.busy === 'true') {
+          vscode.postMessage({ type: 'cancelExport' });
+        } else {
+          vscode.postMessage({ type: 'requestExport' });
+        }
       });
 
       // --- VS Code theme overlay -------------------------------------
