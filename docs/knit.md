@@ -217,7 +217,79 @@ explorer-context-menu hook is opt-in via your own keybindings).
 | `raven.rConsole.activation` | `auto` | Gates the knit command (and the R console / plot / data viewers / chunk run commands). |
 | `raven.knit.workingDirectory` | `document` | `document` / `project` / `current`. |
 | `raven.knit.timeoutMs` | `600000` | Hard timeout (ms). On expiry Raven escalates the kill ladder. |
+| `raven.knit.fontFamily` | `""` | Body/prose font for the preview. Empty inherits `markdown.preview.fontFamily`. |
+| `raven.knit.monospaceFontFamily` | `""` | Monospace font for code chunks and output. Empty inherits `editor.fontFamily`. |
 | `raven.packages.rPath` | (auto) | Path to the R binary. Empty means "search PATH". |
+
+### Fonts
+
+The two font settings accept the same comma-separated form as CSS
+`font-family` — quoted names with spaces are fine, e.g.
+`"JetBrains Mono", "Fira Code", monospace`.
+
+Resolution order per slot:
+
+1. Your `raven.knit.fontFamily` / `raven.knit.monospaceFontFamily` if
+   non-empty.
+2. VS Code's `markdown.preview.fontFamily` (body) or
+   `editor.fontFamily` (mono). These resolve to OS-specific defaults
+   when you have not set them, so the preview always looks reasonable
+   on the machine you're knitting on.
+3. A hard-coded fallback if step 2 somehow yields an invalid value.
+
+Both settings are **resource-scoped** — you can override them
+per-folder in a multi-root workspace via `.vscode/settings.json`. The
+mono fallback also honors VS Code's `[rmd]` / `[quarto]` language-scoped
+`editor.fontFamily` blocks, so a per-language editor font flows into
+the preview.
+
+Fonts are **baked into the rendered `.html` at knit time**, AND the
+open preview panel updates **live** when you change any of the four
+settings above. No re-knit is needed while the panel is open — the
+extension recomputes the fallback chain on every
+`onDidChangeConfiguration` event and pushes the result into the
+webview. The on-disk `.html` keeps the snapshot from the last knit, so
+"Open in Browser" picks up the new fonts the next time you re-knit.
+The same is true if you email or host the file: the recipient sees
+whatever fonts were active at knit time.
+
+**Browser portability.** The `.html` that "Open in Browser" produces
+is the same file the panel reads. The browser reads font names
+verbatim from the CSS, so a reader without your configured fonts
+installed will fall through the comma list. Raven automatically
+appends a generic terminator (`, monospace` for code, `, sans-serif`
+for body) when your value doesn't already end with one, so the browser
+always lands on a sensible generic family rather than reverting to
+Times. For the most robust portability across machines include your
+own fallback list, e.g.
+`"JetBrains Mono", "Fira Code", Menlo, monospace`.
+
+**Rejection rules.** A value is rejected (and the next item in the
+fallback chain is used) when it:
+
+- Exceeds 500 characters.
+- Contains any of `;` `{` `}` `<` `>` `\` or a control character
+  (`\n` `\r` `\t` `\f` `\v` `\0`).
+- Contains the CSS comment sequences `/*` or `*/`.
+- Has an unmatched `"` or `'` (CSS string would run past the
+  declaration and corrupt adjacent styles).
+- Has any `(` or `)` outside a quoted family name. Parens inside
+  quoted names are fine — `"Aptos (Body)", sans-serif` is accepted —
+  but a bare `Foo(bar` would open a CSS function-token that escapes
+  the declaration.
+- Has a leading, trailing, or consecutive comma — `Georgia,` or
+  `Arial,,Times` would produce an empty entry that the browser drops
+  via IACVT.
+- Is exactly one of the CSS-wide keywords (`inherit`, `initial`,
+  `unset`, `revert`, `revert-layer`). The iframe has no useful parent
+  for those to resolve against, so the fallback chain produces a
+  better outcome.
+
+The VS Code Settings UI also enforces the character and length rules
+at edit time via a JSON schema `pattern`, so most character-class
+rejections are caught before they reach the knit pipeline. The
+schema cannot enforce balanced-paren / balanced-quote semantics, so
+those checks live in the runtime sanitizer only.
 
 ## What Raven does **not** do
 

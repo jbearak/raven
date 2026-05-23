@@ -30,7 +30,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { createGrammarRegistry, type GrammarRegistry } from './grammar-registry';
-import { renderKnitHtml } from './render-html';
+import { renderKnitHtml, resolveFontFamilies } from './render-html';
 
 /**
  * Process-wide grammar registry cache.
@@ -148,8 +148,28 @@ export async function runPostKnitRender(args: {
      * both palettes ship via `prefers-color-scheme` media queries.
      */
     themeClasses?: string | null;
+    /**
+     * The source `.Rmd` URI, used to scope `getConfiguration` calls so
+     * per-folder overrides in multi-root workspaces flow through. The
+     * intermediate `.md` path is in the same directory as the source,
+     * so folder-scoped settings would resolve the same against either
+     * URI — we pass the source URI for the additional benefit that
+     * `vscode.workspace.getConfiguration(section, { uri, languageId })`
+     * needs the source's languageId, which only makes sense paired
+     * with the source URI.
+     */
+    sourceUri?: vscode.Uri;
+    /**
+     * `document.languageId` of the source `.Rmd` (commonly `'rmd'`,
+     * `'quarto'`, or `'markdown'`). Used together with `sourceUri` to
+     * scope `getConfiguration('editor', scope)` so `[rmd]` / `[quarto]`
+     * language-scoped `editor.fontFamily` overrides reach the knit
+     * preview. Omitted → no languageId scoping; the resource URI is
+     * still honored.
+     */
+    sourceLanguageId?: string;
 }): Promise<void> {
-    const { mdPath, htmlPath, context, client, themeClasses } = args;
+    const { mdPath, htmlPath, context, client, themeClasses, sourceUri, sourceLanguageId } = args;
 
     const markdownSource = await fs.promises.readFile(mdPath, 'utf-8');
 
@@ -186,6 +206,40 @@ export async function runPostKnitRender(args: {
         }
         : undefined;
 
+    // Resolve fonts at render time and bake them into the `.html`.
+    // The same file is consumed by the panel iframe AND
+    // "Open in Browser", so font choice must live in the CSS.
+    //
+    // Configuration scope: pass the source URI (and languageId for the
+    // editor config) so multi-root folder overrides and
+    // `[rmd]` / `[quarto]` / `[markdown]` language-scoped
+    // `editor.fontFamily` overrides actually reach the knit preview.
+    // `raven.knit.*` and `markdown.preview.fontFamily` are resource-
+    // scoped but not language-scoped (they apply per file/folder, not
+    // per syntax mode); `editor.fontFamily` takes the full scope so
+    // a `[rmd]: { "editor.fontFamily": "Cascadia Code" }` block flows
+    // into the preview's mono fallback.
+    //
+    // The post-knit `.html` is a frozen snapshot — there is no live
+    // link from the browser back to VS Code settings. The
+    // `KnitOutputPanel` mirrors live setting changes into the open
+    // iframe via the `__ravenFontFamilies` postMessage; on-disk fonts
+    // refresh on the next knit. See `docs/knit.md` "Fonts" for the
+    // user-facing model.
+    const knitConfig = vscode.workspace.getConfiguration('raven.knit', sourceUri);
+    const mdPreviewConfig = vscode.workspace.getConfiguration('markdown.preview', sourceUri);
+    const editorScope: vscode.ConfigurationScope | undefined =
+        sourceUri && sourceLanguageId
+            ? { uri: sourceUri, languageId: sourceLanguageId }
+            : (sourceUri ?? undefined);
+    const editorConfig = vscode.workspace.getConfiguration('editor', editorScope);
+    const fonts = resolveFontFamilies(
+        knitConfig.get<string>('fontFamily', ''),
+        knitConfig.get<string>('monospaceFontFamily', ''),
+        mdPreviewConfig.get<string>('fontFamily', ''),
+        editorConfig.get<string>('fontFamily', ''),
+    );
+
     const finalHtml = await renderKnitHtml({
         markdownSource,
         renderMarkdown,
@@ -193,6 +247,7 @@ export async function runPostKnitRender(args: {
         fetchRSemanticTokens,
         katexCss,
         themeClasses: themeClasses ?? null,
+        fonts,
     });
 
     await writeFileAtomic(htmlPath, finalHtml);

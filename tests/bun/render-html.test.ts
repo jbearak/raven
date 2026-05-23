@@ -4,6 +4,8 @@ import {
     decodeCodeBlock,
     extractLanguageId,
     renderKnitHtml,
+    resolveFontFamilies,
+    sanitizeFontFamily,
 } from '../../editors/vscode/src/knit/render-html';
 import { githubDark, githubLight } from '../../editors/vscode/src/knit/code-highlighter';
 import type {
@@ -143,6 +145,298 @@ describe('composeStylesheet', () => {
         expect(css).not.toContain('prefers-color-scheme');
         expect(css).toContain(githubDark.background);
         expect(css).not.toContain(githubLight.background);
+    });
+
+    test.each(['vscode-light', 'vscode-dark'])(
+        'themed branch (themeClasses=%p) still emits font vars',
+        (themeClasses) => {
+            // Today's production call site hardcodes themeClasses=null
+            // so the themed branch's `${fontVars}` interpolation is
+            // dead-by-call-site; pin coverage so a future themed-knits
+            // PR doesn't silently regress fonts.
+            const css = composeStylesheet(themeClasses, {
+                text: 'Georgia, serif',
+                mono: 'Menlo, monospace',
+            });
+            expect(css).toContain('--raven-font-text: Georgia, serif;');
+            expect(css).toContain('--raven-font-mono: Menlo, monospace;');
+        },
+    );
+
+    test('emits font CSS variables alongside the palette and body/code reference them', () => {
+        const css = composeStylesheet(null, {
+            text: '"Source Sans Pro", sans-serif',
+            mono: '"JetBrains Mono", monospace',
+        });
+        expect(css).toContain('--raven-font-text: "Source Sans Pro", sans-serif;');
+        expect(css).toContain('--raven-font-mono: "JetBrains Mono", monospace;');
+        expect(css).toContain('font-family: var(--raven-font-text)');
+        expect(css).toContain('font-family: var(--raven-font-mono)');
+    });
+
+    test('font vars live outside the variant-conditional CSS so dark/light swap is colors-only', () => {
+        // The `prefers-color-scheme: dark` media query rewrites the
+        // palette but must NOT rewrite fonts — fonts don't vary by
+        // variant. We verify by counting occurrences of the font
+        // declarations: exactly one each in the entire stylesheet.
+        const css = composeStylesheet(null, {
+            text: 'Georgia, serif',
+            mono: 'Menlo, monospace',
+        });
+        const textMatches = css.match(/--raven-font-text:/g) ?? [];
+        const monoMatches = css.match(/--raven-font-mono:/g) ?? [];
+        expect(textMatches.length).toBe(1);
+        expect(monoMatches.length).toBe(1);
+    });
+
+    test('omitted fonts arg falls back to the historical hardcoded mono and a sensible body default', () => {
+        // Bun tests that don't care about fonts still get a complete
+        // stylesheet — back-compat for the unit-test surface.
+        const css = composeStylesheet(null);
+        expect(css).toContain('--raven-font-mono:');
+        expect(css).toContain('--raven-font-text:');
+        // The mono fallback is exactly the historical `baseStyles()`
+        // string so existing snapshot-style assumptions about the
+        // mono stack hold.
+        expect(css).toContain('ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace');
+    });
+});
+
+describe('sanitizeFontFamily', () => {
+    test('accepts a simple comma list with quoted names', () => {
+        expect(sanitizeFontFamily('"JetBrains Mono", "Fira Code", monospace'))
+            .toBe('"JetBrains Mono", "Fira Code", monospace');
+    });
+
+    test('trims surrounding whitespace', () => {
+        expect(sanitizeFontFamily('   Georgia, serif   ')).toBe('Georgia, serif');
+    });
+
+    test('rejects empty and whitespace-only input', () => {
+        expect(sanitizeFontFamily('')).toBeNull();
+        expect(sanitizeFontFamily('   ')).toBeNull();
+        expect(sanitizeFontFamily('\t\n')).toBeNull();
+    });
+
+    test('rejects strings over 500 chars', () => {
+        expect(sanitizeFontFamily('a'.repeat(501))).toBeNull();
+        expect(sanitizeFontFamily('a'.repeat(500))).toBe('a'.repeat(500));
+    });
+
+    test.each([
+        ';', '{', '}', '<', '>', '\\',
+        '\n', '\r', '\t', '\f', '\v', '\0',
+    ])(
+        'rejects banned character %p',
+        (banned) => {
+            expect(sanitizeFontFamily(`Georgia${banned}serif`)).toBeNull();
+        },
+    );
+
+    test('rejects CSS comment open/close sequences', () => {
+        expect(sanitizeFontFamily('Georgia /* sneaky */ serif')).toBeNull();
+        expect(sanitizeFontFamily('Georgia /*')).toBeNull();
+        expect(sanitizeFontFamily('Georgia */ serif')).toBeNull();
+    });
+
+    test('rejects unmatched double quote', () => {
+        // An unclosed `"` in the value would survive into the emitted
+        // CSS as an open string token; recovery skips to the next `;`
+        // and silently consumes the sibling --raven-font-mono
+        // declaration. Reject up front.
+        expect(sanitizeFontFamily('"Source Sans Pro')).toBeNull();
+        expect(sanitizeFontFamily('Georgia, "Helvetica')).toBeNull();
+    });
+
+    test('rejects unmatched single quote', () => {
+        // Same bad-string-token recovery hazard as the double-quote
+        // case, just for the `'` form.
+        expect(sanitizeFontFamily("Menlo, 'Andale Mono")).toBeNull();
+        expect(sanitizeFontFamily("'Andale Mono")).toBeNull();
+    });
+
+    test('accepts mixed but balanced quotes', () => {
+        expect(sanitizeFontFamily(`'JetBrains Mono', "Source Sans Pro"`))
+            .toBe(`'JetBrains Mono', "Source Sans Pro"`);
+    });
+
+    test('accepts parens inside quoted family names', () => {
+        // Real-world example: Microsoft Office's default body font is
+        // registered with parens in the name. Quoted parens are part
+        // of the string content per CSS, so they're safe.
+        expect(sanitizeFontFamily('"Aptos (Body)", sans-serif'))
+            .toBe('"Aptos (Body)", sans-serif');
+        expect(sanitizeFontFamily("'Aptos (Body)', sans-serif"))
+            .toBe("'Aptos (Body)', sans-serif");
+        expect(sanitizeFontFamily('"Aptos (Body)"'))
+            .toBe('"Aptos (Body)"');
+    });
+
+    test('rejects bare parens outside a quoted family name', () => {
+        // Bare `(` opens a CSS function-token whose consumption ignores
+        // `}` boundaries — would corrupt the rest of the stylesheet.
+        // Bare balanced `(Foo)` is also rejected: CSS's unquoted
+        // family-name grammar doesn't accept parens, so the declaration
+        // would IACVT-drop anyway; rejecting up front keeps the rule
+        // simple and consistent.
+        expect(sanitizeFontFamily('Foo(bar')).toBeNull();
+        expect(sanitizeFontFamily('Foo (Bar)')).toBeNull();
+        expect(sanitizeFontFamily('Foo(Bar)')).toBeNull();
+        expect(sanitizeFontFamily('"Foo" (Bar)')).toBeNull();
+        expect(sanitizeFontFamily('("Foo")')).toBeNull();
+    });
+
+    test('rejects trailing comma', () => {
+        // `Foo,` becomes `Foo,, sans-serif` after the resolver appends
+        // a generic, which makes the var() substitution invalid and
+        // the font-family declaration is dropped at IACVT.
+        expect(sanitizeFontFamily('Georgia,')).toBeNull();
+        expect(sanitizeFontFamily('Georgia, ')).toBeNull();
+    });
+
+    test('rejects leading and consecutive commas', () => {
+        expect(sanitizeFontFamily(',Arial')).toBeNull();
+        expect(sanitizeFontFamily('Arial,,Times')).toBeNull();
+        expect(sanitizeFontFamily('Arial, , Times')).toBeNull();
+    });
+
+    test('rejects empty quoted family entries', () => {
+        // `""` and `''` are degenerate — CSS treats them as a
+        // custom family with no name, which no font matches and the
+        // user almost certainly did not mean.
+        expect(sanitizeFontFamily('""')).toBeNull();
+        expect(sanitizeFontFamily("''")).toBeNull();
+        expect(sanitizeFontFamily('"", monospace')).toBeNull();
+        expect(sanitizeFontFamily('Arial, ""')).toBeNull();
+    });
+
+    test.each([
+        'inherit', 'initial', 'unset', 'revert', 'revert-layer',
+        'INHERIT', 'Initial', 'Unset', 'Revert', 'Revert-Layer',
+    ])(
+        'rejects bare CSS-wide keyword %p',
+        (keyword) => {
+            // CSS-wide keywords are only valid as the sole value of a
+            // property; the iframe has no useful parent for `inherit`
+            // to pull from. Reject so the user falls through to a
+            // real font instead of seeing UA-default Times.
+            expect(sanitizeFontFamily(keyword)).toBeNull();
+        },
+    );
+
+    test('accepts CSS-wide keyword in a list (treated as bare identifier)', () => {
+        // `Foo, inherit` is valid CSS — `inherit` becomes a literal
+        // (unknown) family name and the browser falls through. We do
+        // NOT reject this because the list shape is well-formed and
+        // the user's other entries still work.
+        expect(sanitizeFontFamily('Foo, inherit')).toBe('Foo, inherit');
+    });
+
+    test('non-string input is rejected', () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect(sanitizeFontFamily(null as any)).toBeNull();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect(sanitizeFontFamily(undefined as any)).toBeNull();
+    });
+});
+
+describe('resolveFontFamilies', () => {
+    test('prefers the raven-knit setting over the VS Code fallback', () => {
+        const out = resolveFontFamilies(
+            'Georgia, serif',
+            '"JetBrains Mono", monospace',
+            'system-ui, sans-serif',
+            'Menlo, Consolas, monospace',
+        );
+        expect(out.text).toBe('Georgia, serif');
+        expect(out.mono).toBe('"JetBrains Mono", monospace');
+    });
+
+    test('falls through to the VS Code fallback when the raven setting is empty', () => {
+        const out = resolveFontFamilies(
+            '',
+            '',
+            'system-ui, sans-serif',
+            'Menlo, Consolas, monospace',
+        );
+        expect(out.text).toBe('system-ui, sans-serif');
+        expect(out.mono).toBe('Menlo, Consolas, monospace');
+    });
+
+    test('falls through to the hardcoded fallback when both upstreams are rejected', () => {
+        const out = resolveFontFamilies('Geo;rgia', 'Menlo{}', '', '');
+        // Banned chars in the primary AND empty fallbacks → hardcoded.
+        expect(out.text).toBe(
+            '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
+        );
+        expect(out.mono).toBe(
+            'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+        );
+    });
+
+    test('falls through past a hostile VS Code fallback to the hardcoded default', () => {
+        const out = resolveFontFamilies('', '', 'evil;font', 'evil{font}');
+        expect(out.text).toContain('system-ui'); // hardcoded text fallback
+        expect(out.mono).toContain('ui-monospace'); // hardcoded mono fallback
+    });
+
+    test('appends a generic-family terminator when missing', () => {
+        const out = resolveFontFamilies(
+            '"Source Sans Pro"',
+            '"JetBrains Mono"',
+            '',
+            '',
+        );
+        expect(out.text).toBe('"Source Sans Pro", sans-serif');
+        expect(out.mono).toBe('"JetBrains Mono", monospace');
+    });
+
+    test('does NOT duplicate a terminator that is already present', () => {
+        const out = resolveFontFamilies(
+            'Georgia, serif',
+            '"JetBrains Mono", monospace',
+            '',
+            '',
+        );
+        expect(out.text).toBe('Georgia, serif');
+        expect(out.mono).toBe('"JetBrains Mono", monospace');
+    });
+
+    test('recognizes all CSS generic-family keywords as terminators', () => {
+        // Mirror the GENERIC_FAMILY_KEYWORDS set in render-html.ts —
+        // adding/removing an entry there should be reflected here so
+        // a stale set silently introduces double-terminators.
+        for (const generic of [
+            'monospace', 'sans-serif', 'serif', 'system-ui',
+            'ui-monospace', 'ui-sans-serif', 'ui-serif', 'ui-rounded',
+            'cursive', 'fantasy', 'emoji', 'math', 'fangsong',
+        ]) {
+            const out = resolveFontFamilies(`Foo, ${generic}`, `Bar, ${generic}`, '', '');
+            expect(out.text).toBe(`Foo, ${generic}`);
+            expect(out.mono).toBe(`Bar, ${generic}`);
+        }
+    });
+
+    test('terminator check is case-insensitive', () => {
+        const out = resolveFontFamilies('Georgia, SERIF', 'Menlo, MonoSpace', '', '');
+        expect(out.text).toBe('Georgia, SERIF');
+        expect(out.mono).toBe('Menlo, MonoSpace');
+    });
+
+    test('treats a quoted "monospace" as a family name, not a generic terminator', () => {
+        // CSS treats `"monospace"` (quoted) as a custom family name,
+        // NOT the generic keyword. The terminator should still be
+        // appended so the browser has a real generic fallback.
+        const out = resolveFontFamilies('', '"monospace"', '', '');
+        expect(out.mono).toBe('"monospace", monospace');
+    });
+
+    test('handles commas inside quoted family names without breaking terminator detection', () => {
+        // Top-level comma split must respect quotes — a single quoted
+        // family with a comma inside its name should be treated as
+        // one entry, not two.
+        const out = resolveFontFamilies('', '"Comma, Foundry"', '', '');
+        expect(out.mono).toBe('"Comma, Foundry", monospace');
     });
 });
 

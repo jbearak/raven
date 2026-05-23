@@ -168,6 +168,7 @@ async function runKnitCommand(
     }
 
     let documentText: string;
+    let sourceLanguageId: string;
     try {
         const doc = await vscode.workspace.openTextDocument(docUri);
         // knitr reads the .Rmd from disk via R's `readLines`, not from
@@ -201,6 +202,7 @@ async function runKnitCommand(
             }
         }
         documentText = doc.getText();
+        sourceLanguageId = doc.languageId;
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         await vscode.window.showErrorMessage(`Raven: Knit could not read document: ${message}`);
@@ -347,6 +349,7 @@ async function runKnitCommand(
         fsPath,
         baseName,
         sourceUri: docUri,
+        sourceLanguageId,
         cwd,
         output,
         rBinary,
@@ -362,6 +365,7 @@ interface RenderOutcomeCtx {
     fsPath: string;
     baseName: string;
     sourceUri: vscode.Uri;
+    sourceLanguageId: string;
     cwd: string | undefined;
     output: vscode.OutputChannel;
     rBinary: string;
@@ -450,6 +454,8 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
             htmlPath,
             context: ctx.context,
             client: ctx.getLanguageClient(),
+            sourceUri: ctx.sourceUri,
+            sourceLanguageId: ctx.sourceLanguageId,
             // The same `.html` is loaded by both the panel iframe
             // AND "Open in Browser", so the file can't carry
             // surface-specific theme logic — it's a frozen

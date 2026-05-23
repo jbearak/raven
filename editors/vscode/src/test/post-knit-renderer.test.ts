@@ -85,6 +85,28 @@ suite('runPostKnitRender end-to-end', () => {
         assert.match(html, /^<!doctype html>/i);
         assert.ok(html.includes('POST-KNIT-RENDERER-MARKER'));
         assert.ok(/--raven-bg:/.test(html), 'GitHub palette CSS vars should be inlined');
+        // Font CSS variables are baked in at render time (the same
+        // `.html` is consumed by the panel AND "Open in Browser", so
+        // font resolution has to happen once in the host). Even with
+        // neither raven setting configured the fallback chain
+        // resolves through VS Code defaults to a non-empty,
+        // generic-family-terminated string.
+        assert.ok(
+            /--raven-font-text:/.test(html),
+            'body font CSS var should be inlined (falls back through markdown.preview.fontFamily)',
+        );
+        assert.ok(
+            /--raven-font-mono:/.test(html),
+            'mono font CSS var should be inlined (falls back through editor.fontFamily)',
+        );
+        assert.ok(
+            /font-family: var\(--raven-font-text\)/.test(html),
+            'body selector should reference --raven-font-text',
+        );
+        assert.ok(
+            /font-family: var\(--raven-font-mono\)/.test(html),
+            'code selector should reference --raven-font-mono',
+        );
         assert.ok(
             /<pre class="raven-knit-code"><code class="language-r">/i.test(html),
             'R code block should round-trip with the language-r class and raven-knit-code marker',
