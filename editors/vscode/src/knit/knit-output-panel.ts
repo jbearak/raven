@@ -389,7 +389,16 @@ export class KnitOutputPanel {
         const onThemeChange = (): void => {
             if (instance.disposed) return;
             instance.latestEditorBackground = undefined;
-            void instance.panel.webview.postMessage({ __ravenRequestThemeContext: true });
+            // postMessage can reject if the webview is disposed
+            // between the guard above and the call. Swallow rather
+            // than leaking an unhandled-rejection — pushVscodeThemePalette
+            // already follows up with its own postMessage on a separate
+            // generation, so a lost re-report request is harmless.
+            Promise.resolve(
+                instance.panel.webview.postMessage({ __ravenRequestThemeContext: true }),
+            ).catch(() => {
+                /* webview gone — pushVscodeThemePalette logs on its own postMessage path */
+            });
             void instance.pushVscodeThemePalette();
         };
         const onTheme = vscode.window.onDidChangeActiveColorTheme(onThemeChange);

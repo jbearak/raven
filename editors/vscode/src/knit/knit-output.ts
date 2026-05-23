@@ -935,9 +935,13 @@ export function buildShellHtml(args: {
         for (var i = 0; i < RAVEN_PALETTE_REQUIRED_NAMES.length; i++) {
           if (!seen[RAVEN_PALETTE_REQUIRED_NAMES[i]]) return false;
         }
-        // Count seen names too — refuse extras.
+        // Count seen names too — refuse extras. seen is created with
+        // Object.create(null), so it has no prototype: every enumerable
+        // key is an own property and for...in only visits those. The
+        // null prototype also means seen.hasOwnProperty is undefined,
+        // so calling it would throw — count keys directly instead.
         var count = 0;
-        for (var k in seen) if (seen.hasOwnProperty(k)) count++;
+        for (var k in seen) count++;
         return count === RAVEN_PALETTE_REQUIRED_NAMES.length;
       }
       window.addEventListener('message', function (event) {

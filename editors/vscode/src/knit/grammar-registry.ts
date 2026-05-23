@@ -253,7 +253,7 @@ export function createGrammarRegistry(args: {
             grammarCache.set(lang, Promise.resolve(null));
             return null;
         }
-        const promise = (async () => {
+        const promise: Promise<IGrammar | null> = (async () => {
             try {
                 const registry = await ensureRegistry();
                 const grammar = await registry.loadGrammar(contrib.scopeName);
@@ -268,6 +268,20 @@ export function createGrammarRegistry(args: {
             }
         })();
         grammarCache.set(lang, promise);
+        // Drop the cache entry on failure (`null`) so a transient
+        // problem — an EBUSY mid-VSIX-install, a momentary import
+        // glitch from ensureRegistry — doesn't permanently poison this
+        // language. Mirrors ensureRegistry's recovery on rejection.
+        // Identity-check guards against a racing second loadGrammar
+        // that has already replaced the slot. A legitimate "no grammar
+        // at this scope" also resolves to null and will be retried, but
+        // the contribution map is static for the registry's lifetime so
+        // the retry just re-resolves to null — cheap and harmless.
+        void promise.then((g) => {
+            if (g === null && grammarCache.get(lang) === promise) {
+                grammarCache.delete(lang);
+            }
+        });
         return promise;
     }
 

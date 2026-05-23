@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { activate, getFixtureUri, sleep } from './helper';
+import { activate, awaitActive, getFixtureUri, sleep } from './helper';
 import { __runKnitCommandForTest, type KnitDeps } from '../knit/knit-commands';
 
 /**
@@ -113,6 +113,11 @@ suite('knit saves dirty buffers before invoking R', () => {
         );
 
         // Cleanup: close the editor and remove the temp file.
+        // Wait for the editor we opened to be the active one before
+        // closing — showTextDocument resolves before VS Code promotes
+        // the editor to active, and the suite's cumulative state can
+        // leave a different editor active when this test starts.
+        await awaitActive(editor);
         await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
         try {
             fs.rmSync(tmpDir, { recursive: true, force: true });

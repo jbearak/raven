@@ -1147,15 +1147,20 @@ describe('resolveActiveThemePalette — robustness regressions', () => {
                 }),
             }),
             semanticTokenColorCustomizations: {
-                // Legacy top-level key (often hand-edited).
+                // Legacy top-level keys (often hand-edited). `variable`
+                // also appears in `rules` below at a different hex, so
+                // we can assert the documented precedence (rules wins).
                 variable: '#abcdef',
-                // Canonical wrapper.
-                rules: { function: '#123456' },
+                // Canonical wrapper. `function` is only here; `variable`
+                // overlaps with the legacy key above.
+                rules: { function: '#123456', variable: '#fedcba' },
             },
         }));
         expect(out.ok).toBe(true);
         if (out.ok) {
-            expect(out.palette.roles.variable).toBe('#abcdef');
+            // rules wins for the overlapping key.
+            expect(out.palette.roles.variable).toBe('#fedcba');
+            // non-overlapping rules entry is honored.
             expect(out.palette.roles.function).toBe('#123456');
         }
     });
