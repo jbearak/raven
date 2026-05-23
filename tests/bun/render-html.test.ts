@@ -224,7 +224,7 @@ describe('sanitizeFontFamily', () => {
     });
 
     test.each([
-        ';', '{', '}', '<', '>', '(', ')', '\\',
+        ';', '{', '}', '<', '>', '\\',
         '\n', '\r', '\t', '\f', '\v', '\0',
     ])(
         'rejects banned character %p',
@@ -258,6 +258,32 @@ describe('sanitizeFontFamily', () => {
     test('accepts mixed but balanced quotes', () => {
         expect(sanitizeFontFamily(`'JetBrains Mono', "Source Sans Pro"`))
             .toBe(`'JetBrains Mono', "Source Sans Pro"`);
+    });
+
+    test('accepts parens inside quoted family names', () => {
+        // Real-world example: Microsoft Office's default body font is
+        // registered with parens in the name. Quoted parens are part
+        // of the string content per CSS, so they're safe.
+        expect(sanitizeFontFamily('"Aptos (Body)", sans-serif'))
+            .toBe('"Aptos (Body)", sans-serif');
+        expect(sanitizeFontFamily("'Aptos (Body)', sans-serif"))
+            .toBe("'Aptos (Body)', sans-serif");
+        expect(sanitizeFontFamily('"Aptos (Body)"'))
+            .toBe('"Aptos (Body)"');
+    });
+
+    test('rejects bare parens outside a quoted family name', () => {
+        // Bare `(` opens a CSS function-token whose consumption ignores
+        // `}` boundaries — would corrupt the rest of the stylesheet.
+        // Bare balanced `(Foo)` is also rejected: CSS's unquoted
+        // family-name grammar doesn't accept parens, so the declaration
+        // would IACVT-drop anyway; rejecting up front keeps the rule
+        // simple and consistent.
+        expect(sanitizeFontFamily('Foo(bar')).toBeNull();
+        expect(sanitizeFontFamily('Foo (Bar)')).toBeNull();
+        expect(sanitizeFontFamily('Foo(Bar)')).toBeNull();
+        expect(sanitizeFontFamily('"Foo" (Bar)')).toBeNull();
+        expect(sanitizeFontFamily('("Foo")')).toBeNull();
     });
 
     test('rejects trailing comma', () => {

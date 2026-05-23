@@ -268,11 +268,15 @@ own fallback list, e.g.
 fallback chain is used) when it:
 
 - Exceeds 500 characters.
-- Contains any of `;` `{` `}` `<` `>` `(` `)` `\` or a control
-  character (`\n` `\r` `\t` `\f` `\v` `\0`).
+- Contains any of `;` `{` `}` `<` `>` `\` or a control character
+  (`\n` `\r` `\t` `\f` `\v` `\0`).
 - Contains the CSS comment sequences `/*` or `*/`.
 - Has an unmatched `"` or `'` (CSS string would run past the
   declaration and corrupt adjacent styles).
+- Has any `(` or `)` outside a quoted family name. Parens inside
+  quoted names are fine — `"Aptos (Body)", sans-serif` is accepted —
+  but a bare `Foo(bar` would open a CSS function-token that escapes
+  the declaration.
 - Has a leading, trailing, or consecutive comma — `Georgia,` or
   `Arial,,Times` would produce an empty entry that the browser drops
   via IACVT.
@@ -282,8 +286,10 @@ fallback chain is used) when it:
   better outcome.
 
 The VS Code Settings UI also enforces the character and length rules
-at edit time via a JSON schema `pattern`, so most rejections are
-caught before they reach the knit pipeline.
+at edit time via a JSON schema `pattern`, so most character-class
+rejections are caught before they reach the knit pipeline. The
+schema cannot enforce balanced-paren / balanced-quote semantics, so
+those checks live in the runtime sanitizer only.
 
 ## What Raven does **not** do
 

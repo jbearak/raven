@@ -506,14 +506,13 @@ export class KnitOutputPanel {
         this.outputPath = args.outputPath;
         this.output = args.output;
 
-        // Initialize cached languageId if the source document is already open
-        const fsPath = args.sourceUri.fsPath;
-        for (const doc of vscode.workspace.textDocuments) {
-            if (doc.uri.fsPath === fsPath) {
-                this.cachedSourceLanguageId = doc.languageId;
-                break;
-            }
-        }
+        // Prime the languageId cache from the open source document
+        // (if any). `lookupSourceLanguageId`'s own side effect would
+        // refresh the cache on first use, but priming up front means
+        // the constructor-time `resolveCurrentFontsCss` call in
+        // `updateContent` sees the actual languageId instead of the
+        // default `'rmd'` fallback.
+        this.lookupSourceLanguageId();
 
         this.panel.webview.onDidReceiveMessage((msg: unknown) => this.handleMessage(msg));
     }

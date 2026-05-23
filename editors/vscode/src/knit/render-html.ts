@@ -107,9 +107,8 @@ const CSS_WIDE_KEYWORDS = new Set([
  * surface — see `sanitizeFontFamily`'s doc comment for the threat
  * model):
  *
- *   `; { } < > ( ) \\`  — break out of the declaration, the rule
- *                          block, the `<style>` element, or a
- *                          function-token's value via unmatched paren.
+ *   `; { } < > \\`       — break out of the declaration, the rule
+ *                          block, or the `<style>` element.
  *   `\n \r`              — newline forms in CSS Syntax L3 §3.3 — any
  *                          would terminate a string token or property.
  *   `\t \f \v`           — whitespace that CSS preprocesses or
@@ -120,8 +119,15 @@ const CSS_WIDE_KEYWORDS = new Set([
  *   `\0`                 — CSS Syntax L3 §3.3 replaces NUL with U+FFFD;
  *                          rejecting it up-front keeps the sanitizer's
  *                          textual ban-set stable across that rewrite.
+ *
+ * NOT in the class: `(` and `)`. They are dangerous OUTSIDE a quoted
+ * family name (an unquoted `Foo(` opens a function-token whose
+ * consumption ignores `}` boundaries and can corrupt the rest of the
+ * stylesheet), but they appear LEGITIMATELY in quoted real-world font
+ * names like `"Aptos (Body)"`. `hasBareParens` enforces the
+ * inside-quotes-only rule below.
  */
-const BANNED_CHAR_RE = /[;{}<>()\\\n\r\t\f\v\0]/;
+const BANNED_CHAR_RE = /[;{}<>\\\n\r\t\f\v\0]/;
 
 /**
  * Render a post-knit `.md` source string into the final HTML body
@@ -485,6 +491,12 @@ export interface ResolvedFonts {
  *     that runs until the next quote of the same kind or until EOF /
  *     newline, swallowing adjacent declarations as part of the
  *     bad-string recovery.
+ *   - Bare parens — any `(` or `)` appearing OUTSIDE a quoted family
+ *     name. Bare `Foo(` opens a CSS function-token whose consumption
+ *     ignores `}` boundaries and can corrupt the rest of the
+ *     stylesheet. Parens inside `"…"` or `'…'` are fine (CSS treats
+ *     them as part of the string's content), so a setting of
+ *     `"Aptos (Body)", sans-serif` is accepted.
  *   - Trailing or consecutive commas — `Foo,` becomes `Foo,, sans-serif`
  *     after our terminator is appended; var() substitution then makes
  *     the font-family declaration invalid and the property is dropped
@@ -510,9 +522,39 @@ export function sanitizeFontFamily(input: string): string | null {
     // closing brace.
     if (trimmed.includes('/*') || trimmed.includes('*/')) return null;
     if (!hasBalancedQuotes(trimmed)) return null;
+    if (hasBareParens(trimmed)) return null;
     if (hasEmptyTopLevelSegment(trimmed)) return null;
     if (CSS_WIDE_KEYWORDS.has(trimmed.toLowerCase())) return null;
     return trimmed;
+}
+
+/**
+ * Returns `true` if any `(` or `)` appears OUTSIDE a quoted family
+ * name. A bare `(` would open a CSS function-token whose consumption
+ * ignores `}` boundaries and can corrupt the rest of the stylesheet;
+ * a bare `)` is benign on its own but the symmetric ban keeps the
+ * rule simple and matches user intent (paren only meaningful inside
+ * the name).
+ *
+ * Parens INSIDE `"…"` or `'…'` are allowed so real-world font names
+ * like `"Aptos (Body)"` can be configured. CSS treats those as
+ * string content, not as function-token openers.
+ */
+function hasBareParens(value: string): boolean {
+    let quote: '"' | "'" | null = null;
+    for (let i = 0; i < value.length; i++) {
+        const ch = value[i];
+        if (quote) {
+            if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = ch as '"' | "'";
+            continue;
+        }
+        if (ch === '(' || ch === ')') return true;
+    }
+    return false;
 }
 
 /**
