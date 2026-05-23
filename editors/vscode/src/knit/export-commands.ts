@@ -53,10 +53,14 @@ export interface ExportDeps {
      * one. Receives the export's OperationController so the inner
      * subprocess can listen to the export's cancellation signal —
      * cancelling the export must stop the R subprocess mid-knit, not
-     * let it run to completion. Production wires this to
-     * `runKnitWithExistingController`; tests override.
+     * let it run to completion. The result tells the export pipeline
+     * whether the knit actually produced complete `.md` content; a
+     * cancelled / failed / timed-out knit can leave a partial file
+     * that would otherwise pass a bare `fs.existsSync` check.
+     * Production wires this to `runKnitWithExistingController`; tests
+     * override.
      */
-    runKnit: (uri: vscode.Uri, exportController: OperationController) => Promise<void>;
+    runKnit: (uri: vscode.Uri, exportController: OperationController) => Promise<{ ok: boolean }>;
 }
 
 const EXPORT_OP_KIND: Record<TargetFormat, OpKind> = {
@@ -205,15 +209,28 @@ async function runExportInner(
             }
         }
         controller.updatePhase('knitting');
+        let knitResult: { ok: boolean };
         try {
-            await deps.runKnit(rmd, controller);
+            knitResult = await deps.runKnit(rmd, controller);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             output.appendLine(`[Export] knit failed: ${msg}`);
             return;
         }
+        if (!knitResult.ok) {
+            // Cancelled, timed out, spawn-errored, or otherwise non-ok.
+            // The `.md` on disk may be a partial write left over from the
+            // failed run; either way we cannot safely export it. The
+            // user has already seen the knit failure UI via renderOutcome.
+            output.appendLine('[Export] aborting because the underlying knit did not succeed.');
+            return;
+        }
         if (!fs.existsSync(previewPaths.mdPath)) {
-            output.appendLine(`[Export] knit did not produce a .md at ${previewPaths.mdPath} (knit was likely refused or failed); aborting export.`);
+            // Defensive — knitResult.ok should imply the file exists,
+            // but if knitr ever changes its contract this is the
+            // backstop that prevents Pandoc from being handed a
+            // non-existent input path.
+            output.appendLine(`[Export] knit reported success but no .md at ${previewPaths.mdPath}; aborting.`);
             return;
         }
     }

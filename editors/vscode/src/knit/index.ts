@@ -162,7 +162,7 @@ export function registerKnit(
         registry,
         getOutput: () => knitOutput,
         runKnit: async (uri, exportController) => {
-            await runKnitWithExistingController(
+            return await runKnitWithExistingController(
                 uri,
                 knitOutput,
                 context,

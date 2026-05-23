@@ -147,8 +147,15 @@ export async function runKnitWithExistingController(
     context: vscode.ExtensionContext,
     deps: KnitDeps,
     externalController: OperationController,
-): Promise<void> {
-    await runKnitCommand(explicitUri, output, /* registry */ null, context, deps, externalController);
+): Promise<{ ok: boolean }> {
+    // Capture the outcome via the dedicated channel `runKnitCommand`
+    // populates when `outcomeCapture` is non-null. Avoids refactoring
+    // every return path in runKnitCommand (which spans validation
+    // gates, working-dir resolution, R-expression construction, etc.)
+    // into a typed return.
+    const capture: { outcome: KnitOutcome | null } = { outcome: null };
+    await runKnitCommand(explicitUri, output, /* registry */ null, context, deps, externalController, capture);
+    return { ok: capture.outcome !== null && capture.outcome.kind === 'ok' };
 }
 
 async function runKnitCommand(
@@ -158,6 +165,14 @@ async function runKnitCommand(
     context: vscode.ExtensionContext,
     deps: KnitDeps,
     externalController: OperationController | null = null,
+    /**
+     * Optional out-channel for the final KnitOutcome. The export
+     * pipeline uses this to distinguish a successful knit from a
+     * cancelled/failed one that left a partial `.md`. Null means
+     * "don't capture" — the existing command-surface call site
+     * leaves the field unset.
+     */
+    outcomeCapture: { outcome: KnitOutcome | null } | null = null,
 ): Promise<void> {
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
@@ -486,6 +501,11 @@ async function runKnitCommand(
             registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
         }
     }
+
+    // Capture the outcome for callers (the export pipeline) that need
+    // to distinguish a successful knit from a cancelled/failed one
+    // that left a partial `.md`.
+    if (outcomeCapture !== null) outcomeCapture.outcome = outcome;
 
     await renderOutcome(outcome, {
         fsPath,
