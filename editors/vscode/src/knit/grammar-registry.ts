@@ -211,7 +211,7 @@ export function createGrammarRegistry(args: {
 
     async function ensureRegistry(): Promise<RegistryType> {
         if (registryPromise) return registryPromise;
-        registryPromise = (async () => {
+        const promise = (async () => {
             const textmate = await importTextmate();
             const oniguruma = await importOniguruma();
             const onigBuffer = await readOnigWasm();
@@ -230,7 +230,18 @@ export function createGrammarRegistry(args: {
                 },
             });
         })();
-        return registryPromise;
+        registryPromise = promise;
+        // Clear the cache on rejection so a transient failure (an
+        // EBUSY on the onig.wasm file mid-VSIX-install, a momentary
+        // import glitch) doesn't permanently poison this registry's
+        // lifetime. Without this the rejected promise sits in
+        // `registryPromise` forever; every subsequent `extractWithTheme`
+        // and `loadGrammar` re-throws and the panel sees the GitHub
+        // palette for the rest of the session.
+        promise.catch(() => {
+            if (registryPromise === promise) registryPromise = null;
+        });
+        return promise;
     }
 
     async function loadGrammar(languageId: string): Promise<IGrammar | null> {
@@ -299,21 +310,37 @@ export function createGrammarRegistry(args: {
             const run = (async (): Promise<T> => {
                 await prev;
                 const registry = await ensureRegistry();
+                // Wrap setTheme + inner in try/finally so a throw inside
+                // `inner` doesn't leave the registry on whatever stale
+                // theme this extraction set. The next caller pays a
+                // setTheme of its own anyway, so the cleanup is purely
+                // about preserving the documented "registry never
+                // observes a half-applied theme outside an
+                // extractWithTheme window" invariant.
                 registry.setTheme({ settings: [...themeSettings] });
-                const colorMap = registry.getColorMap();
-                const api: ThemeExtractionApi = {
-                    colorMap,
-                    async tokenizeLine2ForLanguage(languageId, line, state) {
-                        const grammar = await loadGrammar(languageId);
-                        if (!grammar) return null;
-                        const result = grammar.tokenizeLine2(
-                            line,
-                            (state ?? null) as StateStack | null,
-                        );
-                        return { tokens: result.tokens, ruleStack: result.ruleStack };
-                    },
-                };
-                return inner(api);
+                try {
+                    const colorMap = registry.getColorMap();
+                    const api: ThemeExtractionApi = {
+                        colorMap,
+                        async tokenizeLine2ForLanguage(languageId, line, state) {
+                            const grammar = await loadGrammar(languageId);
+                            if (!grammar) return null;
+                            const result = grammar.tokenizeLine2(
+                                line,
+                                (state ?? null) as StateStack | null,
+                            );
+                            return { tokens: result.tokens, ruleStack: result.ruleStack };
+                        },
+                    };
+                    return await inner(api);
+                } finally {
+                    // Reset to an empty theme so any code path that
+                    // bypasses `extractWithTheme` (forbidden by the
+                    // class invariant, but defended here as a
+                    // belt-and-braces guard) sees a known state
+                    // instead of a previous extraction's theme.
+                    registry.setTheme({ settings: [] });
+                }
             })();
             themeOpQueue = run;
             return run;

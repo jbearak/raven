@@ -1,8 +1,10 @@
 import { describe, test, expect } from 'bun:test';
 import {
     buildShellHtml,
+    paletteCssDeclarations,
     rewriteFragmentAnchors,
 } from '../../editors/vscode/src/knit/knit-output';
+import { githubDark, githubLight } from '../../editors/vscode/src/knit/github-colors';
 
 const args = (outputPath: string, nonce = 'NONCE123', initialThemeApplied = false) => ({
     htmlContent: '<!doctype html><html><body><h1>Hi</h1></body></html>',
@@ -503,5 +505,84 @@ describe('rewriteFragmentAnchors', () => {
         expect(html).not.toContain('"><script>alert(1)</script>');
         // The escaped form is what we expect.
         expect(html).toContain('&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;');
+    });
+});
+
+/**
+ * The webview-side `RAVEN_PALETTE_CSS_RE` and `paletteCssIsComplete`
+ * trust boundary in `knit-output.ts` is what gates the VS Code theme
+ * palette overlay from being applied to the iframe's stylesheet. If
+ * `paletteCssDeclarations` ever emits a shape the webview rejects, the
+ * toggle silently degrades to the GitHub palette with no diagnostic.
+ *
+ * Mirror both checks here as a guardrail test: any drift between the
+ * declarations and the accept regex/whitelist (e.g. a new TokenRole
+ * with a digit or uppercase letter, a renamed variable, a missing var)
+ * fails this test rather than silently breaking the live overlay.
+ *
+ * Keep these literals in sync with `knit-output.ts`.
+ */
+describe('paletteCssDeclarations <-> webview accept-regex round-trip', () => {
+    const RAVEN_PALETTE_CSS_RE
+        = /^(?:--raven-(?:bg|fg|c-[a-zA-Z]+): #(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6,8}); ?)+$/;
+    const REQUIRED_NAMES = [
+        '--raven-bg',
+        '--raven-fg',
+        '--raven-c-keyword',
+        '--raven-c-string',
+        '--raven-c-number',
+        '--raven-c-comment',
+        '--raven-c-function',
+        '--raven-c-type',
+        '--raven-c-variable',
+        '--raven-c-operator',
+        '--raven-c-punctuation',
+        '--raven-c-constant',
+    ];
+
+    function paletteCssIsComplete(css: string): boolean {
+        const seen = new Set<string>();
+        const pat = /--raven-(?:bg|fg|c-[a-zA-Z]+)(?=:)/g;
+        let m: RegExpExecArray | null;
+        while ((m = pat.exec(css)) !== null) {
+            if (seen.has(m[0])) return false;
+            seen.add(m[0]);
+        }
+        for (const name of REQUIRED_NAMES) {
+            if (!seen.has(name)) return false;
+        }
+        return seen.size === REQUIRED_NAMES.length;
+    }
+
+    test('githubLight palette is accepted by the shape regex', () => {
+        const css = paletteCssDeclarations(githubLight);
+        expect(RAVEN_PALETTE_CSS_RE.test(css)).toBe(true);
+    });
+
+    test('githubDark palette is accepted by the shape regex', () => {
+        const css = paletteCssDeclarations(githubDark);
+        expect(RAVEN_PALETTE_CSS_RE.test(css)).toBe(true);
+    });
+
+    test('githubLight palette contains every required variable name', () => {
+        const css = paletteCssDeclarations(githubLight);
+        expect(paletteCssIsComplete(css)).toBe(true);
+    });
+
+    test('githubDark palette contains every required variable name', () => {
+        const css = paletteCssDeclarations(githubDark);
+        expect(paletteCssIsComplete(css)).toBe(true);
+    });
+
+    test('a payload missing a required variable is rejected', () => {
+        // Drop --raven-c-constant.
+        const css = paletteCssDeclarations(githubLight)
+            .replace(/--raven-c-constant: #[0-9a-fA-F]+; ?/, '');
+        expect(paletteCssIsComplete(css)).toBe(false);
+    });
+
+    test('a payload with a duplicated variable is rejected', () => {
+        const css = paletteCssDeclarations(githubLight) + ' --raven-bg: #ffffff;';
+        expect(paletteCssIsComplete(css)).toBe(false);
     });
 });

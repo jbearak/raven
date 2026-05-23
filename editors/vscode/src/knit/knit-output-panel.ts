@@ -126,6 +126,35 @@ export class KnitOutputPanel {
     private latestEditorBackground: string | undefined;
 
     /**
+     * Monotonically increasing generation tag for `pushVscodeThemePalette`
+     * calls. Each call snapshots `this.pushGeneration` at entry; if a
+     * newer push has started by the time it's ready to deliver, the
+     * stale result is dropped. Prevents out-of-order delivery when
+     * multiple resolves are in flight (theme listener + config listener
+     * + webview themeContext reply can all fire within a few ms of one
+     * another on a single user theme swap).
+     */
+    private pushGeneration = 0;
+
+    /**
+     * Most recent webview-reported `editor.background` value that
+     * failed the hex-shape validator. Tracked so we log the warning
+     * only on transitions, not on every body-class flip (the
+     * MutationObserver in the webview re-reports on every theme-kind
+     * toggle).
+     */
+    private lastRejectedEditorBackground: string | undefined;
+
+    /**
+     * Snapshot of the `candidateFailures` list we last logged. Lets us
+     * re-log when failures change for the SAME resolved theme id, so a
+     * user editing a candidate theme's JSON and breaking it still sees
+     * the breakage in the output channel even though `outcome.themeId`
+     * hasn't moved.
+     */
+    private lastLoggedCandidateFailuresKey: string | undefined;
+
+    /**
      * Open or update the panel for `args.sourceUri`. Returns
      * `{ ok: true }` on success, `{ ok: false, error }` if the rendered
      * file cannot be accessed (caller should fall back to
@@ -351,23 +380,37 @@ export class KnitOutputPanel {
         // listener fires (VS Code updates webview CSS vars
         // synchronously on theme change), so the next
         // `reportThemeContext` call returns the new bg.
-        const onTheme = vscode.window.onDidChangeActiveColorTheme(() => {
+        // Both listeners route through one helper. Guarded on
+        // `instance.disposed` so a queued event firing during the
+        // synchronous dispose sequence cannot try to postMessage on
+        // a torn-down webview. (VS Code tolerates that today, but
+        // the warning ends up in the developer console for no
+        // benefit — and the guard makes the invariant explicit.)
+        const onThemeChange = (): void => {
+            if (instance.disposed) return;
             instance.latestEditorBackground = undefined;
             void instance.panel.webview.postMessage({ __ravenRequestThemeContext: true });
             void instance.pushVscodeThemePalette();
-        });
+        };
+        const onTheme = vscode.window.onDidChangeActiveColorTheme(onThemeChange);
         const onConfig = vscode.workspace.onDidChangeConfiguration((e) => {
+            // `workbench.colorCustomizations` is in the filter because
+            // a user override like
+            // `{ "editor.background": "#101830" }` changes the
+            // webview's reported `--vscode-editor-background`, and the
+            // resolver's disambiguation-by-bg path needs to re-fire
+            // against the new value. Without it the panel can sit on
+            // a stale bg and pick the wrong same-kind candidate.
             if (
                 e.affectsConfiguration('workbench.colorTheme')
                 || e.affectsConfiguration('workbench.preferredLightColorTheme')
                 || e.affectsConfiguration('workbench.preferredDarkColorTheme')
                 || e.affectsConfiguration('window.autoDetectColorScheme')
+                || e.affectsConfiguration('workbench.colorCustomizations')
                 || e.affectsConfiguration('editor.tokenColorCustomizations')
                 || e.affectsConfiguration('editor.semanticTokenColorCustomizations')
             ) {
-                instance.latestEditorBackground = undefined;
-                void instance.panel.webview.postMessage({ __ravenRequestThemeContext: true });
-                void instance.pushVscodeThemePalette();
+                onThemeChange();
             }
         });
         instance.perPanelDisposables.push(onTheme, onConfig);
@@ -517,6 +560,18 @@ export class KnitOutputPanel {
      */
     private async pushVscodeThemePalette(): Promise<void> {
         if (this.disposed) return;
+        // Sequence-token cancellation. Several listeners (theme change,
+        // configuration change, webview themeContext reply) can all
+        // trigger a push in close succession; without sequencing the
+        // resolves run in parallel and whichever finishes LAST wins.
+        // The first push usually has `latestEditorBackground=undefined`
+        // and picks the wrong candidate under autoDetect + same-kind
+        // preferreds; if it finishes last, it overwrites the corrected
+        // push and the user sees the wrong palette. Snapshot the
+        // generation at entry and drop the result if a newer push has
+        // started by the time we're ready to deliver.
+        this.pushGeneration++;
+        const myGeneration = this.pushGeneration;
         // The whole resolve path can throw if the extension context
         // is a sparse test stub (e.g. `{} as vscode.ExtensionContext`)
         // or if the cached grammar registry fails to init. Treat any
@@ -533,17 +588,24 @@ export class KnitOutputPanel {
             };
         }
         if (this.disposed) return;
+        if (myGeneration !== this.pushGeneration) return;
         let css: string | null = null;
         if (outcome.ok) {
             css = paletteCssDeclarations(outcome.palette);
-            // Log when the resolved theme id CHANGES, so the channel
-            // shows the truth of what's currently applied (the most
-            // recent successful resolution) rather than only the
-            // initial "no-bg-yet" guess. Dedup-by-id prevents the
-            // channel filling up on body-class flips that re-resolve
-            // to the same theme.
-            if (this.lastLoggedThemeId !== outcome.themeId) {
+            // Log when the resolved theme id CHANGES, OR when the set
+            // of candidate failures changes for the same theme — a
+            // user breaking a non-active candidate (typo'd
+            // `tokenColorCustomizations`, broken include path, etc.)
+            // should still surface so they can diagnose the
+            // misconfiguration. Dedup-by-key prevents the channel
+            // filling up on body-class flips that re-resolve to the
+            // same theme with the same failure profile.
+            const failuresKey = serializeCandidateFailures(outcome.candidateFailures);
+            const themeChanged = this.lastLoggedThemeId !== outcome.themeId;
+            const failuresChanged = this.lastLoggedCandidateFailuresKey !== failuresKey;
+            if (themeChanged || failuresChanged) {
                 this.lastLoggedThemeId = outcome.themeId;
+                this.lastLoggedCandidateFailuresKey = failuresKey;
                 const root = vscode.workspace.getConfiguration();
                 const kind = vscode.window.activeColorTheme.kind;
                 const kindName =
@@ -725,13 +787,55 @@ export class KnitOutputPanel {
             // on every body-class flip.
             const bg = msg.editorBackground.trim().toLowerCase();
             const RAVEN_HEX = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6,8})$/i;
-            if (!RAVEN_HEX.test(bg)) return;
+            if (!RAVEN_HEX.test(bg)) {
+                // The disambiguation path silently failing because
+                // VS Code emitted (or the user customized) the bg in
+                // an `rgb()` / `rgba()` / named-color form leaves no
+                // user-visible signal. Log on transitions so the
+                // output channel carries the diagnostic — without
+                // spamming on every body-class flip that re-reports
+                // the same rejected value.
+                if (this.lastRejectedEditorBackground !== bg) {
+                    this.lastRejectedEditorBackground = bg;
+                    this.output.appendLine(
+                        `[theme] webview reported a non-hex editor.background ` +
+                        `(${JSON.stringify(msg.editorBackground)}); ` +
+                        `disambiguation-by-bg is disabled until a hex value arrives.`,
+                    );
+                }
+                return;
+            }
+            this.lastRejectedEditorBackground = undefined;
             if (this.latestEditorBackground === bg) return;
             this.latestEditorBackground = bg;
             void this.pushVscodeThemePalette();
             return;
         }
+        if (msg.type === 'requestPalette') {
+            // The webview booted (initial load or panel reuse) and is
+            // asking us for the current palette. Push without
+            // invalidating `latestEditorBackground` — we want the new
+            // shell to receive whatever palette matches the cached bg.
+            // The shell will follow up with its own `themeContext`
+            // shortly; if that report's bg differs, the resulting
+            // re-resolve will land later and (thanks to pushGeneration)
+            // supersedes this one cleanly.
+            void this.pushVscodeThemePalette();
+            return;
+        }
     }
+}
+
+/**
+ * Build a stable signature for the `candidateFailures` list so we can
+ * detect changes without retaining the array itself. JSON.stringify
+ * over the relevant fields is order-preserving and deterministic for
+ * our purposes.
+ */
+function serializeCandidateFailures(
+    failures: ReadonlyArray<{ themeId: string; reason: string; detail: string }>,
+): string {
+    return JSON.stringify(failures.map((f) => [f.themeId, f.reason, f.detail]));
 }
 
 /**

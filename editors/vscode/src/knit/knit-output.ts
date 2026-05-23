@@ -6,7 +6,17 @@ export type KnitOutputMessage =
     | { type: 'refresh' }
     | { type: 'openInBrowser' }
     | { type: 'themeChanged'; applied: boolean }
-    | { type: 'themeContext'; editorBackground: string };
+    | { type: 'themeContext'; editorBackground: string }
+    /**
+     * The webview just finished booting (initial load or panel reuse).
+     * Asks the host to (re-)resolve and push the current VS Code theme
+     * palette. Needed for the panel-reuse path: setting
+     * `panel.webview.html` discards the prior document and its message
+     * listener; a synchronous postMessage from the host can race the
+     * fresh shell's `addEventListener('message')` and be silently
+     * dropped. Having the new shell pull instead avoids the race.
+     */
+    | { type: 'requestPalette' };
 
 /**
  * Marker key on `postMessage` payloads from the extension host to the
@@ -41,6 +51,7 @@ export function isKnitOutputMessage(msg: unknown): msg is KnitOutputMessage {
     if (m.type === 'refresh' || m.type === 'openInBrowser') return true;
     if (m.type === 'themeChanged' && typeof m.applied === 'boolean') return true;
     if (m.type === 'themeContext' && typeof m.editorBackground === 'string') return true;
+    if (m.type === 'requestPalette') return true;
     return false;
 }
 
@@ -525,6 +536,16 @@ export function buildShellHtml(args: {
           // surrounding padding.
           + ' pre { background: ' + c.codeBg + ' !important; }'
           + ' pre code { background: transparent !important; }'
+          // Inline <code> in prose — not inside <pre> — should also
+          // pick up the textCodeBlock shading so the inline form
+          // matches the block form's surface. The base stylesheet
+          // paints all <code> with --raven-bg; without this rule
+          // the inline form would keep --raven-bg (which we re-emit
+          // via the GitHub variant on :root above) and visibly
+          // diverge from the block form whenever the theme's
+          // textCodeBlock-background differs from the editor
+          // background.
+          + ' :not(pre) > code { background: ' + c.codeBg + ' !important; }'
           // Defensive: zero out every paint property that could
           // give code-block spans a per-token visual chrome. Spans
           // are inline elements whose background-color should never
@@ -844,6 +865,14 @@ export function buildShellHtml(args: {
       // Initial report — at this point the outer shell has been
       // styled, so the CSS variable is resolved.
       reportThemeContext();
+      // Ask the host to (re-)resolve and push the current VS Code
+      // theme palette. The host's pushVscodeThemePalette already
+      // fires on theme/config events, but on a panel reuse the host
+      // sets webview.html and then pushes — that postMessage can
+      // race the fresh shell's listener registration and be lost.
+      // Pulling once from this fully-booted state guarantees we
+      // never see the stale baked palette permanently.
+      vscode.postMessage({ type: 'requestPalette' });
       // Re-apply when VS Code switches its active theme. The outer
       // shell body class flips between vscode-light, vscode-dark, or
       // vscode-high-contrast, which updates the CSS variables read
@@ -865,16 +894,59 @@ export function buildShellHtml(args: {
       // iframe stylesheet. The regex matches the exact declaration
       // sequence paletteCssDeclarations emits; anything else is
       // dropped and the toggle falls back to the GitHub variant.
-      // Mirror vscode-theme-palette.ts:HEX_COLOR_RE — accept only
-      // the four CSS-spec hex lengths (3, 4, 6, 8). The wider {3,8}
-      // form would silently pass 5/7-digit malformed values that no
-      // current code path emits but a future refactor could.
-      var RAVEN_PALETTE_CSS_RE = /^(?:--raven-(?:bg|fg|c-[a-z]+): #(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6,8}); ?)+$/;
+      //
+      // The role-suffix accepts mixed case so future TokenRole names
+      // mirroring VS Code semantic-token type names (e.g.
+      // 'enumMember') stay representable. The hex literal mirrors
+      // vscode-theme-palette.ts:HEX_COLOR_RE — accept only the four
+      // CSS-spec hex lengths (3, 4, 6, 8); the wider {3,8} form would
+      // silently pass 5/7-digit malformed values that no current code
+      // path emits but a future refactor could.
+      var RAVEN_PALETTE_CSS_RE = /^(?:--raven-(?:bg|fg|c-[a-zA-Z]+): #(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6,8}); ?)+$/;
+      // Names paletteCssDeclarations is contracted to emit, in the
+      // SAME order. We assert the entire set is present, with no
+      // duplicates and no extras, so a partial payload (which the
+      // open-ended (?: ... ; ?)+ above otherwise accepts) cannot
+      // silently override the baked GitHub palette with a missing
+      // var that then falls back to the OTHER variant. Keep in
+      // lockstep with paletteCssDeclarations.
+      var RAVEN_PALETTE_REQUIRED_NAMES = [
+        '--raven-bg',
+        '--raven-fg',
+        '--raven-c-keyword',
+        '--raven-c-string',
+        '--raven-c-number',
+        '--raven-c-comment',
+        '--raven-c-function',
+        '--raven-c-type',
+        '--raven-c-variable',
+        '--raven-c-operator',
+        '--raven-c-punctuation',
+        '--raven-c-constant',
+      ];
+      function paletteCssIsComplete(css) {
+        var seen = Object.create(null);
+        var pat = /--raven-(?:bg|fg|c-[a-zA-Z]+)(?=:)/g;
+        var m;
+        while ((m = pat.exec(css)) !== null) {
+          if (seen[m[0]]) return false; // dup
+          seen[m[0]] = true;
+        }
+        for (var i = 0; i < RAVEN_PALETTE_REQUIRED_NAMES.length; i++) {
+          if (!seen[RAVEN_PALETTE_REQUIRED_NAMES[i]]) return false;
+        }
+        // Count seen names too — refuse extras.
+        var count = 0;
+        for (var k in seen) if (seen.hasOwnProperty(k)) count++;
+        return count === RAVEN_PALETTE_REQUIRED_NAMES.length;
+      }
       window.addEventListener('message', function (event) {
         var data = event && event.data;
         if (!data) return;
         if (data.__ravenVscodeThemePalette === true) {
-          if (typeof data.css === 'string' && RAVEN_PALETTE_CSS_RE.test(data.css)) {
+          if (typeof data.css === 'string'
+              && RAVEN_PALETTE_CSS_RE.test(data.css)
+              && paletteCssIsComplete(data.css)) {
             vscodePaletteCss = data.css;
           } else {
             vscodePaletteCss = null;

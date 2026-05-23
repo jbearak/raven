@@ -237,6 +237,48 @@ const FOREGROUND_MASK = 0x00FF8000;
 const HEX_COLOR_RE = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6,8})$/i;
 
 /**
+ * Normalize a CSS hex color into a canonical `#rrggbb` (no alpha) lowercase
+ * form for cross-source equality comparison. Returns `undefined` if the
+ * input is missing / not a valid hex literal.
+ *
+ * Why this exists: the theme JSON's `colors.editor.background` and the
+ * webview-reported `--vscode-editor-background` are both valid hex, but
+ * they can encode the same color in different lengths:
+ *
+ *   - 3- and 4-digit shorthands (`#1e1`, `#1e1f`) → 6-digit expansion.
+ *   - 8-digit RGBA (`#1e1e1eff`) vs 6-digit (`#1e1e1e`) when the alpha is
+ *     fully opaque.
+ *   - Lowercase vs uppercase hex.
+ *   - Stray surrounding whitespace from a hand-edited theme.
+ *
+ * The disambiguation logic compares the two for strict equality; without
+ * normalization the bg-match path silently fails and the resolver falls
+ * back to `firstLoaded` — which is exactly wrong in the autoDetect +
+ * same-kind preferred-* scenario the bg-match path exists to handle.
+ *
+ * Alpha is intentionally dropped when fully opaque. A theme that paints
+ * its editor background semi-transparently is a real (if rare) case; for
+ * disambiguation purposes we treat `#1e1e1e80` as distinct from
+ * `#1e1e1e` (different colors on screen), but `#1e1e1eff` as equal to
+ * `#1e1e1e` (identical colors).
+ */
+function normalizeBgForCompare(raw: string | undefined): string | undefined {
+    if (typeof raw !== 'string') return undefined;
+    const trimmed = raw.trim().toLowerCase();
+    if (!HEX_COLOR_RE.test(trimmed)) return undefined;
+    // Expand 3- / 4-digit shorthands to their 6- / 8-digit forms by
+    // duplicating each hex digit, then drop fully-opaque alpha.
+    let body = trimmed.slice(1);
+    if (body.length === 3 || body.length === 4) {
+        body = body.split('').map((c) => c + c).join('');
+    }
+    if (body.length === 8 && body.slice(6) === 'ff') {
+        body = body.slice(0, 6);
+    }
+    return '#' + body;
+}
+
+/**
  * Semantic-token type name → `TokenRole` mapping for the simple
  * `semanticTokenColors` form. Bare type names only — selectors with
  * modifiers (`function.declaration`) are dropped on the floor by the
@@ -300,7 +342,7 @@ export async function resolveActiveThemePalette(
         return { ok: false, reason: 'no-theme-id', detail: 'no candidate theme ids supplied' };
     }
 
-    const wantedBg = args.activeEditorBackground?.toLowerCase();
+    const wantedBg = normalizeBgForCompare(args.activeEditorBackground);
     const realPath = args.realPath ?? ((p) => Promise.resolve(p));
 
     // Walk candidates in order. For each, try to locate + parse. If
@@ -334,6 +376,7 @@ export async function resolveActiveThemePalette(
         try {
             mergedDoc = await loadAndMergeThemeChain({
                 entryPath: located.absolutePath,
+                extensionRoot: located.extensionRoot,
                 readFile: args.readFile,
                 realPath,
             });
@@ -352,7 +395,7 @@ export async function resolveActiveThemePalette(
         }
         firstLoaded ??= { located, mergedDoc };
         if (wantedBg) {
-            const themeBg = (mergedDoc.editorColors['editor.background'] ?? '').toLowerCase();
+            const themeBg = normalizeBgForCompare(mergedDoc.editorColors['editor.background']);
             if (themeBg && themeBg === wantedBg) {
                 bgMatched = { located, mergedDoc };
                 break;
@@ -473,6 +516,12 @@ interface LocatedTheme {
     id: string;
     label: string;
     absolutePath: string;
+    /**
+     * Extension root that contributed this theme. Used downstream to
+     * keep `include` chains inside the contributing extension's
+     * directory.
+     */
+    extensionRoot: string;
 }
 
 interface ThemeContribution {
@@ -503,10 +552,35 @@ function locateThemeFile(
             const absolutePath = path.isAbsolute(t.path)
                 ? t.path
                 : path.join(ext.extensionPath, t.path);
-            return { id: id || label || wantedId, label: label || id, absolutePath };
+            // Defense-in-depth: reject contributions whose theme path
+            // escapes the extension directory. VS Code's contribution
+            // schema does not validate this either, but the theme file
+            // ends up being `readFile`'d and its absolute path is
+            // logged to the output channel on parse failure — an
+            // accidental or malicious `../../etc/passwd` would surface
+            // there.
+            if (!isInsideDir(ext.extensionPath, absolutePath)) continue;
+            return {
+                id: id || label || wantedId,
+                label: label || id,
+                absolutePath,
+                extensionRoot: ext.extensionPath,
+            };
         }
     }
     return null;
+}
+
+/**
+ * True when `child` resolves to a path equal to or under `parent`. Both
+ * arguments must be absolute. Used to keep theme contribution paths and
+ * `include` chains inside the contributing extension's directory.
+ */
+function isInsideDir(parent: string, child: string): boolean {
+    const rel = path.relative(parent, child);
+    if (rel === '') return true;
+    if (rel.startsWith('..')) return false;
+    return !path.isAbsolute(rel);
 }
 
 function readThemeContributions(pkg: unknown): ThemeContribution[] {
@@ -555,6 +629,14 @@ class ThemeCycleError extends Error {}
  */
 async function loadAndMergeThemeChain(args: {
     entryPath: string;
+    /**
+     * Contributing extension's root directory. `include` paths that
+     * resolve outside this directory are rejected with a ParseError —
+     * the schema doesn't mention this constraint, but a theme reaching
+     * outside its own extension is almost always either a bug or
+     * adversarial.
+     */
+    extensionRoot: string;
     readFile: (absolutePath: string) => Promise<string>;
     realPath: (absolutePath: string) => Promise<string>;
 }): Promise<ParsedThemeDocument> {
@@ -566,6 +648,21 @@ async function loadAndMergeThemeChain(args: {
     // the GitHub-palette fallback.
     const onStack = new Set<string>();
     const alreadyMerged = new Set<string>();
+    // Stable canonical-path cache. If realPath fails on the first
+    // visit and succeeds on a later one (or vice-versa), the canonical
+    // keys would diverge and cycle detection could miss a back-edge.
+    // Memoize the first answer per literal path so every later visit
+    // produces the same key, even when realPath becomes intermittently
+    // unavailable (transient EACCES on a permission-restricted symlink
+    // mid-chain, remote workspace blips, etc.).
+    const canonicalCache = new Map<string, string>();
+    async function canonicalize(p: string): Promise<string> {
+        const cached = canonicalCache.get(p);
+        if (cached !== undefined) return cached;
+        const resolved = await args.realPath(p).catch(() => p);
+        canonicalCache.set(p, resolved);
+        return resolved;
+    }
     // Acc starts with the most-derived (innermost) file's lists, but
     // tokenColors are then prepended by the includes so the final
     // order is "outermost (oldest) → innermost (most-derived)". That
@@ -576,7 +673,7 @@ async function loadAndMergeThemeChain(args: {
     const editorColors: Record<string, string> = {};
 
     async function load(thisPath: string): Promise<void> {
-        const canonical = await args.realPath(thisPath).catch(() => thisPath);
+        const canonical = await canonicalize(thisPath);
         if (onStack.has(canonical)) {
             throw new ThemeCycleError(`include cycle detected at ${canonical}`);
         }
@@ -615,9 +712,16 @@ async function loadAndMergeThemeChain(args: {
         const obj = parsed as Record<string, unknown>;
 
         // Resolve includes FIRST so the current file's rules can
-        // override them.
+        // override them. Containment-check against the contributing
+        // extension's root so a malformed/adversarial include can't
+        // make us read an arbitrary file on disk.
         if (typeof obj.include === 'string' && obj.include.length > 0) {
             const includedAbs = path.resolve(path.dirname(thisPath), obj.include);
+            if (!isInsideDir(args.extensionRoot, includedAbs)) {
+                throw new ParseError(
+                    `${thisPath}: include path "${obj.include}" escapes the extension directory`,
+                );
+            }
             await load(includedAbs);
         }
 
@@ -666,11 +770,21 @@ function normalizeThemeSetting(entry: unknown): ThemeSetting | null {
     const e = entry as Record<string, unknown>;
     const settings = e.settings;
     if (!settings || typeof settings !== 'object') return null;
+    let scope: string | string[] | undefined;
+    if (typeof e.scope === 'string') {
+        scope = e.scope;
+    } else if (Array.isArray(e.scope)) {
+        // Filter non-string elements: vscode-textmate's parseTheme
+        // calls `.trim()` on every selector string and would throw a
+        // TypeError on a null/undefined/number entry inside the array.
+        // The throw lands inside the serialized extractWithTheme window
+        // and aborts the whole palette resolution; defending here keeps
+        // a single malformed rule from poisoning the rest.
+        scope = (e.scope as unknown[]).filter((s): s is string => typeof s === 'string');
+    }
     return {
         name: typeof e.name === 'string' ? e.name : undefined,
-        scope: typeof e.scope === 'string' || Array.isArray(e.scope)
-            ? (e.scope as string | string[])
-            : undefined,
+        scope,
         settings: settings as ThemeSetting['settings'],
     };
 }
@@ -695,7 +809,11 @@ function normalizeThemeSetting(entry: unknown): ThemeSetting | null {
  * the themes we've encountered, this is enough.
  */
 function stripJsonWithComments(raw: string): string {
-    return stripTrailingCommas(stripJsonComments(raw));
+    // Strip a UTF-8 BOM if present. Some Windows-authored theme JSONs
+    // ship with a leading ﻿; Node's `fs.readFile(..., 'utf-8')`
+    // preserves it, and JSON.parse rejects BOM-prefixed input.
+    const withoutBom = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
+    return stripTrailingCommas(stripJsonComments(withoutBom));
 }
 
 function stripJsonComments(raw: string): string {
@@ -855,18 +973,23 @@ function readSemanticOverrides(args: {
     if (cust && typeof cust === 'object') {
         const c = cust as Record<string, unknown>;
         // VS Code's setting wraps the rules under a `rules` key in the
-        // customizations object, but also accepts the top-level keys
-        // for backwards compatibility. Try both.
-        const baseRules = (c.rules && typeof c.rules === 'object') ? c.rules as Record<string, unknown> : c;
-        overlay(out, baseRules);
+        // customizations object, but legacy settings.json files may
+        // place type-name keys at the top level too. Overlay BOTH so a
+        // hand-edited mix (`{ rules: { variable: ... }, function: ... }`)
+        // doesn't lose the top-level intent. Top-level first, `rules`
+        // second so the canonical `rules` block wins on conflict.
+        overlay(out, c);
+        if (c.rules && typeof c.rules === 'object') {
+            overlay(out, c.rules as Record<string, unknown>);
+        }
 
         const perTheme = c[`[${args.activeThemeLabel}]`];
         if (perTheme && typeof perTheme === 'object') {
             const perThemeObj = perTheme as Record<string, unknown>;
-            const perThemeRules = (perThemeObj.rules && typeof perThemeObj.rules === 'object')
-                ? perThemeObj.rules as Record<string, unknown>
-                : perThemeObj;
-            overlay(out, perThemeRules);
+            overlay(out, perThemeObj);
+            if (perThemeObj.rules && typeof perThemeObj.rules === 'object') {
+                overlay(out, perThemeObj.rules as Record<string, unknown>);
+            }
         }
     }
 
@@ -1028,7 +1151,19 @@ function synthesizeDefaultRule(
     tokenColors: readonly ThemeSetting[],
     editorColors: Record<string, string>,
 ): ThemeSetting[] {
-    if (tokenColors.some((rule) => isEmptyScope(rule.scope))) {
+    // Skip synthesis only when there's already an empty-scope rule
+    // that ACTUALLY provides a default foreground. A rule like
+    // `{ scope: '', settings: { background: '#1e1e1e' } }` (no
+    // foreground) does NOT defend against the #000000 fallback —
+    // effectiveDefaultForeground will skip it because its `foreground`
+    // is undefined and end up returning the #000000 sentinel. Treat
+    // that case the same as "no default rule" and synthesize.
+    const hasDefaultForeground = tokenColors.some((rule) => {
+        if (!isEmptyScope(rule.scope)) return false;
+        const fg = rule.settings.foreground;
+        return typeof fg === 'string' && HEX_COLOR_RE.test(fg.toLowerCase());
+    });
+    if (hasDefaultForeground) {
         return [...tokenColors];
     }
     const fg = pickValidColor(editorColors['editor.foreground']);
@@ -1040,10 +1175,10 @@ function synthesizeDefaultRule(
             ...(bg ? { background: bg } : {}),
         },
     };
-    // Prepend so any explicit rules in tokenColors (which don't have
-    // empty scope by definition once we've ruled that out above) get
-    // a chance to override; this synthetic rule only fires for
-    // tokens that match nothing else.
+    // Prepend so any explicit rules in tokenColors get a chance to
+    // override; this synthetic rule only fires for tokens that match
+    // nothing else AND (per the LAST-empty-scope-wins TextMate rule)
+    // when no later empty-scope rule sets a foreground.
     return [synthesized, ...tokenColors];
 }
 
@@ -1082,6 +1217,15 @@ function effectiveDefaultForeground(tokenColors: readonly ThemeSetting[]): strin
 function isWrongRoleForChain(role: TokenRole, scopes: readonly string[]): boolean {
     if (role === 'string' || role === 'comment') return false;
     for (const s of scopes) {
+        // Match both `string.<sub>` (the common form) AND a bare
+        // `string` / `comment` top-level scope. TextMate's naming
+        // convention permits the bare form, and `scopeToRole`'s own
+        // classification only fires on `string.` / `comment.` — so
+        // a bare-scope token's innermost role is something else (e.g.
+        // `punctuation.definition.string.begin`), and without this
+        // equality check the string color would vote into the
+        // punctuation role.
+        if (s === 'string' || s === 'comment') return true;
         if (s.startsWith('string.') || s.startsWith('comment.')) return true;
     }
     return false;

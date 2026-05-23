@@ -880,3 +880,283 @@ describe('resolveActiveThemePalette — customizations layering', () => {
         }
     });
 });
+
+describe('resolveActiveThemePalette — robustness regressions', () => {
+    test('strips a UTF-8 BOM from theme JSON before parsing', async () => {
+        // Some Windows-authored theme JSONs ship with a leading
+        // U+FEFF byte-order mark. `fs.readFile(..., 'utf-8')`
+        // preserves it, and JSON.parse rejects BOM-prefixed input
+        // — without the strip the candidate falls back silently.
+        const ext = fakeThemeExtension({
+            extensionPath: '/e',
+            label: 'BOM Theme',
+            themeRelativePath: 'theme.json',
+        });
+        const bomBody = '﻿' + JSON.stringify({
+            type: 'dark',
+            tokenColors: [],
+            colors: { 'editor.background': '#202020', 'editor.foreground': '#cccccc' },
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['BOM Theme'],
+            extensions: [ext],
+            readFile: readFileFrom({ '/e/theme.json': bomBody }),
+        }));
+        expect(out.ok).toBe(true);
+        if (out.ok) {
+            expect(out.palette.background).toBe('#202020');
+            expect(out.palette.foreground).toBe('#cccccc');
+        }
+    });
+
+    test('synthesizes a default rule when the only empty-scope rule has no foreground', async () => {
+        // Regression: previously synthesizeDefaultRule short-circuited
+        // whenever ANY empty-scope rule existed, even when that rule
+        // had only a background set; effectiveDefaultForeground then
+        // returned the hardcoded #000000 sentinel and unstyled tokens
+        // rendered as invisible black text on the theme's dark
+        // editor.background. The fix requires the existing empty-scope
+        // rule to actually provide a foreground; otherwise we synthesize
+        // from colors.editor.foreground.
+        const ext = fakeThemeExtension({
+            extensionPath: '/e',
+            label: 'Empty BG Only',
+            themeRelativePath: 'theme.json',
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Empty BG Only'],
+            extensions: [ext],
+            readFile: readFileFrom({
+                '/e/theme.json': JSON.stringify({
+                    type: 'dark',
+                    // Empty-scope rule with only background — bypasses
+                    // synthesis under the old code path.
+                    tokenColors: [{ settings: { background: '#1e1e1e' } }],
+                    colors: {
+                        'editor.background': '#1e1e1e',
+                        'editor.foreground': '#d4d4d4',
+                    },
+                }),
+            }),
+            // No corpus votes: every role falls back to noMatchFg.
+            registry: fakeRegistry({ colorMap: [] }),
+        }));
+        expect(out.ok).toBe(true);
+        if (out.ok) {
+            // roleFallback should be the editor.foreground we provided,
+            // NOT the #000000 sentinel.
+            expect(out.palette.roles.punctuation).toBe('#d4d4d4');
+            expect(out.palette.roles.variable).toBe('#d4d4d4');
+        }
+    });
+
+    test('matches editor.background when theme JSON uses 8-digit alpha-ff hex but webview reports 6-digit', async () => {
+        // VS Code's webview color-variable pipeline can emit either
+        // 6-digit or 8-digit hex. Strict-equality on raw strings
+        // (`#1e1e1eff` vs `#1e1e1e`) defeats disambiguation; the fix
+        // normalizes both sides to a canonical 6-digit form for
+        // opaque colors.
+        const extA = fakeThemeExtension({
+            extensionPath: '/a',
+            extensionId: 'theme-a',
+            label: 'Theme A',
+            themeRelativePath: 'a.json',
+        });
+        const extB = fakeThemeExtension({
+            extensionPath: '/b',
+            extensionId: 'theme-b',
+            label: 'Theme B',
+            themeRelativePath: 'b.json',
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Theme A', 'Theme B'],
+            activeEditorBackground: '#1e1e1e', // 6-digit
+            extensions: [extA, extB],
+            readFile: readFileFrom({
+                '/a/a.json': JSON.stringify({
+                    type: 'dark',
+                    tokenColors: [],
+                    colors: { 'editor.background': '#202020', 'editor.foreground': '#cccccc' },
+                }),
+                '/b/b.json': JSON.stringify({
+                    type: 'dark',
+                    tokenColors: [],
+                    // 8-digit RGBA with fully-opaque alpha.
+                    colors: { 'editor.background': '#1e1e1eFF', 'editor.foreground': '#dddddd' },
+                }),
+            }),
+        }));
+        expect(out.ok).toBe(true);
+        if (out.ok) {
+            // Theme B should have been picked by bg-match despite the
+            // alpha-length mismatch.
+            expect(out.themeId).toBe('Theme B');
+        }
+    });
+
+    test('normalizes 3-digit shorthand hex for bg comparison', async () => {
+        const extA = fakeThemeExtension({
+            extensionPath: '/a',
+            extensionId: 'theme-a',
+            label: 'Theme A',
+            themeRelativePath: 'a.json',
+        });
+        const extB = fakeThemeExtension({
+            extensionPath: '/b',
+            extensionId: 'theme-b',
+            label: 'Theme B',
+            themeRelativePath: 'b.json',
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Theme A', 'Theme B'],
+            activeEditorBackground: '#000', // 3-digit shorthand
+            extensions: [extA, extB],
+            readFile: readFileFrom({
+                '/a/a.json': JSON.stringify({
+                    type: 'dark',
+                    tokenColors: [],
+                    colors: { 'editor.background': '#111111' },
+                }),
+                '/b/b.json': JSON.stringify({
+                    type: 'dark',
+                    tokenColors: [],
+                    colors: { 'editor.background': '#000000' },
+                }),
+            }),
+        }));
+        expect(out.ok).toBe(true);
+        if (out.ok) {
+            expect(out.themeId).toBe('Theme B');
+        }
+    });
+
+    test('trims whitespace inside theme JSON bg value during disambiguation', async () => {
+        const ext = fakeThemeExtension({
+            extensionPath: '/e',
+            label: 'Whitespace Theme',
+            themeRelativePath: 'theme.json',
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Whitespace Theme'],
+            activeEditorBackground: '#1e1e1e',
+            extensions: [ext],
+            readFile: readFileFrom({
+                '/e/theme.json': JSON.stringify({
+                    type: 'dark',
+                    tokenColors: [],
+                    // Hand-edited stray-whitespace case.
+                    colors: { 'editor.background': '  #1e1e1e  ' },
+                }),
+            }),
+        }));
+        expect(out.ok).toBe(true);
+        if (out.ok) {
+            expect(out.themeId).toBe('Whitespace Theme');
+        }
+    });
+
+    test('filters non-string elements out of tokenColors[].scope arrays', async () => {
+        // A malformed theme with `scope: [null, 'keyword']` previously
+        // crashed inside setTheme's selector parser; the resolver now
+        // filters the array to strings before passing it through.
+        const ext = fakeThemeExtension({
+            extensionPath: '/e',
+            label: 'Malformed Scope',
+            themeRelativePath: 'theme.json',
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Malformed Scope'],
+            extensions: [ext],
+            readFile: readFileFrom({
+                '/e/theme.json': JSON.stringify({
+                    type: 'dark',
+                    tokenColors: [
+                        // Null element inside the array; non-string
+                        // wrapper.
+                        { scope: [null, 'keyword'], settings: { foreground: '#aabbcc' } },
+                    ],
+                    colors: {},
+                }),
+            }),
+        }));
+        // The resolution should succeed (graceful filter) rather
+        // than fall back to grammar-unavailable from a setTheme
+        // TypeError.
+        expect(out.ok).toBe(true);
+    });
+
+    test('rejects theme contributions whose path escapes the extension directory', async () => {
+        // Defense-in-depth: a contributes.themes[].path of `../../../`
+        // would otherwise be `readFile`'d.
+        const ext: ExtensionLike = {
+            id: 'evil.theme',
+            extensionPath: '/exts/evil',
+            packageJSON: {
+                contributes: {
+                    themes: [{ id: 'Evil', label: 'Evil', uiTheme: 'vs-dark', path: '../../../etc/passwd' }],
+                },
+            },
+        };
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Evil'],
+            extensions: [ext],
+            readFile: async () => { throw new Error('should not have been called'); },
+        }));
+        expect(out.ok).toBe(false);
+        if (!out.ok) expect(out.reason).toBe('theme-not-found');
+    });
+
+    test('rejects include paths that escape the contributing extension directory', async () => {
+        const ext = fakeThemeExtension({
+            extensionPath: '/exts/test',
+            label: 'Escaping Include',
+            themeRelativePath: 'theme.json',
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Escaping Include'],
+            extensions: [ext],
+            readFile: readFileFrom({
+                '/exts/test/theme.json': JSON.stringify({
+                    type: 'dark',
+                    include: '../../../etc/passwd',
+                    tokenColors: [],
+                    colors: {},
+                }),
+            }),
+        }));
+        expect(out.ok).toBe(false);
+        if (!out.ok) expect(out.reason).toBe('parse-error');
+    });
+
+    test('merges legacy top-level semantic-token keys with rules-block keys', async () => {
+        // Both shapes should be honored, with `rules` winning on
+        // conflict (per VS Code's documented schema).
+        const ext = fakeThemeExtension({
+            extensionPath: '/e',
+            label: 'Both Shapes',
+            themeRelativePath: 'theme.json',
+        });
+        const out = await resolveActiveThemePalette(baseArgs({
+            candidateThemeIds: ['Both Shapes'],
+            extensions: [ext],
+            readFile: readFileFrom({
+                '/e/theme.json': JSON.stringify({
+                    type: 'dark',
+                    tokenColors: [],
+                    colors: {},
+                }),
+            }),
+            semanticTokenColorCustomizations: {
+                // Legacy top-level key (often hand-edited).
+                variable: '#abcdef',
+                // Canonical wrapper.
+                rules: { function: '#123456' },
+            },
+        }));
+        expect(out.ok).toBe(true);
+        if (out.ok) {
+            expect(out.palette.roles.variable).toBe('#abcdef');
+            expect(out.palette.roles.function).toBe('#123456');
+        }
+    });
+});
