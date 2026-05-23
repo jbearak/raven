@@ -1263,7 +1263,7 @@
           "maxLength": 500,
           "pattern": "^[^;{}<>\\\\\\n\\r\\t\\f\\v\\u0000]*$",
           "patternErrorMessage": "Cannot contain ; { } < > \\ or whitespace control characters.",
-          "description": "Body/prose font for the Raven: Knit preview. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces are fine). Leave empty to inherit `markdown.preview.fontFamily`. The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit. Readers without the configured fonts installed fall back through the comma list to a generic family."
+          "description": "Body/prose font for the Raven: Knit preview. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine — e.g. `\"Aptos (Body)\", sans-serif`). Leave empty to inherit `markdown.preview.fontFamily`. The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit. Bare parens, unbalanced quotes, and CSS-wide keywords (`inherit`, `initial`, …) are rejected at knit time and the next layer of the fallback chain is used."
         },
         "raven.knit.monospaceFontFamily": {
           "type": "string",
@@ -1272,7 +1272,7 @@
           "maxLength": 500,
           "pattern": "^[^;{}<>\\\\\\n\\r\\t\\f\\v\\u0000]*$",
           "patternErrorMessage": "Cannot contain ; { } < > \\ or whitespace control characters.",
-          "description": "Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit preview. Accepts the same comma-separated form as CSS `font-family`. Leave empty to inherit `editor.fontFamily` (honors `[rmd]` / `[quarto]` language-scoped overrides). The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit."
+          "description": "Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit preview. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine). Leave empty to inherit `editor.fontFamily` (honors `[rmd]` / `[quarto]` language-scoped overrides). The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit. Bare parens, unbalanced quotes, and CSS-wide keywords are rejected at knit time and the next layer of the fallback chain is used."
         },
         "raven.plot.viewerColumn": {
           "type": "string",

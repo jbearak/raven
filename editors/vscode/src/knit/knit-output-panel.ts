@@ -507,11 +507,14 @@ export class KnitOutputPanel {
         this.output = args.output;
 
         // Prime the languageId cache from the open source document
-        // (if any). `lookupSourceLanguageId`'s own side effect would
-        // refresh the cache on first use, but priming up front means
-        // the constructor-time `resolveCurrentFontsCss` call in
-        // `updateContent` sees the actual languageId instead of the
-        // default `'rmd'` fallback.
+        // (if any). `lookupSourceLanguageId`'s own side effect updates
+        // `cachedSourceLanguageId` on every call, and the production
+        // flow runs `updateContent` (which calls into the lookup)
+        // immediately after this constructor — so this prime is
+        // strictly redundant in production. It IS load-bearing for
+        // direct unit-test callers that bypass `updateContent`: the
+        // cache reflects the actual source languageId from the moment
+        // the panel exists, not the `'rmd'` default.
         this.lookupSourceLanguageId();
 
         this.panel.webview.onDidReceiveMessage((msg: unknown) => this.handleMessage(msg));

@@ -1094,6 +1094,27 @@ export function buildShellHtml(args: {
         for (var k2 in seen) count2++;
         return count2 === RAVEN_FONT_REQUIRED_NAMES.length;
       }
+      // Quote-aware bare-paren guard. Mirrors \`render-html.ts\`'s
+      // \`hasBareParens\` so the trust boundary stays defensible on its
+      // own. The accept-regex above intentionally permits \`(\` and \`)\`
+      // so quoted real-world names like \`"Aptos (Body)"\` round-trip;
+      // this helper catches the residual hazard — an unquoted \`Foo(\`
+      // would open a CSS function-token whose consumption ignores
+      // \`}\` boundaries and could corrupt the iframe stylesheet
+      // outside the font-override block.
+      function fontCssHasBareParens(css) {
+        var quote = null;
+        for (var i2 = 0; i2 < css.length; i2++) {
+          var ch = css.charAt(i2);
+          if (quote) {
+            if (ch === quote) quote = null;
+            continue;
+          }
+          if (ch === '"' || ch === "'") { quote = ch; continue; }
+          if (ch === '(' || ch === ')') return true;
+        }
+        return false;
+      }
       window.addEventListener('message', function (event) {
         var data = event && event.data;
         if (!data) return;
@@ -1111,12 +1132,14 @@ export function buildShellHtml(args: {
         if (data.__ravenFontFamilies === true) {
           // Accept only the exact two-declaration shape
           // \`fontsCssDeclarations\` emits, with both required names,
-          // no duplicates, and no extras. Anything else clears the
-          // override so the baked fonts in the on-disk .html show
-          // through — same fail-safe model as the palette path.
+          // no duplicates, no extras, and no bare parens outside
+          // quoted family names. Anything else clears the override
+          // so the baked fonts in the on-disk .html show through —
+          // same fail-safe model as the palette path.
           if (typeof data.css === 'string'
               && RAVEN_FONT_CSS_RE.test(data.css)
-              && fontCssIsComplete(data.css)) {
+              && fontCssIsComplete(data.css)
+              && !fontCssHasBareParens(data.css)) {
             vscodeFontCss = data.css;
           } else {
             vscodeFontCss = null;
