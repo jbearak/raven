@@ -56,9 +56,32 @@ export interface BeginOpOptions {
     broadcast?: (p: OpPhase) => void;
 }
 
+/**
+ * Callback invoked when a preview directory's refcount drops to zero
+ * *and* the dir has been marked for deletion. The registry runs the
+ * callback inline from `unpinPreviewDir`; implementations should be
+ * non-blocking (start an async rm, don't await).
+ *
+ * `previewDir` is the absolute path the registered handler should rm;
+ * `previewKey` is provided for logging.
+ */
+export type PreviewDirDeleter = (previewDir: string, previewKey: string) => void;
+
 export class OperationRegistry {
     private readonly ops = new Map<string, OperationController>();
     private readonly previewPins = new Map<string, number>();
+    /** previewKey -> previewDir (absolute path), set on `requestPreviewDirDeletion`. */
+    private readonly previewMarkedForDeletion = new Map<string, string>();
+    private previewDeleter: PreviewDirDeleter | null = null;
+
+    /**
+     * Install the per-process callback that actually removes a preview
+     * subdir from disk. Called once at activation. Idempotent in the
+     * sense that re-installing is fine, but should never be necessary.
+     */
+    setPreviewDirDeleter(deleter: PreviewDirDeleter): void {
+        this.previewDeleter = deleter;
+    }
 
     beginOp(key: string, kind: OpKind, opts: BeginOpOptions = {}): BeginOpResult {
         const existing = this.ops.get(key);
@@ -101,11 +124,36 @@ export class OperationRegistry {
 
     unpinPreviewDir(previewKey: string): void {
         const next = (this.previewPins.get(previewKey) ?? 0) - 1;
-        if (next <= 0) this.previewPins.delete(previewKey);
-        else this.previewPins.set(previewKey, next);
+        if (next <= 0) {
+            this.previewPins.delete(previewKey);
+            // If the panel asked for deletion while exports held refs,
+            // discharge it now that the last ref is gone.
+            const dir = this.previewMarkedForDeletion.get(previewKey);
+            if (dir !== undefined) {
+                this.previewMarkedForDeletion.delete(previewKey);
+                if (this.previewDeleter) this.previewDeleter(dir, previewKey);
+            }
+        } else {
+            this.previewPins.set(previewKey, next);
+        }
     }
 
     previewRefs(previewKey: string): number {
         return this.previewPins.get(previewKey) ?? 0;
+    }
+
+    /**
+     * Request deletion of `previewKey`'s temp directory (`previewDir`).
+     * If no exports are currently pinning it, the registered deleter
+     * runs immediately; otherwise the (key, dir) pair is recorded and
+     * the deleter runs when the last pin is released. Safe to call
+     * multiple times; the latest `previewDir` wins.
+     */
+    requestPreviewDirDeletion(previewKey: string, previewDir: string): void {
+        if (this.previewRefs(previewKey) === 0) {
+            if (this.previewDeleter) this.previewDeleter(previewDir, previewKey);
+            return;
+        }
+        this.previewMarkedForDeletion.set(previewKey, previewDir);
     }
 }

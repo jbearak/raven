@@ -16,6 +16,8 @@ import {
 import { PandocResolver } from './pandoc-detect';
 import { OperationRegistry } from './operation-controller';
 import { registerExportCommands } from './export-commands';
+import { KnitOutputPanel } from './knit-output-panel';
+import { previewArtifactPaths } from './raven-knit-paths';
 
 export { disposeKnitGrammarRegistryForDeactivation };
 export { runExport } from './export-commands';
@@ -88,6 +90,26 @@ export function registerKnit(
     // knit blocks a same-source export (and vice versa). Webview cancel
     // commands look up controllers via canonicalOpKey.
     const registry = new OperationRegistry();
+    // Wire the preview-dir deleter so KnitOutputPanel.onDidDispose ->
+    // registry.requestPreviewDirDeletion -> async rm. When an export
+    // is mid-flight the rm is deferred until the last unpin.
+    registry.setPreviewDirDeleter(async (previewDir, previewKey) => {
+        try {
+            await fs.promises.rm(previewDir, { recursive: true, force: true });
+        } catch (err) {
+            knitOutput.appendLine(
+                `[knit] failed to remove preview dir ${previewDir} (key=${previewKey}): ${(err as Error).message}`,
+            );
+        }
+    });
+    KnitOutputPanel.setOnDidDisposeHandler((rmdAbsPath: string) => {
+        try {
+            const paths = previewArtifactPaths(rmdAbsPath);
+            registry.requestPreviewDirDeletion(paths.previewKey, paths.previewDir);
+        } catch {
+            // session uninitialized — nothing to clean up
+        }
+    });
     registerKnitCommands(
         context,
         {

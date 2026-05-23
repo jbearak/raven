@@ -57,6 +57,17 @@ import {
 export class KnitOutputPanel {
     private static instances = new Map<string, KnitOutputPanel>();
     private static previewColumn: vscode.ViewColumn | undefined;
+    /**
+     * Production-installed callback invoked on every panel disposal,
+     * with the source .Rmd's absolute path. Wired in `knit/index.ts`
+     * to OperationRegistry.requestPreviewDirDeletion, which refcount-
+     * gates the actual rm -rf so in-flight exports keep their cached
+     * `.md`/`figure/` until they finish.
+     */
+    private static onDidDisposeHandler: ((rmdAbsPath: string) => void) | null = null;
+    static setOnDidDisposeHandler(handler: (rmdAbsPath: string) => void): void {
+        KnitOutputPanel.onDidDisposeHandler = handler;
+    }
 
     private panel: vscode.WebviewPanel;
     private rootDir: string;
@@ -369,6 +380,14 @@ export class KnitOutputPanel {
                 try { d.dispose(); } catch { /* swallow */ }
             }
             instance.perPanelDisposables.length = 0;
+            // Signal the registered cleanup handler that the per-source
+            // preview temp dir can be removed (subject to refcounting —
+            // in-flight exports may still need it). Production wires
+            // this in knit/index.ts to OperationRegistry.requestPreviewDirDeletion.
+            const handler = KnitOutputPanel.onDidDisposeHandler;
+            if (handler) {
+                try { handler(instance.sourceUri.fsPath); } catch { /* swallow */ }
+            }
         });
 
         // Listen for VS Code theme changes and the editor.* settings

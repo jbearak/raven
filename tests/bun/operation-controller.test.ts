@@ -82,4 +82,37 @@ describe('OperationRegistry', () => {
         expect(a.kind).toBe('started');
         expect(b.kind).toBe('busy');
     });
+
+    it('requestPreviewDirDeletion fires the deleter immediately when no pins held', () => {
+        const reg = new OperationRegistry();
+        const deleted: Array<[string, string]> = [];
+        reg.setPreviewDirDeleter((dir, key) => { deleted.push([dir, key]); });
+        reg.requestPreviewDirDeletion('p1', '/tmp/preview/p1');
+        expect(deleted).toEqual([['/tmp/preview/p1', 'p1']]);
+    });
+
+    it('requestPreviewDirDeletion defers when pins are held; fires on last unpin', () => {
+        const reg = new OperationRegistry();
+        const deleted: string[] = [];
+        reg.setPreviewDirDeleter((dir) => { deleted.push(dir); });
+        reg.pinPreviewDir('p1');
+        reg.pinPreviewDir('p1');
+        reg.requestPreviewDirDeletion('p1', '/tmp/preview/p1');
+        expect(deleted).toEqual([]);
+        reg.unpinPreviewDir('p1');
+        expect(deleted).toEqual([]);
+        reg.unpinPreviewDir('p1');
+        expect(deleted).toEqual(['/tmp/preview/p1']);
+    });
+
+    it('requestPreviewDirDeletion only fires once even with multiple requests while pinned', () => {
+        const reg = new OperationRegistry();
+        const deleted: string[] = [];
+        reg.setPreviewDirDeleter((dir) => { deleted.push(dir); });
+        reg.pinPreviewDir('p1');
+        reg.requestPreviewDirDeletion('p1', '/tmp/preview/p1');
+        reg.requestPreviewDirDeletion('p1', '/tmp/preview/p1');
+        reg.unpinPreviewDir('p1');
+        expect(deleted).toEqual(['/tmp/preview/p1']);
+    });
 });
