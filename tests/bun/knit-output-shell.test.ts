@@ -164,16 +164,18 @@ describe('buildShellHtml', () => {
     test('theme overlay repaints code-block backgrounds from the theme', () => {
         // The GitHub-palette base stylesheet paints pre/code with
         // --raven-bg, which clashes with the VS Code editor bg when
-        // the theme overlay is applied. The overlay must also read
-        // --vscode-textCodeBlock-background and inject a `pre, code`
+        // the theme overlay is applied. The overlay must read
+        // --vscode-textCodeBlock-background and inject a `pre`
         // background override so code blocks pick up the theme's
         // shading rather than staying on the GitHub palette.
         const html = buildShellHtml(args('/work/report.html'));
         expect(html).toContain('--vscode-textCodeBlock-background');
-        // The injected stylesheet must paint both <pre> and inner
-        // <code> so syntax-highlight wrappers and inline code in
-        // prose pick up the same shading.
-        expect(html).toMatch(/pre,\s*code,\s*pre code\s*\{\s*background:/);
+        // The injected stylesheet paints `pre` with c.codeBg and
+        // forces `pre code` to transparent so a semi-transparent
+        // textCodeBlock-background (VS Code's default for dark
+        // themes) doesn't double-layer inside the code text area.
+        expect(html).toMatch(/pre\s*\{\s*background:/);
+        expect(html).toMatch(/pre code\s*\{\s*background:\s*transparent/);
     });
 
     test('theme overlay re-emits GitHub palette variant on :root', () => {
