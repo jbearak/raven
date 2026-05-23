@@ -479,6 +479,27 @@ export class KnitOutputPanel {
      */
     private async pushVscodeThemePalette(): Promise<void> {
         if (this.disposed) return;
+        // Diagnostic: log the inputs the resolver is about to consume.
+        // Lets us tell apart "the panel is resolving a stale theme"
+        // from "VS Code is reporting a stale kind" from "settings
+        // disagree with what the user expects". Logged once per panel
+        // session along with the resolved-palette line.
+        if (!this.themePaletteLogged) {
+            const root = vscode.workspace.getConfiguration();
+            const kind = vscode.window.activeColorTheme.kind;
+            const kindName =
+                kind === vscode.ColorThemeKind.Light ? 'Light'
+                : kind === vscode.ColorThemeKind.Dark ? 'Dark'
+                : kind === vscode.ColorThemeKind.HighContrast ? 'HighContrast'
+                : 'HighContrastLight';
+            this.output.appendLine(
+                `[theme] inputs: activeColorTheme.kind=${kindName}, ` +
+                `autoDetectColorScheme=${root.get('window.autoDetectColorScheme')}, ` +
+                `workbench.colorTheme=${JSON.stringify(root.get('workbench.colorTheme'))}, ` +
+                `preferredLight=${JSON.stringify(root.get('workbench.preferredLightColorTheme'))}, ` +
+                `preferredDark=${JSON.stringify(root.get('workbench.preferredDarkColorTheme'))}`,
+            );
+        }
         // The whole resolve path can throw if the extension context
         // is a sparse test stub (e.g. `{} as vscode.ExtensionContext`)
         // or if the cached grammar registry fails to init. Treat any
