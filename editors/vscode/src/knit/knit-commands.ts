@@ -17,7 +17,7 @@ import {
 import { runKnit } from './knit-engine';
 import { computeHtmlOutputPath } from './knit-paths';
 import { canonicalOpKey, previewArtifactPaths } from './raven-knit-paths';
-import { OperationRegistry } from './operation-controller';
+import { OperationRegistry, type OperationController } from './operation-controller';
 import * as fs from 'fs';
 import { runPostKnitRender } from './post-knit-renderer';
 import type { LanguageClient } from 'vscode-languageclient/node';
@@ -126,10 +126,27 @@ export function registerKnitCommands(
     return getOutput();
 }
 
+/**
+ * Public re-entry point for callers that already hold a controller
+ * slot on this source (the editor-toolbar export pipeline calls this
+ * after taking out an `export-*` controller, so re-acquiring through
+ * `beginOp` would falsely report "busy"). The caller MUST already
+ * own the registry slot for the source URI; otherwise use the
+ * registered command surface instead.
+ */
+export async function runKnitWithExistingController(
+    explicitUri: vscode.Uri | undefined,
+    output: vscode.OutputChannel,
+    context: vscode.ExtensionContext,
+    deps: KnitDeps,
+): Promise<void> {
+    await runKnitCommand(explicitUri, output, /* registry */ null, context, deps);
+}
+
 async function runKnitCommand(
     explicitUri: vscode.Uri | undefined,
     output: vscode.OutputChannel,
-    registry: OperationRegistry,
+    registry: OperationRegistry | null,
     context: vscode.ExtensionContext,
     deps: KnitDeps,
 ): Promise<void> {
@@ -359,25 +376,35 @@ async function runKnitCommand(
     // being consumed and a fresh knit would race). The canonical key
     // collapses different URI shapes of the same file (e.g., case
     // differences on Windows) onto a single slot.
+    //
+    // `registry === null` is the re-entry path: the editor-toolbar
+    // export pipeline took out an `export-*` controller and now calls
+    // this function to perform the underlying knit. The caller already
+    // owns the slot; skipping the beginOp lets the nested knit proceed
+    // without falsely reporting "already being knitted by the export
+    // I just started".
     const opKey = canonicalOpKey(docUri);
-    const begin = registry.beginOp(opKey, 'knit-preview');
-    if (begin.kind === 'busy') {
-        const what =
-            begin.existing.kind === 'knit-preview'
-                ? 'being knitted'
-                : begin.existing.kind === 'export-html'
-                    ? 'exporting to HTML'
-                    : begin.existing.kind === 'export-pdf'
-                        ? 'exporting to PDF'
-                        : begin.existing.kind === 'export-docx'
-                            ? 'exporting to Word'
-                            : 'busy';
-        await vscode.window.showInformationMessage(
-            `Raven: Knit — ${baseName} is already ${what}.`,
-        );
-        return;
+    let controller: OperationController | null = null;
+    if (registry !== null) {
+        const begin = registry.beginOp(opKey, 'knit-preview');
+        if (begin.kind === 'busy') {
+            const what =
+                begin.existing.kind === 'knit-preview'
+                    ? 'being knitted'
+                    : begin.existing.kind === 'export-html'
+                        ? 'exporting to HTML'
+                        : begin.existing.kind === 'export-pdf'
+                            ? 'exporting to PDF'
+                            : begin.existing.kind === 'export-docx'
+                                ? 'exporting to Word'
+                                : 'busy';
+            await vscode.window.showInformationMessage(
+                `Raven: Knit — ${baseName} is already ${what}.`,
+            );
+            return;
+        }
+        controller = begin.controller;
     }
-    const controller = begin.controller;
 
     output.appendLine(`---`);
     output.appendLine(`Knitting ${fsPath}`);
@@ -414,7 +441,14 @@ async function runKnitCommand(
         // both the progress notification AND the in-flight gate open
         // until the user dismissed the toast, causing a spurious
         // "already being knitted" on rapid re-invocation.
-        registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
+        //
+        // Re-entry path: when this function was called with a null
+        // registry (the export pipeline runs us under its own
+        // `export-*` controller), there's no slot to release here —
+        // the outer pipeline owns lifecycle.
+        if (registry !== null && controller !== null) {
+            registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
+        }
     }
 
     await renderOutcome(outcome, {

@@ -5,8 +5,9 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
-import { registerKnitCommands } from './knit-commands';
-import { disposeKnitGrammarRegistryForDeactivation } from './post-knit-renderer';
+import { registerKnitCommands, runKnitWithExistingController } from './knit-commands';
+import { disposeKnitGrammarRegistryForDeactivation, runPostKnitRender as postKnitRender } from './post-knit-renderer';
+import { runKnit as knitEngineRun } from './knit-engine';
 import {
     cleanupCurrentSession,
     initSessionState,
@@ -110,6 +111,21 @@ export function registerKnit(
             // session uninitialized — nothing to clean up
         }
     });
+    // Pin/unpin handlers let the panel hold the preview dir alive
+    // across the Export ▾ QuickPick. Closes the race where the user
+    // dismisses the panel while picking a format — the disposal
+    // handler would otherwise request deletion before the export
+    // pipeline has taken its own pin.
+    KnitOutputPanel.setPreviewPinHandlers(
+        (rmdAbsPath: string) => {
+            try { registry.pinPreviewDir(previewArtifactPaths(rmdAbsPath).previewKey); }
+            catch { /* session uninitialized */ }
+        },
+        (rmdAbsPath: string) => {
+            try { registry.unpinPreviewDir(previewArtifactPaths(rmdAbsPath).previewKey); }
+            catch { /* session uninitialized */ }
+        },
+    );
     registerKnitCommands(
         context,
         {
@@ -135,12 +151,28 @@ export function registerKnit(
     );
     // The same registry from above feeds the export pipeline so
     // beginOp on either side respects the other's in-flight slot.
+    // For editor-toolbar export, runKnit runs UNDER the export-*
+    // controller already taken out by runExport. We must NOT re-enter
+    // the registry's beginOp here — that would falsely report busy on
+    // the same source key. `runKnitWithExistingController` is the
+    // explicit re-entry point that skips the busy gate, leaving the
+    // outer export controller as the single registry slot.
     registerExportCommands(context, {
         resolver,
         registry,
         getOutput: () => knitOutput,
         runKnit: async (uri) => {
-            await vscode.commands.executeCommand('raven.knit', uri);
+            await runKnitWithExistingController(
+                uri,
+                knitOutput,
+                context,
+                {
+                    runKnit: knitEngineRun,
+                    showOrUpdatePanel: KnitOutputPanel.showOrUpdate,
+                    getLanguageClient: getLanguageClient ?? (() => undefined),
+                    runPostKnitRender: postKnitRender,
+                },
+            );
         },
     });
 }

@@ -69,6 +69,24 @@ export class KnitOutputPanel {
         KnitOutputPanel.onDidDisposeHandler = handler;
     }
 
+    /**
+     * Pin / unpin handlers wired by `knit/index.ts` to the
+     * OperationRegistry. The panel uses these to hold the preview dir
+     * alive across the Export ▾ QuickPick. Without the pin, the user
+     * could open the QuickPick, dismiss the panel before choosing, and
+     * then watch the still-pending export pipeline fail because the
+     * disposal handler already removed the cached `.md`.
+     */
+    private static pinPreviewHandler: ((rmdAbsPath: string) => void) | null = null;
+    private static unpinPreviewHandler: ((rmdAbsPath: string) => void) | null = null;
+    static setPreviewPinHandlers(
+        pin: (rmdAbsPath: string) => void,
+        unpin: (rmdAbsPath: string) => void,
+    ): void {
+        KnitOutputPanel.pinPreviewHandler = pin;
+        KnitOutputPanel.unpinPreviewHandler = unpin;
+    }
+
     private panel: vscode.WebviewPanel;
     private rootDir: string;
     private sourceUri: vscode.Uri;
@@ -933,21 +951,40 @@ export class KnitOutputPanel {
             { label: '$(file-pdf) Export to PDF…', description: 'Pandoc PDF' },
             { label: '$(file) Export to Word…', description: 'Pandoc DOCX' },
         ];
-        const choice = await vscode.window.showQuickPick(items, {
-            placeHolder: `Export ${this.sourceUri.path.split('/').pop() ?? this.sourceUri.fsPath}`,
-        });
-        if (!choice) return;
-        // The webview entry reuses the cached preview .md. We dispatch
-        // through `raven.knit.export*` so any caller-supplied wiring
-        // (test harness, etc.) gets the same entry point as the
-        // editor-toolbar invocations — `runExport` then differentiates
-        // entry-mode by the optional second argument.
-        if (choice.label.includes('HTML')) {
-            await vscode.commands.executeCommand('raven.knit.exportHtml', this.sourceUri, { entry: 'webview' });
-        } else if (choice.label.includes('PDF')) {
-            await vscode.commands.executeCommand('raven.knit.exportPdf', this.sourceUri, { entry: 'webview' });
-        } else if (choice.label.includes('Word')) {
-            await vscode.commands.executeCommand('raven.knit.exportDocx', this.sourceUri, { entry: 'webview' });
+        // Pin the preview dir across the QuickPick lifecycle. Without
+        // this, the user could open the QuickPick, close the panel
+        // before choosing, then choose a format — the disposal handler
+        // would have already requested deletion of the cached `.md`,
+        // and the export pipeline would find it gone. The export-
+        // pipeline takes its own pin when it begins, so any window
+        // between this unpin and that pin would re-open the race; we
+        // therefore hold the pin until executeCommand resolves (i.e.,
+        // until the export pipeline has finished, by which point it
+        // has already done its own pin/unpin cycle).
+        const rmdAbsPath = this.sourceUri.fsPath;
+        const pin = KnitOutputPanel.pinPreviewHandler;
+        const unpin = KnitOutputPanel.unpinPreviewHandler;
+        if (pin) pin(rmdAbsPath);
+        let choice: vscode.QuickPickItem | undefined;
+        try {
+            choice = await vscode.window.showQuickPick(items, {
+                placeHolder: `Export ${this.sourceUri.path.split('/').pop() ?? this.sourceUri.fsPath}`,
+            });
+            if (!choice) return;
+            // The webview entry reuses the cached preview .md. We dispatch
+            // through `raven.knit.export*` so any caller-supplied wiring
+            // (test harness, etc.) gets the same entry point as the
+            // editor-toolbar invocations — `runExport` then differentiates
+            // entry-mode by the optional second argument.
+            if (choice.label.includes('HTML')) {
+                await vscode.commands.executeCommand('raven.knit.exportHtml', this.sourceUri, { entry: 'webview' });
+            } else if (choice.label.includes('PDF')) {
+                await vscode.commands.executeCommand('raven.knit.exportPdf', this.sourceUri, { entry: 'webview' });
+            } else if (choice.label.includes('Word')) {
+                await vscode.commands.executeCommand('raven.knit.exportDocx', this.sourceUri, { entry: 'webview' });
+            }
+        } finally {
+            if (unpin) unpin(rmdAbsPath);
         }
     }
 
