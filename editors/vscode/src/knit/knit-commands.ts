@@ -170,6 +170,36 @@ async function runKnitCommand(
     let documentText: string;
     try {
         const doc = await vscode.workspace.openTextDocument(docUri);
+        // knitr reads the .Rmd from disk via R's `readLines`, not from
+        // VS Code's in-memory buffer. If the editor has unsaved
+        // changes, the knit output would silently reflect the
+        // stale-on-disk version — which is indistinguishable from "the
+        // knit didn't work" from the user's perspective. Save before
+        // running so the disk and the buffer agree.
+        //
+        // `save()` returns false if a participant (formatter,
+        // codeActionsOnSave, etc.) refuses the save. In that case we
+        // can't know whether the disk reflects the user's intent, so
+        // surface the failure and bail rather than knit a stale file.
+        if (doc.isDirty) {
+            let saved = false;
+            try {
+                saved = await doc.save();
+            } catch (err) {
+                output.show(true);
+                output.appendLine(
+                    `[knit] save failed for ${fsPath}: ` +
+                    (err instanceof Error ? err.message : String(err)),
+                );
+            }
+            if (!saved) {
+                await vscode.window.showWarningMessage(
+                    `Raven: Knit — could not save ${path.basename(fsPath)}. ` +
+                    `The knit output would not reflect your unsaved changes.`,
+                );
+                return;
+            }
+        }
         documentText = doc.getText();
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
