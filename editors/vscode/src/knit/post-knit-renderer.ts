@@ -30,7 +30,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { createGrammarRegistry, type GrammarRegistry } from './grammar-registry';
-import { renderKnitHtml } from './render-html';
+import { renderKnitHtml, resolveFontFamilies } from './render-html';
 
 /**
  * Process-wide grammar registry cache.
@@ -186,6 +186,24 @@ export async function runPostKnitRender(args: {
         }
         : undefined;
 
+    // Resolve fonts at render time. The post-knit `.html` is a frozen
+    // snapshot shared by the panel iframe AND "Open in Browser", so
+    // font choice is baked into the CSS — there is no live link from
+    // the browser back to VS Code settings. `resolveFontFamilies`
+    // walks the fallback chain (raven setting → VS Code default →
+    // hardcoded) and appends a generic-family terminator so a reader
+    // without the configured fonts installed still lands on a sensible
+    // fallback. See `docs/knit.md` "Fonts" for the user-facing model.
+    const knitConfig = vscode.workspace.getConfiguration('raven.knit');
+    const mdPreviewConfig = vscode.workspace.getConfiguration('markdown.preview');
+    const editorConfig = vscode.workspace.getConfiguration('editor');
+    const fonts = resolveFontFamilies(
+        knitConfig.get<string>('fontFamily', ''),
+        knitConfig.get<string>('monospaceFontFamily', ''),
+        mdPreviewConfig.get<string>('fontFamily', ''),
+        editorConfig.get<string>('fontFamily', ''),
+    );
+
     const finalHtml = await renderKnitHtml({
         markdownSource,
         renderMarkdown,
@@ -193,6 +211,7 @@ export async function runPostKnitRender(args: {
         fetchRSemanticTokens,
         katexCss,
         themeClasses: themeClasses ?? null,
+        fonts,
     });
 
     await writeFileAtomic(htmlPath, finalHtml);

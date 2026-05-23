@@ -49,6 +49,8 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.editor.dotInWordSeparators` | `"ask"` | `"ask"` \| `"yes"` \| `"no"` | — | [editor-integrations](editor-integrations.md) | Whether to exclude dots from word separators in R and JAGS files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it. |
 | `raven.help.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [help-viewer](help-viewer.md) | Initial editor column when the R help viewer first opens. |
 | `raven.indentation.style` | `"rstudio"` | `"rstudio"` \| `"rstudio-minus"` \| `"off"` | `indentation.style` | [indentation](indentation.md) | Indentation style for R code. |
+| `raven.knit.fontFamily` | `""` | string | — | [knit](knit.md) | Body/prose font for the Raven: Knit preview. |
+| `raven.knit.monospaceFontFamily` | `""` | string | — | [knit](knit.md) | Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit preview. |
 | `raven.knit.timeoutMs` | `600000` | integer (≥1000) | — | [knit](knit.md) | Hard timeout (milliseconds) for the Raven: Knit subprocess. |
 | `raven.knit.workingDirectory` | `"document"` | `"document"` \| `"project"` \| `"current"` | — | [knit](knit.md) | Working directory passed to rmarkdown::render's knit_root_dir argument. |
 | `raven.linting.assignmentOperator` | `"<-"` | `"<-"` \| `"="` | `linting.assignmentOperator` | [linting](linting.md) | Preferred assignment operator. |

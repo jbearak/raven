@@ -40,6 +40,47 @@ import {
 const LANG_CLASS_PREFIX = 'language-';
 
 /**
+ * Hard-coded font fallbacks. Used when every upstream candidate
+ * (raven-knit setting, VS Code default) is empty or rejected by the
+ * sanitizer.
+ *
+ * `MONO_HARDCODED_FALLBACK` is the exact string `baseStyles()` shipped
+ * before user-configurable fonts existed, so a user who removes their
+ * setting (or whose VS Code defaults somehow fail the sanitizer) lands
+ * back on the historical default rather than something new.
+ */
+const TEXT_HARDCODED_FALLBACK =
+    '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif';
+const MONO_HARDCODED_FALLBACK =
+    'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace';
+
+/**
+ * CSS generic-family keywords. If a resolved font-family string already
+ * ends with one of these, we don't append our own terminator — the
+ * user's list already has a final fallback.
+ *
+ * Comparison is case-insensitive and ignores trailing whitespace. The
+ * list mirrors the CSS Fonts Module Level 4 generic family keywords; we
+ * include `emoji`, `math`, `fangsong` for completeness even though
+ * they're rarely used as a list terminator.
+ */
+const GENERIC_FAMILY_KEYWORDS = new Set([
+    'monospace',
+    'sans-serif',
+    'serif',
+    'system-ui',
+    'ui-monospace',
+    'ui-sans-serif',
+    'ui-serif',
+    'ui-rounded',
+    'cursive',
+    'fantasy',
+    'emoji',
+    'math',
+    'fangsong',
+]);
+
+/**
  * Render a post-knit `.md` source string into the final HTML body
  * we'll show in the panel and write to disk for "Open in Browser".
  *
@@ -92,6 +133,15 @@ export async function renderKnitHtml(args: {
      * paints whichever palette the panel is currently themed for.
      */
     themeClasses?: string | null;
+
+    /**
+     * Already-resolved font-family strings for body and monospace.
+     * Production callers pass the result of `resolveFontFamilies` —
+     * sanitized, with a generic-family terminator appended. Tests
+     * may omit this; the renderer falls back to the hardcoded
+     * defaults that match the historical behavior.
+     */
+    fonts?: ResolvedFonts;
 }): Promise<string> {
     const html = await args.renderMarkdown(args.markdownSource);
     const rewritten = await rewriteCodeBlocks(html, args);
@@ -280,9 +330,9 @@ function escapeAttr(value: string): string {
  */
 function assembleDocument(
     body: string,
-    args: { katexCss?: string; themeClasses?: string | null },
+    args: { katexCss?: string; themeClasses?: string | null; fonts?: ResolvedFonts },
 ): string {
-    const css = composeStylesheet(args.themeClasses ?? null) +
+    const css = composeStylesheet(args.themeClasses ?? null, args.fonts) +
         (args.katexCss ? `\n${args.katexCss}\n` : '');
     return `<!doctype html>
 <html>
@@ -305,7 +355,10 @@ ${body}
  * caller's theme — the in-VS-Code panel passes the body class so the
  * code-block colors match the active editor theme variant.
  */
-export function composeStylesheet(themeClasses: string | null): string {
+export function composeStylesheet(
+    themeClasses: string | null,
+    fonts?: ResolvedFonts,
+): string {
     const isLight = themeClasses !== null && /\bvscode-(light|high-contrast-light)\b/.test(themeClasses);
 
     // Always include both palettes as data so we can swap them on
@@ -315,6 +368,18 @@ export function composeStylesheet(themeClasses: string | null): string {
     // front and then add a media-query swap when running standalone.
     const lightVars = paletteAsCssVars(githubLight);
     const darkVars = paletteAsCssVars(githubDark);
+    // Font vars are emitted alongside the palette in the same outer
+    // `:root { }`. Unlike the palette they do NOT vary by variant, so
+    // the variant-conditional inner-:root (the
+    // `prefers-color-scheme: dark` media query below, and the
+    // body-class branch for the in-VS-Code panel) keeps shipping
+    // colors only. Existing callers without `fonts` get the
+    // hardcoded historical defaults so legacy unit tests don't break.
+    const resolvedFonts: ResolvedFonts = fonts ?? {
+        text: `${TEXT_HARDCODED_FALLBACK}`,
+        mono: `${MONO_HARDCODED_FALLBACK}`,
+    };
+    const fontVars = fontsAsCssVars(resolvedFonts);
 
     if (themeClasses === null) {
         // Standalone (browser) — start light, swap on prefers-color-scheme: dark.
@@ -322,6 +387,7 @@ export function composeStylesheet(themeClasses: string | null): string {
 :root {
   color-scheme: light dark;
   ${lightVars}
+  ${fontVars}
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -336,9 +402,166 @@ ${baseStyles()}
 :root {
   color-scheme: ${isLight ? 'light' : 'dark'};
   ${isLight ? lightVars : darkVars}
+  ${fontVars}
 }
 ${baseStyles()}
 `.trim();
+}
+
+/**
+ * Resolved font-family strings ready to drop into CSS values. Both
+ * fields are sanitized and end with a generic-family terminator; the
+ * renderer treats them as trusted input.
+ */
+export interface ResolvedFonts {
+    /** Body / prose font-family. */
+    text: string;
+    /** Monospace font-family for code chunks and output blocks. */
+    mono: string;
+}
+
+/**
+ * Sanitize a user-supplied font-family string for inclusion in a CSS
+ * property value.
+ *
+ * Font-family is a free-form CSS value: it accepts comma-separated
+ * lists with quoted names that may include spaces (e.g.
+ * `'JetBrains Mono', "Source Sans Pro", monospace`). We can't validate
+ * the grammar usefully — too many shapes — but we can reject the
+ * specific characters that would let the string break out of the CSS
+ * value, escape the `<style>` block, or smuggle a comment that
+ * survives into the rendered stylesheet.
+ *
+ * Banned: `;` `{` `}` `<` `>` `\` newline, carriage-return, NUL,
+ * and the comment sequences `/*` / `*\/`.
+ *
+ * Returns the trimmed input on success, or `null` if the input is
+ * empty, too long, or contains a banned shape.
+ */
+export function sanitizeFontFamily(input: string): string | null {
+    if (typeof input !== 'string') return null;
+    const trimmed = input.trim();
+    if (trimmed.length === 0) return null;
+    if (trimmed.length > 500) return null;
+    // Single banned-character class. `\` is included because CSS
+    // unicode escapes (`\3b ;`) could otherwise smuggle a semicolon
+    // past the `;` check on parsers that resolve escapes before
+    // applying our regex. Newlines and `\0` would break the property
+    // line entirely.
+    if (/[;{}<>\\\n\r\0]/.test(trimmed)) return null;
+    // CSS comment sequences. A literal `/*` opens a comment that
+    // extends until `*\/`, which would let an attacker comment out
+    // every property between the font-family and the next legitimate
+    // closing brace.
+    if (trimmed.includes('/*') || trimmed.includes('*/')) return null;
+    return trimmed;
+}
+
+/**
+ * Walk the font fallback chain and return resolved, sanitized,
+ * terminator-guaranteed strings for body and monospace.
+ *
+ * Chain (per slot, first non-null wins):
+ *   1. User setting (`raven.knit.fontFamily` / `monospaceFontFamily`).
+ *   2. VS Code fallback (`markdown.preview.fontFamily` /
+ *      `editor.fontFamily`) — VS Code resolves these to OS-specific
+ *      defaults via `getConfiguration(...).get(...)` even when the
+ *      user has not set them.
+ *   3. Hard-coded fallback (only fires if the sanitizer rejects the
+ *      VS Code value, since `get()` itself never returns empty for
+ *      these well-known settings).
+ *
+ * After picking the winner, a generic-family terminator is appended
+ * (`, monospace` for mono, `, sans-serif` for text) unless the resolved
+ * string already ends with one. This guarantees the baked `.html`
+ * degrades gracefully when opened in a browser on a machine that
+ * doesn't have the user's configured fonts installed — the browser
+ * falls through to a generic family rather than reverting to its own
+ * Times default.
+ */
+export function resolveFontFamilies(
+    textRaw: string,
+    monoRaw: string,
+    textFallback: string,
+    monoFallback: string,
+): ResolvedFonts {
+    return {
+        text: resolveSlot(textRaw, textFallback, TEXT_HARDCODED_FALLBACK, 'sans-serif'),
+        mono: resolveSlot(monoRaw, monoFallback, MONO_HARDCODED_FALLBACK, 'monospace'),
+    };
+}
+
+function resolveSlot(
+    primary: string,
+    fallback: string,
+    hardcoded: string,
+    terminator: string,
+): string {
+    const picked =
+        sanitizeFontFamily(primary)
+        ?? sanitizeFontFamily(fallback)
+        ?? hardcoded;
+    return appendGenericTerminator(picked, terminator);
+}
+
+function appendGenericTerminator(value: string, terminator: string): string {
+    // Split on the LAST top-level comma so quoted names containing
+    // commas inside their quoted forms (unusual but legal: e.g.
+    // `"Comma, Foundry"`) don't confuse the check. The CSS grammar
+    // uses comma at the top level as the family separator; commas
+    // inside quoted family names are part of the name.
+    const lastComma = lastTopLevelComma(value);
+    const lastEntryRaw = lastComma < 0 ? value : value.slice(lastComma + 1);
+    const lastEntry = lastEntryRaw.trim().toLowerCase();
+    // Per CSS spec, generic family keywords (`monospace`, `serif`, …)
+    // are bare identifiers. A QUOTED `"monospace"` is a custom family
+    // name, NOT the generic keyword — so we treat any quoted last
+    // entry as "not a terminator" and append our own generic, which
+    // is what the browser ultimately needs to find a real fallback.
+    if (lastEntry.startsWith('"') || lastEntry.startsWith("'")) {
+        return `${value}, ${terminator}`;
+    }
+    if (GENERIC_FAMILY_KEYWORDS.has(lastEntry)) return value;
+    return `${value}, ${terminator}`;
+}
+
+/**
+ * Index of the last top-level comma in a font-family list, or -1 if
+ * none. "Top-level" means outside any `"..."` or `'...'` quoted family
+ * name. Returns -1 for inputs with no comma.
+ */
+function lastTopLevelComma(value: string): number {
+    let quote: '"' | "'" | null = null;
+    let last = -1;
+    for (let i = 0; i < value.length; i++) {
+        const ch = value[i];
+        if (quote) {
+            if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = ch as '"' | "'";
+            continue;
+        }
+        if (ch === ',') last = i;
+    }
+    return last;
+}
+
+/**
+ * Emit the `--raven-font-text` / `--raven-font-mono` declarations as
+ * a single chunk for splicing into the outer `:root { }` block — same
+ * shape as `paletteAsCssVars`, joined with the trailing newline +
+ * indent that the inline-template assembly uses.
+ *
+ * Inputs are trusted: callers are expected to have run them through
+ * `resolveFontFamilies`, which sanitizes every candidate.
+ */
+function fontsAsCssVars(fonts: ResolvedFonts): string {
+    return [
+        `--raven-font-text: ${fonts.text};`,
+        `--raven-font-mono: ${fonts.mono};`,
+    ].join('\n  ');
 }
 
 function paletteAsCssVars(palette: GithubPalette): string {
@@ -373,12 +596,13 @@ function baseStyles(): string {
 body {
   background: var(--raven-bg);
   color: var(--raven-fg);
+  font-family: var(--raven-font-text);
 }
 pre {
   overflow-x: auto;
 }
 code {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-family: var(--raven-font-mono);
   color: var(--raven-fg);
 }
 pre.raven-knit-code,

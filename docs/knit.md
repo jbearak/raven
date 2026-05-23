@@ -217,7 +217,44 @@ explorer-context-menu hook is opt-in via your own keybindings).
 | `raven.rConsole.activation` | `auto` | Gates the knit command (and the R console / plot / data viewers / chunk run commands). |
 | `raven.knit.workingDirectory` | `document` | `document` / `project` / `current`. |
 | `raven.knit.timeoutMs` | `600000` | Hard timeout (ms). On expiry Raven escalates the kill ladder. |
+| `raven.knit.fontFamily` | `""` | Body/prose font for the preview. Empty inherits `markdown.preview.fontFamily`. |
+| `raven.knit.monospaceFontFamily` | `""` | Monospace font for code chunks and output. Empty inherits `editor.fontFamily`. |
 | `raven.packages.rPath` | (auto) | Path to the R binary. Empty means "search PATH". |
+
+### Fonts
+
+The two font settings accept the same comma-separated form as CSS
+`font-family` — quoted names with spaces are fine, e.g.
+`"JetBrains Mono", "Fira Code", monospace`.
+
+Resolution order per slot:
+
+1. Your `raven.knit.fontFamily` / `raven.knit.monospaceFontFamily` if
+   non-empty.
+2. VS Code's `markdown.preview.fontFamily` (body) or
+   `editor.fontFamily` (mono). These resolve to OS-specific defaults
+   when you have not set them, so the preview always looks reasonable
+   on the machine you're knitting on.
+3. A hard-coded fallback if step 2 somehow yields an invalid value.
+
+Fonts are **baked into the rendered `.html` at knit time**, not
+read live. Change a setting and re-knit to pick it up. This is the
+same model Quarto uses for its rendered HTML.
+
+**Browser portability.** The `.html` that the panel displays is the
+same file "Open in Browser" opens, and the same file you can email or
+host anywhere. The browser reads font names verbatim from the CSS, so
+a reader without your configured fonts installed will fall through the
+comma list. Raven automatically appends a generic terminator
+(`, monospace` for code, `, sans-serif` for body) when your value
+doesn't already end with one, so the browser always lands on a
+sensible generic family rather than reverting to Times. For the most
+robust portability across machines include your own fallback list,
+e.g. `"JetBrains Mono", "Fira Code", Menlo, monospace`.
+
+For safety, any value containing `;`, `{`, `}`, `<`, `>`, `\`, or a
+CSS comment (`/*` / `*/`) is rejected and the next item in the
+fallback chain is used.
 
 ## What Raven does **not** do
 
