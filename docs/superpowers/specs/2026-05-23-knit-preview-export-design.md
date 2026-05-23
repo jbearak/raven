@@ -67,7 +67,7 @@ $(file-pdf)   Export to PDF…
 $(file-word)  Export to Word…
 ```
 
-If the source `.Rmd` is dirty or its on-disk mtime is newer than the cached preview's `.md`, a top item appears:
+If the open source `.Rmd` is dirty (unsaved changes) or its on-disk mtime is newer than the cached preview's `.md`, a top item appears:
 
 ```text
 $(warning)    Preview may be out of date — Knit again first?
@@ -76,7 +76,7 @@ $(file-code)  Export to HTML…
 ...
 ```
 
-Picking the top item runs knit-then-export as a single cancellable progress operation.
+**This mtime check is advisory UI only.** It is not used to invalidate the cache or block export. If the user picks one of the format items below, we export the cached `.md` as-is (per Approach C in the Architecture section). If they pick the top item, we run knit-then-export as a single cancellable progress operation.
 
 ### Editor-title Raven menu
 
@@ -138,7 +138,7 @@ Settings sync touch-points (per CLAUDE.md): `editors/vscode/package.json` schema
         └── ...
 ```
 
-- `<workspaceHash>` is `sha256` of the first workspace folder's URI (stable per workspace, distinct across workspaces sharing the same machine).
+- `<workspaceHash>` is `sha256` of the first workspace folder's URI (stable per workspace, distinct across workspaces sharing the same machine). If no workspace is open (the user opened a single `.Rmd` directly), we fall back to `sha256` of the .Rmd's parent directory absolute path.
 - Preview subdirs are stable so the iframe can keep referencing the same paths across re-knits, and `figure/` artifacts stay alive while the panel is open.
 - Editor-toolbar export subdirs are throwaway.
 
@@ -180,8 +180,9 @@ If the user clicks Export or Knit again while an operation is in flight on the s
 
 Webview button states during in-flight ops:
 
-- The triggering button shows a spinner and changes its tooltip to `"Cancel and start a new export"`. Clicking it triggers the same toast.
-- Unrelated buttons (Open in Browser) stay enabled.
+- While a **knit** is running: the `Knit again` button shows a spinner with tooltip `"Cancel and re-knit"`. Clicking it triggers the toast above. The `Export ▾` button is disabled with tooltip `"Wait for knit to finish, or cancel it"`.
+- While an **export** is running: the `Export ▾` button shows a spinner with tooltip `"Cancel current export"`. Clicking it cancels the in-flight export (no toast — single-op cancel). The `Knit again` button is disabled with tooltip `"Wait for export to finish"`.
+- Unrelated buttons (Open in Browser, Apply VS Code theme) stay enabled regardless.
 
 ## YAML `output:` handling
 
@@ -284,7 +285,7 @@ Standard install dirs probed when `pandoc` isn't on PATH:
 ```
 
 - `Install Pandoc…` → `vscode.env.openExternal('https://pandoc.org/installing.html')`
-- `Set path…` → opens settings UI scoped to `raven.pandoc.path` via `vscode.commands.executeCommand('workbench.action.openSettings', 'raven.pandoc.path')`
+- `Set path…` → opens settings UI scoped to `raven.pandoc.path` via `vscode.commands.executeCommand('workbench.action.openSettings', '@id:raven.pandoc.path')` (the `@id:` filter restricts the search to that one setting).
 
 ### Failure UX — Pandoc invocation fails
 
@@ -338,7 +339,7 @@ if (action) {
 ## Migration
 
 - Current code writes `<basename>.md` + `figure/` into the .Rmd directory. After this lands those locations are no longer written; existing files are left in place (already gitignored per commit `109110cd`). No prompt, no auto-delete.
-- The gate is removed. Documents that today produce the "Copy command" dialog now silently render as HTML preview. `CHANGELOG.md` notes the behavior change.
+- The gate is removed. Documents that today produce the "Copy command" dialog now silently render as HTML preview. Documented in the PR description (Raven has no `CHANGELOG.md`; user-facing change notes live in PR descriptions and `docs/knit.md`).
 - Existing keybindings, `tasks.json` entries, and the walkthrough completion event keep firing — command ID `raven.knit` unchanged.
 
 ## Tests
@@ -378,8 +379,7 @@ Tests that spawn Pandoc or that depend on subprocess signal delivery self-skip v
 - **`docs/knit.md`**: rewrite to reflect the new pipeline. Sections: "What Knit Preview does", "Where files go" (temp dir + how to find them), "Exporting" (HTML/PDF/Word, what each needs), "YAML options honored / ignored" (full table).
 - **`README.md`**: update the Knit feature paragraph to mention export.
 - **`docs/coexistence.md`**: note that REditorSupport.R's `r.knitRmdToPdf` etc. continue to work; user picks.
-- **`CHANGELOG.md`**: Knit → Knit Preview rename, files-to-temp, gate removed, new export commands, new settings.
-- **`CLAUDE.md`** Knit invariants section: add (1) the temp-dir layout contract, (2) the webview-export-reuses-cached-md contract.
+- **`CLAUDE.md`** Knit invariants section: add (1) the temp-dir layout contract, (2) the webview-export-reuses-cached-md contract, (3) the chunk-option injection safety rule, (4) the centralized-Pandoc-args invariant.
 
 ## Invariants worth pinning in CLAUDE.md
 
