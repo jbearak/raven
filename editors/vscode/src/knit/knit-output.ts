@@ -5,7 +5,8 @@ import { githubDark, githubLight, type GithubPalette } from './github-colors';
 export type KnitOutputMessage =
     | { type: 'refresh' }
     | { type: 'openInBrowser' }
-    | { type: 'themeChanged'; applied: boolean };
+    | { type: 'themeChanged'; applied: boolean }
+    | { type: 'themeContext'; editorBackground: string };
 
 /**
  * Marker key on `postMessage` payloads from the extension host to the
@@ -36,9 +37,10 @@ export interface VscodeThemePaletteUpdate {
  */
 export function isKnitOutputMessage(msg: unknown): msg is KnitOutputMessage {
     if (msg === null || typeof msg !== 'object') return false;
-    const m = msg as { type?: unknown; applied?: unknown };
+    const m = msg as { type?: unknown; applied?: unknown; editorBackground?: unknown };
     if (m.type === 'refresh' || m.type === 'openInBrowser') return true;
     if (m.type === 'themeChanged' && typeof m.applied === 'boolean') return true;
+    if (m.type === 'themeContext' && typeof m.editorBackground === 'string') return true;
     return false;
 }
 
@@ -793,11 +795,36 @@ export function buildShellHtml(args: {
           && iframe.contentDocument.readyState !== 'loading') {
         attachIframeInputHandlers();
       }
+      // Report the webview's actually-rendered editor background to
+      // the extension host. The host uses this to identify which
+      // theme VS Code is rendering: the public API exposes only
+      // activeColorTheme.kind, which is ambiguous when both
+      // workbench.preferredLightColorTheme and
+      // workbench.preferredDarkColorTheme have the same kind (e.g.
+      // both configured to dark themes). The actual editor background
+      // is the only public signal that lets the host match the right
+      // theme JSON.
+      function reportThemeContext() {
+        try {
+          var cs = getComputedStyle(document.documentElement);
+          var bg = (cs.getPropertyValue('--vscode-editor-background') || '').trim();
+          if (bg.length > 0) {
+            vscode.postMessage({ type: 'themeContext', editorBackground: bg });
+          }
+        } catch (e) { /* ignore — host falls back to first candidate */ }
+      }
+      // Initial report — at this point the outer shell has been
+      // styled, so the CSS variable is resolved.
+      reportThemeContext();
       // Re-apply when VS Code switches its active theme. The outer
       // shell body class flips between vscode-light, vscode-dark, or
       // vscode-high-contrast, which updates the CSS variables read
-      // by readThemeColors.
-      new MutationObserver(applyTheme).observe(document.body, {
+      // by readThemeColors. Re-report the editor background too so
+      // the host re-resolves to the new theme.
+      new MutationObserver(function () {
+        applyTheme();
+        reportThemeContext();
+      }).observe(document.body, {
         attributes: true, attributeFilter: ['class'],
       });
       syncThemeBtn();

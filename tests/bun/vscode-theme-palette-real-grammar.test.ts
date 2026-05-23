@@ -150,7 +150,7 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
 
                 const registry = makeRegistry();
                 const out = await resolveActiveThemePalette({
-                    workbenchColorThemeId: 'Test Dark Sparse',
+                    candidateThemeIds: ['Test Dark Sparse'],
                     isLight: false,
                     extensions: [makeThemeExtension(themePath)],
                     tokenColorCustomizations: undefined,
@@ -229,7 +229,7 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
 
                 const registry = makeRegistry();
                 const out = await resolveActiveThemePalette({
-                    workbenchColorThemeId: 'Test Dark Sparse',
+                    candidateThemeIds: ['Test Dark Sparse'],
                     isLight: false,
                     extensions: [makeThemeExtension(themePath)],
                     tokenColorCustomizations: undefined,
@@ -296,7 +296,7 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
 
                 const registry = makeRegistry();
                 const out = await resolveActiveThemePalette({
-                    workbenchColorThemeId: 'Test Dark Sparse',
+                    candidateThemeIds: ['Test Dark Sparse'],
                     isLight: false,
                     extensions: [makeThemeExtension(themePath)],
                     tokenColorCustomizations: undefined,
@@ -354,7 +354,7 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
 
                 const registry = makeRegistry();
                 const out = await resolveActiveThemePalette({
-                    workbenchColorThemeId: 'Test Dark Sparse',
+                    candidateThemeIds: ['Test Dark Sparse'],
                     isLight: false,
                     extensions: [makeThemeExtension(themePath)],
                     tokenColorCustomizations: undefined,
@@ -415,7 +415,7 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
 
                 const registry = makeRegistry();
                 const out = await resolveActiveThemePalette({
-                    workbenchColorThemeId: 'Test Dark Sparse',
+                    candidateThemeIds: ['Test Dark Sparse'],
                     isLight: false,
                     extensions: [makeThemeExtension(themePath)],
                     tokenColorCustomizations: undefined,
@@ -433,6 +433,106 @@ describe('resolveActiveThemePalette — against the real R grammar', () => {
                 // same" symptom. The extractor must detect this and
                 // fall back to GitHub.
                 expect(out.palette.roles.keyword.toLowerCase()).toBe('#ff7b72');
+            } finally {
+                try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        },
+    );
+
+    itLive(
+        'activeEditorBackground disambiguates two same-kind candidates',
+        async () => {
+            // Regression for the autoDetect bug: with
+            // window.autoDetectColorScheme=true and both
+            // preferredLightColorTheme + preferredDarkColorTheme
+            // configured to DARK themes (the user's actual scenario),
+            // activeColorTheme.kind=Dark for either OS appearance. The
+            // resolver can't tell which preferred-* is active from
+            // settings alone — the only reliable signal is the
+            // webview's actually-rendered --vscode-editor-background.
+            //
+            // Setup: two dark themes with distinct backgrounds. Pass
+            // both as candidates. The candidate whose
+            // colors.editor.background matches activeEditorBackground
+            // wins.
+            const tmpDir = fs.mkdtempSync(
+                path.join(require('os').tmpdir(), 'raven-theme-palette-'),
+            );
+            const themeAPath = path.join(tmpDir, 'theme-a.json');
+            const themeBPath = path.join(tmpDir, 'theme-b.json');
+            try {
+                fs.writeFileSync(
+                    themeAPath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#002b36',
+                            'editor.foreground': '#839496',
+                        },
+                        tokenColors: [
+                            { scope: 'keyword', settings: { foreground: '#859900' } },
+                        ],
+                    }),
+                    'utf-8',
+                );
+                fs.writeFileSync(
+                    themeBPath,
+                    JSON.stringify({
+                        type: 'dark',
+                        colors: {
+                            'editor.background': '#121314',
+                            'editor.foreground': '#bbbebf',
+                        },
+                        tokenColors: [
+                            { scope: 'keyword', settings: { foreground: '#c586c0' } },
+                        ],
+                    }),
+                    'utf-8',
+                );
+
+                const extA: ExtensionLike = {
+                    id: 'test.theme-a',
+                    extensionPath: tmpDir,
+                    packageJSON: {
+                        contributes: {
+                            themes: [
+                                { label: 'Theme A', path: 'theme-a.json' },
+                            ],
+                        },
+                    },
+                };
+                const extB: ExtensionLike = {
+                    id: 'test.theme-b',
+                    extensionPath: tmpDir,
+                    packageJSON: {
+                        contributes: {
+                            themes: [
+                                { label: 'Theme B', path: 'theme-b.json' },
+                            ],
+                        },
+                    },
+                };
+
+                const registry = makeRegistry();
+                // Theme B is first in the candidate list (kind-matching
+                // priority). But the webview reports Theme A's
+                // background — so the disambiguation must pick A,
+                // not B.
+                const out = await resolveActiveThemePalette({
+                    candidateThemeIds: ['Theme B', 'Theme A'],
+                    activeEditorBackground: '#002b36',
+                    isLight: false,
+                    extensions: [extA, extB],
+                    tokenColorCustomizations: undefined,
+                    semanticTokenColorCustomizations: undefined,
+                    registry,
+                    readFile: (p) => fs.promises.readFile(p, 'utf-8'),
+                });
+                expect(out.ok).toBe(true);
+                if (!out.ok) return;
+                expect(out.palette.background).toBe('#002b36');
+                expect(out.themeId).toBe('Theme A');
+                expect(out.palette.roles.keyword.toLowerCase()).toBe('#859900');
             } finally {
                 try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
             }

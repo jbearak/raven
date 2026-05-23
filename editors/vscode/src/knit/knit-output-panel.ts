@@ -109,6 +109,20 @@ export class KnitOutputPanel {
     private themePaletteLogged = false;
 
     /**
+     * The webview's most recently reported `--vscode-editor-background`,
+     * lowercased. Set by `handleMessage` on `themeContext` messages
+     * from the webview script. The resolver uses this to disambiguate
+     * between candidate themes whose kinds coincide — only the
+     * actually-rendered editor background uniquely identifies which
+     * theme VS Code is rendering.
+     *
+     * Undefined until the webview reports for the first time. While
+     * undefined, the resolver falls back to "first candidate that
+     * loads".
+     */
+    private latestEditorBackground: string | undefined;
+
+    /**
      * Open or update the panel for `args.sourceUri`. Returns
      * `{ ok: true }` on success, `{ ok: false, error }` if the rendered
      * file cannot be accessed (caller should fall back to
@@ -492,12 +506,17 @@ export class KnitOutputPanel {
                 : kind === vscode.ColorThemeKind.Dark ? 'Dark'
                 : kind === vscode.ColorThemeKind.HighContrast ? 'HighContrast'
                 : 'HighContrastLight';
+            const isLight =
+                kind === vscode.ColorThemeKind.Light
+                || kind === vscode.ColorThemeKind.HighContrastLight;
             this.output.appendLine(
                 `[theme] inputs: activeColorTheme.kind=${kindName}, ` +
                 `autoDetectColorScheme=${root.get('window.autoDetectColorScheme')}, ` +
                 `workbench.colorTheme=${JSON.stringify(root.get('workbench.colorTheme'))}, ` +
                 `preferredLight=${JSON.stringify(root.get('workbench.preferredLightColorTheme'))}, ` +
-                `preferredDark=${JSON.stringify(root.get('workbench.preferredDarkColorTheme'))}`,
+                `preferredDark=${JSON.stringify(root.get('workbench.preferredDarkColorTheme'))}, ` +
+                `candidates=${JSON.stringify(KnitOutputPanel.candidateThemeIds(isLight))}, ` +
+                `activeEditorBackground=${JSON.stringify(this.latestEditorBackground)}`,
             );
         }
         // The whole resolve path can throw if the extension context
@@ -572,7 +591,8 @@ export class KnitOutputPanel {
             kind === vscode.ColorThemeKind.Light
             || kind === vscode.ColorThemeKind.HighContrastLight;
         return resolveActiveThemePalette({
-            workbenchColorThemeId: KnitOutputPanel.activeThemeId(isLight),
+            candidateThemeIds: KnitOutputPanel.candidateThemeIds(isLight),
+            activeEditorBackground: this.latestEditorBackground,
             isLight,
             extensions: vscode.extensions.all.map((e) => ({
                 id: e.id,
@@ -588,44 +608,55 @@ export class KnitOutputPanel {
     }
 
     /**
-     * Resolve the id of the currently-active VS Code theme.
+     * Build the ordered list of candidate theme ids the resolver
+     * will try. The first whose theme JSON's `colors.editor.background`
+     * matches the webview's actual `--vscode-editor-background` wins;
+     * if there's no match (or the webview hasn't reported a bg yet),
+     * the first candidate is used.
      *
-     * `workbench.colorTheme` alone is not the answer: when the user
-     * has `window.autoDetectColorScheme: true`, VS Code switches the
-     * active theme between `workbench.preferredLightColorTheme` and
-     * `workbench.preferredDarkColorTheme` based on the OS appearance,
-     * while leaving `workbench.colorTheme` set to whatever the user
-     * last picked manually. Reading only `workbench.colorTheme` in
-     * that mode yields the WRONG theme — for example, a user whose
-     * dark preference is "Dark 2026" but who is currently in macOS
-     * light mode sees Solarized Light in the editor while we'd be
-     * extracting Dark 2026's palette.
+     * Why a list rather than a single id: when
+     * `window.autoDetectColorScheme: true` and the user has both
+     * `preferredLightColorTheme` and `preferredDarkColorTheme`
+     * configured to themes with the same kind (e.g. both dark), the
+     * public API can't tell us which one VS Code is actually
+     * rendering. `activeColorTheme.kind` returns the chosen theme's
+     * type, not the OS appearance. Providing both as candidates and
+     * letting the resolver disambiguate by editor.background is the
+     * only public-API path that gets this right.
      *
-     * The public API does not expose the active theme's id
-     * (`vscode.window.activeColorTheme` only carries `.kind`), so we
-     * reconstruct it from settings:
-     *
-     *   1. If auto-detect is enabled, use the preferred-*-color-theme
-     *      that matches the active `kind`.
-     *   2. Otherwise (or as a fallback), use `workbench.colorTheme`.
-     *
-     * `isLight` is computed from the live `activeColorTheme.kind` —
-     * the source of truth for "which variant is showing right now".
+     * Ordering: kind-matching preferred-* first (so the typical
+     * "preferredLight is a light theme, preferredDark is a dark
+     * theme" case works even without a bg hint), then the other
+     * preferred-*, then `workbench.colorTheme` as a last fallback.
      */
-    private static activeThemeId(isLight: boolean): string {
+    private static candidateThemeIds(isLight: boolean): readonly string[] {
         const root = vscode.workspace.getConfiguration();
         const autoDetect = root.get<boolean>('window.autoDetectColorScheme', false);
+        const candidates: string[] = [];
+
         if (autoDetect) {
-            const preferred = isLight
-                ? root.get<string>('workbench.preferredLightColorTheme')
-                : root.get<string>('workbench.preferredDarkColorTheme');
-            if (typeof preferred === 'string' && preferred.length > 0) {
-                return preferred;
+            const prefLight = root.get<string>('workbench.preferredLightColorTheme');
+            const prefDark = root.get<string>('workbench.preferredDarkColorTheme');
+            const first = isLight ? prefLight : prefDark;
+            const second = isLight ? prefDark : prefLight;
+            if (typeof first === 'string' && first.length > 0) candidates.push(first);
+            if (
+                typeof second === 'string'
+                && second.length > 0
+                && !candidates.includes(second)
+            ) {
+                candidates.push(second);
             }
         }
-        return vscode.workspace
+
+        const colorTheme = vscode.workspace
             .getConfiguration('workbench')
-            .get<string>('colorTheme', '') ?? '';
+            .get<string>('colorTheme', '');
+        if (typeof colorTheme === 'string' && colorTheme.length > 0 && !candidates.includes(colorTheme)) {
+            candidates.push(colorTheme);
+        }
+
+        return candidates;
     }
 
     /**
@@ -660,6 +691,22 @@ export class KnitOutputPanel {
                 KnitOutputPanel.THEME_PREFERENCE_KEY,
                 msg.applied,
             );
+            return;
+        }
+        if (msg.type === 'themeContext') {
+            // The webview just reported its actually-rendered
+            // `--vscode-editor-background`. Update our cached value
+            // and re-resolve the palette so the disambiguation by
+            // editor.background can pick the right theme JSON among
+            // the candidates. Skip if unchanged to avoid extra work
+            // on every body-class flip.
+            const bg = msg.editorBackground.trim().toLowerCase();
+            const RAVEN_HEX = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6,8})$/i;
+            if (!RAVEN_HEX.test(bg)) return;
+            if (this.latestEditorBackground === bg) return;
+            this.latestEditorBackground = bg;
+            void this.pushVscodeThemePalette();
+            return;
         }
     }
 }

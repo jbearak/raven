@@ -83,8 +83,35 @@ export interface ThemePaletteFailure {
 export type ThemePaletteOutcome = ThemePaletteSuccess | ThemePaletteFailure;
 
 export interface ThemePaletteArgs {
-    /** Value of `workbench.colorTheme` from VS Code settings. */
-    workbenchColorThemeId: string;
+    /**
+     * Ordered candidate theme ids — try each in turn. When
+     * `activeEditorBackground` is also provided, the resolver picks
+     * the first candidate whose theme JSON's `colors.editor.background`
+     * matches it; otherwise it uses the first candidate that loads
+     * successfully.
+     *
+     * Why a list and not a single id: `vscode.window.activeColorTheme`
+     * exposes only `kind`, not the active theme's id. When
+     * `window.autoDetectColorScheme` is on, VS Code picks between
+     * `workbench.preferredLightColorTheme` and
+     * `workbench.preferredDarkColorTheme` based on the OS appearance —
+     * a signal the public API does NOT surface. If both preferreds
+     * happen to have the same kind (e.g. a user who's configured both
+     * to dark themes), neither `kind` nor any other setting can
+     * disambiguate. The webview's actually-rendered
+     * `--vscode-editor-background` is the ground truth, so we lean on
+     * it.
+     */
+    candidateThemeIds: readonly string[];
+
+    /**
+     * The webview's actual `--vscode-editor-background`, read with
+     * `getComputedStyle`. Used to disambiguate among
+     * `candidateThemeIds` when settings alone aren't enough. Hex
+     * format; case-insensitive. Optional — when omitted, the first
+     * candidate is used.
+     */
+    activeEditorBackground?: string;
 
     /**
      * Whether the active theme is light. Comes from
@@ -255,38 +282,70 @@ const SEMANTIC_TYPE_TO_ROLE: Readonly<Record<string, TokenRole>> = {
 export async function resolveActiveThemePalette(
     args: ThemePaletteArgs,
 ): Promise<ThemePaletteOutcome> {
-    if (!args.workbenchColorThemeId) {
-        return { ok: false, reason: 'no-theme-id', detail: 'workbench.colorTheme is empty' };
+    if (!args.candidateThemeIds || args.candidateThemeIds.length === 0) {
+        return { ok: false, reason: 'no-theme-id', detail: 'no candidate theme ids supplied' };
     }
 
-    const located = locateThemeFile(args.workbenchColorThemeId, args.extensions);
-    if (!located) {
-        return {
-            ok: false,
-            reason: 'theme-not-found',
-            detail: `no contributed theme matches "${args.workbenchColorThemeId}"`,
-        };
+    const wantedBg = args.activeEditorBackground?.toLowerCase();
+    const realPath = args.realPath ?? ((p) => Promise.resolve(p));
+
+    // Walk candidates in order. For each, try to locate + parse. If
+    // `wantedBg` is set, prefer the candidate whose theme JSON has a
+    // matching `colors.editor.background` — that's how we know which
+    // of multiple same-kind candidates VS Code is actually rendering.
+    // If no candidate's bg matches (or there's no bg hint), use the
+    // first one that loaded successfully. Track the most relevant
+    // failure so we can report a useful error if every candidate
+    // fails.
+    let firstLoaded:
+        | { located: LocatedTheme; mergedDoc: ParsedThemeDocument }
+        | null = null;
+    let bgMatched:
+        | { located: LocatedTheme; mergedDoc: ParsedThemeDocument }
+        | null = null;
+    let lastFailureReason: ThemeFailureReason = 'theme-not-found';
+    let lastFailureDetail = `none of [${args.candidateThemeIds.join(', ')}] resolved`;
+
+    for (const candidate of args.candidateThemeIds) {
+        if (!candidate) continue;
+        const located = locateThemeFile(candidate, args.extensions);
+        if (!located) {
+            lastFailureReason = 'theme-not-found';
+            lastFailureDetail = `no contributed theme matches "${candidate}"`;
+            continue;
+        }
+        let mergedDoc: ParsedThemeDocument;
+        try {
+            mergedDoc = await loadAndMergeThemeChain({
+                entryPath: located.absolutePath,
+                readFile: args.readFile,
+                realPath,
+            });
+        } catch (err) {
+            lastFailureReason =
+                err instanceof UnsupportedFormatError ? 'unsupported-format'
+                : err instanceof ThemeCycleError ? 'cycle-detected'
+                : err instanceof ParseError ? 'parse-error'
+                : 'read-error';
+            lastFailureDetail = err instanceof Error ? err.message : String(err);
+            continue;
+        }
+        firstLoaded ??= { located, mergedDoc };
+        if (wantedBg) {
+            const themeBg = (mergedDoc.editorColors['editor.background'] ?? '').toLowerCase();
+            if (themeBg && themeBg === wantedBg) {
+                bgMatched = { located, mergedDoc };
+                break;
+            }
+        }
     }
 
-    let mergedDoc: ParsedThemeDocument;
-    try {
-        mergedDoc = await loadAndMergeThemeChain({
-            entryPath: located.absolutePath,
-            readFile: args.readFile,
-            realPath: args.realPath ?? ((p) => Promise.resolve(p)),
-        });
-    } catch (err) {
-        const reason: ThemeFailureReason =
-            err instanceof UnsupportedFormatError ? 'unsupported-format'
-            : err instanceof ThemeCycleError ? 'cycle-detected'
-            : err instanceof ParseError ? 'parse-error'
-            : 'read-error';
-        return {
-            ok: false,
-            reason,
-            detail: err instanceof Error ? err.message : String(err),
-        };
+    const picked = bgMatched ?? firstLoaded;
+    if (!picked) {
+        return { ok: false, reason: lastFailureReason, detail: lastFailureDetail };
     }
+    const located = picked.located;
+    const mergedDoc = picked.mergedDoc;
 
     const tokenColors = mergeCustomizations({
         baseTokenColors: mergedDoc.tokenColors,

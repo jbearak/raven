@@ -141,7 +141,7 @@ function readFileFrom(table: Record<string, string>) {
 
 function baseArgs(overrides: Partial<ThemePaletteArgs>): ThemePaletteArgs {
     return {
-        workbenchColorThemeId: 'Test Dark',
+        candidateThemeIds: ['Test Dark'],
         isLight: false,
         extensions: [],
         tokenColorCustomizations: undefined,
@@ -153,13 +153,13 @@ function baseArgs(overrides: Partial<ThemePaletteArgs>): ThemePaletteArgs {
 }
 
 describe('resolveActiveThemePalette — discovery', () => {
-    test('fails when workbench.colorTheme is empty', async () => {
-        const out = await resolveActiveThemePalette(baseArgs({ workbenchColorThemeId: '' }));
+    test('fails when no candidate theme ids are supplied', async () => {
+        const out = await resolveActiveThemePalette(baseArgs({ candidateThemeIds: [] }));
         expect(out.ok).toBe(false);
         if (!out.ok) expect(out.reason).toBe('no-theme-id');
     });
 
-    test('fails when no contributed theme matches the id', async () => {
+    test('fails when no contributed theme matches any candidate', async () => {
         const out = await resolveActiveThemePalette(baseArgs({ extensions: [] }));
         expect(out.ok).toBe(false);
         if (!out.ok) expect(out.reason).toBe('theme-not-found');
@@ -178,7 +178,7 @@ describe('resolveActiveThemePalette — discovery', () => {
             colors: { 'editor.background': '#222222', 'editor.foreground': '#eeeeee' },
         });
         const out = await resolveActiveThemePalette(baseArgs({
-            workbenchColorThemeId: 'theme-id-X',
+            candidateThemeIds: ['theme-id-X'],
             extensions: [ext],
             readFile: readFileFrom({ [file]: themeJson }),
         }));
@@ -197,7 +197,7 @@ describe('resolveActiveThemePalette — discovery', () => {
         });
         const file = '/exts/test/theme.json';
         const out = await resolveActiveThemePalette(baseArgs({
-            workbenchColorThemeId: 'Test Dark',
+            candidateThemeIds: ['Test Dark'],
             extensions: [ext],
             readFile: readFileFrom({
                 [file]: JSON.stringify({ type: 'dark', tokenColors: [], colors: {} }),
@@ -647,7 +647,7 @@ describe('resolveActiveThemePalette — customizations layering', () => {
             themeRelativePath: 'theme.json',
         });
         return baseArgs({
-            workbenchColorThemeId: 'My Theme',
+            candidateThemeIds: ['My Theme'],
             extensions: [ext],
             readFile: readFileFrom({
                 '/e/theme.json': JSON.stringify({
@@ -730,7 +730,7 @@ describe('resolveActiveThemePalette — customizations layering', () => {
             themeRelativePath: 'theme.json',
         });
         const out = await resolveActiveThemePalette(baseArgs({
-            workbenchColorThemeId: 'My Theme',
+            candidateThemeIds: ['My Theme'],
             extensions: [ext],
             readFile: readFileFrom({
                 '/e/theme.json': JSON.stringify({
@@ -762,7 +762,7 @@ describe('resolveActiveThemePalette — customizations layering', () => {
             themeRelativePath: 'theme.json',
         });
         const out = await resolveActiveThemePalette(baseArgs({
-            workbenchColorThemeId: 'My Theme',
+            candidateThemeIds: ['My Theme'],
             extensions: [ext],
             readFile: readFileFrom({
                 '/e/theme.json': JSON.stringify({
@@ -790,7 +790,7 @@ describe('resolveActiveThemePalette — customizations layering', () => {
             themeRelativePath: 'theme.json',
         });
         const out = await resolveActiveThemePalette(baseArgs({
-            workbenchColorThemeId: 'My Theme',
+            candidateThemeIds: ['My Theme'],
             extensions: [ext],
             readFile: readFileFrom({
                 '/e/theme.json': JSON.stringify({
