@@ -1,8 +1,10 @@
 import { describe, test, expect } from 'bun:test';
 import {
     buildShellHtml,
+    paletteCssDeclarations,
     rewriteFragmentAnchors,
 } from '../../editors/vscode/src/knit/knit-output';
+import { githubDark, githubLight } from '../../editors/vscode/src/knit/github-colors';
 
 const args = (outputPath: string, nonce = 'NONCE123', initialThemeApplied = false) => ({
     htmlContent: '<!doctype html><html><body><h1>Hi</h1></body></html>',
@@ -159,6 +161,48 @@ describe('buildShellHtml', () => {
         expect(html).toContain('--vscode-editor-background');
         expect(html).toContain('--vscode-editor-foreground');
         expect(html).toContain('--vscode-textLink-foreground');
+    });
+
+    test('theme overlay repaints code-block backgrounds from the theme', () => {
+        // The GitHub-palette base stylesheet paints pre/code with
+        // --raven-bg, which clashes with the VS Code editor bg when
+        // the theme overlay is applied. The overlay must read
+        // --vscode-textCodeBlock-background and inject a `pre`
+        // background override so code blocks pick up the theme's
+        // shading rather than staying on the GitHub palette.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('--vscode-textCodeBlock-background');
+        // The injected stylesheet paints `pre` with c.codeBg and
+        // forces `pre code` to transparent so a semi-transparent
+        // textCodeBlock-background (VS Code's default for dark
+        // themes) doesn't double-layer inside the code text area.
+        expect(html).toMatch(/pre\s*\{\s*background:/);
+        expect(html).toMatch(/pre code\s*\{\s*background:\s*transparent/);
+    });
+
+    test('theme overlay re-emits GitHub palette variant on :root', () => {
+        // The rendered document bakes --raven-c-* / --raven-fg /
+        // --raven-bg at knit time from a single GitHub palette
+        // variant. When the user switches VS Code themes after the
+        // overlay was enabled, MutationObserver re-runs applyTheme,
+        // which updates the code-block background (resolved live
+        // from --vscode-textCodeBlock-background). The overlay must
+        // also re-emit the matching GitHub palette variant on the
+        // iframe's :root so syntax-token colors stay readable on
+        // the new code-block background — otherwise dark tokens
+        // could end up painted onto a light shade or vice versa.
+        const html = buildShellHtml(args('/work/report.html'));
+        // Both variants must be baked into the shell so the script
+        // can pick at runtime without a network/build step.
+        expect(html).toContain('--raven-c-keyword: #cf222e'); // light
+        expect(html).toContain('--raven-c-keyword: #ff7b72'); // dark
+        // The variant chooser must consult the same body-class
+        // regex render-html.ts:composeStylesheet uses, so the
+        // overlay-time variant matches the bake-time one.
+        expect(html).toMatch(/vscode-\(light\|high-contrast-light\)/);
+        // The injected stylesheet must write the chosen variant
+        // into :root so var()-referencing token spans pick it up.
+        expect(html).toMatch(/:root\s*\{\s*'\s*\+\s*variantCss/);
     });
 
     test('script observes outer-shell body class for theme switches', () => {
@@ -461,5 +505,84 @@ describe('rewriteFragmentAnchors', () => {
         expect(html).not.toContain('"><script>alert(1)</script>');
         // The escaped form is what we expect.
         expect(html).toContain('&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;');
+    });
+});
+
+/**
+ * The webview-side `RAVEN_PALETTE_CSS_RE` and `paletteCssIsComplete`
+ * trust boundary in `knit-output.ts` is what gates the VS Code theme
+ * palette overlay from being applied to the iframe's stylesheet. If
+ * `paletteCssDeclarations` ever emits a shape the webview rejects, the
+ * toggle silently degrades to the GitHub palette with no diagnostic.
+ *
+ * Mirror both checks here as a guardrail test: any drift between the
+ * declarations and the accept regex/whitelist (e.g. a new TokenRole
+ * with a digit or uppercase letter, a renamed variable, a missing var)
+ * fails this test rather than silently breaking the live overlay.
+ *
+ * Keep these literals in sync with `knit-output.ts`.
+ */
+describe('paletteCssDeclarations <-> webview accept-regex round-trip', () => {
+    const RAVEN_PALETTE_CSS_RE
+        = /^(?:--raven-(?:bg|fg|c-[a-zA-Z]+): #(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6,8}); ?)+$/;
+    const REQUIRED_NAMES = [
+        '--raven-bg',
+        '--raven-fg',
+        '--raven-c-keyword',
+        '--raven-c-string',
+        '--raven-c-number',
+        '--raven-c-comment',
+        '--raven-c-function',
+        '--raven-c-type',
+        '--raven-c-variable',
+        '--raven-c-operator',
+        '--raven-c-punctuation',
+        '--raven-c-constant',
+    ];
+
+    function paletteCssIsComplete(css: string): boolean {
+        const seen = new Set<string>();
+        const pat = /--raven-(?:bg|fg|c-[a-zA-Z]+)(?=:)/g;
+        let m: RegExpExecArray | null;
+        while ((m = pat.exec(css)) !== null) {
+            if (seen.has(m[0])) return false;
+            seen.add(m[0]);
+        }
+        for (const name of REQUIRED_NAMES) {
+            if (!seen.has(name)) return false;
+        }
+        return seen.size === REQUIRED_NAMES.length;
+    }
+
+    test('githubLight palette is accepted by the shape regex', () => {
+        const css = paletteCssDeclarations(githubLight);
+        expect(RAVEN_PALETTE_CSS_RE.test(css)).toBe(true);
+    });
+
+    test('githubDark palette is accepted by the shape regex', () => {
+        const css = paletteCssDeclarations(githubDark);
+        expect(RAVEN_PALETTE_CSS_RE.test(css)).toBe(true);
+    });
+
+    test('githubLight palette contains every required variable name', () => {
+        const css = paletteCssDeclarations(githubLight);
+        expect(paletteCssIsComplete(css)).toBe(true);
+    });
+
+    test('githubDark palette contains every required variable name', () => {
+        const css = paletteCssDeclarations(githubDark);
+        expect(paletteCssIsComplete(css)).toBe(true);
+    });
+
+    test('a payload missing a required variable is rejected', () => {
+        // Drop --raven-c-constant.
+        const css = paletteCssDeclarations(githubLight)
+            .replace(/--raven-c-constant: #[0-9a-fA-F]+; ?/, '');
+        expect(paletteCssIsComplete(css)).toBe(false);
+    });
+
+    test('a payload with a duplicated variable is rejected', () => {
+        const css = paletteCssDeclarations(githubLight) + ' --raven-bg: #ffffff;';
+        expect(paletteCssIsComplete(css)).toBe(false);
     });
 });

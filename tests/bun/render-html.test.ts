@@ -26,6 +26,15 @@ function fakeRegistry(
         async primeForLanguage(languageId) {
             return Boolean(tokenizers[languageId.toLowerCase()]);
         },
+        async extractWithTheme(_themeSettings, _inner) {
+            // The render-html pipeline only consumes the raw-scope path
+            // (`tokenizeLineForLanguage`); the theme-aware extraction
+            // is the panel/palette resolver's responsibility. Throw so
+            // any test that wires this fake through a code path that
+            // does need theme extraction fails loudly rather than
+            // silently returning bogus values.
+            throw new Error('fakeRegistry.extractWithTheme is not implemented');
+        },
     };
 }
 

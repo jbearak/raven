@@ -46,7 +46,7 @@ import {
     registerActivationReactivity,
     resolveRConsoleActivation,
 } from './r-console-activation';
-import { registerKnit } from './knit';
+import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit';
 import { registerInstallNags } from './recommendations/install-nag';
 import { registerWalkthroughCommands } from './recommendations/walkthrough';
 import { validateServerBinary } from './server-binary-check';
@@ -753,6 +753,14 @@ function toTomlScalar(v: unknown): string {
 let active_plot_services: PlotServices | null = null;
 
 export function deactivate(): Thenable<void> | undefined {
+    // Drop the knit grammar registry's cached `vscode.extensions.onDidChange`
+    // listener. VS Code does NOT unload the JS module on deactivate, so
+    // the module-scoped reference would otherwise survive into a
+    // subsequent activation (disable→enable in the Extensions view, dev
+    // reload) as a non-null but disposed Disposable — leaving the new
+    // context's `subscriptions` array without a fresh listener and the
+    // cached registry permanently stale across install/uninstall events.
+    disposeKnitGrammarRegistryForDeactivation();
     const stops: Thenable<void>[] = [];
     if (active_plot_services) stops.push(active_plot_services.dispose());
     if (client) stops.push(client.stop());

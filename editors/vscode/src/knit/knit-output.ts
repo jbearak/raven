@@ -1,10 +1,43 @@
 import * as path from 'path';
 import { parseRenderedOutputPath } from './output-path';
+import { githubDark, githubLight, type GithubPalette } from './github-colors';
 
 export type KnitOutputMessage =
     | { type: 'refresh' }
     | { type: 'openInBrowser' }
-    | { type: 'themeChanged'; applied: boolean };
+    | { type: 'themeChanged'; applied: boolean }
+    | { type: 'themeContext'; editorBackground: string }
+    /**
+     * The webview just finished booting (initial load or panel reuse).
+     * Asks the host to (re-)resolve and push the current VS Code theme
+     * palette. Needed for the panel-reuse path: setting
+     * `panel.webview.html` discards the prior document and its message
+     * listener; a synchronous postMessage from the host can race the
+     * fresh shell's `addEventListener('message')` and be silently
+     * dropped. Having the new shell pull instead avoids the race.
+     */
+    | { type: 'requestPalette' };
+
+/**
+ * Marker key on `postMessage` payloads from the extension host to the
+ * outer-shell script. We discriminate via a property instead of a
+ * `type:` field because the existing in-iframe probe path also uses
+ * `event.data.__ravenKnitProbe`, and a shared discriminator field
+ * would risk silent collision with that or with VS Code-injected
+ * message shapes.
+ */
+export const VSCODE_PALETTE_UPDATE_KEY = '__ravenVscodeThemePalette';
+
+export interface VscodeThemePaletteUpdate {
+    /** Marker — must equal `true`. */
+    __ravenVscodeThemePalette: true;
+    /**
+     * Pre-built CSS declarations matching `paletteCssDeclarations` for
+     * the VS Code theme. `null` clears the override so the toggle
+     * falls back to the GitHub variant.
+     */
+    css: string | null;
+}
 
 /**
  * Strict type-narrowing for messages posted from the Knit Output webview.
@@ -14,9 +47,11 @@ export type KnitOutputMessage =
  */
 export function isKnitOutputMessage(msg: unknown): msg is KnitOutputMessage {
     if (msg === null || typeof msg !== 'object') return false;
-    const m = msg as { type?: unknown; applied?: unknown };
+    const m = msg as { type?: unknown; applied?: unknown; editorBackground?: unknown };
     if (m.type === 'refresh' || m.type === 'openInBrowser') return true;
     if (m.type === 'themeChanged' && typeof m.applied === 'boolean') return true;
+    if (m.type === 'themeContext' && typeof m.editorBackground === 'string') return true;
+    if (m.type === 'requestPalette') return true;
     return false;
 }
 
@@ -62,6 +97,35 @@ export function classify(
     const parsed = parseRenderedOutputPath(result.stdout + '\n' + result.stderr).paths;
     if (parsed.length === 0) return { kind: 'noOutput' };
     return { kind: 'ok', parsedOutputs: parsed, cwd: ctx.cwd };
+}
+
+/**
+ * Build the CSS variable declarations for a single GitHub palette
+ * variant, in the same shape `render-html.ts:paletteAsCssVars` emits
+ * when baking the rendered document. Used by the theme overlay to
+ * re-emit `--raven-bg` / `--raven-fg` / `--raven-c-*` at overlay time
+ * so the syntax-highlight palette tracks VS Code theme switches in
+ * lockstep with the code-block background. Without this re-emit, a
+ * theme switch after knit would update `--vscode-textCodeBlock-
+ * background` (resolved live from the outer shell) while leaving the
+ * baked-at-knit `--raven-c-*` tokens on the original variant — e.g.
+ * dark tokens on a light shade.
+ */
+export function paletteCssDeclarations(palette: GithubPalette): string {
+    return [
+        `--raven-bg: ${palette.background};`,
+        `--raven-fg: ${palette.foreground};`,
+        `--raven-c-keyword: ${palette.roles.keyword};`,
+        `--raven-c-string: ${palette.roles.string};`,
+        `--raven-c-number: ${palette.roles.number};`,
+        `--raven-c-comment: ${palette.roles.comment};`,
+        `--raven-c-function: ${palette.roles.function};`,
+        `--raven-c-type: ${palette.roles.type};`,
+        `--raven-c-variable: ${palette.roles.variable};`,
+        `--raven-c-operator: ${palette.roles.operator};`,
+        `--raven-c-punctuation: ${palette.roles.punctuation};`,
+        `--raven-c-constant: ${palette.roles.constant};`,
+    ].join(' ');
 }
 
 /**
@@ -122,12 +186,37 @@ export function buildShellHtml(args: {
      * recreation between knits.
      */
     initialThemeApplied: boolean;
+    /**
+     * Pre-built CSS declarations for the active VS Code theme's
+     * resolved palette, matching the same shape
+     * `paletteCssDeclarations` returns. When non-null, the toggle's
+     * applyTheme() prefers these colors over the GitHub variant. If
+     * the resolver failed (theme JSON not found, parse error, etc.)
+     * the caller passes `null` and the toggle falls back to the
+     * GitHub variant — same behavior as before this feature shipped.
+     */
+    vscodeThemePaletteCss?: string | null;
 }): string {
-    const { htmlContent, baseHref, cspSource, outputPath, nonce, initialThemeApplied } = args;
+    const {
+        htmlContent,
+        baseHref,
+        cspSource,
+        outputPath,
+        nonce,
+        initialThemeApplied,
+        vscodeThemePaletteCss,
+    } = args;
     // path.basename handles both POSIX and Windows separators.
     const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
     const basename = lastSep >= 0 ? outputPath.slice(lastSep + 1) : outputPath;
     const safeName = escapeHtml(basename);
+    // Baked-in CSS strings for the two GitHub palette variants. The
+    // overlay script picks one at runtime based on VS Code's current
+    // theme variant (read from `document.body.className`) and writes
+    // it into the iframe's `:root` so syntax-token colors stay in
+    // sync with the live code-block background.
+    const lightPaletteCss = paletteCssDeclarations(githubLight);
+    const darkPaletteCss = paletteCssDeclarations(githubDark);
 
     // about:srcdoc bypasses `frame-src` per CSP3, but VS Code's webview
     // can occasionally route the inline document through a real URL
@@ -325,6 +414,49 @@ export function buildShellHtml(args: {
       // show cycle leaves the in-memory variable intact.
       let themeApplied = ${initialThemeApplied ? 'true' : 'false'};
 
+      // GitHub palette variants serialized at build time. We pick
+      // one at overlay-apply time based on the active VS Code
+      // theme variant so the syntax-token colors (which the
+      // rendered document references via --raven-c-*) match the
+      // live code-block background. Without this swap, switching
+      // themes after knit could leave e.g. dark-palette tokens on
+      // a light textCodeBlock background.
+      const RAVEN_PALETTE_CSS = {
+        light: ${JSON.stringify(lightPaletteCss)},
+        dark: ${JSON.stringify(darkPaletteCss)},
+      };
+
+      // Resolved VS Code theme palette. When non-null, the toggle
+      // paints these colors instead of the GitHub variant. The
+      // extension host posts replacement values whenever the active
+      // theme or relevant editor.* settings change; the receiver
+      // below applies the update and re-runs applyTheme so the
+      // change shows up immediately without a re-knit.
+      let vscodePaletteCss = ${
+          typeof vscodeThemePaletteCss === 'string' && vscodeThemePaletteCss.length > 0
+              ? JSON.stringify(vscodeThemePaletteCss)
+              : 'null'
+      };
+
+      function activePaletteVariant() {
+        // Mirror the regex used by render-html.ts:composeStylesheet
+        // so the overlay-time variant choice matches the bake-time
+        // logic. vscode-high-contrast (no -light suffix) is the
+        // dark high-contrast variant; vscode-high-contrast-light
+        // is the light one.
+        const cls = document.body.className || '';
+        return /\\bvscode-(light|high-contrast-light)\\b/.test(cls) ? 'light' : 'dark';
+      }
+
+      function activePaletteCss() {
+        // VS Code-extracted palette wins over the GitHub default.
+        // Falling through to GitHub when the resolver failed lets
+        // the toggle still produce a coherent code-block look
+        // matching the live background.
+        if (vscodePaletteCss !== null) return vscodePaletteCss;
+        return RAVEN_PALETTE_CSS[activePaletteVariant()];
+      }
+
       function syncThemeBtn() {
         // Rmd output has no "document theme" — the toggle just
         // controls whether VS Code theming is overlaid. Keep the
@@ -339,10 +471,18 @@ export function buildShellHtml(args: {
           const x = cs.getPropertyValue(name).trim();
           return x.length > 0 ? x : fallback;
         }
+        const bg = v('--vscode-editor-background', '#1e1e1e');
         return {
-          bg: v('--vscode-editor-background', '#1e1e1e'),
+          bg: bg,
           fg: v('--vscode-editor-foreground', '#cccccc'),
           link: v('--vscode-textLink-foreground', '#3794ff'),
+          // textCodeBlock-background is the variable VS Code's own
+          // markdown preview uses for code-block shading; it's
+          // defined by most themes with a subtle tint relative to
+          // the editor background. Fall back to editor-background
+          // for themes that don't set it so the block bg at least
+          // matches the surrounding surface.
+          codeBg: v('--vscode-textCodeBlock-background', bg),
         };
       }
 
@@ -365,10 +505,64 @@ export function buildShellHtml(args: {
           host.appendChild(style);
         }
         const c = readThemeColors();
+        // The GitHub-palette base stylesheet paints both <pre> and
+        // its inner <code> with --raven-bg. Override both so the
+        // syntax-highlight wrapper and any inline <code> in prose
+        // pick up the theme's code-block shading. We ALSO re-emit
+        // the matching GitHub palette variant on :root: token spans
+        // reference --raven-c-* via var(), so updating those vars
+        // here cascades into them automatically and keeps the
+        // syntax-token foreground in lockstep with the live code-
+        // block background. Without this, a VS Code theme switch
+        // after knit would update --vscode-textCodeBlock-background
+        // (resolved live from the outer shell) while leaving token
+        // colors on the baked-at-knit variant — i.e. dark tokens
+        // on a light background, or vice versa.
+        const variantCss = activePaletteCss();
         style.textContent =
-          'html, body { background: ' + c.bg + ' !important; '
+          ':root { ' + variantCss + ' }'
+          + ' html, body { background: ' + c.bg + ' !important; '
           + 'color: ' + c.fg + ' !important; }'
-          + ' a { color: ' + c.link + ' !important; }';
+          + ' a { color: ' + c.link + ' !important; }'
+          // Block code: paint c.codeBg on pre only, and force
+          // pre>code to transparent. textCodeBlock-background is
+          // often a semi-transparent overlay (VS Code default for
+          // dark themes is rgba(10,10,10,0.4)); applying it to BOTH
+          // pre AND its child code stacks the overlay twice inside
+          // the code text area, producing a visible highlight around
+          // the text vs the pre padding region. Painting only pre
+          // keeps the layering at one level — the code area shows
+          // through transparently to the same color as its
+          // surrounding padding.
+          + ' pre { background: ' + c.codeBg + ' !important; }'
+          + ' pre code { background: transparent !important; }'
+          // Inline <code> in prose — not inside <pre> — should also
+          // pick up the textCodeBlock shading so the inline form
+          // matches the block form's surface. The base stylesheet
+          // paints all <code> with --raven-bg; without this rule
+          // the inline form would keep --raven-bg (which we re-emit
+          // via the GitHub variant on :root above) and visibly
+          // diverge from the block form whenever the theme's
+          // textCodeBlock-background differs from the editor
+          // background.
+          + ' :not(pre) > code { background: ' + c.codeBg + ' !important; }'
+          // Defensive: zero out every paint property that could
+          // give code-block spans a per-token visual chrome. Spans
+          // are inline elements whose background-color should never
+          // paint, but some webview rendering paths apply subtle
+          // effects to highlighted text. Forcing the relevant
+          // properties to no-paint defaults keeps the rendered code
+          // looking like the editor.
+          + ' pre code span, code span {'
+          + ' background: transparent !important;'
+          + ' background-color: transparent !important;'
+          + ' background-image: none !important;'
+          + ' text-shadow: none !important;'
+          + ' box-shadow: none !important;'
+          + ' outline: none !important;'
+          + ' border: 0 !important;'
+          + ' filter: none !important;'
+          + ' text-decoration: none !important; }';
         // Paint the iframe element itself too so the brief flash
         // before the inner document parses also matches the theme.
         iframe.style.background = c.bg;
@@ -650,20 +844,134 @@ export function buildShellHtml(args: {
           && iframe.contentDocument.readyState !== 'loading') {
         attachIframeInputHandlers();
       }
+      // Report the webview's actually-rendered editor background to
+      // the extension host. The host uses this to identify which
+      // theme VS Code is rendering: the public API exposes only
+      // activeColorTheme.kind, which is ambiguous when both
+      // workbench.preferredLightColorTheme and
+      // workbench.preferredDarkColorTheme have the same kind (e.g.
+      // both configured to dark themes). The actual editor background
+      // is the only public signal that lets the host match the right
+      // theme JSON.
+      function reportThemeContext() {
+        try {
+          var cs = getComputedStyle(document.documentElement);
+          var bg = (cs.getPropertyValue('--vscode-editor-background') || '').trim();
+          if (bg.length > 0) {
+            vscode.postMessage({ type: 'themeContext', editorBackground: bg });
+          }
+        } catch (e) { /* ignore — host falls back to first candidate */ }
+      }
+      // Initial report — at this point the outer shell has been
+      // styled, so the CSS variable is resolved.
+      reportThemeContext();
+      // Ask the host to (re-)resolve and push the current VS Code
+      // theme palette. The host's pushVscodeThemePalette already
+      // fires on theme/config events, but on a panel reuse the host
+      // sets webview.html and then pushes — that postMessage can
+      // race the fresh shell's listener registration and be lost.
+      // Pulling once from this fully-booted state guarantees we
+      // never see the stale baked palette permanently.
+      vscode.postMessage({ type: 'requestPalette' });
       // Re-apply when VS Code switches its active theme. The outer
       // shell body class flips between vscode-light, vscode-dark, or
       // vscode-high-contrast, which updates the CSS variables read
-      // by readThemeColors.
-      new MutationObserver(applyTheme).observe(document.body, {
+      // by readThemeColors. Re-report the editor background too so
+      // the host re-resolves to the new theme.
+      new MutationObserver(function () {
+        applyTheme();
+        reportThemeContext();
+      }).observe(document.body, {
         attributes: true, attributeFilter: ['class'],
       });
       syncThemeBtn();
-      // Diagnostic probe — the extension host can verify the iframe
-      // successfully navigated to the rendered file rather than
-      // silently staying on about:blank.
+
+      // VS Code theme palette updates from the extension host. We
+      // accept the css string only when it round-trips through a
+      // strict shape check — the field is concatenated into
+      // style.textContent, so a malformed value (or one bearing CSS
+      // that escapes the var-declaration form) would corrupt the
+      // iframe stylesheet. The regex matches the exact declaration
+      // sequence paletteCssDeclarations emits; anything else is
+      // dropped and the toggle falls back to the GitHub variant.
+      //
+      // The role-suffix accepts mixed case so future TokenRole names
+      // mirroring VS Code semantic-token type names (e.g.
+      // 'enumMember') stay representable. The hex literal mirrors
+      // vscode-theme-palette.ts:HEX_COLOR_RE — accept only the four
+      // CSS-spec hex lengths (3, 4, 6, 8); the wider {3,8} form would
+      // silently pass 5/7-digit malformed values that no current code
+      // path emits but a future refactor could.
+      var RAVEN_PALETTE_CSS_RE = /^(?:--raven-(?:bg|fg|c-[a-zA-Z]+): #(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6,8}); ?)+$/;
+      // Names paletteCssDeclarations is contracted to emit, in the
+      // SAME order. We assert the entire set is present, with no
+      // duplicates and no extras, so a partial payload (which the
+      // open-ended (?: ... ; ?)+ above otherwise accepts) cannot
+      // silently override the baked GitHub palette with a missing
+      // var that then falls back to the OTHER variant. Keep in
+      // lockstep with paletteCssDeclarations.
+      var RAVEN_PALETTE_REQUIRED_NAMES = [
+        '--raven-bg',
+        '--raven-fg',
+        '--raven-c-keyword',
+        '--raven-c-string',
+        '--raven-c-number',
+        '--raven-c-comment',
+        '--raven-c-function',
+        '--raven-c-type',
+        '--raven-c-variable',
+        '--raven-c-operator',
+        '--raven-c-punctuation',
+        '--raven-c-constant',
+      ];
+      function paletteCssIsComplete(css) {
+        var seen = Object.create(null);
+        var pat = /--raven-(?:bg|fg|c-[a-zA-Z]+)(?=:)/g;
+        var m;
+        while ((m = pat.exec(css)) !== null) {
+          if (seen[m[0]]) return false; // dup
+          seen[m[0]] = true;
+        }
+        for (var i = 0; i < RAVEN_PALETTE_REQUIRED_NAMES.length; i++) {
+          if (!seen[RAVEN_PALETTE_REQUIRED_NAMES[i]]) return false;
+        }
+        // Count seen names too — refuse extras. seen is created with
+        // Object.create(null), so it has no prototype: every enumerable
+        // key is an own property and for...in only visits those. The
+        // null prototype also means seen.hasOwnProperty is undefined,
+        // so calling it would throw — count keys directly instead.
+        var count = 0;
+        for (var k in seen) count++;
+        return count === RAVEN_PALETTE_REQUIRED_NAMES.length;
+      }
       window.addEventListener('message', function (event) {
         var data = event && event.data;
-        if (!data || data.__ravenKnitProbe !== true) return;
+        if (!data) return;
+        if (data.__ravenVscodeThemePalette === true) {
+          if (typeof data.css === 'string'
+              && RAVEN_PALETTE_CSS_RE.test(data.css)
+              && paletteCssIsComplete(data.css)) {
+            vscodePaletteCss = data.css;
+          } else {
+            vscodePaletteCss = null;
+          }
+          applyTheme();
+          return;
+        }
+        if (data.__ravenRequestThemeContext === true) {
+          // The host asked us to re-report the current editor.bg.
+          // Fires on theme changes that the MutationObserver above
+          // doesn't catch — specifically, swaps between two themes
+          // of the same kind (e.g. Solarized Dark <-> Dark 2026,
+          // both kind=Dark). Body class stays the same, so the
+          // MutationObserver doesn't fire, so the host's cached
+          // latestEditorBackground would stay on the old theme's
+          // bg. The host invalidates its cache and then pokes us
+          // here; we read the current bg and post it back.
+          reportThemeContext();
+          return;
+        }
+        if (data.__ravenKnitProbe !== true) return;
         var locationHref = '';
         try {
           locationHref = iframe.contentWindow ? iframe.contentWindow.location.href : '';

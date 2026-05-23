@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { registerKnitCommands } from './knit-commands';
+import { disposeKnitGrammarRegistryForDeactivation } from './post-knit-renderer';
+
+export { disposeKnitGrammarRegistryForDeactivation };
 
 /**
  * Register `Raven: Knit` and its output-channel command. The commands

@@ -52,14 +52,28 @@ let extensionsChangeListener: vscode.Disposable | null = null;
 
 function getOrCreateRegistry(context: vscode.ExtensionContext): GrammarRegistry {
     if (extensionsChangeListener === null) {
-        extensionsChangeListener = vscode.extensions.onDidChange(() => {
+        const listener = vscode.extensions.onDidChange(() => {
             cachedRegistry = null;
         });
         // The disposable's owner is the extension's lifetime — if
         // anyone calls `runPostKnitRender` they're inside the
         // extension activation, so subscribing the disposable here
         // is safe.
-        context.subscriptions.push(extensionsChangeListener);
+        //
+        // Test stubs occasionally pass `{} as ExtensionContext` with
+        // no `subscriptions` array; pushing into `undefined` would
+        // throw and (worse) leave the listener registered but
+        // un-owned. Catch and restore so the next call retries
+        // cleanly.
+        const subs = (context as { subscriptions?: { push?: unknown } }).subscriptions;
+        if (subs && typeof subs.push === 'function') {
+            (subs as vscode.Disposable[]).push(listener);
+            extensionsChangeListener = listener;
+        } else {
+            // No subscriptions list — drop the listener immediately
+            // rather than leak it for the test session's lifetime.
+            listener.dispose();
+        }
     }
     if (cachedRegistry !== null) return cachedRegistry;
     const onigWasmPath = resolveOnigWasmPath(context);
@@ -76,6 +90,39 @@ export function __resetRegistryCacheForTesting(): void {
     cachedRegistry = null;
     extensionsChangeListener?.dispose();
     extensionsChangeListener = null;
+}
+
+/**
+ * Called from `extension.deactivate()` so a subsequent reactivation
+ * within the same Node process (dev/test reload, disable→enable of the
+ * extension) starts from a clean slate. Without this, the
+ * module-scoped `extensionsChangeListener` would still reference a
+ * disposed Disposable on the second activate, the
+ * `extensionsChangeListener === null` guard in `getOrCreateRegistry`
+ * would skip listener re-registration against the new context, and
+ * `cachedRegistry` would never be invalidated on subsequent
+ * install/uninstall events.
+ */
+export function disposeKnitGrammarRegistryForDeactivation(): void {
+    cachedRegistry = null;
+    extensionsChangeListener?.dispose();
+    extensionsChangeListener = null;
+}
+
+/**
+ * Public access to the cached `GrammarRegistry`. The Knit Output panel
+ * uses this to probe the active VS Code theme via
+ * `vscode-theme-palette.ts` — the same registry the post-knit
+ * renderer uses, so we reuse its loaded grammars and the cost-amortized
+ * onig WASM load.
+ *
+ * Safe to call concurrently with `runPostKnitRender`: the registry's
+ * theme-aware path (`extractWithTheme`) is serialized internally, and
+ * the highlighter path (`tokenizeLineForLanguage`) is not affected by
+ * theme state.
+ */
+export function getKnitGrammarRegistry(context: vscode.ExtensionContext): GrammarRegistry {
+    return getOrCreateRegistry(context);
 }
 
 /**

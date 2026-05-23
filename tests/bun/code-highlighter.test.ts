@@ -34,6 +34,11 @@ function fakeRegistry(
         async primeForLanguage(languageId) {
             return Boolean(tokenizers[languageId.toLowerCase()]);
         },
+        async extractWithTheme(_themeSettings, _inner) {
+            // The highlighter only uses `tokenizeLineForLanguage`;
+            // theme-aware extraction is the palette resolver's path.
+            throw new Error('fakeRegistry.extractWithTheme is not implemented');
+        },
     };
 }
 
@@ -273,6 +278,9 @@ describe('highlightCodeBlock', () => {
             primeForLanguage: async () => {
                 calls++;
                 return true;
+            },
+            extractWithTheme: async () => {
+                throw new Error('extractWithTheme should not be called from highlightCodeBlock');
             },
         };
         const html = await highlightCodeBlock({

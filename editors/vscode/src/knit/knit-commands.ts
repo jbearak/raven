@@ -170,6 +170,36 @@ async function runKnitCommand(
     let documentText: string;
     try {
         const doc = await vscode.workspace.openTextDocument(docUri);
+        // knitr reads the .Rmd from disk via R's `readLines`, not from
+        // VS Code's in-memory buffer. If the editor has unsaved
+        // changes, the knit output would silently reflect the
+        // stale-on-disk version — which is indistinguishable from "the
+        // knit didn't work" from the user's perspective. Save before
+        // running so the disk and the buffer agree.
+        //
+        // `save()` returns false if a participant (formatter,
+        // codeActionsOnSave, etc.) refuses the save. In that case we
+        // can't know whether the disk reflects the user's intent, so
+        // surface the failure and bail rather than knit a stale file.
+        if (doc.isDirty) {
+            let saved = false;
+            try {
+                saved = await doc.save();
+            } catch (err) {
+                output.show(true);
+                output.appendLine(
+                    `[knit] save failed for ${fsPath}: ` +
+                    (err instanceof Error ? err.message : String(err)),
+                );
+            }
+            if (!saved) {
+                await vscode.window.showWarningMessage(
+                    `Raven: Knit — could not save ${path.basename(fsPath)}. ` +
+                    `The knit output would not reflect your unsaved changes.`,
+                );
+                return;
+            }
+        }
         documentText = doc.getText();
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -420,15 +450,26 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
             htmlPath,
             context: ctx.context,
             client: ctx.getLanguageClient(),
-            // Pass VS Code's active theme through so the rendered
-            // `<basename>.html` paints panel-side code spans with
-            // the editor theme rather than the user's OS color
-            // scheme. The standalone "Open in Browser" surface
-            // still gets the `prefers-color-scheme` swap because
-            // the .html embeds both palettes when `themeClasses`
-            // doesn't pin one — but here we DO want the panel to
-            // follow VS Code, so we pin the matching class.
-            themeClasses: themeClassesForActiveTheme(),
+            // The same `.html` is loaded by both the panel iframe
+            // AND "Open in Browser", so the file can't carry
+            // surface-specific theme logic — it's a frozen
+            // snapshot. We leave `themeClasses` null so
+            // `composeStylesheet` emits both palettes and swaps
+            // them on `@media (prefers-color-scheme: dark)`:
+            //
+            //   - Browser: the media query resolves against the
+            //     host OS, so the file auto-detects light/dark.
+            //   - Webview iframe: VS Code reports
+            //     `prefers-color-scheme` via the editor theme
+            //     kind (which usually mirrors the OS — with
+            //     `window.autoDetectColorScheme` on, it's exactly
+            //     the OS).
+            //
+            // Users who want the panel to paint VS Code's editor
+            // theme regardless of OS can toggle "Apply VS Code
+            // theme" — that overlay supersedes the baked palette
+            // and re-resolves on every theme change.
+            themeClasses: null,
         });
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -590,41 +631,6 @@ function absolutizeFromCwd(raw: string, cwd: string): string {
     return path.resolve(cwd, raw);
 }
 
-/**
- * Map VS Code's active color theme to the body-class string the
- * knit render pipeline expects. The string flows through
- * `runPostKnitRender` → `renderKnitHtml` → `composeStylesheet`,
- * whose regex matches `vscode-(light|high-contrast-light)` for the
- * light branch and treats everything else as dark. We emit the
- * canonical body-class name for each `ColorThemeKind` so future
- * stylesheet rules can target high-contrast variants distinctly if
- * they want to.
- *
- * Captured at render time only — the rendered `.html` is a snapshot
- * on disk and does NOT re-render when the user flips themes. That
- * gap is acceptable for an `Raven: Knit` invocation: the user has
- * to re-knit to see updated R output anyway, and the standalone
- * "Open in Browser" surface already covers OS-level dark mode via
- * the embedded `prefers-color-scheme` swap when `themeClasses` is
- * null.
- */
-function themeClassesForActiveTheme(): string {
-    switch (vscode.window.activeColorTheme.kind) {
-        case vscode.ColorThemeKind.Light:
-            return 'vscode-light';
-        case vscode.ColorThemeKind.Dark:
-            return 'vscode-dark';
-        case vscode.ColorThemeKind.HighContrast:
-            return 'vscode-high-contrast';
-        case vscode.ColorThemeKind.HighContrastLight:
-            return 'vscode-high-contrast-light';
-        default:
-            // Future-proof: a new `ColorThemeKind` should default to
-            // the dark branch (which composeStylesheet uses as its
-            // catch-all) rather than crashing.
-            return 'vscode-dark';
-    }
-}
 
 /**
  * Build the `Blocker` we surface when YAML `output:` resolves to a
