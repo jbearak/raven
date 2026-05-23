@@ -49,6 +49,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.editor.dotInWordSeparators` | `"ask"` | `"ask"` \| `"yes"` \| `"no"` | — | [editor-integrations](editor-integrations.md) | Whether to exclude dots from word separators in R and JAGS files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it. |
 | `raven.help.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [help-viewer](help-viewer.md) | Initial editor column when the R help viewer first opens. |
 | `raven.indentation.style` | `"rstudio"` | `"rstudio"` \| `"rstudio-minus"` \| `"off"` | `indentation.style` | [indentation](indentation.md) | Indentation style for R code. |
+| `raven.knit.export.timeoutMs` | `120000` | integer (≥5000) | — | [knit](knit.md) | Timeout (milliseconds) for the Pandoc subprocess used by Knit: Export to PDF / Word / HTML. |
 | `raven.knit.fontFamily` | `""` | string | — | [knit](knit.md) | Body/prose font for the Raven: Knit preview. |
 | `raven.knit.monospaceFontFamily` | `""` | string | — | [knit](knit.md) | Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit preview. |
 | `raven.knit.timeoutMs` | `600000` | integer (≥1000) | — | [knit](knit.md) | Hard timeout (milliseconds) for the Raven: Knit subprocess. |
@@ -87,6 +88,8 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.packages.rPath` | `""` | string | `packages.rPath` | [r-package-dev](r-package-dev.md) | Path to the R executable used for non-interactive subprocess calls (package introspection, library path discovery). |
 | `raven.packages.watchDebounceMs` | `500` | integer (100–5000) | `packages.watchDebounceMs` | [r-package-dev](r-package-dev.md) | Debounce window for batching library path filesystem events, in milliseconds. |
 | `raven.packages.watchLibraryPaths` | `true` | boolean | `packages.watchLibraryPaths` | [r-package-dev](r-package-dev.md) | Watch R library paths for package install/remove events and refresh diagnostics automatically. |
+| `raven.pandoc.path` | `""` | string | — | — | Absolute path to a Pandoc binary. |
+| `raven.pandoc.pdfEngine` | `"xelatex"` | `"xelatex"` \| `"pdflatex"` \| `"lualatex"` \| `"tectonic"` \| `"wkhtmltopdf"` | — | — | LaTeX engine used by Pandoc when exporting to PDF. |
 | `raven.plot.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [plot-viewer](plot-viewer.md) | Initial editor column when the plot viewer first opens. |
 | `raven.rConsole.activation` | `"auto"` | `"enabled"` \| `"disabled"` \| `"auto"` | — | [r-console](r-console.md) | Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd knit command. |
 | `raven.rTerminal.program` | `"R"` | `"R"` \| `"arf"` \| `"radian"` | — | [r-console](r-console.md) | Program to use for the R terminal. 'R' is the standard R console; 'arf' and 'radian' are modern third-party R consoles (must be installed separately). |

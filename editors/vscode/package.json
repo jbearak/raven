@@ -211,7 +211,22 @@
       },
       {
         "command": "raven.knit",
-        "title": "Knit",
+        "title": "Knit Preview",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.knit.exportHtml",
+        "title": "Knit: Export to HTML…",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.knit.exportPdf",
+        "title": "Knit: Export to PDF…",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.knit.exportDocx",
+        "title": "Knit: Export to Word…",
         "category": "Raven"
       },
       {
@@ -382,6 +397,18 @@
           "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
         },
         {
+          "command": "raven.knit.exportHtml",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        },
+        {
+          "command": "raven.knit.exportPdf",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        },
+        {
+          "command": "raven.knit.exportDocx",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        },
+        {
           "command": "raven.knit.openOutputChannel"
         }
       ],
@@ -469,9 +496,24 @@
           "group": "4_file@1"
         },
         {
+          "command": "raven.knit.exportHtml",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "group": "4_file@2"
+        },
+        {
+          "command": "raven.knit.exportPdf",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "group": "4_file@3"
+        },
+        {
+          "command": "raven.knit.exportDocx",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "group": "4_file@4"
+        },
+        {
           "command": "raven.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "4_file@2"
+          "group": "4_file@5"
         },
         {
           "submenu": "raven.sendToR.terminal",
@@ -1255,6 +1297,30 @@
           "default": 600000,
           "minimum": 1000,
           "description": "Hard timeout (milliseconds) for the Raven: Knit subprocess. After this elapses, Raven escalates the kill ladder (SIGINT → SIGTERM → SIGKILL) and surfaces a 'Knit timed out' message."
+        },
+        "raven.knit.export.timeoutMs": {
+          "type": "integer",
+          "default": 120000,
+          "minimum": 5000,
+          "description": "Timeout (milliseconds) for the Pandoc subprocess used by Knit: Export to PDF / Word / HTML. Pandoc itself is fast; this bounds runaway invocations."
+        },
+        "raven.pandoc.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "Absolute path to a Pandoc binary. Leave empty to use PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.)."
+        },
+        "raven.pandoc.pdfEngine": {
+          "type": "string",
+          "enum": [
+            "xelatex",
+            "pdflatex",
+            "lualatex",
+            "tectonic",
+            "wkhtmltopdf"
+          ],
+          "default": "xelatex",
+          "description": "LaTeX engine used by Pandoc when exporting to PDF. Most users should leave this at xelatex; tectonic is a fully self-contained alternative."
         },
         "raven.knit.fontFamily": {
           "type": "string",
