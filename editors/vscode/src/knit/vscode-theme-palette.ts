@@ -399,21 +399,28 @@ export async function resolveActiveThemePalette(
     const bg = pickValidColor(mergedDoc.editorColors['editor.background']);
     const fg = pickValidColor(mergedDoc.editorColors['editor.foreground']);
 
+    // For roles with no extracted color, fall back to `noMatchFg` —
+    // the same color vscode-textmate paints any token whose scope
+    // chain doesn't match a specific rule, i.e. the color the EDITOR
+    // shows for those tokens. Falling back to the GitHub palette
+    // would introduce hues the editor never produces.
     const fallback = args.isLight ? githubLight : githubDark;
+    const noMatchFg = effectiveDefaultForeground(tokenColors);
+    const roleFallback = HEX_COLOR_RE.test(noMatchFg) ? noMatchFg : (fg ?? fallback.foreground);
     const palette: GithubPalette = {
         background: bg ?? fallback.background,
         foreground: fg ?? fallback.foreground,
         roles: {
-            keyword: resolvedRoleColors.keyword ?? fallback.roles.keyword,
-            string: resolvedRoleColors.string ?? fallback.roles.string,
-            number: resolvedRoleColors.number ?? fallback.roles.number,
-            comment: resolvedRoleColors.comment ?? fallback.roles.comment,
-            function: resolvedRoleColors.function ?? fallback.roles.function,
-            type: resolvedRoleColors.type ?? fallback.roles.type,
-            variable: resolvedRoleColors.variable ?? fallback.roles.variable,
-            operator: resolvedRoleColors.operator ?? fallback.roles.operator,
-            punctuation: resolvedRoleColors.punctuation ?? fallback.roles.punctuation,
-            constant: resolvedRoleColors.constant ?? fallback.roles.constant,
+            keyword: resolvedRoleColors.keyword ?? roleFallback,
+            string: resolvedRoleColors.string ?? roleFallback,
+            number: resolvedRoleColors.number ?? roleFallback,
+            comment: resolvedRoleColors.comment ?? roleFallback,
+            function: resolvedRoleColors.function ?? roleFallback,
+            type: resolvedRoleColors.type ?? roleFallback,
+            variable: resolvedRoleColors.variable ?? roleFallback,
+            operator: resolvedRoleColors.operator ?? roleFallback,
+            punctuation: resolvedRoleColors.punctuation ?? roleFallback,
+            constant: resolvedRoleColors.constant ?? roleFallback,
         },
     };
 
