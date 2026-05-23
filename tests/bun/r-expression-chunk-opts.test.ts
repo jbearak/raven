@@ -5,7 +5,7 @@ import type { ChunkOpts } from '../../editors/vscode/src/knit/output-options';
 const noChunkOpts: ChunkOpts = {};
 
 describe('buildKnitExpression with chunk opts', () => {
-    it('emits opts_chunk$set for known chunk keys', () => {
+    it('emits assignments + opts_chunk$set for known chunk keys', () => {
         const expr = buildKnitExpression({
             filePath: '/p/foo.Rmd',
             outputPath: '/tmp/foo.md',
@@ -15,10 +15,16 @@ describe('buildKnitExpression with chunk opts', () => {
             figPath: 'figure/',
             chunkOpts: { fig_width: 5, fig_height: 4, dpi: 150, dev: 'png' },
         });
-        expect(expr).toContain('opts_chunk$set(fig.width = 5');
-        expect(expr).toContain('fig.height = 4');
-        expect(expr).toContain('dpi = 150L');
-        expect(expr).toContain("dev = 'png'");
+        // R-side variable assignments precede the opts_chunk$set call
+        // (per the R-subprocess-safety invariant in CLAUDE.md).
+        expect(expr).toContain('__raven_fig_width <- 5');
+        expect(expr).toContain('__raven_fig_height <- 4');
+        expect(expr).toContain('__raven_dpi <- 150L');
+        expect(expr).toContain("__raven_dev <- 'png'");
+        expect(expr).toContain('fig.width = __raven_fig_width');
+        expect(expr).toContain('fig.height = __raven_fig_height');
+        expect(expr).toContain('dpi = __raven_dpi');
+        expect(expr).toContain('dev = __raven_dev');
     });
 
     it('emits opts_knit$set with base.dir + root.dir and the global fig.path', () => {

@@ -220,29 +220,41 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
     const baseDirLit = escapeRString(input.baseDir);
     const figPathLit = escapeRString(input.figPath);
 
-    // Optional `opts_chunk$set(...)` for YAML-supplied chunk-level
-    // options. We emit a single call with comma-separated pairs to
-    // keep the expression short; an empty chunkOpts gives an empty
-    // segment.
-    const chunkParts: string[] = [];
+    // YAML-supplied chunk-level options pass through R-side variables
+    // rather than being interpolated directly into the
+    // `opts_chunk$set(...)` argument list. Even though every value we
+    // emit here is already validated (numeric finiteness + dev
+    // allowlist), the variable indirection matches the contract in
+    // CLAUDE.md's "R subprocess safety" invariant and gives one audit
+    // point for any future chunk option we add.
+    const assigns: string[] = [];
+    const namedArgs: string[] = [];
     const co = input.chunkOpts;
     if (co.fig_width !== undefined && Number.isFinite(co.fig_width)) {
-        chunkParts.push(`fig.width = ${co.fig_width}`);
+        assigns.push(`__raven_fig_width <- ${co.fig_width}`);
+        namedArgs.push('fig.width = __raven_fig_width');
     }
     if (co.fig_height !== undefined && Number.isFinite(co.fig_height)) {
-        chunkParts.push(`fig.height = ${co.fig_height}`);
+        assigns.push(`__raven_fig_height <- ${co.fig_height}`);
+        namedArgs.push('fig.height = __raven_fig_height');
     }
     if (co.fig_retina !== undefined && Number.isFinite(co.fig_retina)) {
-        chunkParts.push(`fig.retina = ${co.fig_retina}`);
+        assigns.push(`__raven_fig_retina <- ${co.fig_retina}`);
+        namedArgs.push('fig.retina = __raven_fig_retina');
     }
     if (co.dpi !== undefined && Number.isInteger(co.dpi)) {
-        chunkParts.push(`dpi = ${co.dpi}L`);
+        assigns.push(`__raven_dpi <- ${co.dpi}L`);
+        namedArgs.push('dpi = __raven_dpi');
     }
     if (co.dev !== undefined) {
-        chunkParts.push(`dev = ${escapeRString(co.dev)}`);
+        // co.dev passed DEV_ALLOWLIST above; `escapeRString` is the
+        // single-quoted-literal wrapper. The assignment puts it on the
+        // R side; the `opts_chunk$set` call references the local var.
+        assigns.push(`__raven_dev <- ${escapeRString(co.dev)}`);
+        namedArgs.push('dev = __raven_dev');
     }
-    const yamlOptsChunk = chunkParts.length > 0
-        ? ` knitr::opts_chunk$set(${chunkParts.join(', ')});`
+    const yamlOptsChunk = assigns.length > 0
+        ? ` ${assigns.join('; ')}; knitr::opts_chunk$set(${namedArgs.join(', ')});`
         : '';
 
     return [
