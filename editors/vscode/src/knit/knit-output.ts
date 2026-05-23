@@ -26,7 +26,38 @@ export type KnitOutputMessage =
      * longer carries (the baked declarations are still there, but the
      * webview's <style> override always wins on the cascade).
      */
-    | { type: 'requestFonts' };
+    | { type: 'requestFonts' }
+    /**
+     * The user clicked the webview's Export ▾ button. The host opens
+     * a native QuickPick (HTML / PDF / Word) and routes the chosen
+     * format into the export pipeline. Format choice never crosses
+     * the trust boundary — only the trigger does.
+     */
+    | { type: 'requestExport' }
+    /**
+     * The user clicked the toolbar's Export button while an export
+     * was already in flight (the button doubles as a cancel control
+     * when spinning). Host looks up the source's current controller
+     * and calls `cancel()`.
+     */
+    | { type: 'cancelExport' };
+
+/**
+ * Per-type allowed key set for the trust-boundary validator. Sorted so
+ * we can compare against `Object.keys(msg).sort()` for exact-schema
+ * equality. Adding a new message type means adding it here AND adding a
+ * value-type check below in `isKnitOutputMessage`.
+ */
+const MESSAGE_SCHEMAS: Record<KnitOutputMessage['type'], readonly string[]> = {
+    refresh: ['type'],
+    openInBrowser: ['type'],
+    themeChanged: ['applied', 'type'],
+    themeContext: ['editorBackground', 'type'],
+    requestPalette: ['type'],
+    requestFonts: ['type'],
+    requestExport: ['type'],
+    cancelExport: ['type'],
+};
 
 /**
  * Marker key on `postMessage` payloads from the extension host to the
@@ -93,19 +124,29 @@ export function fontsCssDeclarations(fonts: { text: string; mono: string }): str
 
 /**
  * Strict type-narrowing for messages posted from the Knit Output webview.
- * The webview is a trust boundary; reject anything we did not explicitly
- * shape. Additional unknown properties on a recognized type are allowed
- * (the handler ignores them).
+ *
+ * The webview is a trust boundary. We use **per-type exact-schema
+ * matching**: the message object's keys must equal the declared key set
+ * for that type, no more and no less. This rejects payload smuggling
+ * via extra fields (e.g., `{ type: 'requestExport', format: '../etc/passwd' }`)
+ * without silently ignoring them, AND still accepts the legitimate
+ * payload-carrying messages like `themeChanged` / `themeContext`.
  */
 export function isKnitOutputMessage(msg: unknown): msg is KnitOutputMessage {
     if (msg === null || typeof msg !== 'object') return false;
-    const m = msg as { type?: unknown; applied?: unknown; editorBackground?: unknown };
-    if (m.type === 'refresh' || m.type === 'openInBrowser') return true;
-    if (m.type === 'themeChanged' && typeof m.applied === 'boolean') return true;
-    if (m.type === 'themeContext' && typeof m.editorBackground === 'string') return true;
-    if (m.type === 'requestPalette') return true;
-    if (m.type === 'requestFonts') return true;
-    return false;
+    const obj = msg as Record<string, unknown>;
+    if (typeof obj.type !== 'string') return false;
+    const expected = MESSAGE_SCHEMAS[obj.type as KnitOutputMessage['type']];
+    if (!expected) return false;
+    const actual = Object.keys(obj).sort();
+    if (actual.length !== expected.length) return false;
+    for (let i = 0; i < expected.length; i++) {
+        if (actual[i] !== expected[i]) return false;
+    }
+    // Per-type value-type checks for non-`type` fields.
+    if (obj.type === 'themeChanged' && typeof obj.applied !== 'boolean') return false;
+    if (obj.type === 'themeContext' && typeof obj.editorBackground !== 'string') return false;
+    return true;
 }
 
 /**
