@@ -58,7 +58,10 @@ export function sleep(ms: number): Promise<void> {
  * ago" race cheaply), and on any longer delay actively re-focus by
  * re-calling `showTextDocument`. Output channels (`output:` scheme) and
  * other non-test editors do not yield to a polling-only wait — they have
- * to be displaced explicitly.
+ * to be displaced explicitly: when the active editor is an output channel
+ * (commonly `output:tasks` from VS Code's npm-task auto-detection),
+ * `showTextDocument` alone leaves focus on the panel even after the new
+ * editor opens, so we close the panel and refocus the editor group first.
  *
  * Comparison is by document URI, not by `TextEditor` reference identity.
  * `showTextDocument` on an already-open document is documented to return
@@ -95,6 +98,21 @@ export async function awaitActive(
         // a focused output channel or webview when polling alone won't.
         if (elapsed >= 250 && Date.now() - lastForceFocusAt >= 500) {
             lastForceFocusAt = Date.now();
+            // If the current active is an output channel (e.g.
+            // `output:tasks` opened by VS Code's npm-task auto-detection
+            // on startup), `showTextDocument` opens the editor but does
+            // not steal focus back from the panel. Close the panel and
+            // pin focus to the editor group before re-showing so the
+            // newly opened editor actually wins activation.
+            const activeScheme = vscode.window.activeTextEditor?.document.uri.scheme;
+            if (activeScheme === 'output') {
+                try {
+                    await vscode.commands.executeCommand('workbench.action.closePanel');
+                } catch { /* panel may already be closed */ }
+                try {
+                    await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+                } catch { /* no editor group yet — showTextDocument below handles it */ }
+            }
             try {
                 await vscode.window.showTextDocument(editor.document, {
                     viewColumn: editor.viewColumn,
