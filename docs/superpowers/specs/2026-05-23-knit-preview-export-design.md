@@ -113,8 +113,11 @@ Settings sync touch-points (per CLAUDE.md): `editors/vscode/package.json` schema
 .Rmd ──knitr::knit──▶ <tempDir>/<basename>.md ──Raven renderer──▶ <tempDir>/<basename>.html
               ▲                                                        │
               │                                                        ▼
-              └── chunk options injected via opts_chunk$set       webview iframe
+              └── chunk options + fig.path injected           webview iframe
+                  via opts_chunk$set
 ```
+
+**`fig.path` is set explicitly** to a relative path that knitr resolves under its working directory — e.g., `opts_chunk$set(fig.path = 'figure/')` while `opts_knit$set(base.dir = <tempDir>, root.dir = <user setting>)`. Setting `base.dir` to the temp dir (separate from `root.dir`, which controls *where R code runs*) directs knitr's plot-saving to the temp dir without changing the working directory the user's chunks see. This avoids: (a) plots landing in the user's source folder during knit (regression we'd hit if we only set `output`); (b) plots landing in the user's CWD (the wrong place too).
 
 ### Export pipeline (two entry points share the back end)
 
@@ -146,10 +149,14 @@ Settings sync touch-points (per CLAUDE.md): `editors/vscode/package.json` schema
 
 | Trigger | Action |
 |---|---|
-| `KnitOutputPanel.onDidDispose` | Remove that source's `preview/<sha256>/` subdir |
-| Successful or failed export | Remove `export/<uuid>/` in `finally` |
-| Extension `deactivate()` | Remove the whole `raven-knit/<workspaceHash>/` dir |
-| Extension `activate()` | Sweep `raven-knit/*` orphans with mtime > 7 days |
+| `KnitOutputPanel.onDidDispose` | Mark that source's `preview/<sha256>/` for deletion; remove immediately if no in-flight exports reference it, otherwise defer until refcount drops to 0. |
+| Successful or failed export | Decrement preview-dir refcount; remove `export/<uuid>/` in `finally`. |
+| Extension `deactivate()` | Remove the whole `raven-knit/<workspaceHash>/` dir. |
+| Extension `activate()` | Sweep `raven-knit/*` orphans with mtime > 7 days. |
+
+**Preview-dir pinning**: each in-flight export that consumes `preview/<sha256>/` (the webview-export path) increments a refcount on that subdir for the duration of the Pandoc subprocess. Closing the panel mid-export is allowed but the temp dir is preserved until the refcount drops to 0, then deleted. This closes the race where panel disposal removes the `.md` and `figure/` while Pandoc is still reading them.
+
+The pinning structure is in-memory only — process crash leaves orphans, swept on next activation.
 
 ### Webview reuses cached `.md` unconditionally (Approach C)
 
@@ -166,6 +173,24 @@ Every long-running operation (knit, export) runs inside `vscode.window.withProgr
 3. If still alive after another 1.5s, `SIGKILL`. Same ladder `knit-engine.ts` uses for `raven.knit.timeoutMs`.
 
 The notification's native Cancel button is the canonical "stop this now" affordance.
+
+### Operation controller (replaces the current in-flight Set)
+
+`knit-commands.ts` currently tracks in-flight knits as a bare `Set<string>` of source paths. The export feature needs richer state — toolbar button needs to know what op is running, the webview needs to display the spinner, and `cancelExport` messages need a handle to call into. So we replace the Set with a per-source `OperationController` registry:
+
+```typescript
+interface OperationController {
+  source: vscode.Uri;
+  kind: 'knit' | 'export-html' | 'export-pdf' | 'export-docx';
+  cancellation: vscode.CancellationTokenSource;
+  promise: Promise<void>;          // resolves on cleanup, even after cancel
+  broadcastToPanel: (state: 'starting' | 'running' | 'done' | 'cancelled') => void;
+}
+```
+
+- One controller per source URI at a time (the existing one-per-source invariant).
+- New ops await the previous one's `promise` after invoking `cancellation.cancel()` to avoid resource overlap.
+- The webview Export button posts `{ type: 'cancelExport' }`; the host looks up the controller for the current panel's source and calls `cancellation.cancel()`.
 
 ### Conflicting operations
 
@@ -225,11 +250,24 @@ If multiple formats are listed (`output: { pdf_document: {...}, word_document: {
 | `toc: true` | `--toc` |
 | `toc_depth: N` | `--toc-depth=N` |
 | `number_sections: true` | `--number-sections` |
-| `highlight: <style>` | `--highlight-style=<style>` |
+| `highlight: <style>` | `--highlight-style=<style>` (style validated against Pandoc's known list) |
 | `self_contained: true` | `--embed-resources --standalone` |
-| `css: [file.css]` | `--css=file.css` (one flag per file) |
+| `css: [file.css]` | `--css=file.css` (one flag per file; each file path validated to be relative or inside the .Rmd's workspace folder) |
 | `mathjax: <bool>` | `--mathjax` or omit |
-| `pandoc_args: [...]` | passed through verbatim (last) |
+
+**`pandoc_args` is NOT honored in v1** (security: a document could pass `--output`, `--lua-filter`, `--metadata-file`, `--extract-media`, or other flags that bypass Raven's controlled destination or execute external code). Tracked in follow-up issue #2 with a defined allowlist/blocklist as a prerequisite.
+
+### YAML option merge precedence
+
+When the user requests export to format F (HTML, PDF, DOCX), option resolution proceeds in strict precedence order, first-match wins:
+
+1. Block keyed by the requested format's rmarkdown equivalent: `html_document:` for HTML, `pdf_document:` for PDF, `word_document:` for DOCX. (Also accept `bookdown::html_document2`, `tufte::tufte_html`, etc., from `SUPPORTED_HTML_FORMATS` — these all map to "HTML" intent.)
+2. Top-level keys directly under `output:` (e.g., `output: { toc: true, pdf_document: {...} }`).
+3. Raven's built-in defaults.
+
+Format blocks for *non-matching* formats are completely ignored. Specifically: when exporting to PDF, options inside `html_document:` are NOT consulted. This avoids the spec ambiguity where a `toc_depth` set under `html_document:` accidentally drives the PDF table-of-contents depth. Same applies to chunk-level options that come from a format block.
+
+For preview (always HTML), the format-matching layer uses `html_document:` (with the alias list).
 
 ### Ignored keys
 
@@ -317,24 +355,45 @@ A new `pandocConvert(mdPath, format, args, opts)` in `editors/vscode/src/knit/pa
 - Same SIGINT → SIGTERM → SIGKILL escalation ladder, `raven.knit.export.timeoutMs`.
 - stderr piped into the knit output channel.
 - Format flags: `exportHtml` → `--to html5 --standalone`, `exportPdf` → `--to pdf --pdf-engine=<setting>`, `exportDocx` → `--to docx`.
+- **`cwd` is the temp directory containing the `.md`**, never the source `.Rmd` directory. This guarantees relative `figure/foo.png` references in the .md resolve against the freshly-generated temp `figure/` and not against stale source-directory artifacts left over from earlier knit runs.
+- **The destination output is written via temp-then-rename** (same pattern as `post-knit-renderer.ts:writeFileAtomic`). Pandoc's `-o` flag points to a unique sibling temp path inside the destination directory (e.g., `.foo.docx.<pid>.<rand>.tmp`); on Pandoc's clean exit Raven renames over the final destination. On cancel/failure the temp is unlinked, leaving any prior good output untouched. Cross-device renames aren't a concern since the temp lives next to the destination.
+
+### Webview message trust boundary (security)
+
+Adding `requestExport` requires updating the existing trust boundary in `knit-output.ts` and `knit-output-panel.ts`:
+
+- Add `'requestExport'` to the `KnitOutputMessage` discriminated union with a typed payload: `{ type: 'requestExport' }` (no fields from the webview — format choice is collected via the native quickpick the host opens, so untrusted payload surface is zero).
+- Extend `isKnitOutputMessage` to validate the new shape.
+- Add unit tests proving (a) a malformed `{ type: 'requestExport', format: '../etc/passwd' }` is rejected, and (b) the host ignores any payload fields beyond `type`.
+- A user cancelling an export via the toolbar uses a new message `{ type: 'cancelExport' }` with no extra fields. Same validation rule.
 
 ## Post-export feedback
 
-Both entry points (webview and editor toolbar) share this notification:
+Both entry points (webview and editor toolbar) share this notification, which mirrors the existing remote-workspace fallback pattern from `knit-output-panel.ts:openInBrowser`:
 
 ```typescript
-const action = await vscode.window.showInformationMessage(
-  `Saved ${basename}.${ext}`,
-  format === 'docx' ? 'Open in Word' :
-  format === 'pdf'  ? 'View PDF' :
-                      'Open in Browser'
-);
-if (action) {
-  await vscode.env.openExternal(savedUri);
+async function openExportedFile(savedUri: vscode.Uri, format: 'html' | 'pdf' | 'docx', output: vscode.OutputChannel): Promise<void> {
+  const label = format === 'docx' ? 'Open in Word' : format === 'pdf' ? 'View PDF' : 'Open in Browser';
+  const action = await vscode.window.showInformationMessage(`Saved ${path.basename(savedUri.fsPath)}`, label);
+  if (action !== label) return;
+
+  let opened = false;
+  try {
+    opened = await vscode.env.openExternal(savedUri);
+  } catch (err) {
+    output.appendLine(`[Export] openExternal threw: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (opened) return;
+  // Remote workspaces: file:// URIs may route to the extension-host machine
+  // rather than the user's. Same fallback as the existing Open in Browser flow.
+  output.appendLine(`[Export] file:// did not open. Output is at: ${savedUri.fsPath}`);
+  void vscode.window.showWarningMessage(
+    `${label} is not available for this workspace. The file path has been written to the Raven: Knit output channel.`,
+  );
 }
 ```
 
-`vscode.env.openExternal` handles macOS/Windows/Linux without per-platform plumbing.
+`vscode.env.openExternal` handles macOS/Windows/Linux without per-platform plumbing in *local* workspaces. Remote workspaces (SSH, dev containers, codespaces) need the fallback because `file:` URIs may resolve on the wrong side of the remote bridge.
 
 ## Migration
 
@@ -364,6 +423,13 @@ if (action) {
 - `knit-export-yaml-args.test.ts` — `output.pdf_document.toc: true` produces `--toc`; `theme:` is logged as ignored.
 - `knit-export-busy.test.ts` — clicking Export during an in-flight knit shows the `[Cancel and re-knit] / [Wait]` toast; cancel restarts.
 - `knit-temp-dir-cleanup.test.ts` — closing the panel removes the per-source preview subdir; deactivating removes the workspace root.
+- `knit-export-atomic.test.ts` — pre-existing good `<basename>.docx` next to .Rmd; export is cancelled mid-Pandoc; assert the existing file is untouched and no `.tmp` sibling remains.
+- `knit-export-pinning.test.ts` — start a webview export, dispose the panel mid-export, assert temp dir survives until Pandoc exits, then is cleaned up.
+- `knit-export-stale-figures.test.ts` — pre-existing `figure/old.png` in the .Rmd's directory; new knit produces a different plot in temp `figure/`; assert exported PDF references the new plot, not the stale one.
+- `knit-export-pandoc-args-rejected.test.ts` — YAML containing `pandoc_args: ['--output=/tmp/pwned', '--lua-filter=evil.lua']` is parsed but those args are NOT passed to Pandoc; the keys appear in the ignored-output channel log.
+- `knit-export-yaml-merge.test.ts` — YAML with both `html_document:` and `pdf_document:` blocks; exporting to PDF picks only `pdf_document:` options (not `html_document:`).
+- `knit-export-remote-fallback.test.ts` — mock `vscode.env.openExternal` to return false; assert warning toast shown and the output path appears in the knit channel.
+- `knit-multi-root-isolation.test.ts` — two workspace folders contain `analysis.Rmd` files at different absolute paths; assert their temp subdirs hash to different `preview/<sha256>/` paths and neither knit reads the other's `.md`.
 
 ### Pure-function unit tests
 
@@ -388,8 +454,30 @@ Tests that spawn Pandoc or that depend on subprocess signal delivery self-skip v
 3. **Chunk-option injection passes values as R-side variables**, never interpolated into the R code string. Dev/format strings are validated against an allowlist before injection.
 4. **Pandoc-flag mapping is centralized in `buildPandocArgs()`.** Adding a new honored YAML key means adding to that function + its tests; not scattering format logic across the export commands.
 5. **`pandocConvert` never invokes the shell.** `child_process.spawn` with an args array. All paths arrive as args; never concatenated into a command string.
+6. **Pandoc's `cwd` is the temp `.md` directory, never the source `.Rmd` directory.** This prevents relative `figure/foo.png` references in the .md from resolving against stale source-directory artifacts.
+7. **Export destinations are written via temp-then-rename.** Same `writeFileAtomic` shape as `post-knit-renderer.ts`. Cancel/failure during Pandoc must not corrupt or clobber a prior good output.
+8. **Preview temp dirs are refcounted during in-flight exports.** Panel disposal marks for deletion; actual `rm -rf` waits for refcount → 0. Don't add a code path that removes the temp dir while an export references it.
+9. **`pandoc_args` from YAML is not honored.** A document could otherwise inject `--output`, `--lua-filter`, `--metadata-file`. If support is added later, it MUST go through an allowlist/blocklist defined adjacent to `buildPandocArgs`.
+10. **Webview→host messages stay in the trust boundary.** Any new message type (`requestExport`, `cancelExport`) must be added to `KnitOutputMessage` AND `isKnitOutputMessage` in the same commit, with a unit test proving malformed payloads are rejected.
 
 ## Follow-up issues
 
 1. **Custom highlighting-preserving Word/PDF renderer.** Build a tiny renderer that consumes Raven's role-tagged token stream and emits OOXML (via the `docx` npm package) and PDF (via `pdfmake` or `jsPDF` with colored runs). Goal: beat Pandoc on the highlighting dimension we already win on for HTML preview. Substantial work; only worth doing once Pandoc-only path is shipped and stable.
-2. **Per-format YAML option scoping.** Today we merge multiple format blocks. Consider a stricter mode (only the requested format's block is consulted) if users complain about cross-contamination.
+2. **Audited `pandoc_args` passthrough.** Define an allowlist of safe Pandoc flags (e.g., `--shift-heading-level-by`, `--reference-doc` from a workspace path) and a blocklist (anything that changes destination, format, or executes code). Behind a workspace-trust gate.
+
+## Codex adversarial review
+
+The spec was reviewed against the criteria in the user's `feedback_codex_adversarial_review` memory. Ten findings; all addressed inline above:
+
+| # | Severity | Topic | Addressed in |
+|---|---|---|---|
+| 1 | Critical | `pandoc_args` verbatim passthrough is unsafe | Honored-keys table; follow-up #2 |
+| 2 | Critical | Export destination not atomic | Subprocess invocation section; invariant #7 |
+| 3 | High | Temp-dir cleanup races webview export | Cleanup section + refcount; invariant #8 |
+| 4 | High | Stale source-dir artifacts shadow temp figures | Subprocess invocation `cwd`; invariant #6 |
+| 5 | High | knitr `fig.path` not forced into temp | Preview pipeline (`base.dir` + `fig.path`) |
+| 6 | High | YAML option merge order undefined | New "Merge precedence" subsection |
+| 7 | Medium | `requestExport` not in trust boundary | Webview message trust boundary section; invariant #10 |
+| 8 | Medium | No operation registry | Operation controller section |
+| 9 | Medium | Remote-workspace `openExternal` fallback missing | Post-export feedback section |
+| 10 | Low | Test plan omitted critical failure modes | Six new test files added |
