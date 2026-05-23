@@ -172,12 +172,23 @@ describe('buildShellHtml', () => {
         // shading rather than staying on the GitHub palette.
         const html = buildShellHtml(args('/work/report.html'));
         expect(html).toContain('--vscode-textCodeBlock-background');
-        // The injected stylesheet paints `pre` with c.codeBg and
-        // forces `pre code` to transparent so a semi-transparent
-        // textCodeBlock-background (VS Code's default for dark
-        // themes) doesn't double-layer inside the code text area.
-        expect(html).toMatch(/pre\s*\{\s*background:/);
+        // The injected stylesheet paints `pre.raven-knit-code` (input
+        // chunks) with c.codeBg and forces any descendant `code` to
+        // transparent so a semi-transparent textCodeBlock-background
+        // (VS Code's default for dark themes) doesn't double-layer
+        // inside the code text area. The descendant combinator
+        // (`pre code` rather than `pre > code`) also covers
+        // span-wrapped `<pre><span>…<code>` shapes some plugins emit.
+        expect(html).toMatch(/pre\.raven-knit-code\s*\{\s*background:/);
         expect(html).toMatch(/pre code\s*\{\s*background:\s*transparent/);
+        // Output `<pre>` blocks (untagged) are explicitly flattened.
+        // The flatten declarations live on the next concatenation
+        // line, so assert each property separately rather than
+        // trying to match across the `' + '` boundary. The flatten
+        // intentionally omits `!important` so user-authored
+        // `<pre style="…">` in asis output keeps its inline style.
+        expect(html).toMatch(/pre:not\(\.raven-knit-code\)\s*\{/);
+        expect(html).toContain('background: transparent; border: 0; padding: 0;');
     });
 
     test('theme overlay re-emits GitHub palette variant on :root', () => {

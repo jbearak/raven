@@ -78,14 +78,16 @@ suite('runPostKnitRender end-to-end', () => {
 
         // Sanity checks: the document is self-contained, includes our
         // marker, includes the GitHub palette as a CSS variable, and
-        // wrapped the R block in a `<pre><code class="language-r">`
-        // structure.
+        // wrapped the R block in a
+        // `<pre class="raven-knit-code"><code class="language-r">…`
+        // structure. The marker class scopes the panel chrome to input
+        // chunks; output blocks (untagged) render bare.
         assert.match(html, /^<!doctype html>/i);
         assert.ok(html.includes('POST-KNIT-RENDERER-MARKER'));
         assert.ok(/--raven-bg:/.test(html), 'GitHub palette CSS vars should be inlined');
         assert.ok(
-            /<pre><code class="language-r">/i.test(html),
-            'R code block should round-trip with the language-r class',
+            /<pre class="raven-knit-code"><code class="language-r">/i.test(html),
+            'R code block should round-trip with the language-r class and raven-knit-code marker',
         );
         // KaTeX CSS should be inlined (vscode.markdown-math is a
         // built-in). The CSS file contains the `.katex` selector and
@@ -115,11 +117,11 @@ suite('runPostKnitRender end-to-end', () => {
         // dark` swap on the standalone file and the panel theme
         // swap — actually reaches the highlighted spans.
         const blockMatch = html.match(
-            /<pre><code class="language-r">([\s\S]*?)<\/code><\/pre>/i,
+            /<pre(?:\s+class="raven-knit-code")?><code class="language-r">([\s\S]*?)<\/code><\/pre>/i,
         );
         assert.ok(
             blockMatch,
-            'expected a <pre><code class="language-r">...</code></pre> block in the output',
+            'expected a <pre class="raven-knit-code"><code class="language-r">...</code></pre> block in the output',
         );
         const body = blockMatch![1];
         const roleVars = new Set<string>();

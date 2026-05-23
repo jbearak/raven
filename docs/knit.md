@@ -115,6 +115,12 @@ explorer-context-menu hook is opt-in via your own keybindings).
       `function` color even when the TextMate grammar doesn't
       classify them.
 
+    Only the input chunks (the blocks that carry a `language-X`
+    class) get the bordered code-panel surface. Output blocks —
+    emitted by `knitr` as untagged fenced blocks — render as bare
+    monospace text, so a reader can tell input from output the
+    same way Quarto's preview does.
+
     The result is written atomically to `<basename>.html` via a
     temp-and-rename next to the source, so a concurrent re-knit
     can never expose a half-written file to the panel.

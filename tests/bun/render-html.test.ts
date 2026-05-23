@@ -198,8 +198,49 @@ describe('renderKnitHtml', () => {
         });
 
         // The bare `<pre><code>raw text &amp; symbols</code></pre>`
-        // must round-trip without spans or escaping changes.
+        // must round-trip without spans or escaping changes — and
+        // crucially without the `raven-knit-code` marker class, so
+        // the base stylesheet leaves it bare (no border, no panel
+        // background). knitr emits R output as untagged fenced blocks,
+        // so this is the path that lets readers tell input from
+        // output the way Quarto's preview does. The literal here
+        // covers both: the exact `<pre><code>` shape (no class) AND
+        // the unchanged inner text.
         expect(out).toContain('<pre><code>raw text &amp; symbols</code></pre>');
+    });
+
+    test('tags highlighted code blocks with the raven-knit-code marker', async () => {
+        // Input (highlighted) `<pre>` blocks carry the
+        // `raven-knit-code` class so the base stylesheet's chrome
+        // (border, padding, background) targets ONLY input chunks.
+        // Output blocks — emitted by knitr without a `language-X`
+        // tag — never gain the marker and render as bare monospace.
+        const fakeHtml = '<pre><code class="language-r">library</code></pre>';
+        const out = await renderKnitHtml({
+            markdownSource: 'x',
+            renderMarkdown: async () => fakeHtml,
+            registry: fakeRegistry({ r: toyRTokenizer }),
+        });
+        expect(out).toContain('<pre class="raven-knit-code"><code class="language-r">');
+    });
+
+    test('base stylesheet scopes panel chrome to pre.raven-knit-code', async () => {
+        // The chrome (border, padding, border-radius, panel
+        // background) must target `pre.raven-knit-code` only.
+        // Untagged `<pre>` (output) gets nothing more than a
+        // monospace font from the inner `<code>` rule, so the panel
+        // visual is unique to input chunks.
+        const out = await renderKnitHtml({
+            markdownSource: 'x',
+            renderMarkdown: async () => '<p>hi</p>',
+            registry: fakeRegistry({}),
+        });
+        // The chrome block keys off the marker class.
+        expect(out).toMatch(/pre\.raven-knit-code\s*\{[^}]*border:/);
+        expect(out).toMatch(/pre\.raven-knit-code\s*\{[^}]*padding:/);
+        // No `pre { padding: ... }` rule for the bare selector — that
+        // would re-paint output blocks with chrome.
+        expect(out).not.toMatch(/(^|\W)pre\s*\{\s*padding:/);
     });
 
     test('overlays R function semantic tokens on top of the grammar', async () => {

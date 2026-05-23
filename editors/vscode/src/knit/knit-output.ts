@@ -524,28 +524,33 @@ export function buildShellHtml(args: {
           + ' html, body { background: ' + c.bg + ' !important; '
           + 'color: ' + c.fg + ' !important; }'
           + ' a { color: ' + c.link + ' !important; }'
-          // Block code: paint c.codeBg on pre only, and force
-          // pre>code to transparent. textCodeBlock-background is
-          // often a semi-transparent overlay (VS Code default for
-          // dark themes is rgba(10,10,10,0.4)); applying it to BOTH
-          // pre AND its child code stacks the overlay twice inside
-          // the code text area, producing a visible highlight around
-          // the text vs the pre padding region. Painting only pre
-          // keeps the layering at one level — the code area shows
-          // through transparently to the same color as its
-          // surrounding padding.
-          + ' pre { background: ' + c.codeBg + ' !important; }'
+          // Block code: paint c.codeBg on pre.raven-knit-code only
+          // (input chunks). textCodeBlock-background is often a
+          // semi-transparent overlay (VS Code default for dark themes
+          // is rgba(10,10,10,0.4)); applying it to BOTH pre AND its
+          // descendant code stacks the overlay twice inside the code
+          // text area, producing a visible highlight around the text
+          // vs the pre padding region. The pre code rule below forces
+          // ANY code descendant of any pre (including span-wrapped
+          // pre>span>code shapes that some plugins emit) to
+          // transparent, so it shows through to whatever its
+          // surrounding pre paints. Output blocks (untagged pre
+          // elements) are explicitly flattened so they read as
+          // prose-with-monospace, the way Quarto's preview surfaces
+          // output. The flatten rule deliberately omits !important so
+          // user-authored pre style="..." in asis output keeps its
+          // inline style.
+          + ' pre.raven-knit-code { background: ' + c.codeBg + ' !important; }'
           + ' pre code { background: transparent !important; }'
-          // Inline <code> in prose — not inside <pre> — should also
-          // pick up the textCodeBlock shading so the inline form
-          // matches the block form's surface. The base stylesheet
-          // paints all <code> with --raven-bg; without this rule
-          // the inline form would keep --raven-bg (which we re-emit
-          // via the GitHub variant on :root above) and visibly
-          // diverge from the block form whenever the theme's
-          // textCodeBlock-background differs from the editor
-          // background.
-          + ' :not(pre) > code { background: ' + c.codeBg + ' !important; }'
+          + ' pre:not(.raven-knit-code) {'
+          + ' background: transparent; border: 0; padding: 0; }'
+          // Inline code in prose should pick up the textCodeBlock
+          // shading so the inline form matches the block form's
+          // surface. We paint ALL code with c.codeBg by default and
+          // rely on the pre code rule above to override for code
+          // inside any pre — including span-wrapped or otherwise
+          // nested code that a strict child combinator would miss.
+          + ' code { background: ' + c.codeBg + ' !important; }'
           // Defensive: zero out every paint property that could
           // give code-block spans a per-token visual chrome. Spans
           // are inline elements whose background-color should never

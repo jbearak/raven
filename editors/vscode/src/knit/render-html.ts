@@ -161,8 +161,16 @@ async function rewriteCodeBlocks(
             registry: args.registry,
             overlays,
         });
+        // Marker class `raven-knit-code` scopes the panel chrome
+        // (border, padding, background) to highlighted code blocks
+        // only — output blocks (no `language-X` class) are left
+        // untagged and render as bare monospace, so prose readers can
+        // distinguish input from output the same way Quarto's preview
+        // does. The base stylesheet in `baseStyles()` keys off this
+        // class, as does the theme overlay in
+        // `knit-output.ts:applyTheme`. Keep all three in lockstep.
         out.push(
-            `<pre><code class="${LANG_CLASS_PREFIX}${escapeAttr(languageId)}">` +
+            `<pre class="raven-knit-code"><code class="${LANG_CLASS_PREFIX}${escapeAttr(languageId)}">` +
                 highlighted +
                 `</code></pre>`,
         );
@@ -351,23 +359,37 @@ function paletteAsCssVars(palette: GithubPalette): string {
 }
 
 function baseStyles(): string {
+    // Only `pre.raven-knit-code` (input chunks) gets the panel chrome
+    // (border, padding, rounded corners, background). Output `<pre>`
+    // blocks — emitted by knitr without a `language-X` class and
+    // therefore left untagged by `rewriteCodeBlocks` — render as bare
+    // monospace text so readers can tell input from output at a glance,
+    // matching Quarto's preview style.
+    //
+    // `overflow-x: auto` lives on the bare `pre` selector so wide
+    // output (long printed lines, wide data frames) still scrolls
+    // within the block rather than widening the document.
     return `
 body {
   background: var(--raven-bg);
   color: var(--raven-fg);
 }
-pre, code {
-  background: var(--raven-bg);
-  color: var(--raven-fg);
-}
 pre {
-  padding: 0.75rem 1rem;
-  border-radius: 6px;
   overflow-x: auto;
-  border: 1px solid color-mix(in srgb, var(--raven-fg) 15%, transparent);
 }
 code {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--raven-fg);
+}
+pre.raven-knit-code,
+pre.raven-knit-code code {
+  background: var(--raven-bg);
+  color: var(--raven-fg);
+}
+pre.raven-knit-code {
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--raven-fg) 15%, transparent);
 }
 `.trim();
 }

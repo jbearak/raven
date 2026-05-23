@@ -128,9 +128,14 @@ describe('renderKnitHtml against the real R grammar', () => {
             // alone paints anything.
         });
 
-        // Extract just the `<pre><code class="language-r">...</code></pre>` body.
+        // Extract the highlighted code block body. `rewriteCodeBlocks`
+        // tags input chunks with the `raven-knit-code` marker class so
+        // the base stylesheet's panel chrome (border/padding/bg) only
+        // hits input — output `<pre>` stays bare. Match either with or
+        // without the marker so this test stays robust to future
+        // emission-shape tweaks.
         const blockMatch = finalHtml.match(
-            /<pre><code class="language-r">([\s\S]*?)<\/code><\/pre>/,
+            /<pre(?:\s+class="raven-knit-code")?><code class="language-r">([\s\S]*?)<\/code><\/pre>/,
         );
         expect(blockMatch).not.toBeNull();
         const body = blockMatch![1];
