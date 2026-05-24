@@ -36,7 +36,12 @@ function build_html(
     const loopbackHttp = 'http://127.0.0.1:* http://localhost:* http://[::1]:*';
     const loopbackWs = 'ws://127.0.0.1:* ws://localhost:* ws://[::1]:*';
     const external = csp_sources_for_external_base(externalBaseUrl);
-    const imgSrc = `${webview.cspSource} ${loopbackHttp} ${external.http} data:`.trim();
+    // `blob:` is required because the post-quit "Showing last plot" fallback
+    // sets `<img src>` to a Blob URL captured while httpgd was alive — see
+    // the snapshot $effect in webview/App.svelte. Without `blob:`, the CSP
+    // blocks the swap and the browser renders a broken icon under the
+    // banner, which was the bug fixed in #309.
+    const imgSrc = `${webview.cspSource} ${loopbackHttp} ${external.http} data: blob:`.trim();
     const connectSrc = `${loopbackHttp} ${loopbackWs} ${external.http} ${external.ws}`
         .replace(/\s+/g, ' ')
         .trim();

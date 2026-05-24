@@ -93,6 +93,11 @@ suite('plot viewer CSP — local host', () => {
             assert.ok(cspMatch, 'CSP meta tag should be present');
             const csp = cspMatch![1];
             assert.match(csp, /img-src[^;]*http:\/\/127\.0\.0\.1:\*/, 'img-src allows loopback http');
+            // The post-quit "Showing last plot" fallback uses a Blob URL as
+            // <img src> after httpgd dies. Without blob: in img-src, the
+            // browser blocks the swap and shows a broken icon under the
+            // "R session ended" banner.
+            assert.match(csp, /img-src[^;]*\bblob:/, 'img-src allows blob URLs');
             assert.match(csp, /connect-src[^;]*http:\/\/127\.0\.0\.1:\*/, 'connect-src allows loopback http');
             assert.match(csp, /connect-src[^;]*ws:\/\/127\.0\.0\.1:\*/, 'connect-src allows loopback ws');
         } finally {
