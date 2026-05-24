@@ -348,6 +348,9 @@ async function runExportInner(
     for (const dropped of detailed.droppedCss) {
         output.appendLine(`[knit] CSS path outside containment root, dropped: '${dropped}'`);
     }
+    for (const flag of detailed.ignoredFlags) {
+        output.appendLine(`[knit] Ignored output: ${flag}`);
+    }
 
     // [4] Run Pandoc.
     const timeoutMs = vscode.workspace.getConfiguration('raven').get<number>('knit.export.timeoutMs', 120_000);

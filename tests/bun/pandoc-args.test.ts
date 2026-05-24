@@ -97,16 +97,24 @@ describe('buildPandocArgs', () => {
         expect(args).toContain('--standalone');
     });
 
-    it('omits --embed-resources for HTML when self_contained is explicitly false', () => {
+    it('always embeds HTML resources even when self_contained is explicitly false', () => {
+        // Honoring `self_contained: false` would require copying the
+        // temp `figure/` dir next to the .html (and Pandoc's data-dir
+        // assets) for the linked-assets workflow to render. Raven's
+        // temp dir is purged after the panel closes, so the linked
+        // form would produce broken images. We always embed and
+        // surface the override via `ignoredFlags`.
         const o: OutputOptions = { ...emptyOpts, pandocFlags: { self_contained: false } };
-        const args = buildPandocArgs(o, 'html', {
+        const result = buildPandocArgs.detailed(o, 'html', {
             mdPath: 'in.md',
             outPath: 'out.html',
             sourceDir: '/p',
             containmentRoot: '/p',
         });
-        expect(args).toContain('--standalone');
-        expect(args).not.toContain('--embed-resources');
+        expect(result.args).toContain('--embed-resources');
+        expect(result.ignoredFlags).toEqual([
+            'self_contained: false (HTML export always embeds resources)',
+        ]);
     });
 
     it('does not add --embed-resources for PDF / DOCX exports', () => {

@@ -144,24 +144,44 @@ export class OperationRegistry {
 
     /**
      * Request deletion of `previewKey`'s temp directory (`previewDir`).
-     * If no exports are currently pinning it, the registered deleter
-     * runs immediately; otherwise the (key, dir) pair is recorded and
-     * the deleter runs when the last pin is released. Safe to call
-     * multiple times; the latest `previewDir` wins.
+     * The (key, dir) pair is always recorded first; the deleter then
+     * fires on the next macrotask via `setTimeout(_, 0)`. The
+     * macrotask window gives a new operation that pins immediately
+     * after (e.g., a user closing the old panel and right-clicking
+     * Knit Preview) a chance to call `pinPreviewDir` +
+     * `cancelPreviewDirDeletion` before the unrecoverable `fs.rm`
+     * starts. If a pin arrives during the window the deferred
+     * deletion sees `previewRefs > 0` or a missing mark and bails.
+     * The `unpinPreviewDir` path still discharges marked deletions
+     * synchronously when the last pin is released — that path is
+     * already covered by the existing pin/unpin lifecycle and stays
+     * synchronous so refcount-driven tests don't have to await ticks.
      */
     requestPreviewDirDeletion(previewKey: string, previewDir: string): void {
-        if (this.previewRefs(previewKey) === 0) {
-            if (this.previewDeleter) this.previewDeleter(previewDir, previewKey);
-            return;
-        }
         this.previewMarkedForDeletion.set(previewKey, previewDir);
+        if (this.previewRefs(previewKey) > 0) return;
+        setTimeout(() => {
+            // Re-check both the pin count AND the mark: a pin that
+            // arrived during the macrotask boundary may have called
+            // `cancelPreviewDirDeletion`, or another deletion request
+            // for a different (key, dir) pair may have superseded
+            // this one (in which case the latest dir wins via the
+            // existing "latest wins" contract documented above).
+            if (this.previewRefs(previewKey) > 0) return;
+            const dir = this.previewMarkedForDeletion.get(previewKey);
+            if (dir === undefined) return;
+            this.previewMarkedForDeletion.delete(previewKey);
+            if (this.previewDeleter) this.previewDeleter(dir, previewKey);
+        }, 0);
     }
 
     /**
      * Drop a deferred deletion request when the preview dir becomes live
-     * again before the last pin is released. This is intentionally a
-     * no-op for already-fired deletions; callers use it only while a pin
-     * is still protecting the directory.
+     * again before the last pin is released, OR before the
+     * `requestPreviewDirDeletion` macrotask window closes. Callers use
+     * this only while they own a pin protecting the directory — once
+     * the deferred fire has run, the rm has either completed or is in
+     * flight (and `fs.rm` cannot be cancelled).
      */
     cancelPreviewDirDeletion(previewKey: string): void {
         this.previewMarkedForDeletion.delete(previewKey);

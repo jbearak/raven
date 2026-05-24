@@ -361,127 +361,129 @@ async function runKnitCommand(
     // exists before R runs, since knitr won't `mkdir -p` for us.
     const previewPaths = previewArtifactPaths(fsPath);
     const mdOutputPath = previewPaths.mdPath;
-    try {
-        await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        output.show(true);
-        output.appendLine(`[knit] Failed to create temp dir ${previewPaths.previewDir}: ${message}`);
-        await vscode.window.showErrorMessage(
-            `Raven: Knit Preview could not create temp directory. See output for details.`,
-        );
-        return;
-    }
 
-    // YAML output: block — chunk-level options come from here. The
-    // preview path always uses 'html' (preview renders to HTML
-    // regardless of YAML output:). The editor-toolbar export path
-    // passes its target format so PDF / Word knits pick chunk options
-    // from `pdf_document:` / `word_document:` instead of
-    // `html_document:`. Per docs/superpowers/specs/2026-05-23-knit-preview-export-design.md,
-    // non-matching format blocks are completely ignored: when target
-    // is 'pdf', `html_document.fig_width` does NOT drive the PDF
-    // knit, and vice versa.
-    const outputOpts = parseOutputOptions(parsed.value, targetFormat);
-    if (outputOpts.ignored.length > 0) {
-        for (const key of outputOpts.ignored) {
-            output.appendLine(`[knit] Ignored output: option '${key}'`);
-        }
-    }
-
-    let expression: string;
-    try {
-        expression = buildKnitExpression({
-            filePath: fsPath,
-            outputPath: mdOutputPath,
-            format,
-            knitRootDir,
-            // base.dir is the preview temp dir so knitr's plots land
-            // under <previewDir>/figure/ alongside the .md. The
-            // relative fig.path lets the .md reference figures as
-            // `figure/<chunk>-N.png`, and Pandoc's `cwd` (set during
-            // export to `previewDir`) resolves those relative paths
-            // against the freshly-generated figures — never against
-            // stale source-directory artifacts.
-            baseDir: previewPaths.previewDir,
-            figPath: 'figure/',
-            chunkOpts: outputOpts.chunkOpts,
-        });
-    } catch (err) {
-        const isPathError = err instanceof ValidatePathError;
-        const isFormatError = err instanceof ValidateFormatError;
-        const message = err instanceof Error ? err.message : String(err);
-        output.show(true);
-        output.appendLine(`[validation] ${message}`);
-        const surface = isFormatError
-            ? `Raven: Knit Preview — unsupported output format identifier in YAML.`
-            : isPathError
-                ? `Raven: Knit Preview — file path contains an unsupported character. See output for details.`
-                : `Raven: Knit Preview — validation failed. See output for details.`;
-        await vscode.window.showErrorMessage(surface);
-        return;
-    }
-
-    // [7] Spawn + [8] Stream + [9] Exit.
-    const rBinary = resolveRBinary();
-    const timeoutMs = readTimeoutMs();
-    const baseName = path.basename(fsPath);
-
-    // Concurrent-op guard. The shared OperationRegistry tracks both
-    // knit-preview and export-* ops; a busy result here means either
-    // another knit is in flight on the same source (the legacy case)
-    // or an export is mid-Pandoc on this file (so the cached .md is
-    // being consumed and a fresh knit would race). The canonical key
-    // collapses different URI shapes of the same file (e.g., case
-    // differences on Windows) onto a single slot.
-    //
-    // `registry === null` is the re-entry path: the editor-toolbar
-    // export pipeline took out an `export-*` controller and now calls
-    // this function to perform the underlying knit. The caller already
-    // owns the slot; skipping the beginOp lets the nested knit proceed
-    // without falsely reporting "already being knitted by the export
-    // I just started".
-    const opKey = canonicalOpKey(docUri);
-    let controller: OperationController | null = null;
-    if (registry !== null) {
-        const begin = registry.beginOp(opKey, 'knit-preview');
-        if (begin.kind === 'busy') {
-            const what =
-                begin.existing.kind === 'knit-preview'
-                    ? 'being knitted'
-                    : begin.existing.kind === 'export-html'
-                        ? 'exporting to HTML'
-                        : begin.existing.kind === 'export-pdf'
-                            ? 'exporting to PDF'
-                            : begin.existing.kind === 'export-docx'
-                                ? 'exporting to Word'
-                                : 'busy';
-            await vscode.window.showInformationMessage(
-                `Raven: Knit Preview — ${baseName} is already ${what}.`,
-            );
-            return;
-        }
-        controller = begin.controller;
-    }
-
-    // Pin the preview dir for the duration of the knit + post-knit
-    // render. Without this, `KnitOutputPanel.onDidDispose` (fired when
-    // the user closes the previous knit's panel while a new knit is
-    // in flight) would call `requestPreviewDirDeletion`, see refcount
-    // = 0, and start an `fs.rm -rf` race against R writing the `.md` /
-    // `figure/` files.
+    // Pin the preview dir BEFORE any await. `mkdir`, the busy
+    // information toast, and `openTextDocument` (earlier) all yield
+    // the event loop; without an early pin a panel-disposal
+    // `requestPreviewDirDeletion` fired during any of those awaits
+    // would see refcount = 0 and schedule the unrecoverable
+    // `fs.rm -rf` against the dir we're about to write into. The pin
+    // must guard the entire knit + post-knit render pipeline.
     //
     // Re-entry path: when `registry === null` the export pipeline
     // owns the pin via `runExport`, so we skip — double-pinning would
     // leave the refcount stuck above zero after both pipelines unpin.
     let pinnedPreviewKey: string | null = null;
-    if (registry !== null && controller !== null) {
+    if (registry !== null) {
         registry.pinPreviewDir(previewPaths.previewKey);
         pinnedPreviewKey = previewPaths.previewKey;
     }
 
     let knitProducedValidMd = false;
+    let controller: OperationController | null = null;
     try {
+        try {
+            await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            output.show(true);
+            output.appendLine(`[knit] Failed to create temp dir ${previewPaths.previewDir}: ${message}`);
+            await vscode.window.showErrorMessage(
+                `Raven: Knit Preview could not create temp directory. See output for details.`,
+            );
+            return;
+        }
+
+        // YAML output: block — chunk-level options come from here. The
+        // preview path always uses 'html' (preview renders to HTML
+        // regardless of YAML output:). The editor-toolbar export path
+        // passes its target format so PDF / Word knits pick chunk options
+        // from `pdf_document:` / `word_document:` instead of
+        // `html_document:`. Per docs/superpowers/specs/2026-05-23-knit-preview-export-design.md,
+        // non-matching format blocks are completely ignored: when target
+        // is 'pdf', `html_document.fig_width` does NOT drive the PDF
+        // knit, and vice versa.
+        const outputOpts = parseOutputOptions(parsed.value, targetFormat);
+        if (outputOpts.ignored.length > 0) {
+            for (const key of outputOpts.ignored) {
+                output.appendLine(`[knit] Ignored output: option '${key}'`);
+            }
+        }
+
+        let expression: string;
+        try {
+            expression = buildKnitExpression({
+                filePath: fsPath,
+                outputPath: mdOutputPath,
+                format,
+                knitRootDir,
+                // base.dir is the preview temp dir so knitr's plots land
+                // under <previewDir>/figure/ alongside the .md. The
+                // relative fig.path lets the .md reference figures as
+                // `figure/<chunk>-N.png`, and Pandoc's `cwd` (set during
+                // export to `previewDir`) resolves those relative paths
+                // against the freshly-generated figures — never against
+                // stale source-directory artifacts.
+                baseDir: previewPaths.previewDir,
+                figPath: 'figure/',
+                chunkOpts: outputOpts.chunkOpts,
+            });
+        } catch (err) {
+            const isPathError = err instanceof ValidatePathError;
+            const isFormatError = err instanceof ValidateFormatError;
+            const message = err instanceof Error ? err.message : String(err);
+            output.show(true);
+            output.appendLine(`[validation] ${message}`);
+            const surface = isFormatError
+                ? `Raven: Knit Preview — unsupported output format identifier in YAML.`
+                : isPathError
+                    ? `Raven: Knit Preview — file path contains an unsupported character. See output for details.`
+                    : `Raven: Knit Preview — validation failed. See output for details.`;
+            await vscode.window.showErrorMessage(surface);
+            return;
+        }
+
+        // [7] Spawn + [8] Stream + [9] Exit.
+        const rBinary = resolveRBinary();
+        const timeoutMs = readTimeoutMs();
+        const baseName = path.basename(fsPath);
+
+        // Concurrent-op guard. The shared OperationRegistry tracks both
+        // knit-preview and export-* ops; a busy result here means either
+        // another knit is in flight on the same source (the legacy case)
+        // or an export is mid-Pandoc on this file (so the cached .md is
+        // being consumed and a fresh knit would race). The canonical key
+        // collapses different URI shapes of the same file (e.g., case
+        // differences on Windows) onto a single slot.
+        //
+        // `registry === null` is the re-entry path: the editor-toolbar
+        // export pipeline took out an `export-*` controller and now calls
+        // this function to perform the underlying knit. The caller already
+        // owns the slot; skipping the beginOp lets the nested knit proceed
+        // without falsely reporting "already being knitted by the export
+        // I just started".
+        const opKey = canonicalOpKey(docUri);
+        if (registry !== null) {
+            const begin = registry.beginOp(opKey, 'knit-preview');
+            if (begin.kind === 'busy') {
+                const what =
+                    begin.existing.kind === 'knit-preview'
+                        ? 'being knitted'
+                        : begin.existing.kind === 'export-html'
+                            ? 'exporting to HTML'
+                            : begin.existing.kind === 'export-pdf'
+                                ? 'exporting to PDF'
+                                : begin.existing.kind === 'export-docx'
+                                    ? 'exporting to Word'
+                                    : 'busy';
+                await vscode.window.showInformationMessage(
+                    `Raven: Knit Preview — ${baseName} is already ${what}.`,
+                );
+                return;
+            }
+            controller = begin.controller;
+        }
+
         output.appendLine(`---`);
         output.appendLine(`Knitting ${fsPath}`);
         output.appendLine(`R: ${rBinary}`);

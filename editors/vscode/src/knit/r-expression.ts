@@ -276,7 +276,14 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
         ` output = __raven_tmp_output,`,
         ` envir = new.env(),`,
         ` quiet = TRUE);`,
-        ` file.rename(__raven_tmp_output, __raven_output);`,
+        // file.rename returns FALSE (with a warning) on failure rather
+        // than erroring. If we ignored that, a failed rename would
+        // leave the previous .md in place while we still emit
+        // "Output created:" — `parseRenderedOutputPath` would then
+        // hand a stale file to the caller. Convert the FALSE return
+        // into a hard stop so the knit outcome reflects reality.
+        ` if (!isTRUE(file.rename(__raven_tmp_output, __raven_output)))`,
+        ` stop('Failed to rename ', __raven_tmp_output, ' to ', __raven_output);`,
         ` cat('Output created: ', __raven_output, '\\n', sep = '')`,
         ' })',
     ].join('');

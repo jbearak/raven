@@ -14,9 +14,13 @@
  * users can override defaults like `--highlight-style` from YAML
  * without colliding with `-o`/`--to`/`--from`.
  *
- * HTML exports default to `--embed-resources` (matching rmarkdown's
- * `html_document` default of `self_contained: true`). Users opt out
- * with `self_contained: false` in YAML.
+ * HTML exports always pass `--embed-resources` (matching rmarkdown's
+ * `html_document` default of `self_contained: true`). Raven does NOT
+ * honor `self_contained: false` — the linked-assets workflow it
+ * implies requires copying our temp `figure/` dir next to the
+ * exported `.html` and shipping Pandoc's data-dir assets too. We
+ * surface the ignored setting via `DetailedPandocArgs.ignoredFlags`
+ * so the caller can log it; the exported HTML is always portable.
  */
 
 import * as path from 'path';
@@ -37,22 +41,29 @@ export interface BuildPandocArgsCtx {
 export interface DetailedPandocArgs {
     args: string[];
     droppedCss: string[];
+    /**
+     * YAML flags we recognized but chose not to honor. Caller logs
+     * these so the user knows their setting didn't take effect.
+     */
+    ignoredFlags: string[];
 }
 
 function build(opts: OutputOptions, format: TargetFormat, ctx: BuildPandocArgsCtx): DetailedPandocArgs {
     const f = opts.pandocFlags;
     const args: string[] = [ctx.mdPath, '-o', ctx.outPath];
+    const ignoredFlags: string[] = [];
     if (format === 'html') {
-        args.push('--to', 'html5', '--standalone');
-        // Default HTML exports to self-contained. Without embedding,
-        // Pandoc emits `<img src="figure/foo.png">` relative to the
-        // destination — but the figures live in Raven's temp preview
-        // dir, which is purged after the panel closes. The visible
-        // export would silently lose its images. rmarkdown's
-        // html_document defaults to self_contained: true for the same
-        // reason; we match that contract here and respect an explicit
-        // self_contained: false opt-out.
-        if (f.self_contained !== false) args.push('--embed-resources');
+        args.push('--to', 'html5', '--standalone', '--embed-resources');
+        // We always embed for HTML. `self_contained: false` would
+        // require shipping the temp `figure/` dir (and Pandoc's
+        // standalone assets) alongside the .html for the linked-
+        // assets workflow to actually render — Raven's preview temp
+        // dir gets purged after the panel closes, so honoring the
+        // opt-out would produce HTML with broken image links. We
+        // surface the ignored setting so the caller can log it.
+        if (f.self_contained === false) {
+            ignoredFlags.push("self_contained: false (HTML export always embeds resources)");
+        }
     } else if (format === 'pdf') {
         args.push('--to', 'pdf');
         args.push(`--pdf-engine=${ctx.pdfEngine ?? 'xelatex'}`);
@@ -81,7 +92,7 @@ function build(opts: OutputOptions, format: TargetFormat, ctx: BuildPandocArgsCt
 
     args.push(...opts.pandocArgs);
 
-    return { args, droppedCss };
+    return { args, droppedCss, ignoredFlags };
 }
 
 interface BuildPandocArgsFn {

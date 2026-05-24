@@ -83,12 +83,34 @@ describe('OperationRegistry', () => {
         expect(b.kind).toBe('busy');
     });
 
-    it('requestPreviewDirDeletion fires the deleter immediately when no pins held', () => {
+    it('requestPreviewDirDeletion fires the deleter on the next macrotask when no pins held', async () => {
+        // Deferred via setImmediate so a same-tick `pinPreviewDir` +
+        // `cancelPreviewDirDeletion` (the close-panel-then-knit race)
+        // can rescue the directory before the unrecoverable fs.rm
+        // starts. Sync test was tightened to await the macrotask
+        // boundary on purpose.
         const reg = new OperationRegistry();
         const deleted: Array<[string, string]> = [];
         reg.setPreviewDirDeleter((dir, key) => { deleted.push([dir, key]); });
         reg.requestPreviewDirDeletion('p1', '/tmp/preview/p1');
+        expect(deleted).toEqual([]);
+        await new Promise<void>((r) => setTimeout(r, 0));
         expect(deleted).toEqual([['/tmp/preview/p1', 'p1']]);
+    });
+
+    it('requestPreviewDirDeletion bails when a pin lands before the deferred fire', async () => {
+        // This is the race the macrotask boundary is for: the panel
+        // is disposed (deletion requested, no pins) but a brand-new
+        // knit on the same source pins + cancels before the rm runs.
+        const reg = new OperationRegistry();
+        const deleted: string[] = [];
+        reg.setPreviewDirDeleter((dir) => { deleted.push(dir); });
+        reg.requestPreviewDirDeletion('p1', '/tmp/preview/p1');
+        // Synchronously: a new op pins and cancels the deletion.
+        reg.pinPreviewDir('p1');
+        reg.cancelPreviewDirDeletion('p1');
+        await new Promise<void>((r) => setTimeout(r, 0));
+        expect(deleted).toEqual([]);
     });
 
     it('requestPreviewDirDeletion defers when pins are held; fires on last unpin', () => {
