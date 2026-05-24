@@ -234,8 +234,22 @@ button.
 The exported file is written next to the source `.Rmd` as
 `<basename>.{html,pdf,docx}`. Writes are atomic (temp file + rename),
 so a cancelled or failed export never corrupts a prior successful
-output. A notification offers an "Open in Browser" / "View PDF" /
-"Open in Word" button on success.
+output. A notification offers two buttons on success:
+
+- A format-specific external-open button — **Open in Browser**
+  (`html`), **Open PDF** (`pdf`), or **Open in Word** (`docx`) — which
+  hands the file to the OS default handler. In a remote workspace
+  (Remote SSH, Dev Containers, WSL, Codespaces) this button is
+  replaced with **Download**, which reveals the file in the file
+  explorer and runs VS Code's built-in `explorer.download` to copy
+  it from the remote machine to a local path you pick; the
+  OS-handler buttons can't reach your local apps from a remote
+  workspace.
+- **Open in Editor**, which opens the file inside your editor via
+  `vscode.open`. Useful when you don't want to leave the editor, or
+  on a remote workspace as an alternative to downloading. The viewing
+  experience for PDF/Word depends on whichever editor or extension
+  the host has registered for that file type.
 
 PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
 (default `xelatex`). If the engine isn't found Raven surfaces an
