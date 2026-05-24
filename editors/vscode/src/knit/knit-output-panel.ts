@@ -946,10 +946,15 @@ export class KnitOutputPanel {
      * `webview` so the cached preview .md is reused.
      */
     private async openExportQuickPick(): Promise<void> {
-        const items: vscode.QuickPickItem[] = [
-            { label: '$(file-code) Export to HTML…', description: 'Pandoc HTML' },
-            { label: '$(file-pdf) Export to PDF…', description: 'Pandoc PDF' },
-            { label: '$(file) Export to Word…', description: 'Pandoc DOCX' },
+        // Attach the dispatch command directly to each item so routing
+        // can't drift if a label is reworded for a11y or i18n.
+        interface ExportQuickPickItem extends vscode.QuickPickItem {
+            command: 'raven.knit.exportHtml' | 'raven.knit.exportPdf' | 'raven.knit.exportDocx';
+        }
+        const items: ExportQuickPickItem[] = [
+            { label: '$(file-code) Export to HTML…', description: 'Pandoc HTML', command: 'raven.knit.exportHtml' },
+            { label: '$(file-pdf) Export to PDF…', description: 'Pandoc PDF', command: 'raven.knit.exportPdf' },
+            { label: '$(file) Export to Word…', description: 'Pandoc DOCX', command: 'raven.knit.exportDocx' },
         ];
         // Pin the preview dir across the QuickPick lifecycle. Without
         // this, the user could open the QuickPick, close the panel
@@ -965,9 +970,8 @@ export class KnitOutputPanel {
         const pin = KnitOutputPanel.pinPreviewHandler;
         const unpin = KnitOutputPanel.unpinPreviewHandler;
         if (pin) pin(rmdAbsPath);
-        let choice: vscode.QuickPickItem | undefined;
         try {
-            choice = await vscode.window.showQuickPick(items, {
+            const choice = await vscode.window.showQuickPick(items, {
                 placeHolder: `Export ${this.sourceUri.path.split('/').pop() ?? this.sourceUri.fsPath}`,
             });
             if (!choice) return;
@@ -976,13 +980,7 @@ export class KnitOutputPanel {
             // (test harness, etc.) gets the same entry point as the
             // editor-toolbar invocations — `runExport` then differentiates
             // entry-mode by the optional second argument.
-            if (choice.label.includes('HTML')) {
-                await vscode.commands.executeCommand('raven.knit.exportHtml', this.sourceUri, { entry: 'webview' });
-            } else if (choice.label.includes('PDF')) {
-                await vscode.commands.executeCommand('raven.knit.exportPdf', this.sourceUri, { entry: 'webview' });
-            } else if (choice.label.includes('Word')) {
-                await vscode.commands.executeCommand('raven.knit.exportDocx', this.sourceUri, { entry: 'webview' });
-            }
+            await vscode.commands.executeCommand(choice.command, this.sourceUri, { entry: 'webview' });
         } finally {
             if (unpin) unpin(rmdAbsPath);
         }

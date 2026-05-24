@@ -251,7 +251,11 @@ async function runExportInner(
     // [3] Parse YAML + build Pandoc args.
     let documentText: string;
     try {
-        documentText = (await vscode.workspace.fs.readFile(rmd)).toString();
+        // `vscode.workspace.fs.readFile` is typed as `Uint8Array`. A bare
+        // `.toString()` on a true `Uint8Array` returns a comma-separated
+        // byte list, which would make `extractFrontmatter` miss the YAML
+        // fence even on perfectly-formed documents. Decode as UTF-8.
+        documentText = Buffer.from(await vscode.workspace.fs.readFile(rmd)).toString('utf8');
     } catch (err) {
         output.appendLine(`[Export] failed to read source: ${err instanceof Error ? err.message : String(err)}`);
         return;

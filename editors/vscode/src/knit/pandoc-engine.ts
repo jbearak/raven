@@ -12,15 +12,18 @@
  * final destination. On cancel or failure we unlink the temp file
  * without touching any prior good output at the destination path.
  *
- * `cwd` MUST be the directory containing the `.md`. This is what makes
- * relative `figure/foo.png` references resolve against the freshly-
- * generated temp `figure/` and not against stale source-directory
- * artifacts left over from earlier knit runs.
+ * Pandoc's cwd is derived from `dirname(mdPath)` and enforced inside
+ * this function — the `cwd` field on `PandocConvertOpts` is ignored.
+ * Anchoring cwd to the .md's directory is what makes relative
+ * `figure/foo.png` references resolve against the freshly-generated
+ * temp `figure/` and not against stale source-directory artifacts left
+ * over from earlier knit runs.
  */
 
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import * as path from 'path';
 import type { OutputChannel } from 'vscode';
 import type { OperationController } from './operation-controller';
 import { chooseTempPath, interpretExitResult } from './pandoc-engine-helpers';
@@ -38,8 +41,13 @@ export interface PandocConvertOpts {
     args: string[];
     mdPath: string;
     destPath: string;
-    /** Pandoc cwd — MUST be the directory containing `mdPath`. */
-    cwd: string;
+    /**
+     * Ignored. Pandoc's cwd is derived from `mdPath` so relative figure
+     * paths in the .md always resolve against the directory that knitr
+     * wrote them to. Kept on the interface for backward compatibility
+     * with existing callers.
+     */
+    cwd?: string;
     /** SIGINT → SIGTERM → SIGKILL hard deadline. */
     timeoutMs: number;
     controller: OperationController;
@@ -69,8 +77,15 @@ export async function pandocConvert(opts: PandocConvertOpts): Promise<PandocConv
     }
     args.push('-o', tmpOut);
 
+    // Enforce cwd = dirname(mdPath) at the spawn boundary. The contract
+    // is documented and existing callers honor it, but deriving it here
+    // makes the invariant impossible to violate: a future caller that
+    // forgets cwd or passes the source `.Rmd` directory cannot regress
+    // the temp-figure semantics that depend on this.
+    const enforcedCwd = path.dirname(opts.mdPath);
+
     return new Promise<PandocConvertResult>((resolve) => {
-        const child = child_process.spawn(opts.pandocPath, args, { cwd: opts.cwd });
+        const child = child_process.spawn(opts.pandocPath, args, { cwd: enforcedCwd });
         let stderr = '';
         let cancelled = false;
         let termTimer: NodeJS.Timeout | null = null;
