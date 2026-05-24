@@ -107,6 +107,8 @@ export function escapeRString(value: string): string {
     return out;
 }
 
+import type { ChunkOpts } from './output-options';
+
 export interface KnitExpressionInput {
     /** Absolute path of the .Rmd file being knitted. */
     filePath: string;
@@ -131,7 +133,38 @@ export interface KnitExpressionInput {
      * circuits before we spawn R.
      */
     format: string;
+    /**
+     * Base directory for knitr's plot output (figures land relative to
+     * this directory). Set via `opts_knit$set(base.dir = …)` — distinct
+     * from `root.dir`, which is where chunks run. This lets us direct
+     * figures to a temp folder while leaving the user's chunks running
+     * in their configured working directory.
+     */
+    baseDir: string;
+    /**
+     * Relative path inside `baseDir` where figures go, e.g. 'figure/'.
+     * Set via `opts_chunk$set(fig.path = …)`. Must include the trailing
+     * separator to match knitr's expectation (it concatenates this
+     * prefix directly with chunk labels).
+     */
+    figPath: string;
+    /**
+     * Optional knitr chunk-level overrides from YAML's `output:` block
+     * (`fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev`). Applied
+     * via a single `opts_chunk$set(...)` call before `knitr::knit`.
+     */
+    chunkOpts: ChunkOpts;
 }
+
+/**
+ * Whitelisted plot device strings — anything else from YAML is rejected
+ * before reaching `escapeRString`, so a malicious `dev` value cannot
+ * carry an arbitrary R string into the subprocess even if the front-
+ * matter parser somehow let it through.
+ */
+const DEV_ALLOWLIST: ReadonlySet<string> = new Set([
+    'png', 'pdf', 'svg', 'jpeg', 'cairo_pdf',
+]);
 
 /**
  * Build the single-line R expression passed to `R -e`.
@@ -147,8 +180,14 @@ export interface KnitExpressionInput {
  *     `knitRootDir` is null we pin `root.dir` to `getwd()` so chunk
  *     evaluation happens in the subprocess CWD (matches the `current`
  *     mode contract).
- *   - `output = …` makes the .md path deterministic so the TS-side
- *     renderer knows where to find it.
+ *   - knitr writes to `<outputPath>.tmp` and we `file.rename` to the
+ *     real `outputPath` on success. R's `file.rename` is atomic on
+ *     POSIX and uses `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on
+ *     Windows. A cancelled / failed / timed-out knit leaves the
+ *     partial `.md.tmp` behind but the destination `.md` either
+ *     contains the previous successful output or doesn't exist — so
+ *     downstream consumers (webview Export ▾) cannot pick up a
+ *     half-written file.
  *   - `envir = new.env()` isolates chunk evaluation, matching
  *     rmarkdown's default.
  *   - `quiet = TRUE` suppresses knitr's per-chunk progress output;
@@ -156,7 +195,8 @@ export interface KnitExpressionInput {
  *     line we emit.
  *   - `cat('Output created: …')` keeps the existing
  *     `parseRenderedOutputPath` contract — the classifier doesn't
- *     care that knitr (not pandoc) is the producer.
+ *     care that knitr (not pandoc) is the producer. We emit the
+ *     real `output` path, not the `.tmp` sidecar.
  *
  * Each interpolated value is validated before escaping (see module
  * docstring), so the caller can rely on a clean throw rather than a
@@ -165,9 +205,14 @@ export interface KnitExpressionInput {
 export function buildKnitExpression(input: KnitExpressionInput): string {
     validatePathForRExpression(input.filePath);
     validatePathForRExpression(input.outputPath);
+    validatePathForRExpression(input.baseDir);
+    validatePathForRExpression(input.figPath);
     validateFormatIdentifier(input.format);
     if (input.knitRootDir !== null) {
         validatePathForRExpression(input.knitRootDir);
+    }
+    if (input.chunkOpts.dev !== undefined && !DEV_ALLOWLIST.has(input.chunkOpts.dev)) {
+        throw new ValidatePathError(`Chunk dev value not in allowlist: ${input.chunkOpts.dev}`);
     }
 
     const rootDirLiteral = input.knitRootDir !== null
@@ -179,15 +224,67 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
     // contain bindings and to keep the `out` variable from leaking.
     const inputLit = escapeRString(input.filePath);
     const outputLit = escapeRString(input.outputPath);
+    const baseDirLit = escapeRString(input.baseDir);
+    const figPathLit = escapeRString(input.figPath);
+
+    // YAML-supplied chunk-level options pass through R-side variables
+    // rather than being interpolated directly into the
+    // `opts_chunk$set(...)` argument list. Even though every value we
+    // emit here is already validated (numeric finiteness + dev
+    // allowlist), the variable indirection matches the contract in
+    // CLAUDE.md's "R subprocess safety" invariant and gives one audit
+    // point for any future chunk option we add.
+    const assigns: string[] = [];
+    const namedArgs: string[] = [];
+    const co = input.chunkOpts;
+    if (co.fig_width !== undefined && Number.isFinite(co.fig_width)) {
+        assigns.push(`__raven_fig_width <- ${co.fig_width}`);
+        namedArgs.push('fig.width = __raven_fig_width');
+    }
+    if (co.fig_height !== undefined && Number.isFinite(co.fig_height)) {
+        assigns.push(`__raven_fig_height <- ${co.fig_height}`);
+        namedArgs.push('fig.height = __raven_fig_height');
+    }
+    if (co.fig_retina !== undefined && Number.isFinite(co.fig_retina)) {
+        assigns.push(`__raven_fig_retina <- ${co.fig_retina}`);
+        namedArgs.push('fig.retina = __raven_fig_retina');
+    }
+    if (co.dpi !== undefined && Number.isInteger(co.dpi)) {
+        assigns.push(`__raven_dpi <- ${co.dpi}L`);
+        namedArgs.push('dpi = __raven_dpi');
+    }
+    if (co.dev !== undefined) {
+        // co.dev passed DEV_ALLOWLIST above; `escapeRString` is the
+        // single-quoted-literal wrapper. The assignment puts it on the
+        // R side; the `opts_chunk$set` call references the local var.
+        assigns.push(`__raven_dev <- ${escapeRString(co.dev)}`);
+        namedArgs.push('dev = __raven_dev');
+    }
+    const yamlOptsChunk = assigns.length > 0
+        ? ` ${assigns.join('; ')}; knitr::opts_chunk$set(${namedArgs.join(', ')});`
+        : '';
+
     return [
         'local({',
-        ` knitr::opts_knit$set(root.dir = ${rootDirLiteral});`,
-        ` out <- knitr::knit(`,
+        ` knitr::opts_knit$set(root.dir = ${rootDirLiteral}, base.dir = ${baseDirLit});`,
+        ` knitr::opts_chunk$set(fig.path = ${figPathLit});`,
+        yamlOptsChunk,
+        ` __raven_output <- ${outputLit};`,
+        ` __raven_tmp_output <- paste0(__raven_output, '.tmp');`,
+        ` knitr::knit(`,
         `input = ${inputLit},`,
-        ` output = ${outputLit},`,
+        ` output = __raven_tmp_output,`,
         ` envir = new.env(),`,
         ` quiet = TRUE);`,
-        ` cat('Output created: ', out, '\\n', sep = '')`,
+        // file.rename returns FALSE (with a warning) on failure rather
+        // than erroring. If we ignored that, a failed rename would
+        // leave the previous .md in place while we still emit
+        // "Output created:" — `parseRenderedOutputPath` would then
+        // hand a stale file to the caller. Convert the FALSE return
+        // into a hard stop so the knit outcome reflects reality.
+        ` if (!isTRUE(file.rename(__raven_tmp_output, __raven_output)))`,
+        ` stop('Failed to rename ', __raven_tmp_output, ' to ', __raven_output);`,
+        ` cat('Output created: ', __raven_output, '\\n', sep = '')`,
         ' })',
     ].join('');
 }

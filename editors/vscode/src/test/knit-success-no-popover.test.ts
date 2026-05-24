@@ -7,7 +7,7 @@ import { __runKnitCommandForTest, type KnitDeps } from '../knit/knit-commands';
 /**
  * When a knit succeeds and produces an HTML output, the panel itself
  * is the success signal — the user is staring at the rendered content.
- * The previous code surfaced a `Raven: Knit succeeded: X.html` toast
+ * The previous code surfaced a `Raven: Knit Preview succeeded: X.html` toast
  * with a "Show Output Panel" button, which (a) duplicates an obvious
  * affordance the user can already see, and (b) costs an explicit
  * dismissal click. This test pins the contract: no popover on HTML
@@ -69,7 +69,7 @@ suite('knit success: no popover when HTML output is shown', () => {
             for (const args of calls) {
                 const label = String(args[0] ?? '');
                 assert.ok(
-                    !label.startsWith('Raven: Knit succeeded'),
+                    !label.startsWith('Raven: Knit Preview succeeded'),
                     `Unexpected success toast: ${label}`,
                 );
             }

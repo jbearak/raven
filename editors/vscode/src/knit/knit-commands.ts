@@ -5,9 +5,9 @@ import {
     detectBlockers,
     detectFormat,
     extractFrontmatter,
-    isSupportedHtmlFormat,
     parseFrontmatter,
 } from './yaml-frontmatter';
+import { parseOutputOptions, type TargetFormat } from './output-options';
 import {
     buildKnitExpression,
     escapeRString,
@@ -15,7 +15,10 @@ import {
     ValidatePathError,
 } from './r-expression';
 import { runKnit } from './knit-engine';
-import { computeHtmlOutputPath, computeMdOutputPath } from './knit-paths';
+import { computeHtmlOutputPath } from './knit-paths';
+import { canonicalOpKey, previewArtifactPaths } from './raven-knit-paths';
+import { OperationRegistry, type OperationController } from './operation-controller';
+import * as fs from 'fs';
 import { runPostKnitRender } from './post-knit-renderer';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { resolveRConsoleActivation } from '../r-console-activation';
@@ -52,16 +55,38 @@ export interface KnitDeps {
      * override to avoid touching the filesystem and the markdown API.
      */
     runPostKnitRender: typeof runPostKnitRender;
+    /**
+     * Optional shared "Raven: Knit" output channel. When omitted,
+     * `registerKnitCommands` creates and owns one. When provided
+     * (production calls it that way from `knit/index.ts`), the same
+     * channel is used by both knit and Pandoc export logs so the
+     * "Show Knit Output" command reveals a single source of truth.
+     */
+    sharedOutput?: vscode.OutputChannel;
+    /**
+     * Optional shared OperationRegistry. When provided (production
+     * calls it that way), knit and export ops share one per-source
+     * gate so an in-flight knit blocks export and vice versa. When
+     * omitted, `registerKnitCommands` creates a private registry —
+     * legacy / test-only behavior.
+     */
+    sharedRegistry?: OperationRegistry;
 }
 
 /**
- * Top-level registration. Creates the lazy OutputChannel and registers
- * the two commands listed in `package.json`.
+ * Top-level registration. Creates the lazy OutputChannel (unless one
+ * is injected via `deps.sharedOutput`) and registers the two commands
+ * listed in `package.json`.
+ *
+ * `sharedOutput` lets callers (currently `knit/index.ts`) inject one
+ * "Raven: Knit" channel shared with the export pipeline, so both knit
+ * and Pandoc logs appear in the same place that `raven.knit.openOutputChannel`
+ * reveals.
  */
 export function registerKnitCommands(
     context: vscode.ExtensionContext,
     deps?: Partial<KnitDeps>,
-): void {
+): vscode.OutputChannel {
     const resolved: KnitDeps = {
         runKnit: deps?.runKnit ?? runKnit,
         showOrUpdatePanel: deps?.showOrUpdatePanel ?? KnitOutputPanel.showOrUpdate,
@@ -69,7 +94,7 @@ export function registerKnitCommands(
         runPostKnitRender: deps?.runPostKnitRender ?? runPostKnitRender,
     };
 
-    let outputChannel: vscode.OutputChannel | undefined;
+    let outputChannel: vscode.OutputChannel | undefined = deps?.sharedOutput;
     const getOutput = (): vscode.OutputChannel => {
         if (!outputChannel) {
             outputChannel = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
@@ -78,17 +103,18 @@ export function registerKnitCommands(
         return outputChannel;
     };
 
-    // Per-file in-flight set. A second knit against a file that's
-    // already rendering would race on the same output and confuse the
-    // user; we surface a clear info message instead. Keyed by the
-    // resolved fsPath after the up-front gate/extension checks.
-    const inFlight = new Set<string>();
+    // Per-source operation registry. Shared with the export pipeline
+    // when `deps.sharedRegistry` is supplied (production path). The
+    // shared registry ensures an in-flight knit blocks a same-source
+    // export and vice versa. When omitted (tests), we keep a private
+    // registry per `registerKnitCommands` call.
+    const registry = deps?.sharedRegistry ?? new OperationRegistry();
 
     context.subscriptions.push(
         vscode.commands.registerCommand(
             'raven.knit',
             async (uri?: vscode.Uri) => {
-                await runKnitCommand(uri, getOutput(), inFlight, context, resolved);
+                await runKnitCommand(uri, getOutput(), registry, context, resolved);
             },
         ),
         vscode.commands.registerCommand(
@@ -96,31 +122,102 @@ export function registerKnitCommands(
             () => getOutput().show(true),
         ),
     );
+
+    return getOutput();
+}
+
+/**
+ * Public re-entry point for callers that already hold a controller
+ * slot on this source (the editor-toolbar export pipeline calls this
+ * after taking out an `export-*` controller, so re-acquiring through
+ * `beginOp` would falsely report "busy"). The caller MUST already
+ * own the registry slot for the source URI; otherwise use the
+ * registered command surface instead.
+ *
+ * The `externalController` is the caller's already-running operation
+ * controller. We bridge its `cancelled` flag into the knit subprocess
+ * via a CancellationTokenSource so cancelling the outer export
+ * actually stops the underlying R subprocess. We also skip the
+ * nested `withProgress` — the outer caller already shows progress;
+ * a second notification would clutter the UX.
+ *
+ * `targetFormat` (default `'html'`) selects which YAML `output:` block
+ * supplies chunk options for the knit. Editor-toolbar Export → PDF /
+ * Word passes `'pdf'` / `'docx'` so target-specific options like
+ * `pdf_document: { fig_width: 4, dpi: 300 }` actually shape the
+ * figures produced for that target. Without this, PDF/Word exports
+ * would knit with HTML chunk options and Pandoc would convert
+ * HTML-sized figures into the wrong target — violating the design
+ * intent in docs/superpowers/specs/2026-05-23-knit-preview-export-design.md.
+ */
+export async function runKnitWithExistingController(
+    explicitUri: vscode.Uri | undefined,
+    output: vscode.OutputChannel,
+    context: vscode.ExtensionContext,
+    deps: KnitDeps,
+    externalController: OperationController,
+    targetFormat: TargetFormat = 'html',
+): Promise<{ ok: boolean }> {
+    // Capture the outcome via the dedicated channel `runKnitCommand`
+    // populates when `outcomeCapture` is non-null. Avoids refactoring
+    // every return path in runKnitCommand (which spans validation
+    // gates, working-dir resolution, R-expression construction, etc.)
+    // into a typed return.
+    const capture: { outcome: KnitOutcome | null } = { outcome: null };
+    await runKnitCommand(
+        explicitUri,
+        output,
+        /* registry */ null,
+        context,
+        deps,
+        externalController,
+        capture,
+        targetFormat,
+    );
+    return { ok: capture.outcome !== null && capture.outcome.kind === 'ok' };
 }
 
 async function runKnitCommand(
     explicitUri: vscode.Uri | undefined,
     output: vscode.OutputChannel,
-    inFlight: Set<string>,
+    registry: OperationRegistry | null,
     context: vscode.ExtensionContext,
     deps: KnitDeps,
+    externalController: OperationController | null = null,
+    /**
+     * Optional out-channel for the final KnitOutcome. The export
+     * pipeline uses this to distinguish a successful knit from a
+     * cancelled/failed one that left a partial `.md`. Null means
+     * "don't capture" — the existing command-surface call site
+     * leaves the field unset.
+     */
+    outcomeCapture: { outcome: KnitOutcome | null } | null = null,
+    /**
+     * Which YAML `output:` block supplies chunk options for the knit.
+     * Default `'html'` matches Knit Preview's HTML-always contract.
+     * Editor-toolbar Export → PDF / Word passes `'pdf'` / `'docx'`
+     * so target-specific YAML like `pdf_document: { fig_width: 4,
+     * dpi: 300 }` actually drives the knit instead of being ignored
+     * in favour of `html_document`'s defaults.
+     */
+    targetFormat: TargetFormat = 'html',
 ): Promise<void> {
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
         await vscode.window.showInformationMessage(
-            'Raven: Knit requires an active editor with a .Rmd file.',
+            'Raven: Knit Preview requires an active editor with a .Rmd file.',
         );
         return;
     }
 
     // Re-check the *resolved* gate. The command-palette `when` clauses
-    // already gate on `raven.rmdKnit.enabled`, but the command itself is
-    // registered unconditionally (so the walkthrough's command-link
-    // works), and a stale auto-resolution after REditorSupport is
-    // enabled would otherwise let knit run.
+    // already gate on `raven.rmdKnit.enabled`, but the command itself
+    // is registered unconditionally (so user keybindings and
+    // `tasks.json` entries keep working), and a stale auto-resolution
+    // after REditorSupport is enabled would otherwise let knit run.
     if (resolveRConsoleActivation() !== 'enabled') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit is disabled by your `raven.rConsole.activation` setting (or because REditorSupport / Positron is active).',
+            'Raven: Knit Preview is disabled by your `raven.rConsole.activation` setting (or because REditorSupport / Positron is active).',
         );
         return;
     }
@@ -133,7 +230,7 @@ async function runKnitCommand(
     // learning calls this out specifically.
     if (docUri.scheme !== 'file' && docUri.scheme !== 'vscode-remote') {
         await vscode.window.showInformationMessage(
-            'Save the file to disk before running Raven: Knit.',
+            'Save the file to disk before running Raven: Knit Preview.',
         );
         return;
     }
@@ -141,7 +238,7 @@ async function runKnitCommand(
     if (!vscode.workspace.isTrusted) {
         const MANAGE = 'Manage Workspace Trust';
         const choice = await vscode.window.showInformationMessage(
-            'Raven: Knit is disabled in untrusted workspaces.',
+            'Raven: Knit Preview is disabled in untrusted workspaces.',
             MANAGE,
         );
         if (choice === MANAGE) {
@@ -154,7 +251,7 @@ async function runKnitCommand(
     const ext = path.extname(docUri.fsPath || docUri.path).toLowerCase();
     if (ext !== '.rmd') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit only runs on .Rmd files.',
+            'Raven: Knit Preview only runs on .Rmd files.',
         );
         return;
     }
@@ -162,7 +259,7 @@ async function runKnitCommand(
     const fsPath = docUri.fsPath;
     if (!fsPath) {
         await vscode.window.showInformationMessage(
-            'Save the file to disk before running Raven: Knit.',
+            'Save the file to disk before running Raven: Knit Preview.',
         );
         return;
     }
@@ -195,7 +292,7 @@ async function runKnitCommand(
             }
             if (!saved) {
                 await vscode.window.showWarningMessage(
-                    `Raven: Knit — could not save ${path.basename(fsPath)}. ` +
+                    `Raven: Knit Preview — could not save ${path.basename(fsPath)}. ` +
                     `The knit output would not reflect your unsaved changes.`,
                 );
                 return;
@@ -205,7 +302,7 @@ async function runKnitCommand(
         sourceLanguageId = doc.languageId;
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await vscode.window.showErrorMessage(`Raven: Knit could not read document: ${message}`);
+        await vscode.window.showErrorMessage(`Raven: Knit Preview could not read document: ${message}`);
         return;
     }
 
@@ -216,7 +313,7 @@ async function runKnitCommand(
         output.show(true);
         output.appendLine(`[YAML parse error] ${parsed.error}`);
         await vscode.window.showWarningMessage(
-            'Raven: Knit — YAML front matter is malformed; see Raven: Knit output.',
+            'Raven: Knit Preview — YAML front matter is malformed; see Raven: Knit output.',
         );
         return;
     }
@@ -229,24 +326,21 @@ async function runKnitCommand(
     }
 
     // [4] Format detection.
-    const format = detectFormat(parsed.value);
-
-    // [4a] Reject non-HTML output formats. `Raven: Knit` is scoped to
-    // HTML in this version; other formats (pdf_document, word_document,
-    // ioslides, custom output formats) should run through
-    // `rmarkdown::render` in the R console, which surfaces full pandoc
-    // behavior that we don't reproduce. We synthesize a Blocker so the
-    // user gets the same "Copy command" UX as the other refusal paths
-    // (custom knit:, runtime: shiny, site:).
     //
-    // Ordering note: this gate runs AFTER `detectBlockers`, so a
-    // document that also declares `runtime: shiny` or `site:` will
-    // surface those (more-fundamental) blockers first. Format mismatch
-    // is the right thing to refuse only once those have been ruled out.
-    if (!isSupportedHtmlFormat(format)) {
-        await showBlocker(buildNonHtmlFormatBlocker(format), fsPath);
-        return;
-    }
+    // Knit Preview ignores the YAML `output:` block when deciding how
+    // to render — we always produce an HTML preview into the per-
+    // session temp dir, regardless of `output: pdf_document`,
+    // `output: word_document`, etc. The format identifier is still
+    // computed (and passed through validation downstream) for logging,
+    // but no longer gates execution.
+    //
+    // Why ignore it? `knitr::knit` doesn't read the `output:` block —
+    // that's an rmarkdown concept consumed by `rmarkdown::render`.
+    // Honoring it would require switching to rmarkdown (requires
+    // Pandoc on the preview path) and losing Raven's TextMate-based
+    // syntax highlighting + theme overlay. Trade-off documented in
+    // the design spec at docs/superpowers/specs/2026-05-23-knit-preview-export-design.md.
+    const format = detectFormat(parsed.value);
 
     // [5] Resolve working directory.
     const workingDirectoryMode = vscode.workspace
@@ -260,105 +354,246 @@ async function runKnitCommand(
     const { knitRootDir, cwd } = knitDirResult;
 
     // [6] Build R expression.
-    // Predict the intermediate .md path. knitr's default is "strip
-    // the .Rmd extension, append .md". We pass it explicitly so the
-    // TS-side renderer doesn't have to re-derive — and so any future
-    // user-overridable output location can flow through one place.
-    const mdOutputPath = computeMdOutputPath(fsPath);
+    // Resolve the per-session temp paths now. Knit Preview writes its
+    // intermediate `.md`, final `.html`, and `figure/` artifacts into
+    // <tmpdir>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/
+    // — never next to the source `.Rmd`. We must ensure the directory
+    // exists before R runs, since knitr won't `mkdir -p` for us.
+    const previewPaths = previewArtifactPaths(fsPath);
+    const mdOutputPath = previewPaths.mdPath;
 
-    let expression: string;
+    // Pin the preview dir as soon as it's known and before any await
+    // that touches it. `mkdir`, the busy information toast, and the
+    // knit subprocess itself all yield the event loop; without this
+    // early pin a panel-disposal `requestPreviewDirDeletion` fired
+    // during any of those awaits would see refcount = 0 and schedule
+    // the unrecoverable `fs.rm -rf` against the dir we're about to
+    // write into. (Earlier awaits in this function — `openTextDocument`,
+    // `save`, the YAML-parsing path — operate on the source `.Rmd`,
+    // not the preview dir, so they're outside the race surface.) The
+    // pin must guard the entire knit + post-knit render pipeline.
+    //
+    // Re-entry path: when `registry === null` the export pipeline
+    // owns the pin via `runExport`, so we skip — double-pinning would
+    // leave the refcount stuck above zero after both pipelines unpin.
+    let pinnedPreviewKey: string | null = null;
+    if (registry !== null) {
+        registry.pinPreviewDir(previewPaths.previewKey);
+        pinnedPreviewKey = previewPaths.previewKey;
+    }
+
+    let knitProducedValidMd = false;
+    let controller: OperationController | null = null;
     try {
-        expression = buildKnitExpression({
-            filePath: fsPath,
-            outputPath: mdOutputPath,
-            format,
-            knitRootDir,
+        try {
+            await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            output.show(true);
+            output.appendLine(`[knit] Failed to create temp dir ${previewPaths.previewDir}: ${message}`);
+            await vscode.window.showErrorMessage(
+                `Raven: Knit Preview could not create temp directory. See output for details.`,
+            );
+            return;
+        }
+
+        // YAML output: block — chunk-level options come from here. The
+        // preview path always uses 'html' (preview renders to HTML
+        // regardless of YAML output:). The editor-toolbar export path
+        // passes its target format so PDF / Word knits pick chunk options
+        // from `pdf_document:` / `word_document:` instead of
+        // `html_document:`. Per docs/superpowers/specs/2026-05-23-knit-preview-export-design.md,
+        // non-matching format blocks are completely ignored: when target
+        // is 'pdf', `html_document.fig_width` does NOT drive the PDF
+        // knit, and vice versa.
+        const outputOpts = parseOutputOptions(parsed.value, targetFormat);
+        if (outputOpts.ignored.length > 0) {
+            for (const key of outputOpts.ignored) {
+                output.appendLine(`[knit] Ignored output: option '${key}'`);
+            }
+        }
+
+        let expression: string;
+        try {
+            expression = buildKnitExpression({
+                filePath: fsPath,
+                outputPath: mdOutputPath,
+                format,
+                knitRootDir,
+                // base.dir is the preview temp dir so knitr's plots land
+                // under <previewDir>/figure/ alongside the .md. The
+                // relative fig.path lets the .md reference figures as
+                // `figure/<chunk>-N.png`, and Pandoc's `cwd` (set during
+                // export to `previewDir`) resolves those relative paths
+                // against the freshly-generated figures — never against
+                // stale source-directory artifacts.
+                baseDir: previewPaths.previewDir,
+                figPath: 'figure/',
+                chunkOpts: outputOpts.chunkOpts,
+            });
+        } catch (err) {
+            const isPathError = err instanceof ValidatePathError;
+            const isFormatError = err instanceof ValidateFormatError;
+            const message = err instanceof Error ? err.message : String(err);
+            output.show(true);
+            output.appendLine(`[validation] ${message}`);
+            const surface = isFormatError
+                ? `Raven: Knit Preview — unsupported output format identifier in YAML.`
+                : isPathError
+                    ? `Raven: Knit Preview — file path contains an unsupported character. See output for details.`
+                    : `Raven: Knit Preview — validation failed. See output for details.`;
+            await vscode.window.showErrorMessage(surface);
+            return;
+        }
+
+        // [7] Spawn + [8] Stream + [9] Exit.
+        const rBinary = resolveRBinary();
+        const timeoutMs = readTimeoutMs();
+        const baseName = path.basename(fsPath);
+
+        // Concurrent-op guard. The shared OperationRegistry tracks both
+        // knit-preview and export-* ops; a busy result here means either
+        // another knit is in flight on the same source (the legacy case)
+        // or an export is mid-Pandoc on this file (so the cached .md is
+        // being consumed and a fresh knit would race). The canonical key
+        // collapses different URI shapes of the same file (e.g., case
+        // differences on Windows) onto a single slot.
+        //
+        // `registry === null` is the re-entry path: the editor-toolbar
+        // export pipeline took out an `export-*` controller and now calls
+        // this function to perform the underlying knit. The caller already
+        // owns the slot; skipping the beginOp lets the nested knit proceed
+        // without falsely reporting "already being knitted by the export
+        // I just started".
+        const opKey = canonicalOpKey(docUri);
+        if (registry !== null) {
+            const begin = registry.beginOp(opKey, 'knit-preview');
+            if (begin.kind === 'busy') {
+                const what =
+                    begin.existing.kind === 'knit-preview'
+                        ? 'being knitted'
+                        : begin.existing.kind === 'export-html'
+                            ? 'exporting to HTML'
+                            : begin.existing.kind === 'export-pdf'
+                                ? 'exporting to PDF'
+                                : begin.existing.kind === 'export-docx'
+                                    ? 'exporting to Word'
+                                    : 'busy';
+                await vscode.window.showInformationMessage(
+                    `Raven: Knit Preview — ${baseName} is already ${what}.`,
+                );
+                return;
+            }
+            controller = begin.controller;
+        }
+
+        output.appendLine(`---`);
+        output.appendLine(`Knitting ${fsPath}`);
+        output.appendLine(`R: ${rBinary}`);
+        output.appendLine(`Expression: ${expression}`);
+        output.appendLine(`cwd: ${cwd}`);
+        output.appendLine(``);
+
+        let outcome: KnitOutcome;
+        try {
+            if (externalController !== null) {
+                // Re-entry path: the export pipeline already owns a progress
+                // notification and a registry slot. Skip a second `withProgress`
+                // (a nested notification would clutter the UX) and bridge the
+                // export controller's `cancelled` flag into the R subprocess
+                // via a CancellationTokenSource. Polling once per 100ms is
+                // cheap and matches `pandoc-engine.ts`'s cancellation cadence.
+                const cts = new vscode.CancellationTokenSource();
+                const cancelPoll = setInterval(() => {
+                    if (externalController.cancelled) cts.cancel();
+                }, 100);
+                try {
+                    const result = await deps.runKnit({
+                        rBinary,
+                        expression,
+                        cwd,
+                        timeoutMs,
+                        output,
+                        cancellation: cts.token,
+                    });
+                    outcome = classify(result, { cwd });
+                } finally {
+                    clearInterval(cancelPoll);
+                    cts.dispose();
+                }
+            } else {
+                outcome = await vscode.window.withProgress<KnitOutcome>(
+                    {
+                        location: vscode.ProgressLocation.Notification,
+                        title: `Knitting ${baseName}…`,
+                        cancellable: true,
+                    },
+                    async (_progress, token) => {
+                        const result = await deps.runKnit({
+                            rBinary,
+                            expression,
+                            cwd,
+                            timeoutMs,
+                            output,
+                            cancellation: token,
+                        });
+                        return classify(result, { cwd });
+                    },
+                );
+            }
+        } finally {
+            // Critical: registry.endOp runs the moment withProgress resolves,
+            // BEFORE any user-facing toast is awaited. This is the Piece A
+            // fix — under the previous code (a bare Set<string>), awaiting
+            // showInformationMessage inside the withProgress callback held
+            // both the progress notification AND the in-flight gate open
+            // until the user dismissed the toast, causing a spurious
+            // "already being knitted" on rapid re-invocation.
+            //
+            // Re-entry path: when this function was called with a null
+            // registry (the export pipeline runs us under its own
+            // `export-*` controller), there's no slot to release here —
+            // the outer pipeline owns lifecycle.
+            if (registry !== null && controller !== null) {
+                registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
+            }
+        }
+
+        // Capture the outcome for callers (the export pipeline) that need
+        // to distinguish a successful knit from a cancelled/failed one
+        // that left a partial `.md`.
+        if (outcomeCapture !== null) outcomeCapture.outcome = outcome;
+        if (outcome.kind === 'ok') knitProducedValidMd = true;
+
+        await renderOutcome(outcome, {
+            fsPath,
+            baseName,
+            sourceUri: docUri,
+            sourceLanguageId,
+            cwd,
+            output,
+            rBinary,
+            timeoutMs,
+            context,
+            showOrUpdatePanel: deps.showOrUpdatePanel,
+            getLanguageClient: deps.getLanguageClient,
+            runPostKnitRender: deps.runPostKnitRender,
         });
-    } catch (err) {
-        const isPathError = err instanceof ValidatePathError;
-        const isFormatError = err instanceof ValidateFormatError;
-        const message = err instanceof Error ? err.message : String(err);
-        output.show(true);
-        output.appendLine(`[validation] ${message}`);
-        const surface = isFormatError
-            ? `Raven: Knit — unsupported output format identifier in YAML.`
-            : isPathError
-                ? `Raven: Knit — file path contains an unsupported character. See output for details.`
-                : `Raven: Knit — validation failed. See output for details.`;
-        await vscode.window.showErrorMessage(surface);
-        return;
-    }
-
-    // [7] Spawn + [8] Stream + [9] Exit.
-    const rBinary = resolveRBinary();
-    const timeoutMs = readTimeoutMs();
-    const baseName = path.basename(fsPath);
-
-    // Concurrent-knit guard. Re-invoking the command on a file that's
-    // already rendering produces two progress notifications, two R
-    // subprocesses, and interleaved output into the shared channel.
-    // Surface a clear info message instead. The key is the absolute
-    // fsPath so the same file under different relative URIs collapses.
-    if (inFlight.has(fsPath)) {
-        await vscode.window.showInformationMessage(
-            `Raven: Knit — ${baseName} is already being knitted.`,
-        );
-        return;
-    }
-    inFlight.add(fsPath);
-
-    output.appendLine(`---`);
-    output.appendLine(`Knitting ${fsPath}`);
-    output.appendLine(`R: ${rBinary}`);
-    output.appendLine(`Expression: ${expression}`);
-    output.appendLine(`cwd: ${cwd}`);
-    output.appendLine(``);
-
-    let outcome: KnitOutcome;
-    try {
-        outcome = await vscode.window.withProgress<KnitOutcome>(
-            {
-                location: vscode.ProgressLocation.Notification,
-                title: `Knitting ${baseName}…`,
-                cancellable: true,
-            },
-            async (_progress, token) => {
-                const result = await deps.runKnit({
-                    rBinary,
-                    expression,
-                    cwd,
-                    timeoutMs,
-                    output,
-                    cancellation: token,
-                });
-                return classify(result, { cwd });
-            },
-        );
     } finally {
-        // Critical: inFlight.delete runs the moment withProgress resolves,
-        // BEFORE any user-facing toast is awaited. This is the Piece A
-        // fix — under the previous code, awaiting showInformationMessage
-        // inside the withProgress callback held both the progress
-        // notification AND the inFlight gate open until the user
-        // dismissed the toast, causing a spurious "already being knitted"
-        // on rapid re-invocation.
-        inFlight.delete(fsPath);
+        if (pinnedPreviewKey !== null && registry !== null) {
+            // A successful knit just refreshed the dir contents, so
+            // any deletion request triggered by the old panel's
+            // disposal is stale — cancel it before unpinning so the
+            // new panel created in renderOutcome can read the
+            // `.html` we just wrote. On cancel/failure we leave the
+            // deletion request in place so the next unpin discharges
+            // it (the dir contents are not what the user wants).
+            if (knitProducedValidMd) {
+                registry.cancelPreviewDirDeletion(pinnedPreviewKey);
+            }
+            registry.unpinPreviewDir(pinnedPreviewKey);
+        }
     }
-
-    await renderOutcome(outcome, {
-        fsPath,
-        baseName,
-        sourceUri: docUri,
-        sourceLanguageId,
-        cwd,
-        output,
-        rBinary,
-        timeoutMs,
-        context,
-        showOrUpdatePanel: deps.showOrUpdatePanel,
-        getLanguageClient: deps.getLanguageClient,
-        runPostKnitRender: deps.runPostKnitRender,
-    });
 }
 
 interface RenderOutcomeCtx {
@@ -388,12 +623,12 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         if (code === 'ENOENT') {
             ctx.output.appendLine(`[error] R not found at "${ctx.rBinary}".`);
             void vscode.window.showErrorMessage(
-                'Raven: Knit — R not found on PATH. Set `raven.packages.rPath`.',
+                'Raven: Knit Preview — R not found on PATH. Set `raven.packages.rPath`.',
             );
         } else {
             ctx.output.appendLine(`[error] ${outcome.error.message}`);
             void vscode.window.showErrorMessage(
-                `Raven: Knit — failed to launch R: ${outcome.error.message}`,
+                `Raven: Knit Preview — failed to launch R: ${outcome.error.message}`,
             );
         }
         return;
@@ -401,21 +636,21 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
 
     if (outcome.kind === 'cancelled') {
         ctx.output.appendLine('Knit cancelled.');
-        void vscode.window.showInformationMessage('Raven: Knit cancelled.');
+        void vscode.window.showInformationMessage('Raven: Knit Preview cancelled.');
         return;
     }
 
     if (outcome.kind === 'timedOut') {
         ctx.output.appendLine(`Knit timed out after ${ctx.timeoutMs} ms.`);
         ctx.output.show(true);
-        void vscode.window.showErrorMessage('Raven: Knit timed out.');
+        void vscode.window.showErrorMessage('Raven: Knit Preview timed out.');
         return;
     }
 
     if (outcome.kind === 'failed') {
         ctx.output.show(true);
         void vscode.window.showErrorMessage(
-            `Raven: Knit failed (exit ${outcome.exitCode}). See Raven: Knit output.`,
+            `Raven: Knit Preview failed (exit ${outcome.exitCode}). See Raven: Knit output.`,
         );
         return;
     }
@@ -423,7 +658,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
     if (outcome.kind === 'noOutput') {
         const SHOW = 'Show Output';
         const choice = await vscode.window.showInformationMessage(
-            'Raven: Knit succeeded (output path unknown).',
+            'Raven: Knit Preview succeeded (output path unknown).',
             SHOW,
         );
         if (choice === SHOW) ctx.output.show(true);
@@ -442,7 +677,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
     const primary = pickPrimaryOutput(absolutized);
     if (!primary) {
         // Defensive — classify guarantees parsedOutputs.length >= 1 for 'ok'.
-        void vscode.window.showInformationMessage('Raven: Knit succeeded.');
+        void vscode.window.showInformationMessage('Raven: Knit Preview succeeded.');
         return;
     }
 
@@ -490,7 +725,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         const OPEN_MD = 'Open Markdown';
         const SHOW_OUTPUT = 'Show Output';
         const choice = await vscode.window.showErrorMessage(
-            `Raven: Knit produced ${path.basename(mdPath)} but the HTML render step failed. ` +
+            `Raven: Knit Preview produced ${path.basename(mdPath)} but the HTML render step failed. ` +
                 `See Raven: Knit output for details.`,
             OPEN_MD,
             SHOW_OUTPUT,
@@ -503,7 +738,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
                 const openMsg = openErr instanceof Error ? openErr.message : String(openErr);
                 ctx.output.appendLine(`[render] failed to open ${mdPath}: ${openMsg}`);
                 void vscode.window.showErrorMessage(
-                    `Raven: Knit — could not open ${path.basename(mdPath)}: ${openMsg}`,
+                    `Raven: Knit Preview — could not open ${path.basename(mdPath)}: ${openMsg}`,
                 );
             }
         } else if (choice === SHOW_OUTPUT) {
@@ -541,8 +776,12 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
  * Test-only entry point that bypasses the registered `raven.knit`
  * command. Exposes the same code path with caller-controlled deps.
  * Used by `knit-progress-lifecycle.test.ts` to verify the Piece A
- * invariant: `inFlight.delete` runs the moment `withProgress` resolves,
- * NOT when the user dismisses the success toast.
+ * invariant: the registry slot is released the moment `withProgress`
+ * resolves, NOT when the user dismisses the success toast.
+ *
+ * Accepts either a `Set<string>` (legacy — existing tests still pass
+ * one in; it's adapted to an internal OperationRegistry) or a real
+ * `OperationRegistry`. New tests should prefer the registry.
  *
  * The `__` prefix signals "test-only"; do not call from production
  * code.
@@ -550,11 +789,13 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
 export async function __runKnitCommandForTest(args: {
     uri: vscode.Uri | undefined;
     output: vscode.OutputChannel;
-    inFlight: Set<string>;
+    inFlight: Set<string> | OperationRegistry;
     context: vscode.ExtensionContext;
     deps: KnitDeps;
 }): Promise<void> {
-    await runKnitCommand(args.uri, args.output, args.inFlight, args.context, args.deps);
+    const registry =
+        args.inFlight instanceof OperationRegistry ? args.inFlight : new OperationRegistry();
+    await runKnitCommand(args.uri, args.output, registry, args.context, args.deps);
 }
 
 interface KnitDirOk {
@@ -600,7 +841,7 @@ function resolveKnitDir(
         if (!folder) {
             return {
                 ok: false,
-                error: 'Raven: Knit — cannot resolve project root: document is outside the workspace.',
+                error: 'Raven: Knit Preview — cannot resolve project root: document is outside the workspace.',
             };
         }
         return { ok: true, knitRootDir: folder.uri.fsPath, cwd: folder.uri.fsPath };
@@ -637,35 +878,6 @@ function absolutizeFromCwd(raw: string, cwd: string): string {
     return path.resolve(cwd, raw);
 }
 
-
-/**
- * Build the `Blocker` we surface when YAML `output:` resolves to a
- * format Raven's HTML-only knit pipeline doesn't render (`pdf_document`,
- * `word_document`, `ioslides_presentation`, custom output formats, …).
- *
- * Exported so the unit tests can exercise the escaping behavior without
- * having to drive the full `runKnitCommand` flow. `format` is parsed
- * out of YAML and can contain arbitrary characters (the map-key form
- * isn't constrained), so the `copyCommand` MUST escape it through
- * `escapeRString`: an unescaped value like `x'); system('rm -rf ~'); #`
- * would otherwise close the outer R single-quoted literal and inject a
- * follow-up call into the clipboard payload.
- *
- * Ordering note: this runs AFTER `detectBlockers`, so a document with
- * `runtime: shiny` + a non-HTML `output:` surfaces the (more
- * fundamental) shiny blocker first and never reaches this code path.
- */
-export function buildNonHtmlFormatBlocker(format: string): Blocker {
-    const safeFormat = escapeRString(format);
-    return {
-        kind: 'non-html-format',
-        message:
-            `Raven: Knit only renders to HTML. The YAML \`output:\` field ` +
-            `requests \`${format}\`, which Raven doesn't handle in this version. ` +
-            `Run the equivalent in the R console.`,
-        copyCommand: `rmarkdown::render('FILENAME', output_format = ${safeFormat})`,
-    };
-}
 
 async function showBlocker(blocker: Blocker, fsPath: string): Promise<void> {
     const COPY = 'Copy command';

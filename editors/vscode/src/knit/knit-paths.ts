@@ -1,33 +1,22 @@
-import * as path from 'path';
-
 /**
- * Derive the intermediate `.md` path that `knitr::knit` will write
- * to, from the input `.Rmd` path. Strips a trailing
- * `.Rmd` / `.rmd` / `.RMD` extension and appends `.md`.
+ * Thin shim over `raven-knit-paths.previewArtifactPaths` for the
+ * existing `computeMdOutputPath` / `computeHtmlOutputPath` callers.
  *
- * Defensive: if the input has no recognized R-Markdown extension we
- * just append `.md`. The `runKnitCommand` gate already requires
- * `.Rmd`, but a future caller change shouldn't be able to silently
- * produce a strange-looking output path.
+ * The old behavior wrote `<basename>.md` and `<basename>.html` next to
+ * the source `.Rmd`. The new behavior writes them into a per-session
+ * temp dir at `<tmpdir>/raven-knit/<workspaceHash>/<sessionId>/preview/
+ * <sourceHash>/`. See `docs/superpowers/specs/2026-05-23-knit-preview-
+ * export-design.md` for the rationale.
  *
- * Pure path string manipulation — no `vscode` dependency so this is
- * unit-testable from `bun test`.
+ * No `vscode` dependency — purely a path-derivation module.
  */
+
+import { previewArtifactPaths } from './raven-knit-paths';
+
 export function computeMdOutputPath(rmdFsPath: string): string {
-    const dir = path.dirname(rmdFsPath);
-    const base = path.basename(rmdFsPath);
-    const stripped = base.replace(/\.[Rr][Mm][Dd]$/, '');
-    return path.join(dir, `${stripped}.md`);
+    return previewArtifactPaths(rmdFsPath).mdPath;
 }
 
-/**
- * Derive the final `.html` path that the post-knit render pipeline
- * writes to, from the input `.Rmd` path. Same stripping rule as the
- * `.md` helper.
- */
 export function computeHtmlOutputPath(rmdFsPath: string): string {
-    const dir = path.dirname(rmdFsPath);
-    const base = path.basename(rmdFsPath);
-    const stripped = base.replace(/\.[Rr][Mm][Dd]$/, '');
-    return path.join(dir, `${stripped}.html`);
+    return previewArtifactPaths(rmdFsPath).htmlPath;
 }

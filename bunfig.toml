@@ -1,2 +1,3 @@
 [test]
 root = "./tests/bun"
+preload = ["./tests/bun/_helpers/vscode-mock-preload.ts"]

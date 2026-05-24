@@ -57,6 +57,61 @@ import {
 export class KnitOutputPanel {
     private static instances = new Map<string, KnitOutputPanel>();
     private static previewColumn: vscode.ViewColumn | undefined;
+    /**
+     * Production-installed callback invoked on every panel disposal,
+     * with the source .Rmd's absolute path. Wired in `knit/index.ts`
+     * to OperationRegistry.requestPreviewDirDeletion, which refcount-
+     * gates the actual rm -rf so in-flight exports keep their cached
+     * `.md`/`figure/` until they finish.
+     */
+    private static onDidDisposeHandler: ((rmdAbsPath: string) => void) | null = null;
+    static setOnDidDisposeHandler(handler: (rmdAbsPath: string) => void): void {
+        KnitOutputPanel.onDidDisposeHandler = handler;
+    }
+
+    /**
+     * Pin / unpin handlers wired by `knit/index.ts` to the
+     * OperationRegistry. The panel uses these to hold the preview dir
+     * alive across the Export ▾ QuickPick. Without the pin, the user
+     * could open the QuickPick, dismiss the panel before choosing, and
+     * then watch the still-pending export pipeline fail because the
+     * disposal handler already removed the cached `.md`.
+     */
+    private static pinPreviewHandler: ((rmdAbsPath: string) => void) | null = null;
+    private static unpinPreviewHandler: ((rmdAbsPath: string) => void) | null = null;
+    static setPreviewPinHandlers(
+        pin: (rmdAbsPath: string) => void,
+        unpin: (rmdAbsPath: string) => void,
+    ): void {
+        KnitOutputPanel.pinPreviewHandler = pin;
+        KnitOutputPanel.unpinPreviewHandler = unpin;
+    }
+
+    /**
+     * Notify the panel for `rmdAbsPath` that an export op for that source
+     * has started (`busy = true`) or ended (`busy = false`). Toggles the
+     * webview Export button between its "open quickpick" idle state and
+     * its "cancel in-flight export" busy state.
+     *
+     * No-op when no panel for the source is open: the editor-toolbar
+     * Export entry creates a panel on success but during the export
+     * itself there may not be one to update. Callers should fire the
+     * notification anyway — when a panel does exist, having `busy=true`
+     * arrive even slightly before the panel can also matter (the panel-
+     * reuse path's `requestPalette` pattern mirrors this).
+     */
+    static notifyExportBusy(rmdAbsPath: string, busy: boolean): void {
+        const instance = KnitOutputPanel.instances.get(rmdAbsPath);
+        if (!instance) return;
+        if (instance.disposed) return;
+        void instance.panel.webview.postMessage({
+            __ravenExportBusy: true,
+            busy,
+        }).then(undefined, () => {
+            // postMessage can reject if the webview was disposed between
+            // the disposed-flag check and the actual post; swallow.
+        });
+    }
 
     private panel: vscode.WebviewPanel;
     private rootDir: string;
@@ -369,6 +424,14 @@ export class KnitOutputPanel {
                 try { d.dispose(); } catch { /* swallow */ }
             }
             instance.perPanelDisposables.length = 0;
+            // Signal the registered cleanup handler that the per-source
+            // preview temp dir can be removed (subject to refcounting —
+            // in-flight exports may still need it). Production wires
+            // this in knit/index.ts to OperationRegistry.requestPreviewDirDeletion.
+            const handler = KnitOutputPanel.onDidDisposeHandler;
+            if (handler) {
+                try { handler(instance.sourceUri.fsPath); } catch { /* swallow */ }
+            }
         });
 
         // Listen for VS Code theme changes and the editor.* settings
@@ -534,7 +597,7 @@ export class KnitOutputPanel {
             this.output.appendLine(
                 `[panel] read failed: ${err instanceof Error ? err.message : String(err)}`,
             );
-            htmlContent = '<!doctype html><html><body><p>Raven: Knit — '
+            htmlContent = '<!doctype html><html><body><p>Raven: Knit Preview — '
                 + 'could not read the rendered output. Use Open in Browser instead.'
                 + '</p></body></html>';
         }
@@ -884,6 +947,69 @@ export class KnitOutputPanel {
             void this.pushFontFamilies();
             return;
         }
+        if (msg.type === 'requestExport') {
+            void this.openExportQuickPick();
+            return;
+        }
+        if (msg.type === 'cancelExport') {
+            // Cancellation is routed via the OperationRegistry that
+            // `export-commands.ts` owns. We dispatch the dedicated
+            // command so the panel doesn't need a direct registry
+            // reference; the export module is the single source of
+            // truth for "is there a running export and how do I cancel
+            // it." The command is no-op if there's no in-flight export.
+            void vscode.commands.executeCommand('raven.knit.cancelExport', this.sourceUri);
+            return;
+        }
+    }
+
+    /**
+     * Open the native QuickPick that drives the webview's `Export ▾`
+     * button. Format choice is collected by VS Code's quickpick UI
+     * (never crosses the webview trust boundary, which is why the
+     * `requestExport` message has an empty payload), then routed into
+     * `raven.knit.export*` commands with the entry mode forced to
+     * `webview` so the cached preview .md is reused.
+     */
+    private async openExportQuickPick(): Promise<void> {
+        // Attach the dispatch command directly to each item so routing
+        // can't drift if a label is reworded for a11y or i18n.
+        interface ExportQuickPickItem extends vscode.QuickPickItem {
+            command: 'raven.knit.exportHtml' | 'raven.knit.exportPdf' | 'raven.knit.exportDocx';
+        }
+        const items: ExportQuickPickItem[] = [
+            { label: '$(file-code) Export to HTML…', description: 'Pandoc HTML', command: 'raven.knit.exportHtml' },
+            { label: '$(file-pdf) Export to PDF…', description: 'Pandoc PDF', command: 'raven.knit.exportPdf' },
+            { label: '$(file) Export to Word…', description: 'Pandoc DOCX', command: 'raven.knit.exportDocx' },
+        ];
+        // Pin the preview dir across the QuickPick lifecycle. Without
+        // this, the user could open the QuickPick, close the panel
+        // before choosing, then choose a format — the disposal handler
+        // would have already requested deletion of the cached `.md`,
+        // and the export pipeline would find it gone. The export-
+        // pipeline takes its own pin when it begins, so any window
+        // between this unpin and that pin would re-open the race; we
+        // therefore hold the pin until executeCommand resolves (i.e.,
+        // until the export pipeline has finished, by which point it
+        // has already done its own pin/unpin cycle).
+        const rmdAbsPath = this.sourceUri.fsPath;
+        const pin = KnitOutputPanel.pinPreviewHandler;
+        const unpin = KnitOutputPanel.unpinPreviewHandler;
+        if (pin) pin(rmdAbsPath);
+        try {
+            const choice = await vscode.window.showQuickPick(items, {
+                placeHolder: `Export ${this.sourceUri.path.split('/').pop() ?? this.sourceUri.fsPath}`,
+            });
+            if (!choice) return;
+            // The webview entry reuses the cached preview .md. We dispatch
+            // through `raven.knit.export*` so any caller-supplied wiring
+            // (test harness, etc.) gets the same entry point as the
+            // editor-toolbar invocations — `runExport` then differentiates
+            // entry-mode by the optional second argument.
+            await vscode.commands.executeCommand(choice.command, this.sourceUri, { entry: 'webview' });
+        } finally {
+            if (unpin) unpin(rmdAbsPath);
+        }
     }
 
     /**
@@ -931,7 +1057,7 @@ export class KnitOutputPanel {
      * `editor.fontFamily` overrides) and returns the resolved fonts.
      *
      * Source languageId is read live from the open `TextDocument` if
-     * any; we fall back to `'rmd'` (the only languageId `Raven: Knit`
+     * any; we fall back to `'rmd'` (the only languageId `Raven: Knit Preview`
      * acts on today) when the document is closed. The fallback covers
      * the case where the user closes the .Rmd buffer while the
      * preview panel is still open — they'd otherwise see a font

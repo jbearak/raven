@@ -28,12 +28,14 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "Raven: Knit executes R code from the workspace and is disabled in untrusted workspaces. Executable-path settings are also read from user/global settings only.",
+      "description": "Raven: Knit Preview executes R code from the workspace and is disabled in untrusted workspaces. Executable-path settings are also read from user/global settings only.",
       "restrictedConfigurations": [
         "raven.rTerminal.program",
         "raven.server.path",
         "raven.packages.rPath",
-        "raven.packages.additionalLibraryPaths"
+        "raven.packages.additionalLibraryPaths",
+        "raven.pandoc.path",
+        "raven.pandoc.pdfEngine"
       ]
     }
   },
@@ -211,17 +213,27 @@
       },
       {
         "command": "raven.knit",
-        "title": "Knit",
+        "title": "Knit Preview",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.knit.exportHtml",
+        "title": "Knit: Export to HTML…",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.knit.exportPdf",
+        "title": "Knit: Export to PDF…",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.knit.exportDocx",
+        "title": "Knit: Export to Word…",
         "category": "Raven"
       },
       {
         "command": "raven.knit.openOutputChannel",
         "title": "Show Knit Output",
-        "category": "Raven"
-      },
-      {
-        "command": "raven.walkthrough.createSampleRmd",
-        "title": "Create Sample .Rmd",
         "category": "Raven"
       },
       {
@@ -382,6 +394,18 @@
           "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
         },
         {
+          "command": "raven.knit.exportHtml",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        },
+        {
+          "command": "raven.knit.exportPdf",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        },
+        {
+          "command": "raven.knit.exportDocx",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        },
+        {
           "command": "raven.knit.openOutputChannel"
         }
       ],
@@ -469,9 +493,24 @@
           "group": "4_file@1"
         },
         {
+          "command": "raven.knit.exportHtml",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "group": "4_file@2"
+        },
+        {
+          "command": "raven.knit.exportPdf",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "group": "4_file@3"
+        },
+        {
+          "command": "raven.knit.exportDocx",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "group": "4_file@4"
+        },
+        {
           "command": "raven.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
-          "group": "4_file@2"
+          "group": "4_file@5"
         },
         {
           "submenu": "raven.sendToR.terminal",
@@ -767,39 +806,6 @@
           "highContrast": "#3794ff",
           "highContrastLight": "#0066bf"
         }
-      }
-    ],
-    "walkthroughs": [
-      {
-        "id": "raven.getStarted",
-        "title": "Get started with Raven for R Markdown",
-        "description": "Install the recommended sibling extensions and knit your first R Markdown document. Live preview is provided by Quarto (the sibling extension Raven recommends).",
-        "steps": [
-          {
-            "id": "raven.getStarted.installQuarto",
-            "title": "Install Quarto for .qmd grammar and preview",
-            "description": "Raven defers .qmd grammar, LSP, and live preview to the official Quarto extension. [Install Quarto](command:extension.open?%22quarto.quarto%22).",
-            "media": { "markdown": "README.md" },
-            "completionEvents": ["extensionInstalled:quarto.quarto"]
-          },
-          {
-            "id": "raven.getStarted.installRSyntax",
-            "title": "Install R Syntax for .Rmd grammar",
-            "description": "For .Rmd grammar and embedded-language highlighting install [R Syntax](command:extension.open?%22REditorSupport.r-syntax%22) (or the full [R extension](command:extension.open?%22REditorSupport.r%22)).",
-            "media": { "markdown": "README.md" },
-            "completionEvents": [
-              "extensionInstalled:REditorSupport.r-syntax",
-              "extensionInstalled:REditorSupport.r"
-            ]
-          },
-          {
-            "id": "raven.getStarted.knit",
-            "title": "Create a sample .Rmd and knit it",
-            "description": "[Create sample .Rmd](command:raven.walkthrough.createSampleRmd) — Raven will open it. Then run [Raven: Knit](command:raven.knit) from the command palette.",
-            "media": { "markdown": "README.md" },
-            "completionEvents": ["onCommand:raven.knit"]
-          }
-        ]
       }
     ],
     "configuration": {
@@ -1254,7 +1260,31 @@
           "type": "integer",
           "default": 600000,
           "minimum": 1000,
-          "description": "Hard timeout (milliseconds) for the Raven: Knit subprocess. After this elapses, Raven escalates the kill ladder (SIGINT → SIGTERM → SIGKILL) and surfaces a 'Knit timed out' message."
+          "description": "Hard timeout (milliseconds) for the Raven: Knit Preview subprocess. After this elapses, Raven escalates the kill ladder (SIGINT → SIGTERM → SIGKILL) and surfaces a 'Knit timed out' message."
+        },
+        "raven.knit.export.timeoutMs": {
+          "type": "integer",
+          "default": 120000,
+          "minimum": 5000,
+          "description": "Timeout (milliseconds) for the Pandoc subprocess used by Knit: Export to PDF / Word / HTML. Pandoc itself is fast; this bounds runaway invocations."
+        },
+        "raven.pandoc.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "Absolute path to a Pandoc binary. Leave empty to use PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.)."
+        },
+        "raven.pandoc.pdfEngine": {
+          "type": "string",
+          "enum": [
+            "xelatex",
+            "pdflatex",
+            "lualatex",
+            "tectonic",
+            "wkhtmltopdf"
+          ],
+          "default": "xelatex",
+          "description": "PDF engine used by Pandoc when exporting to PDF. Most users should leave this at xelatex; tectonic is a fully self-contained LaTeX alternative, and wkhtmltopdf renders via HTML/WebKit instead of LaTeX."
         },
         "raven.knit.fontFamily": {
           "type": "string",
@@ -1263,7 +1293,7 @@
           "maxLength": 500,
           "pattern": "^[^;{}<>\\\\\\n\\r\\t\\f\\v\\u0000]*$",
           "patternErrorMessage": "Cannot contain ; { } < > \\ or whitespace control characters.",
-          "description": "Body/prose font for the Raven: Knit preview. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine — e.g. `\"Aptos (Body)\", sans-serif`). Leave empty to inherit `markdown.preview.fontFamily`. The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit. Bare parens, unbalanced quotes, and CSS-wide keywords (`inherit`, `initial`, …) are rejected at knit time and the next layer of the fallback chain is used."
+          "description": "Body/prose font for the Raven: Knit Preview output. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine — e.g. `\"Aptos (Body)\", sans-serif`). Leave empty to inherit `markdown.preview.fontFamily`. The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit. Bare parens, unbalanced quotes, and CSS-wide keywords (`inherit`, `initial`, …) are rejected at knit time and the next layer of the fallback chain is used."
         },
         "raven.knit.monospaceFontFamily": {
           "type": "string",
@@ -1272,7 +1302,7 @@
           "maxLength": 500,
           "pattern": "^[^;{}<>\\\\\\n\\r\\t\\f\\v\\u0000]*$",
           "patternErrorMessage": "Cannot contain ; { } < > \\ or whitespace control characters.",
-          "description": "Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit preview. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine). Leave empty to inherit `editor.fontFamily` (honors `[rmd]` / `[quarto]` language-scoped overrides). The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit. Bare parens, unbalanced quotes, and CSS-wide keywords are rejected at knit time and the next layer of the fallback chain is used."
+          "description": "Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit Preview output. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine). Leave empty to inherit `editor.fontFamily` (honors `[rmd]` / `[quarto]` language-scoped overrides). The open preview panel updates live when this setting changes; the rendered `.html` on disk refreshes on the next knit. Bare parens, unbalanced quotes, and CSS-wide keywords are rejected at knit time and the next layer of the fallback chain is used."
         },
         "raven.plot.viewerColumn": {
           "type": "string",

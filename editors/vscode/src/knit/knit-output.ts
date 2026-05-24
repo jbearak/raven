@@ -26,7 +26,38 @@ export type KnitOutputMessage =
      * longer carries (the baked declarations are still there, but the
      * webview's <style> override always wins on the cascade).
      */
-    | { type: 'requestFonts' };
+    | { type: 'requestFonts' }
+    /**
+     * The user clicked the webview's Export ▾ button. The host opens
+     * a native QuickPick (HTML / PDF / Word) and routes the chosen
+     * format into the export pipeline. Format choice never crosses
+     * the trust boundary — only the trigger does.
+     */
+    | { type: 'requestExport' }
+    /**
+     * The user clicked the toolbar's Export button while an export
+     * was already in flight (the button doubles as a cancel control
+     * when spinning). Host looks up the source's current controller
+     * and calls `cancel()`.
+     */
+    | { type: 'cancelExport' };
+
+/**
+ * Per-type allowed key set for the trust-boundary validator. Sorted so
+ * we can compare against `Object.keys(msg).sort()` for exact-schema
+ * equality. Adding a new message type means adding it here AND adding a
+ * value-type check below in `isKnitOutputMessage`.
+ */
+const MESSAGE_SCHEMAS: Record<KnitOutputMessage['type'], readonly string[]> = {
+    refresh: ['type'],
+    openInBrowser: ['type'],
+    themeChanged: ['applied', 'type'],
+    themeContext: ['editorBackground', 'type'],
+    requestPalette: ['type'],
+    requestFonts: ['type'],
+    requestExport: ['type'],
+    cancelExport: ['type'],
+};
 
 /**
  * Marker key on `postMessage` payloads from the extension host to the
@@ -74,6 +105,23 @@ export interface FontFamiliesUpdate {
 }
 
 /**
+ * Marker key for the host→webview export-busy channel. When the host
+ * starts an export op for this panel's source, it posts `{ busy: true }`;
+ * when the op ends (done / cancelled / failed) it posts `{ busy: false }`.
+ * The webview script toggles `exportBtn.dataset.busy` so the next click
+ * dispatches `cancelExport` instead of `requestExport`. The payload is a
+ * single boolean — any other shape is rejected at the trust boundary.
+ */
+export const EXPORT_BUSY_UPDATE_KEY = '__ravenExportBusy';
+
+export interface ExportBusyUpdate {
+    /** Marker — must equal `true`. */
+    __ravenExportBusy: true;
+    /** True while an export op is in flight for this panel's source. */
+    busy: boolean;
+}
+
+/**
  * Build the CSS variable declarations for the live-font override. Same
  * shape `render-html.ts:fontsAsCssVars` emits when baking the rendered
  * document, joined with a single space so the whole payload fits on one
@@ -93,19 +141,29 @@ export function fontsCssDeclarations(fonts: { text: string; mono: string }): str
 
 /**
  * Strict type-narrowing for messages posted from the Knit Output webview.
- * The webview is a trust boundary; reject anything we did not explicitly
- * shape. Additional unknown properties on a recognized type are allowed
- * (the handler ignores them).
+ *
+ * The webview is a trust boundary. We use **per-type exact-schema
+ * matching**: the message object's keys must equal the declared key set
+ * for that type, no more and no less. This rejects payload smuggling
+ * via extra fields (e.g., `{ type: 'requestExport', format: '../etc/passwd' }`)
+ * without silently ignoring them, AND still accepts the legitimate
+ * payload-carrying messages like `themeChanged` / `themeContext`.
  */
 export function isKnitOutputMessage(msg: unknown): msg is KnitOutputMessage {
     if (msg === null || typeof msg !== 'object') return false;
-    const m = msg as { type?: unknown; applied?: unknown; editorBackground?: unknown };
-    if (m.type === 'refresh' || m.type === 'openInBrowser') return true;
-    if (m.type === 'themeChanged' && typeof m.applied === 'boolean') return true;
-    if (m.type === 'themeContext' && typeof m.editorBackground === 'string') return true;
-    if (m.type === 'requestPalette') return true;
-    if (m.type === 'requestFonts') return true;
-    return false;
+    const obj = msg as Record<string, unknown>;
+    if (typeof obj.type !== 'string') return false;
+    const expected = MESSAGE_SCHEMAS[obj.type as KnitOutputMessage['type']];
+    if (!expected) return false;
+    const actual = Object.keys(obj).sort();
+    if (actual.length !== expected.length) return false;
+    for (let i = 0; i < expected.length; i++) {
+        if (actual[i] !== expected[i]) return false;
+    }
+    // Per-type value-type checks for non-`type` fields.
+    if (obj.type === 'themeChanged' && typeof obj.applied !== 'boolean') return false;
+    if (obj.type === 'themeContext' && typeof obj.editorBackground !== 'string') return false;
+    return true;
 }
 
 /**
@@ -427,6 +485,7 @@ export function buildShellHtml(args: {
   <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit output">
     <button id="raven-knit-refresh" type="button" title="Re-knit the source document">Knit again</button>
     <button id="raven-knit-open-browser" type="button" title="Open the rendered file in your default browser">Open in Browser</button>
+    <button id="raven-knit-export" type="button" title="Export as HTML, PDF, or Word">Export ▾</button>
     <button id="raven-knit-theme" type="button"
             aria-pressed="${initialThemeApplied ? 'true' : 'false'}"
             title="Toggle VS Code editor colors on the rendered output">Apply VS Code theme</button>
@@ -455,6 +514,26 @@ export function buildShellHtml(args: {
       });
       document.getElementById('raven-knit-open-browser').addEventListener('click', function () {
         vscode.postMessage({ type: 'openInBrowser' });
+      });
+      // Export button: idle state opens the format quickpick (host opens it
+      // natively so the format choice never crosses the trust boundary);
+      // busy state cancels the in-flight export.
+      const exportBtn = document.getElementById('raven-knit-export');
+      const exportLabelIdle = 'Export ▾';
+      const exportLabelBusy = 'Cancel export';
+      const exportTitleIdle = exportBtn.getAttribute('title') || '';
+      const exportTitleBusy = 'Cancel the in-flight export';
+      function syncExportBtn() {
+        var busy = exportBtn.dataset.busy === 'true';
+        exportBtn.textContent = busy ? exportLabelBusy : exportLabelIdle;
+        exportBtn.setAttribute('title', busy ? exportTitleBusy : exportTitleIdle);
+      }
+      exportBtn.addEventListener('click', function () {
+        if (exportBtn.dataset.busy === 'true') {
+          vscode.postMessage({ type: 'cancelExport' });
+        } else {
+          vscode.postMessage({ type: 'requestExport' });
+        }
       });
 
       // --- VS Code theme overlay -------------------------------------
@@ -1145,6 +1224,18 @@ export function buildShellHtml(args: {
             vscodeFontCss = null;
           }
           applyFonts();
+          return;
+        }
+        if (data.__ravenExportBusy === true) {
+          // Host->webview only. The data.busy field is the single
+          // source of truth -- coerce to a strict boolean check so a
+          // smuggled non-boolean cannot enable the cancel dispatch.
+          if (data.busy === true) {
+            exportBtn.dataset.busy = 'true';
+          } else {
+            delete exportBtn.dataset.busy;
+          }
+          syncExportBtn();
           return;
         }
         if (data.__ravenRequestThemeContext === true) {

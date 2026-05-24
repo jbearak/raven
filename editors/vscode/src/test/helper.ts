@@ -12,8 +12,42 @@ export function getFixtureUri(name: string): vscode.Uri {
 
 export async function activate(): Promise<void> {
     const ext = vscode.extensions.getExtension('jbearak.raven-r');
-    if (ext && !ext.isActive) {
+    if (!ext) {
+        // Surface this loudly; otherwise tests that depend on extension
+        // activation (registerKnit -> initSessionState) silently skip
+        // setup and fail later in confusing places.
+        throw new Error(
+            `Test helper: vscode.extensions.getExtension('jbearak.raven-r') returned undefined. ` +
+                `The extension under test isn't loaded — check .vscode-test.mjs.`,
+        );
+    }
+    if (!ext.isActive) {
         await ext.activate();
+    }
+    // Belt-and-braces: knit tests routinely fail with "Raven knit session
+    // state not initialized" because the extension's `activate` runs out
+    // of the bundled `dist/extension.js`, whereas Mocha tests `require`
+    // the same module via `out/knit/session-state.js`. The two paths
+    // resolve to distinct JS modules with separate `state` singletons,
+    // so the `initSessionState` call inside `registerKnit` doesn't
+    // populate the singleton the tests read from. Initialize the
+    // test-side instance explicitly using the same workspaceUri logic
+    // as `knit/index.ts` so paths line up.
+    //
+    // Cleanup: a fixed sessionId ('raven-test-suite') means a single
+    // temp dir is reused across the entire test run, so we never grow
+    // an orphan dir per Mocha invocation. The production-side
+    // `cleanupCurrentSession` (registered on the extension context's
+    // disposal) handles its OWN, separate session id at shutdown. The
+    // `sweepStaleSessions` >7-day sweep at the next activation handles
+    // anything either side leaves behind.
+    const { maybeCurrentSession, initSessionState } = await import('../knit/session-state');
+    if (maybeCurrentSession() === null) {
+        const workspaceUri =
+            vscode.workspace.workspaceFolders?.[0]?.uri.toString()
+            ?? vscode.workspace.workspaceFile?.toString()
+            ?? null;
+        initSessionState({ sessionId: 'raven-test-suite', workspaceUri });
     }
 }
 
