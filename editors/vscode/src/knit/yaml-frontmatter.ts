@@ -179,7 +179,7 @@ export function detectBlockers(fm: FrontmatterDoc): Blocker[] {
     ) {
         blockers.push({
             kind: 'shiny',
-            message: "Shiny documents aren't supported by Raven: Knit.",
+            message: "Shiny documents aren't supported by Raven: Knit Preview.",
             copyCommand: "rmarkdown::run('FILENAME')",
         });
     }
@@ -189,7 +189,7 @@ export function detectBlockers(fm: FrontmatterDoc): Blocker[] {
         const isBookdown = siteValue !== null && /bookdown/.test(siteValue);
         blockers.push({
             kind: 'site',
-            message: "Site projects aren't supported by Raven: Knit.",
+            message: "Site projects aren't supported by Raven: Knit Preview.",
             copyCommand: isBookdown
                 ? "bookdown::serve_book()"
                 : "rmarkdown::render_site()",

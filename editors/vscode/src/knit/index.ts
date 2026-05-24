@@ -26,7 +26,7 @@ export { runExport } from './export-commands';
 export type { ExportDeps } from './export-commands';
 
 /**
- * Register `Raven: Knit` and its output-channel command. The commands
+ * Register `Raven: Knit Preview` and its output-channel command. The commands
  * are registered unconditionally so walkthrough deep-links work even
  * when the resolved gate is closed; the handler re-checks
  * `resolveRConsoleActivation()` at invocation and surfaces an info

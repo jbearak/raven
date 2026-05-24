@@ -5,7 +5,7 @@ import { activate, getFixtureUri, sleep } from './helper';
 import { __runKnitCommandForTest, type KnitDeps } from '../knit/knit-commands';
 
 /**
- * `Raven: Knit` writes a single `.html` to disk that is shared by
+ * `Raven: Knit Preview` writes a single `.html` to disk that is shared by
  * both the panel iframe and "Open in Browser". A frozen file cannot
  * carry surface-specific theme logic, so `runPostKnitRender` must
  * be called with `themeClasses: null` — that path embeds both

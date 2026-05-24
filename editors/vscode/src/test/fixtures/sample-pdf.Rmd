@@ -3,5 +3,5 @@ title: "PDF output test"
 output: pdf_document
 ---
 
-This document declares `output: pdf_document`. Raven: Knit should
-refuse to render it via the HTML-only knit path.
+This document declares `output: pdf_document`. Raven: Knit Preview
+renders it as HTML regardless of the `output:` block.

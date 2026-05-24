@@ -172,6 +172,6 @@ The cell containing the cursor gets a top and bottom border so you can see at a 
 
 ## Limitations
 
-- `Raven: Knit` (in this extension) runs `rmarkdown::render` for `.Rmd` files. See [docs/knit.md](knit.md). For `.qmd` files Raven defers to `quarto.quarto`'s `Quarto: Render` / `Quarto: Preview`.
+- `Raven: Knit Preview` (in this extension) runs `knitr::knit` plus Raven's HTML render pipeline for `.Rmd` files. Pandoc export (HTML/PDF/Word) is invoked separately by the `Raven: Knit: Export to …` commands. See [docs/knit.md](knit.md). For `.qmd` files Raven defers to `quarto.quarto`'s `Quarto: Render` / `Quarto: Preview`.
 - Nested chunks (the inner chunk inside an outer chunk's body) are not supported — the inner chunk header is treated as ordinary content of the outer chunk.
 - `eval = !my_condition` and other dynamic option expressions are read literally; Raven does not evaluate R to determine `eval`.

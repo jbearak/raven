@@ -571,7 +571,7 @@ export class KnitOutputPanel {
             this.output.appendLine(
                 `[panel] read failed: ${err instanceof Error ? err.message : String(err)}`,
             );
-            htmlContent = '<!doctype html><html><body><p>Raven: Knit — '
+            htmlContent = '<!doctype html><html><body><p>Raven: Knit Preview — '
                 + 'could not read the rendered output. Use Open in Browser instead.'
                 + '</p></body></html>';
         }
@@ -1031,7 +1031,7 @@ export class KnitOutputPanel {
      * `editor.fontFamily` overrides) and returns the resolved fonts.
      *
      * Source languageId is read live from the open `TextDocument` if
-     * any; we fall back to `'rmd'` (the only languageId `Raven: Knit`
+     * any; we fall back to `'rmd'` (the only languageId `Raven: Knit Preview`
      * acts on today) when the document is closed. The fallback covers
      * the case where the user closes the .Rmd buffer while the
      * preview panel is still open — they'd otherwise see a font

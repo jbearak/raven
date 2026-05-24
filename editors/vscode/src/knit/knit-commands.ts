@@ -177,7 +177,7 @@ async function runKnitCommand(
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
         await vscode.window.showInformationMessage(
-            'Raven: Knit requires an active editor with a .Rmd file.',
+            'Raven: Knit Preview requires an active editor with a .Rmd file.',
         );
         return;
     }
@@ -189,7 +189,7 @@ async function runKnitCommand(
     // enabled would otherwise let knit run.
     if (resolveRConsoleActivation() !== 'enabled') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit is disabled by your `raven.rConsole.activation` setting (or because REditorSupport / Positron is active).',
+            'Raven: Knit Preview is disabled by your `raven.rConsole.activation` setting (or because REditorSupport / Positron is active).',
         );
         return;
     }
@@ -202,7 +202,7 @@ async function runKnitCommand(
     // learning calls this out specifically.
     if (docUri.scheme !== 'file' && docUri.scheme !== 'vscode-remote') {
         await vscode.window.showInformationMessage(
-            'Save the file to disk before running Raven: Knit.',
+            'Save the file to disk before running Raven: Knit Preview.',
         );
         return;
     }
@@ -210,7 +210,7 @@ async function runKnitCommand(
     if (!vscode.workspace.isTrusted) {
         const MANAGE = 'Manage Workspace Trust';
         const choice = await vscode.window.showInformationMessage(
-            'Raven: Knit is disabled in untrusted workspaces.',
+            'Raven: Knit Preview is disabled in untrusted workspaces.',
             MANAGE,
         );
         if (choice === MANAGE) {
@@ -223,7 +223,7 @@ async function runKnitCommand(
     const ext = path.extname(docUri.fsPath || docUri.path).toLowerCase();
     if (ext !== '.rmd') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit only runs on .Rmd files.',
+            'Raven: Knit Preview only runs on .Rmd files.',
         );
         return;
     }
@@ -231,7 +231,7 @@ async function runKnitCommand(
     const fsPath = docUri.fsPath;
     if (!fsPath) {
         await vscode.window.showInformationMessage(
-            'Save the file to disk before running Raven: Knit.',
+            'Save the file to disk before running Raven: Knit Preview.',
         );
         return;
     }
@@ -264,7 +264,7 @@ async function runKnitCommand(
             }
             if (!saved) {
                 await vscode.window.showWarningMessage(
-                    `Raven: Knit — could not save ${path.basename(fsPath)}. ` +
+                    `Raven: Knit Preview — could not save ${path.basename(fsPath)}. ` +
                     `The knit output would not reflect your unsaved changes.`,
                 );
                 return;
@@ -274,7 +274,7 @@ async function runKnitCommand(
         sourceLanguageId = doc.languageId;
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await vscode.window.showErrorMessage(`Raven: Knit could not read document: ${message}`);
+        await vscode.window.showErrorMessage(`Raven: Knit Preview could not read document: ${message}`);
         return;
     }
 
@@ -285,7 +285,7 @@ async function runKnitCommand(
         output.show(true);
         output.appendLine(`[YAML parse error] ${parsed.error}`);
         await vscode.window.showWarningMessage(
-            'Raven: Knit — YAML front matter is malformed; see Raven: Knit output.',
+            'Raven: Knit Preview — YAML front matter is malformed; see Raven: Knit output.',
         );
         return;
     }
@@ -340,7 +340,7 @@ async function runKnitCommand(
         output.show(true);
         output.appendLine(`[knit] Failed to create temp dir ${previewPaths.previewDir}: ${message}`);
         await vscode.window.showErrorMessage(
-            `Raven: Knit could not create temp directory. See output for details.`,
+            `Raven: Knit Preview could not create temp directory. See output for details.`,
         );
         return;
     }
@@ -380,10 +380,10 @@ async function runKnitCommand(
         output.show(true);
         output.appendLine(`[validation] ${message}`);
         const surface = isFormatError
-            ? `Raven: Knit — unsupported output format identifier in YAML.`
+            ? `Raven: Knit Preview — unsupported output format identifier in YAML.`
             : isPathError
-                ? `Raven: Knit — file path contains an unsupported character. See output for details.`
-                : `Raven: Knit — validation failed. See output for details.`;
+                ? `Raven: Knit Preview — file path contains an unsupported character. See output for details.`
+                : `Raven: Knit Preview — validation failed. See output for details.`;
         await vscode.window.showErrorMessage(surface);
         return;
     }
@@ -423,7 +423,7 @@ async function runKnitCommand(
                                 ? 'exporting to Word'
                                 : 'busy';
             await vscode.window.showInformationMessage(
-                `Raven: Knit — ${baseName} is already ${what}.`,
+                `Raven: Knit Preview — ${baseName} is already ${what}.`,
             );
             return;
         }
@@ -550,12 +550,12 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         if (code === 'ENOENT') {
             ctx.output.appendLine(`[error] R not found at "${ctx.rBinary}".`);
             void vscode.window.showErrorMessage(
-                'Raven: Knit — R not found on PATH. Set `raven.packages.rPath`.',
+                'Raven: Knit Preview — R not found on PATH. Set `raven.packages.rPath`.',
             );
         } else {
             ctx.output.appendLine(`[error] ${outcome.error.message}`);
             void vscode.window.showErrorMessage(
-                `Raven: Knit — failed to launch R: ${outcome.error.message}`,
+                `Raven: Knit Preview — failed to launch R: ${outcome.error.message}`,
             );
         }
         return;
@@ -563,21 +563,21 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
 
     if (outcome.kind === 'cancelled') {
         ctx.output.appendLine('Knit cancelled.');
-        void vscode.window.showInformationMessage('Raven: Knit cancelled.');
+        void vscode.window.showInformationMessage('Raven: Knit Preview cancelled.');
         return;
     }
 
     if (outcome.kind === 'timedOut') {
         ctx.output.appendLine(`Knit timed out after ${ctx.timeoutMs} ms.`);
         ctx.output.show(true);
-        void vscode.window.showErrorMessage('Raven: Knit timed out.');
+        void vscode.window.showErrorMessage('Raven: Knit Preview timed out.');
         return;
     }
 
     if (outcome.kind === 'failed') {
         ctx.output.show(true);
         void vscode.window.showErrorMessage(
-            `Raven: Knit failed (exit ${outcome.exitCode}). See Raven: Knit output.`,
+            `Raven: Knit Preview failed (exit ${outcome.exitCode}). See Raven: Knit output.`,
         );
         return;
     }
@@ -585,7 +585,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
     if (outcome.kind === 'noOutput') {
         const SHOW = 'Show Output';
         const choice = await vscode.window.showInformationMessage(
-            'Raven: Knit succeeded (output path unknown).',
+            'Raven: Knit Preview succeeded (output path unknown).',
             SHOW,
         );
         if (choice === SHOW) ctx.output.show(true);
@@ -604,7 +604,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
     const primary = pickPrimaryOutput(absolutized);
     if (!primary) {
         // Defensive — classify guarantees parsedOutputs.length >= 1 for 'ok'.
-        void vscode.window.showInformationMessage('Raven: Knit succeeded.');
+        void vscode.window.showInformationMessage('Raven: Knit Preview succeeded.');
         return;
     }
 
@@ -652,7 +652,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         const OPEN_MD = 'Open Markdown';
         const SHOW_OUTPUT = 'Show Output';
         const choice = await vscode.window.showErrorMessage(
-            `Raven: Knit produced ${path.basename(mdPath)} but the HTML render step failed. ` +
+            `Raven: Knit Preview produced ${path.basename(mdPath)} but the HTML render step failed. ` +
                 `See Raven: Knit output for details.`,
             OPEN_MD,
             SHOW_OUTPUT,
@@ -665,7 +665,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
                 const openMsg = openErr instanceof Error ? openErr.message : String(openErr);
                 ctx.output.appendLine(`[render] failed to open ${mdPath}: ${openMsg}`);
                 void vscode.window.showErrorMessage(
-                    `Raven: Knit — could not open ${path.basename(mdPath)}: ${openMsg}`,
+                    `Raven: Knit Preview — could not open ${path.basename(mdPath)}: ${openMsg}`,
                 );
             }
         } else if (choice === SHOW_OUTPUT) {
@@ -768,7 +768,7 @@ function resolveKnitDir(
         if (!folder) {
             return {
                 ok: false,
-                error: 'Raven: Knit — cannot resolve project root: document is outside the workspace.',
+                error: 'Raven: Knit Preview — cannot resolve project root: document is outside the workspace.',
             };
         }
         return { ok: true, knitRootDir: folder.uri.fsPath, cwd: folder.uri.fsPath };

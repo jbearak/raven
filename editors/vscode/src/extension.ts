@@ -389,7 +389,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // populated for whichever surfaces (current or future) consult it.
     register_r_package_detection(context);
 
-    // `Raven: Knit` registers unconditionally so the walkthrough's
+    // `Raven: Knit Preview` registers unconditionally so the walkthrough's
     // command-link works even when the resolved gate is closed. The
     // handler itself re-checks `resolveRConsoleActivation()` at
     // invocation and surfaces a clear info message if the gate is

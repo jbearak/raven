@@ -50,9 +50,9 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.help.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [help-viewer](help-viewer.md) | Initial editor column when the R help viewer first opens. |
 | `raven.indentation.style` | `"rstudio"` | `"rstudio"` \| `"rstudio-minus"` \| `"off"` | `indentation.style` | [indentation](indentation.md) | Indentation style for R code. |
 | `raven.knit.export.timeoutMs` | `120000` | integer (≥5000) | — | [knit](knit.md) | Timeout (milliseconds) for the Pandoc subprocess used by Knit: Export to PDF / Word / HTML. |
-| `raven.knit.fontFamily` | `""` | string | — | [knit](knit.md) | Body/prose font for the Raven: Knit preview. |
-| `raven.knit.monospaceFontFamily` | `""` | string | — | [knit](knit.md) | Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit preview. |
-| `raven.knit.timeoutMs` | `600000` | integer (≥1000) | — | [knit](knit.md) | Hard timeout (milliseconds) for the Raven: Knit subprocess. |
+| `raven.knit.fontFamily` | `""` | string | — | [knit](knit.md) | Body/prose font for the Raven: Knit Preview output. |
+| `raven.knit.monospaceFontFamily` | `""` | string | — | [knit](knit.md) | Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit Preview output. |
+| `raven.knit.timeoutMs` | `600000` | integer (≥1000) | — | [knit](knit.md) | Hard timeout (milliseconds) for the Raven: Knit Preview subprocess. |
 | `raven.knit.workingDirectory` | `"document"` | `"document"` \| `"project"` \| `"current"` | — | [knit](knit.md) | Working directory passed to rmarkdown::render's knit_root_dir argument. |
 | `raven.linting.assignmentOperator` | `"<-"` | `"<-"` \| `"="` | `linting.assignmentOperator` | [linting](linting.md) | Preferred assignment operator. |
 | `raven.linting.assignmentOperatorSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.assignmentOperatorSeverity` | [linting](linting.md) | Severity for the assignment-operator lint. |
