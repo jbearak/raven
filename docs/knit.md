@@ -360,7 +360,3 @@ those checks live in the runtime sanitizer only.
 | Knit-with-Parameters dialog | Edit YAML defaults, or call `rmarkdown::render(params = list(...))`. |
 | `runtime: shiny` documents | `rmarkdown::run('foo.Rmd')` in the R console. |
 | `rmarkdown::render_site` | Run `rmarkdown::render_site()` in the R console. |
-
-A walkthrough ("Get started with Raven for R Markdown") in
-**Welcome ▸ Walkthroughs** wires installation of the recommended
-extensions and creates a sample `.Rmd` for a quick smoke test.

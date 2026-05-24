@@ -48,7 +48,6 @@ import {
 } from './r-console-activation';
 import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit';
 import { registerInstallNags } from './recommendations/install-nag';
-import { registerWalkthroughCommands } from './recommendations/walkthrough';
 import { validateServerBinary } from './server-binary-check';
 
 /**
@@ -389,21 +388,19 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // populated for whichever surfaces (current or future) consult it.
     register_r_package_detection(context);
 
-    // `Raven: Knit Preview` registers unconditionally so the walkthrough's
-    // command-link works even when the resolved gate is closed. The
-    // handler itself re-checks `resolveRConsoleActivation()` at
-    // invocation and surfaces a clear info message if the gate is
-    // closed. Setting `raven.rmdKnit.enabled` to match the resolved gate
-    // gates the command-palette entry.
+    // `Raven: Knit Preview` registers unconditionally so its command-link
+    // works even when the resolved gate is closed. The handler itself
+    // re-checks `resolveRConsoleActivation()` at invocation and surfaces
+    // a clear info message if the gate is closed. Setting
+    // `raven.rmdKnit.enabled` to match the resolved gate gates the
+    // command-palette entry.
     registerKnit(context, r_console_resolved === 'enabled', () => client);
 
-    // Install nags (one-time recommendations to install quarto.quarto for .qmd
-    // and REditorSupport.r-syntax for .Rmd grammar) and the Get-Started
-    // walkthrough's `raven.walkthrough.createSampleRmd` command. Both
-    // activate regardless of the R-console gate — they're about grammar and
+    // Install nags: one-time recommendations to install quarto.quarto
+    // for .qmd and REditorSupport.r-syntax for .Rmd grammar. Activates
+    // regardless of the R-console gate — about grammar and
     // discoverability, not subprocess features.
     registerInstallNags(context);
-    registerWalkthroughCommands(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //

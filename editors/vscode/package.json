@@ -237,11 +237,6 @@
         "category": "Raven"
       },
       {
-        "command": "raven.walkthrough.createSampleRmd",
-        "title": "Create Sample .Rmd",
-        "category": "Raven"
-      },
-      {
         "command": "raven.scaffold.gitignore",
         "title": "Create .gitignore",
         "category": "Raven"
@@ -811,39 +806,6 @@
           "highContrast": "#3794ff",
           "highContrastLight": "#0066bf"
         }
-      }
-    ],
-    "walkthroughs": [
-      {
-        "id": "raven.getStarted",
-        "title": "Get started with Raven for R Markdown",
-        "description": "Install the recommended sibling extensions and knit your first R Markdown document. Live preview is provided by Quarto (the sibling extension Raven recommends).",
-        "steps": [
-          {
-            "id": "raven.getStarted.installQuarto",
-            "title": "Install Quarto for .qmd grammar and preview",
-            "description": "Raven defers .qmd grammar, LSP, and live preview to the official Quarto extension. [Install Quarto](command:extension.open?%22quarto.quarto%22).",
-            "media": { "markdown": "README.md" },
-            "completionEvents": ["extensionInstalled:quarto.quarto"]
-          },
-          {
-            "id": "raven.getStarted.installRSyntax",
-            "title": "Install R Syntax for .Rmd grammar",
-            "description": "For .Rmd grammar and embedded-language highlighting install [R Syntax](command:extension.open?%22REditorSupport.r-syntax%22) (or the full [R extension](command:extension.open?%22REditorSupport.r%22)).",
-            "media": { "markdown": "README.md" },
-            "completionEvents": [
-              "extensionInstalled:REditorSupport.r-syntax",
-              "extensionInstalled:REditorSupport.r"
-            ]
-          },
-          {
-            "id": "raven.getStarted.knit",
-            "title": "Create a sample .Rmd and knit it",
-            "description": "[Create sample .Rmd](command:raven.walkthrough.createSampleRmd) — Raven will open it. Then run [Raven: Knit Preview](command:raven.knit) from the command palette.",
-            "media": { "markdown": "README.md" },
-            "completionEvents": ["onCommand:raven.knit"]
-          }
-        ]
       }
     ],
     "configuration": {
