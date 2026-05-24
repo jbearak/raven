@@ -36,7 +36,7 @@ defers to other extensions (most notably `quarto.quarto` and
 
 ## When the command is available
 
-`Raven: Knit` is gated by `raven.rConsole.activation`. With the
+`Raven: Knit Preview` is gated by `raven.rConsole.activation`. With the
 default `"auto"` setting it is **disabled** when the
 `REditorSupport.r` extension is enabled or VS Code is running as
 Positron — both already provide their own knit affordances. In every
@@ -136,7 +136,7 @@ explorer-context-menu hook is opt-in via your own keybindings).
     has three buttons:
 
     - **Knit again** — re-knits the source `.Rmd` (the same code path
-      as invoking `Raven: Knit` from the palette).
+      as invoking `Raven: Knit Preview` from the palette).
     - **Open in Browser** — opens the rendered file in your OS default
       browser. In remote workspaces (SSH, Codespaces, dev containers)
       this may not work because `file://` URIs target the remote

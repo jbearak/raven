@@ -30,7 +30,7 @@ const SAMPLE_CONTENT = [
     '',
     '# Hello from Raven',
     '',
-    'This is a tiny R Markdown document. Run **Raven: Knit** from the command',
+    'This is a tiny R Markdown document. Run **Raven: Knit Preview** from the command',
     'palette (Cmd/Ctrl+Shift+P) to render it.',
     '',
     '```{r}',
@@ -66,7 +66,7 @@ async function createSampleRmd(): Promise<void> {
 
     await vscode.window.showTextDocument(candidate);
     await vscode.window.showInformationMessage(
-        `Sample created at ${path.basename(candidate.fsPath)}. Open the command palette and run Raven: Knit.`,
+        `Sample created at ${path.basename(candidate.fsPath)}. Open the command palette and run Raven: Knit Preview.`,
     );
 }
 

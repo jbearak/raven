@@ -839,7 +839,7 @@
           {
             "id": "raven.getStarted.knit",
             "title": "Create a sample .Rmd and knit it",
-            "description": "[Create sample .Rmd](command:raven.walkthrough.createSampleRmd) — Raven will open it. Then run [Raven: Knit](command:raven.knit) from the command palette.",
+            "description": "[Create sample .Rmd](command:raven.walkthrough.createSampleRmd) — Raven will open it. Then run [Raven: Knit Preview](command:raven.knit) from the command palette.",
             "media": { "markdown": "README.md" },
             "completionEvents": ["onCommand:raven.knit"]
           }
@@ -1322,7 +1322,7 @@
             "wkhtmltopdf"
           ],
           "default": "xelatex",
-          "description": "LaTeX engine used by Pandoc when exporting to PDF. Most users should leave this at xelatex; tectonic is a fully self-contained alternative."
+          "description": "PDF engine used by Pandoc when exporting to PDF. Most users should leave this at xelatex; tectonic is a fully self-contained LaTeX alternative, and wkhtmltopdf renders via HTML/WebKit instead of LaTeX."
         },
         "raven.knit.fontFamily": {
           "type": "string",
