@@ -941,12 +941,17 @@ export function App({
                         postLifecycle('selection', visibleRange, selection);
                     }}
                     onHeaderClicked={colIndex => {
+                        if (colIndex < 0) return;
                         const next = createColumnSelection(colIndex);
                         setGridSelection(next);
                         postLifecycle('header-click', visibleRange, next);
                     }}
                     onHeaderContextMenu={(colIndex, event) => {
                         event.preventDefault();
+                        if (colIndex < 0) {
+                            setContextMenu(null);
+                            return;
+                        }
                         const next = createColumnSelection(colIndex);
                         setGridSelection(next);
                         const point = toGridShellPoint(
