@@ -320,7 +320,8 @@ export class DataViewerPanel {
         const gen = this.generation;
         switch (m.type) {
             case 'getRows': {
-                this.reader.setLatestViewportGeneration(m.viewportGeneration);
+                const reader = this.reader;
+                reader.setLatestViewportGeneration(m.viewportGeneration);
                 this.trace('get-rows', {
                     generation: m.panelGeneration,
                     requestId: m.requestId,
@@ -329,13 +330,19 @@ export class DataViewerPanel {
                     end: m.end,
                     columns: m.columns.length,
                 });
-                const out = await this.reader.getRows({
-                    start: m.start,
-                    end: m.end,
-                    columns: m.columns,
-                    viewportGeneration: m.viewportGeneration,
-                });
-                if (gen !== this.generation) return;
+                let out;
+                try {
+                    out = await reader.getRows({
+                        start: m.start,
+                        end: m.end,
+                        columns: m.columns,
+                        viewportGeneration: m.viewportGeneration,
+                    });
+                } catch (err) {
+                    if (gen !== this.generation || reader !== this.reader || this.disposed) return;
+                    throw err;
+                }
+                if (gen !== this.generation || reader !== this.reader) return;
                 const reply: ExtensionToWebview = {
                     type: 'rows',
                     panelGeneration: gen,
@@ -476,12 +483,12 @@ export class DataViewerPanel {
         await this.webviewPanel.webview.postMessage(msg);
     }
 
-    /** Test-only: post a `testScrollbarDrag` message to the webview so
-     *  it dispatches synthetic pointer events on the thumb element.
-     *  fraction=0 jumps to top, fraction=1 jumps to bottom. Non-finite
-     *  inputs are rejected, and finite values are clamped to [0, 1] to
-     *  keep test behavior deterministic. Awaiting waits for the message
-     *  to be queued, not for any reply; tests should poll
+    /** Test-only: post a `testScrollToFraction` message to the webview
+     *  so it scrolls through the grid's imperative scroll API. fraction=0
+     *  jumps to top, fraction=1 jumps to bottom. Non-finite inputs are
+     *  rejected, and finite values are clamped to [0, 1] to keep test
+     *  behavior deterministic. Awaiting waits for the message to be
+     *  queued, not for any reply; tests should poll
      *  `getVisibleRange()` to observe the result. */
     async dragScrollbar(fraction: number): Promise<void> {
         if (this.disposed) return;
@@ -490,7 +497,7 @@ export class DataViewerPanel {
         }
         const clampedFraction = Math.min(1, Math.max(0, fraction));
         const msg: ExtensionToWebview = {
-            type: 'testScrollbarDrag',
+            type: 'testScrollToFraction',
             panelGeneration: this.generation,
             fraction: clampedFraction,
         };

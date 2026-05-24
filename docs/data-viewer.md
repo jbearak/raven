@@ -121,7 +121,7 @@ same `View(mtcars)` opened tomorrow remembers the layout.
 - `Cmd/Ctrl+C` copies the selection as TSV. Copying respects the
   active Labels / Format / digits state — what you see is what you
   copy.
-- Column-header selections and whole-table selections (via `#` or
+- Column-header selections and whole-table selections (via
   `Cmd/Ctrl+A`) include the column-name row when copied. Cell and
   row-header selections copy data only, matching spreadsheet
   conventions.
@@ -143,18 +143,10 @@ same `View(mtcars)` opened tomorrow remembers the layout.
 | `Cmd/Ctrl+A`       | Select all rows across visible columns. |
 | `Cmd/Ctrl+C`       | Copy the current selection as TSV.      |
 
-`Home` and `End` are the recommended way to reach the very first or very
-last row in a large data frame. The native scrollbar's minimum thumb
-size prevents dragging the pill all the way to the bottom of a multi-
-million-row grid (see [issue #183](https://github.com/jbearak/raven/issues/183)),
-but `End` jumps there in one keystroke. Modifier combinations (`Shift`,
-`Cmd`/`Ctrl`, `Alt` on these navigation keys) fall through to the
-browser/OS unchanged so platform shortcuts are not hijacked.
-
-On data frames with more than ~625 K rows, Raven also replaces the
-native vertical scrollbar with an overlay so dragging the scrollbar
-thumb to the bottom reaches the last row. The native scrollbar is
-preserved on smaller frames.
+`Home` and `End` jump to the very first or very last row in a large data
+frame. Modifier combinations (`Shift`, `Cmd`/`Ctrl`, `Alt` on these
+navigation keys) fall through to the browser/OS unchanged so platform
+shortcuts are not hijacked.
 
 ## Settings
 

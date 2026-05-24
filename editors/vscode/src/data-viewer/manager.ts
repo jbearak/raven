@@ -94,7 +94,7 @@ export class DataViewerManager {
         await this.panels.get(panelName)?.pressKey(key);
     }
 
-    /** Test-only: drive a custom-scrollbar drag in the named panel.
+    /** Test-only: scroll the named panel to a fractional vertical position.
      *  fraction=0 jumps to top, fraction=1 jumps to bottom. Awaiting
      *  waits for message queuing; tests should poll
      *  `getPanelVisibleRange()` to observe results. */

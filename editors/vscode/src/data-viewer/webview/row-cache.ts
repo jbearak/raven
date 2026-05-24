@@ -7,6 +7,8 @@
 import type { Cell } from '../wire-format';
 
 type Entry = {
+    start: number;
+    end: number;
     rows: Cell[][];
     cells: number;
 };
@@ -29,6 +31,16 @@ export class RowCache {
         return e.rows;
     }
 
+    hasRange(start: number, end: number): boolean {
+        for (const [key, e] of this.entries) {
+            if (start < e.start || end > e.end) continue;
+            this.entries.delete(key);
+            this.entries.set(key, e);
+            return true;
+        }
+        return false;
+    }
+
     put(start: number, end: number, rows: Cell[][]): void {
         const cells = rows.length * (rows[0]?.length ?? 0);
         const key = this.k(start, end);
@@ -37,7 +49,7 @@ export class RowCache {
             this.cells -= old.cells;
             this.entries.delete(key);
         }
-        this.entries.set(key, { rows, cells });
+        this.entries.set(key, { start, end, rows, cells });
         this.cells += cells;
         while (this.cells > this.capacity && this.entries.size > 0) {
             const first = this.entries.keys().next().value as string;
@@ -45,6 +57,16 @@ export class RowCache {
             this.cells -= e.cells;
             this.entries.delete(first);
         }
+    }
+
+    getRow(row: number): Cell[] | undefined {
+        for (const [key, e] of this.entries) {
+            if (row < e.start || row >= e.end) continue;
+            this.entries.delete(key);
+            this.entries.set(key, e);
+            return e.rows[row - e.start];
+        }
+        return undefined;
     }
 
     clear(): void {
