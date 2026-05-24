@@ -54,3 +54,18 @@ If you keep REditorSupport installed but don't need its language server (e.g. yo
 ```
 
 See [Editor Integrations](./editor-integrations.md) for setup details across editors.
+
+## Coexistence with the Quarto extension
+
+When the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) is installed alongside Raven, *and* Raven's R console is active, you'll see two CodeLens rows above every R chunk in a `.qmd` file: Quarto's (**Run Cell · Run Next Cell · Run Above**) and Raven's (**▷ Run Chunk · → Run Next & Move · ↥ Run Above**, configurable via `raven.chunks.codeLens.commands`).
+
+Raven's chunk CodeLens activates with Raven's R console — see [The `raven.rConsole.activation` setting](#the-ravenrconsoleactivation-setting). Under the default `"auto"`, Raven's R console activates only when no other R extension (REditorSupport.r, or Positron) is enabled. So the dueling-row case appears when you have Quarto installed but not REditorSupport.r, or when you've explicitly set `raven.rConsole.activation` to `"enabled"` alongside REditorSupport.r.
+
+What each row does depends on whether REditorSupport.r is installed:
+
+- **REditorSupport.r not installed**. Quarto's row shows "Executing r cells requires the R extension" and does nothing — its dispatcher checks for REditorSupport's extension ID, not for the underlying `r.runSelection` command. Raven's row works as usual: clicking **▷ Run Chunk** sends the chunk to Raven's R terminal.
+- **REditorSupport.r installed, `raven.rConsole.activation` set to `"enabled"`**. Both rows work — Quarto's dispatches to REditorSupport's `r.runSelection`; Raven's runs the chunk in Raven's terminal.
+
+Both extensions register CodeLens providers for `.qmd`, and VS Code doesn't expose a way for one extension to suppress another's lenses, so when both rows appear they stay independent. Quarto's check looks for the REditorSupport extension by ID, so Raven can't satisfy it from this side regardless of which commands Raven registers — the only clean fix lives upstream in the Quarto extension.
+
+If the duplication bothers you and you're not relying on Quarto's other features (preview, format conversion, project tooling, or the Python / Julia / Observable cell executors), disabling the Quarto extension removes its row entirely — Raven's R console, chunk navigation, run commands, and CodeLens cover the same execution surface for `.qmd` files. Otherwise, the simplest habit is to use Raven's row for R chunks; Quarto's row remains useful for cells in other languages when their respective extensions are installed.
