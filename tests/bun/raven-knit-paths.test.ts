@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, afterAll } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -108,6 +108,16 @@ describe('isUnderContainmentRoot — symlink resolution', () => {
     it('falls back to lexical check when the leaf does not exist', () => {
         const missing = path.join(workspace, 'css', 'never-created.css');
         expect(isUnderContainmentRoot(missing, workspace)).toBe(true);
+    });
+
+    afterAll(() => {
+        try {
+            if (fs.existsSync(tmpRoot)) {
+                fs.rmSync(tmpRoot, { recursive: true, force: true });
+            }
+        } catch {
+            // best-effort cleanup; swallow platform-specific failures
+        }
     });
 });
 
