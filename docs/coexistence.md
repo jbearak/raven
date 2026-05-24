@@ -57,7 +57,7 @@ See [Editor Integrations](./editor-integrations.md) for setup details across edi
 
 ## Coexistence with the Quarto extension
 
-When the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) is installed alongside Raven, *and* Raven's R console is active, you'll see two CodeLens rows above every R chunk in a `.qmd` file: Quarto's (**Run Cell · Run Next Cell · Run Above**) and Raven's (**▷ Run Chunk · → Run Next & Move · ↥ Run Above**, configurable via `raven.chunks.codeLens.commands`).
+When the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) is installed alongside Raven, *and* Raven's R console is active, you'll see two CodeLens rows above every R chunk in a `.qmd` file: Quarto's (**Run Cell · Run Next Cell · Run Above**) and Raven's (**▷ Run Chunk · ↘ Run Next Chunk · ↥ Run Above**, configurable via `raven.chunks.codeLens.commands`).
 
 Raven's chunk CodeLens activates with Raven's R console — see [The `raven.rConsole.activation` setting](#the-ravenrconsoleactivation-setting). Under the default `"auto"`, Raven's R console activates only when no other R extension (REditorSupport.r, or Positron) is enabled. So the dueling-row case appears when you have Quarto installed but not REditorSupport.r, or when you've explicitly set `raven.rConsole.activation` to `"enabled"` alongside REditorSupport.r.
 

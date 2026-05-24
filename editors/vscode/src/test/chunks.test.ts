@@ -861,12 +861,12 @@ suite('chunk commands: registration and behavior', () => {
         }
     });
 
-    test('default codeLens row shows ▷ Run Chunk → Run Next & Move ↥ Run Above', async function () {
+    test('default codeLens row shows ▷ Run Chunk ↘ Run Next Chunk ↥ Run Above', async function () {
         // Issue #280: the out-of-the-box default lens row includes the new
-        // `→ Run Next & Move` button between `▷ Run Chunk` and `↥ Run Above`.
+        // `↘ Run Next Chunk` button between `▷ Run Chunk` and `↥ Run Above`.
         // Sibling-targeted lenses are gated by their target's existence:
         // the first runnable chunk drops `↥ Run Above` (nothing above), and
-        // the last runnable chunk drops `→ Run Next & Move` (nothing below).
+        // the last runnable chunk drops `↘ Run Next Chunk` (nothing below).
         const r_console_disabled = !(await vscode.commands.getCommands(true))
             .includes('raven.runCurrentChunkAt');
         if (r_console_disabled) return;
@@ -881,9 +881,9 @@ suite('chunk commands: registration and behavior', () => {
                 vscode.ConfigurationTarget.Global,
             );
             // 3 runnable R chunks. Expected lens counts:
-            //   first  chunk: Run Chunk + Run Next & Move          = 2 (Run Above hidden)
-            //   middle chunk: Run Chunk + Run Next & Move + Above  = 3
-            //   last   chunk: Run Chunk + Run Above                = 2 (Run Next & Move hidden)
+            //   first  chunk: Run Chunk + Run Next Chunk           = 2 (Run Above hidden)
+            //   middle chunk: Run Chunk + Run Next Chunk + Above   = 3
+            //   last   chunk: Run Chunk + Run Above                = 2 (Run Next Chunk hidden)
             // Total = 7.
             const lenses = await poll_for_lenses(
                 editor.document.uri,
@@ -892,7 +892,7 @@ suite('chunk commands: registration and behavior', () => {
             assert.strictEqual(
                 lenses.length,
                 7,
-                `expected 7 default lenses (2 + 3 + 2, first omits Run Above, last omits Run Next & Move), got ${lenses.length}`,
+                `expected 7 default lenses (2 + 3 + 2, first omits Run Above, last omits Run Next Chunk), got ${lenses.length}`,
             );
             const first_two = lenses.slice(0, 2).map((l) => l.command?.title ?? '');
             assert.ok(
@@ -900,8 +900,8 @@ suite('chunk commands: registration and behavior', () => {
                 `default lens 1 should be Run Chunk, got: ${first_two[0]}`,
             );
             assert.ok(
-                first_two[1]?.startsWith('→ Run Next & Move'),
-                `default lens 2 should be Run Next & Move, got: ${first_two[1]}`,
+                first_two[1]?.startsWith('↘ Run Next Chunk'),
+                `default lens 2 should be Run Next Chunk, got: ${first_two[1]}`,
             );
             assert.ok(
                 first_two.every((t) => !t.startsWith('↥ Run Above')),
@@ -914,7 +914,7 @@ suite('chunk commands: registration and behavior', () => {
             );
             const last_chunk_titles = lenses.slice(-2).map((l) => l.command?.title ?? '');
             assert.ok(
-                last_chunk_titles.every((t) => !t.startsWith('→ Run Next')),
+                last_chunk_titles.every((t) => !(t.startsWith('→ Run Next') || t.startsWith('↘ Run Next'))),
                 `Run Next lenses should be absent on the last chunk, got: ${last_chunk_titles.join(', ')}`,
             );
             assert.ok(
@@ -931,7 +931,7 @@ suite('chunk commands: registration and behavior', () => {
     });
 
     test('Run Next/Previous lenses are gated by target availability', async function () {
-        // The user-reported regression: clicking "→ Run Next & Move" on
+        // The user-reported regression: clicking "↘ Run Next Chunk" on
         // the LAST runnable chunk surfaced a cursor-referencing toast
         // even though the click did not involve the cursor. Fix: hide
         // sibling-targeted lenses on chunks where the target chunk
@@ -973,26 +973,30 @@ suite('chunk commands: registration and behavior', () => {
                 + lenses.map((l) => l.command?.title).join(' | '),
             );
             const titles = lenses.map((l) => l.command?.title ?? '');
+            const is_run_previous = (t: string) =>
+                t.startsWith('← Run Previous') || t.startsWith('↖ Run Previous');
+            const is_run_next = (t: string) =>
+                t.startsWith('→ Run Next') || t.startsWith('↘ Run Next');
             // First chunk: no Previous variants.
             const first_chunk = titles.slice(0, 3);
             assert.ok(
-                first_chunk.every((t) => !t.startsWith('← Run Previous')),
+                first_chunk.every((t) => !is_run_previous(t)),
                 `first chunk should not have any Run Previous lens, got: ${first_chunk.join(', ')}`,
             );
             // Last chunk: no Next variants.
             const last_chunk = titles.slice(-3);
             assert.ok(
-                last_chunk.every((t) => !t.startsWith('→ Run Next')),
+                last_chunk.every((t) => !is_run_next(t)),
                 `last chunk should not have any Run Next lens, got: ${last_chunk.join(', ')}`,
             );
             // Middle chunk has both sides.
             const middle_chunk = titles.slice(3, 8);
             assert.ok(
-                middle_chunk.some((t) => t.startsWith('← Run Previous')),
+                middle_chunk.some(is_run_previous),
                 `middle chunk should have Run Previous, got: ${middle_chunk.join(', ')}`,
             );
             assert.ok(
-                middle_chunk.some((t) => t.startsWith('→ Run Next')),
+                middle_chunk.some(is_run_next),
                 `middle chunk should have Run Next, got: ${middle_chunk.join(', ')}`,
             );
         } finally {
