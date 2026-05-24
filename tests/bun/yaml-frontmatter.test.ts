@@ -5,6 +5,7 @@ import {
     detectFormat,
     detectBlockers,
     isSupportedHtmlFormat,
+    stripFrontmatter,
 } from '../../editors/vscode/src/knit/yaml-frontmatter';
 
 describe('extractFrontmatter', () => {
@@ -29,6 +30,71 @@ describe('extractFrontmatter', () => {
     test('accepts CRLF line endings', () => {
         const text = '---\r\ntitle: x\r\n---\r\nbody\r\n';
         expect(extractFrontmatter(text)).toBe('title: x\n');
+    });
+
+    test('treats an empty fence (`---\\n---\\n`) as an empty front matter', () => {
+        // Pandoc and rmarkdown both accept an empty YAML block. The
+        // original regex required a `\n` before the close fence, so
+        // `---\n---\n` slipped through as "no front matter". Fix:
+        // recognize the immediate close and return an empty string.
+        expect(extractFrontmatter('---\n---\nbody\n')).toBe('');
+    });
+
+    test('treats `---\\n---` at EOF as an empty fence', () => {
+        expect(extractFrontmatter('---\n---')).toBe('');
+    });
+});
+
+describe('stripFrontmatter', () => {
+    test('removes a fenced front-matter block and returns the body', () => {
+        const text = '---\ntitle: example\noutput: html_document\n---\n\nbody\n';
+        expect(stripFrontmatter(text)).toBe('\nbody\n');
+    });
+
+    test('returns the document unchanged when no front matter is present', () => {
+        expect(stripFrontmatter('# heading\n\nbody\n')).toBe('# heading\n\nbody\n');
+    });
+
+    test('returns the document as-is when the fence is unterminated', () => {
+        // No closing `---`, so we leave the body alone rather than
+        // swallow content that isn't really front matter. The
+        // contract matches the no-front-matter fast path: the input
+        // is returned unchanged, including CRLF endings.
+        expect(stripFrontmatter('---\ntitle: x\nno close\n'))
+            .toBe('---\ntitle: x\nno close\n');
+        expect(stripFrontmatter('---\r\ntitle: x\r\nno close\r\n'))
+            .toBe('---\r\ntitle: x\r\nno close\r\n');
+    });
+
+    test('strips BOM and normalizes CRLF', () => {
+        const text = '﻿---\r\ntitle: x\r\n---\r\nbody\r\n';
+        expect(stripFrontmatter(text)).toBe('body\n');
+    });
+
+    test('returns an empty string when the document is only front matter', () => {
+        expect(stripFrontmatter('---\ntitle: x\n---\n')).toBe('');
+    });
+
+    test('keeps `---` thematic breaks deeper in the body intact', () => {
+        // Once the leading front matter is stripped, subsequent `---`
+        // lines in the body are markdown thematic breaks, not a second
+        // fence. We must not touch them.
+        const text = '---\ntitle: x\n---\n# heading\n\n---\n\nmore\n';
+        expect(stripFrontmatter(text)).toBe('# heading\n\n---\n\nmore\n');
+    });
+
+    test('strips an empty fence (`---\\n---\\n…`)', () => {
+        expect(stripFrontmatter('---\n---\nbody\n')).toBe('body\n');
+    });
+
+    test('preserves CRLF endings on the no-front-matter fast path', () => {
+        // The no-FM fast path returns the input unchanged. That keeps
+        // a large knit output (data frames, big tables) from being
+        // re-allocated every time, AND preserves CRLF endings for any
+        // downstream consumer that prefers them. markdown-it handles
+        // either.
+        const text = '# heading\r\n\r\nbody\r\n';
+        expect(stripFrontmatter(text)).toBe(text);
     });
 });
 

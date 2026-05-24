@@ -307,7 +307,14 @@ async function runKnitCommand(
     }
 
     // [2] Parse YAML front matter.
-    const fmText = extractFrontmatter(documentText) ?? '';
+    const fmRaw = extractFrontmatter(documentText);
+    // Whether the source document had a terminated front-matter fence
+    // at all (an empty fence counts). The post-knit renderer uses this
+    // to gate stripping the leading `---...---` block from the
+    // intermediate `.md` — see `renderKnitHtml`'s `hadSourceFrontmatter`
+    // docstring for why we must NOT strip blindly.
+    const hadSourceFrontmatter = fmRaw !== null;
+    const fmText = fmRaw ?? '';
     const parsed = parseFrontmatter(fmText);
     if (!parsed.ok) {
         output.show(true);
@@ -575,6 +582,7 @@ async function runKnitCommand(
             rBinary,
             timeoutMs,
             context,
+            hadSourceFrontmatter,
             showOrUpdatePanel: deps.showOrUpdatePanel,
             getLanguageClient: deps.getLanguageClient,
             runPostKnitRender: deps.runPostKnitRender,
@@ -606,6 +614,8 @@ interface RenderOutcomeCtx {
     rBinary: string;
     timeoutMs: number;
     context: vscode.ExtensionContext;
+    /** See the matching field on `runPostKnitRender`. */
+    hadSourceFrontmatter: boolean;
     showOrUpdatePanel: KnitDeps['showOrUpdatePanel'];
     getLanguageClient: KnitDeps['getLanguageClient'];
     runPostKnitRender: KnitDeps['runPostKnitRender'];
@@ -691,6 +701,7 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
             client: ctx.getLanguageClient(),
             sourceUri: ctx.sourceUri,
             sourceLanguageId: ctx.sourceLanguageId,
+            hadSourceFrontmatter: ctx.hadSourceFrontmatter,
             // The same `.html` is loaded by both the panel iframe
             // AND "Open in Browser", so the file can't carry
             // surface-specific theme logic — it's a frozen

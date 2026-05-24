@@ -33,23 +33,97 @@ export interface Blocker {
 const BOM = '﻿';
 
 /**
+ * Split a document into its YAML front-matter fence (if any) and the
+ * remaining body. `fence` is the inner body of the fence (with a
+ * trailing `\n`); `body` is what follows the closing `---`. When no
+ * terminated front matter is present `fence` is `null` and `body` is
+ * the input text, returned as-is.
+ *
+ * BOM stripping and CRLF normalization happen only on the
+ * front-matter path. Avoiding them on the no-front-matter path lets a
+ * large knit output (data frames, big tables) pass through this
+ * function without a full-string normalization allocation, and
+ * preserves CRLF endings for any downstream consumer that cares.
+ */
+function splitFrontmatter(text: string): { fence: string | null; body: string } {
+    // Fast path: if the document cannot possibly start with a
+    // front-matter fence (after an optional BOM), return as-is.
+    const afterBom = text.startsWith(BOM) ? text.slice(BOM.length) : text;
+    if (!afterBom.startsWith('---\n') && !afterBom.startsWith('---\r\n')) {
+        return { fence: null, body: text };
+    }
+
+    // Slow path: BOM-strip + CRLF→LF normalize, then scan for the
+    // closing fence.
+    let normalized = afterBom;
+    normalized = normalized.replace(/\r\n/g, '\n');
+
+    const rest = normalized.slice(4); // skip the opening "---\n"
+
+    // Empty front matter: the close fence sits immediately after the
+    // open fence (`---\n---\n…` or `---\n---` at EOF). The regex
+    // below requires a leading `\n` before the close, which isn't
+    // present in that case — handle it explicitly so we still strip
+    // the visible artifact (`<pre class="frontmatter">` in VS Code's
+    // markdown renderer) that this gate is here to prevent.
+    if (rest.startsWith('---\n')) {
+        return { fence: '', body: rest.slice(4) };
+    }
+    if (rest === '---') {
+        return { fence: '', body: '' };
+    }
+
+    const closeMatch = rest.match(/\n---(?:\n|$)/);
+    if (!closeMatch || closeMatch.index === undefined) {
+        // Unterminated fence: behave like the no-front-matter path
+        // and return the input as-is. Important for the (admittedly
+        // unreachable in production) case of an unterminated CRLF
+        // fence — we don't want to silently LF-normalize a body that
+        // the caller is about to flow into a downstream consumer.
+        return { fence: null, body: text };
+    }
+    const inner = rest.slice(0, closeMatch.index);
+    const fence = inner.endsWith('\n') ? inner : inner + '\n';
+    const after = rest.slice(closeMatch.index + closeMatch[0].length);
+    return { fence, body: after };
+}
+
+/**
  * Strip the YAML front-matter block from the document text. Returns the
  * inner body of the fence with a normalized trailing newline, or `null`
- * when no terminated front-matter block is present. CRLF line endings are
- * normalized to LF so downstream parsing is line-ending-agnostic.
+ * when no terminated front-matter block is present. When a fence IS
+ * present, CRLF line endings inside the fence are normalized to LF so
+ * downstream YAML parsing is line-ending-agnostic.
+ *
+ * An empty fence (`---\n---\n`) returns an empty string, not `null`:
+ * the document declared an empty YAML block and downstream
+ * `parseFrontmatter('')` yields an empty map, matching how
+ * rmarkdown / pandoc treat the same shape.
  */
 export function extractFrontmatter(text: string): string | null {
-    let body = text;
-    if (body.startsWith(BOM)) body = body.slice(BOM.length);
-    body = body.replace(/\r\n/g, '\n');
+    return splitFrontmatter(text).fence;
+}
 
-    if (!body.startsWith('---\n')) return null;
-
-    const rest = body.slice(4);
-    const closeMatch = rest.match(/\n---(?:\n|$)/);
-    if (!closeMatch || closeMatch.index === undefined) return null;
-    const inner = rest.slice(0, closeMatch.index);
-    return inner.endsWith('\n') ? inner : inner + '\n';
+/**
+ * Return the document body with the leading `--- ... ---` front-matter
+ * block removed. When no terminated front matter is present the input
+ * is returned as-is (no BOM stripping, no CRLF normalization).
+ *
+ * Used by the knit pipeline to keep the YAML out of the post-knit
+ * markdown handed to VS Code's `markdown.api.render`: that pipeline
+ * renders front matter as a styled `<pre class="frontmatter">` block
+ * (visible as a table-like box at the top of the preview), but we
+ * already consume the YAML separately upstream. Mirrors what
+ * `rmarkdown::render` + pandoc do natively.
+ *
+ * Callers MUST only invoke this when they know the source `.Rmd`
+ * actually contained a front-matter fence: otherwise a no-YAML
+ * document whose first chunk emits `---\n…\n---\n` content would
+ * silently lose that output. `renderKnitHtml`'s `hadSourceFrontmatter`
+ * flag enforces that contract.
+ */
+export function stripFrontmatter(text: string): string {
+    return splitFrontmatter(text).body;
 }
 
 /**

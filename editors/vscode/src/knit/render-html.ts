@@ -35,6 +35,7 @@ import {
     semanticOverlaysFromLspData,
     type GithubPalette,
 } from './code-highlighter';
+import { stripFrontmatter } from './yaml-frontmatter';
 
 /** Per-language CSS class prefix `markdown-it` emits. */
 const LANG_CLASS_PREFIX = 'language-';
@@ -191,8 +192,37 @@ export async function renderKnitHtml(args: {
      * defaults that match the historical behavior.
      */
     fonts?: ResolvedFonts;
+
+    /**
+     * Whether the source `.Rmd` actually started with a terminated
+     * `---...---` YAML front-matter fence. When `true`, the renderer
+     * strips the leading fence from `markdownSource` before handing
+     * it to `renderMarkdown` (VS Code's `markdown.api.render` would
+     * otherwise wrap the YAML in a styled `<pre class="frontmatter">`
+     * box — the table-like artifact at the top of the preview).
+     *
+     * Required so callers can't accidentally strip chunk-generated
+     * `---…---` content from a no-YAML document. Tests with no
+     * front matter in `markdownSource` can safely pass either
+     * value; production callers must pass the result of
+     * `extractFrontmatter(documentText) !== null` on the original
+     * `.Rmd` text.
+     */
+    hadSourceFrontmatter: boolean;
 }): Promise<string> {
-    const html = await args.renderMarkdown(args.markdownSource);
+    // `knitr::knit` leaves the source `---...---` block in its output
+    // `.md`. VS Code's `markdown.api.render` then renders that block
+    // as a styled `<pre class="frontmatter">` box at the top of the
+    // preview. The YAML is already consumed upstream for output-format
+    // detection and blocker checks, so it has no purpose in the
+    // rendered HTML — strip it here. Gate on `hadSourceFrontmatter`
+    // so we never swallow chunk-generated content that happens to
+    // look like a fence in a no-YAML document. Mirrors what
+    // `rmarkdown::render` + pandoc do natively.
+    const source = args.hadSourceFrontmatter
+        ? stripFrontmatter(args.markdownSource)
+        : args.markdownSource;
+    const html = await args.renderMarkdown(source);
     const rewritten = await rewriteCodeBlocks(html, args);
     return assembleDocument(rewritten, args);
 }

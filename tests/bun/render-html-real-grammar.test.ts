@@ -126,6 +126,7 @@ describe('renderKnitHtml against the real R grammar', () => {
             registry,
             // No LSP overlay — we want to see whether the grammar
             // alone paints anything.
+            hadSourceFrontmatter: false,
         });
 
         // Extract the highlighted code block body. `rewriteCodeBlocks`

@@ -100,10 +100,17 @@ explorer-context-menu hook is opt-in via your own keybindings).
    (`raven.knit.timeoutMs = 600000`). Windows uses `taskkill /T /F`
    instead of POSIX signals.
 10. **Post-knit render.** `knitr::knit` writes `<basename>.md` next to
-    the source. Raven reads that markdown, calls VS Code's
-    `markdown.api.render` to convert it to HTML (KaTeX math, image
-    rewriting, scroll-sync metadata, and any registered `markdown-it`
-    plugins all happen here), and then walks the result for
+    the source. Raven reads that markdown, strips the leading
+    `---...---` YAML front-matter block when the source had one
+    (otherwise VS Code's markdown renderer would wrap it in a styled
+    `<pre class="frontmatter">` box at the top of the preview — the
+    `output:` and other YAML fields are configuration, not document
+    content). The strip is gated on the source's front matter so a
+    no-YAML `.Rmd` whose first chunk emits `---…---`-shaped content
+    flows through unchanged. Raven then calls VS Code's
+    `markdown.api.render` to convert the body to HTML (KaTeX math,
+    image rewriting, scroll-sync metadata, and any registered
+    `markdown-it` plugins all happen here), and walks the result for
     `<pre><code class="language-X">` blocks. Each block is
     re-highlighted using:
 
@@ -377,6 +384,7 @@ those checks live in the runtime sanitizer only.
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |
+| YAML document metadata (`title:`, `author:`, `date:`, `abstract:`, …) in the rendered preview | Out of scope. Pandoc renders these as a styled title block when it consumes the YAML; Raven's preview drops the YAML entirely along with VS Code's `<pre class="frontmatter">` artifact. Use `rmarkdown::render(...)` in the R console for a Pandoc-rendered title block. |
 | `pandoc_args:` *full* passthrough | The editor menu picks export destination (always sibling of the source `.Rmd`) and format, so `-o`/`--output`/`-t`/`--to`/`-w`/`--write` are stripped from YAML's `pandoc_args` and logged. Everything else flows through — see the honored-options table above. |
 | Custom YAML `knit:` hook dispatch | Run the hook function manually in the R console. |
 | Knit-with-Parameters dialog | Edit YAML defaults, or call `rmarkdown::render(params = list(...))`. |

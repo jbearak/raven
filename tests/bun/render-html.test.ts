@@ -469,6 +469,7 @@ describe('renderKnitHtml', () => {
             markdownSource: 'irrelevant — renderMarkdown returns a fixed value',
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: toyRTokenizer }),
+            hadSourceFrontmatter: false,
         });
 
         // The body must include a function-role span. Spans
@@ -487,6 +488,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<pre><code>raw text &amp; symbols</code></pre>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: toyRTokenizer }),
         });
@@ -512,6 +514,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<pre><code class="language-r">library</code></pre>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: toyRTokenizer }),
         });
@@ -526,6 +529,7 @@ describe('renderKnitHtml', () => {
         // visual is unique to input chunks.
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => '<p>hi</p>',
             registry: fakeRegistry({}),
         });
@@ -551,6 +555,7 @@ describe('renderKnitHtml', () => {
         const tokensData = [0, 0, 7, 0, 0];
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: flatTokenizer }),
             fetchRSemanticTokens: async () => tokensData,
@@ -566,6 +571,7 @@ describe('renderKnitHtml', () => {
         let fetchCalled = false;
         await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ python: toyRTokenizer }),
             fetchRSemanticTokens: async () => {
@@ -580,6 +586,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<p>math</p>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({}),
             katexCss: '.katex { color: blue; }',
@@ -591,6 +598,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<p>hi</p>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({}),
         });
@@ -598,6 +606,76 @@ describe('renderKnitHtml', () => {
         expect(out).toContain('<head>');
         expect(out).toContain('<body>');
         expect(out).toContain('<p>hi</p>');
+    });
+
+    test('strips YAML front matter when hadSourceFrontmatter is true', async () => {
+        // The `knitr::knit` output `.md` retains the source `---...---`
+        // front-matter block, and VS Code's `markdown.api.render`
+        // turns that block into a styled `<pre class="frontmatter">`
+        // box at the top of the preview. Strip it here so the YAML
+        // never reaches the renderer.
+        const source =
+            '---\ntitle: My Doc\noutput: html_document\n---\n\n# Hello\n\nbody\n';
+        let received: string | undefined;
+        await renderKnitHtml({
+            markdownSource: source,
+            renderMarkdown: async (src) => {
+                received = src;
+                return '<h1>Hello</h1>\n<p>body</p>';
+            },
+            registry: fakeRegistry({}),
+            hadSourceFrontmatter: true,
+        });
+        // The renderer must never see the YAML fence or its inner
+        // lines, so VS Code's frontmatter plugin has nothing to
+        // latch onto.
+        expect(received).toBeDefined();
+        expect(received).not.toContain('---');
+        expect(received).not.toContain('title:');
+        expect(received).not.toContain('output:');
+        // The body must still flow through unchanged.
+        expect(received).toContain('# Hello');
+        expect(received).toContain('body');
+    });
+
+    test('does NOT strip a leading `---…---` block when hadSourceFrontmatter is false', async () => {
+        // Regression guard: a no-YAML `.Rmd` whose first chunk emits
+        // `---\n…\n---\n` as output content used to be silently
+        // stripped by an unconditional `stripFrontmatter` call. Now
+        // the strip is gated on whether the source document actually
+        // had a front-matter fence — chunk-generated content shaped
+        // like a fence must flow through verbatim.
+        const source = '---\nnot metadata — real chunk output\n---\n\nrest of body\n';
+        let received: string | undefined;
+        await renderKnitHtml({
+            markdownSource: source,
+            renderMarkdown: async (src) => {
+                received = src;
+                return '<p>ignored</p>';
+            },
+            registry: fakeRegistry({}),
+            hadSourceFrontmatter: false,
+        });
+        expect(received).toBe(source);
+    });
+
+    test('strips an empty front-matter block (`---\\n---\\n…`) when hadSourceFrontmatter is true', async () => {
+        // An empty YAML fence still produces VS Code's
+        // `<pre class="frontmatter">` artifact — the gate must
+        // recognize it. The body following the empty fence must
+        // survive.
+        const source = '---\n---\n# Heading\n';
+        let received: string | undefined;
+        await renderKnitHtml({
+            markdownSource: source,
+            renderMarkdown: async (src) => {
+                received = src;
+                return '<h1>Heading</h1>';
+            },
+            registry: fakeRegistry({}),
+            hadSourceFrontmatter: true,
+        });
+        expect(received).toBe('# Heading\n');
     });
 
     test('decodes HTML entities in the code block before tokenizing', async () => {
@@ -608,6 +686,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<pre><code class="language-r">f &lt;- 1</code></pre>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: toyRTokenizer }),
         });
@@ -624,6 +703,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<pre><code class="language-r">library</code></pre>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: toyRTokenizer }),
             themeClasses: 'vscode-dark',
@@ -661,6 +741,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<pre><code class="language-r">library</code></pre>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: toyRTokenizer }),
             themeClasses: null, // standalone (Open in Browser path)
@@ -686,6 +767,7 @@ describe('renderKnitHtml', () => {
         const fakeHtml = '<pre><code class="language-r">library</code></pre>';
         const out = await renderKnitHtml({
             markdownSource: 'x',
+            hadSourceFrontmatter: false,
             renderMarkdown: async () => fakeHtml,
             registry: fakeRegistry({ r: toyRTokenizer }),
             fetchRSemanticTokens: async () => {

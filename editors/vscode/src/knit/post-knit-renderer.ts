@@ -168,8 +168,27 @@ export async function runPostKnitRender(args: {
      * still honored.
      */
     sourceLanguageId?: string;
+    /**
+     * Whether the source `.Rmd` actually started with a terminated
+     * `---...---` YAML front-matter fence. Passed through to
+     * `renderKnitHtml`, which strips the leading fence from the
+     * post-knit `.md` only when this is `true`. See the
+     * `hadSourceFrontmatter` docstring on `renderKnitHtml` for why
+     * gating matters (chunk-generated `---…---` content in a no-YAML
+     * document must NOT be silently stripped).
+     */
+    hadSourceFrontmatter: boolean;
 }): Promise<void> {
-    const { mdPath, htmlPath, context, client, themeClasses, sourceUri, sourceLanguageId } = args;
+    const {
+        mdPath,
+        htmlPath,
+        context,
+        client,
+        themeClasses,
+        sourceUri,
+        sourceLanguageId,
+        hadSourceFrontmatter,
+    } = args;
 
     const markdownSource = await fs.promises.readFile(mdPath, 'utf-8');
 
@@ -248,6 +267,7 @@ export async function runPostKnitRender(args: {
         katexCss,
         themeClasses: themeClasses ?? null,
         fonts,
+        hadSourceFrontmatter,
     });
 
     await writeFileAtomic(htmlPath, finalHtml);

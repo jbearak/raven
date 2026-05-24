@@ -68,6 +68,7 @@ suite('runPostKnitRender end-to-end', () => {
             htmlPath,
             context: fakeContext,
             client: undefined,
+            hadSourceFrontmatter: false,
         });
 
         assert.ok(
@@ -183,6 +184,7 @@ suite('runPostKnitRender end-to-end', () => {
             htmlPath,
             context: fakeContext,
             client: undefined,
+            hadSourceFrontmatter: false,
         });
 
         const html = fs.readFileSync(htmlPath, 'utf-8');
@@ -199,6 +201,72 @@ suite('runPostKnitRender end-to-end', () => {
             stragglers,
             [],
             `expected no stray .tmp files in ${tmp}, found ${JSON.stringify(stragglers)}`,
+        );
+    });
+
+    test('strips YAML front matter so it does not render as a styled box', async function () {
+        this.timeout(30000);
+        await activate();
+
+        // Regression: `knitr::knit` leaves the source `---...---`
+        // block in its output `.md`. Without the gate added in
+        // `renderKnitHtml`, VS Code's `markdown.api.render` wraps
+        // that block in `<pre class="frontmatter">…</pre>` — visible
+        // at the top of the preview as an unwanted table-like box.
+        // This case exercises the REAL `markdown.api.render` (the
+        // bun unit test in `render-html.test.ts` uses a fake renderer
+        // and can't see the live markdown-it plugin behavior).
+        const mdPath = path.join(tmp, 'frontmatter.md');
+        const htmlPath = path.join(tmp, 'frontmatter.html');
+        const mdSource = [
+            '---',
+            'title: My Document',
+            'author: Test Author',
+            'output: html_document',
+            '---',
+            '',
+            'POST-KNIT-RENDERER-MARKER',
+            '',
+        ].join('\n');
+        fs.writeFileSync(mdPath, mdSource, 'utf-8');
+
+        const ravenExt = vscode.extensions.getExtension('jbearak.raven-r');
+        assert.ok(ravenExt);
+        const fakeContext = {
+            extensionUri: ravenExt.extensionUri,
+            subscriptions: [],
+        } as unknown as vscode.ExtensionContext;
+
+        await runPostKnitRender({
+            mdPath,
+            htmlPath,
+            context: fakeContext,
+            client: undefined,
+            hadSourceFrontmatter: true,
+        });
+
+        const html = fs.readFileSync(htmlPath, 'utf-8');
+        // The body must still appear.
+        assert.ok(
+            html.includes('POST-KNIT-RENDERER-MARKER'),
+            'body marker should survive the strip',
+        );
+        // VS Code's frontmatter plugin tags the block with the
+        // `frontmatter` class — that class must NOT appear in the
+        // rendered HTML.
+        assert.ok(
+            !/class="frontmatter\b/.test(html),
+            `expected no <pre class="frontmatter"> in output; got:\n${html}`,
+        );
+        // And the raw YAML values must not leak through as visible
+        // prose either.
+        assert.ok(
+            !/title:\s*My Document/.test(html),
+            'YAML `title:` line should not appear in rendered HTML',
+        );
+        assert.ok(
+            !/author:\s*Test Author/.test(html),
+            'YAML `author:` line should not appear in rendered HTML',
         );
     });
 
@@ -227,6 +295,7 @@ suite('runPostKnitRender end-to-end', () => {
             htmlPath,
             context: fakeContext,
             client: undefined,
+            hadSourceFrontmatter: false,
         });
 
         const html = fs.readFileSync(htmlPath, 'utf-8');
