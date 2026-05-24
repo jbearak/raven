@@ -51,7 +51,7 @@ In `.R` files, `Cmd+Shift+Enter` keeps its usual meaning of **Source File** — 
 
 ## CodeLens buttons
 
-By default each R chunk header shows three buttons:
+By default each R chunk header shows up to three buttons:
 
 ```text
 ▷ Run Chunk    → Run Next & Move    ↥ Run Above
@@ -59,7 +59,7 @@ By default each R chunk header shows three buttons:
 …
 ```
 
-Buttons for non-R languages are intentionally omitted.
+Sibling-targeted lenses are hidden on chunks where they have nothing to point at: the first runnable chunk drops `↥ Run Above` and `← Run Previous` (and `← Run Previous & Move`); the last runnable chunk drops `↧ Run Below`, `→ Run Next`, and `→ Run Next & Move`. Buttons for non-R languages are intentionally omitted.
 
 The set of buttons (and their order) is controlled by `raven.chunks.codeLens.commands` — an array of run-command ids. The available ids are:
 

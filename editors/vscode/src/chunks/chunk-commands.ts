@@ -345,6 +345,7 @@ export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = O
         title: '↥ Run Above',
         tooltip: 'Run every R chunk above this one',
         eval_aware: false,
+        gate: 'requires_previous_runnable',
     },
     'raven.runCurrentAndBelowChunks': {
         positional_id: 'raven.runCurrentAndBelowChunksAt',
@@ -357,6 +358,7 @@ export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = O
         title: '↧ Run Below',
         tooltip: 'Run every R chunk below this one',
         eval_aware: false,
+        gate: 'requires_next_runnable',
     },
     'raven.runPreviousChunk': {
         positional_id: 'raven.runPreviousChunkAt',
