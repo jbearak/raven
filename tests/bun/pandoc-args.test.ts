@@ -2,7 +2,13 @@ import { describe, it, expect } from 'bun:test';
 import { buildPandocArgs } from '../../editors/vscode/src/knit/pandoc-args';
 import type { OutputOptions } from '../../editors/vscode/src/knit/output-options';
 
-const emptyOpts: OutputOptions = { chunkOpts: {}, pandocFlags: {}, ignored: [] };
+const emptyOpts: OutputOptions = {
+    chunkOpts: {},
+    pandocFlags: {},
+    pandocArgs: [],
+    droppedPandocArgs: [],
+    ignored: [],
+};
 
 describe('buildPandocArgs', () => {
     it('produces minimal args for HTML', () => {
@@ -117,5 +123,39 @@ describe('buildPandocArgs', () => {
             containmentRoot: '/p',
         });
         expect(args).toContain('--css=/p/abs.css');
+    });
+
+    it('appends pandocArgs after Raven\'s own flags', () => {
+        const o: OutputOptions = {
+            ...emptyOpts,
+            pandocArgs: ['--shift-heading-level-by=1', '--wrap=auto'],
+        };
+        const args = buildPandocArgs(o, 'html', {
+            mdPath: 'in.md',
+            outPath: 'out.html',
+            sourceDir: '/p',
+            containmentRoot: '/p',
+        });
+        expect(args).toEqual([
+            'in.md', '-o', 'out.html', '--to', 'html5', '--standalone',
+            '--shift-heading-level-by=1', '--wrap=auto',
+        ]);
+    });
+
+    it('pandocArgs appear after --css and other YAML-derived flags', () => {
+        const o: OutputOptions = {
+            ...emptyOpts,
+            pandocFlags: { toc: true, css: ['style.css'] },
+            pandocArgs: ['--shift-heading-level-by=1'],
+        };
+        const args = buildPandocArgs(o, 'html', {
+            mdPath: 'in.md',
+            outPath: 'out.html',
+            sourceDir: '/p',
+            containmentRoot: '/p',
+        });
+        // Our --toc and --css come before the passthrough block.
+        expect(args.indexOf('--shift-heading-level-by=1')).toBeGreaterThan(args.indexOf('--toc'));
+        expect(args.indexOf('--shift-heading-level-by=1')).toBeGreaterThan(args.indexOf('--css=/p/style.css'));
     });
 });

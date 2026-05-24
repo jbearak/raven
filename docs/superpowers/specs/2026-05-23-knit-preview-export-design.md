@@ -232,8 +232,7 @@ interface OutputOptions {
     fig_width?: number; fig_height?: number; fig_retina?: number;
     dpi?: number; dev?: string;
   };
-  // Pandoc-mappable (export only). pandoc_args is NOT included in v1 — see
-  // honored-keys table below. Adding it later requires an allowlist gate.
+  // Pandoc-mappable (export only). Structured flags Raven knows how to map.
   pandocFlags: {
     toc?: boolean; toc_depth?: number;
     number_sections?: boolean;
@@ -241,7 +240,13 @@ interface OutputOptions {
     self_contained?: boolean;
     css?: string[]; mathjax?: boolean;
   };
-  ignored: string[];  // logged-but-not-applied keys (includes pandoc_args)
+  // Verbatim pandoc_args from YAML, minus destination/format flags
+  // (see honored-keys section below). Appended after Raven's own flags.
+  pandocArgs: string[];
+  // Args stripped from pandoc_args because the editor menu owns
+  // destination + format. Surfaced to the output channel.
+  droppedPandocArgs: string[];
+  ignored: string[];  // logged-but-not-applied keys (does NOT include pandoc_args)
 }
 ```
 
@@ -269,7 +274,14 @@ If multiple formats are listed (`output: { pdf_document: {...}, word_document: {
 
 **Containment root**: the workspace folder containing the `.Rmd`. If the user has no workspace open (opened the `.Rmd` directly as a single file), the containment root falls back to the `.Rmd`'s parent directory. This matches the temp-dir layout's no-workspace fallback (`<workspaceHash>` falls back to the .Rmd parent dir), so a `style.css` next to the `.Rmd` is accepted in both single-file and workspace contexts.
 
-**`pandoc_args` is NOT honored in v1** (security: a document could pass `--output`, `--lua-filter`, `--metadata-file`, `--extract-media`, or other flags that bypass Raven's controlled destination or execute external code). Tracked in follow-up issue #2 with a defined allowlist/blocklist as a prerequisite.
+**`pandoc_args` is honored with destination/format stripping.** This matches RStudio's user-visible behavior (Knit writes a sibling of the source `.Rmd` in the YAML-chosen format) while letting useful flags through (`--shift-heading-level-by`, `--wrap`, `--columns`, `--top-level-division`, etc.). The editor menu owns destination and format, so the following are stripped from YAML's `pandoc_args` and logged to the output channel:
+
+- `-o FILE`, `--output FILE`, `--output=FILE`, `-oFILE` (destination)
+- `-t FMT`, `--to FMT`, `--to=FMT`, `-w FMT`, `--write FMT`, `--write=FMT`, `-tFMT`, `-wFMT` (output format)
+
+Everything else is appended verbatim after Raven's own flags. Pandoc's last-arg-wins rule means users can override defaults (e.g. `--highlight-style=...`) from `pandoc_args` without colliding with the stripped categories. Input-format flags (`-f`/`--from`/`-r`/`--read`) are not stripped — Pandoc reads `.md` by default and overriding it is the user's choice.
+
+`pandoc_args` are inert during preview (preview never invokes Pandoc).
 
 ### YAML option merge precedence
 
@@ -456,7 +468,7 @@ async function openExportedFile(savedUri: vscode.Uri, format: 'html' | 'pdf' | '
 - `knit-export-atomic.test.ts` — pre-existing good `<basename>.docx` next to .Rmd; export is cancelled mid-Pandoc; assert the existing file is untouched and no `.tmp` sibling remains.
 - `knit-export-pinning.test.ts` — start a webview export, dispose the panel mid-export, assert temp dir survives until Pandoc exits, then is cleaned up.
 - `knit-export-stale-figures.test.ts` — pre-existing `figure/old.png` in the .Rmd's directory; new knit produces a different plot in temp `figure/`; assert exported PDF references the new plot, not the stale one.
-- `knit-export-pandoc-args-rejected.test.ts` — YAML containing `pandoc_args: ['--output=/tmp/pwned', '--lua-filter=evil.lua']` is parsed but those args are NOT passed to Pandoc; the keys appear in the ignored-output channel log.
+- `knit-export-pandoc-args.test.ts` — YAML containing `pandoc_args: ['-o', '/tmp/pwned.html', '--shift-heading-level-by=1', '--to=docx']` is parsed so that `--shift-heading-level-by=1` ends up in the Pandoc argv after Raven's own flags, while `-o`, `/tmp/pwned.html`, and `--to=docx` appear in the `Stripped destination/format args from pandoc_args` log line and are NOT passed to Pandoc.
 - `knit-export-yaml-merge.test.ts` — YAML with both `html_document:` and `pdf_document:` blocks; exporting to PDF picks only `pdf_document:` options (not `html_document:`).
 - `knit-export-remote-fallback.test.ts` — mock `vscode.env.openExternal` to return false; assert warning toast shown and the output path appears in the knit channel.
 - `knit-multi-root-isolation.test.ts` — two workspace folders contain `analysis.Rmd` files at different absolute paths; assert their temp subdirs hash to different `preview/<sha256>/` paths and neither knit reads the other's `.md`.
@@ -469,7 +481,7 @@ async function openExportedFile(savedUri: vscode.Uri, format: 'html' | 'pdf' | '
 
 ### Pure-function unit tests
 
-- `buildPandocArgs.test.ts` — exhaustive cases for honored keys. Asserts `pandoc_args` from YAML is dropped and surfaces in `ignored`.
+- `buildPandocArgs.test.ts` — exhaustive cases for honored keys. Asserts `OutputOptions.pandocArgs` is appended after Raven's own flags so Pandoc's last-arg-wins rule lets YAML override defaults like `--highlight-style`.
 - `output-options-parse.test.ts` — new structured extraction in `yaml-frontmatter.ts`. Edge cases: object vs string output form, multiple formats listed, key collisions.
 
 ### Sandbox-skip
@@ -493,13 +505,13 @@ Tests that spawn Pandoc or that depend on subprocess signal delivery self-skip v
 6. **Pandoc's `cwd` is the temp `.md` directory, never the source `.Rmd` directory.** This prevents relative `figure/foo.png` references in the .md from resolving against stale source-directory artifacts.
 7. **Export destinations are written via temp-then-rename.** Same `writeFileAtomic` shape as `post-knit-renderer.ts`. Cancel/failure during Pandoc must not corrupt or clobber a prior good output.
 8. **Preview temp dirs are refcounted during in-flight exports.** Panel disposal marks for deletion; actual `rm -rf` waits for refcount → 0. Don't add a code path that removes the temp dir while an export references it.
-9. **`pandoc_args` from YAML is not honored.** A document could otherwise inject `--output`, `--lua-filter`, `--metadata-file`. If support is added later, it MUST go through an allowlist/blocklist defined adjacent to `buildPandocArgs`.
+9. **`pandoc_args` from YAML is honored, minus destination/format flags.** `parseOutputOptions` strips `-o`/`--output`/`-t`/`--to`/`-w`/`--write` (all variants: separate, equals, attached-short) and surfaces them in `OutputOptions.droppedPandocArgs` for the output-channel log. The rest land in `OutputOptions.pandocArgs` and are appended after Raven's own flags by `buildPandocArgs`. The defended invariant is *menu owns destination + format*; everything else flows through to match RStudio's behavior.
 10. **Webview→host messages stay in the trust boundary.** Any new message type (`requestExport`, `cancelExport`) must be added to `KnitOutputMessage` AND `isKnitOutputMessage` in the same commit, with a unit test proving malformed payloads are rejected.
 
 ## Follow-up issues
 
 1. **Custom highlighting-preserving Word/PDF renderer.** Build a tiny renderer that consumes Raven's role-tagged token stream and emits OOXML (via the `docx` npm package) and PDF (via `pdfmake` or `jsPDF` with colored runs). Goal: beat Pandoc on the highlighting dimension we already win on for HTML preview. Substantial work; only worth doing once Pandoc-only path is shipped and stable.
-2. **Audited `pandoc_args` passthrough.** Define an allowlist of safe Pandoc flags (e.g., `--shift-heading-level-by`, `--reference-doc` from a workspace path) and a blocklist (anything that changes destination, format, or executes code). Behind a workspace-trust gate.
+2. ~~**Audited `pandoc_args` passthrough.**~~ **Implemented post-spec** as a *strip-only* design (no allowlist): `parseOutputOptions` strips destination/format flags (`-o`/`--output`/`-t`/`--to`/`-w`/`--write`) and appends the rest verbatim to the Pandoc argv. Rationale: the original "verbatim passthrough is unsafe" finding (Pass 1 #1) conflated two distinct concerns — destination control (real, narrow) and code execution (already on the table via knitr R chunks). With destination/format stripped, the remaining attack surface (`--lua-filter`, `--metadata-file`, etc.) is strictly bounded by what an `.Rmd` chunk could already do. See "Pandoc-flag mapping" section and invariant #9.
 
 ## Codex adversarial review
 

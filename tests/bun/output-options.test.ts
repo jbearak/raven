@@ -50,13 +50,117 @@ describe('parseOutputOptions', () => {
         expect(r.ignored).toContain('code_folding');
     });
 
-    it('logs pandoc_args as ignored (v1)', () => {
+    it('honors pandoc_args by appending kept entries to pandocArgs', () => {
         const r = parseOutputOptions(
-            { output: { html_document: { pandoc_args: ['--lua-filter=evil.lua'] } } },
+            {
+                output: {
+                    html_document: {
+                        pandoc_args: ['--shift-heading-level-by=1', '--wrap=auto'],
+                    },
+                },
+            },
             'html',
         );
-        expect(r.ignored).toContain('pandoc_args');
-        expect((r.pandocFlags as { pandoc_args?: unknown }).pandoc_args).toBeUndefined();
+        expect(r.pandocArgs).toEqual(['--shift-heading-level-by=1', '--wrap=auto']);
+        expect(r.droppedPandocArgs).toEqual([]);
+        expect(r.ignored).not.toContain('pandoc_args');
+    });
+
+    it('strips destination flags (-o, --output) from pandoc_args, separate form', () => {
+        const r = parseOutputOptions(
+            {
+                output: {
+                    html_document: {
+                        pandoc_args: ['-o', '/tmp/x.html', '--shift-heading-level-by=1'],
+                    },
+                },
+            },
+            'html',
+        );
+        expect(r.pandocArgs).toEqual(['--shift-heading-level-by=1']);
+        expect(r.droppedPandocArgs).toEqual(['-o', '/tmp/x.html']);
+    });
+
+    it('strips --output=value (equals form)', () => {
+        const r = parseOutputOptions(
+            { output: { html_document: { pandoc_args: ['--output=/tmp/x.html', '--toc'] } } },
+            'html',
+        );
+        expect(r.pandocArgs).toEqual(['--toc']);
+        expect(r.droppedPandocArgs).toEqual(['--output=/tmp/x.html']);
+    });
+
+    it('strips -oFILE (attached short form)', () => {
+        const r = parseOutputOptions(
+            { output: { html_document: { pandoc_args: ['-o/tmp/x.html', '--wrap=auto'] } } },
+            'html',
+        );
+        expect(r.pandocArgs).toEqual(['--wrap=auto']);
+        expect(r.droppedPandocArgs).toEqual(['-o/tmp/x.html']);
+    });
+
+    it('strips format flags (-t, --to, -w, --write) in every variant', () => {
+        const r = parseOutputOptions(
+            {
+                output: {
+                    html_document: {
+                        pandoc_args: [
+                            '-t', 'docx',
+                            '--to=pdf',
+                            '-w', 'docx',
+                            '--write=pdf',
+                            '-tdocx',
+                            '-wdocx',
+                            '--wrap=auto',
+                        ],
+                    },
+                },
+            },
+            'html',
+        );
+        expect(r.pandocArgs).toEqual(['--wrap=auto']);
+        expect(r.droppedPandocArgs).toEqual([
+            '-t', 'docx',
+            '--to=pdf',
+            '-w', 'docx',
+            '--write=pdf',
+            '-tdocx',
+            '-wdocx',
+        ]);
+    });
+
+    it('drops non-string entries silently', () => {
+        const r = parseOutputOptions(
+            { output: { html_document: { pandoc_args: ['--toc', 123, null, '--wrap=auto'] } } },
+            'html',
+        );
+        expect(r.pandocArgs).toEqual(['--toc', '--wrap=auto']);
+    });
+
+    it('treats non-array pandoc_args as no-op', () => {
+        const r = parseOutputOptions(
+            { output: { html_document: { pandoc_args: 'oops' } } },
+            'html',
+        );
+        expect(r.pandocArgs).toEqual([]);
+        expect(r.droppedPandocArgs).toEqual([]);
+    });
+
+    it('does NOT strip flags whose names start with -o/-t/-w but are different long options', () => {
+        // --output-format is hypothetical; the real concern is that --shift-heading-level-by=-1
+        // (negative value) and similar must not be mistaken for short -o/-t/-w.
+        const r = parseOutputOptions(
+            {
+                output: {
+                    html_document: {
+                        pandoc_args: ['--shift-heading-level-by=-1', '--top-level-division=part'],
+                    },
+                },
+            },
+            'html',
+        );
+        expect(r.pandocArgs).toEqual(['--shift-heading-level-by=-1', '--top-level-division=part']);
+        expect(r.droppedPandocArgs).toEqual([]);
     });
 
     it('accepts string output: as format-name shorthand (no options)', () => {

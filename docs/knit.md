@@ -252,15 +252,14 @@ PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
 | `self_contained` | Pandoc `--embed-resources --standalone` |
 | `css` | Pandoc `--css=<absolute path>` (containment-checked against the workspace folder / .Rmd parent) |
 | `mathjax` | Pandoc `--mathjax` |
+| `pandoc_args` | Appended verbatim to the Pandoc argv during export (after Raven's own flags), except entries that set destination (`-o`, `--output`) or output format (`-t`, `--to`, `-w`, `--write`) — those are stripped because the editor menu owns them. Stripped entries are logged to the `Raven: Knit` output channel. Preview never invokes Pandoc, so `pandoc_args` does not affect preview output. |
 
 Keys **not honored**: `theme`, `code_folding`, `df_print`,
-`code_download`, `template`, `includes`, `pandoc_args`. They are logged
-to the `Raven: Knit` output channel when present in your YAML. The
-omissions are deliberate — most are html_document-specific Bootstrap /
-JS runtime features that Raven's preview pipeline can't reproduce
-without becoming `rmarkdown::html_document`. `pandoc_args` is excluded
-on security grounds (a document could otherwise inject `--output`,
-`--lua-filter`, etc., bypassing Raven's controlled destination).
+`code_download`, `template`, `includes`. They are logged to the
+`Raven: Knit` output channel when present in your YAML. The omissions
+are deliberate — these are html_document-specific Bootstrap / JS
+runtime features that Raven's preview pipeline can't reproduce without
+becoming `rmarkdown::html_document`.
 
 ## Settings
 
@@ -356,7 +355,7 @@ those checks live in the runtime sanitizer only.
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | `.Rmd` grammar | `REditorSupport.r-syntax` or `REditorSupport.r` |
 | html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |
-| `pandoc_args:` passthrough | Cut on security grounds — could inject `--output`, `--lua-filter`, etc. A safer audited subset may land later; track follow-up issues. |
+| `pandoc_args:` *full* passthrough | The editor menu picks export destination (always sibling of the source `.Rmd`) and format, so `-o`/`--output`/`-t`/`--to`/`-w`/`--write` are stripped from YAML's `pandoc_args` and logged. Everything else flows through — see the honored-options table above. |
 | Custom YAML `knit:` hook dispatch | Run the hook function manually in the R console. |
 | Knit-with-Parameters dialog | Edit YAML defaults, or call `rmarkdown::render(params = list(...))`. |
 | `runtime: shiny` documents | `rmarkdown::run('foo.Rmd')` in the R console. |

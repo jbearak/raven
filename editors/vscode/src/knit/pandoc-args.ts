@@ -8,7 +8,11 @@
  * Paths that escape the containment root are dropped and surfaced via
  * `detailed().droppedCss`.
  *
- * No `pandoc_args` passthrough — that lives in `OutputOptions.ignored`.
+ * `OutputOptions.pandocArgs` (verbatim YAML passthrough, already
+ * stripped of destination/format flags by `parseOutputOptions`) is
+ * appended after Raven's own flags. Pandoc's last-arg-wins rule means
+ * users can override defaults like `--highlight-style` from YAML
+ * without colliding with `-o`/`--to`/`--from`.
  */
 
 import * as path from 'path';
@@ -62,6 +66,8 @@ function build(opts: OutputOptions, format: TargetFormat, ctx: BuildPandocArgsCt
             }
         }
     }
+
+    args.push(...opts.pandocArgs);
 
     return { args, droppedCss };
 }

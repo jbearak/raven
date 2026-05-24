@@ -277,6 +277,12 @@ async function runExportInner(
     for (const key of outOpts.ignored) {
         output.appendLine(`[knit] Ignored output: option '${key}'`);
     }
+    if (outOpts.droppedPandocArgs.length > 0) {
+        const list = outOpts.droppedPandocArgs.map((a) => JSON.stringify(a)).join(' ');
+        output.appendLine(
+            `[knit] Stripped destination/format args from pandoc_args (menu choice wins): ${list}`,
+        );
+    }
 
     const sourceDir = path.dirname(rmd.fsPath);
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(rmd)?.uri.fsPath;

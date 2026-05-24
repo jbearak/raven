@@ -1,6 +1,6 @@
 /**
  * Parse the YAML `output:` block of an R Markdown front matter into a
- * structured `OutputOptions` value. Three groups:
+ * structured `OutputOptions` value. Four groups:
  *
  *   - `chunkOpts`: knitr chunk-level options applied via `opts_chunk$set`
  *     BEFORE knitting (`fig_width`, `fig_height`, `fig_retina`, `dpi`,
@@ -8,10 +8,14 @@
  *   - `pandocFlags`: options that map to Pandoc command-line flags
  *     (`toc`, `toc_depth`, `number_sections`, `highlight`,
  *     `self_contained`, `css`, `mathjax`). Apply during export only.
+ *   - `pandocArgs`: verbatim extra args from YAML's `pandoc_args:` list,
+ *     appended after Raven's own flags. Destination flags (`-o`,
+ *     `--output`) and format-selection flags (`-t`, `--to`, `-w`,
+ *     `--write`) are stripped because the editor menu owns those — the
+ *     export writes a sibling of the source `.Rmd` in the menu-chosen
+ *     format, matching RStudio's Knit-button behavior.
  *   - `ignored`: keys the user wrote that we don't honor. Logged to the
- *     "Raven: Knit" output channel. Includes `pandoc_args` in v1 (see
- *     spec: passing it verbatim is unsafe — `--lua-filter`, `--output`,
- *     etc. can break our destination/security model).
+ *     "Raven: Knit" output channel.
  *
  * Merge precedence (first match wins):
  *   1. The requested-format block (e.g., `pdf_document:` for PDF export).
@@ -47,6 +51,20 @@ export interface PandocFlags {
 export interface OutputOptions {
     chunkOpts: ChunkOpts;
     pandocFlags: PandocFlags;
+    /**
+     * Extra args from YAML's `pandoc_args:` that survived stripping, in
+     * original order. Appended after Raven's own flags by
+     * `buildPandocArgs`. Pandoc's last-arg-wins rule applies to any
+     * duplicates (other than destination/format, which we already
+     * stripped).
+     */
+    pandocArgs: string[];
+    /**
+     * Args from YAML's `pandoc_args:` that we stripped (destination /
+     * format flags). Surfaced to the output channel so the user knows
+     * the menu choice took precedence.
+     */
+    droppedPandocArgs: string[];
     /** Keys the user wrote but we don't honor; surfaced to the output channel. */
     ignored: string[];
 }
@@ -92,8 +110,9 @@ const PANDOC_KEYS: (keyof PandocFlags)[] = [
 
 /**
  * Keys we explicitly recognize but do not honor. Surfaced in `ignored`
- * for logging. `pandoc_args` is here for security: passing it verbatim
- * would let any document override `--output`, `--lua-filter`, etc.
+ * for logging. `pandoc_args` is NOT in this list — see `parseOutputOptions`
+ * for its handling (stripped of destination/format flags, then appended
+ * to the Pandoc argv).
  */
 const IGNORED_KEYS = [
     'theme',
@@ -102,8 +121,62 @@ const IGNORED_KEYS = [
     'code_download',
     'template',
     'includes',
-    'pandoc_args',
 ];
+
+/**
+ * Pandoc flags that we strip from YAML's `pandoc_args:` because Raven's
+ * editor menu owns the export destination and format. Stripped values
+ * appear in `OutputOptions.droppedPandocArgs` for logging.
+ *
+ * Coverage matrix:
+ *   - separate form:  `['-o', FILE]`, `['--output', FILE]`
+ *   - equals form:    `'--output=FILE'`
+ *   - attached short: `'-oFILE'` (Pandoc accepts these)
+ *
+ * Same treatment for `-t`/`--to`/`-w`/`--write` (output format).
+ *
+ * Input-format flags (`-f`, `--from`, `-r`, `--read`) are NOT stripped —
+ * Pandoc reads `.md` by default and overriding it is the user's choice.
+ */
+const STRIPPED_LONG_FLAGS: ReadonlySet<string> = new Set([
+    '-o',
+    '--output',
+    '-t',
+    '--to',
+    '-w',
+    '--write',
+]);
+const STRIPPED_EQUALS_PREFIXES = ['--output=', '--to=', '--write='];
+const STRIPPED_SHORT_ATTACHED_RE = /^-[otw]./;
+
+function stripPandocArgs(raw: unknown): { kept: string[]; dropped: string[] } {
+    const kept: string[] = [];
+    const dropped: string[] = [];
+    if (!Array.isArray(raw)) return { kept, dropped };
+    for (let i = 0; i < raw.length; i++) {
+        const arg = raw[i];
+        if (typeof arg !== 'string') continue;
+        if (STRIPPED_LONG_FLAGS.has(arg)) {
+            dropped.push(arg);
+            const next = raw[i + 1];
+            if (typeof next === 'string') {
+                dropped.push(next);
+                i++;
+            }
+            continue;
+        }
+        if (STRIPPED_EQUALS_PREFIXES.some((p) => arg.startsWith(p))) {
+            dropped.push(arg);
+            continue;
+        }
+        if (STRIPPED_SHORT_ATTACHED_RE.test(arg)) {
+            dropped.push(arg);
+            continue;
+        }
+        kept.push(arg);
+    }
+    return { kept, dropped };
+}
 
 const DEV_ALLOWLIST = new Set(['png', 'pdf', 'svg', 'jpeg', 'cairo_pdf']);
 const HIGHLIGHT_ALLOWLIST = new Set([
@@ -128,12 +201,17 @@ function matchesFormat(blockKey: string, target: TargetFormat): boolean {
 export function parseOutputOptions(fm: FrontmatterDoc, target: TargetFormat): OutputOptions {
     const chunkOpts: ChunkOpts = {};
     const pandocFlags: PandocFlags = {};
+    const pandocArgs: string[] = [];
+    const droppedPandocArgs: string[] = [];
     const ignored: string[] = [];
+    const empty = (): OutputOptions => ({
+        chunkOpts, pandocFlags, pandocArgs, droppedPandocArgs, ignored,
+    });
 
     const output = fm.output;
-    if (output === undefined || output === null) return { chunkOpts, pandocFlags, ignored };
-    if (typeof output === 'string') return { chunkOpts, pandocFlags, ignored };
-    if (typeof output !== 'object' || Array.isArray(output)) return { chunkOpts, pandocFlags, ignored };
+    if (output === undefined || output === null) return empty();
+    if (typeof output === 'string') return empty();
+    if (typeof output !== 'object' || Array.isArray(output)) return empty();
 
     const outputMap = output as Record<string, unknown>;
 
@@ -217,5 +295,13 @@ export function parseOutputOptions(fm: FrontmatterDoc, target: TargetFormat): Ou
         }
     }
 
-    return { chunkOpts, pandocFlags, ignored };
+    // pandoc_args: resolved via the same format-block-then-top-level precedence.
+    const rawPandocArgs = resolve('pandoc_args');
+    if (rawPandocArgs !== undefined) {
+        const stripped = stripPandocArgs(rawPandocArgs);
+        pandocArgs.push(...stripped.kept);
+        droppedPandocArgs.push(...stripped.dropped);
+    }
+
+    return empty();
 }
