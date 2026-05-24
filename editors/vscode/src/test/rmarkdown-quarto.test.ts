@@ -17,7 +17,7 @@ function demoPath(file: string): string {
 async function openAndGetCodeLenses(
     filePath: string,
     timeoutMs = 15000,
-): Promise<vscode.CodeLens[]> {
+): Promise<{ lenses: vscode.CodeLens[]; languageId: string }> {
     const uri = vscode.Uri.file(filePath);
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc);
@@ -33,7 +33,7 @@ async function openAndGetCodeLenses(
         )) ?? [];
         if (lenses.length > 0) break;
     }
-    return lenses;
+    return { lenses, languageId: doc.languageId };
 }
 
 suite('rmarkdown-quarto chunk detection', function (this: Mocha.Suite) {
@@ -55,7 +55,19 @@ suite('rmarkdown-quarto chunk detection', function (this: Mocha.Suite) {
             return;
         }
 
-        const lenses = await openAndGetCodeLenses(demoPath('analysis.Rmd'));
+        const { lenses, languageId } = await openAndGetCodeLenses(demoPath('analysis.Rmd'));
+        // Pin the language id so the `files.associations` configurationDefaults
+        // entry (or Raven's `contributes.languages` claim) can't silently drift
+        // back to a state where `.Rmd` resolves to something other than `rmd`.
+        // The Quarto extension is not present in the vscode-test host, so this
+        // is a baseline-not-regressed check rather than the full reproduction
+        // of the Quarto-installed bug, but it still catches an accidental
+        // removal of either contribution.
+        assert.strictEqual(
+            languageId,
+            'rmd',
+            `Expected .Rmd file to resolve to languageId 'rmd', got '${languageId}'`,
+        );
         assert.ok(
             lenses.length >= 2,
             `Expected at least 2 CodeLens entries for .Rmd chunks; got ${lenses.length}`,
@@ -69,7 +81,7 @@ suite('rmarkdown-quarto chunk detection', function (this: Mocha.Suite) {
             return;
         }
 
-        const lenses = await openAndGetCodeLenses(demoPath('report.qmd'));
+        const { lenses } = await openAndGetCodeLenses(demoPath('report.qmd'));
         assert.ok(
             lenses.length >= 2,
             `Expected at least 2 CodeLens entries for .qmd chunks; got ${lenses.length}`,

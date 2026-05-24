@@ -69,3 +69,21 @@ What each row does depends on whether REditorSupport.r is installed:
 Both extensions register CodeLens providers for `.qmd`, and VS Code doesn't expose a way for one extension to suppress another's lenses, so when both rows appear they stay independent. Quarto's check looks for the REditorSupport extension by ID, so Raven can't satisfy it from this side regardless of which commands Raven registers — the only clean fix lives upstream in the Quarto extension.
 
 If the duplication bothers you and you're not relying on Quarto's other features (preview, format conversion, project tooling, or the Python / Julia / Observable cell executors), disabling the Quarto extension removes its row entirely — Raven's R console, chunk navigation, run commands, and CodeLens cover the same execution surface for `.qmd` files. Otherwise, the simplest habit is to use Raven's row for R chunks; Quarto's row remains useful for cells in other languages when their respective extensions are installed.
+
+### `.Rmd` files belong to the `rmd` language
+
+The Quarto extension contributes both `.qmd` and `.rmd` under `editorLangId == quarto`. When only Raven and Quarto are installed, VS Code's `contributes.languages` extension resolver can pick Quarto's claim over Raven's `rmd` contribution — the resolution order across extensions is not a documented invariant — so `.Rmd` files can end up tagged as `quarto`. Most Raven affordances handle both lang ids (run-line, navigation, CodeLens, the send-to-R menus), but **Knit Preview** is gated on `editorLangId == rmd || == r` and silently stops firing. The visible symptom is `Shift+Cmd+Enter` (`Shift+Ctrl+Enter` on Linux/Windows) triggering Quarto's "Editor selection is not within an executable cell" message instead of opening the knit preview.
+
+Raven ships a `files.associations` default pinning `*.rmd` (the pattern is case-insensitive on VS Code's lookup, but Raven's `contributes.languages` extension list lives alongside as `.rmd` / `.Rmd` / `.RMD` for consistency) to the `rmd` language. `files.associations` is registered ahead of `contributes.languages` in VS Code's resolver, so this anchors `.Rmd` to `rmd` regardless of whether REditorSupport.r-syntax is installed alongside.
+
+Trade-off: this also disables Quarto's `.Rmd`-targeted UI (Run Cell, Insert Cell, preview-related menus, the chunk CodeLens) for users who keep the default, because those gate on `editorLangId == quarto`. Quarto's `.qmd` handling is untouched. If you'd rather hand `.rmd` files back to Quarto, override the default explicitly in user or workspace settings:
+
+```json
+"files.associations": {
+  "*.rmd": "quarto",
+  "*.Rmd": "quarto",
+  "*.RMD": "quarto"
+}
+```
+
+`files.associations` is an object-merge setting, so the override above replaces only the keys it lists — other Raven `files.associations` defaults (none today, but possible in the future) stay in effect.

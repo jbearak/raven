@@ -102,6 +102,51 @@ test("VS Code package metadata activates on JAGS and Stan languages", () => {
   expect(pkg.activationEvents).toContain("onLanguage:stan");
 });
 
+test("VS Code package metadata pins .Rmd files to the rmd language via files.associations", () => {
+  // The Quarto extension contributes `editorLangId == quarto` for `.rmd` (it
+  // accepts both `.qmd` and `.rmd`). When only Raven and Quarto are installed,
+  // VS Code's `contributes.languages` resolver can pick Quarto's claim over
+  // Raven's, leaving `.Rmd` files tagged as `quarto` — at which point Raven's
+  // `raven.knit` keybinding (gated on `editorLangId == rmd || == r`) silently
+  // stops firing on `.Rmd`. `contributes.languages` resolution order is not a
+  // documented invariant, so we don't rely on outvoting Quarto there.
+  //
+  // REditorSupport.r-syntax used to mask the bug by contributing another `rmd`
+  // claim, but Raven vendors its own grammars now, so users who uninstall
+  // r-syntax can hit the latent ordering issue.
+  //
+  // `files.associations` is registered through VS Code's
+  // `registerConfiguredLanguageAssociation` path, which takes precedence over
+  // `contributes.languages` extension lookup. Shipping it as a
+  // `configurationDefaults` entry fixes the resolution at the source and lets
+  // users opt out with their own `files.associations`. Pin the contribution.
+  const packageJsonPath = path.join(
+    import.meta.dir,
+    "..",
+    "..",
+    "editors",
+    "vscode",
+    "package.json",
+  );
+  const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+  const associations = pkg.contributes.configurationDefaults?.[
+    "files.associations"
+  ] as Record<string, string> | undefined;
+
+  expect(associations).toBeDefined();
+  expect(associations).toMatchObject({
+    "*.rmd": "rmd",
+    "*.Rmd": "rmd",
+    "*.RMD": "rmd",
+  });
+
+  // Never claim `.qmd` — Quarto owns that extension and its preview / render
+  // commands live there.
+  expect(associations).not.toHaveProperty("*.qmd");
+  expect(associations).not.toHaveProperty("*.Qmd");
+  expect(associations).not.toHaveProperty("*.QMD");
+});
+
 test("VS Code package metadata exposes send method setting", () => {
   const packageJsonPath = path.join(
     import.meta.dir,
