@@ -7,8 +7,9 @@
         "types": [],
         "module": "ESNext",
         "moduleResolution": "Bundler",
-        "verbatimModuleSyntax": true
+        "verbatimModuleSyntax": true,
+        "jsx": "react-jsx"
     },
-    "include": ["**/*.ts", "../messages.ts", "../wire-format.ts", "../arrow-reader.ts"],
+    "include": ["**/*.ts", "**/*.tsx", "../messages.ts", "../wire-format.ts", "../arrow-reader.ts"],
     "exclude": ["../../../node_modules"]
 }

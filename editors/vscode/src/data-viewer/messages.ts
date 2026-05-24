@@ -96,17 +96,15 @@ export type ExtensionToWebview =
         key: string;
     }
     | {
-        /** Test-only: drive a custom-scrollbar drag-to-fraction (0..1)
-         *  by dispatching synthetic pointerdown/move/up events on the
-         *  thumb element. fraction=0 jumps to top, fraction=1 jumps to
-         *  bottom. The webview computes the target thumbTop, then fires
-         *  the events to exercise the real pointer handlers (drag
-         *  offset capture, drag math, cleanup).
+        /** Test-only: scroll the grid to a fractional vertical position.
+         *  fraction=0 jumps to top, fraction=1 jumps to bottom. The
+         *  production UI no longer has Raven-owned scrollbar pointer
+         *  handlers; this routes through the grid's imperative scroll API.
          *
          *  Production code paths never post this message; the webview
          *  can only receive messages from its own extension host, so
          *  exposing it does not introduce an external attack surface. */
-        type: 'testScrollbarDrag';
+        type: 'testScrollToFraction';
         panelGeneration: number;
         fraction: number;
     };

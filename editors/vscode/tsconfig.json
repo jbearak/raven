@@ -9,5 +9,5 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "exclude": ["node_modules", ".vscode-test", "src/plot/webview", "src/help/webview"]
+  "exclude": ["node_modules", ".vscode-test", "src/plot/webview", "src/help/webview", "src/data-viewer/webview"]
 }
