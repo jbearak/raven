@@ -396,8 +396,9 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // command-palette entry.
     registerKnit(context, r_console_resolved === 'enabled', () => client);
 
-    // Install nags: one-time recommendations to install quarto.quarto
-    // for .qmd and REditorSupport.r-syntax for .Rmd grammar. Activates
+    // Install nags: one-time recommendation to install quarto.quarto
+    // for .qmd grammar / preview. Raven ships its own R Markdown
+    // grammar so there is no parallel nag for `.Rmd`. Activates
     // regardless of the R-console gate — about grammar and
     // discoverability, not subprocess features.
     registerInstallNags(context);

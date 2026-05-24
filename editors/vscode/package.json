@@ -690,6 +690,31 @@
     ],
     "grammars": [
       {
+        "language": "r",
+        "scopeName": "source.r",
+        "path": "./syntaxes/r.tmLanguage.json"
+      },
+      {
+        "language": "rmd",
+        "scopeName": "text.html.markdown.rmarkdown",
+        "path": "./syntaxes/rmd.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.c": "c",
+          "meta.embedded.block.cpp": "cpp",
+          "meta.embedded.block.css": "css",
+          "meta.embedded.block.css.scss": "scss",
+          "meta.embedded.block.js": "javascript",
+          "meta.embedded.block.json": "json",
+          "meta.embedded.block.julia": "julia",
+          "meta.embedded.block.python": "python",
+          "meta.embedded.block.r": "r",
+          "meta.embedded.block.sql": "sql",
+          "meta.embedded.block.stan": "stan",
+          "meta.embedded.block.yaml": "yaml",
+          "meta.embedded.inline.r": "r"
+        }
+      },
+      {
         "language": "jags",
         "scopeName": "source.jags",
         "path": "./syntaxes/jags.tmLanguage.json"

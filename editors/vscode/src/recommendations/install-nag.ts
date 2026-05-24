@@ -2,20 +2,18 @@ import * as vscode from 'vscode';
 import {
     NagKey,
     QUARTO_EXTENSION_ID,
-    R_FULL_EXTENSION_ID,
-    R_SYNTAX_EXTENSION_ID,
     markNagDismissed,
     nagStateForLanguageId,
     shouldShowNag,
 } from './nag-state';
 
 /**
- * Watches editor activations for the first `.qmd` or `.Rmd` document
- * opened in a session and surfaces a one-time install info message.
- * Dismissal persists across sessions via `globalState`; in-session
- * dismissal (including closing the toast with the X button) is tracked
- * by `shownThisSession` so we don't re-fire every time the user
- * switches editors.
+ * Watches editor activations for the first `.qmd` document opened in
+ * a session and surfaces a one-time install info message. Dismissal
+ * persists across sessions via `globalState`; in-session dismissal
+ * (including closing the toast with the X button) is tracked by
+ * `shownThisSession` so we don't re-fire every time the user switches
+ * editors.
  *
  * The message recommends grammar / LSP extensions only. It deliberately
  * does NOT promise Raven preview or render features — Raven defers
@@ -77,19 +75,17 @@ interface NagDefinition {
 }
 
 function nagDefinition(key: NagKey): NagDefinition {
-    if (key === NagKey.QuartoForQmd) {
-        return {
-            message:
-                'Raven does not handle .qmd files directly. Install Quarto for .qmd grammar, LSP features, and live preview.',
-            extensionId: QUARTO_EXTENSION_ID,
-        };
+    // Exhaustive switch — adding a NagKey value forces a new branch.
+    switch (key) {
+        case NagKey.QuartoForQmd:
+            return {
+                message:
+                    'Raven does not handle .qmd files directly. Install Quarto for .qmd grammar, LSP features, and live preview.',
+                extensionId: QUARTO_EXTENSION_ID,
+            };
+        default: {
+            const _exhaustive: never = key;
+            throw new Error(`nagDefinition: unhandled key ${String(_exhaustive)}`);
+        }
     }
-    return {
-        message:
-            'Raven does not ship an R Markdown grammar. Install R Syntax (or R) for .Rmd grammar and embedded-language highlighting.',
-        extensionId: R_SYNTAX_EXTENSION_ID,
-    };
 }
-
-/** Re-exported for callers that want to whitelist the full r extension too. */
-export const RECOMMENDED_RMD_EXTENSIONS = [R_SYNTAX_EXTENSION_ID, R_FULL_EXTENSION_ID];

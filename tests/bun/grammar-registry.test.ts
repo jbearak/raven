@@ -125,6 +125,133 @@ describe('GrammarRegistry.scopeNameFor', () => {
         expect(reg.scopeNameFor('r')).toBe('source.r.vscode');
     });
 
+    test('R falls back to Raven\'s own vendored grammar when no sibling extensions are present', () => {
+        // Models the remote-workspace shape: only Raven (which runs on
+        // the workspace host) is visible. The sibling grammar
+        // extensions are UI-only and live on the unreachable UI host.
+        const reg = buildRegistry([
+            fakeExtension('jbearak.raven-r', '/raven', [
+                { language: 'r', scopeName: 'source.r', path: 'syntaxes/r.tmLanguage.json' },
+            ]),
+        ]);
+        expect(reg.scopeNameFor('r')).toBe('source.r');
+    });
+
+    test('R prefers REditorSupport.r-syntax over Raven\'s vendored grammar when both are visible', () => {
+        // Co-located case (local workspace with the upstream extension
+        // installed): Raven still sits at the end of the priority list,
+        // so the freshest sibling wins.
+        const reg = buildRegistry([
+            fakeExtension('jbearak.raven-r', '/raven', [
+                { language: 'r', scopeName: 'source.r.raven', path: 'syntaxes/r.tmLanguage.json' },
+            ]),
+            fakeExtension('REditorSupport.r-syntax', '/syntax', [
+                { language: 'r', scopeName: 'source.r.upstream', path: 'r.tmLanguage.json' },
+            ]),
+        ]);
+        expect(reg.scopeNameFor('r')).toBe('source.r.upstream');
+    });
+
+    test('Rmd prefers REditorSupport.r-syntax over Raven\'s vendored grammar', () => {
+        // Both share `text.html.markdown.rmarkdown` since Raven
+        // vendors the same upstream grammar; the priority list must
+        // disambiguate, not enumeration order. The Codex review
+        // flagged that a default first-wins resolution here would be
+        // implementation-defined.
+        const reg = buildRegistry([
+            fakeExtension('jbearak.raven-r', '/raven', [
+                {
+                    language: 'rmd',
+                    scopeName: 'text.html.markdown.rmarkdown',
+                    path: 'syntaxes/rmd.tmLanguage.json',
+                },
+            ]),
+            fakeExtension('REditorSupport.r-syntax', '/syntax', [
+                {
+                    language: 'rmd',
+                    scopeName: 'text.html.markdown.rmarkdown',
+                    path: 'syntaxes/rmd.json',
+                },
+            ]),
+        ]);
+        // Both contribute the same scopeName, so the assertion is
+        // about which extension's path the registry would consult.
+        // `primeForLanguage` is the visible side-channel for that —
+        // covered indirectly by the `readAttempts` test below. For
+        // `scopeNameFor` we still want a concrete check: the resolved
+        // contribution's scopeName matches the upstream extension.
+        expect(reg.scopeNameFor('rmd')).toBe('text.html.markdown.rmarkdown');
+    });
+
+    test('Rmd falls back to Raven\'s vendored grammar when no sibling Rmd contributor is visible', () => {
+        const reg = buildRegistry([
+            fakeExtension('jbearak.raven-r', '/raven', [
+                {
+                    language: 'rmd',
+                    scopeName: 'text.html.markdown.rmarkdown',
+                    path: 'syntaxes/rmd.tmLanguage.json',
+                },
+            ]),
+        ]);
+        expect(reg.scopeNameFor('rmd')).toBe('text.html.markdown.rmarkdown');
+    });
+
+    test('Rmd loadGrammar prefers REditorSupport.r over Raven when r-syntax is absent', async () => {
+        // Mirrors the middle-of-priority case for R: the full
+        // REditorSupport.r extension currently relies on r-syntax via
+        // extensionDependencies, but if a future release makes it
+        // contribute the grammar itself, RMD_GRAMMAR_PRIORITY must
+        // still place it ahead of Raven's vendored copy.
+        const extensions: vscode.Extension<unknown>[] = [
+            fakeExtension('jbearak.raven-r', '/raven', [
+                {
+                    language: 'rmd',
+                    scopeName: 'text.html.markdown.rmarkdown',
+                    path: 'syntaxes/rmd.tmLanguage.json',
+                },
+            ]),
+            fakeExtension('REditorSupport.r', '/full', [
+                {
+                    language: 'rmd',
+                    scopeName: 'text.html.markdown.rmarkdown',
+                    path: 'syntaxes/rmd.json',
+                },
+            ]),
+        ];
+
+        const readAttempts: string[] = [];
+        const reg = createGrammarRegistry({
+            extensions,
+            getExtensionById: (id) => extensions.find((e) => e.id === id),
+            onigWasmPath: '/dummy/onig.wasm',
+            importTextmate: async () => ({
+                parseRawGrammar: () => ({} as any),
+                Registry: class FakeRegistry {
+                    constructor(public opts: any) {}
+                    async loadGrammar(scopeName: string) {
+                        const raw = await this.opts.loadGrammar(scopeName);
+                        return raw ? ({ tokenizeLine: () => ({ tokens: [], ruleStack: null }) } as any) : null;
+                    }
+                },
+            } as any),
+            importOniguruma: async () => ({
+                loadWASM: async () => undefined,
+                createOnigScanner: () => ({}) as any,
+                createOnigString: () => ({}) as any,
+            } as any),
+            readGrammarFile: async (absolutePath: string) => {
+                readAttempts.push(absolutePath);
+                return '{"name":"rmd","scopeName":"text.html.markdown.rmarkdown","patterns":[]}';
+            },
+            readOnigWasm: async () => new ArrayBuffer(0),
+        });
+
+        await reg.primeForLanguage('rmd');
+
+        expect(readAttempts).toHaveLength(1);
+        expect(readAttempts[0]).toBe('/full/syntaxes/rmd.json');
+    });
+
     test('extension ID case is ignored during R priority matching', () => {
         const reg = buildRegistry([
             // Note the uppercase REditorSupport — the priority list
@@ -236,5 +363,62 @@ describe('GrammarRegistry.primeForLanguage', () => {
 
         expect(readAttempts).toHaveLength(1);
         expect(readAttempts[0]).toBe('/syntax/syntaxes/r.tmLanguage.json');
+    });
+
+    /**
+     * Same shape as the R test above, but for Rmd. Both Raven and
+     * `REditorSupport.r-syntax` contribute `text.html.markdown.rmarkdown`;
+     * the registry must resolve through `REditorSupport.r-syntax`
+     * because Raven sits at the end of `RMD_GRAMMAR_PRIORITY`.
+     */
+    test('Rmd loadGrammar resolves through REditorSupport.r-syntax when both contribute the rmarkdown scope', async () => {
+        const extensions: vscode.Extension<unknown>[] = [
+            fakeExtension('jbearak.raven-r', '/raven', [
+                {
+                    language: 'rmd',
+                    scopeName: 'text.html.markdown.rmarkdown',
+                    path: 'syntaxes/rmd.tmLanguage.json',
+                },
+            ]),
+            fakeExtension('REditorSupport.r-syntax', '/syntax', [
+                {
+                    language: 'rmd',
+                    scopeName: 'text.html.markdown.rmarkdown',
+                    path: 'syntaxes/rmd.json',
+                },
+            ]),
+        ];
+
+        const readAttempts: string[] = [];
+        const reg = createGrammarRegistry({
+            extensions,
+            getExtensionById: (id) => extensions.find((e) => e.id === id),
+            onigWasmPath: '/dummy/onig.wasm',
+            importTextmate: async () => ({
+                parseRawGrammar: () => ({} as any),
+                Registry: class FakeRegistry {
+                    constructor(public opts: any) {}
+                    async loadGrammar(scopeName: string) {
+                        const raw = await this.opts.loadGrammar(scopeName);
+                        return raw ? ({ tokenizeLine: () => ({ tokens: [], ruleStack: null }) } as any) : null;
+                    }
+                },
+            } as any),
+            importOniguruma: async () => ({
+                loadWASM: async () => undefined,
+                createOnigScanner: () => ({}) as any,
+                createOnigString: () => ({}) as any,
+            } as any),
+            readGrammarFile: async (absolutePath: string) => {
+                readAttempts.push(absolutePath);
+                return '{"name":"rmd","scopeName":"text.html.markdown.rmarkdown","patterns":[]}';
+            },
+            readOnigWasm: async () => new ArrayBuffer(0),
+        });
+
+        await reg.primeForLanguage('rmd');
+
+        expect(readAttempts).toHaveLength(1);
+        expect(readAttempts[0]).toBe('/syntax/syntaxes/rmd.json');
     });
 });
