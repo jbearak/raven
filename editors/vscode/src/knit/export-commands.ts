@@ -7,14 +7,16 @@
  *
  * Two entry-point modes:
  *
- *   - `editor-toolbar`: re-knit fresh into a throwaway export subdir,
+ *   - `editor-toolbar`: re-knit fresh into the preview temp dir,
  *     then run Pandoc and save next to the .Rmd. The user invokes
  *     these from the editor-title Raven menu.
  *   - `webview`: reuse the cached `.md` produced by the most recent
  *     Knit Preview (Approach C). The user invokes these via the
- *     `Export ▾` button in the webview's toolbar. The previewed `.md`
- *     is pinned in the OperationRegistry while Pandoc reads it so
- *     panel disposal can't yank the file out from under us.
+ *     `Export ▾` button in the webview's toolbar.
+ *
+ * Both modes pin the preview temp dir in the OperationRegistry while
+ * export work references it so panel disposal can't yank the `.md` or
+ * figure assets out from under us.
  *
  * In both modes the export pipeline:
  *
@@ -88,7 +90,7 @@ export function registerExportCommands(context: vscode.ExtensionContext, deps: E
                     void vscode.window.showWarningMessage('No .Rmd file selected to export.');
                     return;
                 }
-                if (!/\.[Rr]md$/.test(target.fsPath)) {
+                if (path.extname(target.fsPath).toLowerCase() !== '.rmd') {
                     void vscode.window.showWarningMessage(`Cannot export ${path.basename(target.fsPath)} — not an .Rmd file.`);
                     return;
                 }
@@ -181,9 +183,12 @@ async function runExportInner(
             void vscode.window.showWarningMessage('No cached preview. Knit first, then export.');
             return;
         }
-        deps.registry.pinPreviewDir(previewPaths.previewKey);
-        onPin(previewPaths.previewKey);
-    } else {
+    }
+
+    deps.registry.pinPreviewDir(previewPaths.previewKey);
+    onPin(previewPaths.previewKey);
+
+    if (opts.entry === 'editor-toolbar') {
         // editor-toolbar: re-knit fresh.
         //
         // Critical: `runKnit` (= `vscode.commands.executeCommand('raven.knit', uri)`)
@@ -233,6 +238,10 @@ async function runExportInner(
             output.appendLine(`[Export] knit reported success but no .md at ${previewPaths.mdPath}; aborting.`);
             return;
         }
+        // A disposal of the previous panel during the export pin may
+        // have queued deletion. The successful re-knit made this dir
+        // live again, so the final unpin must not remove it.
+        deps.registry.cancelPreviewDirDeletion(previewPaths.previewKey);
     }
 
     // [2] Resolve Pandoc.

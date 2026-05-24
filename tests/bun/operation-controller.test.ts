@@ -115,4 +115,15 @@ describe('OperationRegistry', () => {
         reg.unpinPreviewDir('p1');
         expect(deleted).toEqual(['/tmp/preview/p1']);
     });
+
+    it('cancelPreviewDirDeletion drops a deferred deletion before the last unpin', () => {
+        const reg = new OperationRegistry();
+        const deleted: string[] = [];
+        reg.setPreviewDirDeleter((dir) => { deleted.push(dir); });
+        reg.pinPreviewDir('p1');
+        reg.requestPreviewDirDeletion('p1', '/tmp/preview/p1');
+        reg.cancelPreviewDirDeletion('p1');
+        reg.unpinPreviewDir('p1');
+        expect(deleted).toEqual([]);
+    });
 });

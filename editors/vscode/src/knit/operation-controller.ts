@@ -156,4 +156,14 @@ export class OperationRegistry {
         }
         this.previewMarkedForDeletion.set(previewKey, previewDir);
     }
+
+    /**
+     * Drop a deferred deletion request when the preview dir becomes live
+     * again before the last pin is released. This is intentionally a
+     * no-op for already-fired deletions; callers use it only while a pin
+     * is still protecting the directory.
+     */
+    cancelPreviewDirDeletion(previewKey: string): void {
+        this.previewMarkedForDeletion.delete(previewKey);
+    }
 }
