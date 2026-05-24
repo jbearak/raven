@@ -56,8 +56,9 @@ async function waitForViewerReady(
     timeoutMs = 10000,
 ): Promise<{ start: number; end: number } | undefined> {
     return pollFor(() => {
-        const r = api.getDataViewerPanelViewportRange(panelName)
-            ?? api.getDataViewerPanelVisibleRange(panelName);
+        const rViewport = api.getDataViewerPanelViewportRange(panelName);
+        const rVisible = api.getDataViewerPanelVisibleRange(panelName);
+        const r = rViewport && rViewport.end > rViewport.start ? rViewport : rVisible;
         return r && r.end > r.start ? r : undefined;
     }, timeoutMs);
 }

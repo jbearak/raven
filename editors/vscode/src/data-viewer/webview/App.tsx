@@ -330,6 +330,11 @@ export function App({
         rowCacheRef.current.clear();
         inflightRef.current.clear();
         pendingKeysRef.current.clear();
+        if (missingRowRequestTimerRef.current !== null) {
+            window.clearTimeout(missingRowRequestTimerRef.current);
+            missingRowRequestTimerRef.current = null;
+        }
+        missingRowRequestRef.current = null;
         setCacheRevision(r => r + 1);
     }, []);
 
