@@ -262,11 +262,18 @@ fn get_help_html_inner(
     // hrefs to `javascript:void(0)`+`data-raven-dropped`, which would prevent
     // the strip regexes from matching by the original href.
     //
-    // The rewriter then converts `<a href="../../<pkg>/help/<topic>">`
-    // (relative, produced by Rd2HTML(dynamic = TRUE)) into `raven-help://...`,
-    // which is an explicit allowlisted scheme. Running it before sanitization
-    // means ammonia sees a scheme it recognizes and keeps the href; running it
-    // after would mean ammonia stripped the relative href first and the
+    // The rewriter then performs two transforms on `<a href>`:
+    //   - `<a href="../../<pkg>/help/<topic>">` (relative, produced by
+    //     `Rd2HTML(dynamic = TRUE)`) becomes `raven-help://...`, an explicit
+    //     allowlisted scheme the webview navigates in-panel.
+    //   - `<a href="/doc/manual/<basename>.html[#anchor]">` (R's internal
+    //     dynamic-help server's manual paths, e.g. for `\link[R-exts]{...}`)
+    //     becomes the canonical CRAN URL for the manuals on the
+    //     `R_MANUAL_BASENAMES` allowlist, so external browsers can open them.
+    //     Unknown basenames Drop.
+    // Running the rewriter before sanitization means ammonia sees a scheme
+    // it recognizes (raven-help, https) and keeps the href; running it after
+    // would mean ammonia stripped the relative/absolute href first and the
     // rewriter had nothing to convert.
     //
     // Both the strip and rewrite passes are regex-only transforms on `<a>`
@@ -564,6 +571,42 @@ mod tests {
         assert!(
             !res.html.contains(">Index<"),
             "Index anchor text must be gone (cursor would be I-beam on a naked <a>); html was:\n{}",
+            res.html
+        );
+    }
+
+    #[test]
+    fn r_manual_links_become_cran_urls() {
+        // End-to-end regression for the reported `utils::package.skeleton`
+        // bug: Rd2HTML emits `<a href="/doc/manual/R-exts.html">` for the
+        // `Writing R Extensions` reference. Previously the rewriter dropped
+        // the absolute path to `javascript:void(0)`, ammonia then stripped
+        // that scheme, and the rendered HTML contained a bare <a> with no
+        // href — styled like a link by the CSS but rendered with the I-beam
+        // cursor and dead clicks.
+        let Some(r) = r_path() else {
+            eprintln!("skip: no R");
+            return;
+        };
+        let res = get_help_html("package.skeleton", Some("utils"), &r).expect("render");
+        assert!(
+            res.html
+                .contains("https://cran.r-project.org/doc/manuals/r-release/R-exts.html"),
+            "expected R-exts.html link rewritten to CRAN URL; html was:\n{}",
+            res.html
+        );
+        // The absolute /doc/manual path must not leak through.
+        assert!(
+            !res.html.contains(r#"href="/doc/manual/"#),
+            "raw /doc/manual/ href must not survive into rendered HTML; html was:\n{}",
+            res.html
+        );
+        // The R-Extensions cross-reference must end up as a real <a href=...>
+        // anchor (i.e. NOT a bare <a> without href), which is what produced
+        // the I-beam cursor before the fix.
+        assert!(
+            res.html.contains(r#"<a href="https://cran.r-project.org"#),
+            "R manual link must be a real anchor with an https href; html was:\n{}",
             res.html
         );
     }

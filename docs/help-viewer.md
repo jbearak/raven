@@ -37,6 +37,7 @@ Internal cross-references are rewritten to a custom URL scheme that correctly ro
 - Operator topics (`` \`[\` ``, `` \`%in%\` ``, `+`, `if`, etc.) render and navigate correctly.
 - Images embedded in help pages (e.g., `?ggplot2::theme`) render — local files are served via webview URIs from package help directories.
 - External links (`https://`, `http://`, `mailto:`) open via `vscode.env.openExternal`.
+- References to R's canonical bundled manuals — `R-intro`, `R-admin`, `R-data`, `R-exts`, `R-FAQ`, `R-ints`, `R-lang` — are rewritten from the local `<a href="/doc/manual/<name>.html">` form that `Rd2HTML` emits to the canonical CRAN URL (`https://cran.r-project.org/doc/manuals/r-release/<name>.html`) so they open in the user's browser. This is how the `Writing R Extensions` link in `?utils::package.skeleton` resolves. Anchors are percent-encoded and preserved. Manual paths outside this allowlist (e.g. `rw-FAQ.html`, custom or third-party docs) are not rewritten and click does nothing — those targets either live elsewhere on CRAN or aren't published.
 - `Run examples` and per-package `Index` footer links emitted by `Rd2HTML` are stripped before rendering — they pointed at endpoints that have no analog in the panel and would render as no-op links.
 - A failed in-panel navigation (e.g. a topic that genuinely cannot be resolved) leaves the previously rendered topic visible, with the error shown in the toolbar banner. Back/forward continues to operate from the last successful topic, not from the failed attempt.
 
