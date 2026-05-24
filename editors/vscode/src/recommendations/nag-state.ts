@@ -9,12 +9,9 @@
 
 export enum NagKey {
     QuartoForQmd = 'raven.nag.quartoForQmd',
-    RSyntaxForRmd = 'raven.nag.rSyntaxForRmd',
 }
 
 export const QUARTO_EXTENSION_ID = 'quarto.quarto';
-export const R_SYNTAX_EXTENSION_ID = 'REditorSupport.r-syntax';
-export const R_FULL_EXTENSION_ID = 'REditorSupport.r';
 
 /**
  * Minimal subset of `vscode.Memento` that we depend on. `update`
@@ -41,12 +38,6 @@ export function shouldShowNag(
     if (key === NagKey.QuartoForQmd) {
         return !isExtensionInstalled(QUARTO_EXTENSION_ID);
     }
-    if (key === NagKey.RSyntaxForRmd) {
-        return !(
-            isExtensionInstalled(R_SYNTAX_EXTENSION_ID) ||
-            isExtensionInstalled(R_FULL_EXTENSION_ID)
-        );
-    }
     return false;
 }
 
@@ -61,6 +52,5 @@ export async function markNagDismissed(state: NagStore, key: NagKey): Promise<vo
  */
 export function nagStateForLanguageId(languageId: string): NagKey | null {
     if (languageId === 'quarto') return NagKey.QuartoForQmd;
-    if (languageId === 'rmd') return NagKey.RSyntaxForRmd;
     return null;
 }

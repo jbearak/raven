@@ -19,6 +19,11 @@
  *   3. `vscode.r`                 — VS Code's built-in mirror, which
  *                                   is periodically synced from
  *                                   REditorSupport upstream
+ *   4. `jbearak.raven-r`          — Raven's own vendored copy of the
+ *                                   REditorSupport grammar. Wins by
+ *                                   default in remote workspaces, where
+ *                                   the UI-only siblings above are
+ *                                   invisible to the workspace host.
  *
  * For non-R languages the policy is simpler: pick the first installed
  * contribution we find. The Knit Output pipeline only needs a single
@@ -437,8 +442,9 @@ function pickContributionFromBucket(
     bucket: readonly ResolvedContribution[],
 ): ResolvedContribution | null {
     if (bucket.length === 0) return null;
-    if (languageId === 'r') {
-        for (const preferred of R_GRAMMAR_PRIORITY) {
+    const priority = GRAMMAR_PRIORITY_BY_LANGUAGE[languageId];
+    if (priority) {
+        for (const preferred of priority) {
             const hit = bucket.find((b) => b.extensionId.toLowerCase() === preferred);
             if (hit) return hit;
         }
@@ -465,13 +471,46 @@ function readGrammarContributions(
 /**
  * R-grammar resolution priority. The full R extension subsumes the
  * grammar-only one, but if both are installed we prefer the standalone
- * `r-syntax` because it ships closer to upstream.
+ * `r-syntax` because it ships closer to upstream. Raven's own vendored
+ * grammar sits at the end as the self-resolving fallback for remote
+ * workspaces where sibling UI-only extensions are unreachable.
  */
 const R_GRAMMAR_PRIORITY: readonly string[] = [
     'reditorsupport.r-syntax',
     'reditorsupport.r',
     'vscode.r',
+    'jbearak.raven-r',
 ];
+
+/**
+ * Rmd-grammar resolution priority. `REditorSupport.r-syntax` is the
+ * upstream `text.html.markdown.rmarkdown` grammar Raven vendors from;
+ * if both are installed and visible, defer to the upstream copy.
+ * `REditorSupport.r` is listed for symmetry with `R_GRAMMAR_PRIORITY`:
+ * it currently has `extensionDependencies: ["REditorSupport.r-syntax"]`
+ * and so does not contribute the rmd grammar itself, but if upstream
+ * inverts that relationship the order here keeps the full extension's
+ * contribution ahead of Raven's vendored copy. Raven sits at the end
+ * as the self-resolving fallback, mirroring R. `vscode.r` is
+ * intentionally absent — the VS Code built-in only contributes
+ * `source.r`, never the rmarkdown grammar.
+ */
+const RMD_GRAMMAR_PRIORITY: readonly string[] = [
+    'reditorsupport.r-syntax',
+    'reditorsupport.r',
+    'jbearak.raven-r',
+];
+
+/**
+ * Per-language priority lookup. `pickContributionFromBucket` consults
+ * this map for any language with multiple potential contributors; any
+ * language NOT in this map falls through to "first contribution wins"
+ * (the only behavior that ever shipped before vendoring landed).
+ */
+const GRAMMAR_PRIORITY_BY_LANGUAGE: Readonly<Record<string, readonly string[]>> = {
+    r: R_GRAMMAR_PRIORITY,
+    rmd: RMD_GRAMMAR_PRIORITY,
+};
 
 function pickContribution(
     contributions: ReturnType<typeof collectGrammarContributions>,

@@ -38,16 +38,6 @@ describe('shouldShowNag', () => {
             shouldShowNag(state, NagKey.QuartoForQmd, fakeExtensions(['quarto.quarto']).has),
         ).toBe(false);
     });
-
-    test('rmd nag suppressed when either r-syntax or r is installed', () => {
-        const state = new FakeGlobalState();
-        expect(
-            shouldShowNag(state, NagKey.RSyntaxForRmd, fakeExtensions(['REditorSupport.r-syntax']).has),
-        ).toBe(false);
-        expect(
-            shouldShowNag(state, NagKey.RSyntaxForRmd, fakeExtensions(['REditorSupport.r']).has),
-        ).toBe(false);
-    });
 });
 
 describe('nagStateForLanguageId', () => {
@@ -55,8 +45,8 @@ describe('nagStateForLanguageId', () => {
         expect(nagStateForLanguageId('quarto')).toBe(NagKey.QuartoForQmd);
     });
 
-    test('returns r-syntax nag for .Rmd', () => {
-        expect(nagStateForLanguageId('rmd')).toBe(NagKey.RSyntaxForRmd);
+    test('returns null for .Rmd (Raven ships its own R Markdown grammar)', () => {
+        expect(nagStateForLanguageId('rmd')).toBeNull();
     });
 
     test('returns null for other languages', () => {

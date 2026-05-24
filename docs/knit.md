@@ -31,8 +31,12 @@ Code extensions contribute, with Raven's `function` semantic-token
 overlay layered on top of R blocks.
 
 See [docs/coexistence.md](coexistence.md) for the surfaces Raven
-defers to other extensions (most notably `quarto.quarto` and
-`REditorSupport.r-syntax`).
+defers to other extensions (most notably `quarto.quarto`). The R and
+R Markdown grammars are vendored from REditorSupport upstream and ship
+with Raven, so `.Rmd` files highlight in fresh installs and remote
+workspaces; sibling grammars (`REditorSupport.r-syntax`,
+`REditorSupport.r`, the built-in `vscode.r`) are still preferred when
+installed.
 
 ## When the command is available
 
@@ -111,7 +115,9 @@ explorer-context-menu hook is opt-in via your own keybindings).
     - whichever TextMate grammar your installed VS Code extensions
       contribute for the chunk's language. For R the resolution
       priority is `REditorSupport.r-syntax` →
-      `REditorSupport.r` → the built-in `vscode.r`;
+      `REditorSupport.r` → the built-in `vscode.r` → Raven's own
+      vendored grammar (so R chunks always highlight, even in fresh
+      remote sessions);
     - Raven's `function` LSP semantic-token overlay on top of R
       blocks, so function definitions and call heads pick up the
       `function` color even when the TextMate grammar doesn't
@@ -370,7 +376,6 @@ those checks live in the runtime sanitizer only.
 | Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Output panel is a static viewer with a manual Refresh button — not a live recompile. |
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
-| `.Rmd` grammar | `REditorSupport.r-syntax` or `REditorSupport.r` |
 | html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |
 | `pandoc_args:` *full* passthrough | The editor menu picks export destination (always sibling of the source `.Rmd`) and format, so `-o`/`--output`/`-t`/`--to`/`-w`/`--write` are stripped from YAML's `pandoc_args` and logged. Everything else flows through — see the honored-options table above. |
 | Custom YAML `knit:` hook dispatch | Run the hook function manually in the R console. |
