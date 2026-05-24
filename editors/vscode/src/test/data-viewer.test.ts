@@ -50,6 +50,19 @@ async function pollFor<T>(
     return undefined;
 }
 
+async function waitForViewerReady(
+    api: RavenExtensionApi,
+    panelName: string,
+    timeoutMs = 10000,
+): Promise<{ start: number; end: number } | undefined> {
+    return pollFor(() => {
+        const rViewport = api.getDataViewerPanelViewportRange(panelName);
+        const rVisible = api.getDataViewerPanelVisibleRange(panelName);
+        const r = rViewport && rViewport.end > rViewport.start ? rViewport : rVisible;
+        return r && r.end > r.start ? r : undefined;
+    }, timeoutMs);
+}
+
 suite('data-viewer smoke tests', function (this: Mocha.Suite) {
     // Each test may need to wait for R startup + arrow write + HTTP round-trip.
     this.timeout(120000);
@@ -104,7 +117,10 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         const appeared = await pollForPanel(api, 'mtcars');
         assert.ok(appeared, 'data viewer panel "mtcars" did not appear');
 
-        const cols = api.getDataViewerPanelColumnNames('mtcars');
+        const cols = await pollFor(() => {
+            const value = api.getDataViewerPanelColumnNames('mtcars');
+            return value && value.length > 0 ? value : undefined;
+        }, 10000);
         assert.ok(Array.isArray(cols), 'expected column names array for "mtcars" panel');
 
         // mtcars ships with R and always has these 11 columns in order.
@@ -122,6 +138,8 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             const appeared = await pollForPanel(api, 'mtcars');
             assert.ok(appeared, 'data viewer panel "mtcars" did not appear');
         }
+        const ready = await waitForViewerReady(api, 'mtcars');
+        assert.ok(ready, 'data viewer panel "mtcars" did not report an initial viewport');
 
         await api.pressDataViewerKey('mtcars', 'Home');
         await api.pressDataViewerKey('mtcars', 'ArrowDown');
@@ -224,8 +242,8 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         // it isn't flaky on slow CI runners.
         this.timeout(240000);
 
-        // Smallest size that engages the cap (700_000 × 24 = 16.8 M >
-        // MAX_SCROLL_PX of 15 M) — exactly the failure mode from #183.
+        // Large enough to exercise the browser/grid path that previously
+        // could not reach the final row.
         const N = 700_000;
 
         await api.sendToRTerminal(
@@ -238,6 +256,8 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         // headroom for slow CI.
         const panelAppeared = await pollForPanel(api, 'big', 90000);
         assert.ok(panelAppeared, 'panel "big" did not appear within 90 s');
+        const ready = await waitForViewerReady(api, 'big', 60000);
+        assert.ok(ready, 'panel "big" did not report an initial viewport');
 
         // Reset scroll to the top before the End test. A previous --watch
         // run could have left the same-shape panel scrolled to the bottom;
@@ -276,7 +296,7 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
     });
 
-    test('Drag scrollbar to bottom reaches last row in 700K-row data frame', async function () {
+    test('Scroll to bottom reaches last row in 700K-row data frame', async function () {
         // Sandbox self-skip — same reason as the End-key 700K test above.
         if (isClaudeCodeSandbox()) {
             this.skip();
@@ -298,6 +318,8 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             const appeared = await pollForPanel(api, 'big', 90000);
             assert.ok(appeared, 'panel "big" did not appear within 90 s');
         }
+        const ready = await waitForViewerReady(api, 'big', 60000);
+        assert.ok(ready, 'panel "big" did not report an initial viewport');
 
         // Reset to top, wait for steady state.
         await api.pressDataViewerKey('big', 'Home');
@@ -306,10 +328,10 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             return r && r.end > 0 && r.end < N / 2 ? r : undefined;
         }, 60000);
         assert.ok(topRange,
-            `pre-drag Home reset did not land at the top within 60 s; `
+            `pre-scroll Home reset did not land at the top within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
 
-        // Drag the scrollbar thumb to the bottom.
+        // Drive the test scroll API to the bottom.
         await api.dragDataViewerScrollbar('big', 1.0);
 
         const bottomRange = await pollFor(() => {
@@ -317,15 +339,13 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             return r && r.end === N ? r : undefined;
         }, 60000);
         assert.ok(bottomRange,
-            `Drag-to-bottom did not reach the last row within 60 s; `
+            `Scroll-to-bottom did not reach the last row within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
     });
 
-    test('Drag scrollbar to bottom reaches last row in 10M-row data frame', async function () {
-        // This is the real large-table regression: webview scrollbar
-        // clamping can be lower than the model's nominal capped height,
-        // so the custom scrollbar must map the measured physical bottom
-        // to the logical last row.
+    test('Scroll to bottom reaches last row in 10M-row data frame', async function () {
+        // This is the real large-table regression: the webview grid must
+        // map the bottom of a very large dataset to the logical last row.
         this.timeout(360000);
         const N = 10_000_000;
         const panelName = `huge_scroll_${Date.now()}`;
@@ -335,6 +355,8 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         );
         const appeared = await pollForPanel(api, panelName, 180000);
         assert.ok(appeared, `panel "${panelName}" did not appear within 180 s`);
+        const ready = await waitForViewerReady(api, panelName, 60000);
+        assert.ok(ready, `panel "${panelName}" did not report an initial viewport`);
 
         await api.pressDataViewerKey(panelName, 'Home');
         const topRange = await pollFor(() => {
@@ -342,7 +364,7 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             return r && r.end > 0 && r.end < N / 2 ? r : undefined;
         }, 60000);
         assert.ok(topRange,
-            `pre-drag Home reset did not land at the top within 60 s; `
+            `pre-scroll Home reset did not land at the top within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange(panelName))}`);
 
         await api.dragDataViewerScrollbar(panelName, 1.0);
@@ -352,7 +374,7 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             return r && r.end === N ? r : undefined;
         }, 60000);
         assert.ok(bottomRange,
-            `10M-row drag-to-bottom did not reach the last row within 60 s; `
+            `10M-row scroll-to-bottom did not reach the last row within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange(panelName))}`);
 
         const viewportRange = await pollFor(() => {
@@ -360,12 +382,12 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             return r && r.end === N ? r : undefined;
         }, 60000);
         assert.ok(viewportRange,
-            `10M-row drag-to-bottom fetched the last row but did not render it on screen; `
+            `10M-row scroll-to-bottom fetched the last row but did not render it on screen; `
             + `last viewport range: ${JSON.stringify(api.getDataViewerPanelViewportRange(panelName))}; `
             + `last fetched range: ${JSON.stringify(api.getDataViewerPanelVisibleRange(panelName))}`);
     });
 
-    test('Drag scrollbar to 50% lands near row N/2 in 700K-row data frame', async function () {
+    test('Scroll to 50% lands near row N/2 in 700K-row data frame', async function () {
         // Sandbox self-skip — same reason as the other two 700K-row tests
         // above. Without the panel pre-warming the earlier tests provided
         // (now skipped under sandbox), this one's cold start on top of
@@ -385,6 +407,8 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             const appeared = await pollForPanel(api, 'big', 90000);
             assert.ok(appeared, 'panel "big" did not appear within 90 s');
         }
+        const ready = await waitForViewerReady(api, 'big', 60000);
+        assert.ok(ready, 'panel "big" did not report an initial viewport');
 
         await api.pressDataViewerKey('big', 'Home');
         const topRange = await pollFor(() => {
@@ -403,7 +427,7 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
             return r.start >= 0.40 * N && r.start <= 0.60 * N ? r : undefined;
         }, 60000);
         assert.ok(midRange,
-            `Drag-to-50% did not land near N/2 within 60 s; `
+            `Scroll-to-50% did not land near N/2 within 60 s; `
             + `last range: ${JSON.stringify(api.getDataViewerPanelVisibleRange('big'))}`);
     });
 });

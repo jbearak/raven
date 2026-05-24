@@ -24,8 +24,8 @@ if (requireNamespace("haven", quietly = TRUE)) {
 
   View(nhanes)
   # Expected:
-  #   hover a column header  → tooltip shows "<NAME>: <variable label>"
-  #                            (e.g. "RIAGENDR: Gender")
+  #   hover a column header  → tooltip shows the variable label
+  #                            (e.g. "Gender")
   #   Labels toggle ON       → no visible change (NHANES XPT has no value labels)
 } else {
   message("Skipping NHANES section: install 'haven' to run it.")
@@ -54,7 +54,7 @@ if (requireNamespace("haven", quietly = TRUE)) {
 
   View(labelled_demo)
   # Expected:
-  #   hover "sex" header     → tooltip shows "sex: Sex of the participant"
+  #   hover "sex" header     → tooltip shows "Sex of the participant"
   #   Labels toggle ON       → sex column shows "Male" / "Female" instead of 1 / 2
   #                            handedness shows "Right" / "Left" / "Ambidextrous"
   #   Labels toggle OFF      → numeric codes are visible again
@@ -104,9 +104,9 @@ if (requireNamespace("haven", quietly = TRUE)) {
 
     View(electric)
     # Expected:
-    #   hover any column header  → tooltip shows "<NAME>: <variable label>"
-    #                              (e.g. "FIRSTCHD: FIRST CHD EVENT",
-    #                               "VITAL10: STATUS AT TEN YEARS")
+    #   hover any column header  → tooltip shows the variable label
+    #                              (e.g. "FIRST CHD EVENT",
+    #                               "STATUS AT TEN YEARS")
     #   Labels toggle ON         → four columns swap codes for strings:
     #     FIRSTCHD   1 → "NO CHD", 2 → "SUDDEN  DEATH", 3 → "NONFATALMI",
     #                5 → "FATAL   MI",  6 → "OTHER   CHD"

@@ -1,4 +1,4 @@
-// Two-pass esbuild: extension bundle + webview bundles (Svelte).
+// Two-pass esbuild: extension bundle + webview bundles.
 const fs = require('fs');
 const path = require('path');
 const esbuild = require('esbuild');
@@ -67,6 +67,27 @@ async function buildSvelteWebview(name, entry) {
 }
 
 /**
+ * Build a React webview bundle.
+ *
+ * @param {string} name   - Output directory name under dist/webviews/ (e.g. 'data-viewer').
+ * @param {string} entry  - Absolute path to the webview entry point (main.tsx).
+ */
+async function buildReactWebview(name, entry) {
+    const webviewDist = path.join(dist, 'webviews', name);
+    await esbuild.build({
+        entryPoints: [entry],
+        bundle: true,
+        platform: 'browser',
+        target: 'chrome108',
+        format: 'iife',
+        loader: { '.css': 'css' },
+        sourcemap: true,
+        outfile: path.join(webviewDist, 'index.js'),
+        logLevel: 'info',
+    });
+}
+
+/**
  * Copy the bundled `onig.wasm` from `vscode-oniguruma` into `dist/` so
  * the Knit Output rendering pipeline can load it at runtime via
  * `extensionUri`. esbuild can't bundle .wasm into a CJS module, and
@@ -95,9 +116,9 @@ function copyOnigWasm() {
                 'help-viewer',
                 path.join(root, 'src', 'help', 'webview', 'main.ts'),
             ),
-            buildSvelteWebview(
+            buildReactWebview(
                 'data-viewer',
-                path.join(root, 'src', 'data-viewer', 'webview', 'main.ts'),
+                path.join(root, 'src', 'data-viewer', 'webview', 'main.tsx'),
             ),
         ]);
         copyOnigWasm();

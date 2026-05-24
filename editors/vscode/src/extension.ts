@@ -184,9 +184,9 @@ export interface RavenExtensionApi {
      *  Awaiting waits for the message to be queued; poll
      *  getDataViewerPanelVisibleRange to observe the result. */
     pressDataViewerKey(panelName: string, key: string): Promise<void>;
-    /** Test-only: drive a custom-scrollbar drag in a data viewer panel.
+    /** Test-only: scroll a data viewer panel to a fractional vertical position.
      *  fraction=0 jumps to top, fraction=1 jumps to bottom. Used by
-     *  integration tests to exercise the drag math + scroll pipeline.
+     *  integration tests to exercise the grid scroll pipeline.
      *  Awaiting waits for the message to be queued; poll
      *  getDataViewerPanelVisibleRange to observe the result. */
     dragDataViewerScrollbar(panelName: string, fraction: number): Promise<void>;
