@@ -362,13 +362,16 @@ async function runKnitCommand(
     const previewPaths = previewArtifactPaths(fsPath);
     const mdOutputPath = previewPaths.mdPath;
 
-    // Pin the preview dir BEFORE any await. `mkdir`, the busy
-    // information toast, and `openTextDocument` (earlier) all yield
-    // the event loop; without an early pin a panel-disposal
-    // `requestPreviewDirDeletion` fired during any of those awaits
-    // would see refcount = 0 and schedule the unrecoverable
-    // `fs.rm -rf` against the dir we're about to write into. The pin
-    // must guard the entire knit + post-knit render pipeline.
+    // Pin the preview dir as soon as it's known and before any await
+    // that touches it. `mkdir`, the busy information toast, and the
+    // knit subprocess itself all yield the event loop; without this
+    // early pin a panel-disposal `requestPreviewDirDeletion` fired
+    // during any of those awaits would see refcount = 0 and schedule
+    // the unrecoverable `fs.rm -rf` against the dir we're about to
+    // write into. (Earlier awaits in this function — `openTextDocument`,
+    // `save`, the YAML-parsing path — operate on the source `.Rmd`,
+    // not the preview dir, so they're outside the race surface.) The
+    // pin must guard the entire knit + post-knit render pipeline.
     //
     // Re-entry path: when `registry === null` the export pipeline
     // owns the pin via `runExport`, so we skip — double-pinning would
