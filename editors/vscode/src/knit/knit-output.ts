@@ -316,6 +316,22 @@ export function buildShellHtml(args: {
      * `onDidChangeConfiguration` event.
      */
     vscodeFontFamiliesCss?: string | null;
+    /**
+     * True when the workspace is remote (Remote SSH, Dev Containers,
+     * WSL, Codespaces, etc. — `vscode.env.remoteName` is set). In a
+     * remote workspace the **Open in Browser** action routes the
+     * `file://` URI through the extension-host machine, so it cannot
+     * reach the user's local browser. The toolbar button and the
+     * matching right-click menu item are omitted from the rendered
+     * shell entirely (via the `hidden` HTML attribute, which is
+     * `display: none` per UA stylesheet and is also exposed as
+     * `aria-hidden` to assistive tech). The DOM nodes still exist
+     * so the bound JS handlers can attach without null checks; they
+     * just never fire because hidden elements don't receive events.
+     * Defaults to `false` so callers that don't supply it get the
+     * local-workspace rendering.
+     */
+    isRemoteWorkspace?: boolean;
 }): string {
     const {
         htmlContent,
@@ -326,6 +342,7 @@ export function buildShellHtml(args: {
         initialThemeApplied,
         vscodeThemePaletteCss,
         vscodeFontFamiliesCss,
+        isRemoteWorkspace = false,
     } = args;
     // path.basename handles both POSIX and Windows separators.
     const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
@@ -459,6 +476,7 @@ export function buildShellHtml(args: {
     background: transparent; color: inherit; border: 0;
     font: inherit; cursor: pointer;
   }
+  #raven-knit-context-menu button[hidden] { display: none; }
   /*
    * :focus-visible (not plain :focus) -- when the menu opens we
    * programmatically focus the first enabled item for accessibility,
@@ -484,7 +502,7 @@ export function buildShellHtml(args: {
 <body>
   <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit output">
     <button id="raven-knit-refresh" type="button" title="Re-knit the source document">Knit again</button>
-    <button id="raven-knit-open-browser" type="button" title="Open the rendered file in your default browser">Open in Browser</button>
+    <button id="raven-knit-open-browser" type="button"${isRemoteWorkspace ? ' hidden' : ''} title="Open the rendered file in your default browser">Open in Browser</button>
     <button id="raven-knit-export" type="button" title="Export as HTML, PDF, or Word">Export ▾</button>
     <button id="raven-knit-theme" type="button"
             aria-pressed="${initialThemeApplied ? 'true' : 'false'}"
@@ -498,7 +516,7 @@ export function buildShellHtml(args: {
     <button type="button" role="menuitem" data-action="copy">Copy</button>
     <button type="button" role="menuitem" data-action="copy-image">Copy image</button>
     <button type="button" role="menuitem" data-action="select-all">Select All</button>
-    <button type="button" role="menuitem" data-action="open-in-browser">Open in Browser</button>
+    <button type="button" role="menuitem" data-action="open-in-browser"${isRemoteWorkspace ? ' hidden' : ''}>Open in Browser</button>
   </div>
   <script nonce="${nonce}">
     (function () {

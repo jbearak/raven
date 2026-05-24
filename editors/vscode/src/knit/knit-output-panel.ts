@@ -652,6 +652,18 @@ export class KnitOutputPanel {
             // trip lands. Falls back to null if resolution throws so
             // a panic here doesn't break the rest of the shell.
             vscodeFontFamiliesCss: this.resolveCurrentFontsCss(),
+            // In a remote workspace, the toolbar's "Open in Browser"
+            // action hands a `file://` URI to the extension-host
+            // machine, which is the remote — not where the user is
+            // sitting — so it cannot reach the local browser. The
+            // shell omits the toolbar button and the right-click
+            // menu item entirely; users reach the file via Export ▾,
+            // which routes through the toast's remote-aware Download
+            // flow. Same predicate the export toast in
+            // `open-exported-file.ts` uses.
+            isRemoteWorkspace:
+                typeof vscode.env.remoteName === 'string'
+                && vscode.env.remoteName.length > 0,
         });
         this.panel.title = `Knit Output: ${path.basename(args.outputPath)}`;
         // Fire-and-forget: re-render the shell first, then resolve

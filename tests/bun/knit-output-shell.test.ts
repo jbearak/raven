@@ -82,6 +82,67 @@ describe('buildShellHtml', () => {
         expect(html).toContain('id="raven-knit-theme"');
     });
 
+    test('open-in-browser renders visible in a local workspace', () => {
+        // `isRemoteWorkspace` defaults to false; both the toolbar
+        // button and the context-menu item must render WITHOUT the
+        // `hidden` attribute so the user gets the OS browser path.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-open-browser"(?![^>]*\bhidden\b)[^>]*>Open in Browser<\/button>/,
+        );
+        expect(html).toMatch(
+            /<button[^>]*data-action="open-in-browser"(?![^>]*\bhidden\b)[^>]*>Open in Browser<\/button>/,
+        );
+        expect(html).toContain('title="Open the rendered file in your default browser"');
+    });
+
+    test('open-in-browser is hidden when isRemoteWorkspace=true', () => {
+        // In a remote workspace, file:// targets the extension-host
+        // machine rather than where the user is sitting, so the
+        // browser action cannot reach the user's local apps. The
+        // toolbar button AND the right-click menu item must both
+        // render with the `hidden` HTML attribute (which the user
+        // agent stylesheet maps to display:none + aria-hidden, and
+        // which also blocks click event dispatch). The DOM nodes
+        // still exist so the script's `getElementById(...)`
+        // .addEventListener wiring keeps working without a null
+        // guard.
+        const html = buildShellHtml({
+            ...args('/work/report.html'),
+            isRemoteWorkspace: true,
+        });
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-open-browser"[^>]*\bhidden\b[^>]*>Open in Browser<\/button>/,
+        );
+        expect(html).toMatch(
+            /<button[^>]*data-action="open-in-browser"[^>]*\bhidden\b[^>]*>Open in Browser<\/button>/,
+        );
+        expect(html).toContain('#raven-knit-context-menu button[hidden] { display: none; }');
+        // The hidden state must NOT carry the local-workspace
+        // tooltip past the boundary into screen reader output — the
+        // `hidden` attribute already implies `aria-hidden`, but
+        // belt-and-braces: assert no `disabled` attribute (which
+        // would still expose the button to AT with a tooltip).
+        expect(html).not.toMatch(
+            /<button[^>]*id="raven-knit-open-browser"[^>]*\bdisabled\b/,
+        );
+    });
+
+    test('only open-in-browser is hidden by isRemoteWorkspace', () => {
+        // Defensive scope check: the remote flag must not leak onto
+        // the other toolbar entries or the other context-menu items.
+        const html = buildShellHtml({
+            ...args('/work/report.html'),
+            isRemoteWorkspace: true,
+        });
+        expect(html).not.toMatch(/<button[^>]*id="raven-knit-refresh"[^>]*\bhidden\b/);
+        expect(html).not.toMatch(/<button[^>]*id="raven-knit-export"[^>]*\bhidden\b/);
+        expect(html).not.toMatch(/<button[^>]*id="raven-knit-theme"[^>]*\bhidden\b/);
+        expect(html).not.toMatch(/<button[^>]*data-action="copy"[^>]*\bhidden\b/);
+        expect(html).not.toMatch(/<button[^>]*data-action="select-all"[^>]*\bhidden\b/);
+        expect(html).not.toMatch(/<button[^>]*data-action="copy-image"[^>]*\bhidden\b/);
+    });
+
     test('re-knit button is labelled "Knit again"', () => {
         // "Refresh" was the original label; the document-rendering
         // analogy doesn't fit because the button re-runs knit (re-

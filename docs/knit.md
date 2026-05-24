@@ -138,10 +138,13 @@ explorer-context-menu hook is opt-in via your own keybindings).
     - **Knit again** — re-knits the source `.Rmd` (the same code path
       as invoking `Raven: Knit Preview` from the palette).
     - **Open in Browser** — opens the rendered file in your OS default
-      browser. In remote workspaces (SSH, Codespaces, dev containers)
-      this may not work because `file://` URIs target the remote
-      machine; Raven warns and writes the path to the `Raven: Knit`
-      output channel as a fallback.
+      browser. In remote workspaces (Remote SSH, Dev Containers, WSL,
+      Codespaces) the `file://` URI behind this action targets the
+      remote machine, not where you are sitting, so the button (and
+      the matching right-click "Open in Browser" menu item) is
+      omitted from the toolbar. Use **Export ▾** instead — its toast
+      routes through the remote-aware Download flow that streams the
+      file to your local machine.
     - **Apply VS Code theme** — toggle that overlays the rendered
       document with VS Code's active editor background, foreground,
       and link colors. Code blocks (both fenced and inline `<code>`)
