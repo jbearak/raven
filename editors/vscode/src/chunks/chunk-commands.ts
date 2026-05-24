@@ -369,7 +369,7 @@ export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = O
     },
     'raven.runPreviousChunkAndMove': {
         positional_id: 'raven.runPreviousChunkAndMoveAt',
-        title: '← Run Previous & Move',
+        title: '↖ Run Previous Chunk',
         tooltip: 'Run the R chunk immediately above this one, then move the cursor into it',
         eval_aware: false,
         gate: 'requires_previous_runnable',
@@ -383,7 +383,7 @@ export const CHUNK_LENS_COMMANDS: Readonly<Record<string, ChunkLensCommand>> = O
     },
     'raven.runNextChunkAndMove': {
         positional_id: 'raven.runNextChunkAndMoveAt',
-        title: '→ Run Next & Move',
+        title: '↘ Run Next Chunk',
         tooltip: 'Run the R chunk immediately below this one, then move the cursor into it',
         eval_aware: false,
         gate: 'requires_next_runnable',
