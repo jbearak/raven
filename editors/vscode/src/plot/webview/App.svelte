@@ -1,6 +1,6 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
-    import { initial_state, reduce } from './state';
+    import { onMount, onDestroy, untrack } from 'svelte';
+    import { compute_snapshot_key, initial_state, pick_image_src, reduce } from './state';
     import type { ViewerState } from './state';
     import {
         create_httpgd_client,
@@ -24,6 +24,12 @@
     let dimensions = $state({ width: 800, height: 600 });
     let copy_status = $state<'' | 'copying' | 'copied'>('');
     let copy_status_timer: ReturnType<typeof setTimeout> | null = null;
+    // Snapshot of the current plot as a Blob URL. Populated by an effect that
+    // fetches the live httpgd SVG while the R session is alive; reused after
+    // SESSION_ENDED so the "Showing last plot" banner can actually display a
+    // plot — httpgd dies with R, so the live URL would 404 post-quit.
+    let last_plot_blob_url = $state<string | null>(null);
+    let last_plot_blob_fetcher: AbortController | null = null;
 
     function dispatch(action: import('./state').ViewerAction) {
         state = reduce(state, action);
@@ -91,6 +97,8 @@
 
     onDestroy(() => {
         client?.close();
+        last_plot_blob_fetcher?.abort();
+        revoke_last_plot_blob_url();
         window.removeEventListener('message', on_message);
         window.removeEventListener('resize', on_resize);
     });
@@ -180,22 +188,70 @@
         void copy_current();
     }
 
-    let current_url = $derived.by(() => {
-        if (state.phase !== 'viewing' && state.phase !== 'disconnected') return '';
-        if (!state.activeSession || state.plotIds.length === 0) return '';
-        const id = state.plotIds[state.currentIndex];
-        return plot_url(
-            state.activeSession.httpgdBaseUrl,
-            state.activeSession.httpgdToken,
-            id,
-            {
-                format: 'svg',
-                width: dimensions.width,
-                height: dimensions.height,
-                bg: state.themeBg,
-                upid: state.activeSession.upid,
-            },
-        );
+    // While the R session is alive, `<img src>` uses the live httpgd URL so
+    // resize and theme switches trigger an httpgd re-render (text layout
+    // and background color are baked into the SVG at httpgd's render time,
+    // not produced by CSS). After SESSION_ENDED, `pick_image_src` switches
+    // to `last_plot_blob_url` — see [[plot-post-quit-cache]] in App.svelte.
+    let current_url = $derived(pick_image_src(state, dimensions, last_plot_blob_url));
+
+    // Snapshot key — what the post-quit fallback fetch depends on. See
+    // the docstring on `compute_snapshot_key` in state.ts for why this
+    // deliberately excludes dimensions and themeBg.
+    let snapshot_key = $derived(compute_snapshot_key(state));
+
+    function revoke_last_plot_blob_url(): void {
+        if (last_plot_blob_url) {
+            URL.revokeObjectURL(last_plot_blob_url);
+            last_plot_blob_url = null;
+        }
+    }
+
+    // Capture each plot as a Blob URL while httpgd is alive so the
+    // post-quit "Showing last plot" banner has bytes to display — httpgd
+    // dies with R and the live URL would 404 the moment we needed it.
+    //
+    // Two invariants for the fast-quit race:
+    //   1. The effect aborts the PREVIOUS in-flight fetch only when a new
+    //      snapshot_key replaces it (top-of-effect `abort()`).
+    //   2. The effect does NOT return a cleanup function that aborts on
+    //      teardown. That matters because SESSION_ENDED flips
+    //      `snapshot_key` to null, which would otherwise re-run the effect
+    //      and tear down the in-flight fetch — exactly the snapshot we
+    //      need to display. We let in-flight fetches finish on their own;
+    //      `onDestroy` aborts only on full panel disposal.
+    $effect(() => {
+        const key = snapshot_key;
+        if (!key) return;
+        last_plot_blob_fetcher?.abort();
+        const controller = new AbortController();
+        last_plot_blob_fetcher = controller;
+        // Fixed canonical render size — the cached snapshot is scaled by
+        // CSS post-quit, so matching the viewport isn't required.
+        const url = plot_url(key.baseUrl, key.token, key.plotId, {
+            format: 'svg',
+            width: 800,
+            height: 600,
+            bg: untrack(() => state.themeBg),
+            upid: key.upid,
+        });
+        void fetch(url, { signal: controller.signal })
+            .then(r => (r.ok ? r.blob() : null))
+            .then(blob => {
+                if (!blob || controller.signal.aborted) return;
+                const next = URL.createObjectURL(blob);
+                // Swap-and-revoke: assign the new URL first so any in-flight
+                // render keeps a valid src across the swap, then drop the old.
+                const previous = last_plot_blob_url;
+                last_plot_blob_url = next;
+                if (previous) URL.revokeObjectURL(previous);
+            })
+            .catch(() => {
+                // Aborted or transport error. The live <img> surfaces its
+                // own load failure during the alive session, and post-quit
+                // we fall back to `pick_image_src` returning '' (the {#if
+                // current_url} guard then hides the broken icon).
+            });
     });
 </script>
 
