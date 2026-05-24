@@ -42,7 +42,7 @@ import { parseOutputOptions, type TargetFormat } from './output-options';
 import { buildPandocArgs } from './pandoc-args';
 import { pandocConvert } from './pandoc-engine';
 import { PandocResolver, PandocNotFoundError } from './pandoc-detect';
-import { OperationRegistry, type OpKind, type OperationController } from './operation-controller';
+import { OperationRegistry, type OpKind, type OperationController, type OpPhase } from './operation-controller';
 import { canonicalOpKey, previewArtifactPaths } from './raven-knit-paths';
 import { openExportedFile, type ExportFormat } from './open-exported-file';
 
@@ -63,6 +63,13 @@ export interface ExportDeps {
      * override.
      */
     runKnit: (uri: vscode.Uri, exportController: OperationController) => Promise<{ ok: boolean }>;
+    /**
+     * Push the webview Export button's busy state. Production wires this
+     * to `KnitOutputPanel.notifyExportBusy`; tests can omit (or stub) it.
+     * The export pipeline drives the value off the operation phase:
+     * `true` while the op is in flight, `false` on `done` / `cancelled`.
+     */
+    notifyExportBusy?: (rmdAbsPath: string, busy: boolean) => void;
 }
 
 const EXPORT_OP_KIND: Record<TargetFormat, OpKind> = {
@@ -114,7 +121,13 @@ export function registerExportCommands(context: vscode.ExtensionContext, deps: E
             const target = uri ?? vscode.window.activeTextEditor?.document.uri;
             if (!target) return;
             const op = deps.registry.current(canonicalOpKey(target));
-            if (op && op.kind.startsWith('export-')) op.cancel();
+            // Cancel any export-flavored op for this source: the three
+            // plain `export-*` kinds plus the planned `knit-then-export`
+            // (an editor-toolbar export that re-knits first as a single
+            // cancellable op). Excludes `knit-preview` because the
+            // Knit Output panel has its own progress-notification
+            // cancel path for that.
+            if (op && op.kind !== 'knit-preview') op.cancel();
         }),
     );
 }
@@ -136,10 +149,25 @@ export async function runExport(
 ): Promise<void> {
     const key = canonicalOpKey(rmd);
     const opKind = EXPORT_OP_KIND[format];
-    const begin = deps.registry.beginOp(key, opKind);
+    const notifyBusy = deps.notifyExportBusy;
+    const begin = deps.registry.beginOp(key, opKind, {
+        broadcast: (phase: OpPhase) => {
+            // Drive the webview Export button between its idle "open
+            // quickpick" state and its busy "cancel in-flight export"
+            // state. Terminal phases (done / cancelled) clear busy so
+            // the next click opens the quickpick again. The notifier is
+            // a no-op when no panel is open for this source.
+            if (!notifyBusy) return;
+            const busy = phase !== 'done' && phase !== 'cancelled';
+            notifyBusy(rmd.fsPath, busy);
+        },
+    });
     if (begin.kind === 'busy') {
-        await offerCancelAndRetryToast(begin.existing, rmd, () =>
-            runExport(rmd, format, deps, opts),
+        await offerCancelAndRetryToast(
+            begin.existing,
+            rmd,
+            () => runExport(rmd, format, deps, opts),
+            deps.registry,
         );
         return;
     }
@@ -414,6 +442,7 @@ async function offerCancelAndRetryToast(
     existing: OperationController,
     uri: vscode.Uri,
     retry: () => Promise<void>,
+    registry?: OperationRegistry,
 ): Promise<void> {
     const CANCEL = 'Cancel and retry';
     const WAIT = 'Wait';
@@ -431,6 +460,22 @@ async function offerCancelAndRetryToast(
     while (Date.now() < deadline) {
         if (existing.phase === 'cancelled' || existing.phase === 'done') break;
         await new Promise((r) => setTimeout(r, 100));
+    }
+    // Recursion guard: if the prior controller is STILL the active op
+    // in the registry after the deadline (slow subprocess shutdown,
+    // hung file handle, AV scan), retrying would re-enter beginOp →
+    // busy → this same function in an unbounded loop. Surface a
+    // terminal toast instead and let the user decide.
+    if (registry !== undefined && registry.current(existing.key) === existing) {
+        const SHOW = 'Show details';
+        const choice2 = await vscode.window.showWarningMessage(
+            `Could not cancel the in-flight ${kind}. Wait for it to finish or restart the window.`,
+            SHOW,
+        );
+        if (choice2 === SHOW) {
+            void vscode.commands.executeCommand('raven.knit.openOutputChannel');
+        }
+        return;
     }
     await retry();
 }

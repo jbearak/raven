@@ -12,6 +12,7 @@
 
 import * as path from 'path';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as os from 'os';
 
 interface UriLike {
@@ -42,14 +43,41 @@ export function computeSourceHash(absPath: string): string {
 }
 
 /**
- * True when `absPath` resolves to a path inside `root` (or equal to it)
- * after normalization. Used to gate YAML-supplied CSS paths against
- * traversal-escape attacks.
+ * True when `absPath` resolves to a path inside `root` (or equal to it).
+ * Used to gate YAML-supplied CSS paths against traversal-escape attacks.
+ *
+ * Resolves symlinks on both sides via `fs.realpathSync.native` before
+ * the containment comparison so a symlink at `workspace/css/x.css`
+ * pointing to `/etc/passwd` is rejected — a syntactic check on the
+ * lexical path would have passed. If either side cannot be realpath'd
+ * (file does not exist, EACCES on a parent directory), we fall back to
+ * the lexical comparison; the only realistic case is `absPath` pointing
+ * at a not-yet-created CSS file, which Pandoc will reject downstream.
  */
 export function isUnderContainmentRoot(absPath: string, root: string): boolean {
-    const normalizedAbs = path.normalize(absPath);
-    const normalizedRoot = path.normalize(root);
-    const rel = path.relative(normalizedRoot, normalizedAbs);
+    let resolvedAbs = path.normalize(absPath);
+    let resolvedRoot = path.normalize(root);
+    try {
+        resolvedAbs = fs.realpathSync.native(resolvedAbs);
+    } catch {
+        // Leaf may not exist yet; keep the lexical form. The dirname
+        // check below catches symlink escape via an intermediate dir
+        // even when the leaf is missing.
+        try {
+            const parent = path.dirname(resolvedAbs);
+            const base = path.basename(resolvedAbs);
+            resolvedAbs = path.join(fs.realpathSync.native(parent), base);
+        } catch {
+            // Parent unreachable too — fall through to lexical check.
+        }
+    }
+    try {
+        resolvedRoot = fs.realpathSync.native(resolvedRoot);
+    } catch {
+        // Root must exist for containment to be meaningful, but if it
+        // doesn't the lexical compare is the conservative fallback.
+    }
+    const rel = path.relative(resolvedRoot, resolvedAbs);
     if (rel === '') return true;
     return !rel.startsWith('..') && !path.isAbsolute(rel);
 }

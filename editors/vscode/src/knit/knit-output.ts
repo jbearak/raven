@@ -105,6 +105,23 @@ export interface FontFamiliesUpdate {
 }
 
 /**
+ * Marker key for the host→webview export-busy channel. When the host
+ * starts an export op for this panel's source, it posts `{ busy: true }`;
+ * when the op ends (done / cancelled / failed) it posts `{ busy: false }`.
+ * The webview script toggles `exportBtn.dataset.busy` so the next click
+ * dispatches `cancelExport` instead of `requestExport`. The payload is a
+ * single boolean — any other shape is rejected at the trust boundary.
+ */
+export const EXPORT_BUSY_UPDATE_KEY = '__ravenExportBusy';
+
+export interface ExportBusyUpdate {
+    /** Marker — must equal `true`. */
+    __ravenExportBusy: true;
+    /** True while an export op is in flight for this panel's source. */
+    busy: boolean;
+}
+
+/**
  * Build the CSS variable declarations for the live-font override. Same
  * shape `render-html.ts:fontsAsCssVars` emits when baking the rendered
  * document, joined with a single space so the whole payload fits on one
@@ -502,6 +519,15 @@ export function buildShellHtml(args: {
       // natively so the format choice never crosses the trust boundary);
       // busy state cancels the in-flight export.
       const exportBtn = document.getElementById('raven-knit-export');
+      const exportLabelIdle = 'Export ▾';
+      const exportLabelBusy = 'Cancel export';
+      const exportTitleIdle = exportBtn.getAttribute('title') || '';
+      const exportTitleBusy = 'Cancel the in-flight export';
+      function syncExportBtn() {
+        var busy = exportBtn.dataset.busy === 'true';
+        exportBtn.textContent = busy ? exportLabelBusy : exportLabelIdle;
+        exportBtn.setAttribute('title', busy ? exportTitleBusy : exportTitleIdle);
+      }
       exportBtn.addEventListener('click', function () {
         if (exportBtn.dataset.busy === 'true') {
           vscode.postMessage({ type: 'cancelExport' });
@@ -1198,6 +1224,18 @@ export function buildShellHtml(args: {
             vscodeFontCss = null;
           }
           applyFonts();
+          return;
+        }
+        if (data.__ravenExportBusy === true) {
+          // Host->webview only. The data.busy field is the single
+          // source of truth -- coerce to a strict boolean check so a
+          // smuggled non-boolean cannot enable the cancel dispatch.
+          if (data.busy === true) {
+            exportBtn.dataset.busy = 'true';
+          } else {
+            delete exportBtn.dataset.busy;
+          }
+          syncExportBtn();
           return;
         }
         if (data.__ravenRequestThemeContext === true) {

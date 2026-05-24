@@ -27,6 +27,7 @@ import * as path from 'path';
 import type { OutputChannel } from 'vscode';
 import type { OperationController } from './operation-controller';
 import { chooseTempPath, interpretExitResult } from './pandoc-engine-helpers';
+import { sendSignal } from './process-signals';
 
 export interface PandocConvertOpts {
     pandocPath: string;
@@ -85,7 +86,22 @@ export async function pandocConvert(opts: PandocConvertOpts): Promise<PandocConv
     const enforcedCwd = path.dirname(opts.mdPath);
 
     return new Promise<PandocConvertResult>((resolve) => {
-        const child = child_process.spawn(opts.pandocPath, args, { cwd: enforcedCwd });
+        const child = child_process.spawn(opts.pandocPath, args, {
+            cwd: enforcedCwd,
+            // Close stdin so Pandoc filters that read from it see immediate
+            // EOF instead of hanging; pipe stdout/stderr so the OS pipe
+            // buffer can drain. stderr is consumed by the listener below;
+            // stdout is drained via resume() since Pandoc's `-o` means it
+            // should not write to stdout but a misbehaving filter could.
+            stdio: ['ignore', 'pipe', 'pipe'],
+            // POSIX: lead a new process group so sendSignal's
+            // `process.kill(-pid, …)` reaches xelatex / lualatex / bibtex
+            // helpers Pandoc spawns. Windows: `detached: true` opens a new
+            // console window, so keep the default and rely on `taskkill
+            // /T` for the tree kill.
+            detached: process.platform !== 'win32',
+        });
+        child.stdout?.resume();
         let stderr = '';
         let cancelled = false;
         let termTimer: NodeJS.Timeout | null = null;
@@ -99,23 +115,11 @@ export async function pandocConvert(opts: PandocConvertOpts): Promise<PandocConv
         };
 
         const escalate = () => {
-            try {
-                child.kill('SIGINT');
-            } catch {
-                /* ignore */
-            }
+            sendSignal(child, 'SIGINT');
             termTimer = setTimeout(() => {
-                try {
-                    child.kill('SIGTERM');
-                } catch {
-                    /* ignore */
-                }
+                sendSignal(child, 'SIGTERM');
                 killTimer = setTimeout(() => {
-                    try {
-                        child.kill('SIGKILL');
-                    } catch {
-                        /* ignore */
-                    }
+                    sendSignal(child, 'SIGKILL');
                 }, 1500);
             }, 1500);
         };
@@ -156,19 +160,46 @@ export async function pandocConvert(opts: PandocConvertOpts): Promise<PandocConv
             const exit = interpretExitResult({ code, signal, cancelled });
 
             if (exit.status === 'success') {
+                let renameErr: NodeJS.ErrnoException | null = null;
                 try {
                     await fs.promises.rename(tmpOut, opts.destPath);
-                } catch {
-                    // Cross-device fallback: copy then unlink.
+                } catch (err) {
+                    renameErr = err as NodeJS.ErrnoException;
+                }
+                if (renameErr !== null) {
+                    if (renameErr.code !== 'EXDEV') {
+                        // Non-cross-device rename failure (EACCES, EBUSY,
+                        // EPERM, ENOENT, …). Don't try copyFile — it would
+                        // fail for the same reason and obscure the real
+                        // error. Report failure, surface the original
+                        // code, and best-effort unlink the temp file.
+                        opts.output.appendLine(
+                            `[pandoc] Failed to finalize ${opts.destPath} (${renameErr.code ?? 'unknown'}): ${renameErr.message}`,
+                        );
+                        await fs.promises.unlink(tmpOut).catch(() => { /* swallow */ });
+                        resolve({ status: 'failure', stderr });
+                        return;
+                    }
+                    // Cross-device fallback: copy then unlink. A
+                    // successful copyFile means the destination is
+                    // correct on disk; a subsequent unlink failure is a
+                    // cleanup nuisance, not an export failure.
                     try {
                         await fs.promises.copyFile(tmpOut, opts.destPath);
-                        await fs.promises.unlink(tmpOut);
                     } catch (err2) {
                         opts.output.appendLine(
                             `[pandoc] Failed to finalize ${opts.destPath}: ${(err2 as Error).message}`,
                         );
+                        await fs.promises.unlink(tmpOut).catch(() => { /* swallow */ });
                         resolve({ status: 'failure', stderr });
                         return;
+                    }
+                    try {
+                        await fs.promises.unlink(tmpOut);
+                    } catch (err3) {
+                        opts.output.appendLine(
+                            `[pandoc] temp cleanup failed (${opts.destPath} was written successfully): ${(err3 as Error).message}`,
+                        );
                     }
                 }
                 resolve({ status: 'success', stderr });

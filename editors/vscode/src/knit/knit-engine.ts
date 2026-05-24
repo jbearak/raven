@@ -22,6 +22,7 @@
 
 import { ChildProcess, spawn } from 'child_process';
 import * as vscode from 'vscode';
+import { sendSignal } from './process-signals';
 
 export interface KnitEngineOptions {
     rBinary: string;
@@ -150,44 +151,3 @@ export async function runKnit(opts: KnitEngineOptions): Promise<KnitEngineResult
     return { exitCode, stdout, stderr, cancelled, timedOut, spawnError };
 }
 
-function sendSignal(child: ChildProcess, signal: 'SIGINT' | 'SIGTERM' | 'SIGKILL'): void {
-    try {
-        if (process.platform === 'win32') {
-            // SIGINT is meaningless on Windows; both SIGTERM and SIGKILL
-            // walk the tree via taskkill so detached helpers are reaped.
-            if (signal === 'SIGINT') {
-                // First-step "give R a chance" maps to plain taskkill (no /F),
-                // but we still pass /T so a hung helper doesn't outlive R.
-                runTaskkill(child, false);
-                return;
-            }
-            runTaskkill(child, true);
-            return;
-        }
-        // POSIX: signal the process group so helpers (pandoc / xelatex)
-        // are reaped along with R. `detached: true` at spawn time put R
-        // into its own group.
-        if (child.pid !== undefined) {
-            try {
-                process.kill(-child.pid, signal);
-                return;
-            } catch (err) {
-                // Falls through to direct kill if the group is gone (e.g.
-                // child already exited). EPERM / ESRCH are common.
-                void err;
-            }
-        }
-        child.kill(signal);
-    } catch {
-        // Best effort; the close listener still resolves once the OS reaps the child.
-    }
-}
-
-function runTaskkill(child: ChildProcess, force: boolean): void {
-    if (child.pid === undefined) return;
-    const args = force
-        ? ['/PID', String(child.pid), '/T', '/F']
-        : ['/PID', String(child.pid), '/T'];
-    const tk = spawn('taskkill', args, { stdio: 'ignore' });
-    tk.on('error', () => { /* swallow */ });
-}

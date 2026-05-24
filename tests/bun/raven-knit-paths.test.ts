@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'bun:test';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
     canonicalOpKey,
     computeWorkspaceHash,
@@ -58,6 +61,53 @@ describe('isUnderContainmentRoot', () => {
     });
     it('rejects ../ traversal escapes after normalization', () => {
         expect(isUnderContainmentRoot('/p/../q/x.css', '/p')).toBe(false);
+    });
+});
+
+describe('isUnderContainmentRoot — symlink resolution', () => {
+    // These tests exercise the realpath layer added to defend against
+    // symlink-escape attacks via committed CSS symlinks. The fixture
+    // builds a real workspace dir with a symlink that targets outside.
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-symlink-'));
+    const workspace = path.join(tmpRoot, 'workspace');
+    const outside = path.join(tmpRoot, 'outside');
+    const insideTarget = path.join(workspace, 'css', 'real.css');
+    const symlinkOut = path.join(workspace, 'css', 'evil.css');
+    const symlinkIn = path.join(workspace, 'css', 'good.css');
+
+    try {
+        fs.mkdirSync(path.join(workspace, 'css'), { recursive: true });
+        fs.mkdirSync(outside, { recursive: true });
+        fs.writeFileSync(insideTarget, '/* real */');
+        fs.writeFileSync(path.join(outside, 'secrets.txt'), 'secret');
+        try { fs.symlinkSync(path.join(outside, 'secrets.txt'), symlinkOut); } catch { /* may fail on Windows w/o privilege */ }
+        try { fs.symlinkSync(insideTarget, symlinkIn); } catch { /* may fail on Windows w/o privilege */ }
+    } catch {
+        // tearDown handled per-test; harness still runs other suites
+    }
+
+    const symlinksWorked = (() => {
+        try { return fs.lstatSync(symlinkOut).isSymbolicLink(); }
+        catch { return false; }
+    })();
+
+    it('rejects a symlink whose target escapes the root', () => {
+        if (!symlinksWorked) return; // skipped on Windows without dev mode
+        expect(isUnderContainmentRoot(symlinkOut, workspace)).toBe(false);
+    });
+
+    it('accepts a symlink whose target stays inside the root', () => {
+        if (!symlinksWorked) return;
+        expect(isUnderContainmentRoot(symlinkIn, workspace)).toBe(true);
+    });
+
+    it('accepts a real file inside the root', () => {
+        expect(isUnderContainmentRoot(insideTarget, workspace)).toBe(true);
+    });
+
+    it('falls back to lexical check when the leaf does not exist', () => {
+        const missing = path.join(workspace, 'css', 'never-created.css');
+        expect(isUnderContainmentRoot(missing, workspace)).toBe(true);
     });
 });
 

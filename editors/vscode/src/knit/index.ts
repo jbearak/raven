@@ -176,6 +176,9 @@ export function registerKnit(
                 exportController,
             );
         },
+        notifyExportBusy: (rmdAbsPath, busy) => {
+            KnitOutputPanel.notifyExportBusy(rmdAbsPath, busy);
+        },
     });
 }
 
@@ -204,7 +207,14 @@ const PANDOC_PROBE_TIMEOUT_MS = 10_000;
 
 function probePandocBinary(bin: string, timeoutMs: number = PANDOC_PROBE_TIMEOUT_MS): Promise<string> {
     return new Promise<string>((resolve, reject) => {
-        const child = child_process.spawn(bin, ['--version']);
+        // Close stdin and pipe both stdout/stderr — if a Pandoc build
+        // writes startup warnings to stderr (locale, missing optional
+        // libs) and the buffer fills, the child blocks on write(2). The
+        // probe's hard timeout would then misreport Pandoc as not
+        // installed. Drain both streams to keep the pipes flowing.
+        const child = child_process.spawn(bin, ['--version'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
         let out = '';
         let settled = false;
         const timer = setTimeout(() => {
@@ -214,6 +224,8 @@ function probePandocBinary(bin: string, timeoutMs: number = PANDOC_PROBE_TIMEOUT
             reject(new Error(`pandoc probe timed out after ${timeoutMs}ms`));
         }, timeoutMs);
         child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+        // Drain stderr so the OS pipe buffer cannot fill.
+        child.stderr?.on('data', () => { /* swallow */ });
         child.on('error', (err) => {
             if (settled) return;
             settled = true;

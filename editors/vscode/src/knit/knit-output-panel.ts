@@ -87,6 +87,32 @@ export class KnitOutputPanel {
         KnitOutputPanel.unpinPreviewHandler = unpin;
     }
 
+    /**
+     * Notify the panel for `rmdAbsPath` that an export op for that source
+     * has started (`busy = true`) or ended (`busy = false`). Toggles the
+     * webview Export button between its "open quickpick" idle state and
+     * its "cancel in-flight export" busy state.
+     *
+     * No-op when no panel for the source is open: the editor-toolbar
+     * Export entry creates a panel on success but during the export
+     * itself there may not be one to update. Callers should fire the
+     * notification anyway — when a panel does exist, having `busy=true`
+     * arrive even slightly before the panel can also matter (the panel-
+     * reuse path's `requestPalette` pattern mirrors this).
+     */
+    static notifyExportBusy(rmdAbsPath: string, busy: boolean): void {
+        const instance = KnitOutputPanel.instances.get(rmdAbsPath);
+        if (!instance) return;
+        if (instance.disposed) return;
+        void instance.panel.webview.postMessage({
+            __ravenExportBusy: true,
+            busy,
+        }).then(undefined, () => {
+            // postMessage can reject if the webview was disposed between
+            // the disposed-flag check and the actual post; swallow.
+        });
+    }
+
     private panel: vscode.WebviewPanel;
     private rootDir: string;
     private sourceUri: vscode.Uri;
