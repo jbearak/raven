@@ -224,4 +224,72 @@ describe('export commands', () => {
             expect(warnings).toEqual([]);
         });
     });
+
+    it('clears the progress popover and Export busy state before showing the Saved toast', async () => {
+        // Regression: previously `openExportedFile` (which awaits the
+        // "Saved …" info notification with Open / View buttons) was
+        // called inside the `vscode.window.withProgress` callback, so:
+        //   - the "Exporting to …" progress popover stayed open
+        //   - `notifyExportBusy(rmd, false)` had not yet fired, so the
+        //     toolbar Export ▾ button still said "Cancel export"
+        // until the user clicked Open/View on the Saved toast. The fix
+        // shows the Saved toast only after the progress task settles
+        // and the op has been ended.
+        await withTempDir(async (dir) => {
+            const { runExport } = await loadExportCommands();
+            const rmdPath = writeRmd(dir);
+            const previewPaths = previewArtifactPaths(rmdPath);
+            const registry = new OperationRegistry();
+            const events: string[] = [];
+
+            const vscodeMod = (await import('vscode')) as unknown as {
+                window: {
+                    withProgress: unknown;
+                    showInformationMessage: unknown;
+                };
+            };
+            const origWithProgress = vscodeMod.window.withProgress;
+            const origShowInfo = vscodeMod.window.showInformationMessage;
+            vscodeMod.window.withProgress = async (
+                _opts: unknown,
+                task: (progress: unknown, token: unknown) => Promise<unknown>,
+            ) => {
+                const result = await task({}, { onCancellationRequested: () => ({ dispose() {} }) });
+                events.push('progress-closed');
+                return result;
+            };
+            vscodeMod.window.showInformationMessage = async () => {
+                events.push('saved-toast-shown');
+                return undefined;
+            };
+
+            try {
+                await runExport(fileUri(rmdPath), 'html', {
+                    resolver: { resolve: async () => fakePandocExecutable(dir) },
+                    registry,
+                    getOutput: () => outputChannel(),
+                    runKnit: async () => {
+                        await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });
+                        await fs.promises.writeFile(previewPaths.mdPath, '# knitted\n');
+                        return { ok: true };
+                    },
+                    notifyExportBusy: (_rmd: string, busy: boolean) => {
+                        if (busy === false) events.push('busy-cleared');
+                    },
+                }, { entry: 'editor-toolbar' });
+            } finally {
+                vscodeMod.window.withProgress = origWithProgress;
+                vscodeMod.window.showInformationMessage = origShowInfo;
+            }
+
+            const savedIdx = events.indexOf('saved-toast-shown');
+            const progressIdx = events.indexOf('progress-closed');
+            const busyIdx = events.indexOf('busy-cleared');
+            expect(savedIdx).toBeGreaterThan(-1);
+            expect(progressIdx).toBeGreaterThan(-1);
+            expect(busyIdx).toBeGreaterThan(-1);
+            expect(progressIdx).toBeLessThan(savedIdx);
+            expect(busyIdx).toBeLessThan(savedIdx);
+        });
+    });
 });

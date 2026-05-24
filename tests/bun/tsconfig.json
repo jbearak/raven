@@ -1,0 +1,45 @@
+{
+  // Scoped tsconfig so VS Code's TypeScript language server can resolve
+  // `bun:test` (from @types/bun) and bare-package imports like
+  // `fast-check` from this directory. Without this file each
+  // tests/bun/*.test.ts opens against the editor's default config and
+  // shows "Cannot find module" noise — these files live outside
+  // editors/vscode/tsconfig.json's rootDir, and their node_modules sit
+  // a few directories away under editors/vscode/.
+  //
+  // `include` is deliberately narrow: bun runs all *.test.ts files
+  // without type-checking them, so several files in this directory
+  // have long-standing latent type errors (mock objects that don't
+  // implement every method of the VS Code surface they stand in for,
+  // discriminated-union accesses without narrowing, etc.). Expanding
+  // `include` to `**/*.ts` would resolve modules but surface those
+  // pre-existing issues as new diagnostics — exactly the noise this
+  // file is meant to suppress. Add a file here only after confirming
+  // its types are clean under `tsc --project tests/bun/tsconfig.json
+  // --noEmit`.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "types": ["bun"],
+    "typeRoots": ["../../editors/vscode/node_modules/@types"],
+    "baseUrl": ".",
+    "paths": {
+      "*": [
+        "../../editors/vscode/node_modules/@types/*",
+        "../../editors/vscode/node_modules/*"
+      ]
+    }
+  },
+  "include": [
+    "r-expression.test.ts",
+    "r-expression-chunk-opts.test.ts"
+  ]
+}

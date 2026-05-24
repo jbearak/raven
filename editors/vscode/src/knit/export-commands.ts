@@ -185,8 +185,16 @@ export async function runExport(
     const controller = begin.controller;
 
     let pinnedPreviewKey: string | null = null;
+    // The "Saved …" toast (with Open / View) is shown OUTSIDE the
+    // `withProgress` block — otherwise its `showInformationMessage`
+    // would keep the "Exporting to …" progress popover open and the
+    // Export button stuck on "Cancel export" until the user dismissed
+    // the toast. `runExportInner` returns the destination it produced
+    // (when Pandoc succeeded) and the caller fires the toast after
+    // progress + busy state have cleared.
+    let innerResult: ExportInnerResult | undefined;
     try {
-        await vscode.window.withProgress(
+        innerResult = await vscode.window.withProgress<ExportInnerResult>(
             {
                 location: vscode.ProgressLocation.Notification,
                 cancellable: true,
@@ -194,7 +202,7 @@ export async function runExport(
             },
             async (_progress, token) => {
                 token.onCancellationRequested(() => controller.cancel());
-                await runExportInner(rmd, format, deps, opts, controller, (key: string) => {
+                return await runExportInner(rmd, format, deps, opts, controller, (key: string) => {
                     pinnedPreviewKey = key;
                 });
             },
@@ -203,7 +211,19 @@ export async function runExport(
         if (pinnedPreviewKey !== null) deps.registry.unpinPreviewDir(pinnedPreviewKey);
         deps.registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
     }
+
+    if (innerResult?.kind === 'success' && !controller.cancelled) {
+        await openExportedFile(
+            vscode.Uri.file(innerResult.destPath),
+            innerResult.format,
+            deps.getOutput(),
+        );
+    }
 }
+
+type ExportInnerResult =
+    | { kind: 'success'; destPath: string; format: ExportFormat }
+    | { kind: 'aborted' };
 
 async function runExportInner(
     rmd: vscode.Uri,
@@ -212,7 +232,7 @@ async function runExportInner(
     opts: RunExportOpts,
     controller: OperationController,
     onPin: (previewKey: string) => void,
-): Promise<void> {
+): Promise<ExportInnerResult> {
     const output = deps.getOutput();
     const previewPaths = previewArtifactPaths(rmd.fsPath);
 
@@ -220,7 +240,7 @@ async function runExportInner(
     if (opts.entry === 'webview') {
         if (!fs.existsSync(previewPaths.mdPath)) {
             void vscode.window.showWarningMessage('No cached preview. Knit first, then export.');
-            return;
+            return { kind: 'aborted' };
         }
     }
 
@@ -249,7 +269,7 @@ async function runExportInner(
                 output.appendLine(
                     `[Export] could not remove stale preview .md at ${previewPaths.mdPath}: ${(err as Error).message}`,
                 );
-                return;
+                return { kind: 'aborted' };
             }
         }
         controller.updatePhase('knitting');
@@ -264,7 +284,7 @@ async function runExportInner(
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             output.appendLine(`[Export] knit failed: ${msg}`);
-            return;
+            return { kind: 'aborted' };
         }
         if (!knitResult.ok) {
             // Cancelled, timed out, spawn-errored, or otherwise non-ok.
@@ -272,7 +292,7 @@ async function runExportInner(
             // failed run; either way we cannot safely export it. The
             // user has already seen the knit failure UI via renderOutcome.
             output.appendLine('[Export] aborting because the underlying knit did not succeed.');
-            return;
+            return { kind: 'aborted' };
         }
         if (!fs.existsSync(previewPaths.mdPath)) {
             // Defensive — knitResult.ok should imply the file exists,
@@ -280,7 +300,7 @@ async function runExportInner(
             // backstop that prevents Pandoc from being handed a
             // non-existent input path.
             output.appendLine(`[Export] knit reported success but no .md at ${previewPaths.mdPath}; aborting.`);
-            return;
+            return { kind: 'aborted' };
         }
         // A disposal of the previous panel during the export pin may
         // have queued deletion. The successful re-knit made this dir
@@ -296,7 +316,7 @@ async function runExportInner(
     } catch (err) {
         if (err instanceof PandocNotFoundError) {
             await offerPandocInstall();
-            return;
+            return { kind: 'aborted' };
         }
         throw err;
     }
@@ -311,7 +331,7 @@ async function runExportInner(
         documentText = Buffer.from(await vscode.workspace.fs.readFile(rmd)).toString('utf8');
     } catch (err) {
         output.appendLine(`[Export] failed to read source: ${err instanceof Error ? err.message : String(err)}`);
-        return;
+        return { kind: 'aborted' };
     }
     const fmInner = extractFrontmatter(documentText) ?? '';
     const fmParse = parseFrontmatter(fmInner);
@@ -367,11 +387,16 @@ async function runExportInner(
 
     controller.updatePhase('finalizing');
     if (result.status === 'success') {
-        await openExportedFile(vscode.Uri.file(destPath), formatToExport(format), output);
+        // Defer the "Saved …" toast to the caller — see the comment in
+        // `runExport`. Showing it here would keep the progress popover
+        // and Export-busy state alive until the user clicked Open/View.
+        return { kind: 'success', destPath, format: formatToExport(format) };
     } else if (result.status === 'cancelled') {
         output.appendLine('[Export] Cancelled.');
+        return { kind: 'aborted' };
     } else {
         await offerPandocFailure(format, result.stderr, output, rmd);
+        return { kind: 'aborted' };
     }
 }
 

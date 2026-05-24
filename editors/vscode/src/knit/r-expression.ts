@@ -238,27 +238,27 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
     const namedArgs: string[] = [];
     const co = input.chunkOpts;
     if (co.fig_width !== undefined && Number.isFinite(co.fig_width)) {
-        assigns.push(`__raven_fig_width <- ${co.fig_width}`);
-        namedArgs.push('fig.width = __raven_fig_width');
+        assigns.push(`.raven_fig_width <- ${co.fig_width}`);
+        namedArgs.push('fig.width = .raven_fig_width');
     }
     if (co.fig_height !== undefined && Number.isFinite(co.fig_height)) {
-        assigns.push(`__raven_fig_height <- ${co.fig_height}`);
-        namedArgs.push('fig.height = __raven_fig_height');
+        assigns.push(`.raven_fig_height <- ${co.fig_height}`);
+        namedArgs.push('fig.height = .raven_fig_height');
     }
     if (co.fig_retina !== undefined && Number.isFinite(co.fig_retina)) {
-        assigns.push(`__raven_fig_retina <- ${co.fig_retina}`);
-        namedArgs.push('fig.retina = __raven_fig_retina');
+        assigns.push(`.raven_fig_retina <- ${co.fig_retina}`);
+        namedArgs.push('fig.retina = .raven_fig_retina');
     }
     if (co.dpi !== undefined && Number.isInteger(co.dpi)) {
-        assigns.push(`__raven_dpi <- ${co.dpi}L`);
-        namedArgs.push('dpi = __raven_dpi');
+        assigns.push(`.raven_dpi <- ${co.dpi}L`);
+        namedArgs.push('dpi = .raven_dpi');
     }
     if (co.dev !== undefined) {
         // co.dev passed DEV_ALLOWLIST above; `escapeRString` is the
         // single-quoted-literal wrapper. The assignment puts it on the
         // R side; the `opts_chunk$set` call references the local var.
-        assigns.push(`__raven_dev <- ${escapeRString(co.dev)}`);
-        namedArgs.push('dev = __raven_dev');
+        assigns.push(`.raven_dev <- ${escapeRString(co.dev)}`);
+        namedArgs.push('dev = .raven_dev');
     }
     const yamlOptsChunk = assigns.length > 0
         ? ` ${assigns.join('; ')}; knitr::opts_chunk$set(${namedArgs.join(', ')});`
@@ -269,11 +269,11 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
         ` knitr::opts_knit$set(root.dir = ${rootDirLiteral}, base.dir = ${baseDirLit});`,
         ` knitr::opts_chunk$set(fig.path = ${figPathLit});`,
         yamlOptsChunk,
-        ` __raven_output <- ${outputLit};`,
-        ` __raven_tmp_output <- paste0(__raven_output, '.tmp');`,
+        ` .raven_output <- ${outputLit};`,
+        ` .raven_tmp_output <- paste0(.raven_output, '.tmp');`,
         ` knitr::knit(`,
         `input = ${inputLit},`,
-        ` output = __raven_tmp_output,`,
+        ` output = .raven_tmp_output,`,
         ` envir = new.env(),`,
         ` quiet = TRUE);`,
         // file.rename returns FALSE (with a warning) on failure rather
@@ -282,9 +282,15 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
         // "Output created:" — `parseRenderedOutputPath` would then
         // hand a stale file to the caller. Convert the FALSE return
         // into a hard stop so the knit outcome reflects reality.
-        ` if (!isTRUE(file.rename(__raven_tmp_output, __raven_output)))`,
-        ` stop('Failed to rename ', __raven_tmp_output, ' to ', __raven_output);`,
-        ` cat('Output created: ', __raven_output, '\\n', sep = '')`,
+        //
+        // The leading `.` on every `.raven_*` name is mandatory: R
+        // identifiers cannot start with `_`, so `__raven_*` would
+        // fail at parse time with "unexpected input in ...". The dot
+        // prefix is R's idiom for "internal / hidden" and is what
+        // `__` was unsuccessfully trying to be.
+        ` if (!isTRUE(file.rename(.raven_tmp_output, .raven_output)))`,
+        ` stop('Failed to rename ', .raven_tmp_output, ' to ', .raven_output);`,
+        ` cat('Output created: ', .raven_output, '\\n', sep = '')`,
         ' })',
     ].join('');
 }
