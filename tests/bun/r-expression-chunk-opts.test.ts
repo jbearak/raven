@@ -16,15 +16,17 @@ describe('buildKnitExpression with chunk opts', () => {
             chunkOpts: { fig_width: 5, fig_height: 4, dpi: 150, dev: 'png' },
         });
         // R-side variable assignments precede the opts_chunk$set call
-        // (per the R-subprocess-safety invariant in CLAUDE.md).
-        expect(expr).toContain('__raven_fig_width <- 5');
-        expect(expr).toContain('__raven_fig_height <- 4');
-        expect(expr).toContain('__raven_dpi <- 150L');
-        expect(expr).toContain("__raven_dev <- 'png'");
-        expect(expr).toContain('fig.width = __raven_fig_width');
-        expect(expr).toContain('fig.height = __raven_fig_height');
-        expect(expr).toContain('dpi = __raven_dpi');
-        expect(expr).toContain('dev = __raven_dev');
+        // (per the R-subprocess-safety invariant in CLAUDE.md). The
+        // `.raven_*` prefix is the R idiom for "internal / hidden"
+        // — a leading `_` would be a parse error.
+        expect(expr).toContain('.raven_fig_width <- 5');
+        expect(expr).toContain('.raven_fig_height <- 4');
+        expect(expr).toContain('.raven_dpi <- 150L');
+        expect(expr).toContain(".raven_dev <- 'png'");
+        expect(expr).toContain('fig.width = .raven_fig_width');
+        expect(expr).toContain('fig.height = .raven_fig_height');
+        expect(expr).toContain('dpi = .raven_dpi');
+        expect(expr).toContain('dev = .raven_dev');
     });
 
     it('emits opts_knit$set with base.dir + root.dir and the global fig.path', () => {
