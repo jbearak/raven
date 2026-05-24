@@ -111,6 +111,18 @@ export type SnapshotKey = {
     upid: number;
 };
 
+/**
+ * A blob URL captured for a specific plot during an alive R session,
+ * paired with the `SnapshotKey` it was fetched against. The pairing lets
+ * `pick_image_src` reject a stale cache (failed mid-flight refetch after
+ * navigating to a different plot, deleted-plot bytes still in memory)
+ * instead of replaying earlier bytes under the wrong "Plot N/M" counter.
+ */
+export type CachedSnapshot = {
+    url: string;
+    key: SnapshotKey;
+};
+
 export function compute_snapshot_key(state: ViewerState): SnapshotKey | null {
     if (state.sessionEnded) return null;
     if (state.phase !== 'viewing') return null;
@@ -128,23 +140,30 @@ export function compute_snapshot_key(state: ViewerState): SnapshotKey | null {
  *
  * While the R session is alive, returns the live httpgd URL. After the
  * session ends (httpgd runs inside R and dies with it), returns the
- * `cachedBlobUrl` captured by the webview while the session was alive —
- * without it the live URL would `ERR_CONNECTION_REFUSED` and the
- * "Showing last plot" banner would be a lie.
+ * cached blob URL captured while the session was alive — but only when
+ * the cache corresponds to the currently-displayed plot. A stale cache
+ * (e.g. fetch for the current plot failed mid-flight, leaving a blob
+ * from a previously-viewed plot) is NOT replayed; we'd rather return ''
+ * than mislabel an earlier plot's pixels under the "Showing last plot"
+ * banner.
  *
- * Returns '' when there is nothing to show (no plots, no session, or
- * session ended before any plot was cached).
+ * Only `plotId` is compared. A `upid` mismatch (pre-`points()` snapshot
+ * of the same plot) is tolerated so the fallback stays useful in the
+ * common in-place-update case.
  */
 export function pick_image_src(
     state: ViewerState,
     dimensions: { width: number; height: number },
-    cachedBlobUrl: string | null,
+    cached: CachedSnapshot | null,
 ): string {
     if (state.phase !== 'viewing' && state.phase !== 'disconnected') return '';
     if (state.plotIds.length === 0) return '';
-    if (state.sessionEnded) return cachedBlobUrl ?? '';
-    if (!state.activeSession) return '';
     const id = state.plotIds[state.currentIndex];
+    if (state.sessionEnded) {
+        if (!cached || cached.key.plotId !== id) return '';
+        return cached.url;
+    }
+    if (!state.activeSession) return '';
     return plot_url(
         state.activeSession.httpgdBaseUrl,
         state.activeSession.httpgdToken,

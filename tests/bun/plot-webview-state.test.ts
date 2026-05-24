@@ -189,7 +189,16 @@ describe('pick_image_src', () => {
         // a blob URL while the session is alive and must use it post-quit.
         let s = viewing_state();
         s = reduce(s, { type: 'SESSION_ENDED' });
-        const src = pick_image_src(s, dim, 'blob:cached-svg');
+        const cached = {
+            url: 'blob:cached-svg',
+            key: {
+                baseUrl: 'http://127.0.0.1:12345',
+                token: 't',
+                plotId: 'p1',
+                upid: 1,
+            },
+        };
+        const src = pick_image_src(s, dim, cached);
         expect(src).toBe('blob:cached-svg');
         expect(src).not.toContain('127.0.0.1:12345');
     });
@@ -201,6 +210,44 @@ describe('pick_image_src', () => {
         let s = viewing_state();
         s = reduce(s, { type: 'SESSION_ENDED' });
         expect(pick_image_src(s, dim, null)).toBe('');
+    });
+
+    test('after SESSION_ENDED with cached blob for a DIFFERENT plot, returns "" (no stale replay)', () => {
+        // If a fetch for the navigated-to or in-flight plot failed (e.g. R
+        // died mid-flight), pick_image_src must NOT replay the previously
+        // cached blob under the wrong "Plot N/M" counter — that would lie
+        // about which plot is shown. Better to render '' and let the
+        // viewport fall back to the "R session ended." placeholder.
+        let s = viewing_state(); // plotIds=['p1'], currentIndex=0
+        s = reduce(s, { type: 'SESSION_ENDED' });
+        const stale = {
+            url: 'blob:stale-svg',
+            key: {
+                baseUrl: 'http://127.0.0.1:12345',
+                token: 't',
+                plotId: 'p_old',
+                upid: 1,
+            },
+        };
+        expect(pick_image_src(s, dim, stale)).toBe('');
+    });
+
+    test('after SESSION_ENDED tolerates a upid mismatch on the same plotId (in-place update fallback)', () => {
+        // If a points() bumped upid and the refetch never completed, the
+        // cache has the pre-points version of the same plot. We accept
+        // that as a usable fallback rather than blanking the viewport.
+        let s = viewing_state(); // plotIds=['p1'], upid=1
+        s = reduce(s, { type: 'SESSION_ENDED' });
+        const stale_upid = {
+            url: 'blob:pre-points',
+            key: {
+                baseUrl: 'http://127.0.0.1:12345',
+                token: 't',
+                plotId: 'p1',
+                upid: 0,
+            },
+        };
+        expect(pick_image_src(s, dim, stale_upid)).toBe('blob:pre-points');
     });
 });
 
