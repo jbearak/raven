@@ -93,6 +93,8 @@ Set the array to `[]` to hide all lenses while keeping the commands available fr
 
 When a chunk's header sets `eval = FALSE`, the `▷ Run Chunk` and `▷⇣ Run & Move` labels gain a `(eval = FALSE)` suffix so you know the chunk would otherwise be skipped by `knitr` / `quarto render`.
 
+If you also have the Quarto extension installed, `.qmd` files will show two CodeLens rows — Raven's (when Raven's R console is active) and Quarto's. See [Coexistence with the Quarto extension](./coexistence.md#coexistence-with-the-quarto-extension) for what each row does and how to choose between them.
+
 ## Chunk options
 
 Raven parses the header inside `{…}` and recognizes:
