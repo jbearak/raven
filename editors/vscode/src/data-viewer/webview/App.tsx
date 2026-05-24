@@ -75,6 +75,7 @@ type ContextMenuState = {
     leftPx: number;
     topPx: number;
     columnIndex?: number;
+    kind: 'cell' | 'column';
 };
 
 type HeaderTooltipState = {
@@ -806,6 +807,15 @@ export function App({
         args.ctx.restore();
     }, [columns, visibleCols]);
 
+    const toGridShellPoint = useCallback((clientX: number, clientY: number): { leftPx: number; topPx: number } => {
+        const shellRect = gridShellRef.current?.getBoundingClientRect();
+        if (!shellRect) return { leftPx: clientX, topPx: clientY };
+        return {
+            leftPx: clientX - shellRect.left,
+            topPx: clientY - shellRect.top,
+        };
+    }, []);
+
     useEffect(() => {
         const el = headerTooltipRef.current;
         const parent = gridShellRef.current;
@@ -835,12 +845,13 @@ export function App({
             setHeaderTooltip(null);
             return;
         }
+        const point = toGridShellPoint(args.bounds.x, args.bounds.y + args.bounds.height);
         setHeaderTooltip({
-            text: `${col.name}: ${label}`,
-            leftPx: args.bounds.x + args.localEventX,
-            topPx: args.bounds.y + args.localEventY + 16,
+            text: label,
+            leftPx: point.leftPx,
+            topPx: point.topPx,
         });
-    }, [columns, visibleCols]);
+    }, [columns, toGridShellPoint, visibleCols]);
 
     const updateHiddenColumns = useCallback((hiddenColumns: number[]) => {
         const nextLayout = { ...layout, hiddenColumns };
@@ -938,17 +949,27 @@ export function App({
                         event.preventDefault();
                         const next = createColumnSelection(colIndex);
                         setGridSelection(next);
+                        const point = toGridShellPoint(
+                            event.bounds.x + event.localEventX,
+                            event.bounds.y + event.localEventY,
+                        );
                         setContextMenu({
-                            leftPx: event.bounds.x + event.localEventX,
-                            topPx: event.bounds.y + event.localEventY,
+                            leftPx: point.leftPx,
+                            topPx: point.topPx,
                             columnIndex: visibleCols[colIndex],
+                            kind: 'column',
                         });
                     }}
                     onCellContextMenu={(_cell, event) => {
                         event.preventDefault();
+                        const point = toGridShellPoint(
+                            event.bounds.x + event.localEventX,
+                            event.bounds.y + event.localEventY,
+                        );
                         setContextMenu({
-                            leftPx: event.bounds.x + event.localEventX,
-                            topPx: event.bounds.y + event.localEventY,
+                            leftPx: point.leftPx,
+                            topPx: point.topPx,
+                            kind: 'cell',
                         });
                     }}
                     onColumnResize={(_column, _newSize, colIndex, newSizeWithGrow) => {
@@ -1035,6 +1056,7 @@ export function App({
                     <ColumnContextMenu
                         leftPx={contextMenu.leftPx}
                         topPx={contextMenu.topPx}
+                        copyLabel={contextMenu.kind === 'column' ? 'Copy Column' : 'Copy'}
                         onCopy={() => {
                             copySelection();
                             setContextMenu(null);

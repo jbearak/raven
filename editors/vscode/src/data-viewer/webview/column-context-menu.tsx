@@ -4,6 +4,7 @@ import { useDismiss } from './use-dismiss';
 type Props = {
     leftPx: number;
     topPx: number;
+    copyLabel?: string;
     onCopy: () => void;
     onHideColumn?: () => void;
     onClose: () => void;
@@ -14,6 +15,7 @@ const MARGIN_PX = 4;
 export function ColumnContextMenu({
     leftPx,
     topPx,
+    copyLabel = 'Copy',
     onCopy,
     onHideColumn,
     onClose,
@@ -46,7 +48,7 @@ export function ColumnContextMenu({
             role="menu"
         >
             <button type="button" className="context-menu-item" onClick={onCopy} role="menuitem">
-                Copy
+                {copyLabel}
             </button>
             {onHideColumn && (
                 <button type="button" className="context-menu-item" onClick={onHideColumn} role="menuitem">
