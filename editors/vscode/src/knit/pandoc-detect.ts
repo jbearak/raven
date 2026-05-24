@@ -57,8 +57,14 @@ export class PandocResolver {
 
         const configured = this.deps.getConfigured();
         if (configured) {
+            // `access(X_OK)` only checks the executable bit — a user could
+            // set `raven.pandoc.path` to `/bin/echo` and we'd happily hand
+            // it to the export pipeline. Spawn `--version` so we cache a
+            // path that actually behaves like pandoc. Mirrors the probe
+            // already used for the bare-`pandoc`-on-PATH branch below.
             try {
                 await this.deps.access(configured);
+                await this.deps.spawn(configured);
                 this.cached = configured;
                 return configured;
             } catch {
@@ -79,6 +85,7 @@ export class PandocResolver {
         for (const candidate of fallbacks) {
             try {
                 await this.deps.access(candidate);
+                await this.deps.spawn(candidate);
                 this.cached = candidate;
                 return candidate;
             } catch {

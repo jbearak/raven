@@ -24,6 +24,37 @@ describe('PandocResolver', () => {
         await expect(r.resolve()).rejects.toThrow(PandocNotFoundError);
     });
 
+    it('throws PandocNotFoundError when configured path passes access but spawn rejects', async () => {
+        // In production, `spawn` is `probePandocBinary`, which rejects
+        // when the binary's `--version` output doesn't start with
+        // "pandoc" — see `pandoc-probe.test.ts`. This test pins the
+        // resolver contract: a spawn rejection on the configured path
+        // surfaces as `PandocNotFoundError`, not a leaked spawn error.
+        const r = new PandocResolver({
+            getConfigured: () => '/bin/echo',
+            access: okAccess,
+            spawn: async () => { throw new Error('not pandoc'); },
+        });
+        await expect(r.resolve()).rejects.toThrow(PandocNotFoundError);
+    });
+
+    it('skips fallback candidates whose spawn probe rejects', async () => {
+        // Defense in depth: even if a non-pandoc binary sits at a
+        // fallback path, the resolver should continue down the list
+        // rather than caching the first accessible path.
+        const r = new PandocResolver({
+            getConfigured: () => '',
+            access: okAccess,
+            spawn: async (bin: string) => {
+                if (bin === 'pandoc') throw new Error('not on PATH');
+                if (bin === '/bogus/echo') throw new Error('not pandoc');
+                return 'pandoc 3.0';
+            },
+            fallbacks: () => ['/bogus/echo', '/real/pandoc'],
+        });
+        expect(await r.resolve()).toBe('/real/pandoc');
+    });
+
     it('falls back to bare `pandoc` on PATH when no configured path', async () => {
         const r = new PandocResolver({
             getConfigured: () => '',

@@ -19,6 +19,7 @@ import { OperationRegistry } from './operation-controller';
 import { registerExportCommands } from './export-commands';
 import { KnitOutputPanel } from './knit-output-panel';
 import { previewArtifactPaths } from './raven-knit-paths';
+import { isPandocVersionOutput } from './pandoc-probe';
 
 export { disposeKnitGrammarRegistryForDeactivation };
 export { runExport } from './export-commands';
@@ -178,12 +179,61 @@ export function registerKnit(
     });
 }
 
-function probePandocBinary(bin: string): Promise<string> {
+/**
+ * Probe `<bin> --version` and verify it's actually Pandoc. Resolves to
+ * trimmed stdout on a clean exit AND the first non-empty stdout line
+ * begins with `pandoc` (case-insensitive). Rejects otherwise.
+ *
+ * Why the version-string check: a bare `code === 0` gate accepts any
+ * executable that handles `--version` cleanly. On macOS `/bin/echo
+ * --version` exits 0 and prints `--version`; on Linux many GNU coreutils
+ * accept `--version` and exit 0. Without parsing the output, a user who
+ * mistypes `raven.pandoc.path` (or a malicious workspace-committed
+ * setting on a trusted workspace) could route export through the wrong
+ * binary. Pandoc itself always emits a line starting with `pandoc 3.x`
+ * — see <https://pandoc.org/MANUAL.html#options>.
+ *
+ * `--version` should respond within milliseconds; a much higher cap is
+ * a backstop against a wedged binary (broken shared libraries, hanging
+ * AV scanners on Windows, etc.) blocking the first export forever. A
+ * hung probe would otherwise leave the export's progress notification
+ * spinning with no way to recover except restarting VS Code, since
+ * `PandocResolver` is the gate before the cancellable Pandoc subprocess.
+ */
+const PANDOC_PROBE_TIMEOUT_MS = 10_000;
+
+function probePandocBinary(bin: string, timeoutMs: number = PANDOC_PROBE_TIMEOUT_MS): Promise<string> {
     return new Promise<string>((resolve, reject) => {
         const child = child_process.spawn(bin, ['--version']);
         let out = '';
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            try { child.kill('SIGKILL'); } catch { /* ignore */ }
+            reject(new Error(`pandoc probe timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
         child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-        child.on('error', reject);
-        child.on('close', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(`pandoc exit ${code}`))));
+        child.on('error', (err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+        });
+        child.on('close', (code) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (code !== 0) {
+                reject(new Error(`pandoc exit ${code}`));
+                return;
+            }
+            const trimmed = out.trim();
+            if (!isPandocVersionOutput(trimmed)) {
+                reject(new Error(`not pandoc: --version output did not start with 'pandoc'`));
+                return;
+            }
+            resolve(trimmed);
+        });
     });
 }
