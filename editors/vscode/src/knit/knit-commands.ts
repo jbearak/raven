@@ -7,7 +7,7 @@ import {
     extractFrontmatter,
     parseFrontmatter,
 } from './yaml-frontmatter';
-import { parseOutputOptions } from './output-options';
+import { parseOutputOptions, type TargetFormat } from './output-options';
 import {
     buildKnitExpression,
     escapeRString,
@@ -140,6 +140,15 @@ export function registerKnitCommands(
  * actually stops the underlying R subprocess. We also skip the
  * nested `withProgress` — the outer caller already shows progress;
  * a second notification would clutter the UX.
+ *
+ * `targetFormat` (default `'html'`) selects which YAML `output:` block
+ * supplies chunk options for the knit. Editor-toolbar Export → PDF /
+ * Word passes `'pdf'` / `'docx'` so target-specific options like
+ * `pdf_document: { fig_width: 4, dpi: 300 }` actually shape the
+ * figures produced for that target. Without this, PDF/Word exports
+ * would knit with HTML chunk options and Pandoc would convert
+ * HTML-sized figures into the wrong target — violating the design
+ * intent in docs/superpowers/specs/2026-05-23-knit-preview-export-design.md.
  */
 export async function runKnitWithExistingController(
     explicitUri: vscode.Uri | undefined,
@@ -147,6 +156,7 @@ export async function runKnitWithExistingController(
     context: vscode.ExtensionContext,
     deps: KnitDeps,
     externalController: OperationController,
+    targetFormat: TargetFormat = 'html',
 ): Promise<{ ok: boolean }> {
     // Capture the outcome via the dedicated channel `runKnitCommand`
     // populates when `outcomeCapture` is non-null. Avoids refactoring
@@ -154,7 +164,16 @@ export async function runKnitWithExistingController(
     // gates, working-dir resolution, R-expression construction, etc.)
     // into a typed return.
     const capture: { outcome: KnitOutcome | null } = { outcome: null };
-    await runKnitCommand(explicitUri, output, /* registry */ null, context, deps, externalController, capture);
+    await runKnitCommand(
+        explicitUri,
+        output,
+        /* registry */ null,
+        context,
+        deps,
+        externalController,
+        capture,
+        targetFormat,
+    );
     return { ok: capture.outcome !== null && capture.outcome.kind === 'ok' };
 }
 
@@ -173,6 +192,15 @@ async function runKnitCommand(
      * leaves the field unset.
      */
     outcomeCapture: { outcome: KnitOutcome | null } | null = null,
+    /**
+     * Which YAML `output:` block supplies chunk options for the knit.
+     * Default `'html'` matches Knit Preview's HTML-always contract.
+     * Editor-toolbar Export → PDF / Word passes `'pdf'` / `'docx'`
+     * so target-specific YAML like `pdf_document: { fig_width: 4,
+     * dpi: 300 }` actually drives the knit instead of being ignored
+     * in favour of `html_document`'s defaults.
+     */
+    targetFormat: TargetFormat = 'html',
 ): Promise<void> {
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
@@ -346,9 +374,15 @@ async function runKnitCommand(
     }
 
     // YAML output: block — chunk-level options come from here. The
-    // preview target is always 'html' (preview is HTML regardless of
-    // YAML output:).
-    const outputOpts = parseOutputOptions(parsed.value, 'html');
+    // preview path always uses 'html' (preview renders to HTML
+    // regardless of YAML output:). The editor-toolbar export path
+    // passes its target format so PDF / Word knits pick chunk options
+    // from `pdf_document:` / `word_document:` instead of
+    // `html_document:`. Per docs/superpowers/specs/2026-05-23-knit-preview-export-design.md,
+    // non-matching format blocks are completely ignored: when target
+    // is 'pdf', `html_document.fig_width` does NOT drive the PDF
+    // knit, and vice versa.
+    const outputOpts = parseOutputOptions(parsed.value, targetFormat);
     if (outputOpts.ignored.length > 0) {
         for (const key of outputOpts.ignored) {
             output.appendLine(`[knit] Ignored output: option '${key}'`);
@@ -430,97 +464,131 @@ async function runKnitCommand(
         controller = begin.controller;
     }
 
-    output.appendLine(`---`);
-    output.appendLine(`Knitting ${fsPath}`);
-    output.appendLine(`R: ${rBinary}`);
-    output.appendLine(`Expression: ${expression}`);
-    output.appendLine(`cwd: ${cwd}`);
-    output.appendLine(``);
+    // Pin the preview dir for the duration of the knit + post-knit
+    // render. Without this, `KnitOutputPanel.onDidDispose` (fired when
+    // the user closes the previous knit's panel while a new knit is
+    // in flight) would call `requestPreviewDirDeletion`, see refcount
+    // = 0, and start an `fs.rm -rf` race against R writing the `.md` /
+    // `figure/` files.
+    //
+    // Re-entry path: when `registry === null` the export pipeline
+    // owns the pin via `runExport`, so we skip — double-pinning would
+    // leave the refcount stuck above zero after both pipelines unpin.
+    let pinnedPreviewKey: string | null = null;
+    if (registry !== null && controller !== null) {
+        registry.pinPreviewDir(previewPaths.previewKey);
+        pinnedPreviewKey = previewPaths.previewKey;
+    }
 
-    let outcome: KnitOutcome;
+    let knitProducedValidMd = false;
     try {
-        if (externalController !== null) {
-            // Re-entry path: the export pipeline already owns a progress
-            // notification and a registry slot. Skip a second `withProgress`
-            // (a nested notification would clutter the UX) and bridge the
-            // export controller's `cancelled` flag into the R subprocess
-            // via a CancellationTokenSource. Polling once per 100ms is
-            // cheap and matches `pandoc-engine.ts`'s cancellation cadence.
-            const cts = new vscode.CancellationTokenSource();
-            const cancelPoll = setInterval(() => {
-                if (externalController.cancelled) cts.cancel();
-            }, 100);
-            try {
-                const result = await deps.runKnit({
-                    rBinary,
-                    expression,
-                    cwd,
-                    timeoutMs,
-                    output,
-                    cancellation: cts.token,
-                });
-                outcome = classify(result, { cwd });
-            } finally {
-                clearInterval(cancelPoll);
-                cts.dispose();
-            }
-        } else {
-            outcome = await vscode.window.withProgress<KnitOutcome>(
-                {
-                    location: vscode.ProgressLocation.Notification,
-                    title: `Knitting ${baseName}…`,
-                    cancellable: true,
-                },
-                async (_progress, token) => {
+        output.appendLine(`---`);
+        output.appendLine(`Knitting ${fsPath}`);
+        output.appendLine(`R: ${rBinary}`);
+        output.appendLine(`Expression: ${expression}`);
+        output.appendLine(`cwd: ${cwd}`);
+        output.appendLine(``);
+
+        let outcome: KnitOutcome;
+        try {
+            if (externalController !== null) {
+                // Re-entry path: the export pipeline already owns a progress
+                // notification and a registry slot. Skip a second `withProgress`
+                // (a nested notification would clutter the UX) and bridge the
+                // export controller's `cancelled` flag into the R subprocess
+                // via a CancellationTokenSource. Polling once per 100ms is
+                // cheap and matches `pandoc-engine.ts`'s cancellation cadence.
+                const cts = new vscode.CancellationTokenSource();
+                const cancelPoll = setInterval(() => {
+                    if (externalController.cancelled) cts.cancel();
+                }, 100);
+                try {
                     const result = await deps.runKnit({
                         rBinary,
                         expression,
                         cwd,
                         timeoutMs,
                         output,
-                        cancellation: token,
+                        cancellation: cts.token,
                     });
-                    return classify(result, { cwd });
-                },
-            );
+                    outcome = classify(result, { cwd });
+                } finally {
+                    clearInterval(cancelPoll);
+                    cts.dispose();
+                }
+            } else {
+                outcome = await vscode.window.withProgress<KnitOutcome>(
+                    {
+                        location: vscode.ProgressLocation.Notification,
+                        title: `Knitting ${baseName}…`,
+                        cancellable: true,
+                    },
+                    async (_progress, token) => {
+                        const result = await deps.runKnit({
+                            rBinary,
+                            expression,
+                            cwd,
+                            timeoutMs,
+                            output,
+                            cancellation: token,
+                        });
+                        return classify(result, { cwd });
+                    },
+                );
+            }
+        } finally {
+            // Critical: registry.endOp runs the moment withProgress resolves,
+            // BEFORE any user-facing toast is awaited. This is the Piece A
+            // fix — under the previous code (a bare Set<string>), awaiting
+            // showInformationMessage inside the withProgress callback held
+            // both the progress notification AND the in-flight gate open
+            // until the user dismissed the toast, causing a spurious
+            // "already being knitted" on rapid re-invocation.
+            //
+            // Re-entry path: when this function was called with a null
+            // registry (the export pipeline runs us under its own
+            // `export-*` controller), there's no slot to release here —
+            // the outer pipeline owns lifecycle.
+            if (registry !== null && controller !== null) {
+                registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
+            }
         }
+
+        // Capture the outcome for callers (the export pipeline) that need
+        // to distinguish a successful knit from a cancelled/failed one
+        // that left a partial `.md`.
+        if (outcomeCapture !== null) outcomeCapture.outcome = outcome;
+        if (outcome.kind === 'ok') knitProducedValidMd = true;
+
+        await renderOutcome(outcome, {
+            fsPath,
+            baseName,
+            sourceUri: docUri,
+            sourceLanguageId,
+            cwd,
+            output,
+            rBinary,
+            timeoutMs,
+            context,
+            showOrUpdatePanel: deps.showOrUpdatePanel,
+            getLanguageClient: deps.getLanguageClient,
+            runPostKnitRender: deps.runPostKnitRender,
+        });
     } finally {
-        // Critical: registry.endOp runs the moment withProgress resolves,
-        // BEFORE any user-facing toast is awaited. This is the Piece A
-        // fix — under the previous code (a bare Set<string>), awaiting
-        // showInformationMessage inside the withProgress callback held
-        // both the progress notification AND the in-flight gate open
-        // until the user dismissed the toast, causing a spurious
-        // "already being knitted" on rapid re-invocation.
-        //
-        // Re-entry path: when this function was called with a null
-        // registry (the export pipeline runs us under its own
-        // `export-*` controller), there's no slot to release here —
-        // the outer pipeline owns lifecycle.
-        if (registry !== null && controller !== null) {
-            registry.endOp(controller, controller.cancelled ? 'cancelled' : 'done');
+        if (pinnedPreviewKey !== null && registry !== null) {
+            // A successful knit just refreshed the dir contents, so
+            // any deletion request triggered by the old panel's
+            // disposal is stale — cancel it before unpinning so the
+            // new panel created in renderOutcome can read the
+            // `.html` we just wrote. On cancel/failure we leave the
+            // deletion request in place so the next unpin discharges
+            // it (the dir contents are not what the user wants).
+            if (knitProducedValidMd) {
+                registry.cancelPreviewDirDeletion(pinnedPreviewKey);
+            }
+            registry.unpinPreviewDir(pinnedPreviewKey);
         }
     }
-
-    // Capture the outcome for callers (the export pipeline) that need
-    // to distinguish a successful knit from a cancelled/failed one
-    // that left a partial `.md`.
-    if (outcomeCapture !== null) outcomeCapture.outcome = outcome;
-
-    await renderOutcome(outcome, {
-        fsPath,
-        baseName,
-        sourceUri: docUri,
-        sourceLanguageId,
-        cwd,
-        output,
-        rBinary,
-        timeoutMs,
-        context,
-        showOrUpdatePanel: deps.showOrUpdatePanel,
-        getLanguageClient: deps.getLanguageClient,
-        runPostKnitRender: deps.runPostKnitRender,
-    });
 }
 
 interface RenderOutcomeCtx {

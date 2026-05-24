@@ -13,6 +13,10 @@
  * appended after Raven's own flags. Pandoc's last-arg-wins rule means
  * users can override defaults like `--highlight-style` from YAML
  * without colliding with `-o`/`--to`/`--from`.
+ *
+ * HTML exports default to `--embed-resources` (matching rmarkdown's
+ * `html_document` default of `self_contained: true`). Users opt out
+ * with `self_contained: false` in YAML.
  */
 
 import * as path from 'path';
@@ -36,9 +40,19 @@ export interface DetailedPandocArgs {
 }
 
 function build(opts: OutputOptions, format: TargetFormat, ctx: BuildPandocArgsCtx): DetailedPandocArgs {
+    const f = opts.pandocFlags;
     const args: string[] = [ctx.mdPath, '-o', ctx.outPath];
     if (format === 'html') {
         args.push('--to', 'html5', '--standalone');
+        // Default HTML exports to self-contained. Without embedding,
+        // Pandoc emits `<img src="figure/foo.png">` relative to the
+        // destination — but the figures live in Raven's temp preview
+        // dir, which is purged after the panel closes. The visible
+        // export would silently lose its images. rmarkdown's
+        // html_document defaults to self_contained: true for the same
+        // reason; we match that contract here and respect an explicit
+        // self_contained: false opt-out.
+        if (f.self_contained !== false) args.push('--embed-resources');
     } else if (format === 'pdf') {
         args.push('--to', 'pdf');
         args.push(`--pdf-engine=${ctx.pdfEngine ?? 'xelatex'}`);
@@ -46,12 +60,10 @@ function build(opts: OutputOptions, format: TargetFormat, ctx: BuildPandocArgsCt
         args.push('--to', 'docx');
     }
 
-    const f = opts.pandocFlags;
     if (f.toc) args.push('--toc');
     if (f.toc_depth !== undefined) args.push(`--toc-depth=${f.toc_depth}`);
     if (f.number_sections) args.push('--number-sections');
     if (f.highlight) args.push(`--highlight-style=${f.highlight}`);
-    if (f.self_contained) args.push('--embed-resources', '--standalone');
     if (f.mathjax) args.push('--mathjax');
 
     const droppedCss: string[] = [];

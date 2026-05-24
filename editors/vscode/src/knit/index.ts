@@ -162,7 +162,13 @@ export function registerKnit(
         resolver,
         registry,
         getOutput: () => knitOutput,
-        runKnit: async (uri, exportController) => {
+        // `targetFormat` lets the export pipeline tell the underlying
+        // knit which YAML format block to consult for chunk options.
+        // Editor-toolbar Export → PDF passes 'pdf' so figures come from
+        // `pdf_document: { fig_width, dpi, ... }` instead of HTML
+        // defaults; same for 'docx'. See runKnitWithExistingController
+        // for the design intent.
+        runKnit: async (uri, exportController, targetFormat) => {
             return await runKnitWithExistingController(
                 uri,
                 knitOutput,
@@ -174,6 +180,7 @@ export function registerKnit(
                     runPostKnitRender: postKnitRender,
                 },
                 exportController,
+                targetFormat,
             );
         },
         notifyExportBusy: (rmdAbsPath, busy) => {

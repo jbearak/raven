@@ -167,6 +167,35 @@ describe('export commands', () => {
         });
     });
 
+    it('passes the export target format to the underlying knit', async () => {
+        // Regression for the editor-toolbar PDF/Word export bug: the
+        // knit was hard-coded to 'html' so target-specific YAML like
+        // `pdf_document: { fig_width, dpi }` was ignored in favour of
+        // `html_document` defaults. The export pipeline must thread
+        // its target format through so the right format block wins.
+        await withTempDir(async (dir) => {
+            const { runExport } = await loadExportCommands();
+            const rmdPath = writeRmd(dir);
+            const previewPaths = previewArtifactPaths(rmdPath);
+            const registry = new OperationRegistry();
+            const seenFormats: string[] = [];
+
+            await runExport(fileUri(rmdPath), 'pdf', {
+                resolver: { resolve: async () => fakePandocExecutable(dir) },
+                registry,
+                getOutput: () => outputChannel(),
+                runKnit: async (_uri: unknown, _controller: OperationController, targetFormat: string) => {
+                    seenFormats.push(targetFormat);
+                    await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });
+                    await fs.promises.writeFile(previewPaths.mdPath, '# knitted\n');
+                    return { ok: true };
+                },
+            }, { entry: 'editor-toolbar' });
+
+            expect(seenFormats).toEqual(['pdf']);
+        });
+    });
+
     it('accepts uppercase .RMD files from registered export commands', async () => {
         await withTempDir(async (dir) => {
             const { registerExportCommands } = await loadExportCommands();

@@ -59,10 +59,21 @@ export interface ExportDeps {
      * whether the knit actually produced complete `.md` content; a
      * cancelled / failed / timed-out knit can leave a partial file
      * that would otherwise pass a bare `fs.existsSync` check.
+     *
+     * `targetFormat` tells the underlying knit which YAML `output:`
+     * block to consult for chunk options. Editor-toolbar PDF/Word
+     * exports pass 'pdf' / 'docx' so figures come from
+     * `pdf_document` / `word_document` settings, not from
+     * `html_document` defaults.
+     *
      * Production wires this to `runKnitWithExistingController`; tests
      * override.
      */
-    runKnit: (uri: vscode.Uri, exportController: OperationController) => Promise<{ ok: boolean }>;
+    runKnit: (
+        uri: vscode.Uri,
+        exportController: OperationController,
+        targetFormat: TargetFormat,
+    ) => Promise<{ ok: boolean }>;
     /**
      * Push the webview Export button's busy state. Production wires this
      * to `KnitOutputPanel.notifyExportBusy`; tests can omit (or stub) it.
@@ -244,7 +255,12 @@ async function runExportInner(
         controller.updatePhase('knitting');
         let knitResult: { ok: boolean };
         try {
-            knitResult = await deps.runKnit(rmd, controller);
+            // Pass the export target so the underlying knit picks
+            // chunk options from `pdf_document` / `word_document` /
+            // `html_document` to match — otherwise a PDF export
+            // would knit with HTML's defaults and Pandoc would
+            // convert HTML-sized figures into the wrong target.
+            knitResult = await deps.runKnit(rmd, controller, format);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             output.appendLine(`[Export] knit failed: ${msg}`);

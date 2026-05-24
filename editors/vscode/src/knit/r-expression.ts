@@ -180,8 +180,14 @@ const DEV_ALLOWLIST: ReadonlySet<string> = new Set([
  *     `knitRootDir` is null we pin `root.dir` to `getwd()` so chunk
  *     evaluation happens in the subprocess CWD (matches the `current`
  *     mode contract).
- *   - `output = …` makes the .md path deterministic so the TS-side
- *     renderer knows where to find it.
+ *   - knitr writes to `<outputPath>.tmp` and we `file.rename` to the
+ *     real `outputPath` on success. R's `file.rename` is atomic on
+ *     POSIX and uses `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on
+ *     Windows. A cancelled / failed / timed-out knit leaves the
+ *     partial `.md.tmp` behind but the destination `.md` either
+ *     contains the previous successful output or doesn't exist — so
+ *     downstream consumers (webview Export ▾) cannot pick up a
+ *     half-written file.
  *   - `envir = new.env()` isolates chunk evaluation, matching
  *     rmarkdown's default.
  *   - `quiet = TRUE` suppresses knitr's per-chunk progress output;
@@ -189,7 +195,8 @@ const DEV_ALLOWLIST: ReadonlySet<string> = new Set([
  *     line we emit.
  *   - `cat('Output created: …')` keeps the existing
  *     `parseRenderedOutputPath` contract — the classifier doesn't
- *     care that knitr (not pandoc) is the producer.
+ *     care that knitr (not pandoc) is the producer. We emit the
+ *     real `output` path, not the `.tmp` sidecar.
  *
  * Each interpolated value is validated before escaping (see module
  * docstring), so the caller can rely on a clean throw rather than a
@@ -262,12 +269,15 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
         ` knitr::opts_knit$set(root.dir = ${rootDirLiteral}, base.dir = ${baseDirLit});`,
         ` knitr::opts_chunk$set(fig.path = ${figPathLit});`,
         yamlOptsChunk,
-        ` out <- knitr::knit(`,
+        ` __raven_output <- ${outputLit};`,
+        ` __raven_tmp_output <- paste0(__raven_output, '.tmp');`,
+        ` knitr::knit(`,
         `input = ${inputLit},`,
-        ` output = ${outputLit},`,
+        ` output = __raven_tmp_output,`,
         ` envir = new.env(),`,
         ` quiet = TRUE);`,
-        ` cat('Output created: ', out, '\\n', sep = '')`,
+        ` file.rename(__raven_tmp_output, __raven_output);`,
+        ` cat('Output created: ', __raven_output, '\\n', sep = '')`,
         ' })',
     ].join('');
 }

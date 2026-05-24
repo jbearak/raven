@@ -249,7 +249,7 @@ PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
 | `toc`, `toc_depth` | Pandoc `--toc` / `--toc-depth` (export only) |
 | `number_sections` | Pandoc `--number-sections` (export only) |
 | `highlight` | Pandoc `--highlight-style` (export only; validated against the known list) |
-| `self_contained` | Pandoc `--embed-resources --standalone` |
+| `self_contained` | Pandoc `--embed-resources` for HTML export (HTML defaults to embedded resources; set `self_contained: false` to opt out and emit separate `figure/` assets next to the HTML). Ignored for PDF/Word. |
 | `css` | Pandoc `--css=<absolute path>` (containment-checked against the workspace folder / .Rmd parent) |
 | `mathjax` | Pandoc `--mathjax` |
 | `pandoc_args` | Appended verbatim to the Pandoc argv during export (after Raven's own flags), except entries that set destination (`-o`, `--output`) or output format (`-t`, `--to`, `-w`, `--write`) — those are stripped because the editor menu owns them. Stripped entries are logged to the `Raven: Knit` output channel. Preview never invokes Pandoc, so `pandoc_args` does not affect preview output. |

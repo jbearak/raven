@@ -11,14 +11,20 @@ const emptyOpts: OutputOptions = {
 };
 
 describe('buildPandocArgs', () => {
-    it('produces minimal args for HTML', () => {
+    it('produces minimal args for HTML (default embeds resources)', () => {
+        // HTML exports must default to --embed-resources because the
+        // figure/ directory lives in Raven's temp preview dir, which
+        // disappears when the panel closes. A non-embedded HTML would
+        // be left with broken image links pointing at a missing path.
         const args = buildPandocArgs(emptyOpts, 'html', {
             mdPath: 'in.md',
             outPath: 'out.html',
             sourceDir: '/p',
             containmentRoot: '/p',
         });
-        expect(args).toEqual(['in.md', '-o', 'out.html', '--to', 'html5', '--standalone']);
+        expect(args).toEqual([
+            'in.md', '-o', 'out.html', '--to', 'html5', '--standalone', '--embed-resources',
+        ]);
     });
 
     it('produces minimal args for PDF with xelatex default', () => {
@@ -79,7 +85,7 @@ describe('buildPandocArgs', () => {
         expect(result.droppedCss).toContain('../../../../etc/passwd');
     });
 
-    it('appends --embed-resources --standalone for self_contained', () => {
+    it('keeps --embed-resources when self_contained: true is explicit', () => {
         const o: OutputOptions = { ...emptyOpts, pandocFlags: { self_contained: true } };
         const args = buildPandocArgs(o, 'html', {
             mdPath: 'in.md',
@@ -89,6 +95,40 @@ describe('buildPandocArgs', () => {
         });
         expect(args).toContain('--embed-resources');
         expect(args).toContain('--standalone');
+    });
+
+    it('omits --embed-resources for HTML when self_contained is explicitly false', () => {
+        const o: OutputOptions = { ...emptyOpts, pandocFlags: { self_contained: false } };
+        const args = buildPandocArgs(o, 'html', {
+            mdPath: 'in.md',
+            outPath: 'out.html',
+            sourceDir: '/p',
+            containmentRoot: '/p',
+        });
+        expect(args).toContain('--standalone');
+        expect(args).not.toContain('--embed-resources');
+    });
+
+    it('does not add --embed-resources for PDF / DOCX exports', () => {
+        // self_contained is HTML-specific; PDF and DOCX naturally
+        // package their assets and Pandoc doesn't take --embed-resources
+        // for those targets.
+        const o: OutputOptions = { ...emptyOpts, pandocFlags: { self_contained: true } };
+        const pdfArgs = buildPandocArgs(o, 'pdf', {
+            mdPath: 'in.md',
+            outPath: 'out.pdf',
+            sourceDir: '/p',
+            containmentRoot: '/p',
+            pdfEngine: 'xelatex',
+        });
+        expect(pdfArgs).not.toContain('--embed-resources');
+        const docxArgs = buildPandocArgs(o, 'docx', {
+            mdPath: 'in.md',
+            outPath: 'out.docx',
+            sourceDir: '/p',
+            containmentRoot: '/p',
+        });
+        expect(docxArgs).not.toContain('--embed-resources');
     });
 
     it('appends --highlight-style when present', () => {
@@ -137,7 +177,7 @@ describe('buildPandocArgs', () => {
             containmentRoot: '/p',
         });
         expect(args).toEqual([
-            'in.md', '-o', 'out.html', '--to', 'html5', '--standalone',
+            'in.md', '-o', 'out.html', '--to', 'html5', '--standalone', '--embed-resources',
             '--shift-heading-level-by=1', '--wrap=auto',
         ]);
     });
