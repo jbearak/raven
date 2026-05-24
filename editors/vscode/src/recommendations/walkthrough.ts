@@ -48,7 +48,7 @@ async function createSampleRmd(): Promise<void> {
     const candidate = await pickFreeSampleUri(baseUri);
     if (!candidate) {
         await vscode.window.showErrorMessage(
-            'Raven: Knit — too many sample files in this directory; clean some up before creating another.',
+            'Raven: Knit Preview — too many sample files in this directory; clean some up before creating another.',
         );
         return;
     }
