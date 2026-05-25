@@ -33,6 +33,23 @@ main {
      * text-bearing button) from silently re-introducing the multi-row
      * wrap that the icon-only layout exists to prevent. */
     flex-wrap: nowrap;
+    /* `overflow-x: auto` is the safety net for very narrow panel widths
+     * where the sum of intrinsic button widths exceeds the viewport.
+     * Without it, `main { overflow: hidden }` (styles.css line 15) would
+     * SILENTLY clip the rightmost buttons (share, external, theme
+     * toggle) and users would have no path to copy/export. With it, the
+     * toolbar becomes wheel/touch-scrollable instead. The visible
+     * scrollbar is suppressed below (`scrollbar-width: none` +
+     * `::-webkit-scrollbar { display: none }`) because a scrollbar on
+     * the 28px-tall toolbar would consume disproportionate height; the
+     * trackpad/wheel gesture is the intended access path. */
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+}
+
+.toolbar::-webkit-scrollbar {
+    display: none;
 }
 
 .toolbar button {
@@ -90,30 +107,34 @@ main {
     width: 16px;
     height: 16px;
     display: block;
-    /* `pointer-events: none` is load-bearing for the native `title=`
-     * tooltip on the parent button. Without it, the SVG (which fills
-     * the entire button interior at 16x16) intercepts pointer hover
-     * events; the button never receives a hover and the browser-chrome
-     * tooltip never appears. Letting events pass through to the button
-     * also keeps the `:hover` style and the popovertarget click target
-     * working when the cursor happens to land on a stroke pixel. */
+    /* `pointer-events: none` makes every click/hover on the SVG fall
+     * through to the parent <button>, so `event.target` is always the
+     * button itself — never the inner `<svg>` or `<path>`. That gives
+     * a deterministic click target for the button's `popovertarget`
+     * activation and any future event handler that inspects
+     * `event.target` / `event.composedPath()[0]`. (Note: native
+     * `title=` tooltips and CSS `:hover` BOTH walk the ancestor chain,
+     * so they would still work without this rule — the load-bearing
+     * benefit is target identity, not hover/tooltip propagation.) */
     pointer-events: none;
 }
 
-/* Popover for the collapsed share menu (mode === 'share-menu'). Uses
+/* Popover for the collapsed share menu (Copy / PNG / SVG / PDF). Uses
  * the HTML popover API: `popover="auto"` gives light-dismiss on outside
- * click and Escape; we position it via JS in `on_share_popover_toggle`
- * since CSS anchor positioning isn't reliable in older Electron-based
- * VS Code builds. Stack of secondary buttons matches the toolbar
- * styling so the popover reads as an extension of the row. */
+ * click and Escape; we position it via JS in
+ * `on_share_popover_beforetoggle` (App.svelte) since CSS anchor
+ * positioning isn't reliable in older Electron-based VS Code builds.
+ * Stack of secondary buttons matches the toolbar styling so the popover
+ * reads as an extension of the row. */
 .share-popover {
     position: fixed;
     /* Override the browser UA stylesheet's `[popover] { inset: 0;
      * margin: auto }` which would otherwise center the popover and
-     * cause our JS-applied `top`/`right` values to fight against the
-     * defaulted `left: 0; bottom: 0`. With `inset: auto`, only the two
-     * sides JS sets in `on_share_popover_toggle` define position; width
-     * sizes to content via the browser's default `width: fit-content`. */
+     * cause our JS-applied `top`/`left` values to fight against the
+     * defaulted `right: 0; bottom: 0`. With `inset: auto`, only the
+     * sides JS sets in `on_share_popover_beforetoggle` define position;
+     * width sizes to content via the browser's default
+     * `width: fit-content`. */
     inset: auto;
     margin: 0;
     padding: 4px;
