@@ -1,0 +1,13 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "rootDir": "../../..",
+    "noEmit": true,
+    "types": [],
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["**/*.ts", "../../plot/webview/sanitize.ts", "../../plot/webview/tag-backgrounds.ts"],
+  "exclude": ["../../../node_modules"]
+}

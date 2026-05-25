@@ -286,7 +286,7 @@ PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
 
 | Key | Where it's applied |
 |---|---|
-| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting. For HTML targets (preview and HTML export) Raven defaults `dev = 'svg'` when YAML doesn't set one — inline SVG is what lets the **Apply VS Code theme** toggle recolor R plots. Set `dev:` explicitly in YAML (e.g., `dev: png`) to opt out. Non-HTML targets (PDF, Word) use knitr's PNG default unchanged. Per-chunk `{r dev='png'}` overrides still win. |
+| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting. For HTML targets (preview and HTML export) Raven defaults `dev = 'svglite'` when YAML doesn't set one — svglite with `web_fonts = TRUE` produces inline SVG with real `<text>` elements and a structure the **Apply VS Code theme** toggle can actually recolor. If the `svglite` R package isn't installed, Raven falls back to `dev = 'svg'` (the built-in Cairo device) — plots still render, but the theme overlay can only partially apply. Set `dev:` explicitly in YAML (e.g., `dev: png`) to opt out. Non-HTML targets (PDF, Word) use knitr's PNG default unchanged. Per-chunk `{r dev='png'}` overrides still win. |
 | `toc`, `toc_depth` | Pandoc `--toc` / `--toc-depth` (export only) |
 | `number_sections` | Pandoc `--number-sections` (export only) |
 | `highlight` | Pandoc `--highlight-style` (export only; validated against the known list) |

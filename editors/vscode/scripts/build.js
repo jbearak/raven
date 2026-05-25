@@ -67,6 +67,34 @@ async function buildSvelteWebview(name, entry) {
 }
 
 /**
+ * Build a plain (non-Svelte / non-React) JS webview bundle. Used by the
+ * Knit Output panel's SVG plot processor, which reuses the plot viewer's
+ * `sanitize_svg` + `tag_background_rects` modules from
+ * `src/plot/webview/`. The bundle is loaded as an external <script> in
+ * the shell HTML (the shell itself is template-string JS, but we
+ * delegate the SVG processing to this bundle so we don't reimplement
+ * DOMPurify-based sanitization or the structural background-rect tagger).
+ *
+ * @param {string} name        - Output directory name under dist/webviews/.
+ * @param {string} entry       - Absolute path to the webview entry point.
+ * @param {string} globalName  - Identifier the IIFE assigns its exports to on `window`.
+ */
+async function buildJsWebview(name, entry, globalName) {
+    const webviewDist = path.join(dist, 'webviews', name);
+    await esbuild.build({
+        entryPoints: [entry],
+        bundle: true,
+        platform: 'browser',
+        target: 'chrome108',
+        format: 'iife',
+        globalName,
+        sourcemap: true,
+        outfile: path.join(webviewDist, 'index.js'),
+        logLevel: 'info',
+    });
+}
+
+/**
  * Build a React webview bundle.
  *
  * @param {string} name   - Output directory name under dist/webviews/ (e.g. 'data-viewer').
@@ -119,6 +147,11 @@ function copyOnigWasm() {
             buildReactWebview(
                 'data-viewer',
                 path.join(root, 'src', 'data-viewer', 'webview', 'main.tsx'),
+            ),
+            buildJsWebview(
+                'knit-svg',
+                path.join(root, 'src', 'knit', 'webview', 'svg-processor.ts'),
+                'RavenKnitSvg',
             ),
         ]);
         copyOnigWasm();

@@ -163,7 +163,7 @@ export interface KnitExpressionInput {
  * matter parser somehow let it through.
  */
 const DEV_ALLOWLIST: ReadonlySet<string> = new Set([
-    'png', 'pdf', 'svg', 'jpeg', 'cairo_pdf',
+    'png', 'pdf', 'svg', 'svglite', 'jpeg', 'cairo_pdf',
 ]);
 
 /**
@@ -254,11 +254,39 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
         namedArgs.push('dpi = .raven_dpi');
     }
     if (co.dev !== undefined) {
-        // co.dev passed DEV_ALLOWLIST above; `escapeRString` is the
-        // single-quoted-literal wrapper. The assignment puts it on the
-        // R side; the `opts_chunk$set` call references the local var.
-        assigns.push(`.raven_dev <- ${escapeRString(co.dev)}`);
-        namedArgs.push('dev = .raven_dev');
+        if (co.dev === 'svglite') {
+            // svglite produces SVG output whose structure matches what
+            // the plot viewer's theme overlay was tuned for: outer canvas
+            // rect as the first <rect> child of <svg>, panel.background
+            // as a direct child of <g> with no stroke-linejoin/linecap.
+            // Cairo's `svg` device wraps both rects deeper inside clip-
+            // path groups and emits text as <symbol>+<use> glyph paths
+            // (instead of <text>), which (a) defeats the structural bg-
+            // rect tagger and (b) makes CSS font-family overrides
+            // ineffective. svglite + web_fonts=TRUE produces real <text>
+            // elements and a structure the overlay recoloring CSS can
+            // actually reach.
+            //
+            // If svglite isn't installed, fall back to 'svg' so the knit
+            // still succeeds — the user just gets the same Cairo SVG that
+            // used to render before this feature landed (plot visible,
+            // toggle theming partial). web_fonts is only set when the
+            // installed svglite supports the argument (svglite v2+).
+            assigns.push(
+                `.raven_dev <- if (requireNamespace('svglite', quietly = TRUE)) 'svglite' else 'svg'`,
+            );
+            assigns.push(
+                `.raven_dev_args <- if (.raven_dev == 'svglite' && 'web_fonts' %in% names(formals(svglite::svglite))) list(web_fonts = TRUE) else list()`,
+            );
+            namedArgs.push('dev = .raven_dev');
+            namedArgs.push('dev.args = .raven_dev_args');
+        } else {
+            // co.dev passed DEV_ALLOWLIST above; `escapeRString` is the
+            // single-quoted-literal wrapper. The assignment puts it on the
+            // R side; the `opts_chunk$set` call references the local var.
+            assigns.push(`.raven_dev <- ${escapeRString(co.dev)}`);
+            namedArgs.push('dev = .raven_dev');
+        }
     }
     const yamlOptsChunk = assigns.length > 0
         ? ` ${assigns.join('; ')}; knitr::opts_chunk$set(${namedArgs.join(', ')});`

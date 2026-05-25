@@ -178,7 +178,7 @@ function stripPandocArgs(raw: unknown): { kept: string[]; dropped: string[] } {
     return { kept, dropped };
 }
 
-const DEV_ALLOWLIST = new Set(['png', 'pdf', 'svg', 'jpeg', 'cairo_pdf']);
+const DEV_ALLOWLIST = new Set(['png', 'pdf', 'svg', 'svglite', 'jpeg', 'cairo_pdf']);
 const HIGHLIGHT_ALLOWLIST = new Set([
     'pygments',
     'tango',
@@ -307,20 +307,34 @@ export function parseOutputOptions(fm: FrontmatterDoc, target: TargetFormat): Ou
 }
 
 /**
- * Return `chunkOpts` with `dev` defaulted to `'svg'` if the YAML didn't set
- * one. Used by the HTML knit paths (preview and HTML export) so plots are
- * rendered as inline SVG. Inline SVG is the substrate that lets the Knit
- * Output panel's "Apply VS Code theme" toggle recolor plot text and strokes
- * to match the editor theme — CSS does not cascade into `<img>`-loaded
- * SVG, and a PNG bitmap cannot be recolored by CSS at all. Non-HTML
- * targets (PDF, Word) intentionally do NOT use this default; their R-side
- * defaults (knitr's PNG) and YAML overrides win unchanged.
+ * Return `chunkOpts` with `dev` defaulted to `'svglite'` if the YAML
+ * didn't set one. Used by the HTML knit paths (preview and HTML export)
+ * so plots are rendered as inline SVG with a structure the Knit Output
+ * panel's "Apply VS Code theme" overlay can actually recolor.
  *
- * Chunks that explicitly set `dev` via per-chunk options
- * (`{r dev='png'}`) still win at knit time — `opts_chunk$set` is a
- * document-wide default and chunk headers override it.
+ * Why svglite, not the built-in 'svg' (Cairo) device:
+ *   - svglite emits the outer canvas rect as the first <rect> child of
+ *     <svg> and the panel background as a direct child of <g> with no
+ *     stroke-linejoin/linecap — the exact structure the plot viewer's
+ *     `tag_background_rects` heuristic was tuned for. Cairo wraps both
+ *     deeper inside clip-path groups, defeating the structural tag.
+ *   - svglite (with web_fonts = TRUE, which buildKnitExpression
+ *     auto-enables when the installed svglite supports it) renders
+ *     text as real <text> elements that the CSS font-family override
+ *     can actually re-flow. Cairo renders text as <symbol>+<use> glyph
+ *     paths, which look like the original font regardless of CSS.
+ *   - If svglite isn't installed, the R-side fallback in
+ *     buildKnitExpression downgrades to 'svg' so the knit still
+ *     succeeds — the user just sees the same partially-themed plot
+ *     that pre-svglite users get.
+ *
+ * Non-HTML targets (PDF, Word) intentionally do NOT use this default;
+ * their R-side defaults (knitr's PNG) and YAML overrides win unchanged.
+ * Per-chunk `{r dev='png'}` overrides still win at knit time —
+ * `opts_chunk$set` is a document-wide default and chunk headers
+ * override it.
  */
 export function withSvgDevDefault(opts: ChunkOpts): ChunkOpts {
     if (opts.dev !== undefined) return opts;
-    return { ...opts, dev: 'svg' };
+    return { ...opts, dev: 'svglite' };
 }

@@ -217,13 +217,14 @@ describe('parseOutputOptions', () => {
 });
 
 describe('withSvgDevDefault', () => {
-    it('injects dev=svg when not set', () => {
-        expect(withSvgDevDefault({})).toEqual({ dev: 'svg' });
+    it('injects dev=svglite when not set', () => {
+        expect(withSvgDevDefault({})).toEqual({ dev: 'svglite' });
     });
 
     it('preserves an existing dev value', () => {
         expect(withSvgDevDefault({ dev: 'png' })).toEqual({ dev: 'png' });
         expect(withSvgDevDefault({ dev: 'pdf' })).toEqual({ dev: 'pdf' });
+        expect(withSvgDevDefault({ dev: 'svg' })).toEqual({ dev: 'svg' });
         expect(withSvgDevDefault({ dev: 'cairo_pdf' })).toEqual({ dev: 'cairo_pdf' });
     });
 
@@ -233,7 +234,7 @@ describe('withSvgDevDefault', () => {
             fig_width: 8,
             fig_height: 5,
             dpi: 300,
-            dev: 'svg',
+            dev: 'svglite',
         });
     });
 

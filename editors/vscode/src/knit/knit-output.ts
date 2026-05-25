@@ -332,6 +332,17 @@ export function buildShellHtml(args: {
      * local-workspace rendering.
      */
     isRemoteWorkspace?: boolean;
+    /**
+     * `webview.asWebviewUri(...)` for the bundled SVG processor at
+     * `dist/webviews/knit-svg/index.js`. The shell loads this as an
+     * external <script> so the iframe-load promotion pass can call
+     * `window.RavenKnitSvg.processKnitPlotSvg(svgText)` — the bundle
+     * wraps the plot viewer's `sanitize_svg` + `tag_background_rects`
+     * modules (no reimplementation in the template-string shell).
+     * Optional only to keep test-side `buildShellHtml` callers
+     * compiling; production passes a non-empty URI string.
+     */
+    knitSvgScriptUri?: string;
 }): string {
     const {
         htmlContent,
@@ -343,6 +354,7 @@ export function buildShellHtml(args: {
         vscodeThemePaletteCss,
         vscodeFontFamiliesCss,
         isRemoteWorkspace = false,
+        knitSvgScriptUri,
     } = args;
     // path.basename handles both POSIX and Windows separators.
     const lastSep = Math.max(outputPath.lastIndexOf('/'), outputPath.lastIndexOf('\\'));
@@ -518,7 +530,17 @@ export function buildShellHtml(args: {
     <button type="button" role="menuitem" data-action="select-all">Select All</button>
     <button type="button" role="menuitem" data-action="open-in-browser"${isRemoteWorkspace ? ' hidden' : ''}>Open in Browser</button>
   </div>
-  <script nonce="${nonce}">
+${
+    // The SVG-processor bundle (sanitize_svg + tag_background_rects from
+    // the plot viewer's modules) is loaded as an external script with the
+    // same nonce as the inline script below. The nonce gates both inline
+    // and external <script> evaluation under `script-src 'nonce-${nonce}'`,
+    // so we don't need to widen the CSP. Tests that call buildShellHtml
+    // without `knitSvgScriptUri` skip the tag entirely.
+    typeof knitSvgScriptUri === 'string' && knitSvgScriptUri.length > 0
+        ? `  <script nonce="${nonce}" src="${escapeHtml(knitSvgScriptUri)}"></script>\n`
+        : ''
+}  <script nonce="${nonce}">
     (function () {
       const vscode = acquireVsCodeApi();
       const iframe = document.getElementById('raven-knit-frame');
@@ -787,206 +809,26 @@ export function buildShellHtml(args: {
       });
 
       // Promote <img data-raven-knit-plot> elements to inline <svg> so
-      // the applyTheme() CSS overlay can recolor them. The host-side
-      // inlineLocalImagesAsDataUrls writes knit-emitted SVG figures as
-      // <img src=data:image/svg+xml;base64,...  data-raven-knit-plot=1>.
-      // Parent CSS does NOT cascade into <img>-loaded SVG regardless of
-      // URL scheme, which is why the plot viewer also switched to inline
-      // SVG (see App.svelte). We replicate that substrate switch here.
+      // the applyTheme() CSS overlay can recolor them.
       //
-      // This runs in the webview rather than on the host because the
-      // host runs in Node where esbuild bundles jsdom inline, and
-      // jsdom's XMLHttpRequest-impl.js calls require.resolve for
-      // ./xhr-sync-worker.js at top-level load time, which throws
-      // inside the bundled context. The iframe already has a real DOM
-      // we can borrow for parsing and walking the SVG.
+      // The host-side inlineLocalImagesAsDataUrls writes knit-emitted
+      // SVG figures as <img src=data:image/svg+xml;base64,...
+      // data-raven-knit-plot=1>. Parent CSS does NOT cascade into
+      // <img>-loaded SVG regardless of URL scheme, which is why the
+      // plot viewer also switched to inline SVG (see App.svelte). We
+      // mirror that substrate switch here.
       //
-      // Sanitization: we strip the same elements and attributes
-      // DOMPurify's SVG profile would (script, style, foreignObject,
-      // a, use, image, feImage; style and on* attributes; href values
-      // starting with javascript: or data:text/html). The threat model
-      // matches the plot viewer's: defense in depth, not the primary
-      // boundary. Primary boundaries are (a) the iframe sandbox
-      // attribute allow-same-origin blocks script execution; (b) the
-      // panel CSP (default-src none, style-src cspSource 'unsafe-
-      // inline', connect-src none) blocks external-resource exfil
-      // from style imports, anchor hrefs, and similar.
-      // Elements always removed. <use> is NOT in this list — knitr's
-      // dev=svg (Cairo) and svglite both emit text as <use href=#glyph>
-      // references to <symbol>s in <defs>, so a blanket <use> ban
-      // would erase every label, axis number, and title. We keep <use>
-      // but enforce a same-document href filter below so external-
-      // resource exfil via <use href=http://evil/> stays blocked.
-      var KNIT_PLOT_FORBID_TAGS = {
-        script: 1, style: 1, foreignobject: 1, a: 1,
-        image: 1, feimage: 1,
-      };
-      // Safe SVG presentation properties we migrate from inline
-      // style= into matching attributes BEFORE stripping style=.
-      // Mirrors the SAFE_STYLE_PROPS list in
-      // editors/vscode/src/plot/webview/sanitize.ts. Without this
-      // pre-pass, knitr's dev=svg (Cairo) output renders flat black on
-      // transparent because Cairo emits fill/stroke as style= rather
-      // than as attributes — and stripping style= would lose every
-      // color and font setting in the plot.
-      var KNIT_PLOT_SAFE_STYLE_PROPS = {
-        'fill': 1, 'fill-opacity': 1, 'fill-rule': 1,
-        'stroke': 1, 'stroke-width': 1, 'stroke-linecap': 1,
-        'stroke-linejoin': 1, 'stroke-dasharray': 1, 'stroke-dashoffset': 1,
-        'stroke-miterlimit': 1, 'stroke-opacity': 1,
-        'opacity': 1,
-        'font-size': 1, 'font-family': 1, 'font-style': 1,
-        'font-weight': 1, 'font-variant': 1,
-        'text-anchor': 1, 'dominant-baseline': 1, 'alignment-baseline': 1,
-        'color': 1, 'visibility': 1,
-      };
-      function isUnsafeStyleValue(v) {
-        // Reject any value containing a network-fetching function,
-        // CSS at-rule, JS URL, or CSS expression — the same screen
-        // the plot viewer's UNSAFE_VALUE_RE applies.
-        return /url\\s*\\(|expression\\s*\\(|javascript:|@/i.test(v);
-      }
-      function migrateInlineStylesToAttrs(svg) {
-        // For each surviving element, parse its style= attribute and
-        // promote safe declarations to actual attributes. Then strip
-        // style=. Done as a DOM walk so we don't have to re-serialize
-        // the SVG and re-parse it. The plot viewer does the equivalent
-        // as a regex pre-pass on the SVG text; we already have the DOM,
-        // so walking attrs is the cheaper path.
-        var walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
-        var current = svg;
-        do {
-          if (current.hasAttribute && current.hasAttribute('style')) {
-            var raw = current.getAttribute('style') || '';
-            var decls = raw.split(';');
-            for (var d = 0; d < decls.length; d++) {
-              var colon = decls[d].indexOf(':');
-              if (colon < 0) continue;
-              var prop = decls[d].slice(0, colon).trim().toLowerCase();
-              var value = decls[d].slice(colon + 1).trim();
-              if (!prop || !value) continue;
-              if (!KNIT_PLOT_SAFE_STYLE_PROPS[prop]) continue;
-              if (isUnsafeStyleValue(value)) continue;
-              // Don't clobber an existing attribute (inline style=
-              // and an attr together is rare but the explicit attr
-              // wins per SVG specificity).
-              if (!current.hasAttribute(prop)) {
-                current.setAttribute(prop, value);
-              }
-            }
-            current.removeAttribute('style');
-          }
-          current = walker.nextNode();
-        } while (current);
-      }
-      function isUnsafeHrefValue(v) {
-        if (typeof v !== 'string') return false;
-        // javascript:, data:text/html, and other risky schemes inside
-        // an SVG href/xlink:href. We are conservative; any javascript:
-        // or data:text/html token is treated as forbidden regardless
-        // of leading whitespace or character casing.
-        return /^\\s*(?:javascript|data:text\\/html)/i.test(v);
-      }
-      function isExternalHref(v) {
-        // <use> elements are only allowed to reference same-document
-        // symbols (#glyph-N). Anything that resolves elsewhere is
-        // treated as an attempted external-resource fetch.
-        if (typeof v !== 'string') return true;
-        var t = v.trim();
-        if (t.length === 0) return true;
-        return t.charAt(0) !== '#';
-      }
-      function sanitizeKnitPlotSvg(svg) {
-        // Pre-pass: migrate inline style= declarations to attributes
-        // BEFORE the attribute strip removes them. svglite/Cairo emit
-        // fill, stroke, font-family etc. as inline styles, not as
-        // attributes — stripping style= without this migration would
-        // erase every color and font in the plot.
-        migrateInlineStylesToAttrs(svg);
-        // First pass: walk the SVG subtree and collect elements to
-        // remove. Iterate via NodeFilter.SHOW_ELEMENT so the walk
-        // visits every descendant once. We accumulate into an array
-        // because removing nodes mid-walk invalidates the
-        // TreeWalker's position.
-        var toRemove = [];
-        var walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
-        var node = walker.nextNode();
-        while (node) {
-          var name = node.tagName && node.tagName.toLowerCase();
-          if (name && KNIT_PLOT_FORBID_TAGS[name]) {
-            toRemove.push(node);
-          } else if (name === 'use') {
-            // Tag-allowed, href-checked: external hrefs are the
-            // exfil vector, same-document references are how svglite/
-            // Cairo emit text glyphs.
-            var href = node.getAttribute('href')
-                || node.getAttribute('xlink:href')
-                || '';
-            if (isExternalHref(href)) toRemove.push(node);
-          }
-          node = walker.nextNode();
-        }
-        for (var i = 0; i < toRemove.length; i++) {
-          var el = toRemove[i];
-          if (el.parentNode) el.parentNode.removeChild(el);
-        }
-        // Second pass: strip on* event-handler attributes and any
-        // remaining unsafe href values from every surviving element.
-        // (style= was already removed by migrateInlineStylesToAttrs.)
-        walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
-        var current = svg;
-        do {
-          var attrs = current.attributes;
-          if (attrs) {
-            var stripAttrs = [];
-            for (var j = 0; j < attrs.length; j++) {
-              var an = attrs[j].name.toLowerCase();
-              if (an.indexOf('on') === 0) {
-                stripAttrs.push(attrs[j].name);
-              } else if ((an === 'href' || an === 'xlink:href')
-                         && isUnsafeHrefValue(attrs[j].value)) {
-                stripAttrs.push(attrs[j].name);
-              }
-            }
-            for (var k = 0; k < stripAttrs.length; k++) {
-              current.removeAttribute(stripAttrs[k]);
-            }
-          }
-          current = walker.nextNode();
-        } while (current);
-      }
-      function tagKnitPlotBackgroundRects(svg) {
-        // Mirror the structural logic in
-        // editors/vscode/src/plot/webview/tag-backgrounds.ts:
-        //   Rule 1: the first <rect> direct child of <svg> is the outer
-        //           canvas — always tag.
-        //   Rule 2: a <rect> direct child of <g> with neither
-        //           stroke-linejoin nor stroke-linecap is a panel
-        //           background.
-        var rects = svg.querySelectorAll('rect');
-        for (var i = 0; i < rects.length; i++) {
-          var rect = rects[i];
-          var parent = rect.parentElement;
-          if (!parent) continue;
-          var pn = parent.localName ? parent.localName.toLowerCase() : '';
-          if (pn === 'svg') {
-            // Find the first <rect> direct child of <svg>.
-            var first = null;
-            for (var n = parent.firstElementChild; n; n = n.nextElementSibling) {
-              if (n.localName && n.localName.toLowerCase() === 'rect') {
-                first = n;
-                break;
-              }
-            }
-            if (rect === first) rect.classList.add('raven-bg');
-          } else if (pn === 'g') {
-            if (!rect.hasAttribute('stroke-linejoin')
-                && !rect.hasAttribute('stroke-linecap')) {
-              rect.classList.add('raven-bg');
-            }
-          }
-        }
-      }
+      // The actual SVG processing (DOMPurify sanitization, structural
+      // background-rect tagging, raven-knit-plot class on the root)
+      // is delegated to the bundled processor at
+      // dist/webviews/knit-svg/index.js, which exports
+      // window.RavenKnitSvg.processKnitPlotSvg. That bundle imports
+      // sanitize_svg and tag_background_rects directly from the plot
+      // viewer's modules so there is exactly one implementation of
+      // each: the reference impl the plot viewer has been hardening
+      // against real ggplot output. The shell loads the bundle with
+      // the same nonce as this inline script — both pass
+      // script-src 'nonce-...'.
       function decodeBase64DataUrl(src) {
         // src looks like "data:image/svg+xml;base64,<...>" possibly
         // followed by a "#fragment" suffix that we preserved
@@ -1007,6 +849,13 @@ export function buildShellHtml(args: {
       function promoteKnitPlotSvgs() {
         var doc = iframe.contentDocument;
         if (!doc) return;
+        // The bundle assigns its exports to window.RavenKnitSvg.
+        // If the bundle didn't load (network blip, missing dist/),
+        // skip promotion and leave the <img> in place — better a
+        // broken-image icon than a broken page.
+        var processor =
+          window.RavenKnitSvg && window.RavenKnitSvg.processKnitPlotSvg;
+        if (typeof processor !== 'function') return;
         var imgs = doc.querySelectorAll('img[data-raven-knit-plot]');
         for (var i = 0; i < imgs.length; i++) {
           var img = imgs[i];
@@ -1014,19 +863,12 @@ export function buildShellHtml(args: {
           if (src.indexOf('data:image/svg+xml') !== 0) continue;
           var svgText = decodeBase64DataUrl(src);
           if (!svgText) continue;
+          var processed = processor(svgText);
+          if (!processed) continue;
           var container = doc.createElement('div');
-          // innerHTML parses the SVG via the HTML parser, which the
-          // iframe's parser already exercises for srcdoc content —
-          // foreign-content insertion mode handles <svg>. Standard
-          // browser sanitization rules apply (script tags injected via
-          // innerHTML do NOT execute), so this is safe regardless of
-          // the explicit forbid-pass below.
-          container.innerHTML = svgText;
+          container.innerHTML = processed;
           var svg = container.querySelector('svg');
           if (!svg) continue;
-          sanitizeKnitPlotSvg(svg);
-          tagKnitPlotBackgroundRects(svg);
-          svg.classList.add('raven-knit-plot');
           if (img.parentNode) img.parentNode.replaceChild(svg, img);
         }
       }

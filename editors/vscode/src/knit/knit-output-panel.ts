@@ -374,6 +374,19 @@ export class KnitOutputPanel {
         column: vscode.ViewColumn,
     ): KnitOutputPanel {
         const key = args.sourceUri.fsPath;
+        // The Knit Output webview loads two kinds of local resources:
+        //   - The rendered .html and its sibling figure/ dir under
+        //     `rootDir` (the per-session preview temp dir).
+        //   - The bundled SVG processor at
+        //     `<extensionUri>/dist/webviews/knit-svg/index.js`, loaded
+        //     via a <script src=webview-uri> in the shell so the iframe-
+        //     load promotion can call into the plot viewer's sanitize +
+        //     bg-tag modules without reimplementing them inline.
+        // Both paths must be in `localResourceRoots`; VS Code's
+        // resource handler rejects any URI outside the listed roots.
+        const knitSvgBundleRoot = vscode.Uri.joinPath(
+            context.extensionUri, 'dist', 'webviews', 'knit-svg',
+        );
         const panel = vscode.window.createWebviewPanel(
             'raven.knitOutput',
             'Knit Output',
@@ -382,7 +395,7 @@ export class KnitOutputPanel {
                 enableScripts: true,
                 enableFindWidget: true,
                 retainContextWhenHidden: true,
-                localResourceRoots: [vscode.Uri.file(rootDir)],
+                localResourceRoots: [vscode.Uri.file(rootDir), knitSvgBundleRoot],
             },
         );
         const instance = new KnitOutputPanel(context, panel, rootDir, args);
@@ -664,6 +677,19 @@ export class KnitOutputPanel {
             isRemoteWorkspace:
                 typeof vscode.env.remoteName === 'string'
                 && vscode.env.remoteName.length > 0,
+            // The bundled SVG processor lives at
+            // <extensionUri>/dist/webviews/knit-svg/index.js — see
+            // `create` above for the matching localResourceRoots entry.
+            // The shell loads this as a nonce-gated <script> so the
+            // iframe-load promotion can hand decoded SVG bytes to the
+            // plot viewer's sanitize_svg + tag_background_rects modules
+            // without reimplementing either inline.
+            knitSvgScriptUri: this.panel.webview.asWebviewUri(
+                vscode.Uri.joinPath(
+                    this.context.extensionUri,
+                    'dist', 'webviews', 'knit-svg', 'index.js',
+                ),
+            ).toString(),
         });
         this.panel.title = `Knit Output: ${path.basename(args.outputPath)}`;
         // Fire-and-forget: re-render the shell first, then resolve

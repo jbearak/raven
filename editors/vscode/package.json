@@ -1923,7 +1923,7 @@
     "test": "vscode-test",
     "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
     "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p src/plot/webview && tsc --noEmit -p src/help/webview && tsc --noEmit -p src/data-viewer/webview"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p src/plot/webview && tsc --noEmit -p src/help/webview && tsc --noEmit -p src/data-viewer/webview && tsc --noEmit -p src/knit/webview"
   },
   "dependencies": {
     "@glideapps/glide-data-grid": "^6.0.3",
