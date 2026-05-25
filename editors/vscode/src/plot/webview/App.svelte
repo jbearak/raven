@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
+    import { onMount, onDestroy, untrack } from 'svelte';
     import {
         bg_for_fetch,
         initial_state,
@@ -19,7 +19,33 @@
     } from '../messages';
     import { isExtensionToWebviewMessage } from '../messages';
     import { sanitize_svg } from './sanitize';
+    import { compute_share_popover_position } from './share-popover-position';
     import { tag_background_rects } from './tag-backgrounds';
+
+    // Inlined codicon SVGs (from @vscode/codicons 0.0.45, MIT). Kept
+    // inline (rather than importing the font) so we don't add a runtime
+    // font dependency or change the webview CSP — `fill="currentColor"`
+    // makes them inherit the surrounding button's foreground colour.
+    //
+    // SECURITY INVARIANT: these constants are injected via {@html} (see
+    // template below), which bypasses Svelte's HTML escaping. They MUST
+    // remain pure, hand-vetted SVG with NO `<script>`, NO `<use>`, NO
+    // `<image>`, NO `<a>`, NO `<foreignObject>`, NO `<iframe>`, NO
+    // event-handler attributes (`onclick`, `onload`, …), and NO
+    // `href`/`xlink:href` attributes anywhere. The regression test
+    // `tests/bun/plot-webview-inline-icons.test.ts` enforces this — do
+    // NOT silence it by adding new dangerous elements here; instead,
+    // either keep this constant pure or route the new icon through
+    // `sanitize_svg` at module init.
+    const SYMBOL_COLOR_ICON =
+        '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M8.00101 1C4.13401 1 1.00101 3.8 1.00101 7.667C1.00101 8.956 2.04501 10 3.33401 10C4.75101 10 4.72101 9 6.00001 9C6.64401 9 7.00001 9.606 7.00001 10.25V11.5C7.00001 13.433 8.56701 15 10.5 15C13.653 15 14.999 11.215 14.999 8C14.999 4.134 11.866 1 8.00001 1H8.00101ZM10.5 14C9.12201 14 8.00001 12.878 8.00001 11.5V10.25C8.00001 8.967 7.14001 8 6.00001 8C5.04001 8 4.49801 8.412 4.13901 8.685C3.85401 8.902 3.72401 9 3.33401 9C2.59901 9 2.00101 8.402 2.00101 7.667C2.00101 4.436 4.58001 2 8.00101 2C11.309 2 14 4.692 14 8C14 10.412 13.068 14 10.501 14H10.5ZM12 11C12 11.552 11.552 12 11 12C10.448 12 10 11.552 10 11C10 10.448 10.448 10 11 10C11.552 10 12 10.448 12 11ZM13 8C13 8.552 12.552 9 12 9C11.448 9 11 8.552 11 8C11 7.448 11.448 7 12 7C12.552 7 13 7.448 13 8ZM6.00001 5C6.00001 5.552 5.55201 6 5.00001 6C4.44801 6 4.00001 5.552 4.00001 5C4.00001 4.448 4.44801 4 5.00001 4C5.55201 4 6.00001 4.448 6.00001 5ZM10 5C10 4.448 10.448 4 11 4C11.552 4 12 4.448 12 5C12 5.552 11.552 6 11 6C10.448 6 10 5.552 10 5ZM9.00001 4C9.00001 4.552 8.55201 5 8.00001 5C7.44801 5 7.00001 4.552 7.00001 4C7.00001 3.448 7.44801 3 8.00001 3C8.55201 3 9.00001 3.448 9.00001 4Z"/></svg>';
+    const SHARE_ICON =
+        '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M11.307 1.10533C11.1562 0.988085 10.9519 0.966945 10.7803 1.05085C10.6088 1.13475 10.5 1.30904 10.5 1.5V3.49274C10.4571 3.49456 10.4122 3.49701 10.3654 3.5002C9.96247 3.52766 9.41128 3.61105 8.82119 3.83704C8.11343 4.10809 7.34877 4.58508 6.72601 5.41126C6.10338 6.23727 5.64499 7.38259 5.50206 8.95474C5.48301 9.16438 5.5973 9.36351 5.78793 9.4528C5.97857 9.54209 6.20471 9.50241 6.35356 9.35356C7.54248 8.16464 8.72298 7.57773 9.59562 7.28685C9.9558 7.16679 10.2643 7.09693 10.5 7.0563V9C10.5 9.1969 10.6156 9.37546 10.7952 9.45612C10.9748 9.53678 11.185 9.50452 11.3322 9.37371L15.8322 5.37371C15.9432 5.27502 16.0046 5.13207 15.9997 4.98361C15.9949 4.83514 15.9242 4.69653 15.807 4.60533L11.307 1.10533ZM10.9429 4.49679L10.9457 4.49705C11.0865 4.51223 11.2279 4.46706 11.3335 4.37257C11.4394 4.27772 11.5 4.14223 11.5 4V2.52232L14.7186 5.02564L11.5 7.88658V6.5C11.5 6.22386 11.2762 6 11 6L10.9989 6L10.9976 6.00001L10.9943 6.00003L10.9848 6.00014L10.9552 6.00087C10.9307 6.00166 10.897 6.00316 10.8544 6.00599C10.7695 6.01166 10.6495 6.02268 10.4996 6.04409C10.1999 6.08691 9.77971 6.17139 9.2794 6.33816C8.55493 6.57965 7.66479 6.99299 6.7319 7.69863C6.9264 6.98158 7.2077 6.43355 7.52456 6.01319C8.01593 5.36132 8.61523 4.98675 9.17883 4.7709C9.65371 4.58903 10.1025 4.52044 10.4334 4.49788C10.5981 4.48666 10.7314 4.48699 10.8211 4.48988C10.866 4.49133 10.8997 4.49341 10.9209 4.49498L10.9429 4.49679ZM3.5 2C2.11929 2 1 3.11929 1 4.5V12.5C1 13.8807 2.11929 15 3.5 15H11.5C12.8807 15 14 13.8807 14 12.5V9.5C14 9.22386 13.7761 9 13.5 9C13.2239 9 13 9.22386 13 9.5V12.5C13 13.3284 12.3284 14 11.5 14H3.5C2.67157 14 2 13.3284 2 12.5V4.5C2 3.67157 2.67157 3 3.5 3H7.5C7.77614 3 8 2.77614 8 2.5C8 2.22386 7.77614 2 7.5 2H3.5Z"/></svg>';
+    // codicon "globe" — used for the "Open in browser" button. It is
+    // visually distinct from the neighboring share icon while still
+    // communicating a web/browser destination at toolbar size.
+    const OPEN_IN_BROWSER_ICON =
+        '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M8 1C4.141 1 1 4.141 1 8C1 11.859 4.141 15 8 15C11.859 15 15 11.859 15 8C15 4.141 11.859 1 8 1ZM8 14C7.422 14 6.686 12.906 6.288 11H9.713C9.315 12.906 8.579 14 8.001 14H8ZM6.121 10C6.044 9.392 6 8.723 6 8C6 7.277 6.044 6.608 6.121 6H9.878C9.955 6.608 9.999 7.277 9.999 8C9.999 8.723 9.955 9.392 9.878 10H6.121ZM2 8C2 7.299 2.121 6.626 2.343 6H5.121C5.041 6.656 5 7.332 5 8C5 8.668 5.041 9.344 5.121 10H2.343C2.121 9.374 2 8.701 2 8ZM8 2C8.578 2 9.314 3.094 9.712 5H6.287C6.685 3.094 7.422 2 8 2ZM10.879 6H13.657C13.879 6.626 14 7.299 14 8C14 8.701 13.879 9.374 13.657 10H10.879C10.959 9.344 11 8.668 11 8C11 7.332 10.959 6.656 10.879 6ZM13.195 5H10.722C10.516 3.938 10.199 2.98 9.775 2.268C11.228 2.719 12.446 3.707 13.195 5ZM6.226 2.268C5.802 2.98 5.484 3.938 5.279 5H2.806C3.556 3.707 4.774 2.718 6.226 2.268ZM2.805 11H5.278C5.484 12.062 5.801 13.02 6.225 13.732C4.772 13.281 3.554 12.293 2.805 11ZM9.774 13.732C10.198 13.02 10.516 12.062 10.721 11H13.194C12.444 12.293 11.226 13.282 9.774 13.732Z"/></svg>';
 
     interface Props {
         vscode: { postMessage(msg: WebviewToExtensionMessage): void };
@@ -33,6 +59,22 @@
     let copy_status = $state<'' | 'copying' | 'copied'>('');
     let copy_status_timer: ReturnType<typeof setTimeout> | null = null;
     let resize_timer: ReturnType<typeof setTimeout> | null = null;
+
+    // The toolbar always renders in a compact "icon-only" form on the
+    // right side: a single $(share) button that opens a popover with
+    // Copy / PNG / SVG / PDF, the existing $(globe) browser
+    // link, and a $(symbol-color) toggle for "Apply VS Code theme".
+    // Keeping the icon-only layout permanent (rather than a responsive
+    // collapse) means the toolbar height is invariant under panel
+    // resize and the layout reads cleanly at every width.
+    let share_popover_el: HTMLDivElement | undefined = $state();
+    let share_btn_el: HTMLButtonElement | undefined = $state();
+    // Mirrors the popover's :popover-open state so `aria-expanded` on
+    // the share button reflects reality for assistive tech. Updated by
+    // the toggle handler (newState 'open'/'closed'). Without this, AT
+    // would only ever read 'collapsed' regardless of menu visibility.
+    let share_popover_open = $state(false);
+    const SHARE_POPOVER_ID = 'raven-plot-share-popover';
     // Tracks the in-flight SVG fetcher so a superseded fetch is aborted
     // when a fresh `(plotId, upid, dimensions, themeApplied)` lands.
     let last_fetcher: AbortController | null = null;
@@ -201,6 +243,11 @@
         }
         window.removeEventListener('message', on_message);
         window.removeEventListener('resize', on_resize);
+        // The popover's resize listener is added in on_share_popover_toggle's
+        // 'open' branch. Defensive removal here covers the case where
+        // the component unmounts with the popover still open — the
+        // 'closed' toggle event isn't guaranteed to fire during teardown.
+        window.removeEventListener('resize', on_share_popover_resize);
     });
 
     function go_prev() { dispatch({ type: 'GO_PREV' }); }
@@ -233,6 +280,187 @@
         const id = state.plotIds[state.currentIndex];
         if (!id) return;
         vscode.postMessage({ type: 'request-open-externally', payload: { plotId: id } });
+    }
+
+    // Position the share popover under the share button. Using the HTML
+    // popover API (`popover` attribute) means dismissal is automatic on
+    // outside click or Escape — we only need to handle positioning. The
+    // CSS rule `.share-popover { inset: auto }` overrides the browser
+    // UA stylesheet's `[popover] { inset: 0; margin: auto }` (which
+    // would center the popover) so JS-set `top` and `left` actually
+    // take effect.
+    //
+    // CLAMPING: keep the popover fully inside the viewport in both
+    // dimensions. `right` (right-anchor) was the original strategy; we
+    // now use `left` after clamping so the math is symmetric and the
+    // popover can flip above the trigger when there isn't room below.
+    //   - Horizontal: place near the button's right edge by default;
+    //     clamp so the popover stays at least 4px from both viewport
+    //     edges. On extremely narrow panels (where popover width >
+    //     viewport width - 8) the left-anchor wins and the popover may
+    //     extend off-right; `overflow-x: auto` on .toolbar plus the
+    //     popover's top-layer rendering means the user can still scroll
+    //     to it, but in practice the popover collapses to its content.
+    //   - Vertical: prefer placing below the button; if the popover
+    //     would overflow the bottom (`r.bottom + 4 + h > innerHeight`)
+    //     AND there's more room above, place above the button instead.
+    //     Final clamp ensures `top >= 4` either way.
+    //
+    // `beforetoggle` fires synchronously before the popover becomes
+    // visible (the `:popover-open` rule flips `display: none` → `flex`).
+    // We measure the popover's natural size by reading
+    // `offsetWidth`/`offsetHeight` after a temporary `visibility: hidden;
+    // display: flex` — needed because `display: none` reports zero
+    // dimensions. The visibility trick keeps the popover invisible
+    // during measurement so users never see it at the UA-default
+    // centered position.
+    //
+    // KEYBOARD FOCUS: after positioning, move focus into the popover so
+    // keyboard-only users can immediately Tab through Copy / PNG / SVG
+    // / PDF. Without this, Tab from the share button would go to the
+    // next sibling (external-link button), skipping the popover.
+    //
+    // A `resize` listener is installed while the popover is open so
+    // panel splitter drags reposition the menu rather than leaving it
+    // floating detached from the button. The listener is removed on
+    // close to avoid wasted work when the popover is hidden.
+    function position_share_popover() {
+        if (!share_popover_el || !share_btn_el) return;
+        const r = share_btn_el.getBoundingClientRect();
+        // Clear any stale inline anchors from a previous open BEFORE
+        // measuring. The popover is `position: fixed` with `inset:
+        // auto`, so stale inline coords would force a layout pass at
+        // the old position during measurement. Clearing all four sides
+        // ensures the measurement happens at the static (untransformed)
+        // box and isolates this function from any future writer that
+        // sets `right`/`bottom` directly (e.g. an alternate
+        // positioning path).
+        share_popover_el.style.left = '';
+        share_popover_el.style.top = '';
+        share_popover_el.style.right = '';
+        share_popover_el.style.bottom = '';
+        // Measure the popover's natural box. While `display: none` it
+        // reports zero, so flip to `visibility: hidden` first; the
+        // CSS rule `.share-popover:popover-open { display: flex }`
+        // hasn't fired yet during `beforetoggle`, so we force
+        // `display: flex` locally for the measurement and clear it
+        // immediately afterward. Browsers batch the style mutations so
+        // there's no visible flicker.
+        const prevDisplay = share_popover_el.style.display;
+        const prevVisibility = share_popover_el.style.visibility;
+        share_popover_el.style.visibility = 'hidden';
+        share_popover_el.style.display = 'flex';
+        const w = share_popover_el.offsetWidth;
+        const h = share_popover_el.offsetHeight;
+        share_popover_el.style.display = prevDisplay;
+        share_popover_el.style.visibility = prevVisibility;
+
+        // Clamp algorithm lives in the pure helper
+        // `compute_share_popover_position` — see that file plus the bun
+        // tests in `tests/bun/plot-share-popover-position.test.ts` for
+        // the full case enumeration (right-anchor, viewport overflow,
+        // flip-above, popover taller/wider than viewport).
+        const { left, top } = compute_share_popover_position(
+            r,
+            { width: w, height: h },
+            { width: window.innerWidth, height: window.innerHeight },
+        );
+
+        share_popover_el.style.left = `${left}px`;
+        share_popover_el.style.top = `${top}px`;
+    }
+
+    function on_share_popover_resize() {
+        // Guard against a race where `resize` fires between
+        // `beforetoggle('closed')` (sync) and `toggle('closed')` (the
+        // queued task that removes this listener). On that tick the
+        // popover is mid-closing — re-positioning a popover that's no
+        // longer in the top layer is wasted work and the inline
+        // `display: flex` measurement trick would briefly take effect
+        // on the closing element.
+        if (!share_popover_el?.matches?.(':popover-open')) return;
+        position_share_popover();
+    }
+
+    // `beforetoggle` fires synchronously BEFORE the popover is added to
+    // the top layer (open) or removed from it (close). For OPEN, this
+    // is where we position the popover — running positioning in the
+    // later `toggle` event would paint one frame at the UA default
+    // (centered via `inset: 0; margin: auto`) before our values land.
+    // We also update the `aria-expanded` mirror here so AT readers
+    // never see a transient mismatch between the visible popover and
+    // the attribute.
+    function on_share_popover_beforetoggle(e: ToggleEvent) {
+        if (e.newState === 'open') {
+            position_share_popover();
+            share_popover_open = true;
+        } else {
+            share_popover_open = false;
+        }
+    }
+
+    // `toggle` fires AFTER the popover state change has taken effect.
+    // Focus and listener wiring belong here because focus only works
+    // once the popover is in the top layer (`:popover-open` matches
+    // and `display: flex` is in effect); calling `.focus()` during
+    // `beforetoggle` would no-op because the popover is still
+    // `display: none`.
+    function on_share_popover_toggle(e: ToggleEvent) {
+        if (e.newState === 'open') {
+            // Move focus into the popover so keyboard users can
+            // navigate Copy / PNG / SVG / PDF with Tab. We focus the
+            // first enabled button — disabled buttons (state.phase !==
+            // 'viewing') skip focus naturally because the `:disabled`
+            // selector isn't tabbable. If every popover item is
+            // disabled (shouldn't happen since the share trigger is
+            // also disabled then), the focus call is a no-op.
+            const firstEnabled = share_popover_el?.querySelector<HTMLButtonElement>(
+                'button:not([disabled])',
+            );
+            firstEnabled?.focus();
+            window.addEventListener('resize', on_share_popover_resize);
+        } else {
+            window.removeEventListener('resize', on_share_popover_resize);
+        }
+    }
+
+    function close_share_popover() {
+        // `hidePopover()` throws InvalidStateError when the popover is
+        // not currently showing; guard with `:popover-open` before
+        // calling so the lifecycle effect (which closes the popover on
+        // state-phase changes) is safe to invoke at any time.
+        if (share_popover_el?.matches?.(':popover-open')) {
+            share_popover_el.hidePopover?.();
+        }
+    }
+
+    // Stuck-popover defense: if `state.phase` flips away from 'viewing'
+    // while the popover is open (R session ends, panel reloads), the
+    // share button and all popover items become disabled. The disabled
+    // trigger can't toggle the popover closed; close it programmatically
+    // so users aren't left staring at an inert menu.
+    //
+    // `untrack` is load-bearing here: reading `share_popover_open` as a
+    // regular reactive read would register it as a dep, causing the
+    // effect to re-fire on every popover open/close cycle (in addition
+    // to phase changes). With `untrack`, the effect's dep surface is
+    // just `state.phase`, so a future edit that adds an `else` branch
+    // or a side-effect outside the if-block cannot create a feedback
+    // loop with the popover's own open/close events.
+    $effect(() => {
+        if (state.phase !== 'viewing' && untrack(() => share_popover_open)) {
+            close_share_popover();
+        }
+    });
+
+    function copy_from_share() {
+        close_share_popover();
+        void copy_current();
+    }
+
+    function save_from_share(format: SaveFormat) {
+        close_share_popover();
+        save_plot(format);
     }
 
     function toggle_theme_applied() {
@@ -444,30 +672,68 @@
                 disabled={state.phase !== 'viewing'}
                 title="Remove current plot">✕</button>
         <span class="spacer"></span>
-        <button onclick={copy_current}
+        <!-- ARIA: this trigger uses `aria-expanded` (browser-mirrored
+             via `popovertarget`) so AT users hear "expanded/collapsed"
+             on activation, but does NOT set `aria-haspopup`. The
+             popover content (below) is a labeled group of plain
+             buttons — not a `role="menu"` (no arrow-key nav) nor a
+             `role="dialog"` (not modal) — so any specific aria-haspopup
+             value would set incorrect expectations. `aria-controls`
+             links the trigger to its popover for AT that supports
+             popup tracking; this is informational and never replaces
+             the `aria-expanded` disclosure signal. -->
+        <button class="icon-btn"
+                bind:this={share_btn_el}
+                popovertarget={SHARE_POPOVER_ID}
                 disabled={state.phase !== 'viewing'}
-                title="Copy plot to clipboard (PNG)">Copy</button>
-        <button onclick={() => save_plot('png')}
+                aria-label="Copy or export plot"
+                aria-expanded={share_popover_open}
+                aria-controls={SHARE_POPOVER_ID}
+                title="Copy or export plot">
+            {@html SHARE_ICON}
+        </button>
+        <button class="icon-btn"
+                onclick={open_externally}
                 disabled={state.phase !== 'viewing'}
-                title="Save as PNG">PNG</button>
-        <button onclick={() => save_plot('svg')}
-                disabled={state.phase !== 'viewing'}
-                title="Save as SVG">SVG</button>
-        <button onclick={() => save_plot('pdf')}
-                disabled={state.phase !== 'viewing'}
-                title="Save as PDF">PDF</button>
-        <button onclick={open_externally}
-                disabled={state.phase !== 'viewing'}
-                title="Open in external viewer">↗</button>
-        <button class="theme-toggle"
+                aria-label="Open in browser"
+                title="Open in browser">
+            {@html OPEN_IN_BROWSER_ICON}
+        </button>
+        <button class="theme-toggle icon-btn"
                 class:is-on={state.themeApplied}
                 aria-pressed={state.themeApplied}
+                aria-label="Apply VS Code theme"
                 onclick={toggle_theme_applied}
                 title="Recolor the plot to match the active VS Code theme">
-            <span class="checkmark" aria-hidden="true">{state.themeApplied ? '✓' : ' '}</span>
-            Apply VS Code theme
+            {@html SYMBOL_COLOR_ICON}
         </button>
     </header>
+    <!-- ARIA: this popover is `role="group"` with an explicit
+         `aria-label`, NOT `role="menu"`. The HTML popover API gives us
+         Tab-based focus order, Escape-to-dismiss, and outside-click
+         light-dismiss, but ARIA's menu pattern additionally requires
+         arrow-key navigation between items (Up/Down/Home/End). We
+         don't implement those handlers, so promising `role="menu"`
+         would set incorrect user expectations and WCAG-flag as
+         incomplete keyboard interaction. `role="group"` is the
+         simplest correct choice for "labeled group of related
+         controls" and is what AT (NVDA / JAWS / VoiceOver) reliably
+         announces — a bare `<div popover>` with no role is exposed as
+         generic, which some screen readers skip entirely (dropping the
+         `aria-label` announcement). -->
+    <div id={SHARE_POPOVER_ID}
+         bind:this={share_popover_el}
+         popover="auto"
+         class="share-popover"
+         role="group"
+         aria-label="Copy or export plot"
+         onbeforetoggle={on_share_popover_beforetoggle}
+         ontoggle={on_share_popover_toggle}>
+        <button onclick={copy_from_share} disabled={state.phase !== 'viewing'}>Copy</button>
+        <button onclick={() => save_from_share('png')} disabled={state.phase !== 'viewing'}>PNG</button>
+        <button onclick={() => save_from_share('svg')} disabled={state.phase !== 'viewing'}>SVG</button>
+        <button onclick={() => save_from_share('pdf')} disabled={state.phase !== 'viewing'}>PDF</button>
+    </div>
 
     {#if state.sessionEnded && currentSvg}
         <div class="banner">R session ended. Showing last plot.</div>
@@ -561,23 +827,39 @@
      * with no panel bg at all) required a new entry, and any user-drawn
      * shape that happened to match an allowlisted colour silently
      * disappeared. Structural tagging is colour-agnostic and stable
-     * across themes — see `tag-backgrounds.ts` for the heuristic. */
+     * across themes — see `tag-backgrounds.ts` for the heuristic.
+     *
+     * Source order matters: this rule lives AFTER the stroke-recolor
+     * rule above so the `stroke: none !important` here overrides the
+     * editor-foreground stroke that would otherwise outline tagged
+     * background rects (the two rules have equal CSS specificity, so
+     * later-in-source wins). */
     .plot-host.apply-vscode-theme :global(svg.httpgd rect.raven-bg) {
         fill: none !important;
         stroke: none !important;
     }
 
-    /* Toolbar toggle styling — mirrors the knit-preview "Apply VS Code
-     * theme" button: an accent border when on, a pre-allocated checkmark
-     * slot so toggling doesn't shift the label horizontally. */
-    .theme-toggle .checkmark {
-        display: inline-block;
-        width: 1ch;
-        text-align: center;
-        white-space: pre;
+    /* Toolbar toggle "on" state. Icon-only buttons need a strong
+     * background-color shift to read as engaged — VS Code's canonical
+     * `inputOption.activeBackground` token is intentionally subtle (a
+     * semi-transparent tint over the input background) and tends to
+     * disappear against the editor-widget background the toolbar sits
+     * on. Using the primary button palette instead gives an unambiguous
+     * "pressed" colour that survives every theme: the toggle fills with
+     * the same accent VS Code uses for its primary action buttons, so
+     * users immediately read it as active.
+     *
+     * `currentColor` flows through the inline SVG's `fill="currentColor"`,
+     * so setting `color: button-foreground` recolors the codicon itself
+     * — no extra rule needed for the SVG fill. The off-state border
+     * isn't overridden because the prominent background carries the
+     * indication on its own; layering a border on top reads as noise. */
+    .theme-toggle.is-on {
+        background: var(--vscode-button-background) !important;
+        color: var(--vscode-button-foreground) !important;
     }
 
-    .theme-toggle.is-on {
-        border-color: var(--vscode-focusBorder) !important;
+    .theme-toggle.is-on:hover:not(:disabled) {
+        background: var(--vscode-button-hoverBackground) !important;
     }
 </style>

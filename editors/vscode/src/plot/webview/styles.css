@@ -28,6 +28,28 @@ main {
     border-bottom: 1px solid var(--vscode-panel-border);
     background: var(--vscode-editorWidget-background);
     flex: 0 0 auto;
+    /* Single-row, fixed-height toolbar. `flex-wrap: nowrap` is the flex
+     * default, but pinning it here keeps a future style edit (or a new
+     * text-bearing button) from silently re-introducing the multi-row
+     * wrap that the icon-only layout exists to prevent. */
+    flex-wrap: nowrap;
+    /* `overflow-x: auto` is the safety net for very narrow panel widths
+     * where the sum of intrinsic button widths exceeds the viewport.
+     * Without it, `main { overflow: hidden }` (styles.css line 15) would
+     * SILENTLY clip the rightmost buttons (share, external, theme
+     * toggle) and users would have no path to copy/export. With it, the
+     * toolbar becomes wheel/touch-scrollable instead. The visible
+     * scrollbar is suppressed below (`scrollbar-width: none` +
+     * `::-webkit-scrollbar { display: none }`) because a scrollbar on
+     * the 28px-tall toolbar would consume disproportionate height; the
+     * trackpad/wheel gesture is the intended access path. */
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+}
+
+.toolbar::-webkit-scrollbar {
+    display: none;
 }
 
 .toolbar button {
@@ -38,6 +60,12 @@ main {
     border-radius: 2px;
     font-family: inherit;
     cursor: pointer;
+    /* Buttons never wrap their label and never shrink below their
+     * natural width — should a future button gain a text label, this
+     * keeps the row from collapsing vertically (which is what produced
+     * the original two-row wrap the user reported). */
+    flex-shrink: 0;
+    white-space: nowrap;
 }
 
 .toolbar button:hover:not(:disabled) {
@@ -54,10 +82,96 @@ main {
     text-align: center;
     font-variant-numeric: tabular-nums;
     opacity: 0.8;
+    flex-shrink: 0;
+    white-space: nowrap;
 }
 
 .toolbar .spacer {
     flex: 1;
+}
+
+/* Icon-only toolbar buttons (compact theme toggle, share menu). The
+ * inline SVG inherits the button's foreground via `fill="currentColor"`.
+ * The fixed 16x16 square keeps the row height stable across mode
+ * swaps — without explicit width the SVG would size to its viewBox at
+ * font-relative metrics and cause sub-pixel jitter on font changes. */
+.toolbar .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 6px;
+    line-height: 0;
+}
+
+.toolbar .icon-btn svg {
+    width: 16px;
+    height: 16px;
+    display: block;
+    /* `pointer-events: none` makes every click/hover on the SVG fall
+     * through to the parent <button>, so `event.target` is always the
+     * button itself — never the inner `<svg>` or `<path>`. That gives
+     * a deterministic click target for the button's `popovertarget`
+     * activation and any future event handler that inspects
+     * `event.target` / `event.composedPath()[0]`. (Note: native
+     * `title=` tooltips and CSS `:hover` BOTH walk the ancestor chain,
+     * so they would still work without this rule — the load-bearing
+     * benefit is target identity, not hover/tooltip propagation.) */
+    pointer-events: none;
+}
+
+/* Popover for the collapsed share menu (Copy / PNG / SVG / PDF). Uses
+ * the HTML popover API: `popover="auto"` gives light-dismiss on outside
+ * click and Escape; we position it via JS in
+ * `on_share_popover_beforetoggle` (App.svelte) since CSS anchor
+ * positioning isn't reliable in older Electron-based VS Code builds.
+ * Stack of secondary buttons matches the toolbar styling so the popover
+ * reads as an extension of the row. */
+.share-popover {
+    position: fixed;
+    /* Override the browser UA stylesheet's `[popover] { inset: 0;
+     * margin: auto }` which would otherwise center the popover and
+     * cause our JS-applied `top`/`left` values to fight against the
+     * defaulted `right: 0; bottom: 0`. With `inset: auto`, only the
+     * sides JS sets in `on_share_popover_beforetoggle` define position;
+     * width sizes to content via the browser's default
+     * `width: fit-content`. */
+    inset: auto;
+    margin: 0;
+    padding: 4px;
+    background: var(--vscode-editorWidget-background);
+    color: var(--vscode-editorWidget-foreground);
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    border-radius: 4px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+    min-width: 96px;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.share-popover:popover-open {
+    display: flex;
+}
+
+.share-popover button {
+    background: transparent;
+    color: var(--vscode-foreground);
+    border: 1px solid transparent;
+    padding: 4px 12px;
+    border-radius: 2px;
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.share-popover button:hover:not(:disabled) {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.share-popover button:disabled {
+    opacity: 0.5;
+    cursor: default;
 }
 
 .banner {
