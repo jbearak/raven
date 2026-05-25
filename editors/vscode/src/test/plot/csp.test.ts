@@ -93,11 +93,17 @@ suite('plot viewer CSP — local host', () => {
             assert.ok(cspMatch, 'CSP meta tag should be present');
             const csp = cspMatch![1];
             assert.match(csp, /img-src[^;]*http:\/\/127\.0\.0\.1:\*/, 'img-src allows loopback http');
-            // The post-quit "Showing last plot" fallback uses a Blob URL as
-            // <img src> after httpgd dies. Without blob: in img-src, the
-            // browser blocks the swap and shows a broken icon under the
-            // "R session ended" banner.
-            assert.match(csp, /img-src[^;]*\bblob:/, 'img-src allows blob URLs');
+            // After the inline-SVG substrate switch, the webview no
+            // longer creates blob URLs (the post-quit "Showing last
+            // plot" fallback reads from the in-memory svgCache, not
+            // from a Blob URL <img src>). CSP `img-src` must NOT carry
+            // `blob:` anymore — narrowing the attack surface.
+            assert.doesNotMatch(csp, /img-src[^;]*\bblob:/, 'img-src no longer allows blob URLs');
+            assert.doesNotMatch(csp, /img-src[^;]*\bdata:/, 'img-src no longer allows data URLs');
+            // Script CSP retains its nonce gate — verified explicitly
+            // here so a future relaxation of `script-src` would have
+            // to update this test in the same commit.
+            assert.match(csp, /script-src[^;]*'nonce-/, 'script-src is nonce-gated');
             assert.match(csp, /connect-src[^;]*http:\/\/127\.0\.0\.1:\*/, 'connect-src allows loopback http');
             assert.match(csp, /connect-src[^;]*ws:\/\/127\.0\.0\.1:\*/, 'connect-src allows loopback ws');
         } finally {

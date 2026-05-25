@@ -72,6 +72,21 @@ export class PlotServices {
         this.started = false;
     }
 
+    /**
+     * Re-push state-update to every open plot panel. Called after a
+     * `set-theme-applied` write so all panels (not just the one that
+     * was clicked) reflect the new value. The state-update payload
+     * reads the persisted theme value via
+     * `PlotViewerPanel.readThemePreference`, so this orchestrator
+     * doesn't need to know the storage key string — single source of
+     * truth lives on the panel class.
+     */
+    broadcastStateUpdate(): void {
+        for (const panel of this.panels.values()) {
+            panel.postStateUpdate();
+        }
+    }
+
     private dispose_all_panels(): void {
         // Snapshot first: panel.dispose() triggers onDisposed which mutates the
         // map, so iterating the live map would skip entries.
