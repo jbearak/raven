@@ -19,7 +19,7 @@
 - `editors/vscode/src/knit/render-html.ts` — import `stripFrontmatter` and call it once inside `renderKnitHtml`.
 - `tests/bun/yaml-frontmatter.test.ts` — add `describe('stripFrontmatter', ...)` block including a lockstep test against `extractFrontmatter`.
 - `tests/bun/render-html.test.ts` — add one regression test that confirms `renderKnitHtml` strips frontmatter before invoking the injected `renderMarkdown`.
-- `CLAUDE.md` — append one bullet under the "Knit pipeline" key-invariants block.
+- `AGENTS.md` — append one bullet under the "Knit pipeline" key-invariants block.
 - `docs/knit.md` — add a one-line note in step 10 of the "What it does, step by step" pipeline description.
 
 **Files to create:**
@@ -650,15 +650,15 @@ EOF
 
 ---
 
-## Task 4: Update CLAUDE.md and docs/knit.md
+## Task 4: Update AGENTS.md and docs/knit.md
 
 **Files:**
-- Modify: `CLAUDE.md`
+- Modify: `AGENTS.md`
 - Modify: `docs/knit.md`
 
-### - [ ] Step 1: Add the CLAUDE.md invariant bullet
+### - [ ] Step 1: Add the AGENTS.md invariant bullet
 
-Open `CLAUDE.md` and locate the "Knit pipeline (Knit Preview + Pandoc Export)" key-invariants block (search for the literal string `**Knit pipeline (Knit Preview + Pandoc Export)**`). Find the bullet whose body starts with `Theme-palette role resolution uses a small R-code corpus` — that bullet is currently the last in the block.
+Open `AGENTS.md` and locate the "Knit pipeline (Knit Preview + Pandoc Export)" key-invariants block (search for the literal string `**Knit pipeline (Knit Preview + Pandoc Export)**`). Find the bullet whose body starts with `Theme-palette role resolution uses a small R-code corpus` — that bullet is currently the last in the block.
 
 Append a new bullet at the end of the block. The exact text to insert (after the closing of the last existing bullet, before the next top-level invariants block) is:
 
@@ -693,7 +693,7 @@ Replace the sentence `Raven reads that markdown, calls VS Code's \`markdown.api.
 ### - [ ] Step 3: Verify docs files look right
 
 ```bash
-git diff CLAUDE.md docs/knit.md
+git diff AGENTS.md docs/knit.md
 ```
 
 Expected: only the additions described above; no other lines touched.
@@ -701,11 +701,11 @@ Expected: only the additions described above; no other lines touched.
 ### - [ ] Step 4: Commit
 
 ```bash
-git add CLAUDE.md docs/knit.md
+git add AGENTS.md docs/knit.md
 git commit -m "$(cat <<'EOF'
 docs(knit): note the Knit Preview YAML-strip invariant
 
-Records the rule in CLAUDE.md (alongside the other knit pipeline
+Records the rule in AGENTS.md (alongside the other knit pipeline
 invariants) and updates docs/knit.md's step-by-step description so
 users reading the public docs see that the preview drops YAML while
 the on-disk .md keeps it.
@@ -764,4 +764,4 @@ If the visual check passes, the implementation is complete.
 3. `cd editors/vscode && bun run typecheck` reports no errors.
 4. The rendered `.html` produced by `Raven: Knit Preview` on any `.Rmd` with YAML frontmatter does NOT contain `<table class="frontmatter"` or any element with a `frontmatter` class.
 5. The on-disk `.md` produced by `knitr::knit` STILL contains the YAML frontmatter (Pandoc HTML export / webview "Export ▾" continue to work and render the title block).
-6. `CLAUDE.md` records the new invariant; `docs/knit.md` mentions the strip in its step-by-step pipeline description.
+6. `AGENTS.md` records the new invariant; `docs/knit.md` mentions the strip in its step-by-step pipeline description.

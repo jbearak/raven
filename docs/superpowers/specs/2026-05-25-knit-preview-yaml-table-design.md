@@ -156,9 +156,9 @@ This catches the case where someone changes the wiring in `post-knit-renderer.ts
 2. **Drift between `stripFrontmatter` and `extractFrontmatter`**: mitigated by extracting the shared `findFrontmatterEnd` predicate and the lockstep test.
 3. **VS Code changes the emitted frontmatter shape**: irrelevant under Approach A — we strip before invoking `markdown.api.render`, so whatever shape it would have emitted never enters the pipeline.
 
-## Docs and CLAUDE.md updates
+## Docs and AGENTS.md updates
 
-**`CLAUDE.md`** — add one bullet under the existing "Knit pipeline (Knit Preview + Pandoc Export)" key-invariants block:
+**`AGENTS.md`** — add one bullet under the existing "Knit pipeline (Knit Preview + Pandoc Export)" key-invariants block:
 
 > The Knit Preview's md→html step strips YAML frontmatter from the markdown source in memory **before** calling `markdown.api.render`, so the YAML never appears as a `<table class="frontmatter">` in the rendered HTML. The on-disk `.md` keeps its frontmatter — both Pandoc HTML export and the webview "Export ▾" path re-read it from disk and depend on the YAML (title, output options, `pandoc_args`, …). The strip is implemented in `renderKnitHtml` (`render-html.ts`), not in `post-knit-renderer.ts`, so the pure render-html test surface can exercise it. `stripFrontmatter` and `extractFrontmatter` in `yaml-frontmatter.ts` share a private `findFrontmatterEnd` predicate; the lockstep test in `tests/bun/yaml-frontmatter.test.ts` guards against drift.
 

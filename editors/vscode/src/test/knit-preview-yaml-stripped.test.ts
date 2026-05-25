@@ -96,11 +96,11 @@ suite('Knit Preview strips YAML frontmatter from md→html', () => {
         //   - any future shape using `data-vscode-context` with the
         //     frontMatter webview section
         assert.ok(
-            !/<table[^>]*class="[^"]*\bfrontmatter\b/i.test(html),
+            !/<table[^>]*\bclass=(?:"[^"]*\bfrontmatter\b[^"]*"|'[^']*\bfrontmatter\b[^']*')/i.test(html),
             'rendered HTML must not contain a frontmatter <table>',
         );
         assert.ok(
-            !/class="[^"]*\bfrontmatter\b[^"]*"/i.test(html),
+            !/\bclass=(?:"[^"]*\bfrontmatter\b[^"]*"|'[^']*\bfrontmatter\b[^']*')/i.test(html),
             'rendered HTML must not contain any element with a `frontmatter` class',
         );
         assert.ok(
