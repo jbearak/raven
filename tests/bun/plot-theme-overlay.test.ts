@@ -199,6 +199,41 @@ describe('plot-host theme overlay — multi-rect canvas hiding', () => {
         expect(matched).toBe(true);
     });
 
+    test('overlay covers the ggplot2 panel.background rect (fill="#EBEBEB")', () => {
+        // ggplot2's `theme_gray()` is the package default; its
+        // `panel.background = element_rect(fill = "grey92")` emits as
+        // `fill="#EBEBEB"` (grey92 in hex). The overlay must cover this
+        // rect too, otherwise the gray panel slab paints over the
+        // editor background inside the cartesian grid — visible as a
+        // light gray rectangle inside an otherwise themed plot.
+        //
+        // We don't ship a real ggplot2 httpgd fixture (would require
+        // running R), but the contract is the rect's fill attribute:
+        // the overlay's selector(s) must match a rect with the grey92
+        // fill regardless of where it sits in the SVG tree.
+        const source = readFileSync(APP_SVELTE_PATH, 'utf-8');
+        const selectors = extract_fill_none_selectors_under_theme(source);
+        const dom = new JSDOM(
+            '<!doctype html><html><body>'
+            + '<div class="plot-host apply-vscode-theme">'
+            + '<svg class="httpgd" xmlns="http://www.w3.org/2000/svg">'
+            + '<rect id="canvas" fill="#FFFFFF" stroke="none" />'
+            + '<g clip-path="url(#panel-clip)">'
+            + '<rect id="panel-bg" fill="#EBEBEB" stroke="none" />'
+            + '</g>'
+            + '</svg>'
+            + '</div>'
+            + '</body></html>',
+        );
+        const panelBg = dom.window.document.getElementById('panel-bg');
+        expect(panelBg).not.toBeNull();
+        const matched = selectors.some(sel => {
+            try { return panelBg!.matches(sel); }
+            catch { return false; }
+        });
+        expect(matched).toBe(true);
+    });
+
     test('overlay still covers the first-of-type direct-child canvas rect (regression guard)', () => {
         // Negative-space companion to the inner-rect test: don't let a
         // future change replace the `:first-of-type` selector with one

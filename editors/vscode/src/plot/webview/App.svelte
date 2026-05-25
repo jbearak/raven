@@ -547,23 +547,35 @@
         stroke: var(--vscode-editor-foreground) !important;
     }
 
-    /* httpgd paints the plot canvas with two `#FFFFFF`-filled rects: the
-     * first-of-type direct child of <svg> (hidden by the rule above) AND
-     * an inner rect nested inside a `<g clip-path>` wrapper. The
-     * `:first-of-type` selector cannot reach the second one. We target
-     * every rect with the canvas color directly so both rects go
-     * transparent and `--vscode-editor-background` shows through. The
-     * `i` flag is CSS4 case-insensitive matching — defensive in case a
-     * future httpgd version emits lowercase hex; `bg_for_fetch` sends
-     * `'#ffffff'` lowercase today but httpgd uppercases it before
-     * emitting.
+    /* httpgd-rendered plots paint multiple background rects under the
+     * data layer; the toggle has to hide all of them so
+     * `--vscode-editor-background` can show through.
+     *
+     *   - `#FFFFFF` covers two distinct rects on every plot: the
+     *     first-of-type direct child of <svg> (httpgd's canvas, also
+     *     hit by the `:first-of-type` rule above) AND an inner rect
+     *     wrapped in a `<g clip-path>` that the `:first-of-type`
+     *     selector cannot reach.
+     *   - `#EBEBEB` is `grey92`, the ggplot2 `theme_gray()` default
+     *     for `panel.background`. ggplot2 is the dominant R plot
+     *     ecosystem; without this entry the cartesian grid stays
+     *     painted light-gray over the editor background.
+     *
+     * Extending the allowlist is intentionally conservative: we'd
+     * rather miss a non-default ggplot theme's background (and have
+     * the user toggle off) than hide a deliberate white/grey-filled
+     * shape in their data (e.g. a `geom_rect()` panel) once the toggle
+     * is on. Add new colors only when a real plot demonstrates the
+     * miss. The `i` flag is CSS4 case-insensitive matching — defensive
+     * against a future httpgd version emitting lowercase hex.
      *
      * Source order matters: this rule lives AFTER the stroke-recolor
      * rule above so the `stroke: none !important` here overrides the
-     * editor-foreground stroke that would otherwise outline the
-     * inner canvas rect (the two rules have equal CSS specificity, so
+     * editor-foreground stroke that would otherwise outline the inner
+     * background rects (the two rules have equal CSS specificity, so
      * later-in-source wins). */
-    .plot-host.apply-vscode-theme :global(svg.httpgd rect[fill="#FFFFFF" i]) {
+    .plot-host.apply-vscode-theme :global(svg.httpgd rect[fill="#FFFFFF" i]),
+    .plot-host.apply-vscode-theme :global(svg.httpgd rect[fill="#EBEBEB" i]) {
         fill: none !important;
         stroke: none !important;
     }
