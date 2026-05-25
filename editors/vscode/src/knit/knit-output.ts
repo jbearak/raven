@@ -811,11 +811,74 @@ export function buildShellHtml(args: {
       // panel CSP (default-src none, style-src cspSource 'unsafe-
       // inline', connect-src none) blocks external-resource exfil
       // from style imports, anchor hrefs, and similar.
+      // Elements always removed. <use> is NOT in this list — knitr's
+      // dev=svg (Cairo) and svglite both emit text as <use href=#glyph>
+      // references to <symbol>s in <defs>, so a blanket <use> ban
+      // would erase every label, axis number, and title. We keep <use>
+      // but enforce a same-document href filter below so external-
+      // resource exfil via <use href=http://evil/> stays blocked.
       var KNIT_PLOT_FORBID_TAGS = {
         script: 1, style: 1, foreignobject: 1, a: 1,
-        use: 1, image: 1, feimage: 1,
+        image: 1, feimage: 1,
       };
-      var KNIT_PLOT_FORBID_ATTRS = { style: 1 };
+      // Safe SVG presentation properties we migrate from inline
+      // style= into matching attributes BEFORE stripping style=.
+      // Mirrors the SAFE_STYLE_PROPS list in
+      // editors/vscode/src/plot/webview/sanitize.ts. Without this
+      // pre-pass, knitr's dev=svg (Cairo) output renders flat black on
+      // transparent because Cairo emits fill/stroke as style= rather
+      // than as attributes — and stripping style= would lose every
+      // color and font setting in the plot.
+      var KNIT_PLOT_SAFE_STYLE_PROPS = {
+        'fill': 1, 'fill-opacity': 1, 'fill-rule': 1,
+        'stroke': 1, 'stroke-width': 1, 'stroke-linecap': 1,
+        'stroke-linejoin': 1, 'stroke-dasharray': 1, 'stroke-dashoffset': 1,
+        'stroke-miterlimit': 1, 'stroke-opacity': 1,
+        'opacity': 1,
+        'font-size': 1, 'font-family': 1, 'font-style': 1,
+        'font-weight': 1, 'font-variant': 1,
+        'text-anchor': 1, 'dominant-baseline': 1, 'alignment-baseline': 1,
+        'color': 1, 'visibility': 1,
+      };
+      function isUnsafeStyleValue(v) {
+        // Reject any value containing a network-fetching function,
+        // CSS at-rule, JS URL, or CSS expression — the same screen
+        // the plot viewer's UNSAFE_VALUE_RE applies.
+        return /url\\s*\\(|expression\\s*\\(|javascript:|@/i.test(v);
+      }
+      function migrateInlineStylesToAttrs(svg) {
+        // For each surviving element, parse its style= attribute and
+        // promote safe declarations to actual attributes. Then strip
+        // style=. Done as a DOM walk so we don't have to re-serialize
+        // the SVG and re-parse it. The plot viewer does the equivalent
+        // as a regex pre-pass on the SVG text; we already have the DOM,
+        // so walking attrs is the cheaper path.
+        var walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
+        var current = svg;
+        do {
+          if (current.hasAttribute && current.hasAttribute('style')) {
+            var raw = current.getAttribute('style') || '';
+            var decls = raw.split(';');
+            for (var d = 0; d < decls.length; d++) {
+              var colon = decls[d].indexOf(':');
+              if (colon < 0) continue;
+              var prop = decls[d].slice(0, colon).trim().toLowerCase();
+              var value = decls[d].slice(colon + 1).trim();
+              if (!prop || !value) continue;
+              if (!KNIT_PLOT_SAFE_STYLE_PROPS[prop]) continue;
+              if (isUnsafeStyleValue(value)) continue;
+              // Don't clobber an existing attribute (inline style=
+              // and an attr together is rare but the explicit attr
+              // wins per SVG specificity).
+              if (!current.hasAttribute(prop)) {
+                current.setAttribute(prop, value);
+              }
+            }
+            current.removeAttribute('style');
+          }
+          current = walker.nextNode();
+        } while (current);
+      }
       function isUnsafeHrefValue(v) {
         if (typeof v !== 'string') return false;
         // javascript:, data:text/html, and other risky schemes inside
@@ -824,12 +887,27 @@ export function buildShellHtml(args: {
         // of leading whitespace or character casing.
         return /^\\s*(?:javascript|data:text\\/html)/i.test(v);
       }
+      function isExternalHref(v) {
+        // <use> elements are only allowed to reference same-document
+        // symbols (#glyph-N). Anything that resolves elsewhere is
+        // treated as an attempted external-resource fetch.
+        if (typeof v !== 'string') return true;
+        var t = v.trim();
+        if (t.length === 0) return true;
+        return t.charAt(0) !== '#';
+      }
       function sanitizeKnitPlotSvg(svg) {
-        // Walk the SVG subtree, removing forbidden tags and attributes.
-        // Iterate children via NodeFilter.SHOW_ELEMENT so the iteration
-        // visits every descendant element exactly once. We collect into
-        // an array first because removing a node from the tree during
-        // the walk invalidates the TreeWalker's position.
+        // Pre-pass: migrate inline style= declarations to attributes
+        // BEFORE the attribute strip removes them. svglite/Cairo emit
+        // fill, stroke, font-family etc. as inline styles, not as
+        // attributes — stripping style= without this migration would
+        // erase every color and font in the plot.
+        migrateInlineStylesToAttrs(svg);
+        // First pass: walk the SVG subtree and collect elements to
+        // remove. Iterate via NodeFilter.SHOW_ELEMENT so the walk
+        // visits every descendant once. We accumulate into an array
+        // because removing nodes mid-walk invalidates the
+        // TreeWalker's position.
         var toRemove = [];
         var walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
         var node = walker.nextNode();
@@ -837,6 +915,14 @@ export function buildShellHtml(args: {
           var name = node.tagName && node.tagName.toLowerCase();
           if (name && KNIT_PLOT_FORBID_TAGS[name]) {
             toRemove.push(node);
+          } else if (name === 'use') {
+            // Tag-allowed, href-checked: external hrefs are the
+            // exfil vector, same-document references are how svglite/
+            // Cairo emit text glyphs.
+            var href = node.getAttribute('href')
+                || node.getAttribute('xlink:href')
+                || '';
+            if (isExternalHref(href)) toRemove.push(node);
           }
           node = walker.nextNode();
         }
@@ -844,10 +930,9 @@ export function buildShellHtml(args: {
           var el = toRemove[i];
           if (el.parentNode) el.parentNode.removeChild(el);
         }
-        // Second pass: strip forbidden attributes (style, on*) and
-        // dangerous hrefs from every surviving element. Walk again
-        // because elements may have been promoted as children of
-        // removed parents.
+        // Second pass: strip on* event-handler attributes and any
+        // remaining unsafe href values from every surviving element.
+        // (style= was already removed by migrateInlineStylesToAttrs.)
         walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
         var current = svg;
         do {
@@ -856,7 +941,7 @@ export function buildShellHtml(args: {
             var stripAttrs = [];
             for (var j = 0; j < attrs.length; j++) {
               var an = attrs[j].name.toLowerCase();
-              if (KNIT_PLOT_FORBID_ATTRS[an] || an.indexOf('on') === 0) {
+              if (an.indexOf('on') === 0) {
                 stripAttrs.push(attrs[j].name);
               } else if ((an === 'href' || an === 'xlink:href')
                          && isUnsafeHrefValue(attrs[j].value)) {
