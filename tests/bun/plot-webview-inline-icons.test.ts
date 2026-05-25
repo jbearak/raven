@@ -2,7 +2,7 @@
 // constants in editors/vscode/src/plot/webview/App.svelte.
 //
 // Why this test exists: `SHARE_ICON`, `SYMBOL_COLOR_ICON`, and
-// `LINK_EXTERNAL_ICON` are injected into the webview via Svelte's
+// `OPEN_IN_BROWSER_ICON` are injected into the webview via Svelte's
 // `{@html ...}` template syntax, which bypasses Svelte's normal HTML
 // escaping. Unlike the plot's runtime SVG (which is routed through
 // `sanitize_svg` — see plot-webview-sanitize.test.ts), there is no
@@ -67,7 +67,7 @@ function extractIcon(name: string): string {
 const ICON_CONSTANTS: Record<string, string> = {
     SHARE_ICON: extractIcon('SHARE_ICON'),
     SYMBOL_COLOR_ICON: extractIcon('SYMBOL_COLOR_ICON'),
-    LINK_EXTERNAL_ICON: extractIcon('LINK_EXTERNAL_ICON'),
+    OPEN_IN_BROWSER_ICON: extractIcon('OPEN_IN_BROWSER_ICON'),
 };
 
 describe('App.svelte inline icon constants — XSS defense-in-depth', () => {
