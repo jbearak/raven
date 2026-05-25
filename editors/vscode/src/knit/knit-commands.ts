@@ -7,7 +7,7 @@ import {
     extractFrontmatter,
     parseFrontmatter,
 } from './yaml-frontmatter';
-import { parseOutputOptions, type TargetFormat } from './output-options';
+import { parseOutputOptions, withSvgDevDefault, type TargetFormat } from './output-options';
 import {
     buildKnitExpression,
     escapeRString,
@@ -407,6 +407,15 @@ async function runKnitCommand(
         // is 'pdf', `html_document.fig_width` does NOT drive the PDF
         // knit, and vice versa.
         const outputOpts = parseOutputOptions(parsed.value, targetFormat);
+        // For HTML targets (preview + HTML export), default `dev = 'svg'` when
+        // the user's YAML didn't set one. The Knit Output panel's "Apply VS
+        // Code theme" toggle recolors plot SVGs via CSS overlay, which only
+        // works against inline SVG — not PNG bitmaps or `<img>`-loaded SVG.
+        // Non-HTML targets (PDF, Word) keep knitr's PNG default so their
+        // R-side rendering pipeline is unchanged.
+        if (targetFormat === 'html') {
+            outputOpts.chunkOpts = withSvgDevDefault(outputOpts.chunkOpts);
+        }
         if (outputOpts.ignored.length > 0) {
             for (const key of outputOpts.ignored) {
                 output.appendLine(`[knit] Ignored output: option '${key}'`);

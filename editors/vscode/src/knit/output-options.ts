@@ -305,3 +305,22 @@ export function parseOutputOptions(fm: FrontmatterDoc, target: TargetFormat): Ou
 
     return empty();
 }
+
+/**
+ * Return `chunkOpts` with `dev` defaulted to `'svg'` if the YAML didn't set
+ * one. Used by the HTML knit paths (preview and HTML export) so plots are
+ * rendered as inline SVG. Inline SVG is the substrate that lets the Knit
+ * Output panel's "Apply VS Code theme" toggle recolor plot text and strokes
+ * to match the editor theme — CSS does not cascade into `<img>`-loaded
+ * SVG, and a PNG bitmap cannot be recolored by CSS at all. Non-HTML
+ * targets (PDF, Word) intentionally do NOT use this default; their R-side
+ * defaults (knitr's PNG) and YAML overrides win unchanged.
+ *
+ * Chunks that explicitly set `dev` via per-chunk options
+ * (`{r dev='png'}`) still win at knit time — `opts_chunk$set` is a
+ * document-wide default and chunk headers override it.
+ */
+export function withSvgDevDefault(opts: ChunkOpts): ChunkOpts {
+    if (opts.dev !== undefined) return opts;
+    return { ...opts, dev: 'svg' };
+}

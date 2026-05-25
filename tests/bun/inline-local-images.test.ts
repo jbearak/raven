@@ -16,7 +16,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import { inlineLocalImagesAsDataUrls } from '../../editors/vscode/src/knit/inline-images';
+import {
+    inlineLocalImagesAsDataUrls,
+    KNIT_PLOT_SVG_CLASS,
+    __resetSvgHostContextForTest,
+} from '../../editors/vscode/src/knit/inline-images';
 
 function withTempDir<T>(fn: (dir: string) => T): T {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-inline-img-'));
@@ -119,7 +123,12 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
-    test('uses image/svg+xml for .svg', () => {
+    test('uses image/svg+xml data URL for user-included .svg outside figure/', () => {
+        // SVGs the user references in their Rmd (logos, icons, etc.) that
+        // are NOT under `figure/` keep their data-URL path. The inline-SVG
+        // substitution is scoped to knit-emitted plots, so user-included
+        // images preserve their original colors and fragment-identifier
+        // semantics.
         withTempDir((dir) => {
             const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
             fs.writeFileSync(path.join(dir, 'icon.svg'), svg);
@@ -211,6 +220,136 @@ describe('inlineLocalImagesAsDataUrls', () => {
             const out = inlineLocalImagesAsDataUrls(html, dir);
             expect(out).toContain('src="data:image/svg+xml;base64,');
             expect(out).toMatch(/src="data:image\/svg\+xml;base64,[^"]+\?v=1#frag"/);
+        });
+    });
+
+    // -----------------------------------------------------------------
+    // Inline-SVG path for knit-emitted figures
+    //
+    // SVGs under <docDir>/figure/ flow through DOMPurify sanitization
+    // + structural background-rect tagging and land in the rendered HTML
+    // as inline `<svg class="raven-knit-plot">` markup, NOT as
+    // `<img src="data:image/svg+xml...">`. This is what enables the Knit
+    // Output panel's "Apply VS Code theme" toggle to recolor plot text
+    // and strokes via CSS overlay — parent CSS does not cascade into
+    // `<img>`-loaded SVG regardless of the URL scheme.
+    // -----------------------------------------------------------------
+
+    describe('inline SVG for knit-emitted figures (figure/*.svg)', () => {
+        // Sample plot SVG that exercises the bg-rect tagging rules from
+        // `tag-backgrounds.ts`:
+        //   - The first <rect> child of <svg> is the outer canvas (Rule 1).
+        //   - A <rect> direct child of <g> with no stroke-linejoin/linecap
+        //     is a panel background (Rule 2).
+        //   - A <rect> with stroke-linejoin / stroke-linecap is a data rect.
+        const PLOT_SVG =
+            '<?xml version="1.0" encoding="UTF-8"?>' +
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">' +
+            '<rect width="100" height="100" fill="#fff"/>' + // outer canvas (bg)
+            '<g>' +
+            '<rect x="10" y="10" width="80" height="80" fill="#eee"/>' + // panel bg
+            '<rect x="20" y="20" width="20" height="40" fill="steelblue" ' +
+            'stroke="black" stroke-linejoin="miter" stroke-linecap="butt"/>' + // data bar
+            '<line x1="10" y1="50" x2="90" y2="50" stroke="black"/>' +
+            '<text x="50" y="95" text-anchor="middle">x</text>' +
+            '</g>' +
+            '</svg>';
+
+        test('replaces a figure/*.svg <img> with inline <svg class="raven-knit-plot">', () => {
+            __resetSvgHostContextForTest();
+            withTempDir((dir) => {
+                fs.mkdirSync(path.join(dir, 'figure'));
+                fs.writeFileSync(path.join(dir, 'figure', 'plot-1.svg'), PLOT_SVG);
+
+                const html = '<p><img src="figure/plot-1.svg" alt="A"></p>';
+                const out = inlineLocalImagesAsDataUrls(html, dir);
+
+                // The wrapping <img> tag is gone — replaced with the SVG itself.
+                expect(out).not.toContain('<img src="figure/plot-1.svg"');
+                expect(out).not.toContain('data:image/svg+xml');
+                // The class lives on the root <svg>; CSS in
+                // knit-output.ts:applyTheme() scopes its recoloring rules
+                // to this selector.
+                expect(out).toContain(`class="${KNIT_PLOT_SVG_CLASS}"`);
+                // Structural tagger should have tagged the outer canvas
+                // and the panel background, but NOT the bar (which has
+                // stroke-linejoin + stroke-linecap).
+                expect(out).toMatch(/<rect[^>]*class="[^"]*raven-bg/);
+                const ravenBgMatches = out.match(/class="[^"]*raven-bg/g) ?? [];
+                expect(ravenBgMatches.length).toBe(2);
+            });
+        });
+
+        test('strips dangerous content from the inlined SVG (defense in depth)', () => {
+            __resetSvgHostContextForTest();
+            withTempDir((dir) => {
+                fs.mkdirSync(path.join(dir, 'figure'));
+                const dirty =
+                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1">' +
+                    '<script>window.alert(1)</script>' +
+                    '<style>@import url("//evil/?cookie")</style>' +
+                    '<a href="javascript:1"><rect width="1" height="1"/></a>' +
+                    '<rect width="1" height="1" style="background:url(//evil/?bg)"/>' +
+                    '<foreignObject><iframe src="//evil/"></iframe></foreignObject>' +
+                    '</svg>';
+                fs.writeFileSync(path.join(dir, 'figure', 'plot.svg'), dirty);
+                const out = inlineLocalImagesAsDataUrls('<img src="figure/plot.svg">', dir);
+
+                // No script, no <style>, no foreignObject — DOMPurify
+                // FORBID_TAGS strips them. No `style=` attribute either
+                // (FORBID_ATTR).
+                expect(out).not.toContain('<script');
+                expect(out).not.toContain('<style');
+                expect(out).not.toContain('<foreignObject');
+                expect(out).not.toContain('<iframe');
+                expect(out).not.toMatch(/\sstyle\s*=/i);
+                expect(out).not.toContain('javascript:');
+            });
+        });
+
+        test('leaves <img> in place when the SVG read fails', () => {
+            __resetSvgHostContextForTest();
+            withTempDir((dir) => {
+                // No file written, but the path looks like a knit figure.
+                const html = '<img src="figure/missing.svg">';
+                const out = inlineLocalImagesAsDataUrls(html, dir);
+                expect(out).toBe(html);
+            });
+        });
+
+        test('handles multiple knit-plot SVGs in one document', () => {
+            __resetSvgHostContextForTest();
+            withTempDir((dir) => {
+                fs.mkdirSync(path.join(dir, 'figure'));
+                fs.writeFileSync(path.join(dir, 'figure', 'a.svg'), PLOT_SVG);
+                fs.writeFileSync(path.join(dir, 'figure', 'b.svg'), PLOT_SVG);
+                const html =
+                    '<img src="figure/a.svg" alt="A"><p>text</p><img src="figure/b.svg" alt="B">';
+                const out = inlineLocalImagesAsDataUrls(html, dir);
+
+                const svgMatches = out.match(/<svg\b[^>]*class="[^"]*raven-knit-plot/g) ?? [];
+                expect(svgMatches.length).toBe(2);
+                expect(out).not.toContain('<img src="figure/');
+            });
+        });
+
+        test('idempotent class addition when the SVG already has the class', () => {
+            __resetSvgHostContextForTest();
+            withTempDir((dir) => {
+                fs.mkdirSync(path.join(dir, 'figure'));
+                const preMarked = PLOT_SVG.replace(
+                    '<svg ',
+                    `<svg class="${KNIT_PLOT_SVG_CLASS}" `,
+                );
+                fs.writeFileSync(path.join(dir, 'figure', 'plot.svg'), preMarked);
+                const out = inlineLocalImagesAsDataUrls('<img src="figure/plot.svg">', dir);
+
+                // The class is present exactly once in the root <svg>'s class attr.
+                const rootClassMatch = out.match(/<svg\b[^>]*class="([^"]*)"/);
+                expect(rootClassMatch).not.toBeNull();
+                const tokens = rootClassMatch![1].split(/\s+/).filter(Boolean);
+                expect(tokens.filter((t) => t === KNIT_PLOT_SVG_CLASS).length).toBe(1);
+            });
         });
     });
 });

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'bun:test';
-import { parseOutputOptions } from '../../editors/vscode/src/knit/output-options';
+import {
+    parseOutputOptions,
+    withSvgDevDefault,
+} from '../../editors/vscode/src/knit/output-options';
 
 describe('parseOutputOptions', () => {
     it('handles missing output: as empty', () => {
@@ -210,5 +213,34 @@ describe('parseOutputOptions', () => {
         );
         expect(bad.pandocFlags.highlight).toBeUndefined();
         expect(bad.ignored).toContain('highlight');
+    });
+});
+
+describe('withSvgDevDefault', () => {
+    it('injects dev=svg when not set', () => {
+        expect(withSvgDevDefault({})).toEqual({ dev: 'svg' });
+    });
+
+    it('preserves an existing dev value', () => {
+        expect(withSvgDevDefault({ dev: 'png' })).toEqual({ dev: 'png' });
+        expect(withSvgDevDefault({ dev: 'pdf' })).toEqual({ dev: 'pdf' });
+        expect(withSvgDevDefault({ dev: 'cairo_pdf' })).toEqual({ dev: 'cairo_pdf' });
+    });
+
+    it('preserves other chunk options', () => {
+        const input = { fig_width: 8, fig_height: 5, dpi: 300 };
+        expect(withSvgDevDefault(input)).toEqual({
+            fig_width: 8,
+            fig_height: 5,
+            dpi: 300,
+            dev: 'svg',
+        });
+    });
+
+    it('does not mutate the input', () => {
+        const input = { fig_width: 8 };
+        const out = withSvgDevDefault(input);
+        expect(input).toEqual({ fig_width: 8 });
+        expect(out).not.toBe(input);
     });
 });

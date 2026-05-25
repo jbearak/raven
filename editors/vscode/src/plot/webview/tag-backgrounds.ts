@@ -45,6 +45,22 @@ export function tag_background_rects(svgText: string): string {
     // it's jsdom's document installed into globalThis via beforeAll.
     const doc = (globalThis as { document?: Document }).document;
     if (!doc) return svgText;
+    return tag_background_rects_with_document(svgText, doc);
+}
+
+/**
+ * Same as `tag_background_rects`, but takes the DOM Document explicitly
+ * instead of reading `globalThis.document`. Used by the Knit Preview's
+ * host-side SVG inlining pipeline, which runs in Node.js with a jsdom-
+ * provided document — `globalThis.document` is unset in that context, so
+ * the bare `tag_background_rects` falls through to a no-op.
+ *
+ * The plot viewer's webview path keeps using `tag_background_rects`
+ * unchanged; the parameterized form here is a strict superset of its
+ * behavior with the Document plumbed in.
+ */
+export function tag_background_rects_with_document(svgText: string, doc: Document): string {
+    if (!svgText) return svgText;
 
     // Parse via a detached <div> + innerHTML: DOMPurify's output is
     // HTML-style (not strictly well-formed XML), and the HTML parser

@@ -189,6 +189,20 @@ explorer-context-menu hook is opt-in via your own keybindings).
       and broad role palette, not a pixel-identical rendering of
       VS Code's own code coloring.
 
+      The toggle also recolors R plot output (figures emitted
+      by knitr chunks): when on, the SVG canvas background is
+      hidden, plot text is repainted in `--vscode-editor-foreground`,
+      and non-data strokes (axes, tick marks, gridlines) pick up
+      the same foreground color. Data fills (bar colors, point
+      colors set by `aes(fill=…)`, `geom_rect()` annotations) are
+      left untouched so the visual encoding of the plot is
+      preserved. This requires inline SVG, so Raven defaults
+      `dev = 'svg'` for HTML preview and HTML export — see the
+      "YAML output options honored / ignored" section below.
+      User-included image references in the document (e.g.,
+      `<img src="logo.svg">` not under the chunk-output
+      `figure/` directory) are unaffected.
+
     Standard text copy works inside the rendered output:
     Cmd/Ctrl-C copies the current iframe selection to the system
     clipboard, Cmd/Ctrl-A selects all, and right-clicking opens a
@@ -272,7 +286,7 @@ PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
 
 | Key | Where it's applied |
 |---|---|
-| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting |
+| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting. For HTML targets (preview and HTML export) Raven defaults `dev = 'svg'` when YAML doesn't set one — inline SVG is what lets the **Apply VS Code theme** toggle recolor R plots. Set `dev:` explicitly in YAML (e.g., `dev: png`) to opt out. Non-HTML targets (PDF, Word) use knitr's PNG default unchanged. Per-chunk `{r dev='png'}` overrides still win. |
 | `toc`, `toc_depth` | Pandoc `--toc` / `--toc-depth` (export only) |
 | `number_sections` | Pandoc `--number-sections` (export only) |
 | `highlight` | Pandoc `--highlight-style` (export only; validated against the known list) |

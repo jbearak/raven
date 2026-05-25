@@ -741,7 +741,36 @@ export function buildShellHtml(args: {
           + ' outline: none !important;'
           + ' border: 0 !important;'
           + ' filter: none !important;'
-          + ' text-decoration: none !important; }';
+          + ' text-decoration: none !important; }'
+          // Plot recoloring. Mirrors the Plot Viewer's overlay (see
+          // App.svelte's .plot-host.apply-vscode-theme rules):
+          //   - Hide canvas/panel background rects tagged \`raven-bg\` by
+          //     the host-side background-rect tagger so the editor
+          //     background shows through.
+          //   - Recolor text to --vscode-editor-foreground.
+          //   - Recolor non-data strokes (lines, paths, axes, tick marks)
+          //     to --vscode-editor-foreground; \`rect:not(.raven-bg)\` keeps
+          //     geom_rect / geom_bar data shapes untouched.
+          // \`!important\` is required because R's svglite emits
+          // \`fill=\` / \`stroke=\` as SVG presentation attributes, and
+          // inline-attribute specificity wins over a class selector
+          // otherwise. The selectors are scoped to \`svg.raven-knit-plot\`
+          // so unrelated user SVGs (logos, icons referenced via
+          // \`<img src="logo.svg">\`) are not recolored — only knit-emitted
+          // plot SVGs carry that class (added during host-side inlining
+          // in inline-images.ts).
+          + ' svg.raven-knit-plot text {'
+          + ' fill: ' + c.fg + ' !important;'
+          + ' font-family: var(--vscode-editor-font-family) !important; }'
+          + ' svg.raven-knit-plot line,'
+          + ' svg.raven-knit-plot polyline,'
+          + ' svg.raven-knit-plot polygon,'
+          + ' svg.raven-knit-plot path,'
+          + ' svg.raven-knit-plot circle,'
+          + ' svg.raven-knit-plot rect:not(.raven-bg) {'
+          + ' stroke: ' + c.fg + ' !important; }'
+          + ' svg.raven-knit-plot rect.raven-bg {'
+          + ' fill: none !important; stroke: none !important; }';
         // Paint the iframe element itself too so the brief flash
         // before the inner document parses also matches the theme.
         iframe.style.background = c.bg;

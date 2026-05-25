@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { registerKnitCommands, runKnitWithExistingController } from './knit-commands';
 import { disposeKnitGrammarRegistryForDeactivation, runPostKnitRender as postKnitRender } from './post-knit-renderer';
+import { disposeSvgHostContextForDeactivation } from './inline-images';
 import { runKnit as knitEngineRun } from './knit-engine';
 import {
     cleanupCurrentSession,
@@ -22,6 +23,7 @@ import { previewArtifactPaths } from './raven-knit-paths';
 import { isPandocVersionOutput } from './pandoc-probe';
 
 export { disposeKnitGrammarRegistryForDeactivation };
+export { disposeSvgHostContextForDeactivation };
 export { runExport } from './export-commands';
 export type { ExportDeps } from './export-commands';
 
