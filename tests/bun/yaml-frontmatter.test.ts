@@ -5,6 +5,7 @@ import {
     detectFormat,
     detectBlockers,
     isSupportedHtmlFormat,
+    stripFrontmatter,
 } from '../../editors/vscode/src/knit/yaml-frontmatter';
 
 describe('extractFrontmatter', () => {
@@ -200,6 +201,95 @@ describe('detectBlockers', () => {
 
     test('multiple top-level output entries are NOT a blocker', () => {
         expect(detectBlockers({ output: { html_document: {}, pdf_document: {} } })).toEqual([]);
+    });
+});
+
+describe('stripFrontmatter', () => {
+    test('strips a well-formed frontmatter block with trailing newline', () => {
+        const text = '---\ntitle: example\noutput: html_document\n---\n\nbody\n';
+        // The opening `---\n`, the body, the closing `---`, and the
+        // one newline immediately after the closing fence are removed.
+        // The blank line that originally separated the closing fence
+        // from `body` becomes the leading `\n` of the remainder.
+        expect(stripFrontmatter(text)).toBe('\nbody\n');
+    });
+
+    test('strips frontmatter that ends at EOF without a trailing newline', () => {
+        const text = '---\ntitle: x\n---';
+        expect(stripFrontmatter(text)).toBe('');
+    });
+
+    test('strips a minimal-body frontmatter (one blank line between fences)', () => {
+        // The closing-fence regex requires `\n---` (a newline BEFORE
+        // the closing `---`), so a minimal frontmatter must have at
+        // least one line — even an empty one — between the fences.
+        const text = '---\n\n---\nbody\n';
+        expect(stripFrontmatter(text)).toBe('body\n');
+    });
+
+    test('returns input unchanged when there is no opening fence', () => {
+        const text = '# heading\n\nbody\n';
+        expect(stripFrontmatter(text)).toBe(text);
+    });
+
+    test('returns input unchanged when the opening fence is not at byte 0', () => {
+        const text = '\n---\ntitle: x\n---\nbody\n';
+        expect(stripFrontmatter(text)).toBe(text);
+    });
+
+    test('returns input unchanged when the frontmatter is unterminated', () => {
+        // No closing `---` after the opener — must NOT mistake a
+        // later `---` mid-body for a closer either (there is none here).
+        const text = '---\ntitle: x\nno close\n';
+        expect(stripFrontmatter(text)).toBe(text);
+    });
+
+    test('does not mistake a body-side `---` for a frontmatter close', () => {
+        // No frontmatter at all; the `---` appears as a horizontal
+        // rule between paragraphs. Must come back unchanged.
+        const text = 'intro\n\n---\n\nrest\n';
+        expect(stripFrontmatter(text)).toBe(text);
+    });
+
+    test('strips a leading UTF-8 BOM before matching', () => {
+        const text = '﻿---\ntitle: ok\n---\nbody\n';
+        // BOM-stripped, frontmatter-stripped. Result is just the body
+        // with no separating blank line, since the original had none.
+        expect(stripFrontmatter(text)).toBe('body\n');
+    });
+
+    test('accepts CRLF line endings, returning LF in the remainder', () => {
+        const text = '---\r\ntitle: x\r\n---\r\nbody\r\n';
+        // CRLF→LF normalized before matching; remainder carries LF.
+        expect(stripFrontmatter(text)).toBe('body\n');
+    });
+
+    test('lockstep with extractFrontmatter: same decision predicate', () => {
+        // For every fixture, `stripFrontmatter` must change the input
+        // iff `extractFrontmatter` returns a non-null body. This is
+        // the contract that guards the shared `findFrontmatterEnd`
+        // predicate.
+        const fixtures: string[] = [
+            '---\ntitle: x\n---\nbody\n',
+            '---\ntitle: x\n---',
+            '---\n\n---\nbody\n',
+            '# heading\nbody\n',
+            '---\nunterminated\n',
+            '\n---\ntitle: x\n---\nbody\n',
+            'intro\n\n---\n\nrest\n',
+            '﻿---\ntitle: ok\n---\nbody\n',
+            '---\r\ntitle: x\r\n---\r\nbody\r\n',
+            '',
+        ];
+        for (const f of fixtures) {
+            const stripped = stripFrontmatter(f);
+            const extracted = extractFrontmatter(f);
+            if (extracted === null) {
+                expect(stripped).toBe(f);
+            } else {
+                expect(stripped).not.toBe(f);
+            }
+        }
     });
 });
 
