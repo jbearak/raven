@@ -7,17 +7,7 @@
     "sourceMap": true,
     "rootDir": "src",
     "strict": true,
-    "skipLibCheck": true,
-    // The Knit Preview pipeline (src/knit/inline-images.ts) imports
-    // `sanitize_svg_with_window` and `create_svg_sanitizer` from
-    // src/plot/webview/sanitize.ts, which default-imports the CommonJS
-    // `dompurify` package. tsc traverses that import for type-checking
-    // even though src/plot/webview is in `exclude`. esModuleInterop
-    // allows the `import X from 'cjs-module'` syntax to resolve through
-    // the helper wrapper at runtime. The webview's own tsconfig
-    // (src/plot/webview/tsconfig.json) uses moduleResolution: Bundler,
-    // which sidesteps the issue there.
-    "esModuleInterop": true
+    "skipLibCheck": true
   },
   "exclude": ["node_modules", ".vscode-test", "src/plot/webview", "src/help/webview", "src/data-viewer/webview"]
 }

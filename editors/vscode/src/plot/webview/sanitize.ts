@@ -173,27 +173,7 @@ function migrate_inline_styles_to_attributes(svgText: string): string {
         .replace(/\sstyle='([^']*)'/gi, (_m, decls) => convert(decls));
 }
 
-/**
- * DOMPurify config shared between the webview and the Knit Preview's
- * host-side SVG inlining pipeline. Keep these flags in lockstep with the
- * documentation block above (`Configuration choices`) and with the
- * regression test in `tests/bun/plot-webview-sanitize.test.ts`.
- */
-// DOMPurify clones the config internally before use, so this object is
-// safe to share across calls. Kept as a function (not a `const`) because
-// the FORBID_TAGS/FORBID_ATTR arrays are typed as `string[]` rather than
-// readonly tuples by the DOMPurify Config type — returning a fresh
-// literal each time avoids fighting the `as const` vs mutable-array
-// inference.
-function svgSanitizeConfig() {
-    return {
-        USE_PROFILES: { svg: true, svgFilters: true },
-        FORBID_TAGS: ['use', 'image', 'a', 'style', 'foreignObject', 'feImage'],
-        FORBID_ATTR: ['style'],
-    };
-}
-
-function sanitize_with_dompurify(text: string, dp: DOMPurify): string {
+export function sanitize_svg(text: string): string {
     // Pre-migrate httpgd's inline style declarations into SVG attribute
     // form so the colors and fonts survive DOMPurify's `FORBID_ATTR`
     // pass. Without this, every fill/stroke/font is stripped, the SVG
@@ -201,34 +181,13 @@ function sanitize_with_dompurify(text: string, dp: DOMPurify): string {
     // VS Code theme the plot is effectively invisible until the
     // "Apply VS Code theme" overlay forces a foreground color.
     const preprocessed = migrate_inline_styles_to_attributes(text);
-    const out = dp.sanitize(preprocessed, svgSanitizeConfig());
+    const out = get_dompurify().sanitize(preprocessed, {
+        USE_PROFILES: { svg: true, svgFilters: true },
+        FORBID_TAGS: ['use', 'image', 'a', 'style', 'foreignObject', 'feImage'],
+        FORBID_ATTR: ['style'],
+    });
     // DOMPurify's `sanitize` can return a TrustedHTML object on
     // platforms with Trusted Types; coerce to string so the caller's
     // `{@html}` consumer always receives a primitive.
     return typeof out === 'string' ? out : String(out);
-}
-
-export function sanitize_svg(text: string): string {
-    return sanitize_with_dompurify(text, get_dompurify());
-}
-
-/**
- * Build a reusable SVG sanitizer bound to the given window. Used by the
- * Knit Preview's host-side SVG inlining pipeline, which runs in Node.js
- * with a jsdom-provided window. The webview path keeps using
- * `sanitize_svg` (globalThis-backed) unchanged.
- *
- * A single Knit Preview render typically contains 0–N plot SVGs; reusing
- * the DOMPurify instance across the batch saves the factory call per
- * plot. The webview path's threat model already justifies the sanitize
- * pass — see the module docstring above for the full configuration
- * rationale.
- */
-export function create_svg_sanitizer(win: unknown): (text: string) => string {
-    const factory = DOMPurifyDefault as unknown as (root: unknown) => DOMPurify;
-    if (typeof factory !== 'function') {
-        throw new Error('create_svg_sanitizer: DOMPurify default export is not a factory.');
-    }
-    const dp = factory(win);
-    return (text) => sanitize_with_dompurify(text, dp);
 }

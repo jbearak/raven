@@ -16,11 +16,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import {
-    inlineLocalImagesAsDataUrls,
-    KNIT_PLOT_SVG_CLASS,
-    __resetSvgHostContextForTest,
-} from '../../editors/vscode/src/knit/inline-images';
+import { inlineLocalImagesAsDataUrls } from '../../editors/vscode/src/knit/inline-images';
 
 function withTempDir<T>(fn: (dir: string) => T): T {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-inline-img-'));
@@ -224,131 +220,97 @@ describe('inlineLocalImagesAsDataUrls', () => {
     });
 
     // -----------------------------------------------------------------
-    // Inline-SVG path for knit-emitted figures
+    // Knit-emitted SVG marker (data-raven-knit-plot)
     //
-    // SVGs under <docDir>/figure/ flow through DOMPurify sanitization
-    // + structural background-rect tagging and land in the rendered HTML
-    // as inline `<svg class="raven-knit-plot">` markup, NOT as
-    // `<img src="data:image/svg+xml...">`. This is what enables the Knit
-    // Output panel's "Apply VS Code theme" toggle to recolor plot text
-    // and strokes via CSS overlay — parent CSS does not cascade into
-    // `<img>`-loaded SVG regardless of the URL scheme.
+    // SVGs under <docDir>/figure/ get a marker attribute so the webview
+    // shell's iframe-load promotion pass (`promoteKnitPlotSvgs` in
+    // knit-output.ts) can swap them for inline <svg class="raven-knit-plot">.
+    // The SVG bytes themselves are still embedded as a base64 data URL —
+    // the promotion happens client-side because the host's bundled jsdom
+    // throws on load (xhr-sync-worker.js require.resolve in the bundled
+    // context). The webview's iframe already has a real DOM we use for
+    // parsing + sanitization there.
+    //
+    // User-included SVGs outside `figure/` get NO marker — they stay as
+    // a plain <img src="data:image/svg+xml..."> so their colors and
+    // fragment-identifier semantics are preserved.
     // -----------------------------------------------------------------
 
-    describe('inline SVG for knit-emitted figures (figure/*.svg)', () => {
-        // Sample plot SVG that exercises the bg-rect tagging rules from
-        // `tag-backgrounds.ts`:
-        //   - The first <rect> child of <svg> is the outer canvas (Rule 1).
-        //   - A <rect> direct child of <g> with no stroke-linejoin/linecap
-        //     is a panel background (Rule 2).
-        //   - A <rect> with stroke-linejoin / stroke-linecap is a data rect.
-        const PLOT_SVG =
-            '<?xml version="1.0" encoding="UTF-8"?>' +
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">' +
-            '<rect width="100" height="100" fill="#fff"/>' + // outer canvas (bg)
-            '<g>' +
-            '<rect x="10" y="10" width="80" height="80" fill="#eee"/>' + // panel bg
-            '<rect x="20" y="20" width="20" height="40" fill="steelblue" ' +
-            'stroke="black" stroke-linejoin="miter" stroke-linecap="butt"/>' + // data bar
-            '<line x1="10" y1="50" x2="90" y2="50" stroke="black"/>' +
-            '<text x="50" y="95" text-anchor="middle">x</text>' +
-            '</g>' +
-            '</svg>';
-
-        test('replaces a figure/*.svg <img> with inline <svg class="raven-knit-plot">', () => {
-            __resetSvgHostContextForTest();
+    describe('data-raven-knit-plot marker for figure/*.svg', () => {
+        test('marks knit-emitted figure SVGs', () => {
             withTempDir((dir) => {
+                const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
                 fs.mkdirSync(path.join(dir, 'figure'));
-                fs.writeFileSync(path.join(dir, 'figure', 'plot-1.svg'), PLOT_SVG);
+                fs.writeFileSync(path.join(dir, 'figure', 'plot-1.svg'), svg);
 
-                const html = '<p><img src="figure/plot-1.svg" alt="A"></p>';
+                const html = '<p><img src="figure/plot-1.svg" alt="plot of chunk plot"></p>';
                 const out = inlineLocalImagesAsDataUrls(html, dir);
 
-                // The wrapping <img> tag is gone — replaced with the SVG itself.
-                expect(out).not.toContain('<img src="figure/plot-1.svg"');
-                expect(out).not.toContain('data:image/svg+xml');
-                // The class lives on the root <svg>; CSS in
-                // knit-output.ts:applyTheme() scopes its recoloring rules
-                // to this selector.
-                expect(out).toContain(`class="${KNIT_PLOT_SVG_CLASS}"`);
-                // Structural tagger should have tagged the outer canvas
-                // and the panel background, but NOT the bar (which has
-                // stroke-linejoin + stroke-linecap).
-                expect(out).toMatch(/<rect[^>]*class="[^"]*raven-bg/);
-                const ravenBgMatches = out.match(/class="[^"]*raven-bg/g) ?? [];
-                expect(ravenBgMatches.length).toBe(2);
+                // The src is still a data URL (no SVG inlining on the host).
+                expect(out).toContain('src="data:image/svg+xml;base64,');
+                // The marker attribute is present so the webview pass can find it.
+                expect(out).toContain('data-raven-knit-plot="1"');
+                // alt is preserved.
+                expect(out).toContain('alt="plot of chunk plot"');
             });
         });
 
-        test('strips dangerous content from the inlined SVG (defense in depth)', () => {
-            __resetSvgHostContextForTest();
+        test('does NOT mark SVGs outside figure/', () => {
             withTempDir((dir) => {
-                fs.mkdirSync(path.join(dir, 'figure'));
-                const dirty =
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1">' +
-                    '<script>window.alert(1)</script>' +
-                    '<style>@import url("//evil/?cookie")</style>' +
-                    '<a href="javascript:1"><rect width="1" height="1"/></a>' +
-                    '<rect width="1" height="1" style="background:url(//evil/?bg)"/>' +
-                    '<foreignObject><iframe src="//evil/"></iframe></foreignObject>' +
-                    '</svg>';
-                fs.writeFileSync(path.join(dir, 'figure', 'plot.svg'), dirty);
-                const out = inlineLocalImagesAsDataUrls('<img src="figure/plot.svg">', dir);
+                const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+                fs.writeFileSync(path.join(dir, 'logo.svg'), svg);
 
-                // No script, no <style>, no foreignObject — DOMPurify
-                // FORBID_TAGS strips them. No `style=` attribute either
-                // (FORBID_ATTR).
-                expect(out).not.toContain('<script');
-                expect(out).not.toContain('<style');
-                expect(out).not.toContain('<foreignObject');
-                expect(out).not.toContain('<iframe');
-                expect(out).not.toMatch(/\sstyle\s*=/i);
-                expect(out).not.toContain('javascript:');
-            });
-        });
-
-        test('leaves <img> in place when the SVG read fails', () => {
-            __resetSvgHostContextForTest();
-            withTempDir((dir) => {
-                // No file written, but the path looks like a knit figure.
-                const html = '<img src="figure/missing.svg">';
+                const html = '<img src="logo.svg">';
                 const out = inlineLocalImagesAsDataUrls(html, dir);
-                expect(out).toBe(html);
+
+                expect(out).toContain('src="data:image/svg+xml;base64,');
+                expect(out).not.toContain('data-raven-knit-plot');
             });
         });
 
-        test('handles multiple knit-plot SVGs in one document', () => {
-            __resetSvgHostContextForTest();
+        test('does NOT mark PNG figures (PNG cannot be CSS-themed regardless)', () => {
             withTempDir((dir) => {
                 fs.mkdirSync(path.join(dir, 'figure'));
-                fs.writeFileSync(path.join(dir, 'figure', 'a.svg'), PLOT_SVG);
-                fs.writeFileSync(path.join(dir, 'figure', 'b.svg'), PLOT_SVG);
+                fs.writeFileSync(path.join(dir, 'figure', 'plot-1.png'), TINY_PNG);
+
+                const html = '<img src="figure/plot-1.png">';
+                const out = inlineLocalImagesAsDataUrls(html, dir);
+
+                expect(out).toContain('src="data:image/png;base64,');
+                expect(out).not.toContain('data-raven-knit-plot');
+            });
+        });
+
+        test('marks multiple knit-plot SVGs in one document', () => {
+            withTempDir((dir) => {
+                const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+                fs.mkdirSync(path.join(dir, 'figure'));
+                fs.writeFileSync(path.join(dir, 'figure', 'a.svg'), svg);
+                fs.writeFileSync(path.join(dir, 'figure', 'b.svg'), svg);
+
                 const html =
                     '<img src="figure/a.svg" alt="A"><p>text</p><img src="figure/b.svg" alt="B">';
                 const out = inlineLocalImagesAsDataUrls(html, dir);
 
-                const svgMatches = out.match(/<svg\b[^>]*class="[^"]*raven-knit-plot/g) ?? [];
-                expect(svgMatches.length).toBe(2);
-                expect(out).not.toContain('<img src="figure/');
+                const markers = out.match(/data-raven-knit-plot="1"/g) ?? [];
+                expect(markers.length).toBe(2);
             });
         });
 
-        test('idempotent class addition when the SVG already has the class', () => {
-            __resetSvgHostContextForTest();
+        test('handles knit-plot SVG with #fragment in src', () => {
+            // Fragments on data URLs are meaningless (no URL to navigate to)
+            // but the inline-images path preserves them for round-trip honesty.
+            // The marker still gets added since the resolved file is in figure/.
             withTempDir((dir) => {
+                const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
                 fs.mkdirSync(path.join(dir, 'figure'));
-                const preMarked = PLOT_SVG.replace(
-                    '<svg ',
-                    `<svg class="${KNIT_PLOT_SVG_CLASS}" `,
-                );
-                fs.writeFileSync(path.join(dir, 'figure', 'plot.svg'), preMarked);
-                const out = inlineLocalImagesAsDataUrls('<img src="figure/plot.svg">', dir);
+                fs.writeFileSync(path.join(dir, 'figure', 'plot.svg'), svg);
 
-                // The class is present exactly once in the root <svg>'s class attr.
-                const rootClassMatch = out.match(/<svg\b[^>]*class="([^"]*)"/);
-                expect(rootClassMatch).not.toBeNull();
-                const tokens = rootClassMatch![1].split(/\s+/).filter(Boolean);
-                expect(tokens.filter((t) => t === KNIT_PLOT_SVG_CLASS).length).toBe(1);
+                const html = '<img src="figure/plot.svg#layer-1">';
+                const out = inlineLocalImagesAsDataUrls(html, dir);
+
+                expect(out).toContain('data-raven-knit-plot="1"');
+                expect(out).toMatch(/src="data:image\/svg\+xml;base64,[^"]+#layer-1"/);
             });
         });
     });

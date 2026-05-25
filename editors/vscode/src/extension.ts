@@ -46,11 +46,7 @@ import {
     registerActivationReactivity,
     resolveRConsoleActivation,
 } from './r-console-activation';
-import {
-    registerKnit,
-    disposeKnitGrammarRegistryForDeactivation,
-    disposeSvgHostContextForDeactivation,
-} from './knit';
+import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit';
 import { registerInstallNags } from './recommendations/install-nag';
 import { validateServerBinary } from './server-binary-check';
 
@@ -775,11 +771,6 @@ export function deactivate(): Thenable<void> | undefined {
     // context's `subscriptions` array without a fresh listener and the
     // cached registry permanently stale across install/uninstall events.
     disposeKnitGrammarRegistryForDeactivation();
-    // Drop the jsdom context the inline-SVG path holds for the duration
-    // of the activation. The module-scoped reference would otherwise
-    // survive a disable→enable cycle and leak the previous activation's
-    // window resources.
-    disposeSvgHostContextForDeactivation();
     const stops: Thenable<void>[] = [];
     if (active_plot_services) stops.push(active_plot_services.dispose());
     if (client) stops.push(client.stop());

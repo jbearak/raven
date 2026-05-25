@@ -786,11 +786,175 @@ export function buildShellHtml(args: {
         applyTheme();
       });
 
-      iframe.addEventListener('load', applyTheme);
+      // Promote <img data-raven-knit-plot> elements to inline <svg> so
+      // the applyTheme() CSS overlay can recolor them. The host-side
+      // inlineLocalImagesAsDataUrls writes knit-emitted SVG figures as
+      // <img src=data:image/svg+xml;base64,...  data-raven-knit-plot=1>.
+      // Parent CSS does NOT cascade into <img>-loaded SVG regardless of
+      // URL scheme, which is why the plot viewer also switched to inline
+      // SVG (see App.svelte). We replicate that substrate switch here.
+      //
+      // This runs in the webview rather than on the host because the
+      // host runs in Node where esbuild bundles jsdom inline, and
+      // jsdom's XMLHttpRequest-impl.js calls require.resolve for
+      // ./xhr-sync-worker.js at top-level load time, which throws
+      // inside the bundled context. The iframe already has a real DOM
+      // we can borrow for parsing and walking the SVG.
+      //
+      // Sanitization: we strip the same elements and attributes
+      // DOMPurify's SVG profile would (script, style, foreignObject,
+      // a, use, image, feImage; style and on* attributes; href values
+      // starting with javascript: or data:text/html). The threat model
+      // matches the plot viewer's: defense in depth, not the primary
+      // boundary. Primary boundaries are (a) the iframe sandbox
+      // attribute allow-same-origin blocks script execution; (b) the
+      // panel CSP (default-src none, style-src cspSource 'unsafe-
+      // inline', connect-src none) blocks external-resource exfil
+      // from style imports, anchor hrefs, and similar.
+      var KNIT_PLOT_FORBID_TAGS = {
+        script: 1, style: 1, foreignobject: 1, a: 1,
+        use: 1, image: 1, feimage: 1,
+      };
+      var KNIT_PLOT_FORBID_ATTRS = { style: 1 };
+      function isUnsafeHrefValue(v) {
+        if (typeof v !== 'string') return false;
+        // javascript:, data:text/html, and other risky schemes inside
+        // an SVG href/xlink:href. We are conservative; any javascript:
+        // or data:text/html token is treated as forbidden regardless
+        // of leading whitespace or character casing.
+        return /^\\s*(?:javascript|data:text\\/html)/i.test(v);
+      }
+      function sanitizeKnitPlotSvg(svg) {
+        // Walk the SVG subtree, removing forbidden tags and attributes.
+        // Iterate children via NodeFilter.SHOW_ELEMENT so the iteration
+        // visits every descendant element exactly once. We collect into
+        // an array first because removing a node from the tree during
+        // the walk invalidates the TreeWalker's position.
+        var toRemove = [];
+        var walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
+        var node = walker.nextNode();
+        while (node) {
+          var name = node.tagName && node.tagName.toLowerCase();
+          if (name && KNIT_PLOT_FORBID_TAGS[name]) {
+            toRemove.push(node);
+          }
+          node = walker.nextNode();
+        }
+        for (var i = 0; i < toRemove.length; i++) {
+          var el = toRemove[i];
+          if (el.parentNode) el.parentNode.removeChild(el);
+        }
+        // Second pass: strip forbidden attributes (style, on*) and
+        // dangerous hrefs from every surviving element. Walk again
+        // because elements may have been promoted as children of
+        // removed parents.
+        walker = svg.ownerDocument.createTreeWalker(svg, 1 /* SHOW_ELEMENT */, null);
+        var current = svg;
+        do {
+          var attrs = current.attributes;
+          if (attrs) {
+            var stripAttrs = [];
+            for (var j = 0; j < attrs.length; j++) {
+              var an = attrs[j].name.toLowerCase();
+              if (KNIT_PLOT_FORBID_ATTRS[an] || an.indexOf('on') === 0) {
+                stripAttrs.push(attrs[j].name);
+              } else if ((an === 'href' || an === 'xlink:href')
+                         && isUnsafeHrefValue(attrs[j].value)) {
+                stripAttrs.push(attrs[j].name);
+              }
+            }
+            for (var k = 0; k < stripAttrs.length; k++) {
+              current.removeAttribute(stripAttrs[k]);
+            }
+          }
+          current = walker.nextNode();
+        } while (current);
+      }
+      function tagKnitPlotBackgroundRects(svg) {
+        // Mirror the structural logic in
+        // editors/vscode/src/plot/webview/tag-backgrounds.ts:
+        //   Rule 1: the first <rect> direct child of <svg> is the outer
+        //           canvas — always tag.
+        //   Rule 2: a <rect> direct child of <g> with neither
+        //           stroke-linejoin nor stroke-linecap is a panel
+        //           background.
+        var rects = svg.querySelectorAll('rect');
+        for (var i = 0; i < rects.length; i++) {
+          var rect = rects[i];
+          var parent = rect.parentElement;
+          if (!parent) continue;
+          var pn = parent.localName ? parent.localName.toLowerCase() : '';
+          if (pn === 'svg') {
+            // Find the first <rect> direct child of <svg>.
+            var first = null;
+            for (var n = parent.firstElementChild; n; n = n.nextElementSibling) {
+              if (n.localName && n.localName.toLowerCase() === 'rect') {
+                first = n;
+                break;
+              }
+            }
+            if (rect === first) rect.classList.add('raven-bg');
+          } else if (pn === 'g') {
+            if (!rect.hasAttribute('stroke-linejoin')
+                && !rect.hasAttribute('stroke-linecap')) {
+              rect.classList.add('raven-bg');
+            }
+          }
+        }
+      }
+      function decodeBase64DataUrl(src) {
+        // src looks like "data:image/svg+xml;base64,<...>" possibly
+        // followed by a "#fragment" suffix that we preserved
+        // round-tripping through inlineLocalImagesAsDataUrls. Strip
+        // the leading prefix + any trailing fragment before decoding.
+        var comma = src.indexOf(',');
+        if (comma < 0) return null;
+        var payload = src.slice(comma + 1);
+        var fragment = payload.indexOf('#');
+        if (fragment >= 0) payload = payload.slice(0, fragment);
+        try {
+          // atob handles standard base64; the data URL alphabet matches.
+          return atob(payload);
+        } catch (e) {
+          return null;
+        }
+      }
+      function promoteKnitPlotSvgs() {
+        var doc = iframe.contentDocument;
+        if (!doc) return;
+        var imgs = doc.querySelectorAll('img[data-raven-knit-plot]');
+        for (var i = 0; i < imgs.length; i++) {
+          var img = imgs[i];
+          var src = img.getAttribute('src') || '';
+          if (src.indexOf('data:image/svg+xml') !== 0) continue;
+          var svgText = decodeBase64DataUrl(src);
+          if (!svgText) continue;
+          var container = doc.createElement('div');
+          // innerHTML parses the SVG via the HTML parser, which the
+          // iframe's parser already exercises for srcdoc content —
+          // foreign-content insertion mode handles <svg>. Standard
+          // browser sanitization rules apply (script tags injected via
+          // innerHTML do NOT execute), so this is safe regardless of
+          // the explicit forbid-pass below.
+          container.innerHTML = svgText;
+          var svg = container.querySelector('svg');
+          if (!svg) continue;
+          sanitizeKnitPlotSvg(svg);
+          tagKnitPlotBackgroundRects(svg);
+          svg.classList.add('raven-knit-plot');
+          if (img.parentNode) img.parentNode.replaceChild(svg, img);
+        }
+      }
+
+      iframe.addEventListener('load', function () {
+        promoteKnitPlotSvgs();
+        applyTheme();
+      });
       // The srcdoc parse may have completed before our script ran;
       // try immediately in that case.
       if (iframe.contentDocument
           && iframe.contentDocument.readyState !== 'loading') {
+        promoteKnitPlotSvgs();
         applyTheme();
       }
 
