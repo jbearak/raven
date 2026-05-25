@@ -47,6 +47,25 @@ suite('plot viewer substrate — inline SVG (not <img>)', () => {
             bundle.includes('sanitize') && bundle.includes('FORBID_TAGS'),
             'webview bundle should include the DOMPurify sanitize call',
         );
+        // Negative substrate check — the bundle MUST NOT contain any
+        // `<img>` markers from a Svelte template emitting an `<img>`
+        // element. Svelte 5's compiler turns `<img …>` templates into
+        // calls to internal helpers that include the literal "img"
+        // tag name; restoring an `<img>` substrate would re-introduce
+        // these markers. (We also accept a future world where Svelte
+        // emits the tag via a different shape; the second probe
+        // catches the `src=` attribute pattern the old `<img src=>`
+        // had.) Either pattern showing up means someone re-introduced
+        // an `<img>`-based renderer, which would silently break the
+        // toggle (CSS doesn't cascade into image-loaded SVG).
+        assert.ok(
+            !bundle.includes('"img"'),
+            'webview bundle must not declare an <img> element (substrate guard)',
+        );
+        assert.ok(
+            !/\bimg\s+src\s*=/.test(bundle),
+            'webview bundle must not produce `<img src=...>` markup (substrate guard)',
+        );
     });
 
     test('PlotViewerPanel HTML does not list blob: or data: in img-src', async function () {
@@ -66,19 +85,7 @@ suite('plot viewer substrate — inline SVG (not <img>)', () => {
         const httpgdPort = (fake_httpgd.address() as { port: number }).port;
         try {
             const sessionId = crypto.randomBytes(8).toString('hex');
-            await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'x-raven-session-token': server.token,
-                },
-                body: JSON.stringify({
-                    sessionId,
-                    httpgdHost: '127.0.0.1',
-                    httpgdPort,
-                    httpgdToken: 'tok',
-                }),
-            });
+            await postSessionReady(server, sessionId, httpgdPort);
             const ctx = { extensionUri: ext.extensionUri } as unknown as vscode.ExtensionContext;
             const panel = new PlotViewerPanel(ctx, server, sessionId, 1, { onDisposed: () => {} });
             try {
@@ -114,4 +121,34 @@ async function pollFor<T>(fn: () => T | null | undefined, timeout_ms: number): P
         await new Promise(r => setTimeout(r, 25));
     }
     throw new Error(`pollFor: timed out after ${timeout_ms}ms`);
+}
+
+/**
+ * POST `/session-ready` to the loopback session server and assert
+ * the response is OK. Returning early on a 4xx/5xx leaves the test
+ * to fail later at a more confusing site (panel never sees the
+ * session); surfacing the failure here keeps diagnostics tight.
+ */
+async function postSessionReady(
+    server: RSessionServer,
+    sessionId: string,
+    httpgdPort: number,
+): Promise<void> {
+    const r = await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-raven-session-token': server.token,
+        },
+        body: JSON.stringify({
+            sessionId,
+            httpgdHost: '127.0.0.1',
+            httpgdPort,
+            httpgdToken: 'tok',
+        }),
+    });
+    if (!r.ok) {
+        const body = await r.text().catch(() => '<no body>');
+        throw new Error(`/session-ready failed: ${r.status} ${body}`);
+    }
 }

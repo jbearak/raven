@@ -83,19 +83,7 @@ suite('plot theme-toggle — host wiring', () => {
 
         // Drive a panel into existence so there's something to broadcast to.
         const sessionId = crypto.randomBytes(8).toString('hex');
-        await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-raven-session-token': server.token,
-            },
-            body: JSON.stringify({
-                sessionId,
-                httpgdHost: '127.0.0.1',
-                httpgdPort,
-                httpgdToken: 'tok',
-            }),
-        });
+        await postSessionReady(server, sessionId, httpgdPort);
         const ctx = { extensionUri: ext!.extensionUri } as unknown as vscode.ExtensionContext;
         // Sparse globalState stub to count update() calls.
         let last_value: unknown = undefined;
@@ -134,19 +122,7 @@ suite('plot theme-toggle — host wiring', () => {
         this.timeout(15000);
         const ext = vscode.extensions.getExtension('jbearak.raven-r')!;
         const sessionId = crypto.randomBytes(8).toString('hex');
-        await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-raven-session-token': server.token,
-            },
-            body: JSON.stringify({
-                sessionId,
-                httpgdHost: '127.0.0.1',
-                httpgdPort,
-                httpgdToken: 'tok',
-            }),
-        });
+        await postSessionReady(server, sessionId, httpgdPort);
         const memento = {
             get: (_k: string, _def: unknown) => true, // pretend persisted
             update: async (_k: string, _v: unknown) => { /* no-op */ },
@@ -182,19 +158,7 @@ suite('plot theme-toggle — host wiring', () => {
         this.timeout(15000);
         const ext = vscode.extensions.getExtension('jbearak.raven-r')!;
         const sessionId = crypto.randomBytes(8).toString('hex');
-        await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-raven-session-token': server.token,
-            },
-            body: JSON.stringify({
-                sessionId,
-                httpgdHost: '127.0.0.1',
-                httpgdPort,
-                httpgdToken: 'tok',
-            }),
-        });
+        await postSessionReady(server, sessionId, httpgdPort);
         const memento = {
             get: (_k: string, def: unknown) => def,
             update: async (_k: string, _v: unknown) => { /* no-op */ },
@@ -252,19 +216,7 @@ suite('plot theme-toggle — host wiring', () => {
         const sessionA = crypto.randomBytes(8).toString('hex');
         const sessionB = crypto.randomBytes(8).toString('hex');
         for (const sid of [sessionA, sessionB]) {
-            await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'x-raven-session-token': server.token,
-                },
-                body: JSON.stringify({
-                    sessionId: sid,
-                    httpgdHost: '127.0.0.1',
-                    httpgdPort,
-                    httpgdToken: 'tok',
-                }),
-            });
+            await postSessionReady(server, sid, httpgdPort);
         }
         const panelA = new PlotViewerPanel(ctx, server, sessionA, 1, { onDisposed: () => {} });
         const panelB = new PlotViewerPanel(ctx, server, sessionB, 2, { onDisposed: () => {} });
@@ -284,6 +236,17 @@ suite('plot theme-toggle — host wiring', () => {
                 messagesToB.push(m);
                 return realPostB(m as Parameters<typeof realPostB>[0]);
             };
+
+            // Wait for panel B to report `webview-ready` before
+            // exercising the broadcast — until then, a state-update
+            // posted on B would race the Svelte onMount listener
+            // install and could be dropped. (Production wires this
+            // round-trip identically: the host's
+            // `on_webview_message('webview-ready')` is the bottleneck
+            // that releases the first state-update.)
+            const inboundB: unknown[] = [];
+            internalB.panel!.webview.onDidReceiveMessage((m) => inboundB.push(m));
+            await waitForWebviewReady(inboundB);
 
             // Write globalState as the production set-theme-applied
             // handler does, then call postStateUpdate on the sibling
@@ -329,29 +292,35 @@ suite('plot theme-toggle — host wiring', () => {
         } as unknown as vscode.ExtensionContext;
 
         const sessionId = crypto.randomBytes(8).toString('hex');
-        await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-raven-session-token': server.token,
-            },
-            body: JSON.stringify({
-                sessionId,
-                httpgdHost: '127.0.0.1',
-                httpgdPort,
-                httpgdToken: 'tok',
-            }),
-        });
+        await postSessionReady(server, sessionId, httpgdPort);
         const panel = new PlotViewerPanel(ctx, server, sessionId, 1, { onDisposed: () => {} });
         try {
-            panel.notifyPlotAvailable();
+            // Observe inbound webview→host messages. Register BEFORE
+            // calling `notifyPlotAvailable` so the `webview-ready`
+            // message — which the Svelte `onMount` posts as soon as
+            // its listener is installed — is captured deterministically.
+            const inboundFromWebview: unknown[] = [];
             const internal = panel as unknown as { panel: vscode.WebviewPanel | null };
+            panel.notifyPlotAvailable();
             const html = await pollFor(() => internal.panel?.webview.html ?? null, 5000);
             assert.ok(html, 'panel HTML should be set');
-
-            // Observe inbound webview→host messages.
-            const inboundFromWebview: unknown[] = [];
             internal.panel!.webview.onDidReceiveMessage((m) => inboundFromWebview.push(m));
+
+            // Wait for the webview to report `webview-ready` — by
+            // contract (AGENTS.md "onMount-ordering") the inbound
+            // message listener inside App.svelte is installed BEFORE
+            // this message is posted, so observing it on this side
+            // means a subsequent `state-update` is guaranteed to
+            // reach the webview's handler. Without this gate, the
+            // assertion below could pass for the wrong reason — the
+            // state-update would arrive before App.svelte's listener
+            // exists and be silently dropped, masking a real echo
+            // regression.
+            await waitForWebviewReady(inboundFromWebview);
+
+            // Reset the inbound buffer so the assertion only sees
+            // messages produced in response to OUR state-update.
+            inboundFromWebview.length = 0;
 
             // Push a state-update with themeApplied=true and wait for
             // the webview to settle (the no-echo invariant says NO
@@ -386,4 +355,59 @@ async function pollFor<T>(fn: () => T | null | undefined, timeout_ms: number): P
         await new Promise(r => setTimeout(r, 25));
     }
     throw new Error(`pollFor: timed out after ${timeout_ms}ms`);
+}
+
+/**
+ * POST `/session-ready` and assert the response is OK. A 4xx/5xx
+ * here would otherwise surface much later as a "panel never saw the
+ * session" failure with no useful diagnostic — fail fast at the
+ * source.
+ */
+async function postSessionReady(
+    server: RSessionServer,
+    sessionId: string,
+    httpgdPort: number,
+): Promise<void> {
+    const r = await fetch(`http://127.0.0.1:${server.port}/session-ready`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-raven-session-token': server.token,
+        },
+        body: JSON.stringify({
+            sessionId,
+            httpgdHost: '127.0.0.1',
+            httpgdPort,
+            httpgdToken: 'tok',
+        }),
+    });
+    if (!r.ok) {
+        const body = await r.text().catch(() => '<no body>');
+        throw new Error(`/session-ready failed: ${r.status} ${body}`);
+    }
+}
+
+/**
+ * Wait for the webview's `webview-ready` message in an `inbound`
+ * buffer that is being populated by an `onDidReceiveMessage`
+ * listener. Mirrors the host's own readiness gate: the Svelte
+ * `onMount` installs the inbound listener BEFORE posting
+ * `webview-ready`, so by the time we observe that message the
+ * webview is ready to receive `state-update`s and the no-echo
+ * invariant can be exercised. Without this, a host-posted
+ * `state-update` can arrive before the listener install and be
+ * dropped, causing the no-echo assertion to pass for the wrong
+ * reason.
+ */
+async function waitForWebviewReady(
+    inbound: unknown[],
+    timeout_ms = 5000,
+): Promise<void> {
+    await pollFor(() => {
+        for (const m of inbound) {
+            const msg = m as { type?: string };
+            if (msg.type === 'webview-ready') return true;
+        }
+        return null;
+    }, timeout_ms);
 }

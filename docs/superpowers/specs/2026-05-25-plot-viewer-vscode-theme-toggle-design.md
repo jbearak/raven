@@ -8,9 +8,9 @@
 - **v2** fixed that by switching to inline SVG.
 - **v3** (first adversarial review) caught three issues: `:global()` in non-Svelte CSS file, missing `cachedSvg` writes, undefined `bg=null` semantics.
 - **v4** (second adversarial review) addressed 15 additional findings: Svelte 5 `Map` reactivity (switch to `SvelteMap`), CSS placement (move into App.svelte `<style>` block with proper `:global()`), broadcast feedback-loop invariant, Phase 1 user-visible changes (LRU cap, bg shift) now explicit, DOMPurify forbid-list, `bg_for_fetch` helper, fixture-based regression test, `read_theme_bg` deletion, `evict_oldest` while-loop, `delete`-before-`set` comment, reducer no-op short-circuit, initial-render seeding mechanism.
-- **v5** (third adversarial review) addressed: spec self-contradiction on `theme-changed` host-listener retention (line 497 said "deleted entirely", line 541 said "stays — becomes no-op"; resolved: deleted entirely); `pick_current_svg` post-quit branch was unreachable because `SET_ACTIVE_SESSION { sessionEnded: true }` preserves `activeSession` (fix: gate on `state.sessionEnded`, not `state.activeSession`); the webview's `state-update` handler must dispatch `SET_THEME_APPLIED` (was implied by "no-echo invariant" prose but not shown); DOMPurify config tightened (`FORBID_ATTR: ['style']` — defense in depth against CSS-exfil via inline `style=`); `draggable="false"` on plot-host to lock down the drag surface; cache key extended to `${sessionId}:${plotId}` to prevent cross-session cache collisions; cache semantics renamed FIFO (not LRU — touch happens only on insert; cache hits don't promote, by design); fetch closure captures `upid` so a late dispatch under a stale upid is dropped; Phase 4 task list aligned with §CSS overlay (rules live in App.svelte's `<style>`, not styles.css); CLAUDE.md invariant: webview message listener MUST install before `webview-ready` post; SvelteMap reactivity test moved from bun-only to a Svelte 5 mount test; layout-misalignment risk of `font-family` override documented prominently.
-- **v6** (fourth adversarial review) addressed: closure race during session swap (fetch `.then` now also bails on `state.sessionEnded`); `state.activeSession!.upid` non-null assertion in `pick_current_svg` softened to optional chaining; FIFO reducer no-op short-circuits when the incoming entry equals the existing one byte-for-byte; DOMPurify `ADD_ATTR` claim corrected (SVG profile already permits `class`/`xmlns`/`viewBox`); `<style>` and `<foreignObject>` added to FORBID_TAGS; `ondragstart` handler dropped; explicit deletion checklist for `theme_sub`; httpgd fixture test uses `classList.contains('httpgd')`; cross-panel Memento broadcast race documented; CLAUDE.md invariant forbids host posting `state-update` from `create_panel`.
-- **v7** (fifth adversarial review) addressed: cache key extended to `${sessionId}:${plotId}:${width}:${height}` (so resize refetches); stale "settled in v3" entry corrected (`themeApplied` IS a fetch dep); CLAUDE.md ADD_ATTR reference removed; `initial_state()` no longer reads `window` (bun tests have no DOM); freshness re-check uses `>=`; explicit `SET_THEME_APPLIED` reducer block; `await context.globalState.update(...)` made explicit in §Host changes; no-echo regression test scope clarified; `evict_oldest` iterator-recreation comment; `data:` audit Phase 1 task.
+- **v5** (third adversarial review) addressed: spec self-contradiction on `theme-changed` host-listener retention (line 497 said "deleted entirely", line 541 said "stays — becomes no-op"; resolved: deleted entirely); `pick_current_svg` post-quit branch was unreachable because `SET_ACTIVE_SESSION { sessionEnded: true }` preserves `activeSession` (fix: gate on `state.sessionEnded`, not `state.activeSession`); the webview's `state-update` handler must dispatch `SET_THEME_APPLIED` (was implied by "no-echo invariant" prose but not shown); DOMPurify config tightened (`FORBID_ATTR: ['style']` — defense in depth against CSS-exfil via inline `style=`); `draggable="false"` on plot-host to lock down the drag surface; cache key extended to `${sessionId}:${plotId}` to prevent cross-session cache collisions; cache semantics renamed FIFO (not LRU — touch happens only on insert; cache hits don't promote, by design); fetch closure captures `upid` so a late dispatch under a stale upid is dropped; Phase 4 task list aligned with §CSS overlay (rules live in App.svelte's `<style>`, not styles.css); AGENTS.md invariant: webview message listener MUST install before `webview-ready` post; SvelteMap reactivity test moved from bun-only to a Svelte 5 mount test; layout-misalignment risk of `font-family` override documented prominently.
+- **v6** (fourth adversarial review) addressed: closure race during session swap (fetch `.then` now also bails on `state.sessionEnded`); `state.activeSession!.upid` non-null assertion in `pick_current_svg` softened to optional chaining; FIFO reducer no-op short-circuits when the incoming entry equals the existing one byte-for-byte; DOMPurify `ADD_ATTR` claim corrected (SVG profile already permits `class`/`xmlns`/`viewBox`); `<style>` and `<foreignObject>` added to FORBID_TAGS; `ondragstart` handler dropped; explicit deletion checklist for `theme_sub`; httpgd fixture test uses `classList.contains('httpgd')`; cross-panel Memento broadcast race documented; AGENTS.md invariant forbids host posting `state-update` from `create_panel`.
+- **v7** (fifth adversarial review) addressed: cache key extended to `${sessionId}:${plotId}:${width}:${height}` (so resize refetches); stale "settled in v3" entry corrected (`themeApplied` IS a fetch dep); AGENTS.md ADD_ATTR reference removed; `initial_state()` no longer reads `window` (bun tests have no DOM); freshness re-check uses `>=`; explicit `SET_THEME_APPLIED` reducer block; `await context.globalState.update(...)` made explicit in §Host changes; no-echo regression test scope clarified; `evict_oldest` iterator-recreation comment; `data:` audit Phase 1 task.
 - **v8** (this revision, sixth adversarial review — final round, cap reached) addressed: (a) **pre-paint body class doesn't match `.plot-host.apply-vscode-theme`** — v7's "bake class on body so first paint is right" advice was wrong because the overlay selector requires the `.plot-host` element to exist, which only happens after Svelte mounts; fix: drop the body-class baking, rely on `onMount`'s synchronous `SET_THEME_APPLIED` dispatch which runs before the first commit-paint; the in-DOM `<svg>` doesn't exist either until fetch completes, so there's nothing for an early class to scope against. (b) **Post-quit fallback returned the OLDEST cached size, not the most recent** — `for (const [key, entry] of state.svgCache)` walks insertion order from oldest, so the first match is the oldest size; fix: iterate in reverse (most-recent-insertion-first). (c) **Resize gesture (60fps) can evict all history during a drag** — without dimension debounce, a 1-second drag at 60fps produces ~60 distinct (width, height) cache keys, blowing the 50-entry cap and evicting every other plot's history (regressing smoke test #10); fix: debounce `dimensions` updates in `on_resize` (100ms trailing) AND add an eviction tweak that keeps at most one entry per `(sessionId, plotId)` regardless of dimension. (d) **`<feImage>` in svgFilters profile** can reference external resources — added to FORBID_TAGS. (e) `SET_ACTIVE_SESSION` reducer no-op short-circuit added so a redundant `state-update` doesn't trigger a Svelte cascade. (f) `evict_oldest` "UB" wording corrected (Map delete during iteration IS defined behavior — entries are skipped if not yet visited; the rationale for re-creating the iterator is clarity, not safety). (g) `dimensions` regression test added to test plan. (h) `>=` freshness re-check rationale documented (same-upid bytes-diff is a transient httpgd error case where first-writer-wins is correct — same-bytes is short-circuited by the reducer; pathological diff-bytes-same-upid is treated as "trust the earlier completion"). (i) `__ravenInitialPlotState` cleared after first read so a panel restore doesn't re-apply a stale seed over a live state-update.
 
 ## Summary
@@ -139,7 +139,7 @@ Properties of this fetch loop:
 
 Today's `<img>` design accidentally provides history-navigation caching: the browser's image cache holds every plot that has ever been displayed, so after R quits the user can still press `‹/›` to walk the history. The inline-SVG design loses this property unless we re-create the caching explicitly.
 
-The webview holds a **FIFO SVG cache** keyed by `${sessionId}:${plotId}`:
+The webview holds a **FIFO SVG cache** keyed by `${sessionId}:${plotId}:${width}:${height}` (see `svg_cache_key` for the canonical encoding):
 
 ```typescript
 // In ViewerState:
@@ -147,10 +147,10 @@ type SvgEntry = {
     svgText: string;
     upid: number;        // distinguishes in-place updates of the same plotId
 };
-// SvelteMap<`${sessionId}:${plotId}`, SvgEntry>, capped at 50 entries
-// (oldest INSERTED evicted on overflow — FIFO, not true LRU; see "Cache
-// semantics" below). 50 × ~100 KB ≈ 5 MB worst case — fine for a long
-// R session.
+// SvelteMap<`${sessionId}:${plotId}:${width}:${height}`, SvgEntry>,
+// capped at 50 entries (oldest INSERTED evicted on overflow — FIFO,
+// not true LRU; see "Cache semantics" below). 50 × ~100 KB ≈ 5 MB
+// worst case — fine for a long R session.
 svgCache: SvelteMap<string, SvgEntry>;
 ```
 
@@ -158,7 +158,7 @@ svgCache: SvelteMap<string, SvgEntry>;
 
 Alternative considered: `Record<string, SvgEntry>` (plain object) — also reactive under `$state`'s proxy. Rejected because (a) keys are arbitrary strings (UUID-style plotIds), and `Record` semantics around `delete` and ordered iteration are murkier than `Map`'s explicit insertion-order contract; (b) `SvelteMap` is the Svelte-idiomatic answer.
 
-Every successful fetch dispatches `SET_SVG_CACHE_ENTRY { plotId, entry }` which the reducer applies via Map insertion + LRU eviction (the cap and policy live in the reducer, not in the effect, so it stays a pure function).
+Every successful fetch dispatches `SET_SVG_CACHE_ENTRY { plotId, entry }` which the reducer applies via Map insertion + FIFO eviction (the cap and policy live in the reducer, not in the effect, so it stays a pure function).
 
 `pick_current_svg(state)` resolves the rendered SVG by reading the cache, not a separate `currentSvg` field:
 
@@ -300,7 +300,7 @@ export type ViewerState = {
     currentIndex: number;
     sessionEnded: boolean;
     themeApplied: boolean;                  // NEW: mirrors host globalState
-    svgCache: SvelteMap<string, SvgEntry>;  // NEW: LRU cache (cap 50), plotId → svg
+    svgCache: SvelteMap<string, SvgEntry>;  // NEW: FIFO cache (cap 50), keyed by svg_cache_key()
 };
 
 type SvgEntry = {
@@ -646,7 +646,7 @@ export function sanitize_svg(text: string): string {
 }
 ```
 
-Add `dompurify` (pinned to the latest stable release as of implementation time — record the exact version in a doc comment AND in `CLAUDE.md` under "Learnings → Environment / tooling" since security deps deserve explicit pins) and `@types/dompurify` as a dev dep to `editors/vscode/package.json` (the VS Code extension's `package.json`, not the root). The webview is bundled via the Svelte build, so DOMPurify ships as part of the webview chunk.
+Add `dompurify` (pinned to the latest stable release as of implementation time — record the exact version in a doc comment AND in `AGENTS.md` under "Learnings → Environment / tooling" since security deps deserve explicit pins) as a dep to `editors/vscode/package.json` (the VS Code extension's `package.json`, not the root). Do NOT also add `@types/dompurify` — the `dompurify` package now ships its own types and `@types/dompurify` is a deprecated stub (npm warns "you do not need this installed"). The webview is bundled via the Svelte build, so DOMPurify ships as part of the webview chunk.
 
 Sanitization is applied to every fetched SVG before insertion. Cost is small (DOMPurify is fast — μs-to-low-ms range for typical SVG sizes). Failure mode: DOMPurify returns a string; if the input is malformed, the output is the salvaged subset (empty in worst case). The webview falls back to the no-plot placeholder via `pick_current_svg() === null` if `sanitize_svg` returns the empty string.
 
@@ -741,11 +741,11 @@ One subtle change: today `copy_current()` constructs the httpgd URL and `await f
 
 1. **Background semantics**: today the live URL passes `bg=state.themeBg` (the editor `--vscode-editor-background` hex); Phase 1 changes this to `bg='#ffffff'` unconditionally. For *typical* R/ggplot output (which paints its own opaque canvas anyway), there's no visible difference. For ggplot with `theme(plot.background = element_rect(fill = NA))` (rare but legal), today's behavior shows the editor bg through the transparent panel; Phase 1's behavior shows white. Documented in `docs/plot-viewer.md`.
 
-2. **History navigation cap**: today's `<img>` design has no Raven-imposed cap on cached plot history (the browser image cache holds everything it has memory for). Phase 1 introduces a 50-entry LRU. A user with 51+ plots in history loses the ability to walk to the oldest plots post-quit. 50 × ~100 KB ≈ 5 MB feels generous for typical sessions; if real usage data shows this is too small, raise the cap or switch to byte-budget eviction.
+2. **History navigation cap**: today's `<img>` design has no Raven-imposed cap on cached plot history (the browser image cache holds everything it has memory for). Phase 1 introduces a 50-entry FIFO cache (eviction is over insertion order — cache hits do NOT promote, by design; see "Cache semantics" below). A user with 51+ plots in history loses the ability to walk to the oldest plots post-quit. 50 × ~100 KB ≈ 5 MB feels generous for typical sessions; if real usage data shows this is too small, raise the cap or switch to byte-budget eviction.
 
 Implementation tasks:
 
-- Add `dompurify` and `@types/dompurify` deps in `editors/vscode/package.json` (the VS Code extension's package.json, not the root).
+- Add `dompurify` dep in `editors/vscode/package.json` (the VS Code extension's package.json, not the root). Do NOT add `@types/dompurify` — `dompurify` ships its own types and `@types/dompurify` is a deprecated stub.
 - New `editors/vscode/src/plot/webview/sanitize.ts` with `sanitize_svg`.
 - Rewrite `App.svelte`'s `<img>` to `<div class="plot-host">` with `{@html sanitized SVG}`.
 - Add `<style>` block to App.svelte (none today) with the overlay rules. Defer the `.plot-host.apply-vscode-theme :global(...)` selectors to Phase 4 (those depend on the toggle class which doesn't exist yet) — Phase 1 ships a stripped-down `<style>` block.
@@ -761,7 +761,7 @@ Implementation tasks:
 - CSP cleanup: drop `blob:` and `data:` from `img-src` directive in `csp.ts` / `plot-viewer-panel.ts`. **Pre-cleanup audit**: grep the built `editors/vscode/dist/webviews/plot-viewer/index.css` and `index.js` for `data:` URLs. If any are present (e.g. inlined toolbar icons in CSS), either keep `data:` in `img-src` or refactor those references to `webview.cspSource`-served files. The substrate switch removes the runtime *uses* of `data:`/`blob:` (no more `URL.createObjectURL`, no more `<img src=data:...>`), but the bundler might still produce data-URL assets at build time.
 - Existing tests for `pick_image_src` rewrite to target `pick_current_svg`.
 - New tests for `sanitize_svg`: strips `<script>`, strips `onclick=`, strips `javascript:`, preserves benign SVG structure.
-- New tests for `evict_oldest` and LRU behavior in `plot-webview-state.test.ts`.
+- New tests for `evict_oldest` and FIFO behavior in `plot-webview-state.test.ts`.
 
 ### Phase 2: Wire protocol + reducer for theme toggle
 
@@ -787,7 +787,7 @@ Implementation tasks:
 
 - `docs/plot-viewer.md`: new "Color theme" section. Cross-reference [`docs/coexistence.md`](../coexistence.md) and [`docs/knit.md`](../knit.md) for related theme handling.
 - `docs/coexistence.md`: one-sentence parity note about REditorSupport.R's `r.plot.toggleStyle`.
-- `CLAUDE.md`: new subsection under "Key invariants" describing:
+- [AGENTS.md](../../../AGENTS.md): new subsection under "Key invariants" describing:
   - The inline-SVG rendering substrate (and why — CSS scoping).
   - Sanitization invariant: every SVG text from httpgd flows through `sanitize_svg` before `{@html}`. DOMPurify is configured with `FORBID_ATTR: ['style']` (CSS-exfiltration defense behind `style-src 'unsafe-inline'`) and `FORBID_TAGS: ['use', 'image', 'a', 'style', 'foreignObject']` (closes external-href, contextmenu-interception, CSS-`@import`, and arbitrary-HTML hosting attack surfaces). The `class="httpgd"` attribute and `viewBox` attribute are load-bearing for the overlay's selectors — they're preserved by DOMPurify's SVG profile today, and the regression test in `tests/bun/plot-webview-sanitize.test.ts` asserts they survive sanitization (the test is the guard against a future DOMPurify profile change silently breaking the toggle).
   - Toggle broadcast invariant: a `set-theme-applied` from any panel updates Memento AND broadcasts to all open panels via `PlotViewerPanel.readThemePreference` (single source of truth).
@@ -795,7 +795,7 @@ Implementation tasks:
   - **onMount-ordering invariant**: `App.svelte`'s `onMount` MUST install the `window.addEventListener('message', ...)` listener BEFORE posting `webview-ready`. The host responds to `webview-ready` synchronously with a `state-update` that re-asserts the persisted `themeApplied`; if the listener isn't installed yet, the message is dropped and the panel boots with `themeApplied=false` (from the initial-render seed) regardless of the persisted value. Today's code already follows this order; the invariant pins it against future re-ordering.
   - **No host-initiated `state-update` from `create_panel`**: the host posts `state-update` ONLY from `on_webview_message`'s `webview-ready` branch and from `post_state_update()` (called by `notifyPlotAvailable`, `notifySessionEnded`, and `broadcastStateUpdate`). Posting from inside `create_panel` would race the webview's onMount listener install — the message would be sent before the listener exists, even with onMount-ordering done right (because the listener is installed *during* mount, which is after `create_panel` returns). The webview-ready round-trip is the single bottleneck that guarantees the listener is live before any state arrives.
   - The `bg=` parameter is `'#ffffff'` in the live preview fetch — re-introducing a theme-dependent value would require adding `state.themeApplied` to the fetch effect's dependencies AND updating the CSS overlay's hidden-rect assumption AND extending the cache key to include `themeApplied`.
-  - SVG cache key shape: `${sessionId}:${plotId}`. Bypassing the sessionId prefix would let one R session's plot bytes serve another's identically-named plot (httpgd plotIds are short and can collide across fresh sessions).
+  - SVG cache key shape: `${sessionId}:${plotId}:${width}:${height}` (see `svg_cache_key` in `editors/vscode/src/plot/webview/state.ts`). sessionId-scoping prevents cross-session bleed (httpgd plotIds are short and can collide across fresh sessions); dimension-keying makes resize trigger a refetch (httpgd bakes width/height into the SVG at render time, so the same plotId at a different size IS a different image).
   - Cache eviction policy: FIFO over insertion order, not LRU. Touching the cache on read is intentionally not implemented; if a future need arises, add a `TOUCH_SVG_CACHE_ENTRY` action dispatched from the effect's cache-hit branch.
   - DOMPurify SVG profile is the only path from httpgd to the DOM. Bypassing it would re-open XSS via SVG.
 - **Phase 5 also adds a regression smoke test** that asserts httpgd's actual SVG output starts with `<svg class="httpgd"` and contains a `<rect>` as its first child element. This is the load-bearing assumption of the CSS overlay; if a future httpgd version changes the structure, the overlay silently breaks. Test lives in `tests/bun/plot-httpgd-svg-structure.test.ts` and runs against a real R subprocess (sandbox-skipped via `isClaudeCodeSandbox()` per existing convention).
@@ -855,7 +855,7 @@ Implementation tasks:
 7. Switch VS Code theme while toggle is on: expect plot to recolor (CSS variables update; no refetch).
 8. Resize panel: expect a single refetch with new dimensions (existing behavior preserved).
 9. Quit R: expect "Showing last plot" banner with the most recent cached SVG; toggle state preserved.
-10. Plot three things in R (`plot(1:10); plot(11:20); hist(rnorm(100))`), navigate `‹‹` to the first plot, then quit R: expect to be able to press `‹` and `›` and walk all three cached plots post-quit. This is the regression guard for the substrate switch — today's `<img>` design accidentally provides this via the browser image cache; the new design provides it via the LRU SVG cache.
+10. Plot three things in R (`plot(1:10); plot(11:20); hist(rnorm(100))`), navigate `‹‹` to the first plot, then quit R: expect to be able to press `‹` and `›` and walk all three cached plots post-quit. This is the regression guard for the substrate switch — today's `<img>` design accidentally provides this via the browser image cache; the new design provides it via the FIFO SVG cache.
 11. Right-click the plot host div: expect Copy to fire (regression guard for the contextmenu-on-div change from contextmenu-on-img).
 
 ## Risks and limitations
@@ -886,7 +886,7 @@ Implementation tasks:
 **Settled in v3** (no longer open):
 
 - **Initial-render flash**: bake initial `themeApplied` into the HTML at panel-create time. Phase 4.
-- **DOMPurify version**: pin to latest stable at implementation; document in `CLAUDE.md`.
+- **DOMPurify version**: pin to latest stable at implementation; document in [AGENTS.md](../../../AGENTS.md).
 - **WebSocket subscription**: unchanged.
 - **`oncontextmenu` on `<div>`**: same behavior as on `<img>` (contextmenu is a generic DOM event). Smoke test in Phase 1.
 - **`bg=` query parameter**: explicitly `'#ffffff'` (not `null` and not the editor bg). See "Background parameter" in the architecture section.
