@@ -33,23 +33,89 @@ export interface Blocker {
 const BOM = '﻿';
 
 /**
- * Strip the YAML front-matter block from the document text. Returns the
+ * Internal result describing where a well-formed frontmatter block sits
+ * inside a *normalized* document (post-BOM-strip, post-CRLF→LF). Used by
+ * both `extractFrontmatter` (which returns the inner body) and
+ * `stripFrontmatter` (which returns the remainder of the document after
+ * the closing fence).
+ *
+ * Sharing this predicate is the lockstep contract: the two callers must
+ * always agree about whether a frontmatter block exists.
+ */
+interface FrontmatterBounds {
+    /** Normalized document text (post-BOM-strip, post-CRLF→LF). */
+    normalized: string;
+    /** Inner body of the fence (between opening `---\n` and closing `---`), always ending with `\n`. */
+    inner: string;
+    /**
+     * Index in `normalized` one past the closing fence's trailing
+     * newline (or one past the closing fence itself if the document
+     * ends without a newline after it). Used by `stripFrontmatter` as
+     * the start of the remainder.
+     */
+    endIndex: number;
+}
+
+/**
+ * Normalize the document (BOM strip + CRLF→LF) and locate the
+ * frontmatter block, if any. Returns `null` when no terminated block is
+ * present at byte 0 of the normalized document — same condition the old
+ * `extractFrontmatter` used.
+ */
+function findFrontmatterEnd(text: string): FrontmatterBounds | null {
+    let normalized = text;
+    if (normalized.startsWith(BOM)) normalized = normalized.slice(BOM.length);
+    normalized = normalized.replace(/\r\n/g, '\n');
+
+    if (!normalized.startsWith('---\n')) return null;
+
+    const rest = normalized.slice(4);
+    const closeMatch = rest.match(/\n---(?:\n|$)/);
+    if (!closeMatch || closeMatch.index === undefined) return null;
+
+    const innerRaw = rest.slice(0, closeMatch.index);
+    const inner = innerRaw.endsWith('\n') ? innerRaw : innerRaw + '\n';
+
+    // Compute the absolute index in `normalized` immediately after the
+    // matched close. `4` is the opening `---\n`; `closeMatch.index` is
+    // where `\n---…` begins inside `rest`; `closeMatch[0].length` is the
+    // length of `\n---` plus the optional trailing `\n` (or 0 at EOF).
+    const endIndex = 4 + closeMatch.index + closeMatch[0].length;
+
+    return { normalized, inner, endIndex };
+}
+
+/**
+ * Extract the YAML front-matter body from the document text. Returns the
  * inner body of the fence with a normalized trailing newline, or `null`
  * when no terminated front-matter block is present. CRLF line endings are
  * normalized to LF so downstream parsing is line-ending-agnostic.
  */
 export function extractFrontmatter(text: string): string | null {
-    let body = text;
-    if (body.startsWith(BOM)) body = body.slice(BOM.length);
-    body = body.replace(/\r\n/g, '\n');
+    const bounds = findFrontmatterEnd(text);
+    return bounds ? bounds.inner : null;
+}
 
-    if (!body.startsWith('---\n')) return null;
-
-    const rest = body.slice(4);
-    const closeMatch = rest.match(/\n---(?:\n|$)/);
-    if (!closeMatch || closeMatch.index === undefined) return null;
-    const inner = rest.slice(0, closeMatch.index);
-    return inner.endsWith('\n') ? inner : inner + '\n';
+/**
+ * Return `text` with the leading `---\n...\n---(\n|$)` frontmatter block
+ * removed, or `text` unchanged when no terminated frontmatter block is
+ * present at the start of the document.
+ *
+ * Matches `extractFrontmatter`'s detection rules verbatim: the strip
+ * fires iff `extractFrontmatter(text) !== null`. CRLF inputs are
+ * normalized to LF before matching; when a frontmatter block is present,
+ * the returned remainder carries LF line endings. (No-frontmatter
+ * documents are returned with their original line endings intact.)
+ *
+ * Used by the Knit Preview's md→html step (`renderKnitHtml`) so VS
+ * Code's `markdown.api.render` never sees the frontmatter and therefore
+ * never emits its `<table class="frontmatter">`. The on-disk `.md` is
+ * unaffected — Pandoc HTML export still reads the full YAML.
+ */
+export function stripFrontmatter(text: string): string {
+    const bounds = findFrontmatterEnd(text);
+    if (!bounds) return text;
+    return bounds.normalized.slice(bounds.endIndex);
 }
 
 /**
