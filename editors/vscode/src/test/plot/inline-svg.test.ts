@@ -47,19 +47,20 @@ suite('plot viewer substrate — inline SVG (not <img>)', () => {
             bundle.includes('sanitize') && bundle.includes('FORBID_TAGS'),
             'webview bundle should include the DOMPurify sanitize call',
         );
-        // Negative substrate check — the bundle MUST NOT contain any
-        // `<img>` markers from a Svelte template emitting an `<img>`
-        // element. Svelte 5's compiler turns `<img …>` templates into
-        // calls to internal helpers that include the literal "img"
-        // tag name; restoring an `<img>` substrate would re-introduce
-        // these markers. (We also accept a future world where Svelte
-        // emits the tag via a different shape; the second probe
-        // catches the `src=` attribute pattern the old `<img src=>`
-        // had.) Either pattern showing up means someone re-introduced
-        // an `<img>`-based renderer, which would silently break the
-        // toggle (CSS doesn't cascade into image-loaded SVG).
+        // Negative substrate check — the bundle MUST NOT contain a
+        // Svelte template emitting an `<img>` element. Svelte 5's
+        // compiler inlines the rendered template text into the
+        // bundle, so a literal `<img` substring is the load-bearing
+        // signal. (The bare tag-name `"img"` is NOT a reliable signal
+        // because DOMPurify ships a built-in HTML allowlist that
+        // includes `"img"` regardless of what Raven's source does.)
+        // The `src=` probe is the second-layer guard for the old
+        // `<img src=httpgd-url>` substrate. Either pattern showing up
+        // means someone re-introduced an `<img>`-based renderer,
+        // which would silently break the toggle (CSS doesn't cascade
+        // into image-loaded SVG).
         assert.ok(
-            !bundle.includes('"img"'),
+            !bundle.includes('<img'),
             'webview bundle must not declare an <img> element (substrate guard)',
         );
         assert.ok(

