@@ -273,6 +273,7 @@ describe('stripFrontmatter', () => {
             '---\ntitle: x\n---\nbody\n',
             '---\ntitle: x\n---',
             '---\n\n---\nbody\n',
+            '---\n---\n',
             '# heading\nbody\n',
             '---\nunterminated\n',
             '\n---\ntitle: x\n---\nbody\n',

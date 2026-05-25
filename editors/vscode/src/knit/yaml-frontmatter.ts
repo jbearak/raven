@@ -86,7 +86,7 @@ function findFrontmatterEnd(text: string): FrontmatterBounds | null {
 }
 
 /**
- * Strip the YAML front-matter block from the document text. Returns the
+ * Extract the YAML front-matter body from the document text. Returns the
  * inner body of the fence with a normalized trailing newline, or `null`
  * when no terminated front-matter block is present. CRLF line endings are
  * normalized to LF so downstream parsing is line-ending-agnostic.
@@ -103,8 +103,9 @@ export function extractFrontmatter(text: string): string | null {
  *
  * Matches `extractFrontmatter`'s detection rules verbatim: the strip
  * fires iff `extractFrontmatter(text) !== null`. CRLF inputs are
- * normalized to LF before matching, and the returned remainder carries
- * LF line endings.
+ * normalized to LF before matching; when a frontmatter block is present,
+ * the returned remainder carries LF line endings. (No-frontmatter
+ * documents are returned with their original line endings intact.)
  *
  * Used by the Knit Preview's md→html step (`renderKnitHtml`) so VS
  * Code's `markdown.api.render` never sees the frontmatter and therefore
