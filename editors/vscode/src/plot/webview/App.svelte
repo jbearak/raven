@@ -547,6 +547,27 @@
         stroke: var(--vscode-editor-foreground) !important;
     }
 
+    /* httpgd paints the plot canvas with two `#FFFFFF`-filled rects: the
+     * first-of-type direct child of <svg> (hidden by the rule above) AND
+     * an inner rect nested inside a `<g clip-path>` wrapper. The
+     * `:first-of-type` selector cannot reach the second one. We target
+     * every rect with the canvas color directly so both rects go
+     * transparent and `--vscode-editor-background` shows through. The
+     * `i` flag is CSS4 case-insensitive matching — defensive in case a
+     * future httpgd version emits lowercase hex; `bg_for_fetch` sends
+     * `'#ffffff'` lowercase today but httpgd uppercases it before
+     * emitting.
+     *
+     * Source order matters: this rule lives AFTER the stroke-recolor
+     * rule above so the `stroke: none !important` here overrides the
+     * editor-foreground stroke that would otherwise outline the
+     * inner canvas rect (the two rules have equal CSS specificity, so
+     * later-in-source wins). */
+    .plot-host.apply-vscode-theme :global(svg.httpgd rect[fill="#FFFFFF" i]) {
+        fill: none !important;
+        stroke: none !important;
+    }
+
     /* Toolbar toggle styling — mirrors the knit-preview "Apply VS Code
      * theme" button: an accent border when on, a pre-allocated checkmark
      * slot so toggling doesn't shift the label horizontally. */
