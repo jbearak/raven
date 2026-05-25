@@ -209,8 +209,8 @@ describe('plot-host theme overlay — multi-rect canvas hiding', () => {
         // `panel.background = element_rect(fill = "grey92")` emits as
         // `fill="#EBEBEB"` (grey92 in hex). Under the structural-
         // tagging mechanism the panel rect is tagged by Rule 2
-        // (only-rect-in-<g> with stroke=none) — fill colour is no
-        // longer load-bearing.
+        // (direct-child <g> rect lacking stroke-linejoin and
+        // stroke-linecap) — fill colour is no longer load-bearing.
         const source = readFileSync(APP_SVELTE_PATH, 'utf-8');
         const selectors = extract_fill_none_selectors_under_theme(source);
         const svgSource =
@@ -241,8 +241,8 @@ describe('plot-host theme overlay — multi-rect canvas hiding', () => {
         // grey50 = `#7F7F7F` wasn't in the previous allowlist —
         // before this refactor the panel would have stayed painted
         // dark-grey over the editor background. After: tagged by
-        // Rule 2 (only-rect-in-<g> with stroke=none), hidden by
-        // `.raven-bg`.
+        // Rule 2 (direct-child <g> rect lacking stroke-linejoin and
+        // stroke-linecap), hidden by `.raven-bg`.
         const source = readFileSync(APP_SVELTE_PATH, 'utf-8');
         const selectors = extract_fill_none_selectors_under_theme(source);
         const svgSource =
