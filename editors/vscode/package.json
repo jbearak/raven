@@ -1916,6 +1916,7 @@
   "dependencies": {
     "@glideapps/glide-data-grid": "^6.0.3",
     "apache-arrow": "^21.1.0",
+    "dompurify": "3.4.5",
     "js-yaml": "^4.1.1",
     "jsonc-parser": "^3.3.1",
     "react": "^18.3.1",

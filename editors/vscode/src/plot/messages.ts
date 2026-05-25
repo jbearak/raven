@@ -19,24 +19,32 @@ export type ActiveSessionInfo = {
     upid: number;
 };
 
+/**
+ * State-update payload. The host posts this on `webview-ready`, on every
+ * /plot-available event, and on every set-theme-applied broadcast.
+ *
+ * `themeApplied` mirrors the host's `globalState[THEME_PREFERENCE_KEY]`
+ * — broadcasting it on every state-update keeps all open panels in
+ * sync. See plot-viewer-panel.ts and PlotServices.broadcastStateUpdate.
+ */
 export type StateUpdatePayload = {
     activeSession: ActiveSessionInfo | null;
     sessionEnded: boolean;
+    themeApplied: boolean;
 };
 
 export type ExtensionToWebviewMessage =
-    | { type: 'state-update'; payload: StateUpdatePayload }
-    | { type: 'theme-changed'; payload: Record<string, never> };
+    | { type: 'state-update'; payload: StateUpdatePayload };
 
 export type WebviewToExtensionMessage =
     | { type: 'webview-ready'; payload: Record<string, never> }
     | { type: 'request-save-plot'; payload: { plotId: string; format: SaveFormat } }
     | { type: 'request-open-externally'; payload: { plotId: string } }
-    | { type: 'report-error'; payload: { message: string } };
+    | { type: 'report-error'; payload: { message: string } }
+    | { type: 'set-theme-applied'; payload: { applied: boolean } };
 
 const EXTENSION_TO_WEBVIEW_TYPES = new Set<ExtensionToWebviewMessage['type']>([
     'state-update',
-    'theme-changed',
 ]);
 
 const WEBVIEW_TO_EXTENSION_TYPES = new Set<WebviewToExtensionMessage['type']>([
@@ -44,6 +52,7 @@ const WEBVIEW_TO_EXTENSION_TYPES = new Set<WebviewToExtensionMessage['type']>([
     'request-save-plot',
     'request-open-externally',
     'report-error',
+    'set-theme-applied',
 ]);
 
 export function isExtensionToWebviewMessage(value: unknown): value is ExtensionToWebviewMessage {
@@ -64,16 +73,31 @@ export function isExtensionToWebviewMessage(value: unknown): value is ExtensionT
                 if (typeof activeSession !== 'object') return false;
                 const s = activeSession as Record<string, unknown>;
                 if (typeof s.sessionId !== 'string' ||
+                    s.sessionId.length === 0 ||
+                    s.sessionId.includes(':') ||
                     typeof s.httpgdBaseUrl !== 'string' ||
                     typeof s.httpgdToken !== 'string' ||
-                    typeof s.upid !== 'number') {
+                    typeof s.upid !== 'number' ||
+                    !Number.isInteger(s.upid) ||
+                    s.upid < 0) {
+                    // - sessionId must not contain `:` because the
+                    //   svgCache uses `${sessionId}:${plotId}:...` as
+                    //   its key; a session id with a colon would
+                    //   collide with cross-session boundaries
+                    //   (sessionId "a:b" colliding with sessionId "a"
+                    //   for plotId "b").
+                    // - upid must be a non-negative integer:
+                    //   `Number.isInteger` excludes NaN, ±Infinity,
+                    //   and fractional values; the `>= 0` check
+                    //   rejects negative upids that pass isInteger.
+                    //   httpgd never emits any of those, so locking
+                    //   the guard down loses nothing.
                     return false;
                 }
             }
-            return typeof payload.sessionEnded === 'boolean';
+            return typeof payload.sessionEnded === 'boolean'
+                && typeof payload.themeApplied === 'boolean';
         }
-        case 'theme-changed':
-            return true;
         default:
             return false;
     }
@@ -104,6 +128,10 @@ export function isWebviewToExtensionMessage(value: unknown): value is WebviewToE
         case 'report-error': {
             const payload = p as Record<string, unknown>;
             return typeof payload.message === 'string';
+        }
+        case 'set-theme-applied': {
+            const payload = p as Record<string, unknown>;
+            return typeof payload.applied === 'boolean';
         }
         default:
             return false;

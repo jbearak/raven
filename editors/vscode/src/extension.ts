@@ -360,6 +360,18 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         active_plot_services = plot_services;
         data_viewer_manager = registerDataViewer(context, plot_services.server, dataViewerDirOf(context));
 
+        // Internal command that PlotViewerPanel dispatches from its
+        // `set-theme-applied` handler so it can fan out to every open
+        // panel without holding a PlotServices reference. Mirrors the
+        // raven.knit.cancelExport pattern. Not user-invocable (no entry
+        // in package.json's commandPalette menu).
+        context.subscriptions.push(
+            vscode.commands.registerCommand(
+                'raven.plot.broadcastStateUpdate',
+                () => plot_services.broadcastStateUpdate(),
+            ),
+        );
+
         // Register R terminal and send-to-R commands
         register_r_terminal(context, plot_services);
         register_send_to_r_commands(context);
