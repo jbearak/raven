@@ -498,8 +498,8 @@
                 bind:this={share_btn_el}
                 popovertarget={SHARE_POPOVER_ID}
                 disabled={state.phase !== 'viewing'}
-                aria-label="Share or export plot"
-                title="Share or export plot">
+                aria-label="Copy or export plot"
+                title="Copy or export plot">
             {@html SHARE_ICON}
         </button>
         <button class="icon-btn"
@@ -647,23 +647,27 @@
         stroke: none !important;
     }
 
-    /* Toolbar toggle "on" state. Icon-only buttons can't lean on a
-     * label-adjacent indicator (no checkmark slot anymore), so the
-     * pressed state has to read from the button chrome alone. The
-     * `inputOption.active*` tokens are VS Code's canonical "this toggle
-     * is engaged" palette — they're what the search widget's
-     * case-sensitive / regex / whole-word toggles use. Pairing the
-     * accent background with `inputOption.activeBorder` (falling back
-     * to focusBorder for older themes that don't define it) gives a
-     * clearly-pressed look that doesn't depend on theme-specific
-     * border contrast.
+    /* Toolbar toggle "on" state. Icon-only buttons need a strong
+     * background-color shift to read as engaged — VS Code's canonical
+     * `inputOption.activeBackground` token is intentionally subtle (a
+     * semi-transparent tint over the input background) and tends to
+     * disappear against the editor-widget background the toolbar sits
+     * on. Using the primary button palette instead gives an unambiguous
+     * "pressed" colour that survives every theme: the toggle fills with
+     * the same accent VS Code uses for its primary action buttons, so
+     * users immediately read it as active.
      *
      * `currentColor` flows through the inline SVG's `fill="currentColor"`,
-     * so changing `color` to `activeForeground` recolors the codicon
-     * itself — no extra rule needed for the SVG fill. */
+     * so setting `color: button-foreground` recolors the codicon itself
+     * — no extra rule needed for the SVG fill. The off-state border
+     * isn't overridden because the prominent background carries the
+     * indication on its own; layering a border on top reads as noise. */
     .theme-toggle.is-on {
-        background: var(--vscode-inputOption-activeBackground) !important;
-        color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground)) !important;
-        border-color: var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder)) !important;
+        background: var(--vscode-button-background) !important;
+        color: var(--vscode-button-foreground) !important;
+    }
+
+    .theme-toggle.is-on:hover:not(:disabled) {
+        background: var(--vscode-button-hoverBackground) !important;
     }
 </style>
