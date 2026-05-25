@@ -20,6 +20,7 @@
     import { isExtensionToWebviewMessage } from '../messages';
     import { sanitize_svg } from './sanitize';
     import { compute_share_popover_position } from './share-popover-position';
+    import { tag_background_rects } from './tag-backgrounds';
 
     // Inlined codicon SVGs (from @vscode/codicons 0.0.45, MIT). Kept
     // inline (rather than importing the font) so we don't add a runtime
@@ -622,10 +623,18 @@
                 if (existing && existing.upid >= capturedUpid) return;
                 const sanitized = sanitize_svg(text);
                 if (!sanitized) return;
+                // Heuristic structural tagging of canvas/panel
+                // background rects (see ./tag-backgrounds for the
+                // rules). The overlay CSS targets `rect.raven-bg` so
+                // we get colour-agnostic background hiding without a
+                // hand-maintained allowlist. The tagger is a pure
+                // function of the SVG text, so caching the post-tag
+                // bytes is sound.
+                const tagged = tag_background_rects(sanitized);
                 dispatch({
                     type: 'SET_SVG_CACHE_ENTRY',
                     cacheKey,
-                    entry: { svgText: sanitized, upid: capturedUpid },
+                    entry: { svgText: tagged, upid: capturedUpid },
                 });
             })
             .catch(() => {
@@ -796,11 +805,6 @@
         max-height: 100%;
     }
 
-    .plot-host.apply-vscode-theme :global(svg.httpgd > rect:first-of-type) {
-        fill: none !important;
-        stroke: none !important;
-    }
-
     .plot-host.apply-vscode-theme :global(svg.httpgd text) {
         fill: var(--vscode-editor-foreground) !important;
         font-family: var(--vscode-editor-font-family) !important;
@@ -811,39 +815,28 @@
     .plot-host.apply-vscode-theme :global(svg.httpgd polygon),
     .plot-host.apply-vscode-theme :global(svg.httpgd path),
     .plot-host.apply-vscode-theme :global(svg.httpgd circle),
-    .plot-host.apply-vscode-theme :global(svg.httpgd rect:not(:first-of-type)) {
+    .plot-host.apply-vscode-theme :global(svg.httpgd rect:not(.raven-bg)) {
         stroke: var(--vscode-editor-foreground) !important;
     }
 
-    /* httpgd-rendered plots paint multiple background rects under the
-     * data layer; the toggle has to hide all of them so
-     * `--vscode-editor-background` can show through.
+    /* Hide the canvas/panel background rects that `tag_background_rects`
+     * (in ./tag-backgrounds.ts) flagged with `class="raven-bg"`. The
+     * webview body's `--vscode-editor-background` shows through.
      *
-     *   - `#FFFFFF` covers two distinct rects on every plot: the
-     *     first-of-type direct child of <svg> (httpgd's canvas, also
-     *     hit by the `:first-of-type` rule above) AND an inner rect
-     *     wrapped in a `<g clip-path>` that the `:first-of-type`
-     *     selector cannot reach.
-     *   - `#EBEBEB` is `grey92`, the ggplot2 `theme_gray()` default
-     *     for `panel.background`. ggplot2 is the dominant R plot
-     *     ecosystem; without this entry the cartesian grid stays
-     *     painted light-gray over the editor background.
-     *
-     * Extending the allowlist is intentionally conservative: we'd
-     * rather miss a non-default ggplot theme's background (and have
-     * the user toggle off) than hide a deliberate white/grey-filled
-     * shape in their data (e.g. a `geom_rect()` panel) once the toggle
-     * is on. Add new colors only when a real plot demonstrates the
-     * miss. The `i` flag is CSS4 case-insensitive matching — defensive
-     * against a future httpgd version emitting lowercase hex.
+     * The previous mechanism was a `rect[fill="#FFFFFF" i],
+     * rect[fill="#EBEBEB" i]` allowlist: every non-default ggplot theme
+     * (`theme_dark()` → grey50, user-customized themes, theme_minimal
+     * with no panel bg at all) required a new entry, and any user-drawn
+     * shape that happened to match an allowlisted colour silently
+     * disappeared. Structural tagging is colour-agnostic and stable
+     * across themes — see `tag-backgrounds.ts` for the heuristic.
      *
      * Source order matters: this rule lives AFTER the stroke-recolor
      * rule above so the `stroke: none !important` here overrides the
-     * editor-foreground stroke that would otherwise outline the inner
+     * editor-foreground stroke that would otherwise outline tagged
      * background rects (the two rules have equal CSS specificity, so
      * later-in-source wins). */
-    .plot-host.apply-vscode-theme :global(svg.httpgd rect[fill="#FFFFFF" i]),
-    .plot-host.apply-vscode-theme :global(svg.httpgd rect[fill="#EBEBEB" i]) {
+    .plot-host.apply-vscode-theme :global(svg.httpgd rect.raven-bg) {
         fill: none !important;
         stroke: none !important;
     }
