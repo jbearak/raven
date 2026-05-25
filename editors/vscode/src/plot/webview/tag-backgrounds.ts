@@ -8,12 +8,24 @@
  *   1. It is the first <rect> direct child of <svg> — httpgd's outer
  *      canvas always sits in that slot, regardless of fill.
  *
- *   2. It is the only <rect> direct child of a <g> parent AND has
- *      `stroke="none"` (or no stroke attribute). This catches panel
- *      backgrounds (e.g. ggplot2's `panel.background` rect, sitting
- *      alone before the data layer) while leaving bar-chart bars
- *      (multiple <rect> siblings in a <g>) and `geom_rect()`
- *      annotations (which typically carry a stroke) untouched.
+ *   2. It is a <rect> direct child of a <g> AND has neither
+ *      `stroke-linejoin` nor `stroke-linecap` attributes. ggplot2's
+ *      element_rect (used for `panel.background`, `plot.background`,
+ *      etc.) and httpgd's inner canvas rect render with no linejoin/
+ *      linecap (their grid defaults match httpgd's defaults). Data
+ *      rects (geom_rect / geom_bar / geom_col / geom_tile) ALWAYS
+ *      carry both attributes because GeomRect's defaults
+ *      (`linejoin = "mitre"`, `lineend = "butt"`) differ from
+ *      httpgd's "round" / "round" defaults and are therefore emitted.
+ *
+ * This was verified empirically by capturing real httpgd output for
+ * ggplot's `theme_gray()` scatter and bar charts (see the
+ * `tests/fixtures/httpgd/ggplot-*.svg` snapshots): the inner-canvas
+ * rect arrives as `stroke="#FFFFFF" fill="#FFFFFF"` (stroke matches
+ * fill, not "none"), and the panel.bg rect lives alongside data bars
+ * in the same `<g>`. A "stroke=none AND only-rect-in-g" rule misses
+ * both. Filtering by linejoin/linecap presence catches them and
+ * rejects the bars correctly.
  *
  * The previous mechanism was a CSS `rect[fill="#FFFFFF" i], rect[fill=
  * "#EBEBEB" i]` allowlist — brittle: every non-default ggplot theme
@@ -77,14 +89,18 @@ function is_background_rect(rect: Element): boolean {
     }
 
     if (parent.localName === 'g') {
-        // Rule 2: a single <rect> direct child of <g> with no stroke
-        // is a background. Bar-chart bars come in multiples (count > 1
-        // disqualifies); geom_rect() annotations typically carry a
-        // stroke (non-`none` stroke disqualifies).
-        const directRects = collect_direct_rect_children(parent);
-        if (directRects.length !== 1) return false;
-        const stroke = rect.getAttribute('stroke');
-        return stroke === null || stroke === 'none';
+        // Rule 2: ggplot2 backgrounds (element_rect) and httpgd's
+        // inner canvas render WITHOUT `stroke-linejoin` / `stroke-
+        // linecap` attributes — their R-side defaults match httpgd's
+        // SVG defaults, so the attributes aren't emitted. Data rects
+        // (GeomRect / GeomBar / GeomCol / GeomTile) ALWAYS carry both
+        // attributes because GeomRect defaults to `linejoin = "mitre"`
+        // / `lineend = "butt"`, which differ from httpgd's defaults
+        // and get emitted explicitly. The presence test cleanly
+        // separates them.
+        if (rect.hasAttribute('stroke-linejoin')) return false;
+        if (rect.hasAttribute('stroke-linecap')) return false;
+        return true;
     }
 
     return false;
@@ -95,12 +111,4 @@ function first_rect_child(parent: Element): Element | null {
         if (n.localName === 'rect') return n;
     }
     return null;
-}
-
-function collect_direct_rect_children(parent: Element): Element[] {
-    const out: Element[] = [];
-    for (let n = parent.firstElementChild; n !== null; n = n.nextElementSibling) {
-        if (n.localName === 'rect') out.push(n);
-    }
-    return out;
 }

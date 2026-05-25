@@ -5,17 +5,18 @@
 //
 //   1. The first <rect> direct child of <svg> — httpgd's outer canvas,
 //      regardless of fill.
-//   2. The only <rect> direct child of a <g> parent AND with
-//      `stroke="none"` (or no stroke attribute) — a panel background
-//      sitting alone before its data layer.
+//   2. A <rect> direct child of a <g> AND with neither `stroke-linejoin`
+//      nor `stroke-linecap` attributes. ggplot2's element_rect (used
+//      for panel.background, plot.background, etc.) and httpgd's inner
+//      canvas render without these attributes (their grid defaults
+//      match httpgd's defaults). Data rects (GeomRect / GeomBar /
+//      GeomCol / GeomTile) ALWAYS carry both because GeomRect defaults
+//      to `linejoin = "mitre"` / `lineend = "butt"` and httpgd emits
+//      non-default join/cap values explicitly.
 //
-// The overlay CSS then targets `rect.raven-bg` instead of a colour
-// allowlist, so new ggplot themes (theme_dark, theme_minimal, user-
-// customized) work without an extra hex entry per theme.
-//
-// Negatives the heuristic must respect:
-//   - Bar-chart bars (multiple rect siblings in a <g>) stay un-tagged.
-//   - geom_rect() annotations carrying a stroke stay un-tagged.
+// This distinguisher is validated against captured real httpgd 2.1.4
+// output for both `theme_gray()` scatter and bar plots — see the
+// `tests/fixtures/httpgd/ggplot-*.svg` fixtures.
 
 import { describe, test, expect, beforeAll } from 'bun:test';
 import { JSDOM } from 'jsdom';
@@ -23,9 +24,6 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 beforeAll(() => {
-    // Same jsdom-into-globalThis pattern the sanitize tests use. The
-    // tagger relies on `globalThis.document` so it can create a
-    // detached container element and walk parsed DOM.
     const dom = new JSDOM('<!doctype html><html><body></body></html>');
     const g = globalThis as Record<string, unknown>;
     g.window = dom.window;
@@ -47,12 +45,11 @@ const sanitize_svg: (text: string) => string = await (async () => {
     return mod.sanitize_svg;
 })();
 
-const FIXTURE_PATH = resolve(
+const FIXTURES_DIR = resolve(
     (import.meta as unknown as { dir: string }).dir,
     '..',
     'fixtures',
     'httpgd',
-    'plot-1-10.svg',
 );
 
 function parse_rects(svgText: string): Element[] {
@@ -61,19 +58,17 @@ function parse_rects(svgText: string): Element[] {
 }
 
 describe('tag_background_rects — heuristic identifies canvas + panel rects', () => {
-    test('httpgd fixture: both canvas rects gain class="raven-bg"; data circles untouched', () => {
-        const fixture = readFileSync(FIXTURE_PATH, 'utf-8');
+    test('existing httpgd fixture: both canvas rects gain class="raven-bg"; data circles untouched', () => {
+        const fixture = readFileSync(resolve(FIXTURES_DIR, 'plot-1-10.svg'), 'utf-8');
         const sanitized = sanitize_svg(fixture);
         const tagged = tag_background_rects(sanitized);
         const rects = parse_rects(tagged);
         const taggedRects = rects.filter(r => r.classList.contains('raven-bg'));
-        // Outer canvas (first-of-type direct child of <svg>) + inner
-        // canvas (single rect under <g clip-path>, stroke=none) = 2.
-        // The <clipPath><rect/></clipPath> defs rects sit under
-        // <clipPath>, not under <g> or directly under <svg>, so the
-        // heuristic skips them.
+        // Outer canvas (Rule 1) + inner canvas (Rule 2, no linejoin/
+        // linecap, direct child of <g>) = 2. The <clipPath><rect/></clipPath>
+        // defs rect is not tagged — its parent is <clipPath>, neither
+        // <svg> nor <g>.
         expect(taggedRects.length).toBe(2);
-        // Data circles aren't rects; the tagger never visits them.
         const dom = new JSDOM(`<!doctype html><html><body>${tagged}</body></html>`);
         const circles = Array.from(dom.window.document.querySelectorAll('circle'));
         expect(circles.length).toBeGreaterThan(0);
@@ -82,12 +77,61 @@ describe('tag_background_rects — heuristic identifies canvas + panel rects', (
         }
     });
 
-    test('ggplot2 panel.background: outer canvas + panel rect both tagged regardless of fill', () => {
-        // Synthetic mirror of ggplot2 theme_gray output: outer #FFFFFF
-        // canvas + a single #EBEBEB panel.background rect alone in its
-        // <g clip-path>. Note: the heuristic must NOT look at fill —
-        // theme_dark's #7F7F7F or a user-customized colour would fail
-        // an allowlist but pass the structural rules.
+    test('real httpgd ggplot scatter: outer canvas + inner canvas + panel.background all tagged', () => {
+        // Captured live from R via `ggplot(mtcars, aes(wt, mpg)) +
+        // geom_point()` against httpgd 2.1.4. The inner canvas rect
+        // arrives as `stroke="#FFFFFF" fill="#FFFFFF"` (matching
+        // stroke/fill, not "none") — the original "stroke=none AND
+        // only-rect-in-g" heuristic missed it. This is the regression
+        // pin for the user-reported "always white" bug.
+        const fixture = readFileSync(resolve(FIXTURES_DIR, 'ggplot-scatter.svg'), 'utf-8');
+        const sanitized = sanitize_svg(fixture);
+        const tagged = tag_background_rects(sanitized);
+        const rects = parse_rects(tagged);
+        const taggedRects = rects.filter(r => r.classList.contains('raven-bg'));
+        // 3 expected: outer canvas (#FFFFFF, Rule 1), inner canvas
+        // (#FFFFFF/#FFFFFF, Rule 2), panel.background (#EBEBEB, Rule 2).
+        // The 3 <clipPath><rect/></clipPath> defs rects sit under
+        // <clipPath> and are skipped.
+        expect(taggedRects.length).toBe(3);
+        // Spot-check each by fill colour.
+        const fills = taggedRects.map(r => r.getAttribute('fill')).sort();
+        expect(fills).toEqual(['#EBEBEB', '#FFFFFF', '#FFFFFF']);
+    });
+
+    test('real httpgd ggplot bar chart: backgrounds tagged, bars (with linejoin/linecap) untouched', () => {
+        // Captured live: `ggplot(mtcars, aes(factor(cyl))) + geom_bar()`.
+        // The c1 <g> holds the panel.background rect AND 3 bar rects
+        // as siblings. A naive "only-rect-in-g" rule would miss the
+        // panel.background; an "all stroke=none rects" rule would
+        // erase the bars. The linejoin/linecap distinguisher cleanly
+        // separates them: GeomBar emits `stroke-linejoin="miter"`
+        // and `stroke-linecap="butt"`; element_rect does not.
+        const fixture = readFileSync(resolve(FIXTURES_DIR, 'ggplot-bar.svg'), 'utf-8');
+        const sanitized = sanitize_svg(fixture);
+        const tagged = tag_background_rects(sanitized);
+        const rects = parse_rects(tagged);
+        const taggedRects = rects.filter(r => r.classList.contains('raven-bg'));
+        // 3 expected: outer canvas, inner canvas, panel.background.
+        expect(taggedRects.length).toBe(3);
+        // The 3 bar rects (#595959) must NOT be tagged.
+        const bars = rects.filter(r => r.getAttribute('fill') === '#595959');
+        expect(bars).toHaveLength(3);
+        for (const bar of bars) {
+            expect(bar.classList.contains('raven-bg')).toBe(false);
+        }
+        // Pin the structural signal: each bar carries stroke-linejoin
+        // (this is what makes the heuristic work).
+        for (const bar of bars) {
+            expect(bar.hasAttribute('stroke-linejoin')).toBe(true);
+            expect(bar.hasAttribute('stroke-linecap')).toBe(true);
+        }
+    });
+
+    test('ggplot2 panel.background synthetic: outer canvas + panel rect both tagged', () => {
+        // Synthetic mirror of theme_gray output. The heuristic must
+        // NOT look at fill — theme_dark's #7F7F7F or a user-customized
+        // colour would fail an allowlist but pass the structural rules.
         const input = '<svg class="httpgd" xmlns="http://www.w3.org/2000/svg">'
             + '<rect width="100%" height="100%" fill="#FFFFFF" stroke="none" />'
             + '<defs><clipPath id="cp"><rect /></clipPath></defs>'
@@ -99,17 +143,13 @@ describe('tag_background_rects — heuristic identifies canvas + panel rects', (
         const rects = parse_rects(out);
         const taggedRects = rects.filter(r => r.classList.contains('raven-bg'));
         // 2 expected: outer canvas (Rule 1) + panel rect (Rule 2).
-        // The <clipPath><rect/></clipPath> defs rect is not tagged —
-        // its parent is <clipPath>, not <g> or <svg>.
+        // The defs clipPath rect's parent is <clipPath>, not <g>.
         expect(taggedRects.length).toBe(2);
     });
 
-    test('theme_dark()-style panel (fill=#7F7F7F, stroke=none alone in <g>) is tagged', () => {
-        // Generalization probe: the WHOLE POINT of the heuristic is
-        // that it works for ggplot2 themes the colour allowlist never
-        // saw — theme_dark, theme_minimal (which has no panel bg at
-        // all so nothing to tag), user-customized themes. #7F7F7F is
-        // theme_dark's panel default.
+    test('theme_dark()-style panel (fill=#7F7F7F, no linejoin/linecap alone in <g>) is tagged', () => {
+        // Generalization probe: themes the colour allowlist never
+        // saw should still get their panel.background tagged.
         const input = '<svg class="httpgd" xmlns="http://www.w3.org/2000/svg">'
             + '<rect width="100%" height="100%" fill="#FFFFFF" stroke="none" />'
             + '<g clip-path="url(#cp)">'
@@ -123,26 +163,30 @@ describe('tag_background_rects — heuristic identifies canvas + panel rects', (
         expect(panelBg!.classList.contains('raven-bg')).toBe(true);
     });
 
-    test('bar chart: multiple <rect> siblings in <g> are NOT tagged (data, not background)', () => {
-        // ggplot2 geom_bar() with default colour=NA emits multiple
-        // rects with stroke=none inside one clip-path <g>. A naive
-        // "all stroke=none rects" rule would erase the bars; the
-        // :only-of-type constraint of Rule 2 is what saves us.
+    test('bar chart synthetic: rects with stroke-linejoin/stroke-linecap are NOT tagged', () => {
+        // ggplot2 GeomBar / GeomRect / GeomCol / GeomTile always emit
+        // `stroke-linejoin="miter"` and `stroke-linecap="butt"` because
+        // their grid defaults differ from httpgd's "round" defaults.
+        // Background rects (element_rect themes, inner canvas) never
+        // emit these attributes. The presence check is the load-bearing
+        // distinguisher.
         const input = '<svg class="httpgd" xmlns="http://www.w3.org/2000/svg">'
             + '<rect width="100%" height="100%" fill="#FFFFFF" stroke="none" />'
             + '<g clip-path="url(#cp)">'
-            + '<rect x="0" width="20" fill="#0000FF" stroke="none" />'
-            + '<rect x="30" width="20" fill="#0000FF" stroke="none" />'
-            + '<rect x="60" width="20" fill="#0000FF" stroke="none" />'
+            // Panel.bg — alone-or-not is no longer the criterion, only
+            // attr-presence. Lives alongside bars in the same <g>.
+            + '<rect fill="#EBEBEB" stroke="none" />'
+            + '<rect x="0" width="20" fill="#0000FF" stroke="none" stroke-linejoin="miter" stroke-linecap="butt" />'
+            + '<rect x="30" width="20" fill="#0000FF" stroke="none" stroke-linejoin="miter" stroke-linecap="butt" />'
+            + '<rect x="60" width="20" fill="#0000FF" stroke="none" stroke-linejoin="miter" stroke-linecap="butt" />'
             + '</g>'
             + '</svg>';
         const out = tag_background_rects(input);
         const rects = parse_rects(out);
-        // The outer canvas is still tagged (Rule 1 always applies).
         const taggedRects = rects.filter(r => r.classList.contains('raven-bg'));
-        expect(taggedRects).toHaveLength(1);
-        expect(taggedRects[0].getAttribute('width')).toBe('100%');
-        // None of the inner bars are tagged.
+        // 2 tagged: outer canvas + panel.bg (no linejoin/linecap).
+        // The 3 bars (with linejoin/linecap) stay un-tagged.
+        expect(taggedRects).toHaveLength(2);
         const bars = rects.filter(r => r.getAttribute('fill') === '#0000FF');
         expect(bars).toHaveLength(3);
         for (const bar of bars) {
@@ -150,15 +194,16 @@ describe('tag_background_rects — heuristic identifies canvas + panel rects', (
         }
     });
 
-    test('geom_rect() annotation with stroke is NOT tagged even when alone in <g>', () => {
-        // A deliberate single annotation rect with a stroke colour
-        // (the typical geom_rect() shape when colour aesthetic is set)
-        // looks structurally like a panel-bg under Rule 2 if we ignore
-        // stroke. The stroke check is what distinguishes them.
+    test('geom_rect() annotation (with stroke-linejoin) is NOT tagged', () => {
+        // GeomRect's default linejoin="mitre" / lineend="butt" gets
+        // emitted by httpgd, so the annotation carries the
+        // distinguishing attributes even when colour=NA produces
+        // stroke="none". The presence-of-linejoin check keeps it out
+        // of the background bucket.
         const input = '<svg class="httpgd" xmlns="http://www.w3.org/2000/svg">'
             + '<rect width="100%" height="100%" fill="#FFFFFF" stroke="none" />'
             + '<g clip-path="url(#cp)">'
-            + '<rect fill="#FF0000" stroke="#000000" />'
+            + '<rect fill="#FF0000" stroke="none" stroke-linejoin="miter" stroke-linecap="butt" />'
             + '</g>'
             + '</svg>';
         const out = tag_background_rects(input);
@@ -166,6 +211,25 @@ describe('tag_background_rects — heuristic identifies canvas + panel rects', (
         const annotation = rects.find(r => r.getAttribute('fill') === '#FF0000');
         expect(annotation).toBeDefined();
         expect(annotation!.classList.contains('raven-bg')).toBe(false);
+    });
+
+    test('inner-canvas-style rect (stroke=fill, no linejoin/linecap) is tagged — pins the user-reported regression', () => {
+        // The httpgd ggplot inner canvas emits
+        // `stroke="#FFFFFF" fill="#FFFFFF"` (stroke matches fill, NOT
+        // "none"). The original heuristic's `stroke === 'none'` check
+        // dropped this rect, leaving the panel area white over the
+        // editor background once the panel.background was hidden.
+        const input = '<svg class="httpgd" xmlns="http://www.w3.org/2000/svg">'
+            + '<rect width="100%" height="100%" fill="#FFFFFF" stroke="none" />'
+            + '<g clip-path="url(#cp)">'
+            + '<rect fill="#FFFFFF" stroke="#FFFFFF" />'
+            + '</g>'
+            + '</svg>';
+        const out = tag_background_rects(input);
+        const rects = parse_rects(out);
+        const innerCanvas = rects.find(r => r.getAttribute('stroke') === '#FFFFFF');
+        expect(innerCanvas).toBeDefined();
+        expect(innerCanvas!.classList.contains('raven-bg')).toBe(true);
     });
 
     test('existing class attribute is preserved alongside raven-bg', () => {
@@ -203,8 +267,6 @@ describe('tag_background_rects — heuristic identifies canvas + panel rects', (
     });
 
     test('input lacking <svg> is returned unchanged', () => {
-        // Defensive: sanitize_svg can hand us non-SVG text on malformed
-        // input. The tagger must not silently corrupt that.
         const input = 'hello world';
         expect(tag_background_rects(input)).toBe(input);
     });
