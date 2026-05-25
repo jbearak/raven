@@ -35,6 +35,7 @@ import {
     semanticOverlaysFromLspData,
     type GithubPalette,
 } from './code-highlighter';
+import { stripFrontmatter } from './yaml-frontmatter';
 
 /** Per-language CSS class prefix `markdown-it` emits. */
 const LANG_CLASS_PREFIX = 'language-';
@@ -192,7 +193,13 @@ export async function renderKnitHtml(args: {
      */
     fonts?: ResolvedFonts;
 }): Promise<string> {
-    const html = await args.renderMarkdown(args.markdownSource);
+    // Strip the YAML frontmatter before invoking the renderer so the
+    // VS Code markdown pipeline never emits its `<table class="frontmatter">`
+    // for the preview. The on-disk .md (which Pandoc export reads) is
+    // untouched — the strip only mutates the in-memory string passed to
+    // `args.renderMarkdown`. See
+    // docs/superpowers/specs/2026-05-25-knit-preview-yaml-table-design.md.
+    const html = await args.renderMarkdown(stripFrontmatter(args.markdownSource));
     const rewritten = await rewriteCodeBlocks(html, args);
     return assembleDocument(rewritten, args);
 }

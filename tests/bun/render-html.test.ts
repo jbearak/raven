@@ -698,4 +698,44 @@ describe('renderKnitHtml', () => {
             `<span style="color:var(--raven-c-function)">library</span>`,
         );
     });
+
+    test('strips YAML frontmatter from the markdown before calling renderMarkdown', async () => {
+        // Regression test for the user-reported "Knit Preview prints
+        // YAML as a table" behavior. The strip lives in renderKnitHtml
+        // so VS Code's markdown.api.render never sees the frontmatter
+        // and therefore never emits its `<table class="frontmatter">`
+        // shape. The on-disk .md is untouched (Pandoc export depends on
+        // the full YAML); this test only exercises the in-memory
+        // strip handed to the injected renderMarkdown.
+        const seenByRenderer: string[] = [];
+        const markdownSource =
+            '---\ntitle: Hi\nauthor: Me\n---\n\nBody text.\n';
+        const out = await renderKnitHtml({
+            markdownSource,
+            renderMarkdown: async (src) => {
+                seenByRenderer.push(src);
+                return '<p>Body text.</p>';
+            },
+            registry: fakeRegistry({}),
+        });
+
+        // renderMarkdown received the post-strip source — no YAML
+        // delimiters, no `title:` line.
+        expect(seenByRenderer).toHaveLength(1);
+        expect(seenByRenderer[0]).not.toContain('---');
+        expect(seenByRenderer[0]).not.toContain('title:');
+        expect(seenByRenderer[0]).not.toContain('author:');
+        expect(seenByRenderer[0]).toContain('Body text.');
+
+        // The assembled document body must not contain YAML fragments
+        // either. We deliberately do not assert on the `<table
+        // class="frontmatter">` shape here — that's VS Code's
+        // markdown extension's emission, which we're not exercising
+        // with the fake renderer. The end-to-end integration test in
+        // editors/vscode/src/test/knit-preview-yaml-stripped.test.ts
+        // covers that shape against the real renderer.
+        expect(out).toContain('<p>Body text.</p>');
+        expect(out).not.toContain('title:');
+        expect(out).not.toContain('author:');
+    });
 });
