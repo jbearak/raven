@@ -100,10 +100,12 @@ explorer-context-menu hook is opt-in via your own keybindings).
    (`raven.knit.timeoutMs = 600000`). Windows uses `taskkill /T /F`
    instead of POSIX signals.
 10. **Post-knit render.** `knitr::knit` writes `<basename>.md` next to
-    the source. Raven reads that markdown, calls VS Code's
-    `markdown.api.render` to convert it to HTML (KaTeX math, image
-    rewriting, scroll-sync metadata, and any registered `markdown-it`
-    plugins all happen here), and then walks the result for
+    the source. Raven reads that markdown, **strips the YAML frontmatter
+    from the in-memory copy** (so the preview never shows a frontmatter
+    table — the on-disk `.md` keeps its YAML for Pandoc export), then
+    calls VS Code's `markdown.api.render` to convert it to HTML (KaTeX
+    math, image rewriting, scroll-sync metadata, and any registered
+    `markdown-it` plugins all happen here), and then walks the result for
     `<pre><code class="language-X">` blocks. Each block is
     re-highlighted using:
 
