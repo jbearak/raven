@@ -20,6 +20,15 @@
     import { isExtensionToWebviewMessage } from '../messages';
     import { sanitize_svg } from './sanitize';
 
+    // Inlined codicon SVGs (from @vscode/codicons 0.0.45, MIT). Kept
+    // inline (rather than importing the font) so we don't add a runtime
+    // font dependency or change the webview CSP — `fill="currentColor"`
+    // makes them inherit the surrounding button's foreground colour.
+    const SYMBOL_COLOR_ICON =
+        '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M8.00101 1C4.13401 1 1.00101 3.8 1.00101 7.667C1.00101 8.956 2.04501 10 3.33401 10C4.75101 10 4.72101 9 6.00001 9C6.64401 9 7.00001 9.606 7.00001 10.25V11.5C7.00001 13.433 8.56701 15 10.5 15C13.653 15 14.999 11.215 14.999 8C14.999 4.134 11.866 1 8.00001 1H8.00101ZM10.5 14C9.12201 14 8.00001 12.878 8.00001 11.5V10.25C8.00001 8.967 7.14001 8 6.00001 8C5.04001 8 4.49801 8.412 4.13901 8.685C3.85401 8.902 3.72401 9 3.33401 9C2.59901 9 2.00101 8.402 2.00101 7.667C2.00101 4.436 4.58001 2 8.00101 2C11.309 2 14 4.692 14 8C14 10.412 13.068 14 10.501 14H10.5ZM12 11C12 11.552 11.552 12 11 12C10.448 12 10 11.552 10 11C10 10.448 10.448 10 11 10C11.552 10 12 10.448 12 11ZM13 8C13 8.552 12.552 9 12 9C11.448 9 11 8.552 11 8C11 7.448 11.448 7 12 7C12.552 7 13 7.448 13 8ZM6.00001 5C6.00001 5.552 5.55201 6 5.00001 6C4.44801 6 4.00001 5.552 4.00001 5C4.00001 4.448 4.44801 4 5.00001 4C5.55201 4 6.00001 4.448 6.00001 5ZM10 5C10 4.448 10.448 4 11 4C11.552 4 12 4.448 12 5C12 5.552 11.552 6 11 6C10.448 6 10 5.552 10 5ZM9.00001 4C9.00001 4.552 8.55201 5 8.00001 5C7.44801 5 7.00001 4.552 7.00001 4C7.00001 3.448 7.44801 3 8.00001 3C8.55201 3 9.00001 3.448 9.00001 4Z"/></svg>';
+    const SHARE_ICON =
+        '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M11.307 1.10533C11.1562 0.988085 10.9519 0.966945 10.7803 1.05085C10.6088 1.13475 10.5 1.30904 10.5 1.5V3.49274C10.4571 3.49456 10.4122 3.49701 10.3654 3.5002C9.96247 3.52766 9.41128 3.61105 8.82119 3.83704C8.11343 4.10809 7.34877 4.58508 6.72601 5.41126C6.10338 6.23727 5.64499 7.38259 5.50206 8.95474C5.48301 9.16438 5.5973 9.36351 5.78793 9.4528C5.97857 9.54209 6.20471 9.50241 6.35356 9.35356C7.54248 8.16464 8.72298 7.57773 9.59562 7.28685C9.9558 7.16679 10.2643 7.09693 10.5 7.0563V9C10.5 9.1969 10.6156 9.37546 10.7952 9.45612C10.9748 9.53678 11.185 9.50452 11.3322 9.37371L15.8322 5.37371C15.9432 5.27502 16.0046 5.13207 15.9997 4.98361C15.9949 4.83514 15.9242 4.69653 15.807 4.60533L11.307 1.10533ZM10.9429 4.49679L10.9457 4.49705C11.0865 4.51223 11.2279 4.46706 11.3335 4.37257C11.4394 4.27772 11.5 4.14223 11.5 4V2.52232L14.7186 5.02564L11.5 7.88658V6.5C11.5 6.22386 11.2762 6 11 6L10.9989 6L10.9976 6.00001L10.9943 6.00003L10.9848 6.00014L10.9552 6.00087C10.9307 6.00166 10.897 6.00316 10.8544 6.00599C10.7695 6.01166 10.6495 6.02268 10.4996 6.04409C10.1999 6.08691 9.77971 6.17139 9.2794 6.33816C8.55493 6.57965 7.66479 6.99299 6.7319 7.69863C6.9264 6.98158 7.2077 6.43355 7.52456 6.01319C8.01593 5.36132 8.61523 4.98675 9.17883 4.7709C9.65371 4.58903 10.1025 4.52044 10.4334 4.49788C10.5981 4.48666 10.7314 4.48699 10.8211 4.48988C10.866 4.49133 10.8997 4.49341 10.9209 4.49498L10.9429 4.49679ZM3.5 2C2.11929 2 1 3.11929 1 4.5V12.5C1 13.8807 2.11929 15 3.5 15H11.5C12.8807 15 14 13.8807 14 12.5V9.5C14 9.22386 13.7761 9 13.5 9C13.2239 9 13 9.22386 13 9.5V12.5C13 13.3284 12.3284 14 11.5 14H3.5C2.67157 14 2 13.3284 2 12.5V4.5C2 3.67157 2.67157 3 3.5 3H7.5C7.77614 3 8 2.77614 8 2.5C8 2.22386 7.77614 2 7.5 2H3.5Z"/></svg>';
+
     interface Props {
         vscode: { postMessage(msg: WebviewToExtensionMessage): void };
     }
@@ -32,6 +41,17 @@
     let copy_status = $state<'' | 'copying' | 'copied'>('');
     let copy_status_timer: ReturnType<typeof setTimeout> | null = null;
     let resize_timer: ReturnType<typeof setTimeout> | null = null;
+
+    // The toolbar always renders in a compact "icon-only" form on the
+    // right side: a single $(share) button that opens a popover with
+    // Copy / PNG / SVG / PDF, the existing $(arrow-up-right) external
+    // link, and a $(symbol-color) toggle for "Apply VS Code theme".
+    // Keeping the icon-only layout permanent (rather than a responsive
+    // collapse) means the toolbar height is invariant under panel
+    // resize and the layout reads cleanly at every width.
+    let share_popover_el: HTMLDivElement | undefined = $state();
+    let share_btn_el: HTMLButtonElement | undefined = $state();
+    const SHARE_POPOVER_ID = 'raven-plot-share-popover';
     // Tracks the in-flight SVG fetcher so a superseded fetch is aborted
     // when a fresh `(plotId, upid, dimensions, themeApplied)` lands.
     let last_fetcher: AbortController | null = null;
@@ -232,6 +252,45 @@
         const id = state.plotIds[state.currentIndex];
         if (!id) return;
         vscode.postMessage({ type: 'request-open-externally', payload: { plotId: id } });
+    }
+
+    // Position the share popover under the share button on each open.
+    // Using the HTML popover API (`popover` attribute) means dismissal
+    // is automatic on outside click or Escape — we only need to handle
+    // positioning. The CSS rule `.share-popover { inset: auto }`
+    // overrides the browser UA stylesheet's `[popover] { inset: 0;
+    // margin: auto }` (which would center the popover) so the JS-set
+    // `top` and `right` actually take effect. `right` anchors the
+    // popover's right edge near the share button's right edge so the
+    // menu reads as attached to it.
+    //
+    // `beforetoggle` fires synchronously before the popover becomes
+    // visible (the `:popover-open` rule flips `display: none` → `flex`).
+    // Setting position there avoids a one-frame flash at the centered
+    // default before our values land — visible when the menu opens
+    // because the popover is briefly painted at inset:0 / margin:auto
+    // before our `style.top` / `style.right` overrides take effect on
+    // the next style recalc.
+    function on_share_popover_beforetoggle(e: ToggleEvent) {
+        if (e.newState !== 'open') return;
+        if (!share_popover_el || !share_btn_el) return;
+        const r = share_btn_el.getBoundingClientRect();
+        share_popover_el.style.top = `${r.bottom + 4}px`;
+        share_popover_el.style.right = `${Math.max(4, window.innerWidth - r.right)}px`;
+    }
+
+    function close_share_popover() {
+        share_popover_el?.hidePopover?.();
+    }
+
+    function copy_from_share() {
+        close_share_popover();
+        void copy_current();
+    }
+
+    function save_from_share(format: SaveFormat) {
+        close_share_popover();
+        save_plot(format);
     }
 
     function toggle_theme_applied() {
@@ -435,30 +494,38 @@
                 disabled={state.phase !== 'viewing'}
                 title="Remove current plot">✕</button>
         <span class="spacer"></span>
-        <button onclick={copy_current}
+        <button class="icon-btn"
+                bind:this={share_btn_el}
+                popovertarget={SHARE_POPOVER_ID}
                 disabled={state.phase !== 'viewing'}
-                title="Copy plot to clipboard (PNG)">Copy</button>
-        <button onclick={() => save_plot('png')}
+                aria-label="Share or export plot"
+                title="Share or export plot">
+            {@html SHARE_ICON}
+        </button>
+        <button class="icon-btn"
+                onclick={open_externally}
                 disabled={state.phase !== 'viewing'}
-                title="Save as PNG">PNG</button>
-        <button onclick={() => save_plot('svg')}
-                disabled={state.phase !== 'viewing'}
-                title="Save as SVG">SVG</button>
-        <button onclick={() => save_plot('pdf')}
-                disabled={state.phase !== 'viewing'}
-                title="Save as PDF">PDF</button>
-        <button onclick={open_externally}
-                disabled={state.phase !== 'viewing'}
+                aria-label="Open in external viewer"
                 title="Open in external viewer">↗</button>
-        <button class="theme-toggle"
+        <button class="theme-toggle icon-btn"
                 class:is-on={state.themeApplied}
                 aria-pressed={state.themeApplied}
+                aria-label="Apply VS Code theme"
                 onclick={toggle_theme_applied}
-                title="Recolor the plot to match the active VS Code theme">
-            <span class="checkmark" aria-hidden="true">{state.themeApplied ? '✓' : ' '}</span>
-            Apply VS Code theme
+                title="Apply VS Code theme">
+            {@html SYMBOL_COLOR_ICON}
         </button>
     </header>
+    <div id={SHARE_POPOVER_ID}
+         bind:this={share_popover_el}
+         popover="auto"
+         class="share-popover"
+         onbeforetoggle={on_share_popover_beforetoggle}>
+        <button onclick={copy_from_share} disabled={state.phase !== 'viewing'}>Copy</button>
+        <button onclick={() => save_from_share('png')} disabled={state.phase !== 'viewing'}>PNG</button>
+        <button onclick={() => save_from_share('svg')} disabled={state.phase !== 'viewing'}>SVG</button>
+        <button onclick={() => save_from_share('pdf')} disabled={state.phase !== 'viewing'}>PDF</button>
+    </div>
 
     {#if state.sessionEnded && currentSvg}
         <div class="banner">R session ended. Showing last plot.</div>
@@ -580,17 +647,23 @@
         stroke: none !important;
     }
 
-    /* Toolbar toggle styling — mirrors the knit-preview "Apply VS Code
-     * theme" button: an accent border when on, a pre-allocated checkmark
-     * slot so toggling doesn't shift the label horizontally. */
-    .theme-toggle .checkmark {
-        display: inline-block;
-        width: 1ch;
-        text-align: center;
-        white-space: pre;
-    }
-
+    /* Toolbar toggle "on" state. Icon-only buttons can't lean on a
+     * label-adjacent indicator (no checkmark slot anymore), so the
+     * pressed state has to read from the button chrome alone. The
+     * `inputOption.active*` tokens are VS Code's canonical "this toggle
+     * is engaged" palette — they're what the search widget's
+     * case-sensitive / regex / whole-word toggles use. Pairing the
+     * accent background with `inputOption.activeBorder` (falling back
+     * to focusBorder for older themes that don't define it) gives a
+     * clearly-pressed look that doesn't depend on theme-specific
+     * border contrast.
+     *
+     * `currentColor` flows through the inline SVG's `fill="currentColor"`,
+     * so changing `color` to `activeForeground` recolors the codicon
+     * itself — no extra rule needed for the SVG fill. */
     .theme-toggle.is-on {
-        border-color: var(--vscode-focusBorder) !important;
+        background: var(--vscode-inputOption-activeBackground) !important;
+        color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground)) !important;
+        border-color: var(--vscode-inputOption-activeBorder, var(--vscode-focusBorder)) !important;
     }
 </style>

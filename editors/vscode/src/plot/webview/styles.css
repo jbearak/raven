@@ -28,6 +28,11 @@ main {
     border-bottom: 1px solid var(--vscode-panel-border);
     background: var(--vscode-editorWidget-background);
     flex: 0 0 auto;
+    /* Single-row, fixed-height toolbar. `flex-wrap: nowrap` is the flex
+     * default, but pinning it here keeps a future style edit (or a new
+     * text-bearing button) from silently re-introducing the multi-row
+     * wrap that the icon-only layout exists to prevent. */
+    flex-wrap: nowrap;
 }
 
 .toolbar button {
@@ -38,6 +43,12 @@ main {
     border-radius: 2px;
     font-family: inherit;
     cursor: pointer;
+    /* Buttons never wrap their label and never shrink below their
+     * natural width — should a future button gain a text label, this
+     * keeps the row from collapsing vertically (which is what produced
+     * the original two-row wrap the user reported). */
+    flex-shrink: 0;
+    white-space: nowrap;
 }
 
 .toolbar button:hover:not(:disabled) {
@@ -54,10 +65,92 @@ main {
     text-align: center;
     font-variant-numeric: tabular-nums;
     opacity: 0.8;
+    flex-shrink: 0;
+    white-space: nowrap;
 }
 
 .toolbar .spacer {
     flex: 1;
+}
+
+/* Icon-only toolbar buttons (compact theme toggle, share menu). The
+ * inline SVG inherits the button's foreground via `fill="currentColor"`.
+ * The fixed 16x16 square keeps the row height stable across mode
+ * swaps — without explicit width the SVG would size to its viewBox at
+ * font-relative metrics and cause sub-pixel jitter on font changes. */
+.toolbar .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 6px;
+    line-height: 0;
+}
+
+.toolbar .icon-btn svg {
+    width: 16px;
+    height: 16px;
+    display: block;
+    /* `pointer-events: none` is load-bearing for the native `title=`
+     * tooltip on the parent button. Without it, the SVG (which fills
+     * the entire button interior at 16x16) intercepts pointer hover
+     * events; the button never receives a hover and the browser-chrome
+     * tooltip never appears. Letting events pass through to the button
+     * also keeps the `:hover` style and the popovertarget click target
+     * working when the cursor happens to land on a stroke pixel. */
+    pointer-events: none;
+}
+
+/* Popover for the collapsed share menu (mode === 'share-menu'). Uses
+ * the HTML popover API: `popover="auto"` gives light-dismiss on outside
+ * click and Escape; we position it via JS in `on_share_popover_toggle`
+ * since CSS anchor positioning isn't reliable in older Electron-based
+ * VS Code builds. Stack of secondary buttons matches the toolbar
+ * styling so the popover reads as an extension of the row. */
+.share-popover {
+    position: fixed;
+    /* Override the browser UA stylesheet's `[popover] { inset: 0;
+     * margin: auto }` which would otherwise center the popover and
+     * cause our JS-applied `top`/`right` values to fight against the
+     * defaulted `left: 0; bottom: 0`. With `inset: auto`, only the two
+     * sides JS sets in `on_share_popover_toggle` define position; width
+     * sizes to content via the browser's default `width: fit-content`. */
+    inset: auto;
+    margin: 0;
+    padding: 4px;
+    background: var(--vscode-editorWidget-background);
+    color: var(--vscode-editorWidget-foreground);
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    border-radius: 4px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+    min-width: 96px;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.share-popover:popover-open {
+    display: flex;
+}
+
+.share-popover button {
+    background: transparent;
+    color: var(--vscode-foreground);
+    border: 1px solid transparent;
+    padding: 4px 12px;
+    border-radius: 2px;
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.share-popover button:hover:not(:disabled) {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.share-popover button:disabled {
+    opacity: 0.5;
+    cursor: default;
 }
 
 .banner {
