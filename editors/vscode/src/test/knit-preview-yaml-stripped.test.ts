@@ -104,7 +104,7 @@ suite('Knit Preview strips YAML frontmatter from md→html', () => {
             'rendered HTML must not contain any element with a `frontmatter` class',
         );
         assert.ok(
-            !/data-vscode-context='[^']*frontMatter/i.test(html),
+            !/data-vscode-context=(?:'[^']*|"[^"]*)\bfrontMatter\b/i.test(html),
             'rendered HTML must not carry the frontmatter data-vscode-context',
         );
 
