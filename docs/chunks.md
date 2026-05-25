@@ -24,12 +24,13 @@ Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct sy
 
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
-| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Run Current Chunk (in `.Rmd` / `.qmd`) |
+| `Cmd+Alt+Enter` | `Ctrl+Alt+Enter` | Run Current Chunk |
+| `Cmd+Alt+Shift+Enter` | `Ctrl+Alt+Shift+Enter` | Run Current Chunk and Move |
 | `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Above Chunks |
 | `Cmd+Alt+N` | `Ctrl+Alt+N` | Go to Next Chunk |
 | `Cmd+Alt+Shift+N` | `Ctrl+Alt+Shift+N` | Go to Previous Chunk |
 
-In `.R` files, `Cmd+Shift+Enter` keeps its usual meaning of **Source File** — to run a single cell, use the command palette or the CodeLens "Run Chunk" button.
+In `.R` files without `# %%` cell markers the current-chunk shortcuts surface a warning; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
 
 ## Commands
 

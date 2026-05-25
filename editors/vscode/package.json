@@ -317,6 +317,18 @@
         "when": "editorTextFocus && raven.rConsoleEnabled && raven.rmdKnit.enabled && (editorLangId == rmd || editorLangId == r) && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
       },
       {
+        "command": "raven.runCurrentChunk",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.runCurrentChunkAndMove",
+        "key": "ctrl+alt+shift+enter",
+        "mac": "cmd+alt+shift+enter",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
         "command": "raven.runAboveChunks",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p",
