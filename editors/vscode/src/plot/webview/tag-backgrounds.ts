@@ -34,30 +34,34 @@ export function tag_background_rects(svgText: string): string {
     const doc = (globalThis as { document?: Document }).document;
     if (!doc) return svgText;
 
-    // Parse via a detached <div> + innerHTML rather than DOMParser:
-    // DOMPurify's output is HTML-style (not strictly well-formed XML
-    // — closing tags, attribute quote conventions, etc.), and an
-    // HTML-aware parser is the forgiving path. The browser's HTML
-    // parser switches to foreign-content mode for `<svg>`, so the SVG
-    // namespace and element semantics are preserved.
+    // Parse via a detached <div> + innerHTML: DOMPurify's output is
+    // HTML-style (not strictly well-formed XML), and the HTML parser
+    // is the forgiving path. `<svg>` triggers foreign-content insertion,
+    // so the SVG namespace and element semantics are preserved.
     const container = doc.createElement('div');
     container.innerHTML = svgText;
     const svg = container.querySelector('svg');
     if (!svg) return svgText;
 
-    // `getElementsByTagName` returns a live HTMLCollection. We add
-    // class attributes only (no element insertions/removals), so the
-    // collection length stays stable and the index-based iteration is
-    // safe.
-    const rects = svg.getElementsByTagName('rect');
-    for (let i = 0; i < rects.length; i++) {
-        const rect = rects[i];
+    // `querySelectorAll` returns a static NodeList and handles
+    // namespaced (SVG) elements consistently across browsers — safer
+    // than `getElementsByTagName` for descendant-of-SVG queries.
+    const rects = svg.querySelectorAll('rect');
+    for (const rect of rects) {
         if (is_background_rect(rect)) {
-            add_class(rect, 'raven-bg');
+            // classList.add() is idempotent, handles whitespace
+            // normalization, and works uniformly on SVG and HTML
+            // elements.
+            rect.classList.add('raven-bg');
         }
     }
 
-    return container.innerHTML;
+    // Serialize the SVG element directly, not the wrapping <div>.
+    // Reading `container.innerHTML` would re-serialize the SVG inside
+    // the HTML <div>, which in some browsers strips the `xmlns`
+    // declaration when the namespace is implicit. `svg.outerHTML`
+    // preserves attribute fidelity.
+    return svg.outerHTML;
 }
 
 function is_background_rect(rect: Element): boolean {
@@ -99,19 +103,4 @@ function collect_direct_rect_children(parent: Element): Element[] {
         if (n.localName === 'rect') out.push(n);
     }
     return out;
-}
-
-function add_class(el: Element, cls: string): void {
-    const existing = el.getAttribute('class');
-    if (!existing) {
-        el.setAttribute('class', cls);
-        return;
-    }
-    // Idempotent: a caller that runs the tagger twice should not get a
-    // doubled class token.
-    const tokens = existing.split(/\s+/);
-    for (const t of tokens) {
-        if (t === cls) return;
-    }
-    el.setAttribute('class', `${existing} ${cls}`);
 }
