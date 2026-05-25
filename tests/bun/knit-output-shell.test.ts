@@ -252,6 +252,65 @@ describe('buildShellHtml', () => {
         expect(html).toContain('background: transparent; border: 0; padding: 0;');
     });
 
+    test('theme overlay recolors inline SVG plots and hides tagged plot backgrounds', () => {
+        // Knit Preview figures are marked as SVG plots by
+        // inlineLocalImagesAsDataUrls, then inlined into the sandboxed
+        // iframe by the shell script. Once inline, the same structural
+        // overlay idea used by the plot viewer can reach text, strokes,
+        // and tagged background rects.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('.raven-knit-plot-host svg.raven-knit-plot-svg text');
+        expect(html).toContain('path:not(.raven-bg):not(.raven-text-glyph)');
+        expect(html).toContain('.raven-knit-plot-host svg.raven-knit-plot-svg rect:not(.raven-bg)');
+        expect(html).toContain('.raven-knit-plot-host svg.raven-knit-plot-svg .raven-bg');
+        expect(html).toContain('fill: none !important;');
+        expect(html).toContain('stroke: none !important;');
+    });
+
+    test('theme overlay does not stroke grDevices SVG font glyph paths', () => {
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('tagKnitPlotGlyphPaths(svg)');
+        expect(html).toContain("defs path");
+        expect(html).toContain("classList.add('raven-text-glyph')");
+        expect(html).toContain('path:not(.raven-bg):not(.raven-text-glyph)');
+        expect(html).toContain('path.raven-text-glyph');
+        expect(html).toContain('stroke: none !important;');
+    });
+
+    test('shell tags grDevices SVG canvas rects and first clipped fill path as backgrounds', () => {
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('isInitialDirectSvgRect');
+        expect(html).toContain('grDevices::svg commonly emits duplicate top-level canvas');
+        expect(html).toContain('tagKnitPlotBackgroundPaths(svg)');
+        expect(html).toContain('firstClipPathGroup');
+        expect(html).toContain('clipPathBoundsForGroup');
+        expect(html).toContain('boundsNearlyEqual');
+        expect(html).toContain("pathEl.classList.add('raven-bg')");
+    });
+
+    test('shell inlines only SVGs marked as knit plots and sanitizes before insertion', () => {
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('img[data-raven-plot-svg="true"]');
+        expect(html).toContain('DOMParser');
+        expect(html).toContain('raven-knit-plot-svg');
+        expect(html).toContain('raven-bg');
+        expect(html).toContain("'foreignobject'");
+        expect(html).toContain("'feimage'");
+        expect(html).toContain("name.indexOf('on') === 0");
+        expect(html).toContain("name === 'href'");
+        expect(html).toContain("name === 'xlink:href'");
+    });
+
+    test('shell leaves marked SVG plots as images until the theme overlay is applied', () => {
+        const html = buildShellHtml(args('/work/report.html'));
+        const applyTheme = html.indexOf('function applyTheme()');
+        const offBranch = html.indexOf('if (!themeApplied)', applyTheme);
+        const inlineCall = html.indexOf('inlineKnitSvgPlots(doc);', applyTheme);
+        expect(applyTheme).toBeGreaterThanOrEqual(0);
+        expect(offBranch).toBeGreaterThan(applyTheme);
+        expect(inlineCall).toBeGreaterThan(offBranch);
+    });
+
     test('theme overlay re-emits GitHub palette variant on :root', () => {
         // The rendered document bakes --raven-c-* / --raven-fg /
         // --raven-bg at knit time from a single GitHub palette

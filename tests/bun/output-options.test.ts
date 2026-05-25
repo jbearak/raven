@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'bun:test';
-import { parseOutputOptions } from '../../editors/vscode/src/knit/output-options';
+import {
+    applyKnitTargetChunkDefaults,
+    parseOutputOptions,
+} from '../../editors/vscode/src/knit/output-options';
 
 describe('parseOutputOptions', () => {
     it('handles missing output: as empty', () => {
@@ -210,5 +213,21 @@ describe('parseOutputOptions', () => {
         );
         expect(bad.pandocFlags.highlight).toBeUndefined();
         expect(bad.ignored).toContain('highlight');
+    });
+});
+
+describe('applyKnitTargetChunkDefaults', () => {
+    it('defaults HTML preview/export figures to SVG when YAML omits dev', () => {
+        expect(applyKnitTargetChunkDefaults({}, 'html')).toEqual({ dev: 'svg' });
+    });
+
+    it('preserves an explicit YAML dev for HTML targets', () => {
+        expect(applyKnitTargetChunkDefaults({ dev: 'png', dpi: 150 }, 'html'))
+            .toEqual({ dev: 'png', dpi: 150 });
+    });
+
+    it('does not default PDF or Word exports to SVG', () => {
+        expect(applyKnitTargetChunkDefaults({}, 'pdf')).toEqual({});
+        expect(applyKnitTargetChunkDefaults({}, 'docx')).toEqual({});
     });
 });

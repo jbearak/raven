@@ -61,10 +61,22 @@ export interface InlineImagesOutputSink {
     appendLine(line: string): void;
 }
 
+export interface InlineImagesOptions {
+    /**
+     * Mark local `figure/*.svg` images so the Knit Output shell can
+     * replace them with sanitized inline SVG nodes inside the sandboxed
+     * iframe. The marker is opt-in because this helper is also useful
+     * as a plain "data URL all local images" transform in tests and
+     * future callers.
+     */
+    markSvgPlots?: boolean;
+}
+
 export function inlineLocalImagesAsDataUrls(
     html: string,
     docDir: string,
     output?: InlineImagesOutputSink,
+    options: InlineImagesOptions = {},
 ): string {
     return html.replace(/<img\b([^>]*)>/gi, (match, attrs: string) => {
         const srcMatch = attrs.match(/\bsrc\s*=\s*"([^"]*)"/i)
@@ -114,6 +126,7 @@ export function inlineLocalImagesAsDataUrls(
         const resolved = path.resolve(docDir, relative);
         const docDirNorm = path.resolve(docDir) + path.sep;
         if (!(resolved + path.sep).startsWith(docDirNorm)) return match;
+        const normalizedRelative = path.relative(path.resolve(docDir), resolved);
 
         const ext = path.extname(resolved).toLowerCase();
         const mime = mimeForImageExtension(ext);
@@ -133,8 +146,28 @@ export function inlineLocalImagesAsDataUrls(
 
         const dataUrl = `data:${mime};base64,${bytes.toString('base64')}${srcSuffix}`;
         const rewrittenAttrs = attrs.replace(srcMatch[0], `src="${dataUrl}"`);
-        return `<img${rewrittenAttrs}>`;
+        const finalAttrs = options.markSvgPlots && ext === '.svg' && isKnitFigurePath(normalizedRelative)
+            ? withImgAttribute(rewrittenAttrs, 'data-raven-plot-svg', 'true')
+            : rewrittenAttrs;
+        return `<img${finalAttrs}>`;
     });
+}
+
+function isKnitFigurePath(relativePath: string): boolean {
+    const parts = relativePath.split(/[\\/]+/).filter(Boolean);
+    return parts.length >= 2 && parts[0] === 'figure';
+}
+
+function withImgAttribute(attrs: string, name: string, value: string): string {
+    const attrPattern = new RegExp(
+        `\\s${name}\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+)`,
+        'i',
+    );
+    const withoutExisting = attrs.replace(attrPattern, '');
+    const attr = ` ${name}="${value}"`;
+    const selfClosing = withoutExisting.match(/\s*\/\s*$/);
+    if (!selfClosing) return withoutExisting + attr;
+    return withoutExisting.slice(0, selfClosing.index) + attr + selfClosing[0];
 }
 
 export function mimeForImageExtension(ext: string): string | null {

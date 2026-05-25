@@ -660,6 +660,307 @@ export function buildShellHtml(args: {
         };
       }
 
+      // Local SVG plots are loaded as data: URL <img> elements first:
+      // image-loaded SVG is inert (scripts do not run) and preserves
+      // the nested-iframe image-loading workaround. Before applying
+      // the VS Code theme overlay, we replace only images explicitly
+      // marked by the extension host as knitr figure SVGs with
+      // sanitized inline SVG nodes. Inline SVG is required because CSS
+      // cannot reach inside an <img>-loaded SVG document.
+      const RAVEN_SVG_SAFE_STYLE_PROPS = {
+        'fill': true,
+        'fill-opacity': true,
+        'fill-rule': true,
+        'stroke': true,
+        'stroke-width': true,
+        'stroke-linecap': true,
+        'stroke-linejoin': true,
+        'stroke-dasharray': true,
+        'stroke-dashoffset': true,
+        'stroke-miterlimit': true,
+        'stroke-opacity': true,
+        'opacity': true,
+        'font-size': true,
+        'font-family': true,
+        'font-style': true,
+        'font-weight': true,
+        'font-variant': true,
+        'text-anchor': true,
+        'dominant-baseline': true,
+        'alignment-baseline': true,
+        'color': true,
+        'visibility': true,
+      };
+      const RAVEN_SVG_FORBID_TAGS = {
+        'script': true,
+        'style': true,
+        'foreignobject': true,
+        'image': true,
+        'a': true,
+        'iframe': true,
+        'object': true,
+        'embed': true,
+        'feimage': true,
+      };
+      function decodeSvgDataUrl(src) {
+        if (typeof src !== 'string') return null;
+        var comma = src.indexOf(',');
+        if (comma < 0) return null;
+        var meta = src.slice(0, comma);
+        if (!/^data:image\\/svg\\+xml(?:[;,]|$)/i.test(meta)) return null;
+        var data = src.slice(comma + 1);
+        var suffixAt = data.search(/[?#]/);
+        if (suffixAt >= 0) data = data.slice(0, suffixAt);
+        try {
+          if (/;base64(?:[;,]|$)/i.test(meta)) {
+            var binary = atob(data);
+            if (typeof TextDecoder !== 'undefined') {
+              var bytes = new Uint8Array(binary.length);
+              for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+              return new TextDecoder('utf-8').decode(bytes);
+            }
+            return decodeURIComponent(Array.prototype.map.call(binary, function (ch) {
+              return '%' + ('00' + ch.charCodeAt(0).toString(16)).slice(-2);
+            }).join(''));
+          }
+          return decodeURIComponent(data);
+        } catch (e) {
+          return null;
+        }
+      }
+      function svgStyleValueIsSafe(value) {
+        return !/url\\s*\\(|expression\\s*\\(|javascript:|@|[<>]/i.test(value);
+      }
+      function migrateInlineSvgStyles(root) {
+        var nodes = [root].concat(Array.prototype.slice.call(root.querySelectorAll('*')));
+        for (var i = 0; i < nodes.length; i++) {
+          var el = nodes[i];
+          var style = el.getAttribute('style');
+          if (!style) continue;
+          var declarations = style.split(';');
+          for (var j = 0; j < declarations.length; j++) {
+            var decl = declarations[j];
+            var colon = decl.indexOf(':');
+            if (colon < 0) continue;
+            var prop = decl.slice(0, colon).trim().toLowerCase();
+            var value = decl.slice(colon + 1).trim();
+            if (!prop || !value) continue;
+            if (!RAVEN_SVG_SAFE_STYLE_PROPS[prop]) continue;
+            if (!svgStyleValueIsSafe(value)) continue;
+            if (!el.hasAttribute(prop)) el.setAttribute(prop, value);
+          }
+          el.removeAttribute('style');
+        }
+      }
+      function valueHasUnsafeSvgUrl(value) {
+        if (!/url\\s*\\(/i.test(value)) return false;
+        var re = /url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/gi;
+        var saw = false;
+        var m;
+        while ((m = re.exec(value)) !== null) {
+          saw = true;
+          if (m[2].trim().charAt(0) !== '#') return true;
+        }
+        return !saw;
+      }
+      function hrefIsSafeInternalUse(el, name, value) {
+        if (el.localName.toLowerCase() !== 'use') return false;
+        if (name !== 'href' && name !== 'xlink:href') return false;
+        return /^\\s*#[-A-Za-z0-9_:.]+\\s*$/.test(value);
+      }
+      function sanitizeKnitPlotSvg(svgText, doc) {
+        var parsed;
+        try {
+          parsed = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+        } catch (e) {
+          return null;
+        }
+        var parsedRoot = parsed && parsed.documentElement;
+        if (!parsedRoot || parsedRoot.localName.toLowerCase() !== 'svg') return null;
+        var svg = doc.importNode(parsedRoot, true);
+        migrateInlineSvgStyles(svg);
+        var nodes = [svg].concat(Array.prototype.slice.call(svg.querySelectorAll('*')));
+        for (var i = nodes.length - 1; i >= 0; i--) {
+          var el = nodes[i];
+          if (RAVEN_SVG_FORBID_TAGS[el.localName.toLowerCase()]) {
+            if (el.parentNode) el.parentNode.removeChild(el);
+            continue;
+          }
+          var attrs = Array.prototype.slice.call(el.attributes || []);
+          for (var j = 0; j < attrs.length; j++) {
+            var attr = attrs[j];
+            var name = attr.name.toLowerCase();
+            var value = attr.value || '';
+            if (name.indexOf('on') === 0) {
+              el.removeAttribute(attr.name);
+              continue;
+            }
+            if (name === 'style') {
+              el.removeAttribute(attr.name);
+              continue;
+            }
+            if (name === 'href' || name === 'xlink:href') {
+              if (!hrefIsSafeInternalUse(el, name, value)) {
+                el.removeAttribute(attr.name);
+              }
+              continue;
+            }
+            if (/javascript:/i.test(value) || valueHasUnsafeSvgUrl(value)) {
+              el.removeAttribute(attr.name);
+            }
+          }
+        }
+        svg.classList.add('raven-knit-plot-svg');
+        tagKnitPlotGlyphPaths(svg);
+        tagKnitPlotBackgroundRects(svg);
+        tagKnitPlotBackgroundPaths(svg);
+        return svg;
+      }
+      function firstRectChild(parent) {
+        for (var n = parent.firstElementChild; n !== null; n = n.nextElementSibling) {
+          if (n.localName.toLowerCase() === 'rect') return n;
+        }
+        return null;
+      }
+      function isInitialDirectSvgRect(rect) {
+        var parent = rect.parentElement;
+        if (!parent || parent.localName.toLowerCase() !== 'svg') return false;
+        var sawRect = false;
+        for (var n = parent.firstElementChild; n !== null; n = n.nextElementSibling) {
+          var name = n.localName.toLowerCase();
+          if (name === 'defs' && !sawRect) continue;
+          if (n === rect) return true;
+          if (name === 'rect') {
+            sawRect = true;
+            continue;
+          }
+          if (name !== 'rect') return false;
+        }
+        return false;
+      }
+      function isKnitPlotBackgroundRect(rect) {
+        var parent = rect.parentElement;
+        if (!parent) return false;
+        var parentName = parent.localName.toLowerCase();
+        if (parentName === 'svg') {
+          if (firstRectChild(parent) === rect) return true;
+          // grDevices::svg commonly emits duplicate top-level canvas
+          // rects before any plot geometry. Treat only that initial run
+          // as background; later direct rects remain content.
+          return isInitialDirectSvgRect(rect);
+        }
+        if (parentName === 'g') {
+          if (rect.hasAttribute('stroke-linejoin')) return false;
+          if (rect.hasAttribute('stroke-linecap')) return false;
+          return true;
+        }
+        return false;
+      }
+      function tagKnitPlotBackgroundRects(svg) {
+        var rects = svg.querySelectorAll('rect');
+        for (var i = 0; i < rects.length; i++) {
+          if (isKnitPlotBackgroundRect(rects[i])) {
+            rects[i].classList.add('raven-bg');
+          }
+        }
+      }
+      function tagKnitPlotGlyphPaths(svg) {
+        var paths = svg.querySelectorAll('defs path');
+        for (var i = 0; i < paths.length; i++) {
+          paths[i].classList.add('raven-text-glyph');
+        }
+      }
+      function firstClipPathGroup(svg) {
+        for (var n = svg.firstElementChild; n !== null; n = n.nextElementSibling) {
+          if (n.localName.toLowerCase() === 'g' && n.hasAttribute('clip-path')) return n;
+        }
+        return null;
+      }
+      function pathBounds(d) {
+        var matches = String(d || '').match(/[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?/g);
+        if (!matches || matches.length < 8 || matches.length % 2 !== 0) return null;
+        var minX = Infinity;
+        var minY = Infinity;
+        var maxX = -Infinity;
+        var maxY = -Infinity;
+        for (var i = 0; i < matches.length; i += 2) {
+          var x = Number(matches[i]);
+          var y = Number(matches[i + 1]);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
+          maxX = Math.max(maxX, x);
+          maxY = Math.max(maxY, y);
+        }
+        return { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+      }
+      function boundsNearlyEqual(a, b) {
+        if (!a || !b) return false;
+        var epsilon = 0.1;
+        return Math.abs(a.minX - b.minX) <= epsilon
+          && Math.abs(a.minY - b.minY) <= epsilon
+          && Math.abs(a.maxX - b.maxX) <= epsilon
+          && Math.abs(a.maxY - b.maxY) <= epsilon;
+      }
+      function clipPathBoundsForGroup(group, svg) {
+        var clip = (group.getAttribute('clip-path') || '').trim();
+        var m = /^url\\(#([-A-Za-z0-9_:.]+)\\)$/.exec(clip);
+        if (!m) return null;
+        var clips = svg.querySelectorAll('clipPath');
+        for (var i = 0; i < clips.length; i++) {
+          if (clips[i].getAttribute('id') !== m[1]) continue;
+          var pathEl = clips[i].querySelector('path');
+          return pathEl ? pathBounds(pathEl.getAttribute('d') || '') : null;
+        }
+        return null;
+      }
+      function isKnitPlotBackgroundPath(pathEl, firstClippedGroup, svg) {
+        var parent = pathEl.parentElement;
+        if (!parent || parent !== firstClippedGroup) return false;
+        var stroke = (pathEl.getAttribute('stroke') || '').trim().toLowerCase();
+        if (stroke.length > 0 && stroke !== 'none') return false;
+        var fill = (pathEl.getAttribute('fill') || '').trim().toLowerCase();
+        if (fill.length === 0 || fill === 'none') return false;
+        // ggplot backgrounds emitted by grDevices::svg are filled paths
+        // in the first clipped group. Only hide that path when its bounds
+        // match the clipping rectangle; an early filled data layer should
+        // remain visible even if it also has no stroke.
+        return boundsNearlyEqual(
+          pathBounds(pathEl.getAttribute('d') || ''),
+          clipPathBoundsForGroup(firstClippedGroup, svg),
+        );
+      }
+      function tagKnitPlotBackgroundPaths(svg) {
+        var firstClippedGroup = firstClipPathGroup(svg);
+        if (!firstClippedGroup) return;
+        var paths = svg.querySelectorAll('path');
+        for (var i = 0; i < paths.length; i++) {
+          var pathEl = paths[i];
+          if (isKnitPlotBackgroundPath(pathEl, firstClippedGroup, svg)) {
+            pathEl.classList.add('raven-bg');
+          }
+        }
+      }
+      function inlineKnitSvgPlots(doc) {
+        var imgs = doc.querySelectorAll('img[data-raven-plot-svg="true"]');
+        for (var i = 0; i < imgs.length; i++) {
+          var img = imgs[i];
+          var svgText = decodeSvgDataUrl(img.getAttribute('src') || '');
+          if (!svgText) continue;
+          var svg = sanitizeKnitPlotSvg(svgText, doc);
+          if (!svg) continue;
+          var host = doc.createElement('span');
+          host.className = 'raven-knit-plot-host';
+          var alt = img.getAttribute('alt') || '';
+          if (alt.length > 0) {
+            host.setAttribute('role', 'img');
+            host.setAttribute('aria-label', alt);
+          }
+          host.appendChild(svg);
+          img.replaceWith(host);
+        }
+      }
+
       function applyTheme() {
         const doc = iframe.contentDocument;
         if (!doc || !doc.documentElement) return;
@@ -673,6 +974,7 @@ export function buildShellHtml(args: {
           syncThemeBtn();
           return;
         }
+        inlineKnitSvgPlots(doc);
         if (!style) {
           style = doc.createElement('style');
           style.id = 'raven-vscode-theme-overrides';
@@ -741,7 +1043,28 @@ export function buildShellHtml(args: {
           + ' outline: none !important;'
           + ' border: 0 !important;'
           + ' filter: none !important;'
-          + ' text-decoration: none !important; }';
+          + ' text-decoration: none !important; }'
+          // SVG plots: after panel-side sanitization/inlining, the
+          // overlay can reach into the plot the same way the plot
+          // viewer's inline-SVG substrate does. The use selector covers R's
+          // grDevices SVG text glyphs, which are emitted as internal
+          // <use href="#glyph-..."> references rather than <text>.
+          + ' .raven-knit-plot-host { background: ' + c.bg + ' !important; }'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg text,'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg use {'
+          + ' fill: ' + c.fg + ' !important;'
+          + ' font-family: var(--raven-font-text) !important; }'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg line,'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg polyline,'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg polygon,'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg path:not(.raven-bg):not(.raven-text-glyph),'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg circle,'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg rect:not(.raven-bg) {'
+          + ' stroke: ' + c.fg + ' !important; }'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg path.raven-text-glyph {'
+          + ' stroke: none !important; }'
+          + ' .raven-knit-plot-host svg.raven-knit-plot-svg .raven-bg {'
+          + ' fill: none !important; stroke: none !important; }';
         // Paint the iframe element itself too so the brief flash
         // before the inner document parses also matches the theme.
         iframe.style.background = c.bg;
@@ -807,14 +1130,16 @@ export function buildShellHtml(args: {
       const ctxMenu = document.getElementById('raven-knit-context-menu');
       const ctxCopyBtn = ctxMenu.querySelector('[data-action="copy"]');
       const ctxCopyImageBtn = ctxMenu.querySelector('[data-action="copy-image"]');
-      // The <img> the user right-clicked, captured at contextmenu
-      // time. Cleared when the menu hides so a stale reference
+      // The image-like element the user right-clicked, captured at
+      // contextmenu time. This is usually an <img>, but knitr SVG
+      // plots become inline <svg> nodes so the theme overlay can
+      // reach them. Cleared when the menu hides so a stale reference
       // can't leak into a follow-up Copy from a text selection.
       // We capture the element (not just its src) because the
-      // canvas-based copy below reads pixels from the already-
-      // loaded image — fetch() is blocked by the outer-shell CSP's
-      // connect-src 'none', so going back to the network would
-      // fail for every supported source kind.
+      // canvas-based copy below reads pixels from already-loaded
+      // content — fetch() is blocked by the outer-shell CSP's
+      // connect-src 'none', so going back to the network would fail
+      // for every supported source kind.
       let pendingImage = null;
 
       function copyIframeSelection() {
@@ -881,10 +1206,23 @@ export function buildShellHtml(args: {
         // paste the URL into another tool to pick the image up.
         function copyUrlFallback() {
           if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(img.src).catch(function () { /* swallow */ });
+            if (img.src) {
+              navigator.clipboard.writeText(img.src).catch(function () { /* swallow */ });
+              return;
+            }
+            var fallback = '';
+            if (!fallback && String(img.tagName).toLowerCase() === 'svg') {
+              try { fallback = new XMLSerializer().serializeToString(img); }
+              catch (e) { fallback = ''; }
+            }
+            if (fallback) navigator.clipboard.writeText(fallback).catch(function () { /* swallow */ });
           }
         }
         if (!hasClipboardImage) { copyUrlFallback(); return; }
+        if (String(img.tagName).toLowerCase() === 'svg') {
+          copyInlineSvgImage(img, copyUrlFallback);
+          return;
+        }
         try {
           const canvas = document.createElement('canvas');
           canvas.width = img.naturalWidth || img.width;
@@ -903,6 +1241,42 @@ export function buildShellHtml(args: {
               navigator.clipboard.write([item]).catch(copyUrlFallback);
             } catch (e) { copyUrlFallback(); }
           }, 'image/png');
+        } catch (e) { copyUrlFallback(); }
+      }
+
+      function copyInlineSvgImage(svg, copyUrlFallback) {
+        try {
+          const rect = svg.getBoundingClientRect();
+          var width = Math.round(rect.width || 0);
+          var height = Math.round(rect.height || 0);
+          if ((!width || !height) && svg.viewBox && svg.viewBox.baseVal) {
+            width = Math.round(svg.viewBox.baseVal.width || width);
+            height = Math.round(svg.viewBox.baseVal.height || height);
+          }
+          if (!width) width = Math.round(parseFloat(svg.getAttribute('width') || '0'));
+          if (!height) height = Math.round(parseFloat(svg.getAttribute('height') || '0'));
+          if (!width || !height) { copyUrlFallback(); return; }
+          const source = new XMLSerializer().serializeToString(svg);
+          const image = new Image();
+          image.onload = function () {
+            try {
+              const canvas = document.createElement('canvas');
+              canvas.width = width;
+              canvas.height = height;
+              const ctx = canvas.getContext('2d');
+              if (!ctx) { copyUrlFallback(); return; }
+              ctx.drawImage(image, 0, 0, width, height);
+              canvas.toBlob(function (blob) {
+                if (!blob) { copyUrlFallback(); return; }
+                try {
+                  const item = new window.ClipboardItem({ 'image/png': blob });
+                  navigator.clipboard.write([item]).catch(copyUrlFallback);
+                } catch (e) { copyUrlFallback(); }
+              }, 'image/png');
+            } catch (e) { copyUrlFallback(); }
+          };
+          image.onerror = copyUrlFallback;
+          image.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(source);
         } catch (e) { copyUrlFallback(); }
       }
 
@@ -1031,14 +1405,16 @@ export function buildShellHtml(args: {
           const y = e.clientY + rect.top;
           const sel = win.getSelection();
           const hasSel = !!(sel && sel.toString().length > 0);
-          // If the user right-clicked on an <img>, capture the
-          // element itself so the Copy image action can draw it
-          // onto a canvas (fetch() is blocked by the outer-shell
-          // CSP's connect-src 'none', so we read pixels from the
-          // already-loaded image rather than re-requesting).
+          // If the user right-clicked on an <img> or a panel-inlined
+          // SVG plot, capture the element itself so the Copy image
+          // action can draw it onto a canvas (fetch() is blocked by
+          // the outer-shell CSP's connect-src 'none', so we read
+          // pixels from already-loaded content rather than
+          // re-requesting).
           let image = null;
           const tgt = e.target;
           if (tgt && tgt.tagName === 'IMG') image = tgt;
+          else if (tgt && tgt.closest) image = tgt.closest('svg.raven-knit-plot-svg');
           showContextMenu(x, y, hasSel, image);
         });
         // A new click inside the iframe should dismiss the menu so

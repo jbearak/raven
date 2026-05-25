@@ -69,6 +69,28 @@ export interface OutputOptions {
     ignored: string[];
 }
 
+/**
+ * Apply Raven-owned chunk-option defaults after YAML parsing. The
+ * parser reports only what the user wrote; this helper adds defaults
+ * that belong to Raven's pipeline.
+ *
+ * HTML targets default to SVG figures so Knit Preview can inline and
+ * recolor plots when the "Apply VS Code theme" toggle is on. Explicit
+ * YAML `dev:` still wins: raster devices such as `png` are honored,
+ * they just cannot be recolored by the SVG overlay. PDF / Word target
+ * knits keep knitr's native defaults because those formats are not the
+ * live HTML preview surface.
+ */
+export function applyKnitTargetChunkDefaults(
+    chunkOpts: ChunkOpts,
+    target: TargetFormat,
+): ChunkOpts {
+    if (target !== 'html' || chunkOpts.dev !== undefined) {
+        return { ...chunkOpts };
+    }
+    return { ...chunkOpts, dev: 'svg' };
+}
+
 const HTML_FORMATS: ReadonlySet<string> = new Set([
     'html_document',
     'html_notebook',

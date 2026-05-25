@@ -7,7 +7,11 @@ import {
     extractFrontmatter,
     parseFrontmatter,
 } from './yaml-frontmatter';
-import { parseOutputOptions, type TargetFormat } from './output-options';
+import {
+    applyKnitTargetChunkDefaults,
+    parseOutputOptions,
+    type TargetFormat,
+} from './output-options';
 import {
     buildKnitExpression,
     escapeRString,
@@ -407,6 +411,7 @@ async function runKnitCommand(
         // is 'pdf', `html_document.fig_width` does NOT drive the PDF
         // knit, and vice versa.
         const outputOpts = parseOutputOptions(parsed.value, targetFormat);
+        const chunkOpts = applyKnitTargetChunkDefaults(outputOpts.chunkOpts, targetFormat);
         if (outputOpts.ignored.length > 0) {
             for (const key of outputOpts.ignored) {
                 output.appendLine(`[knit] Ignored output: option '${key}'`);
@@ -429,7 +434,7 @@ async function runKnitCommand(
                 // stale source-directory artifacts.
                 baseDir: previewPaths.previewDir,
                 figPath: 'figure/',
-                chunkOpts: outputOpts.chunkOpts,
+                chunkOpts,
             });
         } catch (err) {
             const isPathError = err instanceof ValidatePathError;
