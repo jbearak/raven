@@ -73,6 +73,36 @@ describe('buildKnitExpression with chunk opts', () => {
         ).toThrow();
     });
 
+    it('emits a requireNamespace fallback when dev is svglite', () => {
+        // Cairo's `svg` device (knitr's pre-svglite default) wraps the
+        // outer canvas and panel-bg rects deeper inside clip-path
+        // groups, defeating the plot viewer's structural bg-rect
+        // tagger. svglite produces the structure the heuristic was
+        // tuned for via httpgd. When svglite isn't installed we fall
+        // back to 'svg' so the knit still succeeds with a (partially)
+        // themed plot.
+        const expr = buildKnitExpression({
+            filePath: '/p/foo.Rmd',
+            outputPath: '/tmp/foo.md',
+            format: 'html_document',
+            knitRootDir: null,
+            baseDir: '/tmp',
+            figPath: 'figure/',
+            chunkOpts: { dev: 'svglite' },
+        });
+        expect(expr).toContain(
+            ".raven_dev <- if (requireNamespace('svglite', quietly = TRUE)) 'svglite' else 'svg'",
+        );
+        expect(expr).toContain('dev = .raven_dev');
+        // We do NOT pass `web_fonts = TRUE` (it's a list-typed argument
+        // in svglite, not a boolean — passing TRUE makes svglite throw
+        // "`family` must be a character vector without NA values").
+        // svglite's default behavior already emits text as <text>
+        // elements, which is what the CSS overlay needs.
+        expect(expr).not.toContain('web_fonts');
+        expect(expr).not.toContain('dev.args');
+    });
+
     it('uses getwd() when knitRootDir is null', () => {
         const expr = buildKnitExpression({
             filePath: '/p/foo.Rmd',

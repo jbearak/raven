@@ -263,23 +263,26 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
             // path groups and emits text as <symbol>+<use> glyph paths
             // (instead of <text>), which (a) defeats the structural bg-
             // rect tagger and (b) makes CSS font-family overrides
-            // ineffective. svglite + web_fonts=TRUE produces real <text>
-            // elements and a structure the overlay recoloring CSS can
-            // actually reach.
+            // ineffective. svglite's default behavior emits real <text>
+            // elements with Unicode text content — the CSS overlay can
+            // recolor and re-flow them as expected.
+            //
+            // We do NOT pass `web_fonts = TRUE` (or any other dev.args).
+            // `web_fonts` is a list-of-font-definitions parameter, not a
+            // boolean — passing TRUE causes svglite to interpret it as
+            // a font spec, fail to extract `$family`, and crash with
+            // "`family` must be a character vector without NA values".
+            // The default (no web_fonts) is what the plot viewer's
+            // httpgd transport uses and works correctly.
             //
             // If svglite isn't installed, fall back to 'svg' so the knit
             // still succeeds — the user just gets the same Cairo SVG that
             // used to render before this feature landed (plot visible,
-            // toggle theming partial). web_fonts is only set when the
-            // installed svglite supports the argument (svglite v2+).
+            // toggle theming partial).
             assigns.push(
                 `.raven_dev <- if (requireNamespace('svglite', quietly = TRUE)) 'svglite' else 'svg'`,
             );
-            assigns.push(
-                `.raven_dev_args <- if (.raven_dev == 'svglite' && 'web_fonts' %in% names(formals(svglite::svglite))) list(web_fonts = TRUE) else list()`,
-            );
             namedArgs.push('dev = .raven_dev');
-            namedArgs.push('dev.args = .raven_dev_args');
         } else {
             // co.dev passed DEV_ALLOWLIST above; `escapeRString` is the
             // single-quoted-literal wrapper. The assignment puts it on the
