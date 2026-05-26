@@ -74,6 +74,8 @@ describe('summarizePredicate', () => {
             .toBe('d < 2024-01-01');
         expect(sum({ kind: 'dateBetween', lo: '2024-01-01', hi: '2024-12-31', inclusive: true }, DATE))
             .toBe('d 2024-01-01–2024-12-31');
+        expect(sum({ kind: 'dateNotBetween', lo: '2024-01-01', hi: '2024-12-31', inclusive: true }, DATE))
+            .toBe('d not in 2024-01-01–2024-12-31');
     });
     test('bool', () => {
         expect(sum({ kind: 'bool', value: true }, BOOL)).toBe('b is true');

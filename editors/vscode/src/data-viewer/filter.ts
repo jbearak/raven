@@ -161,6 +161,13 @@ async function acceptorFor(
                 return (i) => (cs ? values[i] : values[i].toLowerCase()).endsWith(needle);
             }
             case 'strRegex': {
+                // NB: the compiled pattern is user-supplied and `r.test` runs
+                // synchronously over every row on the extension-host event
+                // loop. A catastrophic-backtracking pattern (e.g. `(a+)+$`)
+                // on a large frame can stall the host. This is user-
+                // self-inflicted and the webview validates syntax (not ReDoS)
+                // before applying; a hard guard would require a worker. If we
+                // ever see this in practice, move filter compute off-thread.
                 let rx: RegExp | null = null;
                 try {
                     rx = new RegExp(predicate.pattern, cs ? '' : 'i');
