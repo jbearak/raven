@@ -71,10 +71,10 @@ expression opens a new tab.
 ## Toolbar
 
 ```text
-rows: 12,345 | Sort: mpg▲ cyl▼ ✕ | [Labels] [Format] [3 digits ▾] | [Columns ▾ <7>]
+rows: 12,345 | Sort: mpg▲ cyl▼ ✕ | Filter: cyl ∈ {6,8} ✕ | [Labels] [Format] [3 digits ▾] | [Columns ▾ <7>]
 ```
 
-The `Sort` strip is hidden entirely when no sort is active.
+The `Sort` and `Filter` strips are hidden entirely when no sort or filter is active.
 
 Each toggle is filled when active; clicking flips it. The Labels and
 Format buttons are hidden entirely when no column in the current data
@@ -229,6 +229,96 @@ cyl ▼` (truncated to four keys with a `+N more` suffix when needed).
 While the host is building a large permutation, the status bar shows
 `Sorting…`.
 
+## Filtering
+
+Right-click a column header and choose **Filter…** to open the filter editor
+for that column. You can also press **⇧⌥F** to open the editor for the
+currently focused column.
+
+### Per-type predicates
+
+| Column type | Available predicates |
+| --- | --- |
+| Numeric (Int, Float) | `=`, `≠`, `<`, `≤`, `>`, `≥`, `between`, `not between` |
+| Factor / value-labelled (`haven_labelled`, `foreign`, `readstata13`) | `is one of`, `is not one of` |
+| Character | `contains`, `does not contain`, `starts with`, `ends with`, `=`, `≠`, `matches regex` |
+| Boolean | `is true`, `is false` |
+| Date / Timestamp | `=`, `≠`, `<`, `≤`, `>`, `≥`, `between`, `not between` |
+| Any column | `is empty`, `is not empty` |
+
+For numeric `between` / `not between`, the editor shows a histogram of the
+column's distribution with draggable range thumbs alongside the numeric
+input fields.
+
+For factor and value-labelled columns, the editor shows a searchable
+checklist of levels when the column's value dictionary has been shipped.
+Large or unshipped dictionaries fall back to a free-text value list.
+
+The `matches regex` predicate for character columns uses ECMAScript (JavaScript)
+regex syntax — not PCRE or R regex syntax. A **Case sensitive** toggle
+controls whether all character predicates match case-sensitively.
+
+Use `is empty` to select rows where a column is missing; `is not empty`
+selects only non-missing rows.
+
+### NA / NaN
+
+By default, missing values (`NA`, `NaN`) fail every predicate and are
+excluded from filtered results. Each filter editor has an **Include NA /
+NaN** checkbox that re-includes missing rows for that specific filter.
+
+### Labels and Format
+
+Filters on labelled columns match the displayed string — the label when
+Labels is on, the underlying code or value when Labels is off. This is the
+same WYSIWYG rule as sorting: what you see is what is matched. Toggling
+Labels with an active filter on a labelled column will re-evaluate the
+filter.
+
+The Format toggle and digits setting never affect filtering. Numeric
+predicates always match the underlying double, regardless of how many digits
+are shown in the grid.
+
+### Chip strip
+
+Active filters appear as chips in the toolbar. Each chip shows a short
+summary of the filter condition (for example, `cyl ∈ {6, 8}` or `mpg > 20`).
+Click a chip to re-open its editor. The kebab menu on each chip offers
+**Enable** / **Disable** (disabled chips are shown greyed-out and are not
+applied) and **Remove**. The trailing **✕** on the strip clears all filters.
+
+### Composition
+
+Filters across different columns are combined with AND — a row must satisfy
+all active filters to appear. At most one filter is allowed per column;
+adding a second filter for the same column replaces the first.
+
+### Status bar
+
+When a filter is active, the status bar shows `filtered to N (X%)` — the
+count of rows passing all filters and the percentage of the full row count.
+The percentage is omitted in the 0–1 % and 99–100 % bands. While the host
+is rebuilding the filter index the status bar shows `Filtering…`.
+
+### Persistence
+
+Active filters are persisted per panel-name × schema-hash alongside layout,
+toolbar state, and sort, so a later `View(df)` against the same dataset
+restores the filter configuration. Only the chip descriptors (predicate type
+and values) are stored — filter membership is always recomputed against the
+current data on restore. Set `raven.dataViewer.persistFilters` to `false` to
+open every panel unfiltered.
+
+### Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `Shift+Alt+F` | Open filter editor for the focused column. |
+| `Shift+Alt+X` | Clear filter on the focused column. |
+| `Shift+Alt+9` | Clear all active filters. |
+| `Enter` (in editor) | Apply the filter and close the editor. |
+| `Escape` (in editor) | Cancel without applying. |
+
 ## Settings
 
 | Setting | Default | Description |
@@ -237,6 +327,7 @@ While the host is building a large permutation, the status bar shows
 | `raven.dataViewer.maxStoredLayouts` | `10000` | LRU cap on persisted column-width / visibility entries. Each unique panel-name × schema-hash pair counts once. |
 | `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on (Format defaults to on). |
 | `raven.dataViewer.persistSort` | `true` | Persist the active row sort per panel-name × schema hash. Set to `false` to make every `View(df)` open unsorted. |
+| `raven.dataViewer.persistFilters` | `true` | Persist active filters per panel-name × schema hash. Set to `false` to open every panel unfiltered. |
 
 The data viewer's overall enable/disable is controlled by `raven.rConsole.activation` — there is no separate `raven.dataViewer.enabled` toggle.
 
