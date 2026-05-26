@@ -146,18 +146,26 @@ explorer-context-menu hook is opt-in via your own keybindings).
     second `.Rmd` opens a separate panel that stacks as a tab in the
     same "preview" column rather than replacing the first. Re-knitting
     the same `.Rmd` updates its panel in place. The panel toolbar
-    has three buttons:
+    is icon-only and stays single-row at every panel width. From left
+    to right it carries:
 
-    - **Knit again** — re-knits the source `.Rmd` (the same code path
-      as invoking `Raven: Knit Preview` from the palette).
-    - **Open in Browser** — opens the rendered file in your OS default
-      browser. In remote workspaces (Remote SSH, Dev Containers, WSL,
-      Codespaces) the `file://` URI behind this action targets the
-      remote machine, not where you are sitting, so the button (and
-      the matching right-click "Open in Browser" menu item) is
-      omitted from the toolbar. Use **Export ▾** instead — its toast
-      routes through the remote-aware Download flow that streams the
-      file to your local machine.
+    - **Knit again** (refresh icon) — re-knits the source `.Rmd` (the
+      same code path as invoking `Raven: Knit Preview` from the
+      palette).
+    - **Export** (share icon) — opens an in-shell popover with three
+      format choices (Pandoc HTML, PDF, Word). While an export is in
+      flight the icon swaps to a stop-circle and the next click
+      cancels the running pandoc invocation. The popover dismisses on
+      outside click, on Escape, or when you click into the rendered
+      report — the same UX the Plot Viewer's share popover uses.
+    - **Open in Browser** (globe icon) — opens the rendered file in
+      your OS default browser. In remote workspaces (Remote SSH, Dev
+      Containers, WSL, Codespaces) the `file://` URI behind this
+      action targets the remote machine, not where you are sitting,
+      so the button (and the matching right-click "Open in Browser"
+      menu item) is omitted from the toolbar. Use **Export** instead
+      — its toast routes through the remote-aware Download flow that
+      streams the file to your local machine.
     - **Apply VS Code theme** — toggle that overlays the rendered
       document with VS Code's active editor background, foreground,
       and link colors. Code blocks (both fenced and inline `<code>`)

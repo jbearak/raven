@@ -1653,6 +1653,30 @@ export function buildShellHtml(args: {
         // and silently trigger a single-key keybinding the user
         // may have configured in VS Code.
         win.addEventListener('keydown', function (e) {
+          // Escape dismisses any open toolbar UI even when focus is
+          // inside the iframe. Keystrokes that fire inside a sandboxed
+          // (allow-same-origin) iframe stay within its document tree,
+          // so the HTML popover API's built-in Escape light-dismiss
+          // (which listens on the OUTER shell document) never sees
+          // them — without this branch a user who clicks into the
+          // rendered report and presses Escape would be stuck with
+          // an open Export menu they cannot close from the keyboard.
+          // Mirrors the existing mousedown -> dismissToolbarUi route
+          // that closes the popover on iframe clicks.
+          if (e.key === 'Escape') {
+            var dismissed = false;
+            if (!ctxMenu.hidden) { hideContextMenu(); dismissed = true; }
+            if (exportPopover
+                && exportPopover.matches
+                && exportPopover.matches(':popover-open')) {
+              closeExportPopover();
+              dismissed = true;
+            }
+            if (dismissed) {
+              e.preventDefault();
+              return;
+            }
+          }
           const mod = e.metaKey || e.ctrlKey;
           if (!mod) return;
           // AltGr on Windows / many Linux layouts fires as Ctrl+Alt
