@@ -288,6 +288,27 @@ describe('computeFilteredIndices — setIn on labelled INT (labelled-non-float c
     });
 });
 
+describe('computeFilteredIndices — setIn on value-labelled STRING stays WYSIWYG (toggle-dependent)', () => {
+    // labelled-non-float.arrow col 1 `answer`: Utf8 ['Y','N','M','Y','N'],
+    // value labels {Y:Apple,N:Mango,M:Zebra}. This column must KEEP the
+    // displayed-string semantics (matches labels when Labels on, raw codes
+    // when off) — it must NOT use the code-based labelled-numeric path.
+    test('Labels ON: matches the displayed label (rows 0,3)', async () => {
+        const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
+        const e = entry('a', 1, { kind: 'setIn', values: ['Apple'] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 3]);
+        await r.close();
+    });
+    test('Labels OFF: matches raw codes, so the label string matches nothing', async () => {
+        const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
+        const e = entry('a', 1, { kind: 'setIn', values: ['Apple'] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_OFF);
+        expect(Array.from(out!)).toEqual([]);
+        await r.close();
+    });
+});
+
 describe('computeFilteredIndices — setIn on plain string column', () => {
     test('matches values directly regardless of labelsOn', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
