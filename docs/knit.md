@@ -9,8 +9,15 @@ intentionally narrow:
 - The preview is always HTML, regardless of the YAML `output:`
   field. `pdf_document`, `word_document`, etc. still preview as HTML;
   the `output:` field only affects the named formats during export.
-- The preview is a static viewer with a manual Refresh button — not a
-  live recompile. Click **Knit again** to re-render after editing.
+- The preview is a static viewer with a manual **Knit again**
+  button — re-knitting is deliberate, not background-driven. The
+  intended workflow is `Shift+Cmd+Enter` (or `Shift+Ctrl+Enter` on
+  Windows/Linux), which saves the file if it's unsaved and re-knits
+  in one keystroke. Re-rendering only on demand keeps the preview
+  deterministic (you decide when it changes) and avoids spurious
+  re-renders while you're mid-edit. If you want background
+  re-rendering on save, REditorSupport's `.Rmd` preview and Quarto's
+  `Quarto: Preview` provide it.
 - The preview is saved to a per-session temp directory under
   `<os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/`,
   so the `.Rmd`'s own directory stays clean. Export commands write the

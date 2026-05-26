@@ -14,11 +14,18 @@ frame. Writing to an on-disk Arrow file also means paging doesn't have
 to go back through R, which keeps scrolling on multi-million-row frames
 smooth.
 
-Other R data viewers in VS Code take different transport routes — the
+Other R data viewers in VS Code take different staging routes — the
 REditorSupport extension's [`sess`](https://github.com/REditorSupport/vscode-R/tree/master/sess)
-helper, for example, keeps the frame in R memory and serves row windows
-over JSON-RPC. Both approaches virtualize. See
-[Comparison: Data viewer](./comparison.md#data-viewer) for the side-by-side.
+helper, for example, materializes the whole frame in R memory and serves
+row windows from there to the webview over JSON-RPC. Both extensions
+paginate the wire, but the staging is different: Raven snapshots the
+frame to disk once as Arrow and the webview reads windows from the file
+directly, bypassing R for paging; `sess` keeps everything live in R. In
+our own smoke tests, the on-disk Arrow path has stayed responsive on
+multi-million-row frames and on `labelled` columns from `haven`, where
+we've seen the R-staged path hit memory limits or formatter errors.
+See [Comparison: Data viewer](./comparison.md#data-viewer) for the
+side-by-side.
 
 > [!NOTE]
 > The data viewer is reached through Raven's R console: it activates only
