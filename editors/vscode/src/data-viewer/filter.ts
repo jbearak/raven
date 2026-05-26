@@ -230,7 +230,41 @@ async function acceptorFor(
         }
     }
 
-    throw new Error(`filter: predicate kind not yet implemented: ${predicate.kind}`);
+    if (predicate.kind === 'setIn' || predicate.kind === 'setNotIn') {
+        const wantStr = new Set(predicate.values.map(String));
+        const isFactor = schema.arrowType.startsWith('Dictionary');
+        const hasValueLabels = !!schema.valueLabels;
+
+        if (isFactor) {
+            const codes = await loadFactorCodes(reader, columnIndex);
+            if (ctx.labelsOn) {
+                const labels: string[] = Array.isArray(schema.dictionary)
+                    ? schema.dictionary
+                    : await dictFromGetLabels(reader, columnIndex, codes);
+                return predicate.kind === 'setIn'
+                    ? (i) => wantStr.has(labels[codes[i]])
+                    : (i) => !wantStr.has(labels[codes[i]]);
+            }
+            return predicate.kind === 'setIn'
+                ? (i) => wantStr.has(String(codes[i]))
+                : (i) => !wantStr.has(String(codes[i]));
+        }
+
+        if (hasValueLabels && ctx.labelsOn) {
+            const displayed = await loadValueLabelled(reader, columnIndex, schema);
+            return predicate.kind === 'setIn'
+                ? (i) => wantStr.has(displayed[i])
+                : (i) => !wantStr.has(displayed[i]);
+        }
+
+        const values = await loadString(reader, columnIndex);
+        return predicate.kind === 'setIn'
+            ? (i) => wantStr.has(values[i])
+            : (i) => !wantStr.has(values[i]);
+    }
+
+    const _exhaustive: never = predicate;
+    throw new Error(`filter: unhandled predicate ${(_exhaustive as { kind: string }).kind}`);
 }
 
 async function missingMaskFor(
@@ -309,6 +343,59 @@ async function loadString(reader: ArrowSliceReader, columnIndex: number): Promis
         for (let r = 0; r < n; r++) {
             const v = child.get(r);
             if (v !== null && v !== undefined) out[start + r] = String(v);
+        }
+    }
+    return out;
+}
+
+async function loadFactorCodes(reader: ArrowSliceReader, columnIndex: number): Promise<Int32Array> {
+    const nrow = reader.nrow;
+    const codes = new Int32Array(nrow);
+    const numBatches = reader.batchStarts.length - 1;
+    for (let bi = 0; bi < numBatches; bi++) {
+        const batch = await (reader as any).getBatch(bi);
+        const child = batch.getChildAt(columnIndex);
+        const data = child.data[0];
+        const start = reader.batchStarts[bi];
+        const n = reader.batchStarts[bi + 1] - start;
+        for (let r = 0; r < n; r++) codes[start + r] = data.values[r] as number;
+    }
+    return codes;
+}
+
+async function dictFromGetLabels(
+    reader: ArrowSliceReader,
+    columnIndex: number,
+    codes: Int32Array,
+): Promise<string[]> {
+    const seen = new Set<number>();
+    for (let i = 0; i < codes.length; i++) seen.add(codes[i]);
+    const labels = await reader.getLabels(columnIndex, [...seen]);
+    const max = [...seen].reduce((a, b) => Math.max(a, b), -1);
+    const out: string[] = new Array(max + 1).fill('');
+    for (const [k, v] of Object.entries(labels)) out[Number(k)] = v;
+    return out;
+}
+
+async function loadValueLabelled(
+    reader: ArrowSliceReader,
+    columnIndex: number,
+    schema: ColumnSchema,
+): Promise<string[]> {
+    const nrow = reader.nrow;
+    const out: string[] = new Array(nrow).fill('');
+    const labels = schema.valueLabels ?? {};
+    const numBatches = reader.batchStarts.length - 1;
+    for (let bi = 0; bi < numBatches; bi++) {
+        const batch = await (reader as any).getBatch(bi);
+        const child = batch.getChildAt(columnIndex);
+        const start = reader.batchStarts[bi];
+        const n = reader.batchStarts[bi + 1] - start;
+        for (let r = 0; r < n; r++) {
+            const v = child.get(r);
+            if (v === null || v === undefined) continue;
+            const key = typeof v === 'bigint' ? v.toString() : String(v);
+            out[start + r] = labels[key] ?? key;
         }
     }
     return out;

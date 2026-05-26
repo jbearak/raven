@@ -217,6 +217,45 @@ describe('computeFilteredIndices — string predicates on s ["a","b",null,"d","e
     });
 });
 
+const CTX_LABELS_OFF = { labelsOn: false, formatOn: true, digits: 3 };
+
+describe('computeFilteredIndices — setIn on factor with Labels routing', () => {
+    test('Labels on: setIn matches against label strings', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 3, { kind: 'setIn', values: ['low', 'high'] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 2, 3]);
+        await r.close();
+    });
+    test('Labels off: setIn matches against codes', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 3, { kind: 'setIn', values: [0, 2] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_OFF);
+        expect(Array.from(out!)).toEqual([0, 2, 3]);
+        await r.close();
+    });
+});
+
+describe('computeFilteredIndices — setIn on haven_labelled with Labels on', () => {
+    test('matches against label strings', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 6, { kind: 'setIn', values: ['low'] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(out!.length).toBe(2);
+        await r.close();
+    });
+});
+
+describe('computeFilteredIndices — setIn on plain string column', () => {
+    test('matches values directly regardless of labelsOn', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'setIn', values: ['a', 'e'] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 4]);
+        await r.close();
+    });
+});
+
 describe('computeFilteredIndices — date predicates on d (DateDay 2024-01-01..05)', () => {
     test('dateCompare < 2024-01-03', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
