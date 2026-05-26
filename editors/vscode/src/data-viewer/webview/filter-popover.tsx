@@ -4,6 +4,9 @@
  *
  * Behaviour by column kind:
  *  Numeric (Int/Uint/Float)    → numCompare | numBetween | numNotBetween + histogram brush
+ *  Labelled numeric (numeric type + valueLabels) → setIn / setNotIn (label
+ *      checklist, stored & matched as codes) | numCompare | numBetween |
+ *      numNotBetween. setIn/setNotIn pre-selected.
  *  Factor (Dictionary) / has valueLabels + dictionaryShipped  → setIn / setNotIn checklist
  *  Factor without shipped dict → setIn / setNotIn + free-text list
  *  String (Utf8/LargeUtf8)     → strContains / strStartsWith / strEndsWith / strCompare / strRegex

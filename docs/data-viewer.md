@@ -240,7 +240,8 @@ currently focused column.
 | Column type | Available predicates |
 | --- | --- |
 | Numeric (Int, Float) | `=`, `≠`, `<`, `≤`, `>`, `≥`, `between`, `not between` |
-| Factor / value-labelled (`haven_labelled`, `foreign`, `readstata13`) | `is one of`, `is not one of` |
+| Labelled numeric (`haven_labelled`, `foreign`, `readstata13`) | `is one of`, `is not one of` (label checklist, matched by code) **plus** the full numeric set above |
+| Factor | `is one of`, `is not one of` |
 | Character | `contains`, `does not contain`, `starts with`, `ends with`, `=`, `≠`, `matches regex` |
 | Boolean | `is true`, `is false` |
 | Date / Timestamp | `=`, `≠`, `<`, `≤`, `>`, `≥`, `between`, `not between` |
@@ -250,9 +251,12 @@ For numeric `between` / `not between`, the editor shows a histogram of the
 column's distribution with draggable range thumbs alongside the numeric
 input fields.
 
-For factor and value-labelled columns, the editor shows a searchable
-checklist of levels when the column's value dictionary has been shipped.
-Large or unshipped dictionaries fall back to a free-text value list.
+For factor columns, the editor shows a searchable checklist of levels when
+the column's value dictionary has been shipped; large or unshipped
+dictionaries fall back to a free-text value list. For labelled numeric
+columns the editor defaults to a searchable checklist of the labelled
+values, each shown as label + underlying code, and also offers the full
+set of numeric predicates via the condition dropdown.
 
 The `matches regex` predicate for character columns uses ECMAScript (JavaScript)
 regex syntax — not PCRE or R regex syntax. A **Case sensitive** toggle
@@ -274,6 +278,13 @@ Labels is on, the underlying code or value when Labels is off. This is the
 same WYSIWYG rule as sorting: what you see is what is matched. Toggling
 Labels with an active filter on a labelled column will re-evaluate the
 filter.
+
+Labelled **numeric** columns are the exception: their `is one of` /
+`is not one of` checklist matches the **underlying numeric code**, not the
+displayed label, so toggling Labels never changes which rows a labelled-numeric
+filter keeps. The chip still shows the labels (for example `gender ∈ {Male,
+Female}`). The numeric `compare` / `between` predicates likewise match the
+underlying value, as for any numeric column.
 
 The Format toggle and digits setting never affect filtering. Numeric
 predicates always match the underlying double, regardless of how many digits
