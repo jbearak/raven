@@ -25,7 +25,7 @@ import type { ColumnSchema } from '../arrow-reader';
 import type { FilterEntry, FilterPredicate, HistogramBin } from '../messages';
 import { useDismiss } from './use-dismiss';
 import { FilterHistogram } from './filter-histogram';
-import { colKind, kindOptions, type ColKind, type KindOption } from './filter-column-kind';
+import { colKind, kindOptions, labelledNumericChoices } from './filter-column-kind';
 
 /** A small uid helper that avoids a `crypto` availability issue in older
  *  webview runtimes. Falls back gracefully if crypto.randomUUID is present. */
@@ -238,6 +238,9 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     const hasShippedDictionary = kind === 'factor' && column.dictionaryShipped && Array.isArray(column.dictionary);
     const dictValues: string[] = hasShippedDictionary ? (column.dictionary ?? []) : [];
 
+    const isLabelledNumeric = kind === 'labelledNumeric';
+    const labelledChoices = isLabelledNumeric ? labelledNumericChoices(column) : [];
+
     // ── Factor search state ───────────────────────────────────────────────
     const [factorSearch, setFactorSearch] = useState('');
 
@@ -324,7 +327,8 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     }
 
     function effectiveSetValues(): (string | number)[] {
-        if (hasShippedDictionary) {
+        if (isLabelledNumeric || hasShippedDictionary) {
+            // labelled-numeric → numeric codes; shipped dictionary → label strings.
             return setSelected.selected;
         }
         // Free-text: split on comma or newline
@@ -456,7 +460,46 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
                 )}
 
                 {(selectedKind === 'setIn' || selectedKind === 'setNotIn') && (
-                    hasShippedDictionary ? (
+                    isLabelledNumeric ? (
+                        <>
+                            <input
+                                type="text"
+                                className="filter-popover-input filter-popover-search"
+                                placeholder="Search labels…"
+                                value={factorSearch}
+                                onChange={e => setFactorSearch(e.target.value)}
+                            />
+                            <div className="filter-popover-checklist">
+                                {labelledChoices
+                                    .filter(c => !factorSearch
+                                        || c.label.toLowerCase().includes(factorSearch.toLowerCase())
+                                        || String(c.code).includes(factorSearch))
+                                    .map(c => {
+                                        const checked = setSelected.selected.includes(c.code);
+                                        return (
+                                            <label key={c.code} className="filter-popover-check-row">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={checked}
+                                                    onChange={e => {
+                                                        setSetSelected(s => ({
+                                                            selected: e.target.checked
+                                                                ? [...s.selected, c.code]
+                                                                : s.selected.filter(x => x !== c.code),
+                                                        }));
+                                                    }}
+                                                />
+                                                <span className="filter-popover-label-text">{c.label}</span>
+                                                <span className="filter-popover-code-dim">{c.code}</span>
+                                            </label>
+                                        );
+                                    })}
+                                {labelledChoices.length === 0 && (
+                                    <div className="filter-popover-hint">No labels available</div>
+                                )}
+                            </div>
+                        </>
+                    ) : hasShippedDictionary ? (
                         <>
                             <input
                                 type="text"
