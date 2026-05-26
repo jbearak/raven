@@ -137,8 +137,9 @@ when an `.Rmd` file is open.
     same way Quarto's preview does.
 
     The result is written atomically to `<basename>.html` via a
-    temp-and-rename next to the source, so a concurrent re-knit
-    can never expose a half-written file to the panel.
+    temp-and-rename inside the per-session preview temp directory
+    (alongside the intermediate `<basename>.md`), so a concurrent
+    re-knit can never expose a half-written file to the panel.
 
 11. **Reveal.** Raven opens the rendered HTML in a **Knit Preview**
     webview panel beside the editor — no success popover, the panel

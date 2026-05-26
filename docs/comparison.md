@@ -68,7 +68,7 @@ Raven takes a different approach. Its language server is a separate Rust process
 
 - **Workspace viewer** — A sidebar panel that introspects the live R session, showing objects in `globalenv()` with their types and dimensions, plus attached and loaded namespaces. Objects can be viewed or removed directly from the panel.
 - **htmlwidget / Shiny viewer** — Interactive HTML output (plotly, DT, profvis, etc.) and Shiny apps render in VS Code webview panels.
-- **R Markdown / Quarto live preview** — REditorSupport renders `.Rmd` previews in a webview panel. Raven ships chunk highlighting, chunk navigation, and run-chunk / run-above CodeLens buttons (see [Chunks](./chunks.md)) and a `knit` command (see [Knit](./knit.md)), but does not render the knitted output in-editor.
+- **Live R Markdown / Quarto preview** — REditorSupport renders `.Rmd` previews in a webview panel that auto-refreshes. Raven ships chunk highlighting, chunk navigation, run-chunk / run-above CodeLens buttons (see [Chunks](./chunks.md)), and a static `Raven: Knit Preview` (see [Knit](./knit.md)) with a manual refresh button, but no auto-refreshing preview and no `.qmd` rendering.
 - **List / environment viewer** — `View()` on lists and environments opens a collapsible tree view. Raven's `View()` only handles data frames and matrices.
 
 If you're interested in any of these, please [file an issue](https://github.com/jbearak/raven/issues) or submit a PR.
