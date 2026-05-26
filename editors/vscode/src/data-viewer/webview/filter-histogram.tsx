@@ -13,7 +13,7 @@
  *  - Each thumb exposes role="slider" / aria-valuemin/max/now.
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import type { HistogramBin } from '../messages';
 
 type Props = {
@@ -80,30 +80,48 @@ export function FilterHistogram({ bins, lo, hi, onChange }: Props) {
         return ((clientX - rect.left) / rect.width) * SVG_W;
     }, []);
 
-    const onPointerMove = useCallback((e: PointerEvent) => {
-        if (!dragging.current) return;
-        const rawX = getSvgX(e.clientX);
-        const rawValue = xToValue(rawX, dMin, dMax);
-        const snapped = snapToBin(rawValue, bins);
-        if (dragging.current === 'lo') {
-            onChange(Math.min(snapped, hi), hi);
-        } else {
-            onChange(lo, Math.max(snapped, lo));
-        }
-    }, [bins, dMin, dMax, getSvgX, hi, lo, onChange]);
+    // Drag reads live lo/hi/bins/onChange from a ref so the window listeners
+    // can be STABLE (registered once, identity never changes). Without this,
+    // each onChange re-renders the component, changing a useCallback-based
+    // handler's identity mid-drag — which both leaks the originally-added
+    // listener and can leave a dangling pointermove handler if the popover
+    // unmounts before pointerup fires. The unmount effect below is the
+    // backstop for the close-mid-drag case.
+    const live = useRef({ bins, dMin, dMax, lo, hi, onChange, getSvgX });
+    live.current = { bins, dMin, dMax, lo, hi, onChange, getSvgX };
 
-    const onPointerUp = useCallback(() => {
-        dragging.current = null;
-        window.removeEventListener('pointermove', onPointerMove);
-        window.removeEventListener('pointerup', onPointerUp);
-    }, [onPointerMove]);
+    const handlersRef = useRef<{ move: (e: PointerEvent) => void; up: () => void } | null>(null);
+    if (handlersRef.current === null) {
+        const move = (e: PointerEvent) => {
+            if (!dragging.current) return;
+            const s = live.current;
+            const rawValue = xToValue(s.getSvgX(e.clientX), s.dMin, s.dMax);
+            const snapped = snapToBin(rawValue, s.bins);
+            if (dragging.current === 'lo') s.onChange(Math.min(snapped, s.hi), s.hi);
+            else s.onChange(s.lo, Math.max(snapped, s.lo));
+        };
+        const up = () => {
+            dragging.current = null;
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', up);
+        };
+        handlersRef.current = { move, up };
+    }
+
+    useEffect(() => () => {
+        const h = handlersRef.current;
+        if (!h) return;
+        window.removeEventListener('pointermove', h.move);
+        window.removeEventListener('pointerup', h.up);
+    }, []);
 
     const startDrag = useCallback((which: 'lo' | 'hi') => (e: React.PointerEvent) => {
         e.preventDefault();
         dragging.current = which;
-        window.addEventListener('pointermove', onPointerMove);
-        window.addEventListener('pointerup', onPointerUp);
-    }, [onPointerMove, onPointerUp]);
+        const h = handlersRef.current!;
+        window.addEventListener('pointermove', h.move);
+        window.addEventListener('pointerup', h.up);
+    }, []);
 
     const binStep = bins.length > 1 ? bins[1].lo - bins[0].lo : dMax - dMin;
 
