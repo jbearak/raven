@@ -157,7 +157,7 @@ export function fontsCssDeclarations(fonts: { text: string; mono: string }): str
 }
 
 /**
- * Strict type-narrowing for messages posted from the Knit Output webview.
+ * Strict type-narrowing for messages posted from the Knit Preview webview.
  *
  * The webview is a trust boundary. We use **per-type exact-schema
  * matching**: the message object's keys must equal the declared key set
@@ -305,7 +305,7 @@ function escapeHtml(s: string): string {
 }
 
 /**
- * Build the outer-shell HTML for the Knit Output webview.
+ * Build the outer-shell HTML for the Knit Preview webview.
  *
  * The shell is Raven-controlled and owns the CSP in `<head>`; the
  * rendered HTML loads inside `<iframe srcdoc="..." sandbox="allow-
@@ -633,7 +633,7 @@ export function buildShellHtml(args: {
 </style>
 </head>
 <body>
-  <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit output">
+  <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit preview">
     <button id="raven-knit-refresh" type="button"
             aria-label="Knit again"
             title="Knit again (re-knit the source document)">${ICON_REFRESH}</button>
@@ -2047,7 +2047,7 @@ export function rewriteFragmentAnchors(html: string): string {
 }
 
 /**
- * Pick the output path to surface in the Knit Output panel.
+ * Pick the output path to surface in the Knit Preview panel.
  *
  * When `output_format = "all"` (or a custom multi-format render) produces
  * a mix of formats, the user almost always wants the HTML viewer rather
