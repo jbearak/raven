@@ -61,6 +61,7 @@ import { ColumnVisibilityPopover } from './column-visibility-popover';
 import { ColumnContextMenu } from './column-context-menu';
 import { ToolbarSortStrip } from './sort-strip';
 import { FilterStrip } from './filter-strip';
+import { FilterPopover } from './filter-popover';
 
 type VscodeApi = {
     postMessage(msg: WebviewToExtension): void;
@@ -327,7 +328,12 @@ export function App({
     const [filterPending, setFilterPending] = useState(false);
     const [nrowFiltered, setNrowFiltered] = useState<number | undefined>(restored?.nrowFiltered);
     const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>(restored?.histograms ?? {});
-    const [filterEditor, setFilterEditor] = useState<{ entry?: FilterEntry; columnIndex?: number } | null>(null);
+    const [filterEditor, setFilterEditor] = useState<{
+        entry?: FilterEntry;
+        columnIndex?: number;
+        leftPx?: number;
+        topPx?: number;
+    } | null>(null);
 
     const visibleCols = useMemo(
         () => visibleColumnIndices(columns, layout.hiddenColumns),
@@ -1091,6 +1097,20 @@ export function App({
                     clearAllSorts();
                     return;
                 }
+                if (event.key === '9' || event.code === 'Digit9') {
+                    event.preventDefault();
+                    onClearAllFilters();
+                    return;
+                }
+                if (event.key === 'F' || event.code === 'KeyF') {
+                    event.preventDefault();
+                    const focused = gridSelection.current?.cell[0];
+                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    if (sourceIndex !== undefined) {
+                        setFilterEditor({ columnIndex: sourceIndex, leftPx: 100, topPx: 100 });
+                    }
+                    return;
+                }
             }
             const meta = event.metaKey || event.ctrlKey;
             if (!meta) return;
@@ -1114,7 +1134,9 @@ export function App({
         clearAllSorts,
         copySelection,
         gridSelection,
+        onClearAllFilters,
         postLifecycle,
+        setFilterEditor,
         sortColumn,
         visibleCols,
         visibleRange,
@@ -1493,8 +1515,72 @@ export function App({
                                 },
                             }
                             : undefined}
+                        filter={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
+                            ? {
+                                hasFilter: filter.entries.some(
+                                    e => e.columnIndex === contextMenu.columnIndex,
+                                ),
+                                anyFiltered: filter.entries.length > 0,
+                                onAddFilter: () => {
+                                    setFilterEditor({
+                                        columnIndex: contextMenu.columnIndex,
+                                        leftPx: contextMenu.leftPx,
+                                        topPx: contextMenu.topPx,
+                                    });
+                                    setContextMenu(null);
+                                },
+                                onClearColumn: () => {
+                                    applyFilters(filter.entries.filter(
+                                        e => e.columnIndex !== contextMenu.columnIndex,
+                                    ));
+                                    setContextMenu(null);
+                                },
+                                onClearAll: () => {
+                                    applyFilters([]);
+                                    setContextMenu(null);
+                                },
+                            }
+                            : undefined}
                     />
                 )}
+                {filterEditor !== null && (() => {
+                    const editorColumnIndex = filterEditor.entry?.columnIndex ?? filterEditor.columnIndex;
+                    if (editorColumnIndex === undefined) return null;
+                    const editorColumn = columns[editorColumnIndex];
+                    if (!editorColumn) return null;
+                    return (
+                        <FilterPopover
+                            column={editorColumn}
+                            columnIndex={editorColumnIndex}
+                            histogram={histograms[editorColumnIndex]}
+                            initial={filterEditor.entry}
+                            anchor={{
+                                leftPx: filterEditor.leftPx ?? 100,
+                                topPx: filterEditor.topPx ?? 100,
+                            }}
+                            onApply={(entry) => {
+                                // One-filter-per-column: replace by id (edit) or by columnIndex (new).
+                                const next = (() => {
+                                    if (filterEditor.entry) {
+                                        // Editing existing: replace by id, also enforce one-per-column.
+                                        const withoutSameCol = filter.entries.filter(
+                                            e => e.id !== entry.id && e.columnIndex !== entry.columnIndex,
+                                        );
+                                        return [...withoutSameCol, entry];
+                                    }
+                                    // New: replace any existing entry for this column.
+                                    const withoutCol = filter.entries.filter(
+                                        e => e.columnIndex !== entry.columnIndex,
+                                    );
+                                    return [...withoutCol, entry];
+                                })();
+                                applyFilters(next);
+                                setFilterEditor(null);
+                            }}
+                            onCancel={() => setFilterEditor(null)}
+                        />
+                    );
+                })()}
                 {headerTooltip && (
                     <div
                         ref={headerTooltipRef}
