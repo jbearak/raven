@@ -236,12 +236,54 @@ describe('computeFilteredIndices — setIn on factor with Labels routing', () =>
     });
 });
 
-describe('computeFilteredIndices — setIn on haven_labelled with Labels on', () => {
-    test('matches against label strings', async () => {
+describe('computeFilteredIndices — setIn/setNotIn on labelled FLOAT (tiny col 6 lbl=[1,2,3,1,2])', () => {
+    // valueLabels {1:low,2:mid,3:high}. Matching is by underlying code and
+    // MUST be identical with Labels on and off (toggle-independent).
+    test('setIn [1] matches rows 0,3 with Labels ON', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 6, { kind: 'setIn', values: [1] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 3]);
+        await r.close();
+    });
+    test('setIn [1] matches rows 0,3 with Labels OFF (identical)', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 6, { kind: 'setIn', values: [1] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_OFF);
+        expect(Array.from(out!)).toEqual([0, 3]);
+        await r.close();
+    });
+    test('setIn [1,3] matches rows 0,2,3', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 6, { kind: 'setIn', values: [1, 3] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 2, 3]);
+        await r.close();
+    });
+    test('setNotIn [1] keeps rows 1,2,4', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 6, { kind: 'setNotIn', values: [1] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([1, 2, 4]);
+        await r.close();
+    });
+    test('label strings (legacy) no longer match — codes only', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         const e = entry('a', 6, { kind: 'setIn', values: ['low'] });
         const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
-        expect(out!.length).toBe(2);
+        expect(Array.from(out!)).toEqual([]);
+        await r.close();
+    });
+});
+
+describe('computeFilteredIndices — setIn on labelled INT (labelled-non-float col 0 rating=[1,2,3,1,2])', () => {
+    test('setIn [2] matches rows 1,4 regardless of toggle', async () => {
+        const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
+        const e = entry('a', 0, { kind: 'setIn', values: [2] });
+        const on = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        const off = await computeFilteredIndices(r, state([e]), CTX_LABELS_OFF);
+        expect(Array.from(on!)).toEqual([1, 4]);
+        expect(Array.from(off!)).toEqual([1, 4]);
         await r.close();
     });
 });

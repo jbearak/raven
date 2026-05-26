@@ -8,10 +8,15 @@
  *     can skip filter storage entirely.
  *   - **Cross-entry AND**: enabled entries are intersected on a row
  *     mask; disabled entries are ignored.
- *   - **WYSIWYG label routing**: when `labelsOn` is true, factor and
- *     value-labelled columns evaluate `setIn` / `setNotIn` against the
- *     displayed label string. When `labelsOn` is false, against the
- *     underlying code / numeric / string value.
+ *   - **WYSIWYG label routing (factors & value-labelled strings)**: when
+ *     `labelsOn` is true, factor and value-labelled *string* columns evaluate
+ *     `setIn` / `setNotIn` against the displayed label string; when false,
+ *     against the underlying code / string value.
+ *   - **Labelled-numeric set membership is code-based**: a numeric column
+ *     carrying `valueLabels` always matches `setIn` / `setNotIn` against the
+ *     underlying numeric code, ignoring `labelsOn` (the popover stores codes;
+ *     labels are display-only). This is intentionally NOT WYSIWYG so the
+ *     filter survives a Labels toggle.
  *   - **Format independence**: digits / formatOn never affects the
  *     row index. Numeric predicates always match against the raw
  *     double.
@@ -255,6 +260,21 @@ async function acceptorFor(
             return predicate.kind === 'setIn'
                 ? (i) => wantStr.has(String(codes[i]))
                 : (i) => !wantStr.has(String(codes[i]));
+        }
+
+        // Labelled NUMERIC column: always match the underlying numeric code,
+        // regardless of the Labels toggle. The popover stores codes (numbers)
+        // for these columns; labels are display-only. This makes the filter
+        // toggle-independent (flipping Labels never invalidates it).
+        const t = schema.arrowType;
+        const isNumericLabelled = !isFactor && hasValueLabels
+            && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'));
+        if (isNumericLabelled) {
+            const want = new Set(predicate.values.map(Number));
+            const values = await loadNumeric(reader, columnIndex);
+            return predicate.kind === 'setIn'
+                ? (i) => want.has(values[i])
+                : (i) => !want.has(values[i]);
         }
 
         if (hasValueLabels && ctx.labelsOn) {
