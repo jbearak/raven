@@ -738,8 +738,12 @@ body,
 }
 
 .filter-popover-row .filter-popover-input {
-    flex: 1 1 auto;
+    /* flex-basis 0 + min-width 0 lets the two number inputs share the row
+     * and shrink to fit; without min-width:0 a number input keeps its
+     * intrinsic width and overflows the popover (clipped by overflow:hidden). */
+    flex: 1 1 0;
     width: auto;
+    min-width: 0;
 }
 
 .filter-popover-between-sep {

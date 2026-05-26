@@ -148,6 +148,13 @@ export function FilterHistogram({ bins, lo, hi, onChange }: Props) {
             className="filter-histogram"
             width={SVG_W}
             height={SVG_H}
+            // viewBox makes the fixed 260-unit layout scale to the popover's
+            // actual content width (≈236px at the min popover width), so the
+            // right thumb at the domain max stays inside the box instead of
+            // being clipped. getSvgX maps via the rendered rect, so the drag
+            // math is unaffected by the scale.
+            viewBox={`0 0 ${SVG_W} ${SVG_H}`}
+            preserveAspectRatio="xMidYMid meet"
             role="group"
             aria-label="Range histogram"
             style={{ display: 'block', width: '100%', maxWidth: `${SVG_W}px`, height: `${SVG_H}px`, cursor: 'default', userSelect: 'none' }}
