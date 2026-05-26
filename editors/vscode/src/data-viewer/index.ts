@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { DataViewerManager } from './manager';
 import { LayoutStore } from './layout-state';
 import { ToolbarStateStore } from './toolbar-state';
+import { SortStateStore } from './sort-state';
 import type { Settings } from './messages';
 import { sweep_stale } from './sweep';
 import type { RSessionServer } from '../r-session-server';
@@ -23,6 +24,7 @@ export function registerDataViewer(
         .get<number>('maxStoredLayouts', 10000);
     const store = new LayoutStore(context.globalState as any, cap);
     const toolbarStore = new ToolbarStateStore(context.globalState as any, cap);
+    const sortStore = new SortStateStore(context.globalState as any, cap);
 
     const settings = (): Settings => {
         const cfg = vscode.workspace.getConfiguration('raven.dataViewer');
@@ -30,10 +32,17 @@ export function registerDataViewer(
             missingValueStyle: cfg.get<'foreground' | 'background' | 'none'>(
                 'missingValueStyle', 'foreground'),
             defaultDigits: cfg.get<number>('defaultDigits', 3),
+            persistSort: cfg.get<boolean>('persistSort', true),
         };
     };
 
-    const manager = new DataViewerManager(context.extensionUri, store, toolbarStore, settings);
+    const manager = new DataViewerManager(
+        context.extensionUri,
+        store,
+        toolbarStore,
+        sortStore,
+        settings,
+    );
 
     context.subscriptions.push({
         dispose: server.onEvent(e => {

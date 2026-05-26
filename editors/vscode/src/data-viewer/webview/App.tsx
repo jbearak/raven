@@ -19,11 +19,14 @@ import {
     type Theme,
 } from '@glideapps/glide-data-grid';
 import type { ColumnSchema } from '../arrow-reader';
-import type {
-    ExtensionToWebview,
-    Layout,
-    Settings,
-    WebviewToExtension,
+import {
+    EMPTY_SORT,
+    type ExtensionToWebview,
+    type Layout,
+    type Settings,
+    type SortKey,
+    type SortState,
+    type WebviewToExtension,
 } from '../messages';
 import type { ToolbarState } from '../toolbar-state';
 import type { Cell } from '../wire-format';
@@ -52,6 +55,7 @@ import {
 } from './column-visibility-model';
 import { ColumnVisibilityPopover } from './column-visibility-popover';
 import { ColumnContextMenu } from './column-context-menu';
+import { ToolbarSortStrip } from './sort-strip';
 
 type VscodeApi = {
     postMessage(msg: WebviewToExtension): void;
@@ -69,6 +73,7 @@ type PersistedState = {
     schemaHash: string;
     objectClass?: string;
     visibleRange: VisibleRange;
+    sort: SortState;
 };
 
 type ContextMenuState = {
@@ -86,7 +91,7 @@ type HeaderTooltipState = {
 
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
-const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3 };
+const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true };
 
 function createEmptySelection(): GridSelection {
     return {
@@ -190,6 +195,77 @@ function useVscodeTheme(): { grid: Partial<Theme>; missingFg: Partial<Theme>; mi
     }, [revision]);
 }
 
+/** True when an event would type into the given element (or its
+ *  shadow-DOM descendants). Used to guard keyboard shortcuts so they
+ *  don't hijack the user's typing in text inputs / textareas / selects /
+ *  contenteditable surfaces. */
+function isEditableTarget(el: Element | null): boolean {
+    if (!el) return false;
+    if (el instanceof HTMLInputElement) {
+        // Buttons and checkboxes don't take text — only true text inputs.
+        const t = el.type.toLowerCase();
+        return t !== 'button' && t !== 'submit' && t !== 'reset'
+            && t !== 'checkbox' && t !== 'radio'
+            && t !== 'image' && t !== 'file' && t !== 'color';
+    }
+    if (el instanceof HTMLTextAreaElement) return true;
+    if (el instanceof HTMLSelectElement) return true;
+    if (el instanceof HTMLElement && el.isContentEditable) return true;
+    return false;
+}
+
+/** Paint the sort arrow + (when there's more than one key) a priority
+ *  badge in the right-edge cluster of a column header. The arrow alpha
+ *  encodes the primary/secondary cue at a glance; the badge is the
+ *  precise readout. */
+function drawSortGlyphs(
+    ctx: CanvasRenderingContext2D,
+    rect: { x: number; y: number; width: number; height: number },
+    theme: Theme,
+    entry: { direction: 'asc' | 'desc'; priority: number },
+    showBadge: boolean,
+): void {
+    const isPrimary = entry.priority === 1;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(rect.x, rect.y, rect.width, rect.height);
+    ctx.clip();
+    const arrowRightEdge = rect.x + rect.width - 8;
+    const arrowCenterY = rect.y + rect.height / 2;
+    const arrowSize = 5;
+    ctx.fillStyle = theme.textHeader;
+    ctx.globalAlpha = isPrimary ? 0.85 : 0.55;
+    ctx.beginPath();
+    if (entry.direction === 'asc') {
+        ctx.moveTo(arrowRightEdge - arrowSize, arrowCenterY + arrowSize / 2);
+        ctx.lineTo(arrowRightEdge, arrowCenterY + arrowSize / 2);
+        ctx.lineTo(arrowRightEdge - arrowSize / 2, arrowCenterY - arrowSize / 2);
+    } else {
+        ctx.moveTo(arrowRightEdge - arrowSize, arrowCenterY - arrowSize / 2);
+        ctx.lineTo(arrowRightEdge, arrowCenterY - arrowSize / 2);
+        ctx.lineTo(arrowRightEdge - arrowSize / 2, arrowCenterY + arrowSize / 2);
+    }
+    ctx.closePath();
+    ctx.fill();
+    if (showBadge) {
+        const badgeCenterX = arrowRightEdge - arrowSize - 10;
+        const badgeRadius = 7;
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = theme.bgHeader === theme.bgCell
+            ? 'rgba(128, 128, 128, 0.35)'
+            : theme.bgCell;
+        ctx.beginPath();
+        ctx.arc(badgeCenterX, arrowCenterY, badgeRadius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = theme.textHeader;
+        ctx.font = `600 9px ${theme.fontFamily}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(entry.priority), badgeCenterX, arrowCenterY + 0.5);
+    }
+    ctx.restore();
+}
+
 function sameColumns(a: readonly ColumnSchema[], b: readonly ColumnSchema[]): boolean {
     if (a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) {
@@ -237,11 +313,23 @@ export function App({
     const [headerTooltip, setHeaderTooltip] = useState<HeaderTooltipState | null>(null);
     const [copyStatus, setCopyStatus] = useState<'' | 'copying' | 'copied' | 'error'>('');
     const [copyStatusMsg, setCopyStatusMsg] = useState('');
+    const [sort, setSort] = useState<SortState>(restored?.sort ?? EMPTY_SORT);
+    const [sortPending, setSortPending] = useState(false);
 
     const visibleCols = useMemo(
         () => visibleColumnIndices(columns, layout.hiddenColumns),
         [columns, layout.hiddenColumns],
     );
+    /** Map of source column index → { direction, priority (1-based) } for
+     *  the active sort. Empty when no sort is active. Used by drawHeader
+     *  and by the context menu's "check active direction" rendering. */
+    const sortByColumn = useMemo(() => {
+        const m = new Map<number, { direction: 'asc' | 'desc'; priority: number }>();
+        sort.keys.forEach((k, i) =>
+            m.set(k.columnIndex, { direction: k.direction, priority: i + 1 }));
+        return m;
+    }, [sort]);
+    const showPriorityBadge = sort.keys.length > 1;
     const allGridColumns = useMemo(() => buildGridColumns(columns, layout), [columns, layout]);
     const gridColumns = useMemo(
         () => buildVisibleGridColumns(allGridColumns, visibleCols),
@@ -250,9 +338,25 @@ export function App({
     const labelsHaveEffect = hasLabelsEffect(columns);
     const formatHasEffect = hasFormatEffect(columns);
     const rowCountText = describeVisibleRows(nrow, visibleRange);
+    /** Summary text appended to the status bar when a sort is active.
+     *  Truncates to 4 keys with an ellipsis so the bar never wraps; the
+     *  toolbar chip strip is the full picture. */
+    const sortStatusText = useMemo(() => {
+        if (sort.keys.length === 0) return '';
+        const MAX = 4;
+        const visible = sort.keys.slice(0, MAX).map(k => {
+            const col = columns[k.columnIndex];
+            const name = col?.name ?? `col ${k.columnIndex}`;
+            return `${name} ${k.direction === 'asc' ? '▲' : '▼'}`;
+        }).join(', ');
+        return sort.keys.length > MAX
+            ? `sorted by ${visible}, +${sort.keys.length - MAX} more`
+            : `sorted by ${visible}`;
+    }, [columns, sort]);
     const statusText = [
         describeShape(nrow, columns, objectClass),
         describeHiddenColumnCount(layout.hiddenColumns.length),
+        sortPending ? 'Sorting…' : sortStatusText,
     ].filter(Boolean).join(' | ');
 
     const persistWebviewState = useCallback(() => {
@@ -267,6 +371,7 @@ export function App({
             schemaHash,
             objectClass,
             visibleRange,
+            sort,
         });
     }, [
         vscode,
@@ -280,6 +385,7 @@ export function App({
         schemaHash,
         objectClass,
         visibleRange,
+        sort,
     ]);
 
     useEffect(() => {
@@ -399,6 +505,8 @@ export function App({
         setObjectClass(m.objectClass);
         if (m.type === 'init') setSettings(m.settings);
         setToolbar(m.toolbar);
+        setSort(m.sort);
+        setSortPending(false);
         toolbarBootstrappedRef.current = true;
         clearRows();
         setResolvedLabels({});
@@ -452,6 +560,113 @@ export function App({
             gridRef.current?.updateCells(damageList);
         }
     }, [panelGeneration, visibleCols, visibleRange.end, visibleRange.start]);
+
+    const applySortApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'sortApplied' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        setSort(m.sort);
+        setSortPending(false);
+        // Permutation just changed — every cached row window is now in
+        // the wrong order. Clear and refetch the current viewport.
+        clearRows();
+        // (Pulse animation on apply, suppressed when fromPersistence,
+        // is deferred — spec §3.1 describes it but no callers depend on
+        // it for v1.)
+        // Refetch covers the visible range; the existing
+        // requestRows / paddedRange path picks the right window once the
+        // cache is empty.
+        if (nrow > 0 && visibleCols.length > 0) {
+            requestRows(paddedRange(
+                visibleRange.start,
+                Math.max(1, visibleRange.end - visibleRange.start),
+                nrow,
+                OVERSCAN_ROWS,
+            ));
+        }
+        // Persist the latest sort. Cleared (empty keys) saves are also
+        // valid — the host treats an empty SortState as a clear.
+        if (schemaHash) {
+            vscode.postMessage({
+                type: 'saveSort',
+                panelGeneration: m.panelGeneration,
+                schemaHash,
+                sort: m.sort,
+            });
+        }
+    }, [
+        clearRows,
+        nrow,
+        panelGeneration,
+        requestRows,
+        schemaHash,
+        visibleCols.length,
+        visibleRange,
+        vscode,
+    ]);
+
+    const applySortStatus = useCallback((m: Extract<ExtensionToWebview, { type: 'sortStatus' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        setSortPending(m.state === 'pending');
+    }, [panelGeneration]);
+
+    /** Send a setSort request. Empty `keys` clears the sort. The host
+     *  replies with `sortApplied` which drives state updates. */
+    const applySort = useCallback((keys: SortKey[]) => {
+        setSortPending(true);
+        const requestId = ++nextRequestIdRef.current;
+        vscode.postMessage({
+            type: 'setSort',
+            panelGeneration,
+            requestId,
+            keys,
+            labelsOn: toolbar.labelsOn,
+            formatOn: toolbar.formatOn,
+            digits: toolbar.digits,
+        });
+    }, [panelGeneration, toolbar, vscode]);
+
+    /** Pick a direction for `sourceIndex`. When `append` is true, merge
+     *  into the existing sort (flipping the column's direction in place
+     *  if already present). Otherwise this column becomes the only sort
+     *  key. */
+    const sortColumn = useCallback((
+        sourceIndex: number,
+        direction: 'asc' | 'desc',
+        append: boolean,
+    ) => {
+        const existing = sort.keys.findIndex(k => k.columnIndex === sourceIndex);
+        let next: SortKey[];
+        if (!append) {
+            // Plain pick: this column becomes the sort. If user picks the
+            // same column/direction that's already active, no-op.
+            if (existing >= 0
+                && sort.keys.length === 1
+                && sort.keys[0].direction === direction) {
+                return;
+            }
+            next = [{ columnIndex: sourceIndex, direction }];
+        } else if (existing >= 0) {
+            // Shift+pick on an existing key: flip direction in place,
+            // priority preserved.
+            if (sort.keys[existing].direction === direction) return;
+            next = sort.keys.map((k, i) =>
+                i === existing ? { ...k, direction } : k);
+        } else {
+            // Shift+pick on a new column: append at the end.
+            next = [...sort.keys, { columnIndex: sourceIndex, direction }];
+        }
+        applySort(next);
+    }, [applySort, sort.keys]);
+
+    const clearSortOnColumn = useCallback((sourceIndex: number) => {
+        const next = sort.keys.filter(k => k.columnIndex !== sourceIndex);
+        if (next.length === sort.keys.length) return;
+        applySort(next);
+    }, [applySort, sort.keys]);
+
+    const clearAllSorts = useCallback(() => {
+        if (sort.keys.length === 0) return;
+        applySort([]);
+    }, [applySort, sort.keys.length]);
 
     const applyCopyDone = useCallback((m: Extract<ExtensionToWebview, { type: 'copyDone' }>) => {
         if (m.panelGeneration !== panelGeneration) return;
@@ -609,6 +824,12 @@ export function App({
                 case 'copyDone':
                     applyCopyDone(m);
                     return;
+                case 'sortApplied':
+                    applySortApplied(m);
+                    return;
+                case 'sortStatus':
+                    applySortStatus(m);
+                    return;
                 case 'testKey':
                     handleTestKey(m.key);
                     return;
@@ -628,6 +849,8 @@ export function App({
         applyInitOrReplace,
         applyLabels,
         applyRows,
+        applySortApplied,
+        applySortStatus,
         handleTestKey,
         panelGeneration,
         scrollToFraction,
@@ -643,6 +866,24 @@ export function App({
             toolbar,
         });
     }, [panelGeneration, schemaHash, toolbar, vscode]);
+
+    /** Labels-toggle invalidates sort keys derived from displayed text.
+     *  When the active sort touches a factor or value-labelled column
+     *  and Labels changed since the sort was built, re-issue setSort so
+     *  the host rebuilds the permutation against the current toolbar
+     *  state. Numeric / date / string sorts are unaffected and skipped. */
+    useEffect(() => {
+        if (sort.keys.length === 0) return;
+        if (sort.labelsOnWhenSorted === toolbar.labelsOn) return;
+        const touchesLabelled = sort.keys.some(k => {
+            const col = columns[k.columnIndex];
+            if (!col) return false;
+            return col.arrowType.startsWith('Dictionary')
+                || (col.arrowType.startsWith('Float') && col.valueLabels);
+        });
+        if (!touchesLabelled) return;
+        applySort(sort.keys);
+    }, [applySort, columns, sort, toolbar.labelsOn]);
 
     useEffect(() => {
         if (!toolbar.labelsOn) return;
@@ -732,6 +973,35 @@ export function App({
             copySelection();
         };
         const onKeyDown = (event: KeyboardEvent) => {
+            // Sort shortcuts: Shift+Alt+A / D / 0. Reserved namespace —
+            // they don't collide with the platform's Cmd/Ctrl+A select
+            // or arrow-key navigation already wired below. Skip when
+            // focus is in a text-entry control (e.g. the column-filter
+            // input in the Columns popover) so the modifier doesn't
+            // hijack the user's typing.
+            if (event.shiftKey && event.altKey
+                && !event.metaKey && !event.ctrlKey
+                && !isEditableTarget(document.activeElement)) {
+                if (event.key === 'A' || event.code === 'KeyA') {
+                    event.preventDefault();
+                    const focused = gridSelection.current?.cell[0];
+                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    if (sourceIndex !== undefined) sortColumn(sourceIndex, 'asc', false);
+                    return;
+                }
+                if (event.key === 'D' || event.code === 'KeyD') {
+                    event.preventDefault();
+                    const focused = gridSelection.current?.cell[0];
+                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    if (sourceIndex !== undefined) sortColumn(sourceIndex, 'desc', false);
+                    return;
+                }
+                if (event.key === ')' || event.code === 'Digit0') {
+                    event.preventDefault();
+                    clearAllSorts();
+                    return;
+                }
+            }
             const meta = event.metaKey || event.ctrlKey;
             if (!meta) return;
             if (event.key === 'a' || event.key === 'A') {
@@ -750,12 +1020,26 @@ export function App({
             document.removeEventListener('copy', onCopy);
             window.removeEventListener('keydown', onKeyDown);
         };
-    }, [copySelection, postLifecycle, visibleCols.length, visibleRange]);
+    }, [
+        clearAllSorts,
+        copySelection,
+        gridSelection,
+        postLifecycle,
+        sortColumn,
+        visibleCols,
+        visibleRange,
+    ]);
 
-    const drawHeader: DrawHeaderCallback = useCallback(({ ctx, column, theme, rect, isSelected, hasSelectedCell }, drawContent) => {
+    const drawHeader: DrawHeaderCallback = useCallback(({ ctx, column, columnIndex, theme, rect, isSelected, hasSelectedCell }, drawContent) => {
         const col = column as typeof gridColumns[number];
+        const sourceIndex = visibleCols[columnIndex];
+        const sortEntry = sourceIndex !== undefined ? sortByColumn.get(sourceIndex) : undefined;
+
+        // Default text rendering when no variable label — but we still
+        // need to paint sort glyphs on top when the column is sorted.
         if (!col.variableLabel) {
             drawContent();
+            if (sortEntry) drawSortGlyphs(ctx, rect, theme, sortEntry, showPriorityBadge);
             return;
         }
         const textColor = isSelected || hasSelectedCell ? theme.textHeaderSelected : theme.textHeader;
@@ -771,7 +1055,8 @@ export function App({
         ctx.font = `400 11px ${theme.fontFamily}`;
         ctx.fillText(col.variableLabel, rect.x + 12, rect.y + rect.height - 9);
         ctx.restore();
-    }, [gridColumns]);
+        if (sortEntry) drawSortGlyphs(ctx, rect, theme, sortEntry, showPriorityBadge);
+    }, [gridColumns, showPriorityBadge, sortByColumn, visibleCols]);
 
     const drawCell: DrawCellCallback = useCallback((args, drawContent) => {
         const sourceIndex = visibleCols[args.col];
@@ -871,6 +1156,12 @@ export function App({
         <div className="data-viewer-root">
             <div className="toolbar">
                 <span className="row-count">{rowCountText}</span>
+                <ToolbarSortStrip
+                    sort={sort}
+                    columns={columns}
+                    onChange={applySort}
+                    onClearAll={clearAllSorts}
+                />
                 <button
                     type="button"
                     className={toolbar.labelsOn ? 'toggle active' : 'toggle'}
@@ -1078,6 +1369,32 @@ export function App({
                                 setContextMenu(null);
                             }}
                         onClose={() => setContextMenu(null)}
+                        sort={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
+                            ? {
+                                activeDirection:
+                                    sortByColumn.get(contextMenu.columnIndex)?.direction ?? 'none',
+                                anySorted: sort.keys.length > 0,
+                                otherColumnsSorted: sort.keys.some(
+                                    k => k.columnIndex !== contextMenu.columnIndex,
+                                ),
+                                onSort: (direction, append) => {
+                                    sortColumn(contextMenu.columnIndex!, direction, append);
+                                    setContextMenu(null);
+                                },
+                                onAddToSort: (direction) => {
+                                    sortColumn(contextMenu.columnIndex!, direction, true);
+                                    setContextMenu(null);
+                                },
+                                onClearColumn: () => {
+                                    clearSortOnColumn(contextMenu.columnIndex!);
+                                    setContextMenu(null);
+                                },
+                                onClearAll: () => {
+                                    clearAllSorts();
+                                    setContextMenu(null);
+                                },
+                            }
+                            : undefined}
                     />
                 )}
                 {headerTooltip && (

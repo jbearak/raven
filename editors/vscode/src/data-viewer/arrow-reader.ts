@@ -73,12 +73,20 @@ export type GetRowsRequest = {
     /** Latest viewport generation seen by the panel. Older requests are
      *  skipped (returned with `stale: true`). */
     viewportGeneration: number;
+    /** Optional row permutation. When present, `start..end` indexes into
+     *  the permutation; the reader fetches the underlying rows
+     *  `permutation[start..end]` and returns them in visible order. */
+    permutation?: Uint32Array;
 };
 
 export type GetRowsResponse = {
     /** Outer length = end - start (clamped). Inner length = columns.length. */
     rows: Cell[][];
     stale: boolean;
+    /** When a permutation was supplied, the original 0-based row indices
+     *  for each row in `rows` (length matches `rows`). Lets the webview
+     *  render the original row number in the gutter. */
+    originalRowIndices?: number[];
 };
 
 export type OpenOptions = {
@@ -243,6 +251,10 @@ export class ArrowSliceReader {
         const end = Math.min(this.nrow, req.end);
         if (end <= start) return { rows: [], stale: false };
 
+        if (req.permutation) {
+            return this.getRowsPermuted(req, start, end);
+        }
+
         const fields = this.reader.schema.fields;
         const rowCount = end - start;
         const rows: Cell[][] = [];
@@ -277,6 +289,61 @@ export class ArrowSliceReader {
             }
         }
         return { rows, stale: false };
+    }
+
+    /** Permuted variant: `start..end` indexes into `req.permutation`, and
+     *  we read the underlying rows it points at — in any order — but
+     *  return them in visible (sorted) order. */
+    private async getRowsPermuted(
+        req: GetRowsRequest,
+        start: number,
+        end: number,
+    ): Promise<GetRowsResponse> {
+        const permutation = req.permutation!;
+        const visibleCount = end - start;
+        const originalRowIndices: number[] = new Array(visibleCount);
+        for (let i = 0; i < visibleCount; i++) {
+            originalRowIndices[i] = permutation[start + i];
+        }
+
+        // Group requested rows by their containing batch. We process
+        // batches in ascending index order so sequential reads warm the
+        // batch LRU naturally.
+        const byBatch = new Map<number, { localRow: number; outPos: number }[]>();
+        for (let i = 0; i < visibleCount; i++) {
+            const rawRow = originalRowIndices[i];
+            const batchIdx = upperBoundLE(this.batchStarts, rawRow);
+            const list = byBatch.get(batchIdx);
+            const entry = { localRow: rawRow - this.batchStarts[batchIdx], outPos: i };
+            if (list) list.push(entry);
+            else byBatch.set(batchIdx, [entry]);
+        }
+        const batchIndices = [...byBatch.keys()].sort((a, b) => a - b);
+
+        const fields = this.reader.schema.fields;
+        const rows: Cell[][] = new Array(visibleCount);
+        for (let i = 0; i < visibleCount; i++) rows[i] = new Array(req.columns.length);
+
+        for (const bi of batchIndices) {
+            if (req.viewportGeneration < this.latestViewportGen) {
+                return { rows: [], stale: true };
+            }
+            const batch = await this.getBatch(bi);
+            const list = byBatch.get(bi)!;
+            for (let ci = 0; ci < req.columns.length; ci++) {
+                const colIdx = req.columns[ci];
+                const field = fields[colIdx];
+                const child = batch.getChildAt(colIdx);
+                const arrowType = String(field.type);
+                const tz = arrowType.startsWith('Timestamp')
+                    ? ((field.type as any).timezone ?? 'UTC')
+                    : 'UTC';
+                for (const { localRow, outPos } of list) {
+                    rows[outPos][ci] = encodeArrowCell(child, localRow, arrowType, tz);
+                }
+            }
+        }
+        return { rows, stale: false, originalRowIndices };
     }
 
     async getLabels(columnIndex: number, indices: number[]): Promise<Record<number, string>> {

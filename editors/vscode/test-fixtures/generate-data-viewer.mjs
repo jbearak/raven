@@ -155,7 +155,138 @@ function buildBigdict() {
     write(join(outDir, 'bigdict.arrow'), t);
 }
 
+// ---------- bigint64: 5 rows × 1 Int64 column with values straddling
+//                       the JS Number.MAX_SAFE_INTEGER boundary.
+// Used to verify the sort engine doesn't coalesce distinct Int64 values
+// when they're beyond 2^53.
+
+function buildBigInt64() {
+    const N = 5;
+    // Three Int64 values above Number.MAX_SAFE_INTEGER (= 2^53 - 1) plus
+    // two safe-range anchors. Under Number-coercion, these collapse with
+    // round-half-to-even at ULP = 2:
+    //
+    //   bigint               | Number(bigint)        | note
+    //   (1n << 53n) + 1n     | 2^53                  | rounds DOWN
+    //   (1n << 53n) + 3n     | 2^53 + 4              | rounds UP (half-to-even)
+    //   (1n << 53n) + 5n     | 2^53 + 4              | rounds DOWN — COLLIDES with the +3 row
+    //
+    // (Note: (1n << 53n) + 1n == MAX_SAFE_INTEGER + 2, not + 1. The
+    // value 2^53 is one past MAX_SAFE_INTEGER and is itself
+    // representable; it's 2^53 + 1 that needs rounding.)
+    //
+    // The rows are arranged so naive Number() + stable sort produces a
+    // DIFFERENT order than bigint sort — without that, the test would
+    // pass even if the engine secretly coerced through Number:
+    //
+    //   row 0: (1n << 53n) + 5n   → Number 2^53 + 4    (precise: largest)
+    //   row 1: (1n << 53n) + 3n   → Number 2^53 + 4    (precise: middle)
+    //   row 2: (1n << 53n) + 1n   → Number 2^53        (precise: smallest of these three)
+    //   row 3: 1n
+    //   row 4: -1n
+    //
+    // Bigint asc:        [4, 3, 2, 1, 0]   (each precise value distinct)
+    // Naive Number asc:  [4, 3, 2, 0, 1]   (rows 0 and 1 tie at 2^53+4;
+    //                                       stable sort keeps original
+    //                                       order, so 0 comes before 1)
+    const values = new BigInt64Array(N);
+    values[0] = (1n << 53n) + 5n;
+    values[1] = (1n << 53n) + 3n;
+    values[2] = (1n << 53n) + 1n;
+    values[3] = 1n;
+    values[4] = -1n;
+    const fields = [new A.Field('big', new A.Int64(), false)];
+    const schema = new A.Schema(fields);
+    const colVec = A.makeVector({ data: values, type: new A.Int64() });
+    const data = A.makeData({
+        type: new A.Struct(fields),
+        length: N,
+        nullCount: 0,
+        children: [colVec.data[0]],
+    });
+    const t = new A.Table(schema, [new A.RecordBatch(schema, data)]);
+    write(join(outDir, 'bigint64.arrow'), t);
+}
+
+// ---------- uint64: 4 rows × 1 Uint64 column with values straddling
+//                     the signed 64-bit boundary (2^63).
+// Storing 2^63 in BigInt64Array would wrap to a negative two's-
+// complement bigint and break ascending order; the engine must use
+// BigUint64Array for Uint64 columns.
+
+function buildUint64() {
+    const N = 4;
+    // Original row order:
+    //   row 0: 2^63 + 1    (above signed 64-bit positive max)
+    //   row 1: 2^64 - 1    (Uint64 max)
+    //   row 2: 1
+    //   row 3: 0
+    // Asc on bigint compare → row 3, 2, 0, 1.
+    const values = new BigUint64Array(N);
+    values[0] = (1n << 63n) + 1n;
+    values[1] = (1n << 64n) - 1n;
+    values[2] = 1n;
+    values[3] = 0n;
+    const fields = [new A.Field('big', new A.Uint64(), false)];
+    const schema = new A.Schema(fields);
+    const colVec = A.makeVector({ data: values, type: new A.Uint64() });
+    const data = A.makeData({
+        type: new A.Struct(fields),
+        length: N,
+        nullCount: 0,
+        children: [colVec.data[0]],
+    });
+    const t = new A.Table(schema, [new A.RecordBatch(schema, data)]);
+    write(join(outDir, 'uint64.arrow'), t);
+}
+
+// ---------- labelled-non-float: 5 rows × 2 labelled columns whose
+//                                  underlying storage is Int32 and Utf8
+// (rather than Float64 like tiny.lbl). cell-render.ts honors valueLabels
+// for any number-or-string cell, so the sort engine must too.
+
+function buildLabelledNonFloat() {
+    const N = 5;
+    // i32 col with codes whose label order differs from numeric order:
+    //   code 1 → "zebra", 2 → "apple", 3 → "mango".
+    // Original rows: 1, 2, 3, 1, 2.
+    //   Labels off (asc by code): rows [0, 3, 1, 4, 2] (1,1,2,2,3)
+    //   Labels  on (asc by label): apple(1,4), mango(2), zebra(0,3) → [1, 4, 2, 0, 3]
+    const i32Field = new A.Field('rating', new A.Int32(), false,
+        new Map([
+            ['raven.value_labels', JSON.stringify({ 1: 'zebra', 2: 'apple', 3: 'mango' })],
+            ['raven.original_class', 'haven_labelled/vctrs_vctr/integer'],
+        ]));
+    // utf8 col with labels whose lexical order INVERTS the raw-code
+    // order, so the test can prove the engine actually uses labels
+    // when Labels is on (and raw codes when Labels is off).
+    //   "Y" → "Apple", "N" → "Mango", "M" → "Zebra"
+    // Original rows: "Y", "N", "M", "Y", "N"
+    //   Labels off (asc, raw codes): M(2), N(1), N(4), Y(0), Y(3) → [2, 1, 4, 0, 3]
+    //   Labels  on (asc, by label):  Apple(0,3), Mango(1,4), Zebra(2) → [0, 3, 1, 4, 2]
+    const utf8Field = new A.Field('answer', new A.Utf8(), false,
+        new Map([
+            ['raven.value_labels', JSON.stringify({ Y: 'Apple', N: 'Mango', M: 'Zebra' })],
+            ['raven.original_class', 'haven_labelled/vctrs_vctr/character'],
+        ]));
+    const fields = [i32Field, utf8Field];
+    const schema = new A.Schema(fields);
+    const i32Vec = A.vectorFromArray(Int32Array.from([1, 2, 3, 1, 2]), new A.Int32());
+    const utf8Vec = A.vectorFromArray(['Y', 'N', 'M', 'Y', 'N'], new A.Utf8());
+    const data = A.makeData({
+        type: new A.Struct(fields),
+        length: N,
+        nullCount: 0,
+        children: [i32Vec.data[0], utf8Vec.data[0]],
+    });
+    const t = new A.Table(schema, [new A.RecordBatch(schema, data)]);
+    write(join(outDir, 'labelled-non-float.arrow'), t);
+}
+
 buildTiny();
 buildMultibatch();
+buildBigInt64();
+buildUint64();
+buildLabelledNonFloat();
 buildBigdict();
 console.log('done.');

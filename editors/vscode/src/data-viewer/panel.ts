@@ -14,13 +14,17 @@ import * as fs from 'node:fs/promises';
 import { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import {
     COPY_CELL_LIMIT,
+    EMPTY_SORT,
     ExtensionToWebview,
     Layout,
     Settings,
+    SortState,
     WebviewToExtension,
 } from './messages';
+import { computePermutation } from './sort';
 import { LayoutStore, schemaHash } from './layout-state';
 import { ToolbarState, ToolbarStateStore } from './toolbar-state';
+import { SortStateStore } from './sort-state';
 import { build_csp } from './csp';
 import { render_tsv, ResolvedLabels } from './tsv';
 
@@ -38,6 +42,17 @@ export class DataViewerPanel {
     private dictionaries: Record<number, string[]> = {};
     private columns: ColumnSchema[] = [];
     private layout: Layout = { columnWidths: {}, hiddenColumns: [] };
+    /** Current sort state. Mirrors what the webview sees in its header
+     *  glyphs and toolbar chip strip. Updated by `setSort` and by
+     *  init/replace's restore path. */
+    private sort: SortState = EMPTY_SORT;
+    /** Permutation backing the current sort. `undefined` ↔ identity
+     *  ordering. Plumbed into every reader.getRows call below. */
+    private permutation: Uint32Array | undefined;
+    /** Monotonic counter — every setSort that produces a new permutation
+     *  bumps it. Late-landing `sortApplied` responses tagged with an
+     *  older value are dropped. */
+    private sortGeneration = 0;
     private readonly traceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     /** Latest visible-row range observed via lifecycle events. Used by
      *  the integration test API. `undefined` until the first lifecycle
@@ -57,6 +72,7 @@ export class DataViewerPanel {
         filePath: string,
         private readonly store: LayoutStore,
         private readonly toolbarStore: ToolbarStateStore,
+        private readonly sortStore: SortStateStore,
         private readonly settings: Settings,
         private readonly disposeHook: () => void,
     ) {
@@ -76,6 +92,7 @@ export class DataViewerPanel {
         filePath: string,
         store: LayoutStore,
         toolbarStore: ToolbarStateStore,
+        sortStore: SortStateStore,
         settings: Settings,
         extensionUri: vscode.Uri,
         disposeHook: () => void,
@@ -94,7 +111,8 @@ export class DataViewerPanel {
         );
         webviewPanel.webview.html = build_html(webviewPanel.webview, extensionUri);
         const panel = new DataViewerPanel(
-            panelName, webviewPanel, reader, filePath, store, toolbarStore, settings, disposeHook,
+            panelName, webviewPanel, reader, filePath,
+            store, toolbarStore, sortStore, settings, disposeHook,
         );
         panel.trace('create', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         return panel;
@@ -121,6 +139,11 @@ export class DataViewerPanel {
         this.lastVisibleRange = undefined;
         this.lastViewportRange = undefined;
         this.lastFocusCell = undefined;
+        // Old permutation cannot be reused — sendReplace below will
+        // attempt to restore a saved sort against the new reader.
+        this.sort = EMPTY_SORT;
+        this.permutation = undefined;
+        this.sortGeneration += 1;
         const prevReader = this.reader;
         const prevPath = this.filePath;
         this.reader = reader;
@@ -146,25 +169,32 @@ export class DataViewerPanel {
         const reader = this.reader;
         const columns = reader.schema.columns;
         const layoutHash = schemaHash(columns);
-        const [layout, toolbar] = await Promise.all([
+        const [layout, toolbar, savedSort] = await Promise.all([
             this.store.load(this.panelName, layoutHash),
             this.toolbarStore.load(this.panelName, layoutHash),
+            this.settings.persistSort
+                ? this.sortStore.load(this.panelName, layoutHash)
+                : Promise.resolve(undefined),
         ]);
         if (generation !== this.generation || reader !== this.reader) return false;
         this.columns = columns;
         this.layout = layout ?? { columnWidths: {}, hiddenColumns: [] };
         this.dictionaries = this.collectDictionaries();
+        const activeToolbar = toolbar ?? this.defaultToolbar();
+        const restored = await this.restoreSort(savedSort, activeToolbar, generation, reader);
+        if (generation !== this.generation || reader !== this.reader) return false;
         const msg: ExtensionToWebview = {
             type: 'init',
             panelGeneration: generation,
             nrow: reader.nrow,
             columns: this.columns,
             layout: this.layout,
-            toolbar: toolbar ?? this.defaultToolbar(),
+            toolbar: activeToolbar,
             settings: this.settings,
             dictionaries: this.dictionaries,
             schemaHash: layoutHash,
             objectClass: reader.schema.objectClass,
+            sort: restored,
         };
         this.trace('post-init', {
             generation,
@@ -188,24 +218,31 @@ export class DataViewerPanel {
         const reader = this.reader;
         const columns = reader.schema.columns;
         const layoutHash = schemaHash(columns);
-        const [layout, toolbar] = await Promise.all([
+        const [layout, toolbar, savedSort] = await Promise.all([
             this.store.load(this.panelName, layoutHash),
             this.toolbarStore.load(this.panelName, layoutHash),
+            this.settings.persistSort
+                ? this.sortStore.load(this.panelName, layoutHash)
+                : Promise.resolve(undefined),
         ]);
         if (generation !== this.generation || reader !== this.reader) return;
         this.columns = columns;
         this.layout = layout ?? { columnWidths: {}, hiddenColumns: [] };
         this.dictionaries = this.collectDictionaries();
+        const activeToolbar = toolbar ?? this.defaultToolbar();
+        const restored = await this.restoreSort(savedSort, activeToolbar, generation, reader);
+        if (generation !== this.generation || reader !== this.reader) return;
         const msg: ExtensionToWebview = {
             type: 'replace',
             panelGeneration: generation,
             nrow: reader.nrow,
             columns: this.columns,
             layout: this.layout,
-            toolbar: toolbar ?? this.defaultToolbar(),
+            toolbar: activeToolbar,
             dictionaries: this.dictionaries,
             schemaHash: layoutHash,
             objectClass: reader.schema.objectClass,
+            sort: restored,
         };
         this.trace('post-replace', {
             generation,
@@ -216,6 +253,49 @@ export class DataViewerPanel {
             loadedToolbar: toolbar ?? null,
         });
         await this.webviewPanel.webview.postMessage(msg);
+    }
+
+    /** Attempt to restore a persisted sort. Returns the SortState to ship
+     *  to the webview, and as a side effect updates `this.sort` and
+     *  `this.permutation`. Always recomputes the permutation against the
+     *  current reader — schema-hash equality is not evidence that two
+     *  datasets share row values, so the only persisted truth is the
+     *  list of sort keys. The state is dropped when:
+     *    - persistSort is off,
+     *    - no saved state exists,
+     *    - the saved state had no keys (already empty), or
+     *    - any key references a column that no longer exists.
+     *  Caller is responsible for the post-await generation check. */
+    private async restoreSort(
+        saved: SortState | undefined,
+        toolbar: ToolbarState,
+        generation: number,
+        reader: ArrowSliceReader,
+    ): Promise<SortState> {
+        this.sort = EMPTY_SORT;
+        this.permutation = undefined;
+        if (!saved || saved.keys.length === 0) return EMPTY_SORT;
+        const maxColIndex = this.columns.length - 1;
+        for (const k of saved.keys) {
+            if (k.columnIndex < 0 || k.columnIndex > maxColIndex) return EMPTY_SORT;
+        }
+        try {
+            const perm = await computePermutation(reader, saved.keys, {
+                labelsOn: toolbar.labelsOn,
+                formatOn: toolbar.formatOn,
+                digits: toolbar.digits,
+            });
+            if (generation !== this.generation || reader !== this.reader) return EMPTY_SORT;
+            this.sort = {
+                keys: saved.keys,
+                labelsOnWhenSorted: toolbar.labelsOn,
+            };
+            this.permutation = perm;
+            this.sortGeneration += 1;
+            return this.sort;
+        } catch {
+            return EMPTY_SORT;
+        }
     }
 
     private collectDictionaries(): Record<number, string[]> {
@@ -313,6 +393,20 @@ export class DataViewerPanel {
             }
             return;
         }
+        if (m.type === 'saveSort') {
+            this.trace('save-sort', {
+                schemaHash: m.schemaHash,
+                keys: m.sort.keys,
+            });
+            if (m.schemaHash && this.settings.persistSort) {
+                if (m.sort.keys.length === 0) {
+                    await this.sortStore.clear(this.panelName, m.schemaHash);
+                } else {
+                    await this.sortStore.save(this.panelName, m.schemaHash, m.sort);
+                }
+            }
+            return;
+        }
         if (m.panelGeneration !== this.generation) return;
         // Capture generation BEFORE any await so a replace mid-fetch causes
         // us to drop the stale response rather than post under the new
@@ -337,6 +431,7 @@ export class DataViewerPanel {
                         end: m.end,
                         columns: m.columns,
                         viewportGeneration: m.viewportGeneration,
+                        permutation: this.permutation,
                     });
                 } catch (err) {
                     if (gen !== this.generation || reader !== this.reader || this.disposed) return;
@@ -352,6 +447,7 @@ export class DataViewerPanel {
                     end: m.end,
                     rows: out.rows,
                     stale: out.stale,
+                    originalRowIndices: out.originalRowIndices,
                 };
                 this.trace('post-rows', {
                     generation: gen,
@@ -381,7 +477,101 @@ export class DataViewerPanel {
                 await this.handleCopy(m, gen);
                 return;
             }
+            case 'setSort': {
+                await this.handleSetSort(m, gen);
+                return;
+            }
         }
+    }
+
+    private async handleSetSort(
+        m: Extract<WebviewToExtension, { type: 'setSort' }>,
+        gen: number,
+    ): Promise<void> {
+        // Clear the current permutation and let the webview render a
+        // "Sorting…" indicator while we work. For empty `keys`, this is
+        // also the final state (no apply pass needed).
+        this.sortGeneration += 1;
+        const mySortGen = this.sortGeneration;
+        if (m.keys.length === 0) {
+            this.sort = EMPTY_SORT;
+            this.permutation = undefined;
+            const ack: ExtensionToWebview = {
+                type: 'sortApplied',
+                panelGeneration: gen,
+                requestId: m.requestId,
+                sort: EMPTY_SORT,
+                fromPersistence: false,
+            };
+            await this.webviewPanel.webview.postMessage(ack);
+            return;
+        }
+
+        const pending: ExtensionToWebview = {
+            type: 'sortStatus',
+            panelGeneration: gen,
+            state: 'pending',
+        };
+        await this.webviewPanel.webview.postMessage(pending);
+
+        let perm: Uint32Array;
+        try {
+            perm = await computePermutation(this.reader, m.keys, {
+                labelsOn: m.labelsOn,
+                formatOn: m.formatOn,
+                digits: m.digits,
+            });
+        } catch (err) {
+            // Drop the failure entirely if a newer setSort or a panel
+            // replace landed while computePermutation was in flight —
+            // publishing a stale idle/error pair would either confuse the
+            // status bar (clearing a "Sorting…" that belongs to a newer
+            // request) or surface an error that's no longer relevant.
+            if (gen !== this.generation
+                || mySortGen !== this.sortGeneration
+                || this.disposed) {
+                return;
+            }
+            const idle: ExtensionToWebview = {
+                type: 'sortStatus',
+                panelGeneration: gen,
+                state: 'idle',
+            };
+            await this.webviewPanel.webview.postMessage(idle);
+            const errMsg: ExtensionToWebview = {
+                type: 'error',
+                panelGeneration: gen,
+                message: err instanceof Error ? err.message : String(err),
+            };
+            await this.webviewPanel.webview.postMessage(errMsg);
+            return;
+        }
+
+        // If another setSort raced in front, or the panel was replaced,
+        // discard our result without publishing.
+        if (gen !== this.generation || mySortGen !== this.sortGeneration) return;
+
+        const next: SortState = {
+            keys: m.keys,
+            labelsOnWhenSorted: m.labelsOn,
+        };
+        this.sort = next;
+        this.permutation = perm;
+
+        const idle: ExtensionToWebview = {
+            type: 'sortStatus',
+            panelGeneration: gen,
+            state: 'idle',
+        };
+        await this.webviewPanel.webview.postMessage(idle);
+        const ack: ExtensionToWebview = {
+            type: 'sortApplied',
+            panelGeneration: gen,
+            requestId: m.requestId,
+            sort: next,
+            fromPersistence: false,
+        };
+        await this.webviewPanel.webview.postMessage(ack);
     }
 
     private async handleCopy(
@@ -406,6 +596,7 @@ export class DataViewerPanel {
             end: m.range.rowEnd,
             columns: m.range.colIndices,
             viewportGeneration: Number.MAX_SAFE_INTEGER,
+            permutation: this.permutation,
         });
         if (gen !== this.generation) return;
 

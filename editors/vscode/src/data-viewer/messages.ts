@@ -25,6 +25,32 @@ export type Layout = {
 export type Settings = {
     missingValueStyle: 'foreground' | 'background' | 'none';
     defaultDigits: number;
+    persistSort: boolean;
+};
+
+/** A single sort key. Priority is the position in the SortState.keys array
+ *  — index 0 is the primary key, index 1 the secondary, etc. */
+export type SortKey = {
+    /** Index into ColumnSchema[]. Stable for a given schema hash. */
+    columnIndex: number;
+    direction: 'asc' | 'desc';
+};
+
+export type SortState = {
+    keys: SortKey[];
+    /** Snapshot of Labels-on at the time the sort was built. Used by the
+     *  webview to detect that the Labels toggle has flipped since this
+     *  sort was last applied, so a labelled column re-sorts. The host
+     *  itself always recomputes the permutation on restore — the
+     *  persisted `keys` are the only source of truth for ordering, and
+     *  schema-hash equality plus column-name equality is not evidence of
+     *  same values. */
+    labelsOnWhenSorted: boolean;
+};
+
+export const EMPTY_SORT: SortState = {
+    keys: [],
+    labelsOnWhenSorted: true,
 };
 
 export type ExtensionToWebview =
@@ -38,11 +64,15 @@ export type ExtensionToWebview =
         settings: Settings;
         dictionaries: Record<number, string[]>;
         /** schemaHash for the active dataset. Echoed back by saveLayout
-         *  / saveToolbar so the host stores under the hash that was
-         *  current when the user toggled, even if a later replace
-         *  swapped the dataset before the debounce fired. */
+         *  / saveToolbar / saveSort so the host stores under the hash
+         *  that was current when the user toggled, even if a later
+         *  replace swapped the dataset before the debounce fired. */
         schemaHash: string;
         objectClass?: string;
+        /** Sort state restored from persistence, or EMPTY_SORT if none.
+         *  Webview reflects this in its header glyphs and toolbar strip
+         *  without firing the apply-pulse animation. */
+        sort: SortState;
     }
     | {
         type: 'rows';
@@ -53,6 +83,11 @@ export type ExtensionToWebview =
         end: number;
         rows: Cell[][];
         stale: boolean;
+        /** When a sort is active, the original (unsorted) 0-based row
+         *  index for each row in this window. Length matches rows.length.
+         *  Omitted when no sort is active — the gutter falls back to
+         *  `position + 1`. */
+        originalRowIndices?: number[];
     }
     | {
         type: 'labels';
@@ -71,6 +106,26 @@ export type ExtensionToWebview =
         dictionaries: Record<number, string[]>;
         schemaHash: string;
         objectClass?: string;
+        sort: SortState;
+    }
+    | {
+        /** Sent after the extension host has finished building the
+         *  permutation for a setSort request. The webview updates its
+         *  header glyphs, toolbar strip, status bar, and gutter
+         *  renderer. The pulse animation fires only when
+         *  `fromPersistence` is false. */
+        type: 'sortApplied';
+        panelGeneration: number;
+        requestId: number;
+        sort: SortState;
+        fromPersistence: boolean;
+    }
+    | {
+        /** Lifecycle ping for the in-panel status bar. `state: 'pending'`
+         *  shows a "Sorting…" indicator; `'idle'` clears it. */
+        type: 'sortStatus';
+        panelGeneration: number;
+        state: 'pending' | 'idle';
     }
     | {
         type: 'copyDone';
@@ -182,6 +237,31 @@ export type WebviewToExtension =
          *  paste lands with headers. Set by the webview for column /
          *  select-all selections. */
         includeHeader: boolean;
+    }
+    | {
+        /** Apply (or update, or clear) the active sort. The extension
+         *  host builds the permutation and broadcasts `sortApplied`.
+         *  Sending an empty `keys` array clears the sort. The Labels /
+         *  Format / digits snapshot lets the host derive sort keys
+         *  WYSIWYG without depending on a separate toolbar-snapshot
+         *  message. */
+        type: 'setSort';
+        panelGeneration: number;
+        requestId: number;
+        keys: SortKey[];
+        labelsOn: boolean;
+        formatOn: boolean;
+        digits: number;
+    }
+    | {
+        /** Debounced persistence of the active sort, mirroring
+         *  saveLayout / saveToolbar. The schemaHash echoes the active
+         *  one so a save that lands after a replace still goes to the
+         *  right slot. */
+        type: 'saveSort';
+        panelGeneration: number;
+        schemaHash: string;
+        sort: SortState;
     };
 
 /** Hard cap on the number of cells the extension will materialize for a
