@@ -91,7 +91,7 @@ type HeaderTooltipState = {
 
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
-const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true };
+const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true };
 
 function createEmptySelection(): GridSelection {
     return {

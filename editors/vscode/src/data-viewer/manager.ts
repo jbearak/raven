@@ -18,6 +18,7 @@ import { DataViewerPanel } from './panel';
 import { LayoutStore } from './layout-state';
 import { ToolbarStateStore } from './toolbar-state';
 import { SortStateStore } from './sort-state';
+import { FilterStateStore } from './filter-state';
 import { Settings } from './messages';
 import { sweep_stale } from './sweep';
 import type { ViewDataEvent } from '../r-session-server/types';
@@ -31,6 +32,7 @@ export class DataViewerManager {
         private readonly store: LayoutStore,
         private readonly toolbarStore: ToolbarStateStore,
         private readonly sortStore: SortStateStore,
+        private readonly filterStore: FilterStateStore,
         private readonly settings: () => Settings,
     ) {}
 
@@ -46,7 +48,7 @@ export class DataViewerManager {
                 }
                 const panel = await DataViewerPanel.create(
                     e.panelName, reader, e.filePath,
-                    this.store, this.toolbarStore, this.sortStore, this.settings(),
+                    this.store, this.toolbarStore, this.sortStore, this.filterStore, this.settings(),
                     this.extensionUri,
                     () => { this.panels.delete(e.panelName); },
                 );

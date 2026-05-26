@@ -26,6 +26,7 @@ export type Settings = {
     missingValueStyle: 'foreground' | 'background' | 'none';
     defaultDigits: number;
     persistSort: boolean;
+    persistFilters: boolean;
 };
 
 /** A single sort key. Priority is the position in the SortState.keys array
