@@ -38,21 +38,19 @@ export type SortKey = {
 
 export type SortState = {
     keys: SortKey[];
-    /** Snapshot of Labels-on at the time the sort was built. Restoring a
-     *  saved sort when the current Labels state differs is fine — we
-     *  rebuild the affected keys — but the snapshot lets us detect "no
-     *  rebuild needed" and skip recomputing. */
+    /** Snapshot of Labels-on at the time the sort was built. Used by the
+     *  webview to detect that the Labels toggle has flipped since this
+     *  sort was last applied, so a labelled column re-sorts. The host
+     *  itself always recomputes the permutation on restore — the
+     *  persisted `keys` are the only source of truth for ordering, and
+     *  schema-hash equality plus column-name equality is not evidence of
+     *  same values. */
     labelsOnWhenSorted: boolean;
-    /** Row count at sort time. If a re-View() produces a different nrow
-     *  for the same schemaHash, the saved permutation is invalid and the
-     *  sort is dropped on restore (with a clearing toast). */
-    nrowWhenSorted: number;
 };
 
 export const EMPTY_SORT: SortState = {
     keys: [],
     labelsOnWhenSorted: true,
-    nrowWhenSorted: 0,
 };
 
 export type ExtensionToWebview =

@@ -10,7 +10,7 @@
  * events) is a follow-on.
  */
 
-import { describe, test, expect, mock } from 'bun:test';
+import { describe, test, expect, mock, afterEach } from 'bun:test';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { copyFileSync, mkdtempSync } from 'node:fs';
@@ -107,28 +107,73 @@ async function flush(): Promise<void> {
     for (let i = 0; i < 4; i++) await new Promise(r => setTimeout(r, 0));
 }
 
+/** Resources to tear down even when a test assertion throws. afterEach
+ *  walks these in reverse order so readers are closed before their
+ *  panels are disposed. */
+type Cleanup = () => Promise<void> | void;
+let pendingCleanups: Cleanup[] = [];
+
+afterEach(async () => {
+    const list = pendingCleanups.reverse();
+    pendingCleanups = [];
+    for (const c of list) {
+        try { await c(); } catch { /* swallow — best effort */ }
+    }
+    mock.restore();
+});
+
+type PanelTestContext = {
+    panel: any;
+    reader: any;
+    fakePanel: FakeWebviewPanel;
+    fakeWebview: FakeWebview;
+    sortStore: any;
+    tempPath: string;
+    arrowMod: any;
+    panelMod: any;
+};
+
+/** Set up a DataViewerPanel against the tiny fixture. Registers
+ *  failure-safe cleanups (reader close + fake-panel dispose) with
+ *  afterEach so a thrown assertion still releases resources. */
+async function setupPanel(settingsOverride?: Partial<typeof TEST_SETTINGS>): Promise<PanelTestContext> {
+    const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
+    const kv = new MemKV();
+    const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
+    const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
+    const sortStore = new sortMod.SortStateStore(kv as any, 100);
+    const tempPath = tempCopyOf('tiny.arrow');
+    const reader = await arrowMod.ArrowSliceReader.open(tempPath);
+    pendingCleanups.push(() => reader.close().catch(() => undefined));
+    const panel = await panelMod.DataViewerPanel.create(
+        'tiny', reader, tempPath,
+        layoutStore, toolbarStore, sortStore,
+        { ...TEST_SETTINGS, ...settingsOverride },
+        { fsPath: '/x', toString: () => '/x' } as any,
+        () => {},
+    );
+    const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+    pendingCleanups.push(() => fakePanel.dispose());
+    return {
+        panel,
+        reader,
+        fakePanel,
+        fakeWebview: fakePanel.webview,
+        sortStore,
+        tempPath,
+        arrowMod,
+        panelMod,
+    };
+}
+
 describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
     test('setSort builds a permutation and broadcasts sortApplied', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
-        const kv = new MemKV();
-        const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
-        const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
-        const sortStore = new sortMod.SortStateStore(kv as any, 100);
-        const reader = await arrowMod.ArrowSliceReader.open(tempCopyOf('tiny.arrow'));
-        const panel = await panelMod.DataViewerPanel.create(
-            'tiny', reader, tempCopyOf('tiny.arrow'),
-            layoutStore, toolbarStore, sortStore,
-            TEST_SETTINGS,
-            { fsPath: '/x', toString: () => '/x' } as any,
-            () => {},
-        );
-        const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
-        const fakeWebview = fakePanel.webview;
+        const { fakeWebview } = await setupPanel();
 
         fakeWebview.deliverFromWebview({ type: 'webviewReady' });
         await flush();
         const init = fakeWebview.posted.find(m => m.type === 'init') as any;
-        expect(init.sort).toEqual({ keys: [], labelsOnWhenSorted: true, nrowWhenSorted: 0 });
+        expect(init.sort).toEqual({ keys: [], labelsOnWhenSorted: true });
 
         // tiny.x = [1,2,3,4,5]; desc → [4,3,2,1,0]
         fakeWebview.deliverFromWebview({
@@ -145,33 +190,15 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
         expect(ack).toBeDefined();
         expect(ack.fromPersistence).toBe(false);
         expect(ack.sort.keys).toEqual([{ columnIndex: 0, direction: 'desc' }]);
-        expect(ack.sort.nrowWhenSorted).toBe(5);
+        expect(ack.sort.labelsOnWhenSorted).toBe(true);
 
         // sortStatus pending → idle pair should be present.
         const statusMessages = fakeWebview.posted.filter(m => m.type === 'sortStatus');
         expect(statusMessages.map(m => m.state)).toEqual(['pending', 'idle']);
-
-        await reader.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('subsequent getRows uses the active permutation', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
-        const kv = new MemKV();
-        const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
-        const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
-        const sortStore = new sortMod.SortStateStore(kv as any, 100);
-        const reader = await arrowMod.ArrowSliceReader.open(tempCopyOf('tiny.arrow'));
-        const panel = await panelMod.DataViewerPanel.create(
-            'tiny', reader, tempCopyOf('tiny.arrow'),
-            layoutStore, toolbarStore, sortStore,
-            TEST_SETTINGS,
-            { fsPath: '/x', toString: () => '/x' } as any,
-            () => {},
-        );
-        const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
-        const fakeWebview = fakePanel.webview;
+        const { fakeWebview } = await setupPanel();
 
         fakeWebview.deliverFromWebview({ type: 'webviewReady' });
         await flush();
@@ -202,28 +229,10 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
         expect(rows).toBeDefined();
         expect(rows.rows.map((r: any[]) => r[0])).toEqual([5, 4, 3, 2, 1]);
         expect(rows.originalRowIndices).toEqual([4, 3, 2, 1, 0]);
-
-        await reader.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('saveSort persists and next init restores the sort', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
-        const kv = new MemKV();
-        const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
-        const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
-        const sortStore = new sortMod.SortStateStore(kv as any, 100);
-        const reader = await arrowMod.ArrowSliceReader.open(tempCopyOf('tiny.arrow'));
-        const panel = await panelMod.DataViewerPanel.create(
-            'tiny', reader, tempCopyOf('tiny.arrow'),
-            layoutStore, toolbarStore, sortStore,
-            TEST_SETTINGS,
-            { fsPath: '/x', toString: () => '/x' } as any,
-            () => {},
-        );
-        const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
-        const fakeWebview = fakePanel.webview;
+        const { panel, fakeWebview, sortStore, arrowMod } = await setupPanel();
 
         fakeWebview.deliverFromWebview({ type: 'webviewReady' });
         await flush();
@@ -238,7 +247,6 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
             sort: {
                 keys: [{ columnIndex: 0, direction: 'desc' }],
                 labelsOnWhenSorted: true,
-                nrowWhenSorted: 5,
             },
         });
         await flush();
@@ -246,12 +254,14 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
         expect(stored).toEqual({
             keys: [{ columnIndex: 0, direction: 'desc' }],
             labelsOnWhenSorted: true,
-            nrowWhenSorted: 5,
         });
 
-        // Trigger a replace; the saved sort should restore.
+        // Trigger a replace; the saved sort should restore. The replace
+        // path opens its own reader and panel.replace() unlinks the
+        // previous file, so the second reader gets its own temp copy.
         const path2 = tempCopyOf('tiny.arrow');
         const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        pendingCleanups.push(() => reader2.close().catch(() => undefined));
         await panel.replace(reader2, path2);
         await flush();
         const replace = fakeWebview.posted.find(m => m.type === 'replace') as any;
@@ -269,28 +279,10 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
         await flush();
         const rows = fakeWebview.posted.find(m => m.type === 'rows' && m.requestId === 9) as any;
         expect(rows.rows.map((r: any[]) => r[0])).toEqual([5, 4, 3, 2, 1]);
-
-        await reader2.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('setSort with empty keys clears the permutation', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
-        const kv = new MemKV();
-        const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
-        const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
-        const sortStore = new sortMod.SortStateStore(kv as any, 100);
-        const reader = await arrowMod.ArrowSliceReader.open(tempCopyOf('tiny.arrow'));
-        const panel = await panelMod.DataViewerPanel.create(
-            'tiny', reader, tempCopyOf('tiny.arrow'),
-            layoutStore, toolbarStore, sortStore,
-            TEST_SETTINGS,
-            { fsPath: '/x', toString: () => '/x' } as any,
-            () => {},
-        );
-        const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
-        const fakeWebview = fakePanel.webview;
+        const { fakeWebview } = await setupPanel();
 
         fakeWebview.deliverFromWebview({ type: 'webviewReady' });
         await flush();
@@ -332,28 +324,10 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
         const rows = fakeWebview.posted.find(m => m.type === 'rows' && m.requestId === 3) as any;
         expect(rows.rows.map((r: any[]) => r[0])).toEqual([1, 2, 3, 4, 5]);
         expect(rows.originalRowIndices).toBeUndefined();
-
-        await reader.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 
     test('persistSort=false skips sortStore writes', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
-        const kv = new MemKV();
-        const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
-        const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
-        const sortStore = new sortMod.SortStateStore(kv as any, 100);
-        const reader = await arrowMod.ArrowSliceReader.open(tempCopyOf('tiny.arrow'));
-        const panel = await panelMod.DataViewerPanel.create(
-            'tiny', reader, tempCopyOf('tiny.arrow'),
-            layoutStore, toolbarStore, sortStore,
-            { ...TEST_SETTINGS, persistSort: false },
-            { fsPath: '/x', toString: () => '/x' } as any,
-            () => {},
-        );
-        const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
-        const fakeWebview = fakePanel.webview;
+        const { fakeWebview, sortStore } = await setupPanel({ persistSort: false });
 
         fakeWebview.deliverFromWebview({ type: 'webviewReady' });
         await flush();
@@ -366,15 +340,10 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
             sort: {
                 keys: [{ columnIndex: 0, direction: 'desc' }],
                 labelsOnWhenSorted: true,
-                nrowWhenSorted: 5,
             },
         });
         await flush();
         const stored = await sortStore.load('tiny', init.schemaHash);
         expect(stored).toBeUndefined();
-
-        await reader.close().catch(() => undefined);
-        fakePanel.dispose();
-        mock.restore();
     });
 });

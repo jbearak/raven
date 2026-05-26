@@ -10,7 +10,7 @@
  * strip would just be wasted toolbar real estate.
  */
 
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { ColumnSchema } from '../arrow-reader';
 import type { SortKey, SortState } from '../messages';
 import { useDismiss } from './use-dismiss';
@@ -75,10 +75,29 @@ function SortChip({
     // container's `overflow-x: auto` clip (the strip needs horizontal
     // scrolling for many sort keys, but `overflow: auto` would
     // otherwise clip absolutely-positioned descendants).
+    //
+    // Open captures provisional coords from the chip's bottom-left; a
+    // layout effect below measures the rendered popover and clamps to
+    // the viewport so a chip near the right edge or bottom of the
+    // toolbar doesn't push the popover off-screen.
     const [popoverCoords, setPopoverCoords] = useState<{ left: number; top: number } | null>(null);
     const popoverRef = useRef<HTMLDivElement>(null);
     const chipRef = useRef<HTMLButtonElement>(null);
     useDismiss(popoverRef, () => setPopoverCoords(null));
+
+    useLayoutEffect(() => {
+        const el = popoverRef.current;
+        if (!el || !popoverCoords) return;
+        const MARGIN = 4;
+        const rect = el.getBoundingClientRect();
+        const maxLeft = Math.max(MARGIN, window.innerWidth - rect.width - MARGIN);
+        const maxTop = Math.max(MARGIN, window.innerHeight - rect.height - MARGIN);
+        const clampedLeft = Math.min(Math.max(MARGIN, popoverCoords.left), maxLeft);
+        const clampedTop = Math.min(Math.max(MARGIN, popoverCoords.top), maxTop);
+        if (clampedLeft !== popoverCoords.left || clampedTop !== popoverCoords.top) {
+            setPopoverCoords({ left: clampedLeft, top: clampedTop });
+        }
+    }, [popoverCoords]);
 
     const popoverOpen = popoverCoords !== null;
     const arrow = sortKey.direction === 'asc' ? '▲' : '▼';

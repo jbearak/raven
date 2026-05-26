@@ -155,7 +155,43 @@ function buildBigdict() {
     write(join(outDir, 'bigdict.arrow'), t);
 }
 
+// ---------- bigint64: 5 rows × 1 Int64 column with values straddling
+//                       the JS Number.MAX_SAFE_INTEGER boundary.
+// Used to verify the sort engine doesn't coalesce distinct Int64 values
+// when they're beyond 2^53.
+
+function buildBigInt64() {
+    const N = 5;
+    // Three values just above MAX_SAFE_INTEGER that all collapse to the
+    // same Number under naive Number(bigint), plus two distinct safe
+    // values for ordering anchors. Original row order:
+    //   row 0: MAX_SAFE_INTEGER + 1 (= 2^53)          [coalesces with row 1, 2]
+    //   row 1: MAX_SAFE_INTEGER + 3
+    //   row 2: MAX_SAFE_INTEGER + 5
+    //   row 3: 1
+    //   row 4: -1
+    // Asc on bigint compare → row 4, 3, 0, 1, 2.
+    const values = new BigInt64Array(N);
+    values[0] = (1n << 53n) + 1n;
+    values[1] = (1n << 53n) + 3n;
+    values[2] = (1n << 53n) + 5n;
+    values[3] = 1n;
+    values[4] = -1n;
+    const fields = [new A.Field('big', new A.Int64(), false)];
+    const schema = new A.Schema(fields);
+    const colVec = A.makeVector({ data: values, type: new A.Int64() });
+    const data = A.makeData({
+        type: new A.Struct(fields),
+        length: N,
+        nullCount: 0,
+        children: [colVec.data[0]],
+    });
+    const t = new A.Table(schema, [new A.RecordBatch(schema, data)]);
+    write(join(outDir, 'bigint64.arrow'), t);
+}
+
 buildTiny();
 buildMultibatch();
+buildBigInt64();
 buildBigdict();
 console.log('done.');

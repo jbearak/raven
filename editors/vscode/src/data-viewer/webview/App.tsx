@@ -195,6 +195,25 @@ function useVscodeTheme(): { grid: Partial<Theme>; missingFg: Partial<Theme>; mi
     }, [revision]);
 }
 
+/** True when an event would type into the given element (or its
+ *  shadow-DOM descendants). Used to guard keyboard shortcuts so they
+ *  don't hijack the user's typing in text inputs / textareas / selects /
+ *  contenteditable surfaces. */
+function isEditableTarget(el: Element | null): boolean {
+    if (!el) return false;
+    if (el instanceof HTMLInputElement) {
+        // Buttons and checkboxes don't take text — only true text inputs.
+        const t = el.type.toLowerCase();
+        return t !== 'button' && t !== 'submit' && t !== 'reset'
+            && t !== 'checkbox' && t !== 'radio'
+            && t !== 'image' && t !== 'file' && t !== 'color';
+    }
+    if (el instanceof HTMLTextAreaElement) return true;
+    if (el instanceof HTMLSelectElement) return true;
+    if (el instanceof HTMLElement && el.isContentEditable) return true;
+    return false;
+}
+
 /** Paint the sort arrow + (when there's more than one key) a priority
  *  badge in the right-edge cluster of a column header. The arrow alpha
  *  encodes the primary/secondary cue at a glance; the badge is the
@@ -956,9 +975,13 @@ export function App({
         const onKeyDown = (event: KeyboardEvent) => {
             // Sort shortcuts: Shift+Alt+A / D / 0. Reserved namespace —
             // they don't collide with the platform's Cmd/Ctrl+A select
-            // or arrow-key navigation already wired below.
+            // or arrow-key navigation already wired below. Skip when
+            // focus is in a text-entry control (e.g. the column-filter
+            // input in the Columns popover) so the modifier doesn't
+            // hijack the user's typing.
             if (event.shiftKey && event.altKey
-                && !event.metaKey && !event.ctrlKey) {
+                && !event.metaKey && !event.ctrlKey
+                && !isEditableTarget(document.activeElement)) {
                 if (event.key === 'A' || event.code === 'KeyA') {
                     event.preventDefault();
                     const focused = gridSelection.current?.cell[0];

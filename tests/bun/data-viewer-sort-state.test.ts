@@ -29,7 +29,6 @@ class MemKV {
 const STATE_A: SortState = {
     keys: [{ columnIndex: 2, direction: 'asc' }],
     labelsOnWhenSorted: true,
-    nrowWhenSorted: 100,
 };
 const STATE_B: SortState = {
     keys: [
@@ -37,7 +36,6 @@ const STATE_B: SortState = {
         { columnIndex: 1, direction: 'asc' },
     ],
     labelsOnWhenSorted: false,
-    nrowWhenSorted: 1000,
 };
 
 describe('SortStateStore', () => {

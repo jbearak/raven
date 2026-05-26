@@ -129,6 +129,13 @@ async function buildSortColumn(
     if (arrowType.startsWith('Dictionary')) {
         return buildDictionarySortColumn(reader, columnIndex, schema, ctx);
     }
+    if (arrowType === 'Int64' || arrowType === 'Uint64') {
+        // 64-bit integers can exceed Number's 2^53 safe range, where
+        // distinct values would coalesce into the same Number and sort
+        // as ties. Use BigInt storage + bigint comparator so the order
+        // is exact at the full Int64 range.
+        return buildBigIntSortColumn(reader, columnIndex);
+    }
     if (arrowType.startsWith('Int') || arrowType === 'Bool') {
         return buildNumericSortColumn(reader, columnIndex, false);
     }
@@ -150,7 +157,12 @@ async function buildSortColumn(
     return buildStringSortColumn(reader, columnIndex);
 }
 
-/** Numeric sort column from an Int / Bool / Float / Date column.
+/** Numeric sort column from Int8/16/32, Bool, Float, or Date columns.
+ *  All of these have `.get()` results that fit in JS Number without
+ *  precision loss (Int8/16/32 < 2^32, Bool 0/1, Float64 IEEE-754,
+ *  Date32 < ~5.8M days, Date64 ms < 2^53 for any plausible year).
+ *  Int64/Uint64 columns route through {@link buildBigIntSortColumn}.
+ *
  *  When `floatNaNMissing` is true, NaN values are treated as missing
  *  (matches Float NA semantics from the bootstrap profile). */
 async function buildNumericSortColumn(
@@ -170,8 +182,6 @@ async function buildNumericSortColumn(
             if (v === null || v === undefined) {
                 missing[i] = 1;
                 values[i] = 0;
-            } else if (typeof v === 'bigint') {
-                values[i] = Number(v);
             } else if (floatNaNMissing && Number.isNaN(v as number)) {
                 missing[i] = 1;
                 values[i] = 0;
@@ -190,17 +200,50 @@ async function buildNumericSortColumn(
     };
 }
 
-/** Timestamp sort: read raw microsecond bigint, fall back through
- *  `Number()` for ordering. JS number is safe up to ~2^53 µs which is
- *  ~285 years past the epoch — plenty for the present-day use case.
- *  Pre-1970 and far-future timestamps round-trip without precision loss
- *  at the second level. */
+/** Sort column for Int64 / Uint64. Storage is `BigInt64Array`; the
+ *  comparator uses bigint `<` / `>` so distinct values beyond 2^53
+ *  stay distinct (Number coercion would coalesce them and produce
+ *  spurious sort ties). */
+async function buildBigIntSortColumn(
+    reader: ArrowSliceReader,
+    columnIndex: number,
+): Promise<SortColumn> {
+    const nrow = reader.nrow;
+    const values = new BigInt64Array(nrow);
+    const missing = new Uint8Array(nrow);
+    for await (const batch of iterateBatches(reader)) {
+        const child = batch.batch.getChildAt(columnIndex);
+        for (let r = 0; r < batch.length; r++) {
+            const v = child.get(r);
+            const i = batch.start + r;
+            if (v === null || v === undefined) {
+                missing[i] = 1;
+                continue;
+            }
+            values[i] = typeof v === 'bigint' ? v : BigInt(v as number);
+        }
+    }
+    return {
+        missing,
+        compare: (a, b) => {
+            const va = values[a];
+            const vb = values[b];
+            return va < vb ? -1 : va > vb ? 1 : 0;
+        },
+    };
+}
+
+/** Timestamp sort: raw values are microseconds-since-epoch bigints
+ *  from Arrow. Storage stays as `BigInt64Array` so far-future or
+ *  pre-1970 timestamps (which would exceed Number's safe-int range at
+ *  microsecond resolution beyond ~285 years from epoch) sort
+ *  exactly. */
 async function buildTimestampSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
-    const values = new Float64Array(nrow);
+    const values = new BigInt64Array(nrow);
     const missing = new Uint8Array(nrow);
     for await (const batch of iterateBatches(reader)) {
         const child = batch.batch.getChildAt(columnIndex);
@@ -209,16 +252,18 @@ async function buildTimestampSortColumn(
             const i = batch.start + r;
             if (isNullAt(data, r)) {
                 missing[i] = 1;
-                values[i] = 0;
                 continue;
             }
-            const raw = data.values[r] as bigint;
-            values[i] = Number(raw);
+            values[i] = data.values[r] as bigint;
         }
     }
     return {
         missing,
-        compare: (a, b) => Math.sign(values[a] - values[b]),
+        compare: (a, b) => {
+            const va = values[a];
+            const vb = values[b];
+            return va < vb ? -1 : va > vb ? 1 : 0;
+        },
     };
 }
 

@@ -257,17 +257,15 @@ export class DataViewerPanel {
 
     /** Attempt to restore a persisted sort. Returns the SortState to ship
      *  to the webview, and as a side effect updates `this.sort` and
-     *  `this.permutation`. The persisted state is dropped when:
+     *  `this.permutation`. Always recomputes the permutation against the
+     *  current reader — schema-hash equality is not evidence that two
+     *  datasets share row values, so the only persisted truth is the
+     *  list of sort keys. The state is dropped when:
      *    - persistSort is off,
      *    - no saved state exists,
-     *    - the saved state had no keys (already empty),
-     *    - the saved state's nrow differs from the current reader's nrow
-     *      (the underlying data changed), or
+     *    - the saved state had no keys (already empty), or
      *    - any key references a column that no longer exists.
-     *  Caller is responsible for the post-await generation check.
-     *  (We deliberately skip emitting a "sort cleared" toast on a stale
-     *   restore — the webview can render one off the empty SortState if
-     *   the spec calls for it; see #5 in the open questions.) */
+     *  Caller is responsible for the post-await generation check. */
     private async restoreSort(
         saved: SortState | undefined,
         toolbar: ToolbarState,
@@ -277,7 +275,6 @@ export class DataViewerPanel {
         this.sort = EMPTY_SORT;
         this.permutation = undefined;
         if (!saved || saved.keys.length === 0) return EMPTY_SORT;
-        if (saved.nrowWhenSorted !== reader.nrow) return EMPTY_SORT;
         const maxColIndex = this.columns.length - 1;
         for (const k of saved.keys) {
             if (k.columnIndex < 0 || k.columnIndex > maxColIndex) return EMPTY_SORT;
@@ -292,7 +289,6 @@ export class DataViewerPanel {
             this.sort = {
                 keys: saved.keys,
                 labelsOnWhenSorted: toolbar.labelsOn,
-                nrowWhenSorted: reader.nrow,
             };
             this.permutation = perm;
             this.sortGeneration += 1;
@@ -526,7 +522,16 @@ export class DataViewerPanel {
                 digits: m.digits,
             });
         } catch (err) {
-            if (gen !== this.generation || this.disposed) return;
+            // Drop the failure entirely if a newer setSort or a panel
+            // replace landed while computePermutation was in flight —
+            // publishing a stale idle/error pair would either confuse the
+            // status bar (clearing a "Sorting…" that belongs to a newer
+            // request) or surface an error that's no longer relevant.
+            if (gen !== this.generation
+                || mySortGen !== this.sortGeneration
+                || this.disposed) {
+                return;
+            }
             const idle: ExtensionToWebview = {
                 type: 'sortStatus',
                 panelGeneration: gen,
@@ -549,7 +554,6 @@ export class DataViewerPanel {
         const next: SortState = {
             keys: m.keys,
             labelsOnWhenSorted: m.labelsOn,
-            nrowWhenSorted: this.reader.nrow,
         };
         this.sort = next;
         this.permutation = perm;

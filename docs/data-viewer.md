@@ -185,10 +185,9 @@ is in the sort, each sorted header also shows a small priority badge
 (1, 2, 3 …) so you can see which key takes precedence at a glance.
 
 A chip strip appears in the toolbar listing the active keys in
-priority order; each chip has a kebab (▾) that opens a small popover
-with **Flip direction**, **Remove from sort**, and (when applicable)
-**Move to first**. The trailing **✕** on the strip clears every sort
-key.
+priority order. Click any chip to open a small popover with **Flip
+direction**, **Remove from sort**, and (when applicable) **Move to
+first**. The trailing **✕** on the strip clears every sort key.
 
 ### NA / NaN
 
@@ -216,9 +215,12 @@ the rows.
 
 Sort state is persisted per panel-name + schema-hash alongside layout
 and toolbar state, so a later `View(df)` against the same dataset
-restores the sort. Set `raven.dataViewer.persistSort` to `false` to
-make every panel open unsorted. A re-View() with a different row count
-drops the saved sort to avoid applying a stale permutation.
+restores the sort. Only the list of sort keys is stored — the row
+permutation is always recomputed against the current data on restore,
+because schema-hash equality is not evidence that two datasets share
+row values (column names and types can match while values differ).
+Set `raven.dataViewer.persistSort` to `false` to make every panel
+open unsorted.
 
 ### Status bar
 

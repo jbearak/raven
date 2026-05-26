@@ -6,11 +6,11 @@
  * toolbar, and sort persistence evict together for a given panel+hash,
  * so a panel that survives in one store survives in all three.
  *
- * Stale-restore detection: callers compare the loaded
- * `SortState.nrowWhenSorted` against the current `nrow` before applying.
- * A mismatch means the underlying data changed (re-`View()` after a
- * transform); the saved permutation is invalid and the sort is dropped
- * with a clearing toast — see panel.ts.
+ * What's persisted is only the list of sort keys (column index +
+ * direction). The host always recomputes the permutation against the
+ * current reader on restore — schema-hash equality is not evidence
+ * that two datasets share values, so trusting a stored permutation
+ * would be unsafe.
  */
 
 import type { Memento } from './layout-state';

@@ -296,6 +296,35 @@ describe('computePermutation: multibatch', () => {
     });
 });
 
+describe('computePermutation: Int64 beyond MAX_SAFE_INTEGER', () => {
+    // Fixture row order:
+    //   0: 2^53 + 1     1: 2^53 + 3     2: 2^53 + 5     3: 1     4: -1
+    // Naive Number(bigint) would coalesce rows 0, 1, 2 to the same Number
+    // value, hiding their distinct ordering. The bigint path keeps them
+    // distinct.
+    test('asc preserves distinctness past Number.MAX_SAFE_INTEGER', async () => {
+        const r = await ArrowSliceReader.open(FIX('bigint64.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 0, direction: 'asc' }],
+            CTX_LABELS_ON,
+        );
+        expect(Array.from(p)).toEqual([4, 3, 0, 1, 2]);
+        await r.close();
+    });
+
+    test('desc preserves distinctness past Number.MAX_SAFE_INTEGER', async () => {
+        const r = await ArrowSliceReader.open(FIX('bigint64.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 0, direction: 'desc' }],
+            CTX_LABELS_ON,
+        );
+        expect(Array.from(p)).toEqual([2, 1, 0, 3, 4]);
+        await r.close();
+    });
+});
+
 describe('computePermutation: keys with unused order are ignored', () => {
     test('an empty SortKey[] returns identity even when passed twice', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
