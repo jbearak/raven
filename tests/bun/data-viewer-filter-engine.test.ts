@@ -279,3 +279,26 @@ describe('computeFilteredIndices — date predicates on d (DateDay 2024-01-01..0
         await r.close();
     });
 });
+
+describe('computeFilteredIndices — setIn on UNSHIPPED large-dictionary factor', () => {
+    // Forcing dictionaryThreshold=1 leaves the dictionary unshipped
+    // (schema.dictionary undefined), so the engine must resolve labels via
+    // reader.getLabels through dictFromGetLabels. bigdict.arrow: one `zip`
+    // factor, 50 rows, 20 levels zip-000..zip-019, index = row % 20.
+    test('Labels on: resolves labels via getLabels and matches', async () => {
+        const r = await ArrowSliceReader.open(FIX('bigdict.arrow'), { dictionaryThreshold: 1 });
+        expect(r.schema.columns[0].dictionaryShipped).toBe(false);
+        const e = entry('a', 0, { kind: 'setIn', values: ['zip-000', 'zip-005'] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        // row % 20 ∈ {0, 5} over rows 0..49.
+        expect(Array.from(out!)).toEqual([0, 5, 20, 25, 40, 45]);
+        await r.close();
+    });
+    test('Labels off: matches against integer codes', async () => {
+        const r = await ArrowSliceReader.open(FIX('bigdict.arrow'), { dictionaryThreshold: 1 });
+        const e = entry('a', 0, { kind: 'setIn', values: [0, 5] });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_OFF);
+        expect(Array.from(out!)).toEqual([0, 5, 20, 25, 40, 45]);
+        await r.close();
+    });
+});
