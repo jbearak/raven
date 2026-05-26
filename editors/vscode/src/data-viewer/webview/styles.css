@@ -304,3 +304,158 @@ body,
     color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #ffffff));
     outline: none;
 }
+
+.context-menu-item[role^='menuitemcheckbox'] {
+    display: grid;
+    grid-template-columns: 14px 1fr auto;
+    align-items: center;
+    column-gap: 6px;
+}
+
+.context-menu-item .context-menu-check {
+    width: 14px;
+    color: var(--vscode-menu-selectionForeground, inherit);
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
+
+.context-menu-item .context-menu-shortcut {
+    margin-left: 16px;
+    color: var(--vscode-descriptionForeground, inherit);
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+.context-menu-divider {
+    height: 1px;
+    margin: 4px 0;
+    background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+}
+
+.sort-strip {
+    display: flex;
+    align-items: center;
+    flex: 0 1 auto;
+    min-width: 0;
+    gap: 6px;
+    padding: 0 4px;
+    border-left: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-right: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.sort-strip-label {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.sort-strip-chips {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    gap: 4px;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.sort-chip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    padding: 2px 10px;
+    gap: 5px;
+    border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-radius: 12px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    line-height: 18px;
+}
+
+.sort-chip:hover,
+.sort-chip.open {
+    border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+.sort-chip:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 1px;
+}
+
+.sort-chip-name {
+    max-width: 14ch;
+    overflow: hidden;
+    color: var(--vscode-foreground, #cccccc);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+}
+
+.sort-chip-arrow {
+    flex: 0 0 auto;
+    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, #007fd4));
+    font-size: 11px;
+    line-height: 1;
+}
+
+.sort-chip-popover {
+    /* `position: fixed` (with JS-computed coords from the kebab's
+       bounding rect) keeps the popover out of the chip-strip's
+       `overflow: auto` clip without needing a portal. */
+    position: fixed;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    min-width: 140px;
+    padding: 4px 0;
+    border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 4px;
+    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e)));
+    box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
+    font-size: 12px;
+}
+
+.sort-chip-popover-item {
+    padding: 5px 12px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+}
+
+.sort-chip-popover-item:hover,
+.sort-chip-popover-item:focus {
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #ffffff));
+    outline: none;
+}
+
+.sort-chip-popover-item:disabled {
+    color: var(--vscode-disabledForeground, inherit);
+    cursor: default;
+    opacity: 0.5;
+}
+
+.sort-strip-clear {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-icon-foreground, inherit);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    opacity: 0.65;
+}
+
+.sort-strip-clear:hover {
+    opacity: 1;
+}

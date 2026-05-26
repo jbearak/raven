@@ -1400,6 +1400,11 @@
           "maximum": 15,
           "description": "Initial digits used by the data viewer's Format toggle."
         },
+        "raven.dataViewer.persistSort": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist the data viewer's active row sort per panel name × schema hash so a later View() call restores it. Set to false to make each panel open unsorted."
+        },
         "raven.linting.enabled": {
           "type": [
             "string",

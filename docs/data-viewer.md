@@ -71,8 +71,10 @@ expression opens a new tab.
 ## Toolbar
 
 ```text
-[Labels] [Format] [3 digits ▾] | [Columns ▾ <7>] | rows: 12,345
+rows: 12,345 | Sort: mpg▲ cyl▼ ✕ | [Labels] [Format] [3 digits ▾] | [Columns ▾ <7>]
 ```
+
+The `Sort` strip is hidden entirely when no sort is active.
 
 Each toggle is filled when active; clicking flips it. The Labels and
 Format buttons are hidden entirely when no column in the current data
@@ -156,11 +158,74 @@ same `View(mtcars)` opened tomorrow remembers the layout.
 | `PageDown`         | Scroll one viewport down.               |
 | `Cmd/Ctrl+A`       | Select all rows across visible columns. |
 | `Cmd/Ctrl+C`       | Copy the current selection as TSV.      |
+| `Shift+Alt+A`      | Sort focused column ascending.          |
+| `Shift+Alt+D`      | Sort focused column descending.         |
+| `Shift+Alt+0`      | Clear all sorts.                        |
 
 `Home` and `End` jump to the very first or very last row in a large data
 frame. Modifier combinations (`Shift`, `Cmd`/`Ctrl`, `Alt` on these
 navigation keys) fall through to the browser/OS unchanged so platform
 shortcuts are not hijacked.
+
+## Sorting
+
+Right-click a column header to sort. The menu offers **Sort
+ascending**, **Sort descending**, and the corresponding **Add
+ascending to sort** / **Add descending to sort** when another column
+is already sorted, plus **Clear sort on this column** (only when that
+column is in the sort) and **Clear all sorts** (only when some sort is
+active). Picking *Sort* replaces the sort with that column; picking
+*Add to sort* appends it as the next priority key. Holding **Shift**
+when picking *Sort ascending* / *Sort descending* is a shortcut for the
+*Add* items.
+
+A sorted column shows a hairline triangle on the right edge of its
+header — ▲ for ascending, ▼ for descending. When more than one column
+is in the sort, each sorted header also shows a small priority badge
+(1, 2, 3 …) so you can see which key takes precedence at a glance.
+
+A chip strip appears in the toolbar listing the active keys in
+priority order; each chip has a kebab (▾) that opens a small popover
+with **Flip direction**, **Remove from sort**, and (when applicable)
+**Move to first**. The trailing **✕** on the strip clears every sort
+key.
+
+### NA / NaN
+
+Missing values — R's `NA`, floating-point `NaN`, and `NULL` — always
+sort to the bottom in both ascending and descending order, matching
+`order(..., na.last = TRUE)`. The `±Inf` sentinels sort numerically.
+
+### Labels and Format
+
+Sort follows what you see in the grid:
+
+- A **factor** column sorts by integer level when Labels is off and by
+  label string when Labels is on.
+- A **value-labelled** column (`haven_labelled`, `foreign::value.labels`,
+  `readstata13::read.dta13`) sorts by the underlying numeric when
+  Labels is off and by the displayed label (or the raw value when no
+  label exists for a cell) when Labels is on.
+- **Numeric** columns always sort by the underlying double, even when
+  the Format toggle is rounding the display.
+
+Toggling Labels with a sort active on a labelled column will re-sort
+the rows.
+
+### Persistence
+
+Sort state is persisted per panel-name + schema-hash alongside layout
+and toolbar state, so a later `View(df)` against the same dataset
+restores the sort. Set `raven.dataViewer.persistSort` to `false` to
+make every panel open unsorted. A re-View() with a different row count
+drops the saved sort to avoid applying a stale permutation.
+
+### Status bar
+
+When a sort is active, the status bar appends `sorted by mpg ▲,
+cyl ▼` (truncated to four keys with a `+N more` suffix when needed).
+While the host is building a large permutation, the status bar shows
+`Sorting…`.
 
 ## Settings
 
@@ -169,6 +234,7 @@ shortcuts are not hijacked.
 | `raven.dataViewer.missingValueStyle` | `foreground` | How NA / NaN cells are highlighted: `foreground` (colorize the text), `background` (tint the cell), or `none`. |
 | `raven.dataViewer.maxStoredLayouts` | `10000` | LRU cap on persisted column-width / visibility entries. Each unique panel-name × schema-hash pair counts once. |
 | `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on (Format defaults to on). |
+| `raven.dataViewer.persistSort` | `true` | Persist the active row sort per panel-name × schema hash. Set to `false` to make every `View(df)` open unsorted. |
 
 The data viewer's overall enable/disable is controlled by `raven.rConsole.activation` — there is no separate `raven.dataViewer.enabled` toggle.
 

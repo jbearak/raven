@@ -105,15 +105,23 @@ async function loadPanel() {
     const arrowMod = await import('../../editors/vscode/src/data-viewer/arrow-reader');
     const layoutMod = await import('../../editors/vscode/src/data-viewer/layout-state');
     const toolbarMod = await import('../../editors/vscode/src/data-viewer/toolbar-state');
-    return { panelMod, arrowMod, layoutMod, toolbarMod };
+    const sortMod = await import('../../editors/vscode/src/data-viewer/sort-state');
+    return { panelMod, arrowMod, layoutMod, toolbarMod, sortMod };
 }
+
+const TEST_SETTINGS = {
+    missingValueStyle: 'foreground' as const,
+    defaultDigits: 3,
+    persistSort: true,
+};
 
 describe('DataViewerPanel persistence round-trip', () => {
     test('saveLayout from webview → next replace carries persisted layout', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod } = await loadPanel();
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
         const kv = new MemKV();
         const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
         const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
+        const sortStore = new sortMod.SortStateStore(kv as any, 100);
 
         const path1 = tempCopyOf('tiny.arrow');
         const reader = await arrowMod.ArrowSliceReader.open(path1);
@@ -123,7 +131,8 @@ describe('DataViewerPanel persistence round-trip', () => {
             path1,
             layoutStore,
             toolbarStore,
-            { missingValueStyle: 'foreground', defaultDigits: 3 },
+            sortStore,
+            TEST_SETTINGS,
             { fsPath: '/x', toString: () => '/x' } as any,
             () => {},
         );
@@ -171,17 +180,18 @@ describe('DataViewerPanel persistence round-trip', () => {
     });
 
     test('saveToolbar from webview → next replace carries persisted toolbar', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod } = await loadPanel();
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
         const kv = new MemKV();
         const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
         const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
+        const sortStore = new sortMod.SortStateStore(kv as any, 100);
 
         const path1 = tempCopyOf('tiny.arrow');
         const reader = await arrowMod.ArrowSliceReader.open(path1);
         const panel = await panelMod.DataViewerPanel.create(
             'tiny', reader, path1,
-            layoutStore, toolbarStore,
-            { missingValueStyle: 'foreground', defaultDigits: 3 },
+            layoutStore, toolbarStore, sortStore,
+            TEST_SETTINGS,
             { fsPath: '/x', toString: () => '/x' } as any,
             () => {},
         );
@@ -220,17 +230,18 @@ describe('DataViewerPanel persistence round-trip', () => {
     });
 
     test('saveLayout from a stale generation still persists (no race-drop)', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod } = await loadPanel();
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
         const kv = new MemKV();
         const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
         const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
+        const sortStore = new sortMod.SortStateStore(kv as any, 100);
 
         const path1 = tempCopyOf('tiny.arrow');
         const reader = await arrowMod.ArrowSliceReader.open(path1);
         const panel = await panelMod.DataViewerPanel.create(
             'tiny', reader, path1,
-            layoutStore, toolbarStore,
-            { missingValueStyle: 'foreground', defaultDigits: 3 },
+            layoutStore, toolbarStore, sortStore,
+            TEST_SETTINGS,
             { fsPath: '/x', toString: () => '/x' } as any,
             () => {},
         );

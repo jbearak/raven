@@ -1,5 +1,34 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type MouseEvent } from 'react';
 import { useDismiss } from './use-dismiss';
+
+/** Sort-related slice of context-menu props. Always supplied when the
+ *  menu opens for a column header; omitted for cell context menus,
+ *  where sort makes no sense. */
+export type SortMenuProps = {
+    /** Current direction for this column in the active sort, or 'none'
+     *  if this column isn't a sort key. Drives the asc/desc check
+     *  rendering. */
+    activeDirection: 'asc' | 'desc' | 'none';
+    /** True iff any column is currently sorted. Controls the Clear-all
+     *  item's enabled state. */
+    anySorted: boolean;
+    /** True iff at least one other column is in the sort. Drives the
+     *  "Add to sort" items' visibility — they're meaningless when
+     *  no other column is sorted (the sort would just be this column). */
+    otherColumnsSorted: boolean;
+    /** Called when the user picks Sort ascending / Sort descending.
+     *  `append` is true when the user held Shift on the click — equivalent
+     *  to picking the dedicated "Add to sort" item. */
+    onSort: (direction: 'asc' | 'desc', append: boolean) => void;
+    /** Called when the user picks Add ascending / Add descending. Always
+     *  appends as the next priority key. */
+    onAddToSort: (direction: 'asc' | 'desc') => void;
+    /** Remove this column from the sort. Called only when the column is
+     *  currently a sort key (the item is hidden otherwise). */
+    onClearColumn: () => void;
+    /** Clear the entire sort. Called only when `anySorted` is true. */
+    onClearAll: () => void;
+};
 
 type Props = {
     leftPx: number;
@@ -8,6 +37,8 @@ type Props = {
     onCopy: () => void;
     onHideColumn?: () => void;
     onClose: () => void;
+    /** Only present for column context menus. */
+    sort?: SortMenuProps;
 };
 
 const MARGIN_PX = 4;
@@ -19,6 +50,7 @@ export function ColumnContextMenu({
     onCopy,
     onHideColumn,
     onClose,
+    sort,
 }: Props) {
     const menuRef = useRef<HTMLDivElement>(null);
     useDismiss(menuRef, onClose);
@@ -54,6 +86,91 @@ export function ColumnContextMenu({
                 <button type="button" className="context-menu-item" onClick={onHideColumn} role="menuitem">
                     Hide column
                 </button>
+            )}
+            {sort && (
+                <>
+                    <div className="context-menu-divider" role="separator" />
+                    <button
+                        type="button"
+                        className={
+                            sort.activeDirection === 'asc'
+                                ? 'context-menu-item active'
+                                : 'context-menu-item'
+                        }
+                        onClick={(e: MouseEvent<HTMLButtonElement>) => sort.onSort('asc', e.shiftKey)}
+                        role="menuitemcheckbox"
+                        aria-checked={sort.activeDirection === 'asc'}
+                    >
+                        <span className="context-menu-check">
+                            {sort.activeDirection === 'asc' ? '✓' : ''}
+                        </span>
+                        Sort ascending
+                        <span className="context-menu-shortcut">⇧⌥A</span>
+                    </button>
+                    <button
+                        type="button"
+                        className={
+                            sort.activeDirection === 'desc'
+                                ? 'context-menu-item active'
+                                : 'context-menu-item'
+                        }
+                        onClick={(e: MouseEvent<HTMLButtonElement>) => sort.onSort('desc', e.shiftKey)}
+                        role="menuitemcheckbox"
+                        aria-checked={sort.activeDirection === 'desc'}
+                    >
+                        <span className="context-menu-check">
+                            {sort.activeDirection === 'desc' ? '✓' : ''}
+                        </span>
+                        Sort descending
+                        <span className="context-menu-shortcut">⇧⌥D</span>
+                    </button>
+                    {sort.otherColumnsSorted && sort.activeDirection === 'none' && (
+                        <>
+                            <div className="context-menu-divider" role="separator" />
+                            <button
+                                type="button"
+                                className="context-menu-item"
+                                onClick={() => sort.onAddToSort('asc')}
+                                role="menuitem"
+                            >
+                                <span className="context-menu-check" />
+                                Add ascending to sort
+                            </button>
+                            <button
+                                type="button"
+                                className="context-menu-item"
+                                onClick={() => sort.onAddToSort('desc')}
+                                role="menuitem"
+                            >
+                                <span className="context-menu-check" />
+                                Add descending to sort
+                            </button>
+                        </>
+                    )}
+                    {sort.activeDirection !== 'none' && (
+                        <button
+                            type="button"
+                            className="context-menu-item"
+                            onClick={sort.onClearColumn}
+                            role="menuitem"
+                        >
+                            <span className="context-menu-check" />
+                            Clear sort on this column
+                        </button>
+                    )}
+                    {sort.anySorted && (
+                        <button
+                            type="button"
+                            className="context-menu-item"
+                            onClick={sort.onClearAll}
+                            role="menuitem"
+                        >
+                            <span className="context-menu-check" />
+                            Clear all sorts
+                            <span className="context-menu-shortcut">⇧⌥0</span>
+                        </button>
+                    )}
+                </>
             )}
         </div>
     );
