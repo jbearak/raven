@@ -87,3 +87,31 @@ describe('summarizePredicate', () => {
             .toBe('cyl ∈ {a, b, c, d +2 more}');
     });
 });
+
+const LBL_NUM: ColumnSchema = {
+    name: 'gender', arrowType: 'Float64', isInteger: false, dictionaryShipped: false,
+    valueLabels: { '1': 'Male', '2': 'Female', '998': "Don't know" },
+};
+
+describe('summarizePredicate — labelled-numeric set membership shows labels', () => {
+    test('setIn maps codes to labels', () => {
+        expect(sum({ kind: 'setIn', values: [1, 2] }, LBL_NUM))
+            .toBe('gender ∈ {Male, Female}');
+    });
+    test('setNotIn maps codes to labels', () => {
+        expect(sum({ kind: 'setNotIn', values: [998] }, LBL_NUM))
+            .toBe("gender ∉ {Don't know}");
+    });
+    test('an unmapped code falls back to the bare number', () => {
+        expect(sum({ kind: 'setIn', values: [1, 7] }, LBL_NUM))
+            .toBe('gender ∈ {Male, 7}');
+    });
+    test('truncation past 4 applies to mapped labels', () => {
+        const c: ColumnSchema = {
+            name: 'k', arrowType: 'Int32', isInteger: true, dictionaryShipped: false,
+            valueLabels: { '1': 'a', '2': 'b', '3': 'c', '4': 'd', '5': 'e', '6': 'f' },
+        };
+        expect(sum({ kind: 'setIn', values: [1, 2, 3, 4, 5, 6] }, c))
+            .toBe('k ∈ {a, b, c, d +2 more}');
+    });
+});

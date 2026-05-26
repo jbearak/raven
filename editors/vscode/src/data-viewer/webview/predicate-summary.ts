@@ -22,8 +22,8 @@ export function summarizePredicate(p: FilterPredicate, col: ColumnSchema): strin
             return p.inclusive ? `${n} ${p.lo}–${p.hi}` : `${n} (${p.lo}, ${p.hi})`;
         case 'numNotBetween':
             return p.inclusive ? `${n} not in ${p.lo}–${p.hi}` : `${n} not in (${p.lo}, ${p.hi})`;
-        case 'setIn': return `${n} ∈ {${summarizeSet(p.values)}}`;
-        case 'setNotIn': return `${n} ∉ {${summarizeSet(p.values)}}`;
+        case 'setIn': return `${n} ∈ {${summarizeSet(mapSetValues(p.values, col))}}`;
+        case 'setNotIn': return `${n} ∉ {${summarizeSet(mapSetValues(p.values, col))}}`;
         case 'strCompare': return `${n} ${p.op === '=' ? '=' : '≠'} "${p.value}"`;
         case 'strContains':
             return `${n} ${p.negate ? 'not contains' : 'contains'} "${p.value}"`;
@@ -48,6 +48,19 @@ function numOp(op: '=' | '!=' | '<' | '<=' | '>' | '>='): string {
         case '>': return '>';
         case '>=': return '≥';
     }
+}
+
+/** For a labelled-numeric column (numeric Arrow type + valueLabels), map
+ *  each stored code to its label for display, falling back to the bare
+ *  code when unmapped. All other columns (factors store labels already,
+ *  strings store strings) pass through unchanged. */
+function mapSetValues(values: (string | number)[], col: ColumnSchema): (string | number)[] {
+    const t = col.arrowType;
+    const isNumericLabelled = !!col.valueLabels
+        && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'));
+    if (!isNumericLabelled) return values;
+    const vl = col.valueLabels!;
+    return values.map(v => vl[String(v)] ?? v);
 }
 
 function summarizeSet(values: (string | number)[]): string {
