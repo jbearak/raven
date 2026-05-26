@@ -372,10 +372,18 @@ export function App({
             ? `sorted by ${visible}, +${sort.keys.length - MAX} more`
             : `sorted by ${visible}`;
     }, [columns, sort]);
+    const filterStatusText = useMemo(() => {
+        if (nrowFiltered === undefined) return '';
+        const pctNum = nrow > 0 ? (100 * nrowFiltered) / nrow : 0;
+        // Omit the percentage in the noisy 0–1% and 99–100% bands.
+        const pct = pctNum <= 1 || pctNum >= 99 ? '' : ` (${pctNum.toFixed(1)}%)`;
+        return `filtered to ${nrowFiltered.toLocaleString()}${pct}`;
+    }, [nrowFiltered, nrow]);
     const statusText = [
         describeShape(nrow, columns, objectClass),
         describeHiddenColumnCount(layout.hiddenColumns.length),
         sortPending ? 'Sorting…' : sortStatusText,
+        filterPending ? 'Filtering…' : filterStatusText,
     ].filter(Boolean).join(' | ');
 
     const persistWebviewState = useCallback(() => {
@@ -678,6 +686,10 @@ export function App({
     const onClearAllFilters = useCallback(() => {
         applyFilters([]);
     }, [applyFilters]);
+
+    const clearFilterOnColumn = useCallback((columnIndex: number) => {
+        applyFilters(filter.entries.filter(e => e.columnIndex !== columnIndex));
+    }, [filter, applyFilters]);
 
     /** Send a setSort request. Empty `keys` clears the sort. The host
      *  replies with `sortApplied` which drives state updates. */
@@ -1111,6 +1123,13 @@ export function App({
                     }
                     return;
                 }
+                if (event.key === 'X' || event.code === 'KeyX') {
+                    event.preventDefault();
+                    const focused = gridSelection.current?.cell[0];
+                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    if (sourceIndex !== undefined) clearFilterOnColumn(sourceIndex);
+                    return;
+                }
             }
             const meta = event.metaKey || event.ctrlKey;
             if (!meta) return;
@@ -1132,6 +1151,7 @@ export function App({
         };
     }, [
         clearAllSorts,
+        clearFilterOnColumn,
         copySelection,
         gridSelection,
         onClearAllFilters,
