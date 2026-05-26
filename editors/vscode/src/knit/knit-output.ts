@@ -1657,7 +1657,26 @@ export function buildShellHtml(args: {
         if (!ctxMenu.contains(e.target)) hideContextMenu();
       });
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape') hideContextMenu();
+        // Layered unwind to match the iframe Escape handler: context
+        // menu first (topmost layer when summoned over an open
+        // popover via right-click), then the export popover. The
+        // browser's native popover Escape would dismiss the popover
+        // on its own, but routing it through closeExportPopover()
+        // here makes sure a single Escape press only collapses one
+        // layer even when both are open with outer-shell focus.
+        if (e.key !== 'Escape') return;
+        if (!ctxMenu.hidden) {
+          hideContextMenu();
+          e.preventDefault();
+          return;
+        }
+        if (exportPopover
+            && exportPopover.matches
+            && exportPopover.matches(':popover-open')) {
+          closeExportPopover();
+          e.preventDefault();
+          return;
+        }
       });
 
       function attachIframeInputHandlers() {

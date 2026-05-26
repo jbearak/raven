@@ -300,19 +300,25 @@ describe('buildShellHtml', () => {
     });
 
     test('export trigger carries an explicitly synced aria-expanded', () => {
-        // Because the popover opens imperatively via showPopover()
-        // (so the busy-state cancel branch can short-circuit on the
-        // same click), the browser's declarative popovertarget
-        // auto-mirror does not apply. The trigger must therefore
-        // ship with aria-expanded="false" and the beforetoggle
-        // listener must update it on every state change.
+        // The trigger uses declarative `popovertarget` to toggle the
+        // popover, which also excludes it from the popover's light-
+        // dismiss algorithm (without `popovertarget`, a click on the
+        // trigger while the popover is open would be classified as an
+        // outside click, the popover would close on pointerup, and a
+        // JS click handler that then called showPopover() would just
+        // reopen it — the trigger could never close the popover).
+        // Pin `popovertarget` as a load-bearing attribute, the
+        // `aria-expanded="false"` initial state for AT, and the
+        // `beforetoggle` listener that keeps the attribute in sync
+        // (belt-and-suspenders alongside the browser's native
+        // popovertarget aria-expanded auto-mirror).
         const html = buildShellHtml(args('/work/r.html'));
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-export"[^>]*popovertarget="raven-knit-export-popover"/,
+        );
         expect(html).toMatch(
             /<button[^>]*id="raven-knit-export"[^>]*\baria-expanded="false"/,
         );
-        // The beforetoggle handler updates the attribute on the
-        // synchronous tick — pin the call site so a refactor that
-        // drops it can't slip through.
         expect(html).toMatch(
             /exportPopover\.addEventListener\(['"]beforetoggle['"][\s\S]*?exportBtn\.setAttribute\(['"]aria-expanded['"]/,
         );
@@ -333,9 +339,12 @@ describe('buildShellHtml', () => {
         expect(html).toContain('data-format="pdf"');
         expect(html).toContain('data-format="docx"');
         // The export trigger references the popover via aria-controls
-        // (popovertarget would also work declaratively, but the JS
-        // handler needs to short-circuit on the busy-state path so
-        // we open the popover imperatively).
+        // for AT popup tracking. The actual open/close is driven by
+        // the declarative `popovertarget` attribute (pinned in the
+        // sibling test above); the busy-state click handler then
+        // pre-empts that declarative toggle via `e.preventDefault()`
+        // when the user clicks the cancel-icon to abort an in-flight
+        // export.
         expect(html).toMatch(
             /<button[^>]*id="raven-knit-export"[^>]*aria-controls="raven-knit-export-popover"/,
         );
@@ -635,6 +644,22 @@ describe('buildShellHtml', () => {
         // to "Rendered output: report.html".
         const html = buildShellHtml(args('/work/re<port>&.html'));
         expect(html).toContain('title="Rendered output: re&lt;port&gt;&amp;.html"');
+    });
+
+    test('export popover aria-label escapes the basename', () => {
+        // The popover aria-label now templates the basename so AT users
+        // hear "Export <basename>". macOS and Linux both permit `<`,
+        // `>`, `&`, and `"` in filenames; an unescaped basename would
+        // break out of the attribute value and inject markup into the
+        // toolbar. The basename flows through the same `escapeHtml`
+        // helper as the iframe title test above.
+        const html = buildShellHtml(args('/work/re<script>"&.html'));
+        expect(html).toContain(
+            'aria-label="Export re&lt;script&gt;&quot;&amp;.html"',
+        );
+        // Defense in depth: the unescaped form must not appear
+        // anywhere in the emitted shell.
+        expect(html).not.toContain('re<script>"&.html');
     });
 
     test('toolbar script is nonce-tagged', () => {

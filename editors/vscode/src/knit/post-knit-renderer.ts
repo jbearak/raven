@@ -110,7 +110,7 @@ export function disposeKnitGrammarRegistryForDeactivation(): void {
 }
 
 /**
- * Public access to the cached `GrammarRegistry`. The Knit Output panel
+ * Public access to the cached `GrammarRegistry`. The Knit Preview panel
  * uses this to probe the active VS Code theme via
  * `vscode-theme-palette.ts` — the same registry the post-knit
  * renderer uses, so we reuse its loaded grammars and the cost-amortized

@@ -136,7 +136,7 @@ export function registerExportCommands(context: vscode.ExtensionContext, deps: E
             // plain `export-*` kinds plus the planned `knit-then-export`
             // (an editor-toolbar export that re-knits first as a single
             // cancellable op). Excludes `knit-preview` because the
-            // Knit Output panel has its own progress-notification
+            // Knit Preview panel has its own progress-notification
             // cancel path for that.
             if (op && op.kind !== 'knit-preview') op.cancel();
         }),

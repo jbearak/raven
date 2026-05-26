@@ -1,5 +1,5 @@
 /**
- * GitHub-style syntax-highlighting palettes for the Knit Output
+ * GitHub-style syntax-highlighting palettes for the Knit Preview
  * rendering pipeline.
  *
  * Two color sets, one per theme variant. Each set maps a small handful

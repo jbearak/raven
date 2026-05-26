@@ -1,6 +1,6 @@
 /**
  * Resolves the active VS Code color theme into a `GithubPalette`-shaped
- * record so the Knit Output webview can paint syntax tokens with the
+ * record so the Knit Preview webview can paint syntax tokens with the
  * editor's actual colors instead of the bundled GitHub palette.
  *
  * Why this lives in a dedicated module:
@@ -954,7 +954,7 @@ function mergeCustomizations(args: {
  * VS Code's full semantic-token rule grammar is significantly more
  * complex (type+modifiers, language scoping, multiple selector
  * syntaxes). Implementing it properly would duplicate VS Code-internal
- * code and add a lot of surface for a Knit Output viewer whose color
+ * code and add a lot of surface for a Knit Preview viewer whose color
  * mapping is already 10-role coarse. The simple form covers the
  * majority of themes that explicitly opt-in for things like
  * `"function": "#abc"`.

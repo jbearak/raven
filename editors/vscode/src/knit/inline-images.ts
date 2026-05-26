@@ -1,12 +1,12 @@
 /**
  * Inline relative `<img src>` references in a rendered HTML document
  * as `data:` URLs read from disk. The function is the workaround for
- * a nested-iframe subresource issue in the Knit Output panel.
+ * a nested-iframe subresource issue in the Knit Preview panel.
  *
  * Why this exists
  * ---------------
  *
- * The Knit Output webview shell wraps the rendered HTML in a nested
+ * The Knit Preview webview shell wraps the rendered HTML in a nested
  * `<iframe srcdoc>` (see `knit-output.ts`). VS Code's webview
  * resource handler intercepts requests issued from the OUTER webview
  * document, but it does NOT intercept subresource fetches (`<img>`,
@@ -63,7 +63,7 @@ export interface InlineImagesOutputSink {
 
 export interface InlineImagesOptions {
     /**
-     * Mark local `figure/*.svg` images so the Knit Output shell can
+     * Mark local `figure/*.svg` images so the Knit Preview shell can
      * replace them with sanitized inline SVG nodes inside the sandboxed
      * iframe. The marker is opt-in because this helper is also useful
      * as a plain "data URL all local images" transform in tests and

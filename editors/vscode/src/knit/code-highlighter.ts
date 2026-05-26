@@ -1,5 +1,5 @@
 /**
- * Pure HTML-emitting code highlighter for the Knit Output render
+ * Pure HTML-emitting code highlighter for the Knit Preview render
  * pipeline.
  *
  * Given:

@@ -67,4 +67,20 @@ describe('isKnitOutputMessage — webview trust boundary', () => {
         expect(isKnitOutputMessage('hi')).toBe(false);
         expect(isKnitOutputMessage(42)).toBe(false);
     });
+    it('rejects prototype-poisoning shaped type fields', () => {
+        // MESSAGE_SCHEMAS is a plain object literal, so a hostile
+        // `type: '__proto__'` resolves via the Object.prototype
+        // `__proto__` getter to Object.prototype itself, and
+        // `type: 'constructor'`/`'toString'` walks the prototype
+        // chain to the named function. The exact-key matcher
+        // currently rejects all three because Object.prototype /
+        // Function.length collide with the actual key set, but a
+        // future refactor (e.g., `if (Object.hasOwn(...))` early-
+        // return) could regress that safety. Pin the rejection so
+        // any such refactor lights this up.
+        expect(isKnitOutputMessage({ type: '__proto__' })).toBe(false);
+        expect(isKnitOutputMessage({ type: 'constructor' })).toBe(false);
+        expect(isKnitOutputMessage({ type: 'toString' })).toBe(false);
+        expect(isKnitOutputMessage({ type: 'hasOwnProperty' })).toBe(false);
+    });
 });
