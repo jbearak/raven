@@ -1,6 +1,6 @@
 # Hover
 
-Hovering over an identifier shows what the symbol is, where it's defined, and — for package exports — the R help text. Hover uses the same position-aware, cross-file scope model as [completions](completion.md), [diagnostics](diagnostics.md), and [go-to-definition](go-to-definition.md), so the package attributed at the cursor is the one that would actually resolve at runtime.
+Hovering over an identifier shows what the symbol is, where it's defined, and — for package exports — the R help text. Hover uses the same position-aware, cross-file scope model as [completions](completion.md), [diagnostics](diagnostics.md), and [go-to-definition](go-to-definition.md), so the package attributed at the cursor matches what's in scope under Raven's static model — namely, packages brought in via `library()` / `require()` (or via `loadNamespace()`, which Raven treats as an attach signal even though R itself only loads the namespace), plus namespace qualifiers and declared symbols.
 
 ## What You See
 
