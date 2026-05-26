@@ -299,6 +299,25 @@ describe('buildShellHtml', () => {
         expect(html).toContain('scrollbar-width: none');
     });
 
+    test('export trigger carries an explicitly synced aria-expanded', () => {
+        // Because the popover opens imperatively via showPopover()
+        // (so the busy-state cancel branch can short-circuit on the
+        // same click), the browser's declarative popovertarget
+        // auto-mirror does not apply. The trigger must therefore
+        // ship with aria-expanded="false" and the beforetoggle
+        // listener must update it on every state change.
+        const html = buildShellHtml(args('/work/r.html'));
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-export"[^>]*\baria-expanded="false"/,
+        );
+        // The beforetoggle handler updates the attribute on the
+        // synchronous tick — pin the call site so a refactor that
+        // drops it can't slip through.
+        expect(html).toMatch(
+            /exportPopover\.addEventListener\(['"]beforetoggle['"][\s\S]*?exportBtn\.setAttribute\(['"]aria-expanded['"]/,
+        );
+    });
+
     test('export popover replaces VS Code QuickPick with an in-shell menu', () => {
         // The Export button previously posted a payload-less
         // `requestExport` and the host opened VS Code's native

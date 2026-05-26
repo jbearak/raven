@@ -554,13 +554,9 @@ export function buildShellHtml(args: {
     inset: auto;
     margin: 0;
     padding: 4px;
-    background: var(--vscode-menu-background,
-                    var(--vscode-editorWidget-background));
-    color: var(--vscode-menu-foreground,
-                var(--vscode-editorWidget-foreground));
-    border: 1px solid var(--vscode-widget-border,
-                            var(--vscode-menu-border,
-                                var(--vscode-editorWidget-border)));
+    background: var(--vscode-editorWidget-background);
+    color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
     border-radius: 4px;
     box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
     min-width: 184px;
@@ -573,7 +569,7 @@ export function buildShellHtml(args: {
   #raven-knit-export-popover:popover-open { display: flex; }
   #raven-knit-export-popover button {
     background: transparent;
-    color: inherit;
+    color: var(--vscode-foreground);
     border: 1px solid transparent;
     padding: 4px 12px;
     border-radius: 2px;
@@ -584,10 +580,7 @@ export function buildShellHtml(args: {
   }
   #raven-knit-export-popover button:hover:not(:disabled),
   #raven-knit-export-popover button:focus-visible:not(:disabled) {
-    background: var(--vscode-menu-selectionBackground,
-                    var(--vscode-list-activeSelectionBackground));
-    color: var(--vscode-menu-selectionForeground,
-                var(--vscode-list-activeSelectionForeground));
+    background: var(--vscode-list-hoverBackground);
     outline: none;
   }
   #raven-knit-export-popover button:focus:not(:focus-visible) { outline: none; }
@@ -638,18 +631,23 @@ export function buildShellHtml(args: {
             aria-label="Knit again"
             title="Knit again (re-knit the source document)">${ICON_REFRESH}</button>
     <span class="raven-knit-spacer"></span>
-    <!-- ARIA: the trigger uses \`aria-expanded\` (mirrored by the
-         browser when the popover toggles) so AT users hear
-         "expanded / collapsed" on activation. \`aria-controls\` links
-         the trigger to its popover for AT that supports popup
-         tracking. We do NOT set \`aria-haspopup\` because the popover
-         content is a labeled \`role="group"\` (not a \`role="menu"\` —
-         no arrow-key navigation is implemented) and any specific
-         aria-haspopup value would set incorrect expectations. Same
-         reasoning as the plot viewer's share popover. -->
+    <!-- ARIA: the trigger carries \`aria-expanded\` so AT users hear
+         "expanded / collapsed" on activation. The popover is opened
+         imperatively via showPopover() (so the busy-state cancel
+         branch can short-circuit on the same click), which means the
+         browser's declarative popovertarget auto-mirror does NOT
+         apply — the toggle event listener on the popover keeps the
+         attribute in sync explicitly. \`aria-controls\` links the
+         trigger to its popover for AT that supports popup tracking.
+         We do NOT set \`aria-haspopup\` because the popover content is
+         a labeled \`role="group"\` (not a \`role="menu"\` — no arrow-key
+         navigation is implemented) and any specific aria-haspopup
+         value would set incorrect expectations. Same reasoning as
+         the plot viewer's share popover. -->
     <button id="raven-knit-export" type="button"
             aria-label="Export"
             aria-controls="raven-knit-export-popover"
+            aria-expanded="false"
             title="Export as HTML, PDF, or Word">${ICON_SHARE}</button>
     <button id="raven-knit-open-browser" type="button"${isRemoteWorkspace ? ' hidden' : ''}
             aria-label="Open in Browser"
@@ -791,6 +789,13 @@ export function buildShellHtml(args: {
       }
       if (exportPopover) {
         exportPopover.addEventListener('beforetoggle', function (e) {
+          // aria-expanded mirror MUST update synchronously with the
+          // popover's visible state, not via the queued \`toggle\`
+          // event — otherwise AT readers can briefly see the popover
+          // open while the trigger still reads "collapsed". beforetoggle
+          // fires sync; toggle fires as a queued task after the state
+          // change has taken effect.
+          exportBtn.setAttribute('aria-expanded', e.newState === 'open' ? 'true' : 'false');
           if (e.newState === 'open') {
             positionExportPopover();
           }
