@@ -941,7 +941,11 @@ export function App({
     }, [panelGeneration, schemaHash, toolbar, vscode]);
 
     useEffect(() => {
-        if (!schemaHash) return;
+        // Guard on the same bootstrap flag as saveToolbar: until the first
+        // init/replace lands, `filter` is still the (possibly empty) seed,
+        // and saving it would clobber a host-persisted filter before the
+        // restore round-trip completes.
+        if (!toolbarBootstrappedRef.current || !schemaHash) return;
         const id = window.setTimeout(() => {
             vscode.postMessage({
                 type: 'saveFilter',
