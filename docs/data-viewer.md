@@ -10,16 +10,14 @@ disk, keeping scrolling responsive on multi-million-row data frames.
 Raven serializes the frame to an Apache Arrow IPC (Feather v2) file and
 decodes only the rows currently visible, so the webview's memory and
 decode time scale with the visible viewport rather than the size of the
-frame. Writing to an on-disk Arrow file lets the webview read row
-windows without round-tripping through R for each page, which keeps
-scrolling on multi-million-row frames smooth even while the R session
-is busy.
+frame. Writing to an on-disk Arrow file also means paging doesn't have
+to go back through R, which keeps scrolling on multi-million-row frames
+smooth.
 
 Other R data viewers in VS Code take different transport routes — the
 REditorSupport extension's [`sess`](https://github.com/REditorSupport/vscode-R/tree/master/sess)
 helper, for example, keeps the frame in R memory and serves row windows
-over JSON-RPC. Both approaches virtualize; the choice between them is
-mostly a matter of where the data lives during scrolling. See
+over JSON-RPC. Both approaches virtualize. See
 [Comparison: Data viewer](./comparison.md#data-viewer) for the side-by-side.
 
 > [!NOTE]
