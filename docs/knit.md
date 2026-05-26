@@ -15,9 +15,7 @@ intentionally narrow:
   Windows/Linux), which saves the file if it's unsaved and re-knits
   in one keystroke. Re-rendering only on demand keeps the preview
   deterministic (you decide when it changes) and avoids spurious
-  re-renders while you're mid-edit. If you want background
-  re-rendering on save, REditorSupport's `.Rmd` preview and Quarto's
-  `Quarto: Preview` provide it.
+  re-renders while you're mid-edit.
 - The preview is saved to a per-session temp directory under
   `<os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/`,
   so the `.Rmd`'s own directory stays clean. Export commands write the

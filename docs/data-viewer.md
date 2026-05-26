@@ -22,9 +22,13 @@ paginate the wire, but the staging is different: Raven snapshots the
 frame to disk once as Arrow and the webview reads windows from the file
 directly, bypassing R for paging; `sess` keeps everything live in R. In
 our own smoke tests, the on-disk Arrow path has stayed responsive on
-multi-million-row frames and on `labelled` columns from `haven`, where
-we've seen the R-staged path hit memory limits or formatter errors.
-See [Comparison: Data viewer](./comparison.md#data-viewer) for the
+multi-million-row frames where the R-staged path can hit memory limits.
+The two viewers also differ on value-labelled data: Raven recognizes
+`haven_labelled` plus `foreign` / `readstata13` label maps and
+substitutes the label when its Labels toggle is on (see
+[Labels](#labels)); `sess` classifies labelled columns as formatted
+numerics and renders the underlying codes. See
+[Comparison: Data viewer](./comparison.md#data-viewer) for the
 side-by-side.
 
 > [!NOTE]
