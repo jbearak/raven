@@ -202,6 +202,10 @@ async function acceptorFor(
         switch (predicate.kind) {
             case 'dateCompare': {
                 const v = toUnit(predicate.value);
+                // Unparseable ISO -> no-match, mirroring the invalid-regex
+                // fallback. Without this guard `!=` would keep every row,
+                // since `x !== NaN` is always true.
+                if (!Number.isFinite(v)) return () => false;
                 switch (predicate.op) {
                     case '=': return (i) => values[i] === v;
                     case '!=': return (i) => values[i] !== v;
@@ -210,7 +214,6 @@ async function acceptorFor(
                     case '>': return (i) => values[i] > v;
                     case '>=': return (i) => values[i] >= v;
                 }
-                break;
             }
             case 'dateBetween': {
                 const lo = toUnit(predicate.lo), hi = toUnit(predicate.hi);

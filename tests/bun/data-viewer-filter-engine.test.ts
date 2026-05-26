@@ -232,4 +232,11 @@ describe('computeFilteredIndices — date predicates on d (DateDay 2024-01-01..0
         expect(Array.from(out!)).toEqual([1, 2, 3]);
         await r.close();
     });
+    test('dateCompare != with unparseable date is a no-match (not keep-all)', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 4, { kind: 'dateCompare', op: '!=', value: 'not-a-date' });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([]);
+        await r.close();
+    });
 });
