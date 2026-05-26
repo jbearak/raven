@@ -19,7 +19,7 @@ Raven ships its own copy of the REditorSupport R grammar so the editor and the k
 
 ## Rendered HTML (Raven: Knit Preview)
 
-`Raven: Knit Preview` writes a self-contained `.html` to a per-session temp directory and displays it in the Knit Output panel. Code blocks in that HTML are re-highlighted with a GitHub light/dark palette using whichever VS Code grammar contributes the chunk's language:
+`Raven: Knit Preview` writes a self-contained `.html` to a per-session temp directory and displays it in the Knit Preview panel. Code blocks in that HTML are re-highlighted with a GitHub light/dark palette using whichever VS Code grammar contributes the chunk's language:
 
 - For R chunks, Raven walks the installed extensions in priority order — `REditorSupport.r-syntax`, then `REditorSupport.r`, then VS Code's built-in `vscode.r`, then Raven's own vendored grammar — and uses the first grammar it finds. Function names get an additional `function` color via Raven's LSP semantic-token overlay, layered on top of the grammar's TextMate scopes.
 - For non-R chunks (Python, SQL, Bash, Julia, …), Raven uses whichever grammar VS Code's installed extensions contribute for that language. Unknown languages render as plain monospace.

@@ -28,12 +28,18 @@ export type KnitOutputMessage =
      */
     | { type: 'requestFonts' }
     /**
-     * The user clicked the webview's Export ▾ button. The host opens
-     * a native QuickPick (HTML / PDF / Word) and routes the chosen
-     * format into the export pipeline. Format choice never crosses
-     * the trust boundary — only the trigger does.
+     * The user picked a format from the webview's Export ▾ popover.
+     * The format choice now crosses the trust boundary — it's
+     * validated strictly against the `EXPORT_FORMATS` whitelist in
+     * `isKnitOutputMessage` before the host dispatches the matching
+     * `raven.knit.export*` command. The webview owns the menu UI
+     * (an HTML popover, same pattern as the plot viewer's share
+     * popover) instead of routing through VS Code's native
+     * QuickPick — the popover never raises the toolbar height and
+     * dismisses on outside click or Escape via the platform popover
+     * API.
      */
-    | { type: 'requestExport' }
+    | { type: 'requestExport'; format: ExportFormat }
     /**
      * The user clicked the toolbar's Export button while an export
      * was already in flight (the button doubles as a cancel control
@@ -41,6 +47,17 @@ export type KnitOutputMessage =
      * and calls `cancel()`.
      */
     | { type: 'cancelExport' };
+
+/**
+ * Whitelist of accepted `requestExport` formats. Defined as a const
+ * tuple so `ExportFormat` is the union of literal strings and so the
+ * webview-side trust-boundary check can reuse the same list at
+ * validation time. Adding a new export format means extending this
+ * tuple AND adding a `case` to `KnitOutputPanel.handleMessage`'s
+ * dispatch table — the type system catches both halves.
+ */
+export const EXPORT_FORMATS = ['html', 'pdf', 'docx'] as const;
+export type ExportFormat = typeof EXPORT_FORMATS[number];
 
 /**
  * Per-type allowed key set for the trust-boundary validator. Sorted so
@@ -55,7 +72,7 @@ const MESSAGE_SCHEMAS: Record<KnitOutputMessage['type'], readonly string[]> = {
     themeContext: ['editorBackground', 'type'],
     requestPalette: ['type'],
     requestFonts: ['type'],
-    requestExport: ['type'],
+    requestExport: ['format', 'type'],
     cancelExport: ['type'],
 };
 
@@ -140,7 +157,7 @@ export function fontsCssDeclarations(fonts: { text: string; mono: string }): str
 }
 
 /**
- * Strict type-narrowing for messages posted from the Knit Output webview.
+ * Strict type-narrowing for messages posted from the Knit Preview webview.
  *
  * The webview is a trust boundary. We use **per-type exact-schema
  * matching**: the message object's keys must equal the declared key set
@@ -163,6 +180,10 @@ export function isKnitOutputMessage(msg: unknown): msg is KnitOutputMessage {
     // Per-type value-type checks for non-`type` fields.
     if (obj.type === 'themeChanged' && typeof obj.applied !== 'boolean') return false;
     if (obj.type === 'themeContext' && typeof obj.editorBackground !== 'string') return false;
+    if (obj.type === 'requestExport') {
+        if (typeof obj.format !== 'string') return false;
+        if (!EXPORT_FORMATS.includes(obj.format as ExportFormat)) return false;
+    }
     return true;
 }
 
@@ -240,6 +261,36 @@ export function paletteCssDeclarations(palette: GithubPalette): string {
 }
 
 /**
+ * Inlined codicon SVGs (from @vscode/codicons, MIT). Kept inline so the
+ * toolbar has no runtime font dependency and the outer-shell CSP can
+ * stay locked down (`font-src` need not whitelist a codicon woff URL).
+ * `fill="currentColor"` makes each icon inherit the surrounding
+ * button's foreground color so they track theme switches without
+ * extra CSS.
+ *
+ * SECURITY INVARIANT (mirrors the plot viewer's App.svelte): these
+ * strings are injected into the outer-shell HTML verbatim, so they
+ * MUST stay pure hand-vetted SVG — no `<script>`, `<use>`, `<image>`,
+ * `<a>`, `<foreignObject>`, `<iframe>`, event-handler attributes
+ * (`onclick=`, `onload=`, …), or `href`/`xlink:href`. New icons go
+ * through the same review.
+ */
+const ICON_REFRESH =
+    '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M3 8C3 5.23858 5.23858 3 8 3C9.63527 3 11.0878 3.78495 12.0005 5H10C9.72386 5 9.5 5.22386 9.5 5.5C9.5 5.77614 9.72386 6 10 6H12.8904C12.8973 6.00014 12.9041 6.00014 12.911 6H13C13.2761 6 13.5 5.77614 13.5 5.5V2.5C13.5 2.22386 13.2761 2 13 2C12.7239 2 12.5 2.22386 12.5 2.5V4.03138C11.4009 2.78613 9.79253 2 8 2C4.68629 2 2 4.68629 2 8C2 11.3137 4.68629 14 8 14C11.1301 14 13.6999 11.6035 13.9756 8.54488C14.0003 8.26985 13.7975 8.0268 13.5225 8.00202C13.2474 7.97723 13.0044 8.1801 12.9796 8.45512C12.75 11.003 10.6079 13 8 13C5.23858 13 3 10.7614 3 8Z"/></svg>';
+const ICON_GLOBE =
+    '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M8 1C4.141 1 1 4.141 1 8C1 11.859 4.141 15 8 15C11.859 15 15 11.859 15 8C15 4.141 11.859 1 8 1ZM8 14C7.422 14 6.686 12.906 6.288 11H9.713C9.315 12.906 8.579 14 8.001 14H8ZM6.121 10C6.044 9.392 6 8.723 6 8C6 7.277 6.044 6.608 6.121 6H9.878C9.955 6.608 9.999 7.277 9.999 8C9.999 8.723 9.955 9.392 9.878 10H6.121ZM2 8C2 7.299 2.121 6.626 2.343 6H5.121C5.041 6.656 5 7.332 5 8C5 8.668 5.041 9.344 5.121 10H2.343C2.121 9.374 2 8.701 2 8ZM8 2C8.578 2 9.314 3.094 9.712 5H6.287C6.685 3.094 7.422 2 8 2ZM10.879 6H13.657C13.879 6.626 14 7.299 14 8C14 8.701 13.879 9.374 13.657 10H10.879C10.959 9.344 11 8.668 11 8C11 7.332 10.959 6.656 10.879 6ZM13.195 5H10.722C10.516 3.938 10.199 2.98 9.775 2.268C11.228 2.719 12.446 3.707 13.195 5ZM6.226 2.268C5.802 2.98 5.484 3.938 5.279 5H2.806C3.556 3.707 4.774 2.718 6.226 2.268ZM2.805 11H5.278C5.484 12.062 5.801 13.02 6.225 13.732C4.772 13.281 3.554 12.293 2.805 11ZM9.774 13.732C10.198 13.02 10.516 12.062 10.721 11H13.194C12.444 12.293 11.226 13.282 9.774 13.732Z"/></svg>';
+// codicon "link-external" share glyph — the same icon the plot viewer
+// toolbar uses for its Copy / PNG / SVG / PDF popover. Reusing the
+// glyph across surfaces keeps "click for a menu of export options"
+// recognizable everywhere it appears.
+const ICON_SHARE =
+    '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M11.307 1.10533C11.1562 0.988085 10.9519 0.966945 10.7803 1.05085C10.6088 1.13475 10.5 1.30904 10.5 1.5V3.49274C10.4571 3.49456 10.4122 3.49701 10.3654 3.5002C9.96247 3.52766 9.41128 3.61105 8.82119 3.83704C8.11343 4.10809 7.34877 4.58508 6.72601 5.41126C6.10338 6.23727 5.64499 7.38259 5.50206 8.95474C5.48301 9.16438 5.5973 9.36351 5.78793 9.4528C5.97857 9.54209 6.20471 9.50241 6.35356 9.35356C7.54248 8.16464 8.72298 7.57773 9.59562 7.28685C9.9558 7.16679 10.2643 7.09693 10.5 7.0563V9C10.5 9.1969 10.6156 9.37546 10.7952 9.45612C10.9748 9.53678 11.185 9.50452 11.3322 9.37371L15.8322 5.37371C15.9432 5.27502 16.0046 5.13207 15.9997 4.98361C15.9949 4.83514 15.9242 4.69653 15.807 4.60533L11.307 1.10533ZM10.9429 4.49679L10.9457 4.49705C11.0865 4.51223 11.2279 4.46706 11.3335 4.37257C11.4394 4.27772 11.5 4.14223 11.5 4V2.52232L14.7186 5.02564L11.5 7.88658V6.5C11.5 6.22386 11.2762 6 11 6L10.9989 6L10.9976 6.00001L10.9943 6.00003L10.9848 6.00014L10.9552 6.00087C10.9307 6.00166 10.897 6.00316 10.8544 6.00599C10.7695 6.01166 10.6495 6.02268 10.4996 6.04409C10.1999 6.08691 9.77971 6.17139 9.2794 6.33816C8.55493 6.57965 7.66479 6.99299 6.7319 7.69863C6.9264 6.98158 7.2077 6.43355 7.52456 6.01319C8.01593 5.36132 8.61523 4.98675 9.17883 4.7709C9.65371 4.58903 10.1025 4.52044 10.4334 4.49788C10.5981 4.48666 10.7314 4.48699 10.8211 4.48988C10.866 4.49133 10.8997 4.49341 10.9209 4.49498L10.9429 4.49679ZM3.5 2C2.11929 2 1 3.11929 1 4.5V12.5C1 13.8807 2.11929 15 3.5 15H11.5C12.8807 15 14 13.8807 14 12.5V9.5C14 9.22386 13.7761 9 13.5 9C13.2239 9 13 9.22386 13 9.5V12.5C13 13.3284 12.3284 14 11.5 14H3.5C2.67157 14 2 13.3284 2 12.5V4.5C2 3.67157 2.67157 3 3.5 3H7.5C7.77614 3 8 2.77614 8 2.5C8 2.22386 7.77614 2 7.5 2H3.5Z"/></svg>';
+const ICON_STOP =
+    '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M6 5C5.44772 5 5 5.44772 5 6V10C5 10.5523 5.44772 11 6 11H10C10.5523 11 11 10.5523 11 10V6C11 5.44772 10.5523 5 10 5H6ZM1 8C1 4.13401 4.13401 1 8 1C11.866 1 15 4.13401 15 8C15 11.866 11.866 15 8 15C4.13401 15 1 11.866 1 8ZM8 2C4.68629 2 2 4.68629 2 8C2 11.3137 4.68629 14 8 14C11.3137 14 14 11.3137 14 8C14 4.68629 11.3137 2 8 2Z"/></svg>';
+const ICON_SYMBOL_COLOR =
+    '<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true" focusable="false"><path d="M8.00101 1C4.13401 1 1.00101 3.8 1.00101 7.667C1.00101 8.956 2.04501 10 3.33401 10C4.75101 10 4.72101 9 6.00001 9C6.64401 9 7.00001 9.606 7.00001 10.25V11.5C7.00001 13.433 8.56701 15 10.5 15C13.653 15 14.999 11.215 14.999 8C14.999 4.134 11.866 1 8.00001 1H8.00101ZM10.5 14C9.12201 14 8.00001 12.878 8.00001 11.5V10.25C8.00001 8.967 7.14001 8 6.00001 8C5.04001 8 4.49801 8.412 4.13901 8.685C3.85401 8.902 3.72401 9 3.33401 9C2.59901 9 2.00101 8.402 2.00101 7.667C2.00101 4.436 4.58001 2 8.00101 2C11.309 2 14 4.692 14 8C14 10.412 13.068 14 10.501 14H10.5ZM12 11C12 11.552 11.552 12 11 12C10.448 12 10 11.552 10 11C10 10.448 10.448 10 11 10C11.552 10 12 10.448 12 11ZM13 8C13 8.552 12.552 9 12 9C11.448 9 11 8.552 11 8C11 7.448 11.448 7 12 7C12.552 7 13 7.448 13 8ZM6.00001 5C6.00001 5.552 5.55201 6 5.00001 6C4.44801 6 4.00001 5.552 4.00001 5C4.00001 4.448 4.44801 4 5.00001 4C5.55201 4 6.00001 4.448 6.00001 5ZM10 5C10 4.448 10.448 4 11 4C11.552 4 12 4.448 12 5C12 5.552 11.552 6 11 6C10.448 6 10 5.552 10 5ZM9.00001 4C9.00001 4.552 8.55201 5 8.00001 5C7.44801 5 7.00001 4.552 7.00001 4C7.00001 3.448 7.44801 3 8.00001 3C8.55201 3 9.00001 3.448 9.00001 4Z"/></svg>';
+
+/**
  * Minimal vscode.Webview shape buildShellHtml needs. Defined inline so
  * the pure helper has no dependency on the actual vscode module — tests
  * pass a fake.
@@ -254,7 +305,7 @@ function escapeHtml(s: string): string {
 }
 
 /**
- * Build the outer-shell HTML for the Knit Output webview.
+ * Build the outer-shell HTML for the Knit Preview webview.
  *
  * The shell is Raven-controlled and owns the CSP in `<head>`; the
  * rendered HTML loads inside `<iframe srcdoc="..." sandbox="allow-
@@ -396,69 +447,144 @@ export function buildShellHtml(args: {
 <head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
-<title>Knit Output</title>
+<title>Knit Preview</title>
 <style nonce="${nonce}">
   body { margin: 0; padding: 0; height: 100vh; display: flex; flex-direction: column;
          font-family: var(--vscode-font-family); color: var(--vscode-foreground); }
-  #raven-knit-toolbar { display: flex; gap: 0.5rem; align-items: center;
-                        padding: 0.4rem 0.75rem;
-                        background: var(--vscode-editorWidget-background);
-                        border-bottom: 1px solid var(--vscode-editorWidget-border);
-                        flex: 0 0 auto; }
-  #raven-knit-toolbar button { font: inherit; padding: 0.2rem 0.6rem;
-                               background: var(--vscode-button-background);
-                               color: var(--vscode-button-foreground);
-                               border: 1px solid var(--vscode-button-border, transparent);
-                               cursor: pointer; }
-  #raven-knit-toolbar button:hover { background: var(--vscode-button-hoverBackground); }
   /*
-   * Theme toggle: visually distinct from action buttons.
-   * Uses the VS Code "inputOption" CSS variables -- the same vars
-   * the Find widget toggles (case-sensitive, whole-word, regex)
-   * use. The active state gets a bordered, accent-tinted look
-   * that does not collide with the primary action buttons.
+   * Single-row, fixed-height toolbar modeled after the Plot Viewer's
+   * .toolbar (editors/vscode/src/plot/webview/styles.css). All
+   * buttons are icon-only so the row height never changes when a
+   * label flips (Export -> Cancel) and the layout reads cleanly at
+   * every panel width.
+   *
+   * flex-wrap: nowrap pins single-row behavior across future style
+   * edits; overflow-x: auto plus a suppressed scrollbar is the
+   * safety net for narrow panels where the intrinsic button widths
+   * sum past the viewport — without it the implicit overflow on
+   * body (iframe filling flex 1) would silently clip the right-most
+   * buttons (Export, theme toggle).
    */
-  #raven-knit-toolbar button#raven-knit-theme {
+  #raven-knit-toolbar {
+    display: flex; align-items: center; gap: 4px;
+    padding: 4px 8px;
+    background: var(--vscode-editorWidget-background);
+    border-bottom: 1px solid var(--vscode-editorWidget-border);
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  #raven-knit-toolbar::-webkit-scrollbar { display: none; }
+  #raven-knit-toolbar button {
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: 1px solid transparent;
+    padding: 2px 6px;
+    border-radius: 2px;
+    font: inherit;
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
+  }
+  #raven-knit-toolbar button:hover:not(:disabled) {
+    background: var(--vscode-button-secondaryHoverBackground);
+  }
+  #raven-knit-toolbar button:disabled { opacity: 0.5; cursor: default; }
+  /*
+   * pointer-events: none on the inline SVG makes every click on
+   * the icon fall through to the parent button, so event.target is
+   * always the button itself. That gives a deterministic click
+   * target for the popovertarget activation and any future event
+   * handler that inspects event.target. Matches the plot viewer's
+   * .toolbar .icon-btn svg rule.
+   */
+  #raven-knit-toolbar button svg {
+    width: 16px; height: 16px; display: block; pointer-events: none;
+  }
+  #raven-knit-toolbar .raven-knit-spacer { flex: 1; }
+  /*
+   * Theme toggle "on" state. Mirrors the plot viewer toolbar's
+   * .theme-toggle.is-on styling (App.svelte): the engaged state
+   * fills the icon-only button with the same primary-button accent
+   * VS Code uses for its main action buttons, so users immediately
+   * read the toggle as active. The codicon's fill="currentColor"
+   * picks up the matching button-foreground without an extra rule.
+   *
+   * The prior implementation used the inputOption-* CSS variables
+   * (the Find widget's case-sensitive / whole-word treatment), but
+   * those tokens are intentionally subtle — semi-transparent tints
+   * over the input background that can disappear against the
+   * editorWidget surface the toolbar sits on. The primary-button
+   * palette here gives an unambiguous "pressed" colour that survives
+   * every theme.
+   */
+  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"] {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"]:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground);
+  }
+  /*
+   * Export busy state — when an export op is in flight, the icon
+   * swaps from "export" to "stop-circle" via JS, and a subtle warning
+   * tint signals "click again to cancel". The icon-swap means width
+   * stays constant across busy/idle transitions; only the color
+   * shifts.
+   */
+  #raven-knit-toolbar button#raven-knit-export[data-busy="true"] {
+    color: var(--vscode-inputValidation-warningForeground,
+                var(--vscode-foreground));
+  }
+  /*
+   * Export popover. Mirrors the plot viewer's .share-popover (see
+   * editors/vscode/src/plot/webview/styles.css) — same HTML popover
+   * API for outside-click and Escape dismissal, same fixed
+   * positioning via JS in positionExportPopover, same secondary-menu
+   * surface variables.
+   */
+  #raven-knit-export-popover {
+    position: fixed;
+    inset: auto;
+    margin: 0;
+    padding: 4px;
+    background: var(--vscode-editorWidget-background);
+    color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    border-radius: 4px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+    min-width: 184px;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    font-family: var(--vscode-font-family);
+    font-size: 13px;
+  }
+  #raven-knit-export-popover:popover-open { display: flex; }
+  #raven-knit-export-popover button {
     background: transparent;
     color: var(--vscode-foreground);
     border: 1px solid transparent;
-    /* Push the toggle to the right edge of the toolbar so it sits
-       away from the action buttons -- "Apply theme" is a viewing
-       preference, not an action. */
-    margin-left: auto;
+    padding: 4px 12px;
+    border-radius: 2px;
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
   }
-  #raven-knit-toolbar button#raven-knit-theme:hover {
-    background: var(--vscode-inputOption-hoverBackground,
-                    var(--vscode-toolbar-hoverBackground,
-                        var(--vscode-list-hoverBackground)));
+  #raven-knit-export-popover button:hover:not(:disabled),
+  #raven-knit-export-popover button:focus-visible:not(:disabled) {
+    background: var(--vscode-list-hoverBackground);
+    outline: none;
   }
-  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"] {
-    background: var(--vscode-inputOption-activeBackground,
-                    var(--vscode-button-background));
-    color: var(--vscode-inputOption-activeForeground,
-                var(--vscode-button-foreground));
-    border: 1px solid var(--vscode-inputOption-activeBorder,
-                          var(--vscode-focusBorder));
-  }
-  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"]:hover {
-    background: var(--vscode-inputOption-activeBackground,
-                    var(--vscode-button-background));
-  }
-  /*
-   * The ::before pseudo-element holds the checkmark prefix and an
-   * empty placeholder when the toggle is off. Pre-allocating the
-   * width with "visibility: hidden" for the inactive state keeps
-   * the button's pixel width stable across toggles so the toolbar
-   * does not reflow on every click.
-   */
-  #raven-knit-toolbar button#raven-knit-theme::before {
-    content: "✓";
-    margin-right: 0.35em;
-    visibility: hidden;
-  }
-  #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"]::before {
-    visibility: visible;
-  }
+  #raven-knit-export-popover button:focus:not(:focus-visible) { outline: none; }
+  #raven-knit-export-popover button:disabled { opacity: 0.5; cursor: default; }
   #raven-knit-frame { flex: 1 1 auto; width: 100%; border: 0; background: white; }
   #raven-knit-context-menu {
     position: fixed; min-width: 160px; z-index: 9999;
@@ -500,13 +626,57 @@ export function buildShellHtml(args: {
 </style>
 </head>
 <body>
-  <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit output">
-    <button id="raven-knit-refresh" type="button" title="Re-knit the source document">Knit again</button>
-    <button id="raven-knit-open-browser" type="button"${isRemoteWorkspace ? ' hidden' : ''} title="Open the rendered file in your default browser">Open in Browser</button>
-    <button id="raven-knit-export" type="button" title="Export as HTML, PDF, or Word">Export ▾</button>
+  <div id="raven-knit-toolbar" role="toolbar" aria-label="Knit preview">
+    <button id="raven-knit-refresh" type="button"
+            aria-label="Knit again"
+            title="Knit again (re-knit the source document)">${ICON_REFRESH}</button>
+    <span class="raven-knit-spacer"></span>
+    <!-- ARIA: the trigger carries \`aria-expanded\` so AT users hear
+         "expanded / collapsed" on activation. \`popovertarget\` makes
+         the browser handle the open/close toggle natively AND excludes
+         the trigger from the popover's light-dismiss algorithm — without
+         it, a click on the trigger while the popover is open would be
+         classified as an outside-click, light-dismiss would close the
+         popover on pointerup, and any JS click handler that then called
+         showPopover() would just reopen it (i.e., the trigger could
+         never close the popover). With \`popovertarget\` set, the
+         browser also auto-mirrors aria-expanded for AT, and the
+         \`beforetoggle\` listener below keeps our explicit attribute
+         setting in lockstep for safety. \`aria-controls\` links the
+         trigger to its popover for AT that supports popup tracking.
+         We do NOT set \`aria-haspopup\` because the popover content is
+         a labeled \`role="group"\` (not a \`role="menu"\` — no arrow-key
+         navigation is implemented) and any specific aria-haspopup
+         value would set incorrect expectations. Same reasoning as
+         the plot viewer's share popover. -->
+    <button id="raven-knit-export" type="button"
+            aria-label="Export"
+            aria-controls="raven-knit-export-popover"
+            aria-expanded="false"
+            popovertarget="raven-knit-export-popover"
+            title="Export as HTML, PDF, or Word">${ICON_SHARE}</button>
+    <button id="raven-knit-open-browser" type="button"${isRemoteWorkspace ? ' hidden' : ''}
+            aria-label="Open in Browser"
+            title="Open in Browser (open the rendered file in your default browser)">${ICON_GLOBE}</button>
     <button id="raven-knit-theme" type="button"
             aria-pressed="${initialThemeApplied ? 'true' : 'false'}"
-            title="Toggle VS Code editor colors on the rendered output">Apply VS Code theme</button>
+            aria-label="Apply VS Code theme"
+            title="Apply VS Code theme (recolor the rendered output to match the active editor theme)">${ICON_SYMBOL_COLOR}</button>
+  </div>
+  <!-- ARIA: \`role="group"\` rather than \`role="menu"\` because the HTML
+       popover API gives Tab-order focus + Escape + outside-click
+       dismissal but ARIA's menu pattern additionally requires
+       arrow-key navigation (Up/Down/Home/End). We don't implement
+       those handlers, so \`role="menu"\` would set incorrect AT
+       expectations and WCAG-flag as incomplete keyboard interaction.
+       Same reasoning as the plot viewer's share popover. -->
+  <div id="raven-knit-export-popover"
+       popover="auto"
+       role="group"
+       aria-label="Export ${safeName}">
+    <button type="button" data-format="html">Export to HTML…</button>
+    <button type="button" data-format="pdf">Export to PDF…</button>
+    <button type="button" data-format="docx">Export to Word…</button>
   </div>
   <iframe id="raven-knit-frame"
           srcdoc="${escapeHtml(srcdocHtml)}"
@@ -533,26 +703,179 @@ export function buildShellHtml(args: {
       document.getElementById('raven-knit-open-browser').addEventListener('click', function () {
         vscode.postMessage({ type: 'openInBrowser' });
       });
-      // Export button: idle state opens the format quickpick (host opens it
-      // natively so the format choice never crosses the trust boundary);
-      // busy state cancels the in-flight export.
+      // Export button: idle state opens a webview-side popover with
+      // format choices (HTML / PDF / Word); busy state cancels the
+      // in-flight export. The format choice now crosses the trust
+      // boundary via \`requestExport.format\` — \`isKnitOutputMessage\`
+      // strictly validates against the \`EXPORT_FORMATS\` whitelist
+      // before the host dispatches the matching \`raven.knit.export*\`
+      // command. Icon swap (export -> stop-circle) and a single
+      // unchanging tooltip per state keep the toolbar height invariant.
       const exportBtn = document.getElementById('raven-knit-export');
-      const exportLabelIdle = 'Export ▾';
-      const exportLabelBusy = 'Cancel export';
-      const exportTitleIdle = exportBtn.getAttribute('title') || '';
+      const exportPopover = document.getElementById('raven-knit-export-popover');
+      const ICON_EXPORT_SVG = ${JSON.stringify(ICON_SHARE)};
+      const ICON_STOP_SVG = ${JSON.stringify(ICON_STOP)};
+      // Capture the idle-state title/aria-label so syncExportBtn can
+      // restore them when the busy->idle flip happens. The hardcoded
+      // fallbacks are belt-and-braces: if a future markup edit drops
+      // or empties either attribute, we still emit a non-empty value
+      // on every state flip instead of silently stripping the
+      // affordance after the first export completes.
+      const exportTitleIdle = exportBtn.getAttribute('title') || 'Export as HTML, PDF, or Word';
+      const exportAriaIdle = exportBtn.getAttribute('aria-label') || 'Export';
       const exportTitleBusy = 'Cancel the in-flight export';
+      const exportAriaBusy = 'Cancel export';
       function syncExportBtn() {
         var busy = exportBtn.dataset.busy === 'true';
-        exportBtn.textContent = busy ? exportLabelBusy : exportLabelIdle;
+        exportBtn.innerHTML = busy ? ICON_STOP_SVG : ICON_EXPORT_SVG;
         exportBtn.setAttribute('title', busy ? exportTitleBusy : exportTitleIdle);
+        exportBtn.setAttribute('aria-label', busy ? exportAriaBusy : exportAriaIdle);
       }
-      exportBtn.addEventListener('click', function () {
-        if (exportBtn.dataset.busy === 'true') {
-          vscode.postMessage({ type: 'cancelExport' });
-        } else {
-          vscode.postMessage({ type: 'requestExport' });
+      function closeExportPopover() {
+        // hidePopover() throws InvalidStateError when the popover is
+        // not currently showing; guard with :popover-open before
+        // calling so any caller (busy-state flip, format pick) is
+        // safe to invoke at any time.
+        if (exportPopover && exportPopover.matches && exportPopover.matches(':popover-open')) {
+          if (exportPopover.hidePopover) exportPopover.hidePopover();
         }
+      }
+      // Position the popover under the export button. The HTML
+      // popover API gives outside-click and Escape dismissal for
+      // free; we only need to anchor the visible position. The
+      // CSS rule \`#raven-knit-export-popover { inset: auto }\`
+      // overrides the browser UA stylesheet's [popover] { inset: 0;
+      // margin: auto } (which would otherwise center the popover)
+      // so JS-set top/left actually take effect.
+      //
+      // The toolbar is at the top of the panel, so we always place
+      // the popover BELOW the trigger (no flip-above needed). Both
+      // axes clamp to keep the popover at least 4px from the viewport
+      // edges so very narrow panels still render the menu legibly.
+      function positionExportPopover() {
+        if (!exportPopover || !exportBtn) return;
+        var r = exportBtn.getBoundingClientRect();
+        var vw = window.innerWidth;
+        var vh = window.innerHeight;
+        // If the trigger has scrolled out of the visible viewport
+        // (e.g. the toolbar's overflow-x has clipped it on a very
+        // narrow panel), there is no sensible anchor and the user
+        // can't see what the menu belongs to. Close the popover
+        // instead of clamping to a viewport corner with no visible
+        // source button.
+        var triggerVisible =
+          r.right > 0 && r.left < vw && r.bottom > 0 && r.top < vh;
+        if (!triggerVisible) {
+          closeExportPopover();
+          return;
+        }
+        // Clear stale inline coords before measuring so the popover
+        // reports its natural box, not a previous position.
+        exportPopover.style.left = '';
+        exportPopover.style.top = '';
+        exportPopover.style.right = '';
+        exportPopover.style.bottom = '';
+        // While :popover-open hasn't applied display: flex yet (we're
+        // in beforetoggle), force display: flex for measurement and
+        // hide via visibility so users don't see a flash at the UA
+        // default centered position. Wrap in try/finally so an
+        // unexpected throw during measurement can't leave the popover
+        // permanently invisible via inline display/visibility styles.
+        var prevDisplay = exportPopover.style.display;
+        var prevVisibility = exportPopover.style.visibility;
+        var w, h;
+        try {
+          exportPopover.style.visibility = 'hidden';
+          exportPopover.style.display = 'flex';
+          w = exportPopover.offsetWidth;
+          h = exportPopover.offsetHeight;
+        } finally {
+          exportPopover.style.display = prevDisplay;
+          exportPopover.style.visibility = prevVisibility;
+        }
+
+        // Anchor near the button's left edge by default; clamp so the
+        // popover stays at least 4px from both viewport edges.
+        var left = Math.max(4, Math.min(r.left, vw - w - 4));
+        var top = r.bottom + 4;
+        // If the toolbar is somehow not at the top (e.g. a future
+        // layout change moves it), fall back to placing above when
+        // the button is too close to the bottom of the viewport.
+        if (top + h + 4 > vh && r.top - 4 - h >= 4) {
+          top = r.top - 4 - h;
+        }
+        top = Math.max(4, top);
+        exportPopover.style.left = left + 'px';
+        exportPopover.style.top = top + 'px';
+      }
+      function onExportPopoverResize() {
+        // Guard against the close-toggle race: if resize fires
+        // between beforetoggle('closed') (sync) and toggle('closed')
+        // (queued task that removes this listener), the popover is
+        // mid-closing and the display: flex measurement trick would
+        // briefly take effect on the closing element.
+        if (!exportPopover || !exportPopover.matches || !exportPopover.matches(':popover-open')) return;
+        positionExportPopover();
+      }
+      if (exportPopover) {
+        exportPopover.addEventListener('beforetoggle', function (e) {
+          // aria-expanded mirror MUST update synchronously with the
+          // popover's visible state, not via the queued \`toggle\`
+          // event — otherwise AT readers can briefly see the popover
+          // open while the trigger still reads "collapsed". beforetoggle
+          // fires sync; toggle fires as a queued task after the state
+          // change has taken effect.
+          exportBtn.setAttribute('aria-expanded', e.newState === 'open' ? 'true' : 'false');
+          if (e.newState === 'open') {
+            positionExportPopover();
+          }
+        });
+        exportPopover.addEventListener('toggle', function (e) {
+          if (e.newState === 'open') {
+            var firstEnabled = exportPopover.querySelector('button:not([disabled])');
+            if (firstEnabled) firstEnabled.focus();
+            window.addEventListener('resize', onExportPopoverResize);
+          } else {
+            window.removeEventListener('resize', onExportPopoverResize);
+          }
+        });
+        exportPopover.addEventListener('click', function (e) {
+          var t = e.target;
+          var btn = t && t.closest ? t.closest('button[data-format]') : null;
+          if (!btn || btn.hasAttribute('disabled')) return;
+          var format = btn.getAttribute('data-format');
+          // Whitelist guard mirrors the host-side EXPORT_FORMATS check.
+          // The host-side trust-boundary validator is the authoritative
+          // check, but rejecting here prevents an unsupported format
+          // from racing the popover-close and causing a stray
+          // postMessage that would just bounce off the validator.
+          if (format !== 'html' && format !== 'pdf' && format !== 'docx') return;
+          closeExportPopover();
+          vscode.postMessage({ type: 'requestExport', format: format });
+        });
+      }
+      exportBtn.addEventListener('click', function (e) {
+        if (exportBtn.dataset.busy === 'true') {
+          // In busy mode the click is a cancel — preventDefault stops
+          // the browser from processing the declarative popovertarget
+          // invocation on the trigger, so we don't accidentally toggle
+          // the popover while the user means to cancel.
+          e.preventDefault();
+          vscode.postMessage({ type: 'cancelExport' });
+          return;
+        }
+        // Idle: the browser's declarative popovertarget="raven-knit-
+        // export-popover" attribute on the trigger handles the toggle
+        // (and crucially makes the trigger a popover invoker, so a
+        // click on it is excluded from the light-dismiss algorithm —
+        // see the markup-side comment above for why we don't rely on
+        // an imperative showPopover/hidePopover here).
       });
+      // Initial paint of the export icon. The button HTML already
+      // ships with the export icon baked in via the template literal,
+      // so this just keeps the syncExportBtn invariant on equal
+      // footing with the busy-state postMessage path.
+      syncExportBtn();
 
       // --- VS Code theme overlay -------------------------------------
       // The iframe is srcdoc + sandbox=allow-same-origin, which gives
@@ -1334,7 +1657,26 @@ export function buildShellHtml(args: {
         if (!ctxMenu.contains(e.target)) hideContextMenu();
       });
       document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape') hideContextMenu();
+        // Layered unwind to match the iframe Escape handler: context
+        // menu first (topmost layer when summoned over an open
+        // popover via right-click), then the export popover. The
+        // browser's native popover Escape would dismiss the popover
+        // on its own, but routing it through closeExportPopover()
+        // here makes sure a single Escape press only collapses one
+        // layer even when both are open with outer-shell focus.
+        if (e.key !== 'Escape') return;
+        if (!ctxMenu.hidden) {
+          hideContextMenu();
+          e.preventDefault();
+          return;
+        }
+        if (exportPopover
+            && exportPopover.matches
+            && exportPopover.matches(':popover-open')) {
+          closeExportPopover();
+          e.preventDefault();
+          return;
+        }
       });
 
       function attachIframeInputHandlers() {
@@ -1354,6 +1696,35 @@ export function buildShellHtml(args: {
         // and silently trigger a single-key keybinding the user
         // may have configured in VS Code.
         win.addEventListener('keydown', function (e) {
+          // Escape dismisses any open toolbar UI even when focus is
+          // inside the iframe. Keystrokes that fire inside a sandboxed
+          // (allow-same-origin) iframe stay within its document tree,
+          // so the HTML popover API's built-in Escape light-dismiss
+          // (which listens on the OUTER shell document) never sees
+          // them — without this branch a user who clicks into the
+          // rendered report and presses Escape would be stuck with
+          // an open Export menu they cannot close from the keyboard.
+          // Mirrors the existing mousedown -> dismissToolbarUi route
+          // that closes the popover on iframe clicks.
+          if (e.key === 'Escape') {
+            // Unwind one layer per Escape press — the context menu
+            // (when summoned over an open popover via right-click)
+            // is the topmost layer and dismisses first. The popover
+            // remains; a second Escape closes it. Matches the
+            // conventional "Escape pops one modal" affordance.
+            if (!ctxMenu.hidden) {
+              hideContextMenu();
+              e.preventDefault();
+              return;
+            }
+            if (exportPopover
+                && exportPopover.matches
+                && exportPopover.matches(':popover-open')) {
+              closeExportPopover();
+              e.preventDefault();
+              return;
+            }
+          }
           const mod = e.metaKey || e.ctrlKey;
           if (!mod) return;
           // AltGr on Windows / many Linux layouts fires as Ctrl+Alt
@@ -1417,9 +1788,23 @@ export function buildShellHtml(args: {
           else if (tgt && tgt.closest) image = tgt.closest('svg.raven-knit-plot-svg');
           showContextMenu(x, y, hasSel, image);
         });
-        // A new click inside the iframe should dismiss the menu so
-        // it does not linger after the user moves on.
-        win.addEventListener('mousedown', hideContextMenu);
+        // A new click inside the iframe should dismiss any open
+        // toolbar UI so they don't linger after the user moves on.
+        // The HTML popover API gives outside-click dismissal for free,
+        // BUT the iframe is sandboxed (allow-same-origin): mousedown
+        // events that fire INSIDE the iframe don't propagate to the
+        // outer shell document, so the browser's popover light-dismiss
+        // logic never sees them and leaves the export popover open.
+        // Routing iframe mousedowns through closeExportPopover (and the
+        // existing hideContextMenu) makes a click in the rendered
+        // report behave the same way a click on the toolbar would —
+        // matching the plot viewer's UX where any click outside the
+        // share popover closes it.
+        function dismissToolbarUi() {
+          hideContextMenu();
+          closeExportPopover();
+        }
+        win.addEventListener('mousedown', dismissToolbarUi);
         win.addEventListener('scroll', hideContextMenu, true);
         // Re-attach is required after every iframe reload (Knit
         // again, or singleton-panel content swap).
@@ -1626,6 +2011,14 @@ export function buildShellHtml(args: {
           // smuggled non-boolean cannot enable the cancel dispatch.
           if (data.busy === true) {
             exportBtn.dataset.busy = 'true';
+            // Dismiss any open format popover so the user isn't
+            // looking at a fresh "Export to HTML / PDF / Word" menu
+            // anchored under a trigger that has just swapped to the
+            // cancel icon. Without this, picking a format from the
+            // open popover would post requestExport against an op
+            // key that's already busy, surfacing a surprise
+            // "cancel-and-retry" toast.
+            closeExportPopover();
           } else {
             delete exportBtn.dataset.busy;
           }
@@ -1739,7 +2132,7 @@ export function rewriteFragmentAnchors(html: string): string {
 }
 
 /**
- * Pick the output path to surface in the Knit Output panel.
+ * Pick the output path to surface in the Knit Preview panel.
  *
  * When `output_format = "all"` (or a custom multi-format render) produces
  * a mix of formats, the user almost always wants the HTML viewer rather

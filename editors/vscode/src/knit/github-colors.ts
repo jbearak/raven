@@ -1,5 +1,5 @@
 /**
- * GitHub-style syntax-highlighting palettes for the Knit Output
+ * GitHub-style syntax-highlighting palettes for the Knit Preview
  * rendering pipeline.
  *
  * Two color sets, one per theme variant. Each set maps a small handful
@@ -50,7 +50,16 @@ export interface GithubPalette {
  * ships in `styles/github.css` for parity with the GitHub UI.
  */
 export const githubLight: GithubPalette = {
-    background: '#f6f8fa',
+    // Pure white page bg. The earlier `#f6f8fa` value matched
+    // GitHub's `gray-100` token, but inside the knit preview panel
+    // it produced a visible off-white seam around white-background
+    // plots (every ggplot rendered with `theme_grey()` / `theme_bw()`
+    // bakes a `#FFFFFF` panel rect). Using `#ffffff` here removes
+    // that seam; the body and the plots blend into one continuous
+    // surface, and code blocks stay visually distinct via their
+    // border + padding (they use the same bg as the body, so the
+    // chrome — not the fill — is what separates them).
+    background: '#ffffff',
     foreground: '#24292f',
     roles: {
         keyword: '#cf222e',

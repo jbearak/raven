@@ -1,12 +1,12 @@
 /**
  * Discovers and loads VS Code grammar contributions for the Knit
- * Output rendering pipeline.
+ * Preview rendering pipeline.
  *
  * Every installed extension can contribute one or more entries under
  * `contributes.grammars` in its `package.json`. Each entry maps a
  * `language` ID (and a `scopeName`) to a `.tmLanguage.json` / `.plist`
  * grammar file inside the extension. VS Code's own preview pipeline
- * uses these contributions to tokenize code blocks; the Knit Output
+ * uses these contributions to tokenize code blocks; the Knit Preview
  * rendering pipeline needs the same thing, except we have to walk the
  * contributions ourselves (VS Code does not expose a public "give me a
  * grammar by language ID" API).
@@ -26,7 +26,7 @@
  *                                   invisible to the workspace host.
  *
  * For non-R languages the policy is simpler: pick the first installed
- * contribution we find. The Knit Output pipeline only needs a single
+ * contribution we find. The Knit Preview pipeline only needs a single
  * grammar per language, and a user with multiple grammars installed
  * for the same language is rare in practice.
  *

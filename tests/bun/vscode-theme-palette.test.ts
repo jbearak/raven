@@ -602,7 +602,7 @@ describe('resolveActiveThemePalette — color extraction', () => {
         expect(out.ok).toBe(true);
         if (out.ok) {
             // Invalid bg drops to githubLight.background.
-            expect(out.palette.background).toBe('#f6f8fa');
+            expect(out.palette.background).toBe('#ffffff');
             // Valid 3-digit hex passes through.
             expect(out.palette.foreground).toBe('#ccc');
         }

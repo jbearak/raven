@@ -140,24 +140,32 @@ explorer-context-menu hook is opt-in via your own keybindings).
     temp-and-rename next to the source, so a concurrent re-knit
     can never expose a half-written file to the panel.
 
-11. **Reveal.** Raven opens the rendered HTML in a **Knit Output**
+11. **Reveal.** Raven opens the rendered HTML in a **Knit Preview**
     webview panel beside the editor — no success popover, the panel
     itself is the signal. Each `.Rmd` gets its own panel; knitting a
     second `.Rmd` opens a separate panel that stacks as a tab in the
     same "preview" column rather than replacing the first. Re-knitting
     the same `.Rmd` updates its panel in place. The panel toolbar
-    has three buttons:
+    is icon-only and stays single-row at every panel width. From left
+    to right it carries:
 
-    - **Knit again** — re-knits the source `.Rmd` (the same code path
-      as invoking `Raven: Knit Preview` from the palette).
-    - **Open in Browser** — opens the rendered file in your OS default
-      browser. In remote workspaces (Remote SSH, Dev Containers, WSL,
-      Codespaces) the `file://` URI behind this action targets the
-      remote machine, not where you are sitting, so the button (and
-      the matching right-click "Open in Browser" menu item) is
-      omitted from the toolbar. Use **Export ▾** instead — its toast
-      routes through the remote-aware Download flow that streams the
-      file to your local machine.
+    - **Knit again** (refresh icon) — re-knits the source `.Rmd` (the
+      same code path as invoking `Raven: Knit Preview` from the
+      palette).
+    - **Export** (share icon) — opens an in-shell popover with three
+      format choices (Pandoc HTML, PDF, Word). While an export is in
+      flight the icon swaps to a stop-circle and the next click
+      cancels the running pandoc invocation. The popover dismisses on
+      outside click, on Escape, or when you click into the rendered
+      report — the same UX the Plot Viewer's share popover uses.
+    - **Open in Browser** (globe icon) — opens the rendered file in
+      your OS default browser. In remote workspaces (Remote SSH, Dev
+      Containers, WSL, Codespaces) the `file://` URI behind this
+      action targets the remote machine, not where you are sitting,
+      so the button (and the matching right-click "Open in Browser"
+      menu item) is omitted from the toolbar. Use **Export** instead
+      — its toast routes through the remote-aware Download flow that
+      streams the file to your local machine.
     - **Apply VS Code theme** — toggle that overlays the rendered
       document with VS Code's active editor background, foreground,
       and link colors. Code blocks (both fenced and inline `<code>`)
@@ -386,7 +394,7 @@ those checks live in the runtime sanitizer only.
 | Capability | Where it lives |
 |---|---|
 | Live preview of `.Rmd` or `.qmd` | `quarto.quarto`'s `Quarto: Preview` |
-| Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Output panel is a static viewer with a manual Refresh button — not a live recompile. |
+| Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Preview panel is a static viewer with a manual Knit again button — not a live recompile. |
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |

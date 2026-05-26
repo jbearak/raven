@@ -1,5 +1,5 @@
 /**
- * Knit Output rendering pipeline.
+ * Knit Preview rendering pipeline.
  *
  * The full flow (called from the post-knit code path in
  * `knit-commands.ts`):
