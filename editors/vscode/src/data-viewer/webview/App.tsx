@@ -20,8 +20,12 @@ import {
 } from '@glideapps/glide-data-grid';
 import type { ColumnSchema } from '../arrow-reader';
 import {
+    EMPTY_FILTER,
     EMPTY_SORT,
     type ExtensionToWebview,
+    type FilterEntry,
+    type FilterState,
+    type HistogramBin,
     type Layout,
     type Settings,
     type SortKey,
@@ -56,6 +60,7 @@ import {
 import { ColumnVisibilityPopover } from './column-visibility-popover';
 import { ColumnContextMenu } from './column-context-menu';
 import { ToolbarSortStrip } from './sort-strip';
+import { FilterStrip } from './filter-strip';
 
 type VscodeApi = {
     postMessage(msg: WebviewToExtension): void;
@@ -74,6 +79,9 @@ type PersistedState = {
     objectClass?: string;
     visibleRange: VisibleRange;
     sort: SortState;
+    filter: FilterState;
+    nrowFiltered?: number;
+    histograms?: Record<number, HistogramBin[]>;
 };
 
 type ContextMenuState = {
@@ -315,6 +323,11 @@ export function App({
     const [copyStatusMsg, setCopyStatusMsg] = useState('');
     const [sort, setSort] = useState<SortState>(restored?.sort ?? EMPTY_SORT);
     const [sortPending, setSortPending] = useState(false);
+    const [filter, setFilter] = useState<FilterState>(restored?.filter ?? EMPTY_FILTER);
+    const [filterPending, setFilterPending] = useState(false);
+    const [nrowFiltered, setNrowFiltered] = useState<number | undefined>(restored?.nrowFiltered);
+    const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>(restored?.histograms ?? {});
+    const [filterEditor, setFilterEditor] = useState<{ entry?: FilterEntry; columnIndex?: number } | null>(null);
 
     const visibleCols = useMemo(
         () => visibleColumnIndices(columns, layout.hiddenColumns),
@@ -372,6 +385,9 @@ export function App({
             objectClass,
             visibleRange,
             sort,
+            filter,
+            nrowFiltered,
+            histograms,
         });
     }, [
         vscode,
@@ -386,6 +402,9 @@ export function App({
         objectClass,
         visibleRange,
         sort,
+        filter,
+        nrowFiltered,
+        histograms,
     ]);
 
     useEffect(() => {
@@ -507,6 +526,10 @@ export function App({
         setToolbar(m.toolbar);
         setSort(m.sort);
         setSortPending(false);
+        setFilter(m.filter);
+        setHistograms(m.histograms ?? {});
+        setFilterPending(false);
+        if (m.filter.entries.length === 0) setNrowFiltered(undefined);
         toolbarBootstrappedRef.current = true;
         clearRows();
         setResolvedLabels({});
@@ -607,6 +630,48 @@ export function App({
         if (m.panelGeneration !== panelGeneration) return;
         setSortPending(m.state === 'pending');
     }, [panelGeneration]);
+
+    const applyFilterApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'filterApplied' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        setFilter(m.filter);
+        setNrowFiltered(m.filter.entries.some(e => e.enabled) ? m.nrowFiltered : undefined);
+        setFilterPending(false);
+    }, [panelGeneration]);
+
+    const applyFilterStatus = useCallback((m: Extract<ExtensionToWebview, { type: 'filterStatus' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        setFilterPending(m.state === 'pending');
+    }, [panelGeneration]);
+
+    /** Send a setFilters request. Empty `entries` clears the filter. The host
+     *  replies with `filterApplied` which drives state updates. */
+    const applyFilters = useCallback((entries: FilterEntry[]) => {
+        setFilterPending(entries.some(e => e.enabled));
+        const requestId = ++nextRequestIdRef.current;
+        vscode.postMessage({
+            type: 'setFilters',
+            panelGeneration,
+            requestId,
+            entries,
+            labelsOn: toolbar.labelsOn,
+        });
+    }, [panelGeneration, toolbar.labelsOn, vscode]);
+
+    const onEditFilter = useCallback((entry: FilterEntry) => {
+        setFilterEditor({ entry });
+    }, []);
+
+    const onToggleFilterEnabled = useCallback((id: string) => {
+        applyFilters(filter.entries.map(e => e.id === id ? { ...e, enabled: !e.enabled } : e));
+    }, [applyFilters, filter.entries]);
+
+    const onRemoveFilter = useCallback((id: string) => {
+        applyFilters(filter.entries.filter(e => e.id !== id));
+    }, [applyFilters, filter.entries]);
+
+    const onClearAllFilters = useCallback(() => {
+        applyFilters([]);
+    }, [applyFilters]);
 
     /** Send a setSort request. Empty `keys` clears the sort. The host
      *  replies with `sortApplied` which drives state updates. */
@@ -830,6 +895,12 @@ export function App({
                 case 'sortStatus':
                     applySortStatus(m);
                     return;
+                case 'filterApplied':
+                    applyFilterApplied(m);
+                    return;
+                case 'filterStatus':
+                    applyFilterStatus(m);
+                    return;
                 case 'testKey':
                     handleTestKey(m.key);
                     return;
@@ -846,6 +917,8 @@ export function App({
         return () => window.removeEventListener('message', onMessage);
     }, [
         applyCopyDone,
+        applyFilterApplied,
+        applyFilterStatus,
         applyInitOrReplace,
         applyLabels,
         applyRows,
@@ -866,6 +939,19 @@ export function App({
             toolbar,
         });
     }, [panelGeneration, schemaHash, toolbar, vscode]);
+
+    useEffect(() => {
+        if (!schemaHash) return;
+        const id = window.setTimeout(() => {
+            vscode.postMessage({
+                type: 'saveFilter',
+                panelGeneration,
+                schemaHash,
+                filter,
+            });
+        }, 300);
+        return () => window.clearTimeout(id);
+    }, [filter, panelGeneration, schemaHash, vscode]);
 
     /** Labels-toggle invalidates sort keys derived from displayed text.
      *  When the active sort touches a factor or value-labelled column
@@ -1161,6 +1247,14 @@ export function App({
                     columns={columns}
                     onChange={applySort}
                     onClearAll={clearAllSorts}
+                />
+                <FilterStrip
+                    filter={filter}
+                    columns={columns}
+                    onEdit={onEditFilter}
+                    onToggleEnabled={onToggleFilterEnabled}
+                    onRemove={onRemoveFilter}
+                    onClearAll={onClearAllFilters}
                 />
                 <button
                     type="button"

@@ -459,3 +459,157 @@ body,
 .sort-strip-clear:hover {
     opacity: 1;
 }
+
+/* ── Filter chip strip ──────────────────────────────────────────────── */
+
+.filter-strip {
+    display: flex;
+    align-items: center;
+    flex: 0 1 auto;
+    min-width: 0;
+    gap: 6px;
+    padding: 0 4px;
+    border-left: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-right: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.filter-strip-label {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.filter-strip-chips {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    gap: 4px;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.filter-chip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 3px;
+    padding: 2px 4px 2px 8px;
+    border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-radius: 12px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 18px;
+}
+
+.filter-chip:hover {
+    border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+.filter-chip.disabled {
+    opacity: 0.55;
+}
+
+.filter-chip-toggle {
+    flex: 0 0 auto;
+    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, #007fd4));
+    font-size: 11px;
+    line-height: 1;
+}
+
+.filter-chip-body {
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.filter-chip-body:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 1px;
+}
+
+.filter-chip-kebab {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-icon-foreground, inherit);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    opacity: 0.65;
+}
+
+.filter-chip-kebab:hover,
+.filter-chip-kebab.open {
+    opacity: 1;
+    color: var(--vscode-focusBorder, #007fd4);
+}
+
+.filter-chip-kebab:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 1px;
+}
+
+.filter-chip-popover {
+    /* `position: fixed` (with JS-computed coords from the kebab's
+       bounding rect) keeps the popover out of the chip-strip's
+       `overflow: auto` clip without needing a portal. */
+    position: fixed;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    min-width: 130px;
+    padding: 4px 0;
+    border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 4px;
+    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e)));
+    box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
+    font-size: 12px;
+}
+
+.filter-chip-popover-item {
+    padding: 5px 12px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+}
+
+.filter-chip-popover-item:hover,
+.filter-chip-popover-item:focus {
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #ffffff));
+    outline: none;
+}
+
+.filter-strip-clear {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-icon-foreground, inherit);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    opacity: 0.65;
+}
+
+.filter-strip-clear:hover {
+    opacity: 1;
+}
