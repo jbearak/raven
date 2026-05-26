@@ -25,6 +25,7 @@ import type { ColumnSchema } from '../arrow-reader';
 import type { FilterEntry, FilterPredicate, HistogramBin } from '../messages';
 import { useDismiss } from './use-dismiss';
 import { FilterHistogram } from './filter-histogram';
+import { colKind, kindOptions, type ColKind, type KindOption } from './filter-column-kind';
 
 /** A small uid helper that avoids a `crypto` availability issue in older
  *  webview runtimes. Falls back gracefully if crypto.randomUUID is present. */
@@ -45,71 +46,6 @@ type Props = {
     onCancel: () => void;
     anchor: { leftPx: number; topPx: number };
 };
-
-// ── Column-type categorisation ──────────────────────────────────────────────
-
-type ColKind = 'numeric' | 'factor' | 'string' | 'bool' | 'date';
-
-function colKind(col: ColumnSchema): ColKind {
-    const t = col.arrowType;
-    if (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float')) return 'numeric';
-    if (t.startsWith('Dictionary')) return 'factor';
-    if (col.valueLabels) return 'factor';
-    if (t.startsWith('Utf8') || t.startsWith('LargeUtf8')) return 'string';
-    if (t === 'Bool') return 'bool';
-    if (t.startsWith('Date') || t.startsWith('Timestamp')) return 'date';
-    return 'string'; // safe fallback
-}
-
-// ── Predicate-kind option lists per column type ─────────────────────────────
-
-type KindOption = { value: string; label: string };
-
-function kindOptions(kind: ColKind): KindOption[] {
-    switch (kind) {
-        case 'numeric':
-            return [
-                { value: 'numCompare', label: 'Compare (=, ≠, <, ≤, >, ≥)' },
-                { value: 'numBetween', label: 'Between' },
-                { value: 'numNotBetween', label: 'Not between' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'factor':
-            return [
-                { value: 'setIn', label: 'Is one of' },
-                { value: 'setNotIn', label: 'Is not one of' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'string':
-            return [
-                { value: 'strContains', label: 'Contains' },
-                { value: 'strNotContains', label: 'Does not contain' },
-                { value: 'strStartsWith', label: 'Starts with' },
-                { value: 'strEndsWith', label: 'Ends with' },
-                { value: 'strCompareEq', label: 'Equals (=)' },
-                { value: 'strCompareNe', label: 'Not equals (≠)' },
-                { value: 'strRegex', label: 'Matches regex' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'bool':
-            return [
-                { value: 'bool', label: 'Is true / false' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'date':
-            return [
-                { value: 'dateCompare', label: 'Compare (=, ≠, <, ≤, >, ≥)' },
-                { value: 'dateBetween', label: 'Between' },
-                { value: 'dateNotBetween', label: 'Not between' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-    }
-}
 
 /** Map a persisted FilterPredicate back to our internal kind-select value. */
 function predicateToKindValue(p: FilterPredicate): string {
