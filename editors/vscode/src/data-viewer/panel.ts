@@ -14,6 +14,7 @@ import * as fs from 'node:fs/promises';
 import { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import {
     COPY_CELL_LIMIT,
+    EMPTY_FILTER,
     EMPTY_SORT,
     ExtensionToWebview,
     Layout,
@@ -195,6 +196,8 @@ export class DataViewerPanel {
             schemaHash: layoutHash,
             objectClass: reader.schema.objectClass,
             sort: restored,
+            filter: EMPTY_FILTER,
+            histograms: {},
         };
         this.trace('post-init', {
             generation,
@@ -243,6 +246,8 @@ export class DataViewerPanel {
             schemaHash: layoutHash,
             objectClass: reader.schema.objectClass,
             sort: restored,
+            filter: EMPTY_FILTER,
+            histograms: {},
         };
         this.trace('post-replace', {
             generation,
