@@ -102,3 +102,58 @@ describe('computeFilteredIndices — includeMissing', () => {
         await r.close();
     });
 });
+
+describe('computeFilteredIndices — numeric predicates on x [1,2,3,4,5]', () => {
+    test('numCompare = 3', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 0, { kind: 'numCompare', op: '=', value: 3 });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([2]);
+        await r.close();
+    });
+    test('numCompare >= 3', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 0, { kind: 'numCompare', op: '>=', value: 3 });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([2, 3, 4]);
+        await r.close();
+    });
+    test('numBetween inclusive 2..4', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 0, { kind: 'numBetween', lo: 2, hi: 4, inclusive: true });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([1, 2, 3]);
+        await r.close();
+    });
+    test('numBetween exclusive 2..4', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 0, { kind: 'numBetween', lo: 2, hi: 4, inclusive: false });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([2]);
+        await r.close();
+    });
+    test('numNotBetween inclusive 2..4', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 0, { kind: 'numNotBetween', lo: 2, hi: 4, inclusive: true });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 4]);
+        await r.close();
+    });
+});
+
+describe('computeFilteredIndices — numeric on Float with NA / NaN / Inf', () => {
+    test('numCompare > 0 keeps 1.5 and +Inf', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 1, { kind: 'numCompare', op: '>', value: 0 });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 3]);
+        await r.close();
+    });
+    test('numCompare > 0 with includeMissing keeps NA/NaN too', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 1, { kind: 'numCompare', op: '>', value: 0 }, { includeMissing: true });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 1, 2, 3]);
+        await r.close();
+    });
+});

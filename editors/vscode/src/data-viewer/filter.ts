@@ -100,6 +100,33 @@ async function acceptorFor(
         return (i) => values[i] === want;
     }
 
+    if (predicate.kind === 'numCompare') {
+        const values = await loadNumeric(reader, columnIndex);
+        const v = predicate.value;
+        switch (predicate.op) {
+            case '=': return (i) => values[i] === v;
+            case '!=': return (i) => values[i] !== v;
+            case '<': return (i) => values[i] < v;
+            case '<=': return (i) => values[i] <= v;
+            case '>': return (i) => values[i] > v;
+            case '>=': return (i) => values[i] >= v;
+        }
+    }
+    if (predicate.kind === 'numBetween') {
+        const values = await loadNumeric(reader, columnIndex);
+        const lo = predicate.lo, hi = predicate.hi, incl = predicate.inclusive;
+        return incl
+            ? (i) => values[i] >= lo && values[i] <= hi
+            : (i) => values[i] > lo && values[i] < hi;
+    }
+    if (predicate.kind === 'numNotBetween') {
+        const values = await loadNumeric(reader, columnIndex);
+        const lo = predicate.lo, hi = predicate.hi, incl = predicate.inclusive;
+        return incl
+            ? (i) => values[i] < lo || values[i] > hi
+            : (i) => values[i] <= lo || values[i] >= hi;
+    }
+
     throw new Error(`filter: predicate kind not yet implemented: ${predicate.kind}`);
 }
 
@@ -142,6 +169,29 @@ async function loadBool(reader: ArrowSliceReader, columnIndex: number): Promise<
         }
     }
     return values;
+}
+
+async function loadNumeric(reader: ArrowSliceReader, columnIndex: number): Promise<Float64Array> {
+    const nrow = reader.nrow;
+    const out = new Float64Array(nrow);
+    const numBatches = reader.batchStarts.length - 1;
+    for (let bi = 0; bi < numBatches; bi++) {
+        const batch = await (reader as any).getBatch(bi);
+        const child = batch.getChildAt(columnIndex);
+        const start = reader.batchStarts[bi];
+        const n = reader.batchStarts[bi + 1] - start;
+        for (let r = 0; r < n; r++) {
+            const v = child.get(r);
+            if (v === null || v === undefined) continue;
+            // bigint columns (Int64 / Uint64) lossily coerce to Number;
+            // values outside Number.MAX_SAFE_INTEGER lose precision. For
+            // filter predicates the loss is acceptable because the user
+            // typed a Number-domain `value` field; sort uses BigInt for
+            // exact ordering where precision matters.
+            out[start + r] = typeof v === 'bigint' ? Number(v) : (v as number);
+        }
+    }
+    return out;
 }
 
 function allZero(m: Uint8Array): boolean {
