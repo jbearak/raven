@@ -3,6 +3,21 @@
 // This module provides an async interface for querying R about packages,
 // library paths, and exports. It's used by the package function awareness
 // feature to resolve package symbols.
+//
+// # Safety invariants for callers
+//
+// Any code that spawns an R subprocess (here or in sibling modules like
+// `package_library`) MUST observe:
+//
+// 1. **Validate user-controlled inputs** (e.g. package names) before they
+//    reach the spawn. Package-name validation is the canonical example.
+// 2. **Wrap every R subprocess call in `tokio::time::timeout()`.** A hung
+//    R process must not block the LSP indefinitely.
+// 3. **Never interpolate user-controlled strings into R code.** Pass values
+//    as `Command` args instead. `help()` uses NSE for `package`, so any
+//    variable argument MUST be wrapped in parens to force evaluation:
+//    `help(topic, package = (pkg))`. Without the parens R reads the symbol
+//    literally and a user-supplied package name silently fails to resolve.
 
 // Allow dead code during incremental development - this module will be
 // integrated into WorldState in task 7.1
