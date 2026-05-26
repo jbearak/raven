@@ -127,6 +127,57 @@ async function acceptorFor(
             : (i) => values[i] <= lo || values[i] >= hi;
     }
 
+    if (predicate.kind === 'strCompare'
+        || predicate.kind === 'strContains'
+        || predicate.kind === 'strStartsWith'
+        || predicate.kind === 'strEndsWith'
+        || predicate.kind === 'strRegex') {
+        const values = await loadString(reader, columnIndex);
+        const cs = predicate.caseSensitive;
+        switch (predicate.kind) {
+            case 'strCompare': {
+                const needle = cs ? predicate.value : predicate.value.toLowerCase();
+                const eq = predicate.op === '=';
+                return (i) => {
+                    const hay = cs ? values[i] : values[i].toLowerCase();
+                    return eq ? hay === needle : hay !== needle;
+                };
+            }
+            case 'strContains': {
+                const needle = cs ? predicate.value : predicate.value.toLowerCase();
+                const neg = predicate.negate;
+                return (i) => {
+                    const hay = cs ? values[i] : values[i].toLowerCase();
+                    const hit = hay.includes(needle);
+                    return neg ? !hit : hit;
+                };
+            }
+            case 'strStartsWith': {
+                const needle = cs ? predicate.value : predicate.value.toLowerCase();
+                return (i) => (cs ? values[i] : values[i].toLowerCase()).startsWith(needle);
+            }
+            case 'strEndsWith': {
+                const needle = cs ? predicate.value : predicate.value.toLowerCase();
+                return (i) => (cs ? values[i] : values[i].toLowerCase()).endsWith(needle);
+            }
+            case 'strRegex': {
+                let rx: RegExp | null = null;
+                try {
+                    rx = new RegExp(predicate.pattern, cs ? '' : 'i');
+                } catch {
+                    // Invalid pattern: the chip should already be marked
+                    // invalid by the webview, but we may still be invoked
+                    // (e.g. on restore from persistence after a code
+                    // change). Treat as no-match without throwing.
+                    rx = null;
+                }
+                if (!rx) return () => false;
+                const r = rx;
+                return (i) => r.test(values[i]);
+            }
+        }
+    }
+
     throw new Error(`filter: predicate kind not yet implemented: ${predicate.kind}`);
 }
 
@@ -189,6 +240,23 @@ async function loadNumeric(reader: ArrowSliceReader, columnIndex: number): Promi
             // typed a Number-domain `value` field; sort uses BigInt for
             // exact ordering where precision matters.
             out[start + r] = typeof v === 'bigint' ? Number(v) : (v as number);
+        }
+    }
+    return out;
+}
+
+async function loadString(reader: ArrowSliceReader, columnIndex: number): Promise<string[]> {
+    const nrow = reader.nrow;
+    const out: string[] = new Array(nrow).fill('');
+    const numBatches = reader.batchStarts.length - 1;
+    for (let bi = 0; bi < numBatches; bi++) {
+        const batch = await (reader as any).getBatch(bi);
+        const child = batch.getChildAt(columnIndex);
+        const start = reader.batchStarts[bi];
+        const n = reader.batchStarts[bi + 1] - start;
+        for (let r = 0; r < n; r++) {
+            const v = child.get(r);
+            if (v !== null && v !== undefined) out[start + r] = String(v);
         }
     }
     return out;

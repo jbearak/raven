@@ -157,3 +157,62 @@ describe('computeFilteredIndices — numeric on Float with NA / NaN / Inf', () =
         await r.close();
     });
 });
+
+describe('computeFilteredIndices — string predicates on s ["a","b",null,"d","e"]', () => {
+    test('strCompare = "b" case-insensitive matches "b"', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strCompare', op: '=', value: 'B', caseSensitive: false });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([1]);
+        await r.close();
+    });
+    test('strCompare = "B" case-sensitive matches nothing', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strCompare', op: '=', value: 'B', caseSensitive: true });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([]);
+        await r.close();
+    });
+    test('strContains "d" matches "d"', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strContains', value: 'd', caseSensitive: false, negate: false });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([3]);
+        await r.close();
+    });
+    test('strContains negate -> excludes "d"', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strContains', value: 'd', caseSensitive: false, negate: true });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 1, 4]);
+        await r.close();
+    });
+    test('strStartsWith "a"', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strStartsWith', value: 'a', caseSensitive: false });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0]);
+        await r.close();
+    });
+    test('strEndsWith "e"', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strEndsWith', value: 'e', caseSensitive: false });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([4]);
+        await r.close();
+    });
+    test('strRegex /^[ab]$/i', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strRegex', pattern: '^[ab]$', caseSensitive: false });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 1]);
+        await r.close();
+    });
+    test('strRegex with invalid pattern returns []  (entry treated as no-match, no throw)', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 2, { kind: 'strRegex', pattern: '[', caseSensitive: false });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([]);
+        await r.close();
+    });
+});
