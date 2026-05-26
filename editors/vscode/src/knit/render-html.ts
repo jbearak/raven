@@ -776,6 +776,15 @@ code {
   font-family: var(--raven-font-mono);
   color: var(--raven-fg);
 }
+.raven-knit-plot-host {
+  display: inline-flex;
+  max-width: 100%;
+  vertical-align: middle;
+}
+.raven-knit-plot-host svg {
+  max-width: 100%;
+  height: auto;
+}
 pre.raven-knit-code,
 pre.raven-knit-code code {
   background: var(--raven-bg);

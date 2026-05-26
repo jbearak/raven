@@ -627,7 +627,9 @@ export class KnitOutputPanel {
         // "Open in Browser" stays self-contained without an inflated
         // base64 payload. The mutation only touches the in-memory
         // copy handed to the iframe.
-        htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output);
+        htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output, {
+            markSvgPlots: true,
+        });
         this.panel.webview.html = buildShellHtml({
             htmlContent,
             baseHref,

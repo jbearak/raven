@@ -129,6 +129,54 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
+    test('marks local figure SVGs for panel-side inline theming when requested', () => {
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'figure'));
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+            fs.writeFileSync(path.join(dir, 'figure', 'plot-1.svg'), svg);
+            const html = '<p><img src="figure/plot-1.svg" alt="plot"></p>';
+
+            const out = inlineLocalImagesAsDataUrls(html, dir, undefined, {
+                markSvgPlots: true,
+            });
+
+            expect(out).toContain('src="data:image/svg+xml;base64,');
+            expect(out).toContain('data-raven-plot-svg="true"');
+            expect(out).toContain('alt="plot"');
+        });
+    });
+
+    test('does not mark non-figure SVGs as themeable plots', () => {
+        withTempDir((dir) => {
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+            fs.writeFileSync(path.join(dir, 'logo.svg'), svg);
+            const html = '<img src="logo.svg" alt="logo">';
+
+            const out = inlineLocalImagesAsDataUrls(html, dir, undefined, {
+                markSvgPlots: true,
+            });
+
+            expect(out).toContain('src="data:image/svg+xml;base64,');
+            expect(out).not.toContain('data-raven-plot-svg');
+        });
+    });
+
+    test('does not mark paths that only appear to be under figure before normalization', () => {
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'figure'));
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+            fs.writeFileSync(path.join(dir, 'logo.svg'), svg);
+            const html = '<img src="figure/../logo.svg" alt="logo">';
+
+            const out = inlineLocalImagesAsDataUrls(html, dir, undefined, {
+                markSvgPlots: true,
+            });
+
+            expect(out).toContain('src="data:image/svg+xml;base64,');
+            expect(out).not.toContain('data-raven-plot-svg');
+        });
+    });
+
     test('handles multiple <img> tags in the same document', () => {
         withTempDir((dir) => {
             fs.mkdirSync(path.join(dir, 'figure'));

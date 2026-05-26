@@ -67,7 +67,10 @@ explorer-context-menu hook is opt-in via your own keybindings).
 4. **YAML output options.** Any `output:` format (`html_document`,
    `pdf_document`, `word_document`, `bookdown::pdf_document2`, etc.)
    previews as HTML. Nested options are partially honored — see the
-   "YAML output options honored / ignored" section below.
+   "YAML output options honored / ignored" section below. When the
+   matching HTML options do not specify `dev`, Raven uses SVG figures
+   for the preview so plot colors can be themed in the panel. An
+   explicit `dev:` in YAML or in a chunk is still honored.
 5. **Working-directory resolution.** Controlled by
    `raven.knit.workingDirectory`:
    - `document` (default) — directory containing the `.Rmd`.
@@ -159,7 +162,13 @@ explorer-context-menu hook is opt-in via your own keybindings).
       document with VS Code's active editor background, foreground,
       and link colors. Code blocks (both fenced and inline `<code>`)
       pick up the theme's `textCodeBlock` shading so they match the
-      rest of the surface. Syntax-token colors are extracted from
+      rest of the surface. SVG plots generated under the preview
+      `figure/` directory are sanitized, inlined inside the sandboxed
+      iframe, and recolored with the same background/text/stroke
+      overlay used by Raven's plot viewer. Raster plots (`png`,
+      `jpeg`, etc.) still render normally, but pixels cannot be
+      recolored after knitting; use `dev: svg` if you explicitly set
+      a device and want themed plots. Syntax-token colors are extracted from
       the active theme's TextMate `tokenColors` (plus any
       `semanticTokenColors` entries that map to one of Raven's
       coarse roles, plus your `editor.tokenColorCustomizations`)
@@ -272,7 +281,7 @@ PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
 
 | Key | Where it's applied |
 |---|---|
-| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting |
+| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting. HTML preview defaults `dev` to `svg` when you do not set it, so the theme toggle can recolor plots; explicit raster devices are honored but cannot be recolored live. |
 | `toc`, `toc_depth` | Pandoc `--toc` / `--toc-depth` (export only) |
 | `number_sections` | Pandoc `--number-sections` (export only) |
 | `highlight` | Pandoc `--highlight-style` (export only; validated against the known list) |
