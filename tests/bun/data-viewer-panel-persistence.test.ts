@@ -106,22 +106,25 @@ async function loadPanel() {
     const layoutMod = await import('../../editors/vscode/src/data-viewer/layout-state');
     const toolbarMod = await import('../../editors/vscode/src/data-viewer/toolbar-state');
     const sortMod = await import('../../editors/vscode/src/data-viewer/sort-state');
-    return { panelMod, arrowMod, layoutMod, toolbarMod, sortMod };
+    const filterMod = await import('../../editors/vscode/src/data-viewer/filter-state');
+    return { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod };
 }
 
 const TEST_SETTINGS = {
     missingValueStyle: 'foreground' as const,
     defaultDigits: 3,
     persistSort: true,
+    persistFilters: true,
 };
 
 describe('DataViewerPanel persistence round-trip', () => {
     test('saveLayout from webview → next replace carries persisted layout', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod } = await loadPanel();
         const kv = new MemKV();
         const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
         const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
         const sortStore = new sortMod.SortStateStore(kv as any, 100);
+        const filterStore = new filterMod.FilterStateStore(kv as any, 100);
 
         const path1 = tempCopyOf('tiny.arrow');
         const reader = await arrowMod.ArrowSliceReader.open(path1);
@@ -132,6 +135,7 @@ describe('DataViewerPanel persistence round-trip', () => {
             layoutStore,
             toolbarStore,
             sortStore,
+            filterStore,
             TEST_SETTINGS,
             { fsPath: '/x', toString: () => '/x' } as any,
             () => {},
@@ -180,17 +184,18 @@ describe('DataViewerPanel persistence round-trip', () => {
     });
 
     test('saveToolbar from webview → next replace carries persisted toolbar', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod } = await loadPanel();
         const kv = new MemKV();
         const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
         const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
         const sortStore = new sortMod.SortStateStore(kv as any, 100);
+        const filterStore = new filterMod.FilterStateStore(kv as any, 100);
 
         const path1 = tempCopyOf('tiny.arrow');
         const reader = await arrowMod.ArrowSliceReader.open(path1);
         const panel = await panelMod.DataViewerPanel.create(
             'tiny', reader, path1,
-            layoutStore, toolbarStore, sortStore,
+            layoutStore, toolbarStore, sortStore, filterStore,
             TEST_SETTINGS,
             { fsPath: '/x', toString: () => '/x' } as any,
             () => {},
@@ -230,17 +235,18 @@ describe('DataViewerPanel persistence round-trip', () => {
     });
 
     test('saveLayout from a stale generation still persists (no race-drop)', async () => {
-        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod } = await loadPanel();
         const kv = new MemKV();
         const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
         const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
         const sortStore = new sortMod.SortStateStore(kv as any, 100);
+        const filterStore = new filterMod.FilterStateStore(kv as any, 100);
 
         const path1 = tempCopyOf('tiny.arrow');
         const reader = await arrowMod.ArrowSliceReader.open(path1);
         const panel = await panelMod.DataViewerPanel.create(
             'tiny', reader, path1,
-            layoutStore, toolbarStore, sortStore,
+            layoutStore, toolbarStore, sortStore, filterStore,
             TEST_SETTINGS,
             { fsPath: '/x', toString: () => '/x' } as any,
             () => {},

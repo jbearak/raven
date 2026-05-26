@@ -30,6 +30,21 @@ export type SortMenuProps = {
     onClearAll: () => void;
 };
 
+/** Filter-related slice of context-menu props. Always supplied when the
+ *  menu opens for a column header; omitted for cell context menus. */
+export type FilterMenuProps = {
+    /** True iff this column has an active filter entry. */
+    hasFilter: boolean;
+    /** True iff any column has a filter entry. */
+    anyFiltered: boolean;
+    /** Open the filter editor for a new filter on this column. */
+    onAddFilter: () => void;
+    /** Remove the filter entry for this column. */
+    onClearColumn: () => void;
+    /** Clear all filter entries. */
+    onClearAll: () => void;
+};
+
 type Props = {
     leftPx: number;
     topPx: number;
@@ -39,6 +54,8 @@ type Props = {
     onClose: () => void;
     /** Only present for column context menus. */
     sort?: SortMenuProps;
+    /** Only present for column context menus. */
+    filter?: FilterMenuProps;
 };
 
 const MARGIN_PX = 4;
@@ -51,6 +68,7 @@ export function ColumnContextMenu({
     onHideColumn,
     onClose,
     sort,
+    filter,
 }: Props) {
     const menuRef = useRef<HTMLDivElement>(null);
     useDismiss(menuRef, onClose);
@@ -168,6 +186,41 @@ export function ColumnContextMenu({
                             <span className="context-menu-check" />
                             Clear all sorts
                             <span className="context-menu-shortcut">⇧⌥0</span>
+                        </button>
+                    )}
+                </>
+            )}
+            {filter && (
+                <>
+                    <div className="context-menu-divider" role="separator" />
+                    <button
+                        type="button"
+                        className="context-menu-item"
+                        onClick={filter.onAddFilter}
+                        role="menuitem"
+                    >
+                        Filter…
+                        <span className="context-menu-shortcut">⇧⌥F</span>
+                    </button>
+                    {filter.hasFilter && (
+                        <button
+                            type="button"
+                            className="context-menu-item"
+                            onClick={filter.onClearColumn}
+                            role="menuitem"
+                        >
+                            Clear filter on this column
+                        </button>
+                    )}
+                    {filter.anyFiltered && (
+                        <button
+                            type="button"
+                            className="context-menu-item"
+                            onClick={filter.onClearAll}
+                            role="menuitem"
+                        >
+                            Clear all filters
+                            <span className="context-menu-shortcut">⇧⌥9</span>
                         </button>
                     )}
                 </>

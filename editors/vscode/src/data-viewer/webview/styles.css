@@ -459,3 +459,416 @@ body,
 .sort-strip-clear:hover {
     opacity: 1;
 }
+
+/* ── Filter chip strip ──────────────────────────────────────────────── */
+
+.filter-strip {
+    display: flex;
+    align-items: center;
+    flex: 0 1 auto;
+    min-width: 0;
+    gap: 6px;
+    padding: 0 4px;
+    border-left: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-right: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.filter-strip-label {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.filter-strip-chips {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    gap: 4px;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.filter-chip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 3px;
+    padding: 2px 4px 2px 8px;
+    border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-radius: 12px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 18px;
+}
+
+.filter-chip:hover {
+    border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+.filter-chip.disabled {
+    opacity: 0.55;
+}
+
+.filter-chip-toggle {
+    flex: 0 0 auto;
+    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, #007fd4));
+    font-size: 11px;
+    line-height: 1;
+}
+
+.filter-chip-body {
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.filter-chip-body:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 1px;
+}
+
+.filter-chip-kebab {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-icon-foreground, inherit);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    opacity: 0.65;
+}
+
+.filter-chip-kebab:hover,
+.filter-chip-kebab.open {
+    opacity: 1;
+    color: var(--vscode-focusBorder, #007fd4);
+}
+
+.filter-chip-kebab:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 1px;
+}
+
+.filter-chip-popover {
+    /* `position: fixed` (with JS-computed coords from the kebab's
+       bounding rect) keeps the popover out of the chip-strip's
+       `overflow: auto` clip without needing a portal. */
+    position: fixed;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    min-width: 130px;
+    padding: 4px 0;
+    border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 4px;
+    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e)));
+    box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
+    font-size: 12px;
+}
+
+.filter-chip-popover-item {
+    padding: 5px 12px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+}
+
+.filter-chip-popover-item:hover,
+.filter-chip-popover-item:focus {
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #ffffff));
+    outline: none;
+}
+
+.filter-strip-clear {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-icon-foreground, inherit);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    opacity: 0.65;
+}
+
+.filter-strip-clear:hover {
+    opacity: 1;
+}
+
+/* ── Filter popover ─────────────────────────────────────────────────── */
+
+.filter-popover {
+    position: fixed;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    min-width: 260px;
+    max-width: 320px;
+    max-height: min(520px, 80vh);
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 4px;
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #cccccc));
+    box-shadow: 0 4px 20px rgb(0 0 0 / 0.32);
+    font-size: 12px;
+    overflow: hidden;
+}
+
+.filter-popover-header {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 12px 6px;
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.filter-popover-colname {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.filter-popover-subtitle {
+    color: var(--vscode-descriptionForeground, inherit);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.8;
+}
+
+.filter-popover-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    overflow-y: auto;
+    flex: 1 1 auto;
+}
+
+.filter-popover-field-label {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground, inherit);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: -2px;
+}
+
+.filter-popover-select,
+.filter-popover-op-select {
+    width: 100%;
+    padding: 4px 6px;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 3px;
+    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, #cccccc));
+    font: inherit;
+}
+
+.filter-popover-op-select {
+    width: auto;
+    flex: 0 0 auto;
+}
+
+.filter-popover-select:focus,
+.filter-popover-op-select:focus {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: -1px;
+}
+
+.filter-popover-input {
+    width: 100%;
+    padding: 4px 6px;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 3px;
+    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, #cccccc));
+    font: inherit;
+}
+
+.filter-popover-input:focus {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: -1px;
+}
+
+.filter-popover-input-error {
+    border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, #f14c4c));
+}
+
+.filter-popover-textarea {
+    width: 100%;
+    padding: 4px 6px;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 3px;
+    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, #cccccc));
+    font: inherit;
+    resize: vertical;
+}
+
+.filter-popover-textarea:focus {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: -1px;
+}
+
+.filter-popover-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.filter-popover-row .filter-popover-input {
+    /* flex-basis 0 + min-width 0 lets the two number inputs share the row
+     * and shrink to fit; without min-width:0 a number input keeps its
+     * intrinsic width and overflows the popover (clipped by overflow:hidden). */
+    flex: 1 1 0;
+    width: auto;
+    min-width: 0;
+}
+
+.filter-popover-between-sep {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground, inherit);
+}
+
+.filter-popover-check-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.filter-popover-missing-row {
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.22));
+}
+
+.filter-popover-bool-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.filter-popover-search {
+    margin-bottom: 2px;
+}
+
+.filter-popover-checklist {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 160px;
+    overflow-y: auto;
+    border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-radius: 3px;
+    padding: 4px 6px;
+    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
+}
+
+.filter-popover-error {
+    color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #f14c4c));
+    font-size: 11px;
+}
+
+.filter-popover-hint {
+    color: var(--vscode-descriptionForeground, inherit);
+    font-size: 11px;
+    opacity: 0.8;
+}
+
+.filter-popover-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.filter-popover-btn {
+    padding: 4px 14px;
+    border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    border-radius: 3px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+}
+
+.filter-popover-btn:hover:not(:disabled) {
+    border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+.filter-popover-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.filter-popover-btn-primary {
+    background: var(--vscode-button-background, #0e639c);
+    border-color: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #ffffff);
+}
+
+.filter-popover-btn-primary:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground, #1177bb);
+    border-color: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+/* ── Filter histogram ───────────────────────────────────────────────── */
+
+.filter-histogram {
+    overflow: visible;
+}
+
+.filter-histogram-bar {
+    fill: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    opacity: 0.35;
+}
+
+.filter-histogram-bar.in-range {
+    opacity: 0.8;
+}
+
+.filter-histogram-axis {
+    stroke: var(--vscode-panel-border, rgba(128, 128, 128, 0.5));
+    stroke-width: 1;
+}
+
+.filter-histogram-range {
+    fill: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    opacity: 0.4;
+}
+
+.filter-histogram-thumb {
+    fill: var(--vscode-button-background, #0e639c);
+    stroke: var(--vscode-editor-background, #1e1e1e);
+    stroke-width: 2;
+}
+
+.filter-histogram-thumb:hover,
+.filter-histogram-thumb:focus {
+    fill: var(--vscode-button-hoverBackground, #1177bb);
+    outline: none;
+}

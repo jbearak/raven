@@ -248,7 +248,10 @@ export class ArrowSliceReader {
             return { rows: [], stale: true };
         }
         const start = Math.max(0, req.start);
-        const end = Math.min(this.nrow, req.end);
+        // When a permutation is supplied, clamp to its length (not this.nrow)
+        // so a stale request that arrived with the pre-filter row count never
+        // reads past the end of the permutation.
+        const end = Math.min(req.permutation ? req.permutation.length : this.nrow, req.end);
         if (end <= start) return { rows: [], stale: false };
 
         if (req.permutation) {

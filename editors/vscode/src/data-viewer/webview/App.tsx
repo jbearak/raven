@@ -20,8 +20,12 @@ import {
 } from '@glideapps/glide-data-grid';
 import type { ColumnSchema } from '../arrow-reader';
 import {
+    EMPTY_FILTER,
     EMPTY_SORT,
     type ExtensionToWebview,
+    type FilterEntry,
+    type FilterState,
+    type HistogramBin,
     type Layout,
     type Settings,
     type SortKey,
@@ -56,6 +60,8 @@ import {
 import { ColumnVisibilityPopover } from './column-visibility-popover';
 import { ColumnContextMenu } from './column-context-menu';
 import { ToolbarSortStrip } from './sort-strip';
+import { FilterStrip } from './filter-strip';
+import { FilterPopover } from './filter-popover';
 
 type VscodeApi = {
     postMessage(msg: WebviewToExtension): void;
@@ -74,6 +80,9 @@ type PersistedState = {
     objectClass?: string;
     visibleRange: VisibleRange;
     sort: SortState;
+    filter: FilterState;
+    nrowFiltered?: number;
+    histograms?: Record<number, HistogramBin[]>;
 };
 
 type ContextMenuState = {
@@ -91,7 +100,7 @@ type HeaderTooltipState = {
 
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
-const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true };
+const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true };
 
 function createEmptySelection(): GridSelection {
     return {
@@ -315,6 +324,16 @@ export function App({
     const [copyStatusMsg, setCopyStatusMsg] = useState('');
     const [sort, setSort] = useState<SortState>(restored?.sort ?? EMPTY_SORT);
     const [sortPending, setSortPending] = useState(false);
+    const [filter, setFilter] = useState<FilterState>(restored?.filter ?? EMPTY_FILTER);
+    const [filterPending, setFilterPending] = useState(false);
+    const [nrowFiltered, setNrowFiltered] = useState<number | undefined>(restored?.nrowFiltered);
+    const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>(restored?.histograms ?? {});
+    const [filterEditor, setFilterEditor] = useState<{
+        entry?: FilterEntry;
+        columnIndex?: number;
+        leftPx?: number;
+        topPx?: number;
+    } | null>(null);
 
     const visibleCols = useMemo(
         () => visibleColumnIndices(columns, layout.hiddenColumns),
@@ -337,7 +356,11 @@ export function App({
     );
     const labelsHaveEffect = hasLabelsEffect(columns);
     const formatHasEffect = hasFormatEffect(columns);
-    const rowCountText = describeVisibleRows(nrow, visibleRange);
+    /** When a filter is active, the host's permutation has length `nrowFiltered`.
+     *  All grid-coordinate math must use this count so row indices never
+     *  exceed the permutation length; display/identity contexts still use nrow. */
+    const effectiveNrow = nrowFiltered ?? nrow;
+    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange);
     /** Summary text appended to the status bar when a sort is active.
      *  Truncates to 4 keys with an ellipsis so the bar never wraps; the
      *  toolbar chip strip is the full picture. */
@@ -353,10 +376,18 @@ export function App({
             ? `sorted by ${visible}, +${sort.keys.length - MAX} more`
             : `sorted by ${visible}`;
     }, [columns, sort]);
+    const filterStatusText = useMemo(() => {
+        if (nrowFiltered === undefined) return '';
+        const pctNum = nrow > 0 ? (100 * nrowFiltered) / nrow : 0;
+        // Omit the percentage in the noisy 0–1% and 99–100% bands.
+        const pct = pctNum <= 1 || pctNum >= 99 ? '' : ` (${pctNum.toFixed(1)}%)`;
+        return `filtered to ${nrowFiltered.toLocaleString()}${pct}`;
+    }, [nrowFiltered, nrow]);
     const statusText = [
         describeShape(nrow, columns, objectClass),
         describeHiddenColumnCount(layout.hiddenColumns.length),
         sortPending ? 'Sorting…' : sortStatusText,
+        filterPending ? 'Filtering…' : filterStatusText,
     ].filter(Boolean).join(' | ');
 
     const persistWebviewState = useCallback(() => {
@@ -372,6 +403,9 @@ export function App({
             objectClass,
             visibleRange,
             sort,
+            filter,
+            nrowFiltered,
+            histograms,
         });
     }, [
         vscode,
@@ -386,6 +420,9 @@ export function App({
         objectClass,
         visibleRange,
         sort,
+        filter,
+        nrowFiltered,
+        histograms,
     ]);
 
     useEffect(() => {
@@ -398,9 +435,9 @@ export function App({
             const col = visibleCols[current.cell[0]];
             if (col !== undefined) return { row: current.cell[1], col };
         }
-        if (nrow <= 0 || visibleCols.length === 0) return null;
-        return { row: Math.min(nrow - 1, visibleRange.start), col: visibleCols[0] };
-    }, [gridSelection, nrow, visibleCols, visibleRange.start]);
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return null;
+        return { row: Math.min(effectiveNrow - 1, visibleRange.start), col: visibleCols[0] };
+    }, [effectiveNrow, gridSelection, visibleCols, visibleRange.start]);
 
     const postLifecycle = useCallback((event: string, range: VisibleRange = visibleRange, selection = gridSelection) => {
         vscode.postMessage({
@@ -467,8 +504,8 @@ export function App({
     }, [panelGeneration, visibleCols, vscode]);
 
     const scheduleMissingRowRequest = useCallback((row: number) => {
-        if (nrow <= 0 || visibleCols.length === 0) return;
-        const clamped = Math.max(0, Math.min(nrow - 1, row));
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
+        const clamped = Math.max(0, Math.min(effectiveNrow - 1, row));
         const current = missingRowRequestRef.current;
         missingRowRequestRef.current = current
             ? {
@@ -482,9 +519,9 @@ export function App({
             missingRowRequestRef.current = null;
             missingRowRequestTimerRef.current = null;
             if (!range) return;
-            requestRows(paddedRange(range.start, range.end - range.start, nrow, OVERSCAN_ROWS));
+            requestRows(paddedRange(range.start, range.end - range.start, effectiveNrow, OVERSCAN_ROWS));
         }, 0);
-    }, [nrow, requestRows, visibleCols.length]);
+    }, [effectiveNrow, requestRows, visibleCols.length]);
 
     useEffect(() => () => {
         if (missingRowRequestTimerRef.current !== null) {
@@ -507,6 +544,10 @@ export function App({
         setToolbar(m.toolbar);
         setSort(m.sort);
         setSortPending(false);
+        setFilter(m.filter);
+        setHistograms(m.histograms ?? {});
+        setFilterPending(false);
+        if (m.filter.entries.length === 0) setNrowFiltered(undefined);
         toolbarBootstrappedRef.current = true;
         clearRows();
         setResolvedLabels({});
@@ -574,11 +615,11 @@ export function App({
         // Refetch covers the visible range; the existing
         // requestRows / paddedRange path picks the right window once the
         // cache is empty.
-        if (nrow > 0 && visibleCols.length > 0) {
+        if (effectiveNrow > 0 && visibleCols.length > 0) {
             requestRows(paddedRange(
                 visibleRange.start,
                 Math.max(1, visibleRange.end - visibleRange.start),
-                nrow,
+                effectiveNrow,
                 OVERSCAN_ROWS,
             ));
         }
@@ -594,7 +635,7 @@ export function App({
         }
     }, [
         clearRows,
-        nrow,
+        effectiveNrow,
         panelGeneration,
         requestRows,
         schemaHash,
@@ -607,6 +648,73 @@ export function App({
         if (m.panelGeneration !== panelGeneration) return;
         setSortPending(m.state === 'pending');
     }, [panelGeneration]);
+
+    const applyFilterApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'filterApplied' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        setFilter(m.filter);
+        const activeNrowFiltered = m.filter.entries.some(e => e.enabled) ? m.nrowFiltered : undefined;
+        setNrowFiltered(activeNrowFiltered);
+        setFilterPending(false);
+        // Permutation just changed — every cached row window is stale.
+        // Clear and refetch the current viewport, exactly as applySortApplied does.
+        // clearRows() is idempotent (safe on the fromPersistence path too).
+        clearRows();
+        const count = activeNrowFiltered ?? nrow;
+        if (count > 0 && visibleCols.length > 0) {
+            requestRows(paddedRange(
+                visibleRange.start,
+                Math.max(1, visibleRange.end - visibleRange.start),
+                count,
+                OVERSCAN_ROWS,
+            ));
+        }
+    }, [
+        clearRows,
+        nrow,
+        panelGeneration,
+        requestRows,
+        visibleCols.length,
+        visibleRange,
+    ]);
+
+    const applyFilterStatus = useCallback((m: Extract<ExtensionToWebview, { type: 'filterStatus' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        setFilterPending(m.state === 'pending');
+    }, [panelGeneration]);
+
+    /** Send a setFilters request. Empty `entries` clears the filter. The host
+     *  replies with `filterApplied` which drives state updates. */
+    const applyFilters = useCallback((entries: FilterEntry[]) => {
+        setFilterPending(entries.some(e => e.enabled));
+        const requestId = ++nextRequestIdRef.current;
+        vscode.postMessage({
+            type: 'setFilters',
+            panelGeneration,
+            requestId,
+            entries,
+            labelsOn: toolbar.labelsOn,
+        });
+    }, [panelGeneration, toolbar.labelsOn, vscode]);
+
+    const onEditFilter = useCallback((entry: FilterEntry) => {
+        setFilterEditor({ entry });
+    }, []);
+
+    const onToggleFilterEnabled = useCallback((id: string) => {
+        applyFilters(filter.entries.map(e => e.id === id ? { ...e, enabled: !e.enabled } : e));
+    }, [applyFilters, filter.entries]);
+
+    const onRemoveFilter = useCallback((id: string) => {
+        applyFilters(filter.entries.filter(e => e.id !== id));
+    }, [applyFilters, filter.entries]);
+
+    const onClearAllFilters = useCallback(() => {
+        applyFilters([]);
+    }, [applyFilters]);
+
+    const clearFilterOnColumn = useCallback((columnIndex: number) => {
+        applyFilters(filter.entries.filter(e => e.columnIndex !== columnIndex));
+    }, [filter, applyFilters]);
 
     /** Send a setSort request. Empty `keys` clears the sort. The host
      *  replies with `sortApplied` which drives state updates. */
@@ -688,12 +796,12 @@ export function App({
 
     const viewportForStart = useCallback((start: number): VisibleRange => {
         const height = estimatedViewportRowCount();
-        const clampedStart = Math.max(0, Math.min(start, Math.max(0, nrow - height)));
+        const clampedStart = Math.max(0, Math.min(start, Math.max(0, effectiveNrow - height)));
         return {
             start: clampedStart,
-            end: Math.min(nrow, clampedStart + height),
+            end: Math.min(effectiveNrow, clampedStart + height),
         };
-    }, [estimatedViewportRowCount, nrow]);
+    }, [effectiveNrow, estimatedViewportRowCount]);
 
     const scrollToViewport = useCallback((
         viewport: VisibleRange,
@@ -701,18 +809,18 @@ export function App({
         selection: GridSelection = gridSelection,
     ) => {
         setVisibleRange(viewport);
-        requestRows(paddedRange(viewport.start, viewport.end - viewport.start, nrow, OVERSCAN_ROWS));
+        requestRows(paddedRange(viewport.start, viewport.end - viewport.start, effectiveNrow, OVERSCAN_ROWS));
         postLifecycle(event, viewport, selection);
-    }, [gridSelection, nrow, postLifecycle, requestRows]);
+    }, [effectiveNrow, gridSelection, postLifecycle, requestRows]);
 
     useEffect(() => {
-        if (nrow <= 0 || visibleCols.length === 0) return;
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         const hasViewport = visibleRange.end > visibleRange.start;
         const viewport = hasViewport
             ? visibleRange
             : {
                 start: 0,
-                end: Math.min(nrow, estimatedViewportRowCount()),
+                end: Math.min(effectiveNrow, estimatedViewportRowCount()),
             };
         const timeout = window.setTimeout(() => {
             if (!hasViewport) {
@@ -722,14 +830,14 @@ export function App({
             requestRows(paddedRange(
                 viewport.start,
                 viewport.end - viewport.start,
-                nrow,
+                effectiveNrow,
                 OVERSCAN_ROWS,
             ));
         }, 0);
         return () => window.clearTimeout(timeout);
     }, [
+        effectiveNrow,
         estimatedViewportRowCount,
-        nrow,
         postLifecycle,
         requestRows,
         visibleCols.length,
@@ -739,13 +847,13 @@ export function App({
     const scrollToFraction = useCallback((fraction: number) => {
         const clamped = Math.max(0, Math.min(1, fraction));
         const height = estimatedViewportRowCount();
-        const start = nrow <= 0 ? 0 : Math.round(Math.max(0, nrow - height) * clamped);
-        const targetRow = clamped >= 1 ? Math.max(0, nrow - 1) : start;
+        const start = effectiveNrow <= 0 ? 0 : Math.round(Math.max(0, effectiveNrow - height) * clamped);
+        const targetRow = clamped >= 1 ? Math.max(0, effectiveNrow - 1) : start;
         gridRef.current?.scrollTo(0, targetRow, 'vertical', 0, 0, {
             vAlign: clamped >= 1 ? 'end' : clamped <= 0 ? 'start' : 'center',
         });
         scrollToViewport(viewportForStart(start), 'test-scroll');
-    }, [estimatedViewportRowCount, nrow, scrollToViewport, viewportForStart]);
+    }, [effectiveNrow, estimatedViewportRowCount, scrollToViewport, viewportForStart]);
 
     const handleTestKey = useCallback((key: string) => {
         if (key === 'End') {
@@ -753,11 +861,11 @@ export function App({
                 visibleCols.length - 1,
                 gridSelection.current?.cell[0] ?? 0,
             ));
-            const row = Math.max(0, nrow - 1);
+            const row = Math.max(0, effectiveNrow - 1);
             const next = createCellSelection(displayCol, row);
             setGridSelection(next);
             scrollToFraction(1);
-            postLifecycle('test-key', viewportForStart(Math.max(0, nrow - estimatedViewportRowCount())), next);
+            postLifecycle('test-key', viewportForStart(Math.max(0, effectiveNrow - estimatedViewportRowCount())), next);
             return;
         }
         if (key === 'Home') {
@@ -767,7 +875,7 @@ export function App({
             postLifecycle('test-key', viewportForStart(0), next);
             return;
         }
-        if (nrow <= 0 || visibleCols.length === 0) return;
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         const current = gridSelection.current?.cell ?? [0, Math.max(0, visibleRange.start)];
         let col = current[0];
         let row = current[1];
@@ -777,7 +885,7 @@ export function App({
         else if (key === 'ArrowLeft') col -= 1;
         else return;
         col = Math.max(0, Math.min(visibleCols.length - 1, col));
-        row = Math.max(0, Math.min(nrow - 1, row));
+        row = Math.max(0, Math.min(effectiveNrow - 1, row));
         const next = createCellSelection(col, row);
         setGridSelection(next);
         gridRef.current?.focus();
@@ -786,13 +894,13 @@ export function App({
         if (row < visibleRange.start || row >= visibleRange.end) {
             viewport = viewportForStart(row);
             setVisibleRange(viewport);
-            requestRows(paddedRange(viewport.start, viewport.end - viewport.start, nrow, OVERSCAN_ROWS));
+            requestRows(paddedRange(viewport.start, viewport.end - viewport.start, effectiveNrow, OVERSCAN_ROWS));
         }
         postLifecycle('test-key', viewport, next);
     }, [
+        effectiveNrow,
         estimatedViewportRowCount,
         gridSelection,
-        nrow,
         postLifecycle,
         requestRows,
         scrollToFraction,
@@ -830,6 +938,12 @@ export function App({
                 case 'sortStatus':
                     applySortStatus(m);
                     return;
+                case 'filterApplied':
+                    applyFilterApplied(m);
+                    return;
+                case 'filterStatus':
+                    applyFilterStatus(m);
+                    return;
                 case 'testKey':
                     handleTestKey(m.key);
                     return;
@@ -846,6 +960,8 @@ export function App({
         return () => window.removeEventListener('message', onMessage);
     }, [
         applyCopyDone,
+        applyFilterApplied,
+        applyFilterStatus,
         applyInitOrReplace,
         applyLabels,
         applyRows,
@@ -867,6 +983,23 @@ export function App({
         });
     }, [panelGeneration, schemaHash, toolbar, vscode]);
 
+    useEffect(() => {
+        // Guard on the same bootstrap flag as saveToolbar: until the first
+        // init/replace lands, `filter` is still the (possibly empty) seed,
+        // and saving it would clobber a host-persisted filter before the
+        // restore round-trip completes.
+        if (!toolbarBootstrappedRef.current || !schemaHash) return;
+        const id = window.setTimeout(() => {
+            vscode.postMessage({
+                type: 'saveFilter',
+                panelGeneration,
+                schemaHash,
+                filter,
+            });
+        }, 300);
+        return () => window.clearTimeout(id);
+    }, [filter, panelGeneration, schemaHash, vscode]);
+
     /** Labels-toggle invalidates sort keys derived from displayed text.
      *  When the active sort touches a factor or value-labelled column
      *  and Labels changed since the sort was built, re-issue setSort so
@@ -884,6 +1017,25 @@ export function App({
         if (!touchesLabelled) return;
         applySort(sort.keys);
     }, [applySort, columns, sort, toolbar.labelsOn]);
+
+    /** Labels-toggle invalidates setIn/setNotIn filter predicates that were
+     *  built against label strings. When the active filter touches a labelled
+     *  column and labelsOn changed since the filter was built, re-issue
+     *  applyFilters so the host recomputes the permutation under the new
+     *  toolbar state. The resulting filterApplied sets
+     *  filter.labelsOnWhenFiltered = toolbar.labelsOn, making the guard true
+     *  on the next render and preventing an infinite re-fire loop. */
+    useEffect(() => {
+        if (filter.entries.length === 0) return;
+        if (filter.labelsOnWhenFiltered === toolbar.labelsOn) return;
+        const touchesLabelled = filter.entries.some(e => {
+            const col = columns[e.columnIndex];
+            if (!col) return false;
+            return e.predicate.kind === 'setIn' || e.predicate.kind === 'setNotIn';
+        });
+        if (!touchesLabelled) return;
+        applyFilters(filter.entries);
+    }, [applyFilters, columns, filter, toolbar.labelsOn]);
 
     useEffect(() => {
         if (!toolbar.labelsOn) return;
@@ -923,7 +1075,7 @@ export function App({
     ]);
 
     const copySelection = useCallback((selection: GridSelection = gridSelection) => {
-        if (nrow <= 0 || visibleCols.length === 0) return;
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         let rowStart = 0;
         let rowEnd = 0;
         let colIndices: number[] = [];
@@ -931,7 +1083,7 @@ export function App({
 
         if (selection.columns.length > 0) {
             rowStart = 0;
-            rowEnd = nrow;
+            rowEnd = effectiveNrow;
             colIndices = selection.columns.toArray()
                 .map(displayCol => visibleCols[displayCol])
                 .filter((col): col is number => col !== undefined);
@@ -939,12 +1091,12 @@ export function App({
         } else if (selection.rows.length > 0) {
             const rows = selection.rows.toArray();
             rowStart = Math.max(0, Math.min(...rows));
-            rowEnd = Math.min(nrow, Math.max(...rows) + 1);
+            rowEnd = Math.min(effectiveNrow, Math.max(...rows) + 1);
             colIndices = [...visibleCols];
         } else if (selection.current) {
             const range = selection.current.range;
             rowStart = Math.max(0, range.y);
-            rowEnd = Math.min(nrow, range.y + range.height);
+            rowEnd = Math.min(effectiveNrow, range.y + range.height);
             for (let displayCol = range.x; displayCol < range.x + range.width; displayCol++) {
                 const col = visibleCols[displayCol];
                 if (col !== undefined) colIndices.push(col);
@@ -965,7 +1117,7 @@ export function App({
             digits: toolbar.digits,
             includeHeader,
         });
-    }, [gridSelection, nrow, panelGeneration, toolbar, visibleCols, vscode]);
+    }, [effectiveNrow, gridSelection, panelGeneration, toolbar, visibleCols, vscode]);
 
     useEffect(() => {
         const onCopy = (event: ClipboardEvent) => {
@@ -1001,6 +1153,27 @@ export function App({
                     clearAllSorts();
                     return;
                 }
+                if (event.key === '9' || event.code === 'Digit9') {
+                    event.preventDefault();
+                    onClearAllFilters();
+                    return;
+                }
+                if (event.key === 'F' || event.code === 'KeyF') {
+                    event.preventDefault();
+                    const focused = gridSelection.current?.cell[0];
+                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    if (sourceIndex !== undefined) {
+                        setFilterEditor({ columnIndex: sourceIndex, leftPx: 100, topPx: 100 });
+                    }
+                    return;
+                }
+                if (event.key === 'X' || event.code === 'KeyX') {
+                    event.preventDefault();
+                    const focused = gridSelection.current?.cell[0];
+                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    if (sourceIndex !== undefined) clearFilterOnColumn(sourceIndex);
+                    return;
+                }
             }
             const meta = event.metaKey || event.ctrlKey;
             if (!meta) return;
@@ -1022,9 +1195,12 @@ export function App({
         };
     }, [
         clearAllSorts,
+        clearFilterOnColumn,
         copySelection,
         gridSelection,
+        onClearAllFilters,
         postLifecycle,
+        setFilterEditor,
         sortColumn,
         visibleCols,
         visibleRange,
@@ -1162,6 +1338,14 @@ export function App({
                     onChange={applySort}
                     onClearAll={clearAllSorts}
                 />
+                <FilterStrip
+                    filter={filter}
+                    columns={columns}
+                    onEdit={onEditFilter}
+                    onToggleEnabled={onToggleFilterEnabled}
+                    onRemove={onRemoveFilter}
+                    onClearAll={onClearAllFilters}
+                />
                 <button
                     type="button"
                     className={toolbar.labelsOn ? 'toggle active' : 'toggle'}
@@ -1219,10 +1403,10 @@ export function App({
                     width="100%"
                     height="100%"
                     columns={gridColumns}
-                    rows={nrow}
+                    rows={effectiveNrow}
                     rowHeight={ROW_HEIGHT_PX}
                     headerHeight={HEADER_HEIGHT_PX}
-                    rowMarkers={{ kind: 'number', width: rowMarkerWidth(nrow) }}
+                    rowMarkers={{ kind: 'number', width: rowMarkerWidth(effectiveNrow) }}
                     rowSelect="multi"
                     columnSelect="multi"
                     rangeSelect="rect"
@@ -1302,10 +1486,10 @@ export function App({
                     onVisibleRegionChanged={(range: Rectangle) => {
                         const viewport = {
                             start: Math.max(0, Math.floor(range.y)),
-                            end: Math.min(nrow, Math.ceil(range.y + range.height)),
+                            end: Math.min(effectiveNrow, Math.ceil(range.y + range.height)),
                         };
                         setVisibleRange(viewport);
-                        requestRows(paddedRange(range.y, range.height, nrow, OVERSCAN_ROWS));
+                        requestRows(paddedRange(range.y, range.height, effectiveNrow, OVERSCAN_ROWS));
                         postLifecycle('visible', viewport);
                     }}
                     getCellContent={([displayCol, row]: Item) => {
@@ -1395,8 +1579,72 @@ export function App({
                                 },
                             }
                             : undefined}
+                        filter={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
+                            ? {
+                                hasFilter: filter.entries.some(
+                                    e => e.columnIndex === contextMenu.columnIndex,
+                                ),
+                                anyFiltered: filter.entries.length > 0,
+                                onAddFilter: () => {
+                                    setFilterEditor({
+                                        columnIndex: contextMenu.columnIndex,
+                                        leftPx: contextMenu.leftPx,
+                                        topPx: contextMenu.topPx,
+                                    });
+                                    setContextMenu(null);
+                                },
+                                onClearColumn: () => {
+                                    applyFilters(filter.entries.filter(
+                                        e => e.columnIndex !== contextMenu.columnIndex,
+                                    ));
+                                    setContextMenu(null);
+                                },
+                                onClearAll: () => {
+                                    applyFilters([]);
+                                    setContextMenu(null);
+                                },
+                            }
+                            : undefined}
                     />
                 )}
+                {filterEditor !== null && (() => {
+                    const editorColumnIndex = filterEditor.entry?.columnIndex ?? filterEditor.columnIndex;
+                    if (editorColumnIndex === undefined) return null;
+                    const editorColumn = columns[editorColumnIndex];
+                    if (!editorColumn) return null;
+                    return (
+                        <FilterPopover
+                            column={editorColumn}
+                            columnIndex={editorColumnIndex}
+                            histogram={histograms[editorColumnIndex]}
+                            initial={filterEditor.entry}
+                            anchor={{
+                                leftPx: filterEditor.leftPx ?? 100,
+                                topPx: filterEditor.topPx ?? 100,
+                            }}
+                            onApply={(entry) => {
+                                // One-filter-per-column: replace by id (edit) or by columnIndex (new).
+                                const next = (() => {
+                                    if (filterEditor.entry) {
+                                        // Editing existing: replace by id, also enforce one-per-column.
+                                        const withoutSameCol = filter.entries.filter(
+                                            e => e.id !== entry.id && e.columnIndex !== entry.columnIndex,
+                                        );
+                                        return [...withoutSameCol, entry];
+                                    }
+                                    // New: replace any existing entry for this column.
+                                    const withoutCol = filter.entries.filter(
+                                        e => e.columnIndex !== entry.columnIndex,
+                                    );
+                                    return [...withoutCol, entry];
+                                })();
+                                applyFilters(next);
+                                setFilterEditor(null);
+                            }}
+                            onCancel={() => setFilterEditor(null)}
+                        />
+                    );
+                })()}
                 {headerTooltip && (
                     <div
                         ref={headerTooltipRef}

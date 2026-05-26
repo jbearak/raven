@@ -94,13 +94,15 @@ async function loadPanel() {
     const layoutMod = await import('../../editors/vscode/src/data-viewer/layout-state');
     const toolbarMod = await import('../../editors/vscode/src/data-viewer/toolbar-state');
     const sortMod = await import('../../editors/vscode/src/data-viewer/sort-state');
-    return { panelMod, arrowMod, layoutMod, toolbarMod, sortMod };
+    const filterMod = await import('../../editors/vscode/src/data-viewer/filter-state');
+    return { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod };
 }
 
 const TEST_SETTINGS = {
     missingValueStyle: 'foreground' as const,
     defaultDigits: 3,
     persistSort: true,
+    persistFilters: true,
 };
 
 async function flush(): Promise<void> {
@@ -137,17 +139,18 @@ type PanelTestContext = {
  *  failure-safe cleanups (reader close + fake-panel dispose) with
  *  afterEach so a thrown assertion still releases resources. */
 async function setupPanel(settingsOverride?: Partial<typeof TEST_SETTINGS>): Promise<PanelTestContext> {
-    const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod } = await loadPanel();
+    const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod } = await loadPanel();
     const kv = new MemKV();
     const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
     const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
     const sortStore = new sortMod.SortStateStore(kv as any, 100);
+    const filterStore = new filterMod.FilterStateStore(kv as any, 100);
     const tempPath = tempCopyOf('tiny.arrow');
     const reader = await arrowMod.ArrowSliceReader.open(tempPath);
     pendingCleanups.push(() => reader.close().catch(() => undefined));
     const panel = await panelMod.DataViewerPanel.create(
         'tiny', reader, tempPath,
-        layoutStore, toolbarStore, sortStore,
+        layoutStore, toolbarStore, sortStore, filterStore,
         { ...TEST_SETTINGS, ...settingsOverride },
         { fsPath: '/x', toString: () => '/x' } as any,
         () => {},

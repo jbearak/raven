@@ -9,6 +9,7 @@ import { DataViewerManager } from './manager';
 import { LayoutStore } from './layout-state';
 import { ToolbarStateStore } from './toolbar-state';
 import { SortStateStore } from './sort-state';
+import { FilterStateStore } from './filter-state';
 import type { Settings } from './messages';
 import { sweep_stale } from './sweep';
 import type { RSessionServer } from '../r-session-server';
@@ -25,6 +26,7 @@ export function registerDataViewer(
     const store = new LayoutStore(context.globalState as any, cap);
     const toolbarStore = new ToolbarStateStore(context.globalState as any, cap);
     const sortStore = new SortStateStore(context.globalState as any, cap);
+    const filterStore = new FilterStateStore(context.globalState as any, cap);
 
     const settings = (): Settings => {
         const cfg = vscode.workspace.getConfiguration('raven.dataViewer');
@@ -33,6 +35,7 @@ export function registerDataViewer(
                 'missingValueStyle', 'foreground'),
             defaultDigits: cfg.get<number>('defaultDigits', 3),
             persistSort: cfg.get<boolean>('persistSort', true),
+            persistFilters: cfg.get<boolean>('persistFilters', true),
         };
     };
 
@@ -41,6 +44,7 @@ export function registerDataViewer(
         store,
         toolbarStore,
         sortStore,
+        filterStore,
         settings,
     );
 

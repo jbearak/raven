@@ -14,17 +14,22 @@ import * as fs from 'node:fs/promises';
 import { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import {
     COPY_CELL_LIMIT,
+    EMPTY_FILTER,
     EMPTY_SORT,
     ExtensionToWebview,
+    FilterState,
     Layout,
     Settings,
     SortState,
     WebviewToExtension,
 } from './messages';
 import { computePermutation } from './sort';
+import { computeFilteredIndices } from './filter';
+import { computeNumericHistograms } from './histograms';
 import { LayoutStore, schemaHash } from './layout-state';
 import { ToolbarState, ToolbarStateStore } from './toolbar-state';
 import { SortStateStore } from './sort-state';
+import { FilterStateStore } from './filter-state';
 import { build_csp } from './csp';
 import { render_tsv, ResolvedLabels } from './tsv';
 
@@ -53,6 +58,15 @@ export class DataViewerPanel {
      *  bumps it. Late-landing `sortApplied` responses tagged with an
      *  older value are dropped. */
     private sortGeneration = 0;
+    /** Current filter state. Mirrors what the webview shows in the chip
+     *  strip. Updated by `setFilters` and by init/replace's restore path. */
+    private filter: FilterState = EMPTY_FILTER;
+    /** Row indices surviving the active filter, in original (unsorted)
+     *  order. `undefined` ↔ no filter active (all rows pass). */
+    private filteredIndices: Uint32Array | undefined;
+    /** Monotonic counter — bumped on every setFilters call so stale
+     *  async results can be detected and dropped. */
+    private filterGeneration = 0;
     private readonly traceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     /** Latest visible-row range observed via lifecycle events. Used by
      *  the integration test API. `undefined` until the first lifecycle
@@ -73,6 +87,7 @@ export class DataViewerPanel {
         private readonly store: LayoutStore,
         private readonly toolbarStore: ToolbarStateStore,
         private readonly sortStore: SortStateStore,
+        private readonly filterStore: FilterStateStore,
         private readonly settings: Settings,
         private readonly disposeHook: () => void,
     ) {
@@ -93,6 +108,7 @@ export class DataViewerPanel {
         store: LayoutStore,
         toolbarStore: ToolbarStateStore,
         sortStore: SortStateStore,
+        filterStore: FilterStateStore,
         settings: Settings,
         extensionUri: vscode.Uri,
         disposeHook: () => void,
@@ -112,7 +128,7 @@ export class DataViewerPanel {
         webviewPanel.webview.html = build_html(webviewPanel.webview, extensionUri);
         const panel = new DataViewerPanel(
             panelName, webviewPanel, reader, filePath,
-            store, toolbarStore, sortStore, settings, disposeHook,
+            store, toolbarStore, sortStore, filterStore, settings, disposeHook,
         );
         panel.trace('create', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
         return panel;
@@ -144,6 +160,11 @@ export class DataViewerPanel {
         this.sort = EMPTY_SORT;
         this.permutation = undefined;
         this.sortGeneration += 1;
+        // Old filtered indices cannot be reused — sendReplace below will
+        // attempt to restore a saved filter against the new reader.
+        this.filter = EMPTY_FILTER;
+        this.filteredIndices = undefined;
+        this.filterGeneration += 1;
         const prevReader = this.reader;
         const prevPath = this.filePath;
         this.reader = reader;
@@ -169,11 +190,14 @@ export class DataViewerPanel {
         const reader = this.reader;
         const columns = reader.schema.columns;
         const layoutHash = schemaHash(columns);
-        const [layout, toolbar, savedSort] = await Promise.all([
+        const [layout, toolbar, savedSort, savedFilter] = await Promise.all([
             this.store.load(this.panelName, layoutHash),
             this.toolbarStore.load(this.panelName, layoutHash),
             this.settings.persistSort
                 ? this.sortStore.load(this.panelName, layoutHash)
+                : Promise.resolve(undefined),
+            this.settings.persistFilters
+                ? this.filterStore.load(this.panelName, layoutHash)
                 : Promise.resolve(undefined),
         ]);
         if (generation !== this.generation || reader !== this.reader) return false;
@@ -182,6 +206,10 @@ export class DataViewerPanel {
         this.dictionaries = this.collectDictionaries();
         const activeToolbar = toolbar ?? this.defaultToolbar();
         const restored = await this.restoreSort(savedSort, activeToolbar, generation, reader);
+        if (generation !== this.generation || reader !== this.reader) return false;
+        const restoredFilter = await this.restoreFilter(savedFilter, activeToolbar, generation, reader);
+        if (generation !== this.generation || reader !== this.reader) return false;
+        const histograms = await computeNumericHistograms(reader);
         if (generation !== this.generation || reader !== this.reader) return false;
         const msg: ExtensionToWebview = {
             type: 'init',
@@ -195,6 +223,8 @@ export class DataViewerPanel {
             schemaHash: layoutHash,
             objectClass: reader.schema.objectClass,
             sort: restored,
+            filter: restoredFilter,
+            histograms,
         };
         this.trace('post-init', {
             generation,
@@ -206,6 +236,16 @@ export class DataViewerPanel {
         });
         await this.webviewPanel.webview.postMessage(msg);
         this.webviewInitialized = true;
+        if (this.filteredIndices) {
+            await this.webviewPanel.webview.postMessage({
+                type: 'filterApplied',
+                panelGeneration: generation,
+                requestId: -1,
+                filter: this.filter,
+                nrowFiltered: this.filteredIndices.length,
+                fromPersistence: true,
+            } satisfies ExtensionToWebview);
+        }
         return true;
     }
 
@@ -218,11 +258,14 @@ export class DataViewerPanel {
         const reader = this.reader;
         const columns = reader.schema.columns;
         const layoutHash = schemaHash(columns);
-        const [layout, toolbar, savedSort] = await Promise.all([
+        const [layout, toolbar, savedSort, savedFilter] = await Promise.all([
             this.store.load(this.panelName, layoutHash),
             this.toolbarStore.load(this.panelName, layoutHash),
             this.settings.persistSort
                 ? this.sortStore.load(this.panelName, layoutHash)
+                : Promise.resolve(undefined),
+            this.settings.persistFilters
+                ? this.filterStore.load(this.panelName, layoutHash)
                 : Promise.resolve(undefined),
         ]);
         if (generation !== this.generation || reader !== this.reader) return;
@@ -231,6 +274,10 @@ export class DataViewerPanel {
         this.dictionaries = this.collectDictionaries();
         const activeToolbar = toolbar ?? this.defaultToolbar();
         const restored = await this.restoreSort(savedSort, activeToolbar, generation, reader);
+        if (generation !== this.generation || reader !== this.reader) return;
+        const restoredFilter = await this.restoreFilter(savedFilter, activeToolbar, generation, reader);
+        if (generation !== this.generation || reader !== this.reader) return;
+        const histograms = await computeNumericHistograms(reader);
         if (generation !== this.generation || reader !== this.reader) return;
         const msg: ExtensionToWebview = {
             type: 'replace',
@@ -243,6 +290,8 @@ export class DataViewerPanel {
             schemaHash: layoutHash,
             objectClass: reader.schema.objectClass,
             sort: restored,
+            filter: restoredFilter,
+            histograms,
         };
         this.trace('post-replace', {
             generation,
@@ -253,6 +302,16 @@ export class DataViewerPanel {
             loadedToolbar: toolbar ?? null,
         });
         await this.webviewPanel.webview.postMessage(msg);
+        if (this.filteredIndices) {
+            await this.webviewPanel.webview.postMessage({
+                type: 'filterApplied',
+                panelGeneration: generation,
+                requestId: -1,
+                filter: this.filter,
+                nrowFiltered: this.filteredIndices.length,
+                fromPersistence: true,
+            } satisfies ExtensionToWebview);
+        }
     }
 
     /** Attempt to restore a persisted sort. Returns the SortState to ship
@@ -296,6 +355,65 @@ export class DataViewerPanel {
         } catch {
             return EMPTY_SORT;
         }
+    }
+
+    /** Attempt to restore a persisted filter. Returns the FilterState to
+     *  ship to the webview, and as a side effect updates `this.filter` and
+     *  `this.filteredIndices`. The state is dropped when:
+     *    - persistFilters is off,
+     *    - no saved state exists,
+     *    - the saved state had no entries (already empty), or
+     *    - any entry references a column that no longer exists.
+     *  Caller is responsible for the post-await generation check. */
+    private async restoreFilter(
+        saved: FilterState | undefined,
+        toolbar: ToolbarState,
+        generation: number,
+        reader: ArrowSliceReader,
+    ): Promise<FilterState> {
+        this.filter = EMPTY_FILTER;
+        this.filteredIndices = undefined;
+        if (!saved || saved.entries.length === 0) return EMPTY_FILTER;
+        const maxColIndex = this.columns.length - 1;
+        for (const e of saved.entries) {
+            if (e.columnIndex < 0 || e.columnIndex > maxColIndex) return EMPTY_FILTER;
+        }
+        try {
+            const indices = await computeFilteredIndices(reader, saved, {
+                labelsOn: toolbar.labelsOn,
+                formatOn: toolbar.formatOn,
+                digits: toolbar.digits,
+            });
+            if (generation !== this.generation || reader !== this.reader) return EMPTY_FILTER;
+            this.filter = { entries: saved.entries, labelsOnWhenFiltered: toolbar.labelsOn };
+            this.filteredIndices = indices;
+            this.filterGeneration += 1;
+            return this.filter;
+        } catch {
+            return EMPTY_FILTER;
+        }
+    }
+
+    /** Combine filter + sort into the single permutation handed to the
+     *  reader. `filteredIndices` is the surviving row set in ORIGINAL order;
+     *  `permutation` (when present) is a sort permutation over the ORIGINAL
+     *  frame. We post-filter the sort permutation by the filteredIndices set
+     *  so the visible window reflects both, in sorted order.
+     *
+     *  Spec open-question 4 / follow-up #328: building the sort permutation
+     *  over the full nrow rather than the filtered domain wastes memory; the
+     *  first cut accepts that. */
+    private composeEffective(): Uint32Array | undefined {
+        if (!this.filteredIndices) return this.permutation;
+        if (!this.permutation) return this.filteredIndices;
+        const survives = new Uint8Array(this.reader.nrow);
+        for (let i = 0; i < this.filteredIndices.length; i++) survives[this.filteredIndices[i]] = 1;
+        const out = new Uint32Array(this.filteredIndices.length);
+        let j = 0;
+        for (let i = 0; i < this.permutation.length; i++) {
+            if (survives[this.permutation[i]]) out[j++] = this.permutation[i];
+        }
+        return out;
     }
 
     private collectDictionaries(): Record<number, string[]> {
@@ -407,6 +525,16 @@ export class DataViewerPanel {
             }
             return;
         }
+        if (m.type === 'saveFilter') {
+            if (m.schemaHash && this.settings.persistFilters) {
+                if (m.filter.entries.length === 0) {
+                    await this.filterStore.clear(this.panelName, m.schemaHash);
+                } else {
+                    await this.filterStore.save(this.panelName, m.schemaHash, m.filter);
+                }
+            }
+            return;
+        }
         if (m.panelGeneration !== this.generation) return;
         // Capture generation BEFORE any await so a replace mid-fetch causes
         // us to drop the stale response rather than post under the new
@@ -425,13 +553,14 @@ export class DataViewerPanel {
                     columns: m.columns.length,
                 });
                 let out;
+                const effectivePerm = this.composeEffective();
                 try {
                     out = await reader.getRows({
                         start: m.start,
                         end: m.end,
                         columns: m.columns,
                         viewportGeneration: m.viewportGeneration,
-                        permutation: this.permutation,
+                        permutation: effectivePerm,
                     });
                 } catch (err) {
                     if (gen !== this.generation || reader !== this.reader || this.disposed) return;
@@ -479,6 +608,10 @@ export class DataViewerPanel {
             }
             case 'setSort': {
                 await this.handleSetSort(m, gen);
+                return;
+            }
+            case 'setFilters': {
+                await this.handleSetFilters(m, gen);
                 return;
             }
         }
@@ -574,6 +707,59 @@ export class DataViewerPanel {
         await this.webviewPanel.webview.postMessage(ack);
     }
 
+    private async handleSetFilters(
+        m: Extract<WebviewToExtension, { type: 'setFilters' }>,
+        gen: number,
+    ): Promise<void> {
+        this.filterGeneration += 1;
+        const myFilterGen = this.filterGeneration;
+        const next: FilterState = { entries: m.entries, labelsOnWhenFiltered: m.labelsOn };
+
+        if (m.entries.length === 0 || m.entries.every(e => !e.enabled)) {
+            this.filter = next;
+            this.filteredIndices = undefined;
+            await this.webviewPanel.webview.postMessage({
+                type: 'filterApplied', panelGeneration: gen, requestId: m.requestId,
+                filter: next, nrowFiltered: this.reader.nrow, fromPersistence: false,
+            } satisfies ExtensionToWebview);
+            return;
+        }
+
+        await this.webviewPanel.webview.postMessage({
+            type: 'filterStatus', panelGeneration: gen, state: 'pending',
+        } satisfies ExtensionToWebview);
+
+        let indices: Uint32Array | undefined;
+        try {
+            indices = await computeFilteredIndices(this.reader, next, {
+                labelsOn: m.labelsOn,
+                formatOn: true,
+                digits: this.settings.defaultDigits,
+            });
+        } catch (err) {
+            if (gen !== this.generation || myFilterGen !== this.filterGeneration || this.disposed) return;
+            await this.webviewPanel.webview.postMessage({
+                type: 'filterStatus', panelGeneration: gen, state: 'idle',
+            } satisfies ExtensionToWebview);
+            await this.webviewPanel.webview.postMessage({
+                type: 'error', panelGeneration: gen,
+                message: err instanceof Error ? err.message : String(err),
+            } satisfies ExtensionToWebview);
+            return;
+        }
+
+        if (gen !== this.generation || myFilterGen !== this.filterGeneration) return;
+        this.filter = next;
+        this.filteredIndices = indices;
+        await this.webviewPanel.webview.postMessage({
+            type: 'filterStatus', panelGeneration: gen, state: 'idle',
+        } satisfies ExtensionToWebview);
+        await this.webviewPanel.webview.postMessage({
+            type: 'filterApplied', panelGeneration: gen, requestId: m.requestId,
+            filter: next, nrowFiltered: indices?.length ?? this.reader.nrow, fromPersistence: false,
+        } satisfies ExtensionToWebview);
+    }
+
     private async handleCopy(
         m: Extract<WebviewToExtension, { type: 'copy' }>,
         gen: number,
@@ -591,12 +777,13 @@ export class DataViewerPanel {
                 replyDone(false, 'Selection exceeds copy limit'));
             return;
         }
+        const copyPerm = this.composeEffective();
         const got = await this.reader.getRows({
             start: m.range.rowStart,
             end: m.range.rowEnd,
             columns: m.range.colIndices,
             viewportGeneration: Number.MAX_SAFE_INTEGER,
-            permutation: this.permutation,
+            permutation: copyPerm,
         });
         if (gen !== this.generation) return;
 
