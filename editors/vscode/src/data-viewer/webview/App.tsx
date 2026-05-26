@@ -356,7 +356,11 @@ export function App({
     );
     const labelsHaveEffect = hasLabelsEffect(columns);
     const formatHasEffect = hasFormatEffect(columns);
-    const rowCountText = describeVisibleRows(nrow, visibleRange);
+    /** When a filter is active, the host's permutation has length `nrowFiltered`.
+     *  All grid-coordinate math must use this count so row indices never
+     *  exceed the permutation length; display/identity contexts still use nrow. */
+    const effectiveNrow = nrowFiltered ?? nrow;
+    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange);
     /** Summary text appended to the status bar when a sort is active.
      *  Truncates to 4 keys with an ellipsis so the bar never wraps; the
      *  toolbar chip strip is the full picture. */
@@ -431,9 +435,9 @@ export function App({
             const col = visibleCols[current.cell[0]];
             if (col !== undefined) return { row: current.cell[1], col };
         }
-        if (nrow <= 0 || visibleCols.length === 0) return null;
-        return { row: Math.min(nrow - 1, visibleRange.start), col: visibleCols[0] };
-    }, [gridSelection, nrow, visibleCols, visibleRange.start]);
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return null;
+        return { row: Math.min(effectiveNrow - 1, visibleRange.start), col: visibleCols[0] };
+    }, [effectiveNrow, gridSelection, visibleCols, visibleRange.start]);
 
     const postLifecycle = useCallback((event: string, range: VisibleRange = visibleRange, selection = gridSelection) => {
         vscode.postMessage({
@@ -500,8 +504,8 @@ export function App({
     }, [panelGeneration, visibleCols, vscode]);
 
     const scheduleMissingRowRequest = useCallback((row: number) => {
-        if (nrow <= 0 || visibleCols.length === 0) return;
-        const clamped = Math.max(0, Math.min(nrow - 1, row));
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
+        const clamped = Math.max(0, Math.min(effectiveNrow - 1, row));
         const current = missingRowRequestRef.current;
         missingRowRequestRef.current = current
             ? {
@@ -515,9 +519,9 @@ export function App({
             missingRowRequestRef.current = null;
             missingRowRequestTimerRef.current = null;
             if (!range) return;
-            requestRows(paddedRange(range.start, range.end - range.start, nrow, OVERSCAN_ROWS));
+            requestRows(paddedRange(range.start, range.end - range.start, effectiveNrow, OVERSCAN_ROWS));
         }, 0);
-    }, [nrow, requestRows, visibleCols.length]);
+    }, [effectiveNrow, requestRows, visibleCols.length]);
 
     useEffect(() => () => {
         if (missingRowRequestTimerRef.current !== null) {
@@ -611,11 +615,11 @@ export function App({
         // Refetch covers the visible range; the existing
         // requestRows / paddedRange path picks the right window once the
         // cache is empty.
-        if (nrow > 0 && visibleCols.length > 0) {
+        if (effectiveNrow > 0 && visibleCols.length > 0) {
             requestRows(paddedRange(
                 visibleRange.start,
                 Math.max(1, visibleRange.end - visibleRange.start),
-                nrow,
+                effectiveNrow,
                 OVERSCAN_ROWS,
             ));
         }
@@ -631,7 +635,7 @@ export function App({
         }
     }, [
         clearRows,
-        nrow,
+        effectiveNrow,
         panelGeneration,
         requestRows,
         schemaHash,
@@ -648,9 +652,30 @@ export function App({
     const applyFilterApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'filterApplied' }>) => {
         if (m.panelGeneration !== panelGeneration) return;
         setFilter(m.filter);
-        setNrowFiltered(m.filter.entries.some(e => e.enabled) ? m.nrowFiltered : undefined);
+        const activeNrowFiltered = m.filter.entries.some(e => e.enabled) ? m.nrowFiltered : undefined;
+        setNrowFiltered(activeNrowFiltered);
         setFilterPending(false);
-    }, [panelGeneration]);
+        // Permutation just changed — every cached row window is stale.
+        // Clear and refetch the current viewport, exactly as applySortApplied does.
+        // clearRows() is idempotent (safe on the fromPersistence path too).
+        clearRows();
+        const count = activeNrowFiltered ?? nrow;
+        if (count > 0 && visibleCols.length > 0) {
+            requestRows(paddedRange(
+                visibleRange.start,
+                Math.max(1, visibleRange.end - visibleRange.start),
+                count,
+                OVERSCAN_ROWS,
+            ));
+        }
+    }, [
+        clearRows,
+        nrow,
+        panelGeneration,
+        requestRows,
+        visibleCols.length,
+        visibleRange,
+    ]);
 
     const applyFilterStatus = useCallback((m: Extract<ExtensionToWebview, { type: 'filterStatus' }>) => {
         if (m.panelGeneration !== panelGeneration) return;
@@ -771,12 +796,12 @@ export function App({
 
     const viewportForStart = useCallback((start: number): VisibleRange => {
         const height = estimatedViewportRowCount();
-        const clampedStart = Math.max(0, Math.min(start, Math.max(0, nrow - height)));
+        const clampedStart = Math.max(0, Math.min(start, Math.max(0, effectiveNrow - height)));
         return {
             start: clampedStart,
-            end: Math.min(nrow, clampedStart + height),
+            end: Math.min(effectiveNrow, clampedStart + height),
         };
-    }, [estimatedViewportRowCount, nrow]);
+    }, [effectiveNrow, estimatedViewportRowCount]);
 
     const scrollToViewport = useCallback((
         viewport: VisibleRange,
@@ -784,18 +809,18 @@ export function App({
         selection: GridSelection = gridSelection,
     ) => {
         setVisibleRange(viewport);
-        requestRows(paddedRange(viewport.start, viewport.end - viewport.start, nrow, OVERSCAN_ROWS));
+        requestRows(paddedRange(viewport.start, viewport.end - viewport.start, effectiveNrow, OVERSCAN_ROWS));
         postLifecycle(event, viewport, selection);
-    }, [gridSelection, nrow, postLifecycle, requestRows]);
+    }, [effectiveNrow, gridSelection, postLifecycle, requestRows]);
 
     useEffect(() => {
-        if (nrow <= 0 || visibleCols.length === 0) return;
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         const hasViewport = visibleRange.end > visibleRange.start;
         const viewport = hasViewport
             ? visibleRange
             : {
                 start: 0,
-                end: Math.min(nrow, estimatedViewportRowCount()),
+                end: Math.min(effectiveNrow, estimatedViewportRowCount()),
             };
         const timeout = window.setTimeout(() => {
             if (!hasViewport) {
@@ -805,14 +830,14 @@ export function App({
             requestRows(paddedRange(
                 viewport.start,
                 viewport.end - viewport.start,
-                nrow,
+                effectiveNrow,
                 OVERSCAN_ROWS,
             ));
         }, 0);
         return () => window.clearTimeout(timeout);
     }, [
+        effectiveNrow,
         estimatedViewportRowCount,
-        nrow,
         postLifecycle,
         requestRows,
         visibleCols.length,
@@ -822,13 +847,13 @@ export function App({
     const scrollToFraction = useCallback((fraction: number) => {
         const clamped = Math.max(0, Math.min(1, fraction));
         const height = estimatedViewportRowCount();
-        const start = nrow <= 0 ? 0 : Math.round(Math.max(0, nrow - height) * clamped);
-        const targetRow = clamped >= 1 ? Math.max(0, nrow - 1) : start;
+        const start = effectiveNrow <= 0 ? 0 : Math.round(Math.max(0, effectiveNrow - height) * clamped);
+        const targetRow = clamped >= 1 ? Math.max(0, effectiveNrow - 1) : start;
         gridRef.current?.scrollTo(0, targetRow, 'vertical', 0, 0, {
             vAlign: clamped >= 1 ? 'end' : clamped <= 0 ? 'start' : 'center',
         });
         scrollToViewport(viewportForStart(start), 'test-scroll');
-    }, [estimatedViewportRowCount, nrow, scrollToViewport, viewportForStart]);
+    }, [effectiveNrow, estimatedViewportRowCount, scrollToViewport, viewportForStart]);
 
     const handleTestKey = useCallback((key: string) => {
         if (key === 'End') {
@@ -836,11 +861,11 @@ export function App({
                 visibleCols.length - 1,
                 gridSelection.current?.cell[0] ?? 0,
             ));
-            const row = Math.max(0, nrow - 1);
+            const row = Math.max(0, effectiveNrow - 1);
             const next = createCellSelection(displayCol, row);
             setGridSelection(next);
             scrollToFraction(1);
-            postLifecycle('test-key', viewportForStart(Math.max(0, nrow - estimatedViewportRowCount())), next);
+            postLifecycle('test-key', viewportForStart(Math.max(0, effectiveNrow - estimatedViewportRowCount())), next);
             return;
         }
         if (key === 'Home') {
@@ -850,7 +875,7 @@ export function App({
             postLifecycle('test-key', viewportForStart(0), next);
             return;
         }
-        if (nrow <= 0 || visibleCols.length === 0) return;
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         const current = gridSelection.current?.cell ?? [0, Math.max(0, visibleRange.start)];
         let col = current[0];
         let row = current[1];
@@ -860,7 +885,7 @@ export function App({
         else if (key === 'ArrowLeft') col -= 1;
         else return;
         col = Math.max(0, Math.min(visibleCols.length - 1, col));
-        row = Math.max(0, Math.min(nrow - 1, row));
+        row = Math.max(0, Math.min(effectiveNrow - 1, row));
         const next = createCellSelection(col, row);
         setGridSelection(next);
         gridRef.current?.focus();
@@ -869,13 +894,13 @@ export function App({
         if (row < visibleRange.start || row >= visibleRange.end) {
             viewport = viewportForStart(row);
             setVisibleRange(viewport);
-            requestRows(paddedRange(viewport.start, viewport.end - viewport.start, nrow, OVERSCAN_ROWS));
+            requestRows(paddedRange(viewport.start, viewport.end - viewport.start, effectiveNrow, OVERSCAN_ROWS));
         }
         postLifecycle('test-key', viewport, next);
     }, [
+        effectiveNrow,
         estimatedViewportRowCount,
         gridSelection,
-        nrow,
         postLifecycle,
         requestRows,
         scrollToFraction,
@@ -993,6 +1018,25 @@ export function App({
         applySort(sort.keys);
     }, [applySort, columns, sort, toolbar.labelsOn]);
 
+    /** Labels-toggle invalidates setIn/setNotIn filter predicates that were
+     *  built against label strings. When the active filter touches a labelled
+     *  column and labelsOn changed since the filter was built, re-issue
+     *  applyFilters so the host recomputes the permutation under the new
+     *  toolbar state. The resulting filterApplied sets
+     *  filter.labelsOnWhenFiltered = toolbar.labelsOn, making the guard true
+     *  on the next render and preventing an infinite re-fire loop. */
+    useEffect(() => {
+        if (filter.entries.length === 0) return;
+        if (filter.labelsOnWhenFiltered === toolbar.labelsOn) return;
+        const touchesLabelled = filter.entries.some(e => {
+            const col = columns[e.columnIndex];
+            if (!col) return false;
+            return e.predicate.kind === 'setIn' || e.predicate.kind === 'setNotIn';
+        });
+        if (!touchesLabelled) return;
+        applyFilters(filter.entries);
+    }, [applyFilters, columns, filter, toolbar.labelsOn]);
+
     useEffect(() => {
         if (!toolbar.labelsOn) return;
         const wantByColumn: Record<number, Set<number>> = {};
@@ -1031,7 +1075,7 @@ export function App({
     ]);
 
     const copySelection = useCallback((selection: GridSelection = gridSelection) => {
-        if (nrow <= 0 || visibleCols.length === 0) return;
+        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         let rowStart = 0;
         let rowEnd = 0;
         let colIndices: number[] = [];
@@ -1039,7 +1083,7 @@ export function App({
 
         if (selection.columns.length > 0) {
             rowStart = 0;
-            rowEnd = nrow;
+            rowEnd = effectiveNrow;
             colIndices = selection.columns.toArray()
                 .map(displayCol => visibleCols[displayCol])
                 .filter((col): col is number => col !== undefined);
@@ -1047,12 +1091,12 @@ export function App({
         } else if (selection.rows.length > 0) {
             const rows = selection.rows.toArray();
             rowStart = Math.max(0, Math.min(...rows));
-            rowEnd = Math.min(nrow, Math.max(...rows) + 1);
+            rowEnd = Math.min(effectiveNrow, Math.max(...rows) + 1);
             colIndices = [...visibleCols];
         } else if (selection.current) {
             const range = selection.current.range;
             rowStart = Math.max(0, range.y);
-            rowEnd = Math.min(nrow, range.y + range.height);
+            rowEnd = Math.min(effectiveNrow, range.y + range.height);
             for (let displayCol = range.x; displayCol < range.x + range.width; displayCol++) {
                 const col = visibleCols[displayCol];
                 if (col !== undefined) colIndices.push(col);
@@ -1073,7 +1117,7 @@ export function App({
             digits: toolbar.digits,
             includeHeader,
         });
-    }, [gridSelection, nrow, panelGeneration, toolbar, visibleCols, vscode]);
+    }, [effectiveNrow, gridSelection, panelGeneration, toolbar, visibleCols, vscode]);
 
     useEffect(() => {
         const onCopy = (event: ClipboardEvent) => {
@@ -1359,10 +1403,10 @@ export function App({
                     width="100%"
                     height="100%"
                     columns={gridColumns}
-                    rows={nrow}
+                    rows={effectiveNrow}
                     rowHeight={ROW_HEIGHT_PX}
                     headerHeight={HEADER_HEIGHT_PX}
-                    rowMarkers={{ kind: 'number', width: rowMarkerWidth(nrow) }}
+                    rowMarkers={{ kind: 'number', width: rowMarkerWidth(effectiveNrow) }}
                     rowSelect="multi"
                     columnSelect="multi"
                     rangeSelect="rect"
@@ -1442,10 +1486,10 @@ export function App({
                     onVisibleRegionChanged={(range: Rectangle) => {
                         const viewport = {
                             start: Math.max(0, Math.floor(range.y)),
-                            end: Math.min(nrow, Math.ceil(range.y + range.height)),
+                            end: Math.min(effectiveNrow, Math.ceil(range.y + range.height)),
                         };
                         setVisibleRange(viewport);
-                        requestRows(paddedRange(range.y, range.height, nrow, OVERSCAN_ROWS));
+                        requestRows(paddedRange(range.y, range.height, effectiveNrow, OVERSCAN_ROWS));
                         postLifecycle('visible', viewport);
                     }}
                     getCellContent={([displayCol, row]: Item) => {
