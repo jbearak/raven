@@ -257,14 +257,16 @@ function buildLabelledNonFloat() {
             ['raven.value_labels', JSON.stringify({ 1: 'zebra', 2: 'apple', 3: 'mango' })],
             ['raven.original_class', 'haven_labelled/vctrs_vctr/integer'],
         ]));
-    // utf8 col with codes whose label order differs from alpha order:
-    //   "Y" → "Yes", "N" → "No", "M" → "Maybe"
+    // utf8 col with labels whose lexical order INVERTS the raw-code
+    // order, so the test can prove the engine actually uses labels
+    // when Labels is on (and raw codes when Labels is off).
+    //   "Y" → "Apple", "N" → "Mango", "M" → "Zebra"
     // Original rows: "Y", "N", "M", "Y", "N"
-    //   Labels off (asc, alpha): rows [1, 4, 2, 0, 3] ("M","N","N","Y","Y")
-    //   Labels  on (asc, alpha by label): Maybe(2), No(1,4), Yes(0,3) → [2, 1, 4, 0, 3]
+    //   Labels off (asc, raw codes): M(2), N(1), N(4), Y(0), Y(3) → [2, 1, 4, 0, 3]
+    //   Labels  on (asc, by label):  Apple(0,3), Mango(1,4), Zebra(2) → [0, 3, 1, 4, 2]
     const utf8Field = new A.Field('answer', new A.Utf8(), false,
         new Map([
-            ['raven.value_labels', JSON.stringify({ Y: 'Yes', N: 'No', M: 'Maybe' })],
+            ['raven.value_labels', JSON.stringify({ Y: 'Apple', N: 'Mango', M: 'Zebra' })],
             ['raven.original_class', 'haven_labelled/vctrs_vctr/character'],
         ]));
     const fields = [i32Field, utf8Field];

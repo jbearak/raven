@@ -365,20 +365,24 @@ describe('computePermutation: value-labelled non-Float columns', () => {
             [{ columnIndex: 1, direction: 'asc' }],
             CTX_LABELS_OFF,
         );
-        // codes asc: "M","N","N","Y","Y" → [2, 1, 4, 0, 3]
+        // raw codes asc: "M","N","N","Y","Y" → [2, 1, 4, 0, 3]
         expect(Array.from(p)).toEqual([2, 1, 4, 0, 3]);
         await r.close();
     });
 
-    test('Utf8-labelled: Labels on sorts by label string', async () => {
+    test('Utf8-labelled: Labels on sorts by label string (diverges from raw)', async () => {
         const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
         const p = await computePermutation(
             r,
             [{ columnIndex: 1, direction: 'asc' }],
             CTX_LABELS_ON,
         );
-        // labels asc: Maybe(2), No(1,4), Yes(0,3) → [2, 1, 4, 0, 3]
-        expect(Array.from(p)).toEqual([2, 1, 4, 0, 3]);
+        // Labels: Y→Apple, N→Mango, M→Zebra. Label-alphabetic asc:
+        //   Apple(rows 0, 3), Mango(rows 1, 4), Zebra(row 2)
+        //   → [0, 3, 1, 4, 2] — meaningfully different from the
+        //     raw-code result [2, 1, 4, 0, 3] above, so this test
+        //     would fail if the engine ignored Labels for Utf8 cols.
+        expect(Array.from(p)).toEqual([0, 3, 1, 4, 2]);
         await r.close();
     });
 });
