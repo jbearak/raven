@@ -216,3 +216,20 @@ describe('computeFilteredIndices — string predicates on s ["a","b",null,"d","e
         await r.close();
     });
 });
+
+describe('computeFilteredIndices — date predicates on d (DateDay 2024-01-01..05)', () => {
+    test('dateCompare < 2024-01-03', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 4, { kind: 'dateCompare', op: '<', value: '2024-01-03' });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([0, 1]);
+        await r.close();
+    });
+    test('dateBetween inclusive 2024-01-02..2024-01-04', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const e = entry('a', 4, { kind: 'dateBetween', lo: '2024-01-02', hi: '2024-01-04', inclusive: true });
+        const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
+        expect(Array.from(out!)).toEqual([1, 2, 3]);
+        await r.close();
+    });
+});

@@ -178,6 +178,55 @@ async function acceptorFor(
         }
     }
 
+    if (predicate.kind === 'dateCompare'
+        || predicate.kind === 'dateBetween'
+        || predicate.kind === 'dateNotBetween') {
+        // Convert ISO strings to the same numeric domain the underlying
+        // arrow values live in.
+        //
+        // apache-arrow's child.get(r) for Date32<DAY> (DateDay) returns
+        // ms-since-epoch — NOT day-count — even though the raw typed array
+        // stores days. loadNumeric therefore stores ms for all Date columns.
+        // Timestamp columns (bigint microseconds) coerce to Number ms * 1000
+        // via loadNumeric's bigint path, which loses sub-ms precision but is
+        // fine for user-typed ISO strings.
+        const values = await loadNumeric(reader, columnIndex);
+        const isTs = schema.arrowType.startsWith('Timestamp');
+        const toUnit = (iso: string): number => {
+            const ms = Date.parse(iso);
+            if (!Number.isFinite(ms)) return NaN;
+            if (isTs) return ms * 1000;
+            // Date32<DAY> / Date64: loadNumeric stores ms-since-epoch.
+            return ms;
+        };
+        switch (predicate.kind) {
+            case 'dateCompare': {
+                const v = toUnit(predicate.value);
+                switch (predicate.op) {
+                    case '=': return (i) => values[i] === v;
+                    case '!=': return (i) => values[i] !== v;
+                    case '<': return (i) => values[i] < v;
+                    case '<=': return (i) => values[i] <= v;
+                    case '>': return (i) => values[i] > v;
+                    case '>=': return (i) => values[i] >= v;
+                }
+                break;
+            }
+            case 'dateBetween': {
+                const lo = toUnit(predicate.lo), hi = toUnit(predicate.hi);
+                return predicate.inclusive
+                    ? (i) => values[i] >= lo && values[i] <= hi
+                    : (i) => values[i] > lo && values[i] < hi;
+            }
+            case 'dateNotBetween': {
+                const lo = toUnit(predicate.lo), hi = toUnit(predicate.hi);
+                return predicate.inclusive
+                    ? (i) => values[i] < lo || values[i] > hi
+                    : (i) => values[i] <= lo || values[i] >= hi;
+            }
+        }
+    }
+
     throw new Error(`filter: predicate kind not yet implemented: ${predicate.kind}`);
 }
 
