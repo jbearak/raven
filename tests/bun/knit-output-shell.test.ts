@@ -84,16 +84,20 @@ describe('buildShellHtml', () => {
 
     test('open-in-browser renders visible in a local workspace', () => {
         // `isRemoteWorkspace` defaults to false; both the toolbar
-        // button and the context-menu item must render WITHOUT the
-        // `hidden` attribute so the user gets the OS browser path.
+        // button (icon-only after the icon-toolbar redesign) and the
+        // context-menu item (still text-labeled) must render WITHOUT
+        // the `hidden` attribute so the user gets the OS browser path.
         const html = buildShellHtml(args('/work/report.html'));
         expect(html).toMatch(
-            /<button[^>]*id="raven-knit-open-browser"(?![^>]*\bhidden\b)[^>]*>Open in Browser<\/button>/,
+            /<button[^>]*id="raven-knit-open-browser"(?![^>]*\bhidden\b)[^>]*>/,
+        );
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-open-browser"[^>]*\baria-label="Open in Browser"/,
         );
         expect(html).toMatch(
             /<button[^>]*data-action="open-in-browser"(?![^>]*\bhidden\b)[^>]*>Open in Browser<\/button>/,
         );
-        expect(html).toContain('title="Open the rendered file in your default browser"');
+        expect(html).toContain('title="Open in Browser (open the rendered file in your default browser)"');
     });
 
     test('open-in-browser is hidden when isRemoteWorkspace=true', () => {
@@ -112,7 +116,7 @@ describe('buildShellHtml', () => {
             isRemoteWorkspace: true,
         });
         expect(html).toMatch(
-            /<button[^>]*id="raven-knit-open-browser"[^>]*\bhidden\b[^>]*>Open in Browser<\/button>/,
+            /<button[^>]*id="raven-knit-open-browser"[^>]*\bhidden\b/,
         );
         expect(html).toMatch(
             /<button[^>]*data-action="open-in-browser"[^>]*\bhidden\b[^>]*>Open in Browser<\/button>/,
@@ -143,23 +147,36 @@ describe('buildShellHtml', () => {
         expect(html).not.toMatch(/<button[^>]*data-action="copy-image"[^>]*\bhidden\b/);
     });
 
-    test('re-knit button is labelled "Knit again"', () => {
+    test('re-knit button carries the "Knit again" aria-label and tooltip', () => {
         // "Refresh" was the original label; the document-rendering
         // analogy doesn't fit because the button re-runs knit (re-
         // executes R code, regenerates the file) rather than
-        // refetching the same URL.
+        // refetching the same URL. After the icon-toolbar redesign
+        // the label moves to aria-label/title so the button stays
+        // icon-only — the row height never changes when state
+        // labels rotate.
         const html = buildShellHtml(args('/work/report.html'));
-        expect(html).toMatch(/<button[^>]*id="raven-knit-refresh"[^>]*>Knit again<\/button>/);
-        expect(html).not.toMatch(/>Refresh</);
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-refresh"[^>]*\baria-label="Knit again"/,
+        );
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-refresh"[^>]*\btitle="Knit again \(re-knit the source document\)"/,
+        );
+        // The button is icon-only — no visible text label.
+        expect(html).not.toMatch(/<button[^>]*id="raven-knit-refresh"[^>]*>[^<]*Knit again[^<]*</);
+        expect(html).not.toMatch(/<button[^>]*id="raven-knit-refresh"[^>]*>Refresh</);
     });
 
     test('theme toggle button starts in unpressed state when not persisted', () => {
         const html = buildShellHtml(args('/work/report.html'));
         // Button must declare aria-pressed so screen readers report
         // the toggle state; on first render the theme has not been
-        // applied yet so it should read "false".
+        // applied yet so it should read "false". The label lives in
+        // aria-label now (icon-only design).
         expect(html).toMatch(/<button[^>]*id="raven-knit-theme"[^>]*aria-pressed="false"/);
-        expect(html).toContain('>Apply VS Code theme<');
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-theme"[^>]*\baria-label="Apply VS Code theme"/,
+        );
     });
 
     test('initialThemeApplied=true renders the button in the pressed state', () => {
@@ -167,50 +184,145 @@ describe('buildShellHtml', () => {
         // globalState and threads it through here; the rendered
         // button should immediately reflect "theme applied" so the
         // user does not see a one-frame flicker between renders.
-        // Note: the button label does NOT change with state — Rmd
-        // output has no "document theme" to switch back to, so the
-        // active state is conveyed only via aria-pressed + CSS.
+        // Note: the icon does NOT change with state — Rmd output has
+        // no "document theme" to switch back to, so the active state
+        // is conveyed only via aria-pressed + CSS.
         const html = buildShellHtml(args('/work/report.html', 'N', true));
         expect(html).toMatch(/<button[^>]*id="raven-knit-theme"[^>]*aria-pressed="true"/);
-        expect(html).toContain('>Apply VS Code theme<');
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-theme"[^>]*\baria-label="Apply VS Code theme"/,
+        );
         // The script's local state variable starts at the same value.
         expect(html).toContain('let themeApplied = true;');
     });
 
-    test('theme button label is constant; state is visual only', () => {
+    test('theme button aria-label is constant; state is visual only', () => {
         const off = buildShellHtml(args('/work/r.html', 'N', false));
         const on = buildShellHtml(args('/work/r.html', 'N', true));
-        // Both renderings carry the same visible label — only
-        // aria-pressed flips. The label never says "Use document
-        // theme" since there isn't one.
-        expect(off).toContain('>Apply VS Code theme<');
-        expect(on).toContain('>Apply VS Code theme<');
+        // Both renderings carry the same aria-label — only aria-pressed
+        // flips. The label never says "Use document theme" since
+        // there isn't one.
+        expect(off).toContain('aria-label="Apply VS Code theme"');
+        expect(on).toContain('aria-label="Apply VS Code theme"');
         expect(off).not.toContain('Use document theme');
         expect(on).not.toContain('Use document theme');
     });
 
-    test('toggle is right-aligned in the toolbar', () => {
-        // The toolbar uses flex layout; `margin-left: auto` on the
-        // toggle pushes it to the right edge, separating it from the
-        // two action buttons on the left.
+    test('toolbar groups Knit again on the left and everything else on the right', () => {
+        // Layout mirrors the Plot Viewer toolbar (Svelte App.svelte):
+        // the primary action that re-runs work sits on the left, the
+        // share / browse / theme cluster goes on the right after a
+        // flex: 1 spacer. The viewing-preference toggle is the
+        // right-most item so it never collides with the action group.
         const html = buildShellHtml(args('/work/r.html'));
-        expect(html).toMatch(/#raven-knit-theme\s*\{[\s\S]*?margin-left:\s*auto/);
+        const refreshIdx = html.indexOf('id="raven-knit-refresh"');
+        const spacerIdx = html.indexOf('class="raven-knit-spacer"');
+        const exportIdx = html.indexOf('id="raven-knit-export"');
+        const browserIdx = html.indexOf('id="raven-knit-open-browser"');
+        const themeIdx = html.indexOf('id="raven-knit-theme"');
+        expect(refreshIdx).toBeGreaterThan(0);
+        expect(spacerIdx).toBeGreaterThan(refreshIdx);
+        expect(exportIdx).toBeGreaterThan(spacerIdx);
+        expect(browserIdx).toBeGreaterThan(spacerIdx);
+        expect(themeIdx).toBeGreaterThan(spacerIdx);
+        // Theme toggle is the right-most control.
+        expect(themeIdx).toBeGreaterThan(exportIdx);
+        expect(themeIdx).toBeGreaterThan(browserIdx);
+        expect(html).toMatch(/\.raven-knit-spacer\s*\{[\s\S]*?flex:\s*1/);
     });
 
-    test('toggle uses input-option styling and a checkmark prefix', () => {
-        // Pin the visual contract: the toggle uses VS Code's
-        // input-option CSS variables (the same vars the Find widget
-        // toggles use), and the active state prepends a ✓ via a
-        // ::before pseudo-element. Action buttons must remain on
-        // the button-background palette.
+    test('toggle uses primary-button palette for the engaged state', () => {
+        // Pin the visual contract: the toggle's engaged state fills
+        // the icon-only button with VS Code's primary-button accent
+        // (the same vars the Plot Viewer toolbar's theme toggle
+        // uses). The prior ::before checkmark is gone because the
+        // icon-only redesign uses the codicon glyph + colored
+        // background to convey state, and the prior inputOption-*
+        // accent was too subtle against the editorWidget surface.
         const html = buildShellHtml(args('/work/r.html'));
-        expect(html).toContain('--vscode-inputOption-activeBackground');
-        expect(html).toContain('--vscode-inputOption-activeBorder');
-        expect(html).toContain('--vscode-inputOption-activeForeground');
-        expect(html).toMatch(/#raven-knit-theme::before\s*\{[\s\S]*?content:\s*"✓"/);
+        // The CSS targets the aria-pressed state directly and uses
+        // the primary-button palette so the engaged state is
+        // unambiguous across every theme.
         expect(html).toMatch(
-            /#raven-knit-theme\[aria-pressed="true"\]::before\s*\{\s*visibility:\s*visible/,
+            /#raven-knit-toolbar button#raven-knit-theme\[aria-pressed="true"\]\s*\{[\s\S]*?background:\s*var\(--vscode-button-background\)/,
         );
+        expect(html).toMatch(
+            /#raven-knit-toolbar button#raven-knit-theme\[aria-pressed="true"\]\s*\{[\s\S]*?color:\s*var\(--vscode-button-foreground\)/,
+        );
+        expect(html).toMatch(
+            /#raven-knit-theme\[aria-pressed="true"\]:hover[^{]*\{[\s\S]*?background:\s*var\(--vscode-button-hoverBackground\)/,
+        );
+        // ::before checkmark has been retired with the icon redesign;
+        // assert it didn't sneak back in.
+        expect(html).not.toMatch(/#raven-knit-theme::before/);
+        // The brittle inputOption-* vars are also gone from the
+        // toggle's styling.
+        expect(html).not.toMatch(
+            /#raven-knit-theme\[aria-pressed="true"\]\s*\{[\s\S]*?--vscode-inputOption-/,
+        );
+    });
+
+    test('toolbar buttons are icon-only (SVG glyphs, no visible labels)', () => {
+        // Pin the visual contract for the icon-toolbar redesign: each
+        // toolbar button contains an inline <svg> codicon, and none of
+        // them carries a visible text label. Text labels live in
+        // aria-label and title so AT users still hear them.
+        const html = buildShellHtml(args('/work/r.html'));
+        const buttons = [
+            'raven-knit-refresh',
+            'raven-knit-open-browser',
+            'raven-knit-export',
+            'raven-knit-theme',
+        ];
+        for (const id of buttons) {
+            const re = new RegExp(`<button[^>]*id="${id}"[^>]*>([\\s\\S]*?)<\\/button>`);
+            const m = html.match(re);
+            expect(m).not.toBeNull();
+            const inner = m![1];
+            expect(inner).toContain('<svg');
+            expect(inner).toContain('fill="currentColor"');
+            // Strip the SVG and assert no residual visible text.
+            const withoutSvg = inner.replace(/<svg[\s\S]*?<\/svg>/g, '');
+            expect(withoutSvg.replace(/\s+/g, '')).toBe('');
+        }
+    });
+
+    test('toolbar stays single-row at every panel width', () => {
+        // The redesign pins flex-wrap: nowrap on the toolbar so a
+        // future text-bearing button (or a long aria-label that
+        // somehow leaks visually) can't wrap to a second row and
+        // bump the height. overflow-x: auto with a hidden scrollbar
+        // is the safety net for very narrow panels.
+        const html = buildShellHtml(args('/work/r.html'));
+        expect(html).toMatch(/#raven-knit-toolbar\s*\{[\s\S]*?flex-wrap:\s*nowrap/);
+        expect(html).toMatch(/#raven-knit-toolbar\s*\{[\s\S]*?overflow-x:\s*auto/);
+        expect(html).toContain('scrollbar-width: none');
+    });
+
+    test('export popover replaces VS Code QuickPick with an in-shell menu', () => {
+        // The Export button previously posted a payload-less
+        // `requestExport` and the host opened VS Code's native
+        // QuickPick; the redesign moves the format choice into a
+        // webview-side HTML popover (mirroring the plot viewer's
+        // share popover) so the format value reaches the host via
+        // the validated `requestExport.format` field instead.
+        const html = buildShellHtml(args('/work/r.html'));
+        expect(html).toContain('id="raven-knit-export-popover"');
+        expect(html).toMatch(/popover="auto"/);
+        expect(html).toContain('role="group"');
+        expect(html).toContain('data-format="html"');
+        expect(html).toContain('data-format="pdf"');
+        expect(html).toContain('data-format="docx"');
+        // The export trigger references the popover via aria-controls
+        // (popovertarget would also work declaratively, but the JS
+        // handler needs to short-circuit on the busy-state path so
+        // we open the popover imperatively).
+        expect(html).toMatch(
+            /<button[^>]*id="raven-knit-export"[^>]*aria-controls="raven-knit-export-popover"/,
+        );
+        // The webview now posts the format on the request — the
+        // host-side QuickPick is gone from the panel code.
+        expect(html).toMatch(/postMessage\(\s*\{\s*type:\s*['"]requestExport['"]\s*,\s*format:/);
     });
 
     test('script reads computed vscode-editor CSS variables', () => {

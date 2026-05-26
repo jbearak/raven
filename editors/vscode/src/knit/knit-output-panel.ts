@@ -376,7 +376,7 @@ export class KnitOutputPanel {
         const key = args.sourceUri.fsPath;
         const panel = vscode.window.createWebviewPanel(
             'raven.knitOutput',
-            'Knit Output',
+            'Knit Preview',
             { viewColumn: column, preserveFocus: true },
             {
                 enableScripts: true,
@@ -667,7 +667,7 @@ export class KnitOutputPanel {
                 typeof vscode.env.remoteName === 'string'
                 && vscode.env.remoteName.length > 0,
         });
-        this.panel.title = `Knit Output: ${path.basename(args.outputPath)}`;
+        this.panel.title = `Knit Preview: ${path.basename(args.outputPath)}`;
         // Fire-and-forget: re-render the shell first, then resolve
         // and push the palette. The webview applies it as soon as
         // the message arrives (the initial render also runs
@@ -962,7 +962,7 @@ export class KnitOutputPanel {
             return;
         }
         if (msg.type === 'requestExport') {
-            void this.openExportQuickPick();
+            void this.runExportFromWebview(msg.format);
             return;
         }
         if (msg.type === 'cancelExport') {
@@ -978,49 +978,47 @@ export class KnitOutputPanel {
     }
 
     /**
-     * Open the native QuickPick that drives the webview's `Export ▾`
-     * button. Format choice is collected by VS Code's quickpick UI
-     * (never crosses the webview trust boundary, which is why the
-     * `requestExport` message has an empty payload), then routed into
-     * `raven.knit.export*` commands with the entry mode forced to
-     * `webview` so the cached preview .md is reused.
+     * Dispatch the appropriate `raven.knit.export*` command for the
+     * format the user picked in the webview's Export popover.
+     *
+     * The webview owns the format-choice UI now (an HTML popover
+     * mirroring the plot viewer's share popover), so VS Code's native
+     * QuickPick is no longer in the path. The format value arrives
+     * across the trust boundary in `requestExport.format` and is
+     * already validated against `EXPORT_FORMATS` by
+     * `isKnitOutputMessage` — we still re-narrow here to a strict
+     * switch so the dispatch table is exhaustive at the type level.
+     *
+     * The preview dir is pinned across the dispatch lifecycle. Without
+     * this, the user could click a format and close the panel before
+     * the export starts — the disposal handler would have already
+     * requested deletion of the cached `.md`, and the export pipeline
+     * would find it gone. The export pipeline takes its own pin when
+     * it begins, so any window between our unpin and that pin would
+     * re-open the race; we hold our pin until `executeCommand`
+     * resolves (i.e., until the export pipeline has finished and
+     * already done its own pin/unpin cycle).
      */
-    private async openExportQuickPick(): Promise<void> {
-        // Attach the dispatch command directly to each item so routing
-        // can't drift if a label is reworded for a11y or i18n.
-        interface ExportQuickPickItem extends vscode.QuickPickItem {
-            command: 'raven.knit.exportHtml' | 'raven.knit.exportPdf' | 'raven.knit.exportDocx';
+    private async runExportFromWebview(
+        format: 'html' | 'pdf' | 'docx',
+    ): Promise<void> {
+        let command: 'raven.knit.exportHtml' | 'raven.knit.exportPdf' | 'raven.knit.exportDocx';
+        switch (format) {
+            case 'html': command = 'raven.knit.exportHtml'; break;
+            case 'pdf':  command = 'raven.knit.exportPdf';  break;
+            case 'docx': command = 'raven.knit.exportDocx'; break;
         }
-        const items: ExportQuickPickItem[] = [
-            { label: '$(file-code) Export to HTML…', description: 'Pandoc HTML', command: 'raven.knit.exportHtml' },
-            { label: '$(file-pdf) Export to PDF…', description: 'Pandoc PDF', command: 'raven.knit.exportPdf' },
-            { label: '$(file) Export to Word…', description: 'Pandoc DOCX', command: 'raven.knit.exportDocx' },
-        ];
-        // Pin the preview dir across the QuickPick lifecycle. Without
-        // this, the user could open the QuickPick, close the panel
-        // before choosing, then choose a format — the disposal handler
-        // would have already requested deletion of the cached `.md`,
-        // and the export pipeline would find it gone. The export-
-        // pipeline takes its own pin when it begins, so any window
-        // between this unpin and that pin would re-open the race; we
-        // therefore hold the pin until executeCommand resolves (i.e.,
-        // until the export pipeline has finished, by which point it
-        // has already done its own pin/unpin cycle).
         const rmdAbsPath = this.sourceUri.fsPath;
         const pin = KnitOutputPanel.pinPreviewHandler;
         const unpin = KnitOutputPanel.unpinPreviewHandler;
         if (pin) pin(rmdAbsPath);
         try {
-            const choice = await vscode.window.showQuickPick(items, {
-                placeHolder: `Export ${this.sourceUri.path.split('/').pop() ?? this.sourceUri.fsPath}`,
-            });
-            if (!choice) return;
             // The webview entry reuses the cached preview .md. We dispatch
             // through `raven.knit.export*` so any caller-supplied wiring
             // (test harness, etc.) gets the same entry point as the
             // editor-toolbar invocations — `runExport` then differentiates
             // entry-mode by the optional second argument.
-            await vscode.commands.executeCommand(choice.command, this.sourceUri, { entry: 'webview' });
+            await vscode.commands.executeCommand(command, this.sourceUri, { entry: 'webview' });
         } finally {
             if (unpin) unpin(rmdAbsPath);
         }

@@ -140,7 +140,7 @@ explorer-context-menu hook is opt-in via your own keybindings).
     temp-and-rename next to the source, so a concurrent re-knit
     can never expose a half-written file to the panel.
 
-11. **Reveal.** Raven opens the rendered HTML in a **Knit Output**
+11. **Reveal.** Raven opens the rendered HTML in a **Knit Preview**
     webview panel beside the editor — no success popover, the panel
     itself is the signal. Each `.Rmd` gets its own panel; knitting a
     second `.Rmd` opens a separate panel that stacks as a tab in the
@@ -386,7 +386,7 @@ those checks live in the runtime sanitizer only.
 | Capability | Where it lives |
 |---|---|
 | Live preview of `.Rmd` or `.qmd` | `quarto.quarto`'s `Quarto: Preview` |
-| Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Output panel is a static viewer with a manual Refresh button — not a live recompile. |
+| Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Preview panel is a static viewer with a manual Knit again button — not a live recompile. |
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |
