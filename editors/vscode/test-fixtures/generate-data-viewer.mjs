@@ -162,19 +162,37 @@ function buildBigdict() {
 
 function buildBigInt64() {
     const N = 5;
-    // Three values just above MAX_SAFE_INTEGER that all collapse to the
-    // same Number under naive Number(bigint), plus two distinct safe
-    // values for ordering anchors. Original row order:
-    //   row 0: MAX_SAFE_INTEGER + 1 (= 2^53)          [coalesces with row 1, 2]
-    //   row 1: MAX_SAFE_INTEGER + 3
-    //   row 2: MAX_SAFE_INTEGER + 5
-    //   row 3: 1
-    //   row 4: -1
-    // Asc on bigint compare → row 4, 3, 0, 1, 2.
+    // Three Int64 values above Number.MAX_SAFE_INTEGER (= 2^53 - 1) plus
+    // two safe-range anchors. Under Number-coercion, these collapse with
+    // round-half-to-even at ULP = 2:
+    //
+    //   bigint               | Number(bigint)        | note
+    //   (1n << 53n) + 1n     | 2^53                  | rounds DOWN
+    //   (1n << 53n) + 3n     | 2^53 + 4              | rounds UP (half-to-even)
+    //   (1n << 53n) + 5n     | 2^53 + 4              | rounds DOWN — COLLIDES with the +3 row
+    //
+    // (Note: (1n << 53n) + 1n == MAX_SAFE_INTEGER + 2, not + 1. The
+    // value 2^53 is one past MAX_SAFE_INTEGER and is itself
+    // representable; it's 2^53 + 1 that needs rounding.)
+    //
+    // The rows are arranged so naive Number() + stable sort produces a
+    // DIFFERENT order than bigint sort — without that, the test would
+    // pass even if the engine secretly coerced through Number:
+    //
+    //   row 0: (1n << 53n) + 5n   → Number 2^53 + 4    (precise: largest)
+    //   row 1: (1n << 53n) + 3n   → Number 2^53 + 4    (precise: middle)
+    //   row 2: (1n << 53n) + 1n   → Number 2^53        (precise: smallest of these three)
+    //   row 3: 1n
+    //   row 4: -1n
+    //
+    // Bigint asc:        [4, 3, 2, 1, 0]   (each precise value distinct)
+    // Naive Number asc:  [4, 3, 2, 0, 1]   (rows 0 and 1 tie at 2^53+4;
+    //                                       stable sort keeps original
+    //                                       order, so 0 comes before 1)
     const values = new BigInt64Array(N);
-    values[0] = (1n << 53n) + 1n;
+    values[0] = (1n << 53n) + 5n;
     values[1] = (1n << 53n) + 3n;
-    values[2] = (1n << 53n) + 5n;
+    values[2] = (1n << 53n) + 1n;
     values[3] = 1n;
     values[4] = -1n;
     const fields = [new A.Field('big', new A.Int64(), false)];
