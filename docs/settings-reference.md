@@ -42,6 +42,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.dataViewer.defaultDigits` | `3` | integer (0–15) | — | [data-viewer](data-viewer.md) | Initial digits used by the data viewer's Format toggle. |
 | `raven.dataViewer.maxStoredLayouts` | `10000` | integer (≥0) | — | [data-viewer](data-viewer.md) | Maximum number of persisted column-layout entries (per panel name × schema hash) before LRU eviction. |
 | `raven.dataViewer.missingValueStyle` | `"foreground"` | `"foreground"` \| `"background"` \| `"none"` | — | [data-viewer](data-viewer.md) | How the data viewer highlights NA / NaN cells. |
+| `raven.dataViewer.persistFilters` | `true` | boolean | — | [data-viewer](data-viewer.md) | Persist the data viewer's active row filters per panel name × schema hash so a later View() call restores them. |
 | `raven.dataViewer.persistSort` | `true` | boolean | — | [data-viewer](data-viewer.md) | Persist the data viewer's active row sort per panel name × schema hash so a later View() call restores it. |
 | `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `diagnostics.conditionAssignmentSeverity` | [diagnostics](diagnostics.md) | Severity for the condition-assignment diagnostic. |
 | `raven.diagnostics.enabled` | `true` | boolean | `diagnostics.enabled` | [diagnostics](diagnostics.md) | Enable or disable all diagnostics. |

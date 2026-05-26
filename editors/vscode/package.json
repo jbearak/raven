@@ -1405,6 +1405,11 @@
           "default": true,
           "description": "Persist the data viewer's active row sort per panel name × schema hash so a later View() call restores it. Set to false to make each panel open unsorted."
         },
+        "raven.dataViewer.persistFilters": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist the data viewer's active row filters per panel name × schema hash so a later View() call restores them. Set to false to make each panel open unfiltered."
+        },
         "raven.linting.enabled": {
           "type": [
             "string",
