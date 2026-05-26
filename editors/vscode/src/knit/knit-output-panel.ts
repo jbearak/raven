@@ -1007,6 +1007,15 @@ export class KnitOutputPanel {
             case 'html': command = 'raven.knit.exportHtml'; break;
             case 'pdf':  command = 'raven.knit.exportPdf';  break;
             case 'docx': command = 'raven.knit.exportDocx'; break;
+            // Defense-in-depth: TS already narrows `format` to the three
+            // literals above, but if `EXPORT_FORMATS` is ever widened in
+            // `knit-output.ts` without updating this dispatch, an
+            // exhaustiveness assignment to `never` makes the drift loud
+            // at compile time AND throws a clear error at runtime.
+            default: {
+                const _exhaustive: never = format;
+                throw new Error(`unsupported export format: ${String(_exhaustive)}`);
+            }
         }
         const rmdAbsPath = this.sourceUri.fsPath;
         const pin = KnitOutputPanel.pinPreviewHandler;

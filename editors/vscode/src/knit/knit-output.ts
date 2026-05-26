@@ -525,11 +525,11 @@ export function buildShellHtml(args: {
    * every theme.
    */
   #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"] {
-    background: var(--vscode-button-background) !important;
-    color: var(--vscode-button-foreground) !important;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
   }
   #raven-knit-toolbar button#raven-knit-theme[aria-pressed="true"]:hover:not(:disabled) {
-    background: var(--vscode-button-hoverBackground) !important;
+    background: var(--vscode-button-hoverBackground);
   }
   /*
    * Export busy state — when an export op is in flight, the icon
@@ -632,12 +632,17 @@ export function buildShellHtml(args: {
             title="Knit again (re-knit the source document)">${ICON_REFRESH}</button>
     <span class="raven-knit-spacer"></span>
     <!-- ARIA: the trigger carries \`aria-expanded\` so AT users hear
-         "expanded / collapsed" on activation. The popover is opened
-         imperatively via showPopover() (so the busy-state cancel
-         branch can short-circuit on the same click), which means the
-         browser's declarative popovertarget auto-mirror does NOT
-         apply — the toggle event listener on the popover keeps the
-         attribute in sync explicitly. \`aria-controls\` links the
+         "expanded / collapsed" on activation. \`popovertarget\` makes
+         the browser handle the open/close toggle natively AND excludes
+         the trigger from the popover's light-dismiss algorithm — without
+         it, a click on the trigger while the popover is open would be
+         classified as an outside-click, light-dismiss would close the
+         popover on pointerup, and any JS click handler that then called
+         showPopover() would just reopen it (i.e., the trigger could
+         never close the popover). With \`popovertarget\` set, the
+         browser also auto-mirrors aria-expanded for AT, and the
+         \`beforetoggle\` listener below keeps our explicit attribute
+         setting in lockstep for safety. \`aria-controls\` links the
          trigger to its popover for AT that supports popup tracking.
          We do NOT set \`aria-haspopup\` because the popover content is
          a labeled \`role="group"\` (not a \`role="menu"\` — no arrow-key
@@ -648,6 +653,7 @@ export function buildShellHtml(args: {
             aria-label="Export"
             aria-controls="raven-knit-export-popover"
             aria-expanded="false"
+            popovertarget="raven-knit-export-popover"
             title="Export as HTML, PDF, or Word">${ICON_SHARE}</button>
     <button id="raven-knit-open-browser" type="button"${isRemoteWorkspace ? ' hidden' : ''}
             aria-label="Open in Browser"
@@ -667,7 +673,7 @@ export function buildShellHtml(args: {
   <div id="raven-knit-export-popover"
        popover="auto"
        role="group"
-       aria-label="Export format">
+       aria-label="Export ${safeName}">
     <button type="button" data-format="html">Export to HTML…</button>
     <button type="button" data-format="pdf">Export to PDF…</button>
     <button type="button" data-format="docx">Export to Word…</button>
@@ -709,7 +715,13 @@ export function buildShellHtml(args: {
       const exportPopover = document.getElementById('raven-knit-export-popover');
       const ICON_EXPORT_SVG = ${JSON.stringify(ICON_SHARE)};
       const ICON_STOP_SVG = ${JSON.stringify(ICON_STOP)};
-      const exportTitleIdle = exportBtn.getAttribute('title') || '';
+      // Capture the idle-state title/aria-label so syncExportBtn can
+      // restore them when the busy->idle flip happens. The hardcoded
+      // fallbacks are belt-and-braces: if a future markup edit drops
+      // or empties either attribute, we still emit a non-empty value
+      // on every state flip instead of silently stripping the
+      // affordance after the first export completes.
+      const exportTitleIdle = exportBtn.getAttribute('title') || 'Export as HTML, PDF, or Word';
       const exportAriaIdle = exportBtn.getAttribute('aria-label') || 'Export';
       const exportTitleBusy = 'Cancel the in-flight export';
       const exportAriaBusy = 'Cancel export';
@@ -743,6 +755,20 @@ export function buildShellHtml(args: {
       function positionExportPopover() {
         if (!exportPopover || !exportBtn) return;
         var r = exportBtn.getBoundingClientRect();
+        var vw = window.innerWidth;
+        var vh = window.innerHeight;
+        // If the trigger has scrolled out of the visible viewport
+        // (e.g. the toolbar's overflow-x has clipped it on a very
+        // narrow panel), there is no sensible anchor and the user
+        // can't see what the menu belongs to. Close the popover
+        // instead of clamping to a viewport corner with no visible
+        // source button.
+        var triggerVisible =
+          r.right > 0 && r.left < vw && r.bottom > 0 && r.top < vh;
+        if (!triggerVisible) {
+          closeExportPopover();
+          return;
+        }
         // Clear stale inline coords before measuring so the popover
         // reports its natural box, not a previous position.
         exportPopover.style.left = '';
@@ -752,18 +778,22 @@ export function buildShellHtml(args: {
         // While :popover-open hasn't applied display: flex yet (we're
         // in beforetoggle), force display: flex for measurement and
         // hide via visibility so users don't see a flash at the UA
-        // default centered position.
+        // default centered position. Wrap in try/finally so an
+        // unexpected throw during measurement can't leave the popover
+        // permanently invisible via inline display/visibility styles.
         var prevDisplay = exportPopover.style.display;
         var prevVisibility = exportPopover.style.visibility;
-        exportPopover.style.visibility = 'hidden';
-        exportPopover.style.display = 'flex';
-        var w = exportPopover.offsetWidth;
-        var h = exportPopover.offsetHeight;
-        exportPopover.style.display = prevDisplay;
-        exportPopover.style.visibility = prevVisibility;
+        var w, h;
+        try {
+          exportPopover.style.visibility = 'hidden';
+          exportPopover.style.display = 'flex';
+          w = exportPopover.offsetWidth;
+          h = exportPopover.offsetHeight;
+        } finally {
+          exportPopover.style.display = prevDisplay;
+          exportPopover.style.visibility = prevVisibility;
+        }
 
-        var vw = window.innerWidth;
-        var vh = window.innerHeight;
         // Anchor near the button's left edge by default; clamp so the
         // popover stays at least 4px from both viewport edges.
         var left = Math.max(4, Math.min(r.left, vw - w - 4));
@@ -827,25 +857,19 @@ export function buildShellHtml(args: {
       exportBtn.addEventListener('click', function (e) {
         if (exportBtn.dataset.busy === 'true') {
           // In busy mode the click is a cancel — preventDefault stops
-          // the browser's declarative popovertarget handling (we did
-          // NOT add popovertarget to the button, but defense-in-depth
-          // against a future markup edit).
+          // the browser from processing the declarative popovertarget
+          // invocation on the trigger, so we don't accidentally toggle
+          // the popover while the user means to cancel.
           e.preventDefault();
           vscode.postMessage({ type: 'cancelExport' });
           return;
         }
-        // Idle: open the popover. We toggle via showPopover() rather
-        // than the declarative popovertarget attribute because the
-        // busy-state cancel path above needs to short-circuit on the
-        // same click event — having JS own both branches keeps the
-        // control flow obvious.
-        if (exportPopover && exportPopover.showPopover) {
-          if (exportPopover.matches && exportPopover.matches(':popover-open')) {
-            exportPopover.hidePopover();
-          } else {
-            exportPopover.showPopover();
-          }
-        }
+        // Idle: the browser's declarative popovertarget="raven-knit-
+        // export-popover" attribute on the trigger handles the toggle
+        // (and crucially makes the trigger a popover invoker, so a
+        // click on it is excluded from the light-dismiss algorithm —
+        // see the markup-side comment above for why we don't rely on
+        // an imperative showPopover/hidePopover here).
       });
       // Initial paint of the export icon. The button HTML already
       // ships with the export icon baked in via the template literal,
@@ -1664,15 +1688,20 @@ export function buildShellHtml(args: {
           // Mirrors the existing mousedown -> dismissToolbarUi route
           // that closes the popover on iframe clicks.
           if (e.key === 'Escape') {
-            var dismissed = false;
-            if (!ctxMenu.hidden) { hideContextMenu(); dismissed = true; }
+            // Unwind one layer per Escape press — the context menu
+            // (when summoned over an open popover via right-click)
+            // is the topmost layer and dismisses first. The popover
+            // remains; a second Escape closes it. Matches the
+            // conventional "Escape pops one modal" affordance.
+            if (!ctxMenu.hidden) {
+              hideContextMenu();
+              e.preventDefault();
+              return;
+            }
             if (exportPopover
                 && exportPopover.matches
                 && exportPopover.matches(':popover-open')) {
               closeExportPopover();
-              dismissed = true;
-            }
-            if (dismissed) {
               e.preventDefault();
               return;
             }
@@ -1963,6 +1992,14 @@ export function buildShellHtml(args: {
           // smuggled non-boolean cannot enable the cancel dispatch.
           if (data.busy === true) {
             exportBtn.dataset.busy = 'true';
+            // Dismiss any open format popover so the user isn't
+            // looking at a fresh "Export to HTML / PDF / Word" menu
+            // anchored under a trigger that has just swapped to the
+            // cancel icon. Without this, picking a format from the
+            // open popover would post requestExport against an op
+            // key that's already busy, surfacing a surprise
+            // "cancel-and-retry" toast.
+            closeExportPopover();
           } else {
             delete exportBtn.dataset.busy;
           }
