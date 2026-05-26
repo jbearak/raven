@@ -4,7 +4,7 @@
  * types-only imports, so it runs under bun directly.
  */
 import { describe, test, expect } from 'bun:test';
-import { colKind, kindOptions } from '../../editors/vscode/src/data-viewer/webview/filter-column-kind';
+import { colKind, kindOptions, labelledNumericChoices } from '../../editors/vscode/src/data-viewer/webview/filter-column-kind';
 import type { ColumnSchema } from '../../editors/vscode/src/data-viewer/arrow-reader';
 
 function col(partial: Partial<ColumnSchema> & Pick<ColumnSchema, 'name' | 'arrowType'>): ColumnSchema {
@@ -49,5 +49,44 @@ describe('kindOptions — shape per kind', () => {
             const vals = kindOptions(k).map(o => o.value);
             expect(vals.slice(-2)).toEqual(['isEmpty', 'isNotEmpty']);
         }
+    });
+});
+
+const LBL_FLOAT = col({ name: 'lbl', arrowType: 'Float64', valueLabels: { '1': 'low', '2': 'mid', '3': 'high' } });
+const LBL_INT = col({ name: 'rating', arrowType: 'Int32', isInteger: true, valueLabels: { '1': 'zebra', '2': 'apple', '3': 'mango' } });
+
+describe('colKind — labelled numeric', () => {
+    test('numeric Arrow type + valueLabels → labelledNumeric', () => {
+        expect(colKind(LBL_FLOAT)).toBe('labelledNumeric');
+        expect(colKind(LBL_INT)).toBe('labelledNumeric');
+    });
+    test('numeric WITHOUT valueLabels stays numeric', () => {
+        expect(colKind(col({ name: 'x', arrowType: 'Int32', isInteger: true }))).toBe('numeric');
+    });
+});
+
+describe('kindOptions — labelledNumeric is hybrid, set-membership first', () => {
+    test('lists setIn first and includes numeric predicates', () => {
+        const vals = kindOptions('labelledNumeric').map(o => o.value);
+        expect(vals).toEqual([
+            'setIn', 'setNotIn', 'numCompare', 'numBetween', 'numNotBetween', 'isEmpty', 'isNotEmpty',
+        ]);
+    });
+});
+
+describe('labelledNumericChoices', () => {
+    test('maps valueLabels to {code,label}, sorted by numeric code ascending', () => {
+        expect(labelledNumericChoices(LBL_INT)).toEqual([
+            { code: 1, label: 'zebra' },
+            { code: 2, label: 'apple' },
+            { code: 3, label: 'mango' },
+        ]);
+    });
+    test('sorts out-of-order and string-keyed codes numerically (not lexically)', () => {
+        const c = col({ name: 'q', arrowType: 'Float64', valueLabels: { '10': 'ten', '2': 'two', '1': 'one' } });
+        expect(labelledNumericChoices(c).map(x => x.code)).toEqual([1, 2, 10]);
+    });
+    test('returns [] when there are no value labels', () => {
+        expect(labelledNumericChoices(col({ name: 'x', arrowType: 'Int32' }))).toEqual([]);
     });
 });
