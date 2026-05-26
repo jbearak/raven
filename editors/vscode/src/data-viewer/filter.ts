@@ -1,0 +1,165 @@
+/**
+ * Filter engine for the data viewer. Produces a Uint32Array of surviving
+ * row indices from a FilterState evaluated against an open
+ * ArrowSliceReader.
+ *
+ * Invariants:
+ *   - **Empty / all-disabled state**: returns undefined so the panel
+ *     can skip filter storage entirely.
+ *   - **Cross-entry AND**: enabled entries are intersected on a row
+ *     mask; disabled entries are ignored.
+ *   - **WYSIWYG label routing**: when `labelsOn` is true, factor and
+ *     value-labelled columns evaluate `setIn` / `setNotIn` against the
+ *     displayed label string. When `labelsOn` is false, against the
+ *     underlying code / numeric / string value.
+ *   - **Format independence**: digits / formatOn never affects the
+ *     row index. Numeric predicates always match against the raw
+ *     double.
+ *   - **NA / NaN semantics**: missing rows fail any predicate unless
+ *     `includeMissing` is true on that entry, in which case the entry
+ *     passes for missing rows regardless of predicate value.
+ *
+ * Performance:
+ *   - Row mask is a `Uint8Array(nrow)`; final compaction to
+ *     `Uint32Array` is O(nrow).
+ *   - Per-entry column reads stream through the reader's batch loader
+ *     (same iterator the sort engine uses).
+ */
+
+import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
+import type { FilterEntry, FilterState } from './messages';
+
+export type FilterContext = {
+    labelsOn: boolean;
+    formatOn: boolean;
+    digits: number;
+};
+
+export async function computeFilteredIndices(
+    reader: ArrowSliceReader,
+    state: FilterState,
+    ctx: FilterContext,
+): Promise<Uint32Array | undefined> {
+    const active = state.entries.filter(e => e.enabled);
+    if (active.length === 0) return undefined;
+
+    const nrow = reader.nrow;
+    const mask = new Uint8Array(nrow);
+    mask.fill(1);
+
+    for (const e of active) {
+        await applyEntry(reader, e, ctx, mask);
+        if (allZero(mask)) break;
+    }
+    return compact(mask);
+}
+
+async function applyEntry(
+    reader: ArrowSliceReader,
+    entry: FilterEntry,
+    ctx: FilterContext,
+    mask: Uint8Array,
+): Promise<void> {
+    const schema = reader.schema.columns[entry.columnIndex];
+    if (!schema) {
+        throw new Error(`computeFilteredIndices: unknown columnIndex ${entry.columnIndex}`);
+    }
+    const p = entry.predicate;
+    const accept = await acceptorFor(reader, entry.columnIndex, schema, p, ctx);
+    // isEmpty targets missing values — they always pass regardless of includeMissing.
+    // All other predicates use the entry's includeMissing flag.
+    const include = p.kind === 'isEmpty' ? true : entry.includeMissing;
+    const missing = await missingMaskFor(reader, entry.columnIndex, schema);
+
+    for (let i = 0; i < mask.length; i++) {
+        if (mask[i] === 0) continue;
+        if (missing[i]) {
+            mask[i] = include ? 1 : 0;
+            continue;
+        }
+        mask[i] = accept(i) ? 1 : 0;
+    }
+}
+
+/** Returns a fn `(rowIndex) => boolean` whose domain is **non-missing**
+ *  rows (missing-row handling is enforced by the outer loop). Built
+ *  once per entry; per-row evaluation is O(1) lookup. */
+async function acceptorFor(
+    reader: ArrowSliceReader,
+    columnIndex: number,
+    schema: ColumnSchema,
+    predicate: FilterEntry['predicate'],
+    ctx: FilterContext,
+): Promise<(row: number) => boolean> {
+    if (predicate.kind === 'isEmpty') return () => false;
+    if (predicate.kind === 'isNotEmpty') return () => true;
+
+    if (predicate.kind === 'bool') {
+        const values = await loadBool(reader, columnIndex);
+        const want = predicate.value ? 1 : 0;
+        return (i) => values[i] === want;
+    }
+
+    throw new Error(`filter: predicate kind not yet implemented: ${predicate.kind}`);
+}
+
+async function missingMaskFor(
+    reader: ArrowSliceReader,
+    columnIndex: number,
+    schema: ColumnSchema,
+): Promise<Uint8Array> {
+    const nrow = reader.nrow;
+    const m = new Uint8Array(nrow);
+    const isFloat = schema.arrowType.startsWith('Float');
+    const numBatches = reader.batchStarts.length - 1;
+    for (let bi = 0; bi < numBatches; bi++) {
+        const batch = await (reader as any).getBatch(bi);
+        const child = batch.getChildAt(columnIndex);
+        const start = reader.batchStarts[bi];
+        const n = (reader.batchStarts[bi + 1] - start);
+        for (let r = 0; r < n; r++) {
+            const v = child.get(r);
+            if (v === null || v === undefined) m[start + r] = 1;
+            else if (isFloat && typeof v === 'number' && Number.isNaN(v)) m[start + r] = 1;
+        }
+    }
+    return m;
+}
+
+async function loadBool(reader: ArrowSliceReader, columnIndex: number): Promise<Uint8Array> {
+    const nrow = reader.nrow;
+    const values = new Uint8Array(nrow);
+    const numBatches = reader.batchStarts.length - 1;
+    for (let bi = 0; bi < numBatches; bi++) {
+        const batch = await (reader as any).getBatch(bi);
+        const child = batch.getChildAt(columnIndex);
+        const start = reader.batchStarts[bi];
+        const n = (reader.batchStarts[bi + 1] - start);
+        for (let r = 0; r < n; r++) {
+            const v = child.get(r);
+            if (v === null || v === undefined) continue;
+            values[start + r] = v ? 1 : 0;
+        }
+    }
+    return values;
+}
+
+function allZero(m: Uint8Array): boolean {
+    for (let i = 0; i < m.length; i++) {
+        if (m[i] !== 0) return false;
+    }
+    return true;
+}
+
+function compact(mask: Uint8Array): Uint32Array {
+    let count = 0;
+    for (let i = 0; i < mask.length; i++) {
+        if (mask[i]) count++;
+    }
+    const out = new Uint32Array(count);
+    let j = 0;
+    for (let i = 0; i < mask.length; i++) {
+        if (mask[i]) out[j++] = i;
+    }
+    return out;
+}
