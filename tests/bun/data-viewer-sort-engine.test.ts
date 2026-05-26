@@ -333,7 +333,7 @@ describe('computePermutation: value-labelled non-Float columns', () => {
     //   rating (Int32): [1, 2, 3, 1, 2]
     //     labels { 1: zebra, 2: apple, 3: mango }
     //   answer (Utf8):  [Y, N, M, Y, N]
-    //     labels { Y: Yes, N: No, M: Maybe }
+    //     labels { Y: Apple, N: Mango, M: Zebra }
     test('Int32-labelled: Labels off sorts by integer code', async () => {
         const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
         const p = await computePermutation(
