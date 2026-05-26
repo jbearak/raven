@@ -107,10 +107,16 @@ for visibility purposes; declare any cross-file fixtures in `helper-*.R`.
 ### Build commands
 
 When the workspace is detected as an R package (DESCRIPTION with a non-empty
-`Package:` field, or `raven.packages.packageMode` set to `enabled`), Raven
+`Package:` field, or `raven.packages.packageMode` set to `enabled`) **and**
+Raven's R console is active (see [Coexistence](./coexistence.md)), Raven
 contributes six Command Palette entries that wrap the standard
 `devtools` / `testthat` / `roxygen2` workflows. Names mirror RStudio's
-**Build** menu so existing muscle memory carries over:
+**Build** menu so existing muscle memory carries over. The Command Palette
+and editor-title submenu entries are gated on
+`raven.rConsoleEnabled && raven.isRPackage`; if `raven.rConsole.activation`
+is on the default `"auto"` and REditorSupport's R extension is enabled (or
+you're running Positron), the build commands stay hidden and you should
+use REditorSupport's or Positron's package-development workflow instead.
 
 | Palette title | Runs in | R call |
 |---|---|---|

@@ -1293,10 +1293,10 @@
           "enumDescriptions": [
             "Use the directory containing the .Rmd file (default).",
             "Use the workspace folder containing the .Rmd file.",
-            "Use R's startup working directory (don't pass knit_root_dir)."
+            "Use R's startup working directory (substitute getwd() for the knitr root.dir)."
           ],
           "default": "document",
-          "description": "Working directory passed to rmarkdown::render's knit_root_dir argument. Matches RStudio's Knit Directory submenu."
+          "description": "Working directory used for knitr chunk evaluation (knitr::opts_knit$set(root.dir = ...)). Matches RStudio's Knit Directory submenu."
         },
         "raven.knit.timeoutMs": {
           "type": "integer",

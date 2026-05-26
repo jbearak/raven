@@ -7,15 +7,29 @@ disk, keeping scrolling responsive on multi-million-row data frames.
 
 ## Why we built this
 
-Many webview-based R data viewers transport data frames from R to the
-webview by serializing the entire frame to JSON and shipping it into the
-page in one shot. That works for small frames but can freeze the editor
-on large ones; in some reported cases, large `View()` calls have hung the
-whole VS Code window. Raven serializes the frame to an Apache Arrow IPC
-(Feather v2) file and decodes only the rows currently visible, so the
-webview's memory and decode time scale with the visible viewport rather
-than the size of the frame. See
-[Comparison: Data viewer](./comparison.md#data-viewer) for details.
+Raven serializes the frame to an Apache Arrow IPC (Feather v2) file and
+decodes only the rows currently visible, so the webview's memory and
+decode time scale with the visible viewport rather than the size of the
+frame. Writing to an on-disk Arrow file also means paging doesn't have
+to go back through R, which keeps scrolling on multi-million-row frames
+smooth.
+
+Other R data viewers in VS Code take different staging routes — the
+REditorSupport extension's [`sess`](https://github.com/REditorSupport/vscode-R/tree/master/sess)
+helper, for example, materializes the whole frame in R memory and serves
+row windows from there to the webview over JSON-RPC. Both extensions
+paginate the wire, but the staging is different: Raven snapshots the
+frame to disk once as Arrow and the webview reads windows from the file
+directly, bypassing R for paging; `sess` keeps everything live in R. In
+our own smoke tests, the on-disk Arrow path has stayed responsive on
+multi-million-row frames where the R-staged path can hit memory limits.
+The two viewers also differ on value-labelled data: Raven recognizes
+`haven_labelled` plus `foreign` / `readstata13` label maps and
+substitutes the label when its Labels toggle is on (see
+[Labels](#labels)); `sess` classifies labelled columns as formatted
+numerics and renders the underlying codes. See
+[Comparison: Data viewer](./comparison.md#data-viewer) for the
+side-by-side.
 
 > [!NOTE]
 > The data viewer is reached through Raven's R console: it activates only

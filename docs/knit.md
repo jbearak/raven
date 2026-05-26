@@ -9,8 +9,13 @@ intentionally narrow:
 - The preview is always HTML, regardless of the YAML `output:`
   field. `pdf_document`, `word_document`, etc. still preview as HTML;
   the `output:` field only affects the named formats during export.
-- The preview is a static viewer with a manual Refresh button — not a
-  live recompile. Click **Knit again** to re-render after editing.
+- The preview is a static viewer with a manual **Knit again**
+  button — re-knitting is deliberate, not background-driven. The
+  intended workflow is `Shift+Cmd+Enter` (or `Shift+Ctrl+Enter` on
+  Windows/Linux), which saves the file if it's unsaved and re-knits
+  in one keystroke. Re-rendering only on demand keeps the preview
+  deterministic (you decide when it changes) and avoids spurious
+  re-renders while you're mid-edit.
 - The preview is saved to a per-session temp directory under
   `<os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/`,
   so the `.Rmd`'s own directory stays clean. Export commands write the
@@ -48,9 +53,9 @@ other environment it is enabled and appears in the command palette on
 `.Rmd` files.
 
 The command appears in the command palette only when the resolved gate
-is open and the active file is `.Rmd` / `.rmd` / `.RMD`. Invoke it on
-the active editor, or right-click an `.Rmd` file in the explorer (the
-explorer-context-menu hook is opt-in via your own keybindings).
+is open and the active file is `.Rmd` / `.rmd` / `.RMD`. Invoke it from
+the active editor, the Command Palette, or the editor-title Raven menu
+when an `.Rmd` file is open.
 
 ## What it does, step by step
 
@@ -137,8 +142,9 @@ explorer-context-menu hook is opt-in via your own keybindings).
     same way Quarto's preview does.
 
     The result is written atomically to `<basename>.html` via a
-    temp-and-rename next to the source, so a concurrent re-knit
-    can never expose a half-written file to the panel.
+    temp-and-rename inside the per-session preview temp directory
+    (alongside the intermediate `<basename>.md`), so a concurrent
+    re-knit can never expose a half-written file to the panel.
 
 11. **Reveal.** Raven opens the rendered HTML in a **Knit Preview**
     webview panel beside the editor — no success popover, the panel
