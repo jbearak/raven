@@ -69,6 +69,7 @@ const DOC_LINKS = {
   chunks: "chunks.md",
   dataViewer: "data-viewer.md",
   knit: "knit.md",
+  pandoc: "knit.md",
   sendToR: "r-console.md",
   rTerminal: "r-console.md",
   rConsole: "r-console.md",

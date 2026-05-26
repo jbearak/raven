@@ -88,8 +88,8 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.packages.rPath` | `""` | string | `packages.rPath` | [r-package-dev](r-package-dev.md) | Path to the R executable used for non-interactive subprocess calls (package introspection, library path discovery). |
 | `raven.packages.watchDebounceMs` | `500` | integer (100–5000) | `packages.watchDebounceMs` | [r-package-dev](r-package-dev.md) | Debounce window for batching library path filesystem events, in milliseconds. |
 | `raven.packages.watchLibraryPaths` | `true` | boolean | `packages.watchLibraryPaths` | [r-package-dev](r-package-dev.md) | Watch R library paths for package install/remove events and refresh diagnostics automatically. |
-| `raven.pandoc.path` | `""` | string | — | — | Absolute path to a Pandoc binary. |
-| `raven.pandoc.pdfEngine` | `"xelatex"` | `"xelatex"` \| `"pdflatex"` \| `"lualatex"` \| `"tectonic"` \| `"wkhtmltopdf"` | — | — | PDF engine used by Pandoc when exporting to PDF. |
+| `raven.pandoc.path` | `""` | string | — | [knit](knit.md) | Absolute path to a Pandoc binary. |
+| `raven.pandoc.pdfEngine` | `"xelatex"` | `"xelatex"` \| `"pdflatex"` \| `"lualatex"` \| `"tectonic"` \| `"wkhtmltopdf"` | — | [knit](knit.md) | PDF engine used by Pandoc when exporting to PDF. |
 | `raven.plot.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [plot-viewer](plot-viewer.md) | Initial editor column when the plot viewer first opens. |
 | `raven.rConsole.activation` | `"auto"` | `"enabled"` \| `"disabled"` \| `"auto"` | — | [r-console](r-console.md) | Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd knit command. |
 | `raven.rTerminal.program` | `"R"` | `"R"` \| `"arf"` \| `"radian"` | — | [r-console](r-console.md) | Program to use for the R terminal. 'R' is the standard R console; 'arf' and 'radian' are modern third-party R consoles (must be installed separately). |

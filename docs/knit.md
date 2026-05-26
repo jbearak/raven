@@ -48,9 +48,9 @@ other environment it is enabled and appears in the command palette on
 `.Rmd` files.
 
 The command appears in the command palette only when the resolved gate
-is open and the active file is `.Rmd` / `.rmd` / `.RMD`. Invoke it on
-the active editor, or right-click an `.Rmd` file in the explorer (the
-explorer-context-menu hook is opt-in via your own keybindings).
+is open and the active file is `.Rmd` / `.rmd` / `.RMD`. Invoke it from
+the active editor, the Command Palette, or the editor-title Raven menu
+when an `.Rmd` file is open.
 
 ## What it does, step by step
 
