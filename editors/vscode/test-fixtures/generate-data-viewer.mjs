@@ -190,8 +190,83 @@ function buildBigInt64() {
     write(join(outDir, 'bigint64.arrow'), t);
 }
 
+// ---------- uint64: 4 rows × 1 Uint64 column with values straddling
+//                     the signed 64-bit boundary (2^63).
+// Storing 2^63 in BigInt64Array would wrap to a negative two's-
+// complement bigint and break ascending order; the engine must use
+// BigUint64Array for Uint64 columns.
+
+function buildUint64() {
+    const N = 4;
+    // Original row order:
+    //   row 0: 2^63 + 1    (above signed 64-bit positive max)
+    //   row 1: 2^64 - 1    (Uint64 max)
+    //   row 2: 1
+    //   row 3: 0
+    // Asc on bigint compare → row 3, 2, 0, 1.
+    const values = new BigUint64Array(N);
+    values[0] = (1n << 63n) + 1n;
+    values[1] = (1n << 64n) - 1n;
+    values[2] = 1n;
+    values[3] = 0n;
+    const fields = [new A.Field('big', new A.Uint64(), false)];
+    const schema = new A.Schema(fields);
+    const colVec = A.makeVector({ data: values, type: new A.Uint64() });
+    const data = A.makeData({
+        type: new A.Struct(fields),
+        length: N,
+        nullCount: 0,
+        children: [colVec.data[0]],
+    });
+    const t = new A.Table(schema, [new A.RecordBatch(schema, data)]);
+    write(join(outDir, 'uint64.arrow'), t);
+}
+
+// ---------- labelled-non-float: 5 rows × 2 labelled columns whose
+//                                  underlying storage is Int32 and Utf8
+// (rather than Float64 like tiny.lbl). cell-render.ts honors valueLabels
+// for any number-or-string cell, so the sort engine must too.
+
+function buildLabelledNonFloat() {
+    const N = 5;
+    // i32 col with codes whose label order differs from numeric order:
+    //   code 1 → "zebra", 2 → "apple", 3 → "mango".
+    // Original rows: 1, 2, 3, 1, 2.
+    //   Labels off (asc by code): rows [0, 3, 1, 4, 2] (1,1,2,2,3)
+    //   Labels  on (asc by label): apple(1,4), mango(2), zebra(0,3) → [1, 4, 2, 0, 3]
+    const i32Field = new A.Field('rating', new A.Int32(), false,
+        new Map([
+            ['raven.value_labels', JSON.stringify({ 1: 'zebra', 2: 'apple', 3: 'mango' })],
+            ['raven.original_class', 'haven_labelled/vctrs_vctr/integer'],
+        ]));
+    // utf8 col with codes whose label order differs from alpha order:
+    //   "Y" → "Yes", "N" → "No", "M" → "Maybe"
+    // Original rows: "Y", "N", "M", "Y", "N"
+    //   Labels off (asc, alpha): rows [1, 4, 2, 0, 3] ("M","N","N","Y","Y")
+    //   Labels  on (asc, alpha by label): Maybe(2), No(1,4), Yes(0,3) → [2, 1, 4, 0, 3]
+    const utf8Field = new A.Field('answer', new A.Utf8(), false,
+        new Map([
+            ['raven.value_labels', JSON.stringify({ Y: 'Yes', N: 'No', M: 'Maybe' })],
+            ['raven.original_class', 'haven_labelled/vctrs_vctr/character'],
+        ]));
+    const fields = [i32Field, utf8Field];
+    const schema = new A.Schema(fields);
+    const i32Vec = A.vectorFromArray(Int32Array.from([1, 2, 3, 1, 2]), new A.Int32());
+    const utf8Vec = A.vectorFromArray(['Y', 'N', 'M', 'Y', 'N'], new A.Utf8());
+    const data = A.makeData({
+        type: new A.Struct(fields),
+        length: N,
+        nullCount: 0,
+        children: [i32Vec.data[0], utf8Vec.data[0]],
+    });
+    const t = new A.Table(schema, [new A.RecordBatch(schema, data)]);
+    write(join(outDir, 'labelled-non-float.arrow'), t);
+}
+
 buildTiny();
 buildMultibatch();
 buildBigInt64();
+buildUint64();
+buildLabelledNonFloat();
 buildBigdict();
 console.log('done.');

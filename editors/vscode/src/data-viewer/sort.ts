@@ -129,22 +129,36 @@ async function buildSortColumn(
     if (arrowType.startsWith('Dictionary')) {
         return buildDictionarySortColumn(reader, columnIndex, schema, ctx);
     }
-    if (arrowType === 'Int64' || arrowType === 'Uint64') {
-        // 64-bit integers can exceed Number's 2^53 safe range, where
-        // distinct values would coalesce into the same Number and sort
-        // as ties. Use BigInt storage + bigint comparator so the order
-        // is exact at the full Int64 range.
-        return buildBigIntSortColumn(reader, columnIndex);
+    // Value-labelled columns (haven_labelled, foreign::value.labels,
+    // readstata13) can be backed by any Arrow type whose `.get()`
+    // produces a number, bigint, or string — cell-render.ts shows the
+    // label for any such cell, regardless of underlying storage. Sort
+    // must match: when Labels is on, route through the displayed-text
+    // key. Restricted to the type families whose wire form yields a
+    // labels-eligible cell (Int*/Float/Utf8); Bool, Date, Timestamp
+    // never get label rendering today and so don't need label sorting.
+    if (ctx.labelsOn && schema.valueLabels
+        && (arrowType.startsWith('Int')
+            || arrowType.startsWith('Float')
+            || arrowType === 'Utf8'
+            || arrowType === 'LargeUtf8')) {
+        return buildValueLabelledSortColumn(reader, columnIndex, schema);
+    }
+    if (arrowType === 'Int64') {
+        // 64-bit integers exceed Number's 2^53 safe range; use signed
+        // BigInt storage + bigint comparator so the order stays exact.
+        return buildBigIntSortColumn(reader, columnIndex, false);
+    }
+    if (arrowType === 'Uint64') {
+        // Same reasoning, but unsigned storage — BigInt64Array would
+        // wrap any value above 2^63-1 to a negative two's-complement
+        // bigint and corrupt ascending order.
+        return buildBigIntSortColumn(reader, columnIndex, true);
     }
     if (arrowType.startsWith('Int') || arrowType === 'Bool') {
         return buildNumericSortColumn(reader, columnIndex, false);
     }
     if (arrowType.startsWith('Float')) {
-        // For value-labelled numerics, the Labels toggle (when on) routes
-        // sort through the displayed-text key — same as a factor.
-        if (ctx.labelsOn && schema.valueLabels) {
-            return buildValueLabelledFloatSortColumn(reader, columnIndex, schema);
-        }
         return buildNumericSortColumn(reader, columnIndex, true);
     }
     if (arrowType.startsWith('Date')) {
@@ -200,16 +214,25 @@ async function buildNumericSortColumn(
     };
 }
 
-/** Sort column for Int64 / Uint64. Storage is `BigInt64Array`; the
- *  comparator uses bigint `<` / `>` so distinct values beyond 2^53
- *  stay distinct (Number coercion would coalesce them and produce
- *  spurious sort ties). */
+/** Sort column for Int64 / Uint64. Bigint storage + bigint comparator
+ *  so distinct values beyond 2^53 stay distinct (Number coercion would
+ *  coalesce them and produce spurious sort ties). Storage type depends
+ *  on signedness:
+ *
+ *  - `Int64`  uses `BigInt64Array`  — range [-2^63, 2^63 - 1].
+ *  - `Uint64` uses `BigUint64Array` — range [0, 2^64 - 1].
+ *
+ *  Cross-storage works in both directions: indexed access returns
+ *  `bigint`, and bigint `<` / `>` is exact across all magnitudes. */
 async function buildBigIntSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
+    unsigned: boolean,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
-    const values = new BigInt64Array(nrow);
+    const values: BigInt64Array | BigUint64Array = unsigned
+        ? new BigUint64Array(nrow)
+        : new BigInt64Array(nrow);
     const missing = new Uint8Array(nrow);
     for await (const batch of iterateBatches(reader)) {
         const child = batch.batch.getChildAt(columnIndex);
@@ -355,10 +378,16 @@ async function buildDictionarySortColumn(
     };
 }
 
-/** Value-labelled Float column (haven_labelled or foreign value.labels)
- *  with Labels on: sort by displayed label, falling back to the
- *  formatted raw value when no label exists for a given cell. */
-async function buildValueLabelledFloatSortColumn(
+/** Value-labelled column (haven_labelled, foreign::value.labels,
+ *  readstata13) with Labels on: sort by the displayed label, falling
+ *  back to the raw value's string form when no label exists. Works
+ *  across the storage types whose `.get()` returns a `number`,
+ *  `bigint`, or `string` — the same set that cell-render.ts's label
+ *  lookup applies to. Keys are looked up via `String(rawValue)` to
+ *  match the JSON-key form that the R-side bootstrap writes (numeric
+ *  haven_labelled values become decimal-string keys; string values
+ *  stay as-is). */
+async function buildValueLabelledSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
     schema: ColumnSchema,
@@ -372,14 +401,19 @@ async function buildValueLabelledFloatSortColumn(
         for (let r = 0; r < batch.length; r++) {
             const i = batch.start + r;
             const v = child.get(r);
-            if (v === null || v === undefined || Number.isNaN(v as number)) {
+            if (v === null || v === undefined) {
                 missing[i] = 1;
                 display[i] = '';
                 continue;
             }
-            const num = v as number;
-            const label = valueLabels[String(num)];
-            display[i] = label !== undefined ? label : String(num);
+            if (typeof v === 'number' && Number.isNaN(v)) {
+                missing[i] = 1;
+                display[i] = '';
+                continue;
+            }
+            const key = typeof v === 'bigint' ? v.toString() : String(v);
+            const label = valueLabels[key];
+            display[i] = label !== undefined ? label : key;
         }
     }
     return {

@@ -296,6 +296,93 @@ describe('computePermutation: multibatch', () => {
     });
 });
 
+describe('computePermutation: Uint64 above signed 64-bit max', () => {
+    // Fixture row order:
+    //   0: 2^63 + 1   1: 2^64 - 1   2: 1   3: 0
+    // BigInt64Array would wrap rows 0 and 1 to negative two's-complement
+    // bigints, sorting them BEFORE the small values. BigUint64Array
+    // preserves the unsigned ordering.
+    test('asc keeps huge unsigned values above small ones', async () => {
+        const r = await ArrowSliceReader.open(FIX('uint64.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 0, direction: 'asc' }],
+            CTX_LABELS_ON,
+        );
+        expect(Array.from(p)).toEqual([3, 2, 0, 1]);
+        await r.close();
+    });
+
+    test('desc puts Uint64 max first', async () => {
+        const r = await ArrowSliceReader.open(FIX('uint64.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 0, direction: 'desc' }],
+            CTX_LABELS_ON,
+        );
+        expect(Array.from(p)).toEqual([1, 0, 2, 3]);
+        await r.close();
+    });
+});
+
+describe('computePermutation: value-labelled non-Float columns', () => {
+    // labelled-non-float.arrow row order — both columns are value-
+    // labelled (Int32 + Utf8) so they exercise the generalized
+    // labelled-sort path.
+    //
+    //   rating (Int32): [1, 2, 3, 1, 2]
+    //     labels { 1: zebra, 2: apple, 3: mango }
+    //   answer (Utf8):  [Y, N, M, Y, N]
+    //     labels { Y: Yes, N: No, M: Maybe }
+    test('Int32-labelled: Labels off sorts by integer code', async () => {
+        const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 0, direction: 'asc' }],
+            CTX_LABELS_OFF,
+        );
+        // codes asc: 1,1,2,2,3 → [0, 3, 1, 4, 2] (stable)
+        expect(Array.from(p)).toEqual([0, 3, 1, 4, 2]);
+        await r.close();
+    });
+
+    test('Int32-labelled: Labels on sorts by label string', async () => {
+        const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 0, direction: 'asc' }],
+            CTX_LABELS_ON,
+        );
+        // apple(1,4), mango(2), zebra(0,3) → [1, 4, 2, 0, 3]
+        expect(Array.from(p)).toEqual([1, 4, 2, 0, 3]);
+        await r.close();
+    });
+
+    test('Utf8-labelled: Labels off sorts by raw code string', async () => {
+        const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 1, direction: 'asc' }],
+            CTX_LABELS_OFF,
+        );
+        // codes asc: "M","N","N","Y","Y" → [2, 1, 4, 0, 3]
+        expect(Array.from(p)).toEqual([2, 1, 4, 0, 3]);
+        await r.close();
+    });
+
+    test('Utf8-labelled: Labels on sorts by label string', async () => {
+        const r = await ArrowSliceReader.open(FIX('labelled-non-float.arrow'));
+        const p = await computePermutation(
+            r,
+            [{ columnIndex: 1, direction: 'asc' }],
+            CTX_LABELS_ON,
+        );
+        // labels asc: Maybe(2), No(1,4), Yes(0,3) → [2, 1, 4, 0, 3]
+        expect(Array.from(p)).toEqual([2, 1, 4, 0, 3]);
+        await r.close();
+    });
+});
+
 describe('computePermutation: Int64 beyond MAX_SAFE_INTEGER', () => {
     // Fixture row order:
     //   0: 2^53 + 1     1: 2^53 + 3     2: 2^53 + 5     3: 1     4: -1
