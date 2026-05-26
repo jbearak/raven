@@ -299,7 +299,7 @@ describe('DataViewerPanel: filter round-trips', () => {
     });
 
     test('saveFilter persists and restore on panel recreate sends filterApplied(fromPersistence:true)', async () => {
-        const { fakeWebview, kv, filterMod, filterStore, arrowMod, panelMod } = await setupPanel();
+        const { fakeWebview, kv, filterStore } = await setupPanel();
 
         fakeWebview.deliverFromWebview({ type: 'webviewReady' });
         await flush();
