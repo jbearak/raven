@@ -235,6 +235,14 @@ Right-click a column header and choose **Filter…** to open the filter editor
 for that column. You can also press **⇧⌥F** to open the editor for the
 currently focused column.
 
+When the column already has an active filter, the editor opens pre-populated
+with that filter's current settings — the same predicate, values, and **Include
+NA / NaN** state it had when you last applied it — so you edit in place rather
+than starting over. In that case the context-menu item reads **Edit filter…**,
+and applying updates the existing filter (it does not add a second one — see
+[Composition](#composition)). On an unfiltered column the item reads
+**Filter…** and the editor opens empty.
+
 ### Per-type predicates
 
 | Column type | Available predicates |

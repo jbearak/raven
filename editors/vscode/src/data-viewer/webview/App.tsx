@@ -700,6 +700,19 @@ export function App({
         setFilterEditor({ entry });
     }, []);
 
+    /** Open the filter popover for a column, pre-seeded with its active filter
+     *  (one-filter-per-column invariant) so editing reflects the live settings.
+     *  When the column is unfiltered, `existing` is undefined and the popover
+     *  opens blank — the "add new" path. Keyed on `filter.entries` so callers
+     *  inside effects (e.g. the keyboard handler) never read a stale snapshot. */
+    const openFilterEditor = useCallback(
+        (columnIndex: number, leftPx: number, topPx: number) => {
+            const existing = filter.entries.find(e => e.columnIndex === columnIndex);
+            setFilterEditor({ entry: existing, columnIndex, leftPx, topPx });
+        },
+        [filter.entries],
+    );
+
     const onToggleFilterEnabled = useCallback((id: string) => {
         applyFilters(filter.entries.map(e => e.id === id ? { ...e, enabled: !e.enabled } : e));
     }, [applyFilters, filter.entries]);
@@ -1163,7 +1176,7 @@ export function App({
                     const focused = gridSelection.current?.cell[0];
                     const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
                     if (sourceIndex !== undefined) {
-                        setFilterEditor({ columnIndex: sourceIndex, leftPx: 100, topPx: 100 });
+                        openFilterEditor(sourceIndex, 100, 100);
                     }
                     return;
                 }
@@ -1199,8 +1212,8 @@ export function App({
         copySelection,
         gridSelection,
         onClearAllFilters,
+        openFilterEditor,
         postLifecycle,
-        setFilterEditor,
         sortColumn,
         visibleCols,
         visibleRange,
@@ -1586,11 +1599,11 @@ export function App({
                                 ),
                                 anyFiltered: filter.entries.length > 0,
                                 onAddFilter: () => {
-                                    setFilterEditor({
-                                        columnIndex: contextMenu.columnIndex,
-                                        leftPx: contextMenu.leftPx,
-                                        topPx: contextMenu.topPx,
-                                    });
+                                    openFilterEditor(
+                                        contextMenu.columnIndex!,
+                                        contextMenu.leftPx,
+                                        contextMenu.topPx,
+                                    );
                                     setContextMenu(null);
                                 },
                                 onClearColumn: () => {

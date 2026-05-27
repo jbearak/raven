@@ -199,7 +199,7 @@ export function ColumnContextMenu({
                         onClick={filter.onAddFilter}
                         role="menuitem"
                     >
-                        Filter…
+                        {filter.hasFilter ? 'Edit filter…' : 'Filter…'}
                         <span className="context-menu-shortcut">⇧⌥F</span>
                     </button>
                     {filter.hasFilter && (
