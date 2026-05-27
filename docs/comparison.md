@@ -35,7 +35,7 @@ Those two approaches aren't exclusive: you can install Raven alongside the REdit
 
 ### What REditorSupport's language server offers that Raven doesn't
 
-- **lintr diagnostics** — Style checks and correctness linters (e.g. `object_usage_linter`, `line_length_linter`, `trailing_whitespace_linter`) via the [`lintr`](https://lintr.r-lib.org/) package. Raven implements a small subset of these natively (see [Linting](linting.md)); for the rest, you can run `lintr` via REditorSupport alongside Raven.
+- **lintr diagnostics** — Style checks and correctness linters (e.g. `object_usage_linter`, `line_length_linter`, `trailing_whitespace_linter`) via the [`lintr`](https://lintr.r-lib.org/) package. Raven implements 18 of these natively — most of `lintr`'s default rule set (see [Linting](linting.md)); for the rest, you can run `lintr` via REditorSupport alongside Raven.
 - **Session-aware completions** — When the session watcher is enabled, REditorSupport can complete symbols from the live R session's `globalenv()`, including column names from data frames that only exist at runtime. Raven's completions are purely static.
 
 ## R session integration

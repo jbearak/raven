@@ -4,7 +4,7 @@ Raven is under active development. The gaps below reflect features that exist in
 
 ## Language server
 
-- **Full `lintr` coverage** — Raven ships a built-in, opt-in style linter that re-implements a subset of `lintr` rules natively (see [Linting](./linting.md)). [REditorSupport/languageserver](https://github.com/REditorSupport/languageserver) runs the full `lintr` package, including rules Raven doesn't replicate (`object_usage_linter`, the full set of style checks, etc.). You can run both language servers at once; see [Coexistence: Language servers](./coexistence.md#language-servers-raven-alone-vs-both).
+- **Full `lintr` coverage** — Raven ships a built-in, opt-in style linter that re-implements 18 of `lintr`'s rules natively — most of its default set (see [Linting](./linting.md)). [REditorSupport/languageserver](https://github.com/REditorSupport/languageserver) runs the full `lintr` package, including rules Raven doesn't replicate (`object_usage_linter`, the full set of style checks, etc.). You can run both language servers at once; see [Coexistence: Language servers](./coexistence.md#language-servers-raven-alone-vs-both).
 - **Session-aware completions** — Raven's completions are purely static. REditorSupport can complete symbols from the live R session's `globalenv()`, including column names from data frames that only exist at runtime. See [Comparison: Language intelligence](./comparison.md#language-intelligence).
 
 ## R-session features

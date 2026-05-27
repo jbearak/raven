@@ -47,7 +47,7 @@ Code intelligence and the help viewer are unaffected by this setting. The help v
 
 Raven's language server traces `source()` chains across your project, so its completions, diagnostics, and navigation reflect actual execution order at the cursor position — including cross-file go-to-definition, find-references, and detection of circular dependencies and scope violations. It doesn't need a running R session.
 
-REditorSupport's language server provides [`lintr`](https://lintr.r-lib.org/) diagnostics, which covers a different surface than Raven's diagnostics: it catches style violations and certain correctness issues that Raven doesn't flag, while Raven catches cross-file scope problems that lintr doesn't see. Raven also has its own [opt-in style linter](./linting.md) that mirrors a small subset of `lintr`'s rules; for the rules Raven doesn't ship, run `lintr` via REditorSupport alongside Raven.
+REditorSupport's language server provides [`lintr`](https://lintr.r-lib.org/) diagnostics, which covers a different surface than Raven's diagnostics: it catches style violations and certain correctness issues that Raven doesn't flag, while Raven catches cross-file scope problems that lintr doesn't see. Raven also has its own [opt-in style linter](./linting.md) that re-implements many of `lintr`'s most common rules — 18 linters, covering most of `lintr`'s default rule set; for the rules Raven doesn't ship, run `lintr` via REditorSupport alongside Raven.
 
 If you want both, leave `r.lsp.enabled` at its default (`true`). Both language servers will run, with some overlap in completions and diagnostics.
 

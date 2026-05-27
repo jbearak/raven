@@ -1,6 +1,6 @@
 # Linting
 
-Raven ships an opt-in, native style linter that re-implements a small subset of [`lintr`](https://lintr.r-lib.org/) rules in Rust against the tree-sitter AST. No R session or `lintr` install is needed — rules run on the parse tree Raven already builds for completions and diagnostics.
+Raven ships an opt-in, native style linter that re-implements 18 of [`lintr`](https://lintr.r-lib.org/)'s rules — most of `lintr`'s default rule set — in Rust against the tree-sitter AST. No R session or `lintr` install is needed — rules run on the parse tree Raven already builds for completions and diagnostics.
 
 This page is the landing point for users coming from `lintr` or `REditorSupport`. For these rules alongside Raven's other diagnostic categories, see [Diagnostics § Style Lints](diagnostics.md#style-lints); the per-key configuration reference lives in [Configuration § Linting Settings](configuration.md#linting-settings).
 
@@ -228,7 +228,7 @@ If you also want to run `lintr` itself alongside Raven, see [below](#filling-the
 
 ## Gaps vs `lintr`
 
-`lintr` ships several dozen linters. Raven implements the ones in the table above. Common `lintr` linters that have **no Raven equivalent** include (non-exhaustive):
+`lintr` ships more than 140 linters in total, of which about two dozen are enabled by default. Raven implements 18 of those defaults — the ones in the table above. Common `lintr` linters that have **no Raven equivalent** include (non-exhaustive):
 
 - `object_usage_linter` — flags undefined globals inside function bodies via `codetools::checkUsage()`. Raven's [Undefined variable diagnostic](diagnostics.md#undefined-variables) covers similar ground at the file and `source()`-chain level (via static cross-file scope), but with different semantics: Raven's check is scope- and position-aware across `source()` chains, while `object_usage_linter` runs inside individual function bodies via R's own analyzer.
 - `cyclocomp_linter` — cyclomatic complexity.

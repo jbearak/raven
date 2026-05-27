@@ -101,7 +101,7 @@ Always-on diagnostics that flag likely-wrong code — not style preferences. Act
 
 ### Style Lints
 
-Native style diagnostics (a small subset of [`lintr`](https://lintr.r-lib.org/)). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in); tune per rule via the `raven.linting.*` severities. All style lint rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — master-switch matrix, quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
+Native style diagnostics (18 of [`lintr`](https://lintr.r-lib.org/)'s default rules). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in); tune per rule via the `raven.linting.*` severities. All style lint rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — master-switch matrix, quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
