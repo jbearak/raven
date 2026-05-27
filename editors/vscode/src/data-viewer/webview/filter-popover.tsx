@@ -25,10 +25,25 @@ import React, {
     useState,
 } from 'react';
 import type { ColumnSchema } from '../arrow-reader';
-import type { FilterEntry, FilterPredicate, HistogramBin } from '../messages';
+import type { FilterEntry, HistogramBin } from '../messages';
 import { useDismiss } from './use-dismiss';
 import { FilterHistogram } from './filter-histogram';
 import { colKind, kindOptions, labelledNumericChoices } from './filter-column-kind';
+import {
+    buildPredicate,
+    defaultFormState,
+    predicateToKindValue,
+    seedFromEntry,
+    type BoolState,
+    type DateBetweenState,
+    type DateCompareState,
+    type NumBetweenState,
+    type NumCompareState,
+    type SetFreeTextState,
+    type SetState,
+    type StrRegexState,
+    type StrState,
+} from './filter-popover-seed';
 
 /** A small uid helper that avoids a `crypto` availability issue in older
  *  webview runtimes. Falls back gracefully if crypto.randomUUID is present. */
@@ -50,133 +65,6 @@ type Props = {
     anchor: { leftPx: number; topPx: number };
 };
 
-/** Map a persisted FilterPredicate back to our internal kind-select value. */
-function predicateToKindValue(p: FilterPredicate): string {
-    switch (p.kind) {
-        case 'numCompare': return 'numCompare';
-        case 'numBetween': return 'numBetween';
-        case 'numNotBetween': return 'numNotBetween';
-        case 'setIn': return 'setIn';
-        case 'setNotIn': return 'setNotIn';
-        case 'strContains': return p.negate ? 'strNotContains' : 'strContains';
-        case 'strStartsWith': return 'strStartsWith';
-        case 'strEndsWith': return 'strEndsWith';
-        case 'strCompare': return p.op === '=' ? 'strCompareEq' : 'strCompareNe';
-        case 'strRegex': return 'strRegex';
-        case 'dateCompare': return 'dateCompare';
-        case 'dateBetween': return 'dateBetween';
-        case 'dateNotBetween': return 'dateNotBetween';
-        case 'bool': return 'bool';
-        case 'isEmpty': return 'isEmpty';
-        case 'isNotEmpty': return 'isNotEmpty';
-    }
-}
-
-// ── Value-editor state shapes ───────────────────────────────────────────────
-
-type NumCompareState = { op: '=' | '!=' | '<' | '<=' | '>' | '>='; value: string };
-type NumBetweenState = { lo: string; hi: string; inclusive: boolean };
-type SetState = { selected: (string | number)[] };
-type StrState = { value: string; caseSensitive: boolean };
-type StrRegexState = { pattern: string; caseSensitive: boolean; regexError: string | null };
-type DateCompareState = { op: '=' | '!=' | '<' | '<=' | '>' | '>='; value: string };
-type DateBetweenState = { lo: string; hi: string; inclusive: boolean };
-type BoolState = { value: boolean };
-type SetFreeTextState = { text: string };
-
-// ── Default states ──────────────────────────────────────────────────────────
-
-function defaultNumCompare(): NumCompareState {
-    return { op: '=', value: '' };
-}
-function defaultNumBetween(): NumBetweenState {
-    return { lo: '', hi: '', inclusive: true };
-}
-function defaultSet(): SetState {
-    return { selected: [] };
-}
-function defaultStr(): StrState {
-    return { value: '', caseSensitive: false };
-}
-function defaultStrRegex(): StrRegexState {
-    return { pattern: '', caseSensitive: false, regexError: null };
-}
-function defaultDateCompare(): DateCompareState {
-    return { op: '=', value: '' };
-}
-function defaultDateBetween(): DateBetweenState {
-    return { lo: '', hi: '', inclusive: true };
-}
-function defaultBool(): BoolState {
-    return { value: true };
-}
-function defaultFreeText(): SetFreeTextState {
-    return { text: '' };
-}
-
-/** Recover the initial editor state from a persisted FilterEntry. */
-function seedFromEntry(p: FilterPredicate): {
-    numCompare: NumCompareState;
-    numBetween: NumBetweenState;
-    set: SetState;
-    str: StrState;
-    strRegex: StrRegexState;
-    dateCompare: DateCompareState;
-    dateBetween: DateBetweenState;
-    bool: BoolState;
-    freeText: SetFreeTextState;
-} {
-    const base = {
-        numCompare: defaultNumCompare(),
-        numBetween: defaultNumBetween(),
-        set: defaultSet(),
-        str: defaultStr(),
-        strRegex: defaultStrRegex(),
-        dateCompare: defaultDateCompare(),
-        dateBetween: defaultDateBetween(),
-        bool: defaultBool(),
-        freeText: defaultFreeText(),
-    };
-    switch (p.kind) {
-        case 'numCompare':
-            base.numCompare = { op: p.op, value: String(p.value) };
-            break;
-        case 'numBetween':
-            base.numBetween = { lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive };
-            break;
-        case 'numNotBetween':
-            base.numBetween = { lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive };
-            break;
-        case 'setIn':
-        case 'setNotIn':
-            base.set = { selected: p.values };
-            base.freeText = { text: p.values.join('\n') };
-            break;
-        case 'strContains':
-        case 'strStartsWith':
-        case 'strEndsWith':
-            base.str = { value: p.value, caseSensitive: p.caseSensitive };
-            break;
-        case 'strCompare':
-            base.str = { value: p.value, caseSensitive: p.caseSensitive };
-            break;
-        case 'strRegex':
-            base.strRegex = { pattern: p.pattern, caseSensitive: p.caseSensitive, regexError: null };
-            break;
-        case 'dateCompare':
-            base.dateCompare = { op: p.op, value: p.value };
-            break;
-        case 'dateBetween':
-        case 'dateNotBetween':
-            base.dateBetween = { lo: p.lo, hi: p.hi, inclusive: p.inclusive };
-            break;
-        case 'bool':
-            base.bool = { value: p.value };
-            break;
-    }
-    return base;
-}
-
 // ── Main component ──────────────────────────────────────────────────────────
 
 export function FilterPopover({ column, columnIndex, histogram, initial, onApply, onCancel, anchor }: Props) {
@@ -190,18 +78,19 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     });
 
     // Per-kind value state (we keep all sub-states alive so switching kind and
-    // switching back doesn't lose values the user typed).
-    const seed = initial ? seedFromEntry(initial.predicate) : null;
+    // switching back doesn't lose values the user typed). When editing an
+    // existing entry, the matching sub-state is seeded from its predicate.
+    const seed = initial ? seedFromEntry(initial.predicate) : defaultFormState();
 
-    const [numCompare, setNumCompare] = useState<NumCompareState>(seed?.numCompare ?? defaultNumCompare());
-    const [numBetween, setNumBetween] = useState<NumBetweenState>(seed?.numBetween ?? defaultNumBetween());
-    const [setSelected, setSetSelected] = useState<SetState>(seed?.set ?? defaultSet());
-    const [str, setStr] = useState<StrState>(seed?.str ?? defaultStr());
-    const [strRegex, setStrRegex] = useState<StrRegexState>(seed?.strRegex ?? defaultStrRegex());
-    const [dateCompare, setDateCompare] = useState<DateCompareState>(seed?.dateCompare ?? defaultDateCompare());
-    const [dateBetween, setDateBetween] = useState<DateBetweenState>(seed?.dateBetween ?? defaultDateBetween());
-    const [boolVal, setBoolVal] = useState<BoolState>(seed?.bool ?? defaultBool());
-    const [freeText, setFreeText] = useState<SetFreeTextState>(seed?.freeText ?? defaultFreeText());
+    const [numCompare, setNumCompare] = useState<NumCompareState>(seed.numCompare);
+    const [numBetween, setNumBetween] = useState<NumBetweenState>(seed.numBetween);
+    const [setSelected, setSetSelected] = useState<SetState>(seed.set);
+    const [str, setStr] = useState<StrState>(seed.str);
+    const [strRegex, setStrRegex] = useState<StrRegexState>(seed.strRegex);
+    const [dateCompare, setDateCompare] = useState<DateCompareState>(seed.dateCompare);
+    const [dateBetween, setDateBetween] = useState<DateBetweenState>(seed.dateBetween);
+    const [boolVal, setBoolVal] = useState<BoolState>(seed.bool);
+    const [freeText, setFreeText] = useState<SetFreeTextState>(seed.freeText);
     const [includeMissing, setIncludeMissing] = useState(initial?.includeMissing ?? false);
 
     // Popover ref + positioning
@@ -262,86 +151,15 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     };
 
     // ── Build predicate ───────────────────────────────────────────────────
-    function buildPredicate(): FilterPredicate | null {
-        switch (selectedKind) {
-            case 'isEmpty': return { kind: 'isEmpty' };
-            case 'isNotEmpty': return { kind: 'isNotEmpty' };
-            case 'numCompare': {
-                const v = parseFloat(numCompare.value);
-                if (isNaN(v)) return null;
-                return { kind: 'numCompare', op: numCompare.op, value: v };
-            }
-            case 'numBetween': {
-                const lo = parseFloat(numBetween.lo);
-                const hi = parseFloat(numBetween.hi);
-                if (isNaN(lo) || isNaN(hi)) return null;
-                return { kind: 'numBetween', lo, hi, inclusive: numBetween.inclusive };
-            }
-            case 'numNotBetween': {
-                const lo = parseFloat(numBetween.lo);
-                const hi = parseFloat(numBetween.hi);
-                if (isNaN(lo) || isNaN(hi)) return null;
-                return { kind: 'numNotBetween', lo, hi, inclusive: numBetween.inclusive };
-            }
-            case 'setIn': {
-                const vals = effectiveSetValues();
-                if (vals.length === 0) return null;
-                return { kind: 'setIn', values: vals };
-            }
-            case 'setNotIn': {
-                const vals = effectiveSetValues();
-                if (vals.length === 0) return null;
-                return { kind: 'setNotIn', values: vals };
-            }
-            case 'strContains':
-                if (!str.value) return null;
-                return { kind: 'strContains', value: str.value, caseSensitive: str.caseSensitive, negate: false };
-            case 'strNotContains':
-                if (!str.value) return null;
-                return { kind: 'strContains', value: str.value, caseSensitive: str.caseSensitive, negate: true };
-            case 'strStartsWith':
-                if (!str.value) return null;
-                return { kind: 'strStartsWith', value: str.value, caseSensitive: str.caseSensitive };
-            case 'strEndsWith':
-                if (!str.value) return null;
-                return { kind: 'strEndsWith', value: str.value, caseSensitive: str.caseSensitive };
-            case 'strCompareEq':
-                if (!str.value) return null;
-                return { kind: 'strCompare', op: '=', value: str.value, caseSensitive: str.caseSensitive };
-            case 'strCompareNe':
-                if (!str.value) return null;
-                return { kind: 'strCompare', op: '!=', value: str.value, caseSensitive: str.caseSensitive };
-            case 'strRegex':
-                if (!strRegex.pattern || strRegex.regexError) return null;
-                return { kind: 'strRegex', pattern: strRegex.pattern, caseSensitive: strRegex.caseSensitive };
-            case 'dateCompare':
-                if (!dateCompare.value) return null;
-                return { kind: 'dateCompare', op: dateCompare.op, value: dateCompare.value };
-            case 'dateBetween':
-                if (!dateBetween.lo || !dateBetween.hi) return null;
-                return { kind: 'dateBetween', lo: dateBetween.lo, hi: dateBetween.hi, inclusive: dateBetween.inclusive };
-            case 'dateNotBetween':
-                if (!dateBetween.lo || !dateBetween.hi) return null;
-                return { kind: 'dateNotBetween', lo: dateBetween.lo, hi: dateBetween.hi, inclusive: dateBetween.inclusive };
-            case 'bool':
-                return { kind: 'bool', value: boolVal.value };
-        }
-        return null;
-    }
-
-    function effectiveSetValues(): (string | number)[] {
-        if (isLabelledNumeric || hasShippedDictionary) {
-            // labelled-numeric → numeric codes; shipped dictionary → label strings.
-            return setSelected.selected;
-        }
-        // Free-text: split on comma or newline
-        return freeText.text
-            .split(/[\n,]+/)
-            .map(s => s.trim())
-            .filter(Boolean);
-    }
-
-    const predicate = buildPredicate();
+    // Set membership resolves per column kind: checklist columns
+    // (labelled-numeric or shipped dictionary) carry the selected codes/labels
+    // directly; others parse the free-text value list.
+    const setUsesChecklist = isLabelledNumeric || hasShippedDictionary === true;
+    const predicate = buildPredicate(
+        selectedKind,
+        { numCompare, numBetween, set: setSelected, str, strRegex, dateCompare, dateBetween, bool: boolVal, freeText },
+        { setUsesChecklist },
+    );
     const canApply = predicate !== null && !(selectedKind === 'strRegex' && strRegex.regexError);
 
     const handleApply = () => {
