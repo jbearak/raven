@@ -805,7 +805,7 @@ export async function __runKnitCommandForTest(args: {
 
 interface KnitDirOk {
     ok: true;
-    /** `knit_root_dir` argument to rmarkdown::render; null = omit. */
+    /** Value for `knitr::opts_knit$set(root.dir = …)` — the chunk working directory; null = inherit the subprocess CWD. */
     knitRootDir: string | null;
     /**
      * cwd for the R subprocess. `undefined` = inherit Node's

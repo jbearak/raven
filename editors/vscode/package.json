@@ -1287,7 +1287,7 @@
           ],
           "enumDescriptions": [
             "Aligns same-line arguments to opening paren (RStudio convention)",
-            "Indents all arguments relative to previous line",
+            "Indents all arguments one level in from the line that opens the call, ignoring the paren column",
             "Disables AST-aware indentation (Tier 2), keeping only basic declarative rules (Tier 1)"
           ],
           "default": "rstudio",

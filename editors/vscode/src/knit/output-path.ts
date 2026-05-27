@@ -1,18 +1,18 @@
 /**
- * Best-effort parser for the rendered-output paths that
- * `rmarkdown::render` prints to the R console.
+ * Best-effort parser for the rendered-output path(s) printed by the knit
+ * R expression.
  *
- * Source-of-truth message: `rmarkdown:::render_print` in the rmarkdown
- * R package emits `Output created: <path>` via `message()`. The literal
- * is not currently localized, but rmarkdown could localize it in a
- * future release. If parsing fails we surface "Knit succeeded (output
- * path unknown)" rather than fabricating a path — the subprocess exit
- * code is the ground truth for success/failure; output parsing is a
- * UX nicety.
+ * Source-of-truth message: Raven's knit expression (built in
+ * `r-expression`) emits `Output created: <path>` via `cat()` to stdout.
+ * The caller passes the subprocess's combined stdout+stderr, so a line R
+ * happens to route through `message()` is still matched. If parsing
+ * fails we surface "Knit succeeded (output path unknown)" rather than
+ * fabricating a path — the subprocess exit code is the ground truth for
+ * success/failure; output parsing is a UX nicety.
  *
- * `output_format = "all"` (or a multi-output knit hook) emits one
- * "Output created" line per format. We return every match so the
- * caller can offer "Show All" alongside opening the first.
+ * The single-output HTML pipeline emits exactly one line, but we return
+ * every match defensively so a future multi-output path could offer
+ * "Show All" alongside opening the first.
  */
 
 const OUTPUT_LINE = /^[\t ]*Output created:[\t ]+(.+?)[\t ]*$/;

@@ -127,8 +127,8 @@ Options:
 
 Exit codes:
   0   No diagnostic exceeded --max-severity
-  1   At least one diagnostic exceeded --max-severity
-  2   Operator error (config / path / flag)
+  1   A diagnostic exceeded --max-severity, or a usage error (unknown flag / bad option value)
+  2   Operator error while running (config parse failure, unreadable or missing path)
 ",
         env!("CARGO_PKG_VERSION")
     );
