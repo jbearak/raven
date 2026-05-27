@@ -43,6 +43,7 @@
     "r-expression-chunk-opts.test.ts",
     "open-exported-file.test.ts",
     "plot-webview-inline-icons.test.ts",
-    "plot-share-popover-position.test.ts"
+    "plot-share-popover-position.test.ts",
+    "data-viewer-filter-popover-seed.test.ts"
   ]
 }
