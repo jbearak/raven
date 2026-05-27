@@ -9,8 +9,13 @@ User-facing:
 - `docs/directives.md`
 - `docs/diagnostics.md`
 - `docs/linting.md`
+- `docs/completion.md`
+- `docs/hover.md`
+- `docs/go-to-definition.md`
+- `docs/find-references.md`
 - `docs/indentation.md`
 - `docs/syntax-highlighting.md`
+- `docs/snippets.md`
 - `docs/r-console.md`
 - `docs/chunks.md`
 - `docs/knit.md`
@@ -18,8 +23,13 @@ User-facing:
 - `docs/data-viewer.md`
 - `docs/help-viewer.md`
 - `docs/document-outline.md`
+- `docs/cli.md`
+- `docs/editor-integrations.md`
 - `docs/coexistence.md`
 - `docs/configuration.md`
+- `docs/settings-reference.md`
+- `docs/comparison.md`
+- `docs/limitations.md`
 
 Maintainer/internal:
 - `docs/development.md`
