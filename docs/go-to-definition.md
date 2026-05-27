@@ -73,7 +73,7 @@ Inside `source()` strings and path-taking directives, cmd-click navigates to the
 
 - `source()` calls and forward directives respect `@lsp-cd`.
 - Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) resolve relative to the file's own directory and ignore `@lsp-cd`.
-- Workspace-root fallback applies to AST-detected `source()` calls only, and only when no working directory is in effect.
+- Workspace-root fallback applies to AST-detected `source()` calls and forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`), and only when no working directory is in effect.
 
 See [Cross-File Awareness](cross-file.md#automatic-source-detection) and [Directives](directives.md#working-directory-directives) for details.
 

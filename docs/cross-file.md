@@ -203,7 +203,7 @@ When Raven resolves a relative path to another file, the base directory depends 
 
 - **Forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`) and **AST-detected `source()` calls** resolve relative to the directory of the file they appear in, and honor an in-effect [`@lsp-cd`](directives.md) working directory.
 - **Backward directives** (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) resolve relative to the file's own directory and **ignore `@lsp-cd`**.
-- **Workspace-root fallback** applies to AST-detected `source()` calls only, and only when no `@lsp-cd` is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. It never applies to forward or backward directives.
+- **Workspace-root fallback** applies to AST-detected `source()` calls and forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`), and only when no `@lsp-cd` is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. Forward directives are semantically equivalent to `source()` calls, so they resolve identically across dependency edges, scope, missing-file diagnostics, cmd-click, and path completion. The fallback never applies to backward directives.
 
 ### Global Symbol Hoisting
 

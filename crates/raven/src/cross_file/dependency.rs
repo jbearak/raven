@@ -782,7 +782,9 @@ impl DependencyGraph {
         // Helper to resolve paths for forward sources (@lsp-source directives and source() calls)
         // Uses PathContext with working_directory from @lsp-cd, enabling paths to resolve
         // relative to the configured working directory rather than the file's directory.
-        // Also uses workspace-root fallback for source() statements in files without @lsp-cd.
+        // Also uses workspace-root fallback for AST source() calls AND forward directives
+        // in files without @lsp-cd — forward directives are semantically equivalent to
+        // source() calls (see .kiro/specs/lsp-source-directive/) and must resolve identically.
         // Returns Option<Url> - existence is checked later during file read operations.
         let do_resolve = |path: &str| -> Option<Url> {
             let resolved = resolve_path_with_workspace_fallback(path, &path_ctx)?;

@@ -932,9 +932,12 @@ pub fn file_path_definition(
                 resolve_path(&normalized_path, &path_context)?
             }
             DirectiveType::Source => {
-                // Forward directives respect @lsp-cd but do not use workspace-root fallback.
+                // Forward directives are semantically equivalent to source()
+                // calls — they get the same workspace-root fallback so that
+                // cmd-click on the directive path matches the dependency
+                // graph edge built by `dependency.rs::do_resolve`.
                 let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
-                resolve_path(&normalized_path, &path_context)?
+                resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
             }
         },
         FilePathContext::None => {
@@ -1389,12 +1392,23 @@ pub fn resolve_base_directory(
                 }
             }
             DirectiveType::Source => {
-                // Forward directives respect @lsp-cd but do not use workspace-root fallback.
+                // Forward directives are semantically equivalent to source()
+                // calls — they get the same workspace-root fallback so that
+                // path completion inside the directive lists workspace-root
+                // files (matching the dependency graph behavior). Mirror the
+                // SourceCall arm above.
                 let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
                 if partial_dir.is_empty() {
+                    let has_explicit_wd = path_context.working_directory.is_some();
+                    let has_inherited_wd = path_context.inherited_working_directory.is_some();
+                    if !has_explicit_wd && !has_inherited_wd {
+                        if let Some(ref workspace_root) = path_context.workspace_root {
+                            return Some(workspace_root.clone());
+                        }
+                    }
                     Some(path_context.effective_working_directory())
                 } else {
-                    resolve_path(resolution_path, &path_context)
+                    resolve_path_with_workspace_fallback(resolution_path, &path_context)
                 }
             }
         },
@@ -8475,7 +8489,10 @@ mod resolve_base_directory_tests {
     }
 
     #[test]
-    fn test_resolve_base_directory_forward_directive_does_not_use_workspace_fallback() {
+    fn test_resolve_base_directory_forward_directive_uses_workspace_fallback() {
+        // Forward directives are semantically equivalent to source() calls and
+        // must get the workspace-root fallback so path completion matches the
+        // dependency graph and source() call behavior.
         let temp_dir = TempDir::new().unwrap();
         let child_dir = temp_dir.path().join("child");
         fs::create_dir(&child_dir).unwrap();
@@ -8498,7 +8515,9 @@ mod resolve_base_directory_tests {
         let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), child_dir.join("scripts"));
+        // <child>/scripts doesn't exist; workspace-root fallback resolves to
+        // <workspace>/scripts. Mirrors the SourceCall arm.
+        assert_eq!(result.unwrap(), workspace_scripts);
     }
 
     #[test]
@@ -9132,7 +9151,10 @@ mod file_path_definition_tests {
     }
 
     #[test]
-    fn test_file_path_definition_forward_directive_does_not_use_workspace_fallback() {
+    fn test_file_path_definition_forward_directive_uses_workspace_fallback() {
+        // Forward directives are semantically equivalent to source() calls and
+        // must get the workspace-root fallback so cmd-click matches the
+        // dependency graph and source() call behavior.
         let temp_dir = TempDir::new().unwrap();
         let child_dir = temp_dir.path().join("child");
         fs::create_dir(&child_dir).unwrap();
@@ -9163,7 +9185,16 @@ mod file_path_definition_tests {
             Some(&workspace_root),
         );
 
-        assert!(result.is_none());
+        // <child>/scripts/helpers.R doesn't exist; workspace-root fallback
+        // resolves to <workspace>/scripts/helpers.R, which does exist.
+        let location = result.expect(
+            "Forward directive cmd-click should resolve via workspace-root fallback when \
+             the file-relative path doesn't exist",
+        );
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&workspace_target).unwrap()
+        );
     }
 
     #[test]

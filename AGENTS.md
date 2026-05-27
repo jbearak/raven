@@ -62,8 +62,8 @@ Each item below either spans multiple systems or is a discipline that applies in
   - See `crates/raven/src/cross_file/path_resolve.rs` and `docs/cross-file.md`.
 
 - **Workspace-root fallback**
-  - For AST-detected `source()` calls only, and only when no `@lsp-cd` is explicitly or inheritedly in effect.
-  - Must hold uniformly across dependency-graph resolution, scope resolution, file-path go-to-definition, and path completion. Never apply to backward directives.
+  - For AST-detected `source()` calls AND forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`), and only when no `@lsp-cd` is explicitly or inheritedly in effect. Forward directives are semantically equivalent to `source()` calls and must resolve identically.
+  - Must hold uniformly across dependency-graph resolution, scope resolution, missing-file diagnostics, file-path go-to-definition, and path completion. Never apply to backward directives.
 
 - **Diagnostics publishing monotonicity**
   - Diagnostics publish monotonically by document version. Dependency-triggered revalidation may republish at the same version via the force-republish mechanism, but never older.

@@ -176,11 +176,11 @@ User-facing explanation/examples live in `docs/cross-file.md`.
 
 For codebases without `@lsp-cd`, `source()` paths are often written relative to the workspace root.
 
-For **AST-detected `source()` calls only**, Raven attempts:
+For **AST-detected `source()` calls and forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`), Raven attempts:
 1. File-relative resolution
 2. If the file does not exist *and* there is no explicit/inherited working directory: try workspace-root-relative resolution
 
-This fallback must **not** apply to backward directives.
+Forward directives are semantically equivalent to `source()` calls (see `.kiro/specs/lsp-source-directive/`) and must resolve identically across dependency edges, scope, diagnostics, cmd-click, and path completion. This fallback must **not** apply to backward directives.
 
 ### Parent-prefix scope and forward-source traversal
 
