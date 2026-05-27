@@ -141,6 +141,8 @@ fit_model(data)
 
 Cells with no trailing text fall back to `Chunk #N`.
 
+> **Note:** A line like `# %% Setup ----` matches *both* the `# %%` cell-marker pattern and the section-divider pattern, so in a `.R` file it appears **twice** in the outline — once as a collapsible section (Module) and once as a cell entry (Chunk). Use `# %% Setup` (no trailing `----`) if you want only a plain cell.
+
 ## Symbol Types
 
 Raven recognizes the following R constructs and assigns appropriate symbol types:
@@ -166,7 +168,7 @@ result = process_data(data)
 global_value <<- 42
 ```
 
-**Icon:** Variable symbol
+**Icon:** Field symbol (LSP `SymbolKind::FIELD`)
 
 ### Constants
 
@@ -381,7 +383,7 @@ Results:
 ```
 
 **Features:**
-- Fuzzy matching: "calc" matches "calculate"
+- Substring matching (case-insensitive): "calc" matches "calculate"
 - Shows file location for each symbol
 - Jump to definition with Enter
 - Searches open documents and indexed workspace files

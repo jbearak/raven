@@ -10,7 +10,7 @@ Go-to-definition (Cmd-click, Ctrl-click on Windows/Linux, or F12) navigates to w
 | RHS of `$` or `@` (`foo$bar`) | The member assignment or constructor-literal field — see [$ and @ Member Resolution](#-and--member-resolution) |
 | Symbol declared via `@lsp-var` / `@lsp-func` | The directive line itself — see [Declared Symbols](#declared-symbols) |
 | File path inside `source()` or a path directive | The referenced file, opened at line 0 |
-| Identifier in `.stan`, `.jags`, or `.bugs` files | First definition (or first occurrence as a fallback for data inputs) |
+| Identifier in `.stan`, `.jags`, or `.bugs` files | The most recent definition at or before the cursor (or the first definition if the cursor precedes all of them) — see [JAGS and Stan](#jags-and-stan) for the per-language details |
 
 ## Position-Aware Resolution
 
@@ -47,7 +47,7 @@ If no definition is found in the dependency graph, Raven falls back to other ope
 
 When you cmd-click the RHS of `$` or `@` (e.g. `config$host`), Raven resolves it as a member of the LHS — not as a free variable. It searches for:
 
-- Member assignments: `config$host <- …`, `config[["host"]] <- …`, `object@slot <- …`
+- Member assignments: `config$host <- …`, `config[["host"]] <- …` (both apply to `$`); `object@slot <- …` (applies to `@`)
 - Constructor literals: named arguments in `list()`, `data.frame()`, `tibble()`, `c()`, S4 `new()`, etc.
 
 If multiple candidates exist across the dependency graph, Raven tie-breaks by graph distance (closer wins). Cmd-clicking on `$` or `@` itself (the punctuation) does nothing — only identifiers are navigable.
@@ -85,8 +85,8 @@ Cmd-click on a symbol that comes from an installed package (e.g. `dplyr::mutate`
 
 For `.stan`, `.jags`, and `.bugs` files, Raven provides best-effort go-to-definition within the current file:
 
-- **Stan** — jumps to the declaration of a variable or function.
-- **JAGS** — jumps to the first assignment, or falls back to the first occurrence when the symbol is a data input or constant with no assignment in the file. Built-in keywords, distributions, and functions are excluded from the fallback.
+- **Stan** — jumps to the most recent declaration of a variable or function at or before the cursor (or the first declaration if none precede it).
+- **JAGS** — jumps to the most recent assignment at or before the cursor (or the first assignment if none precede it), or falls back to the first occurrence when the symbol is a data input or constant with no assignment in the file. Built-in keywords, distributions, and functions are excluded from the fallback.
 
 Identifier resolution is file-local — Raven doesn't build a cross-file scope graph for these languages. File-path navigation (e.g. cmd-click on a path in `@lsp-sourced-by`) still works normally. See also [Find References — JAGS and Stan](find-references.md#jags-and-stan).
 

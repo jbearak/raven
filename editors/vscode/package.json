@@ -889,7 +889,7 @@
             "Write code to a temporary file and run source() for both single-line and multi-line sends."
           ],
           "default": "auto",
-          "description": "Controls how Raven sends code to R. 'auto' pastes short blocks directly and switches to a temp file once a block has at least raven.sendToR.autoTempFileThresholdLines lines (≥ N). 'paste' always pastes, using bracketed paste mode for multi-line code. 'tempfile' always writes to a temp file and runs source()."
+          "description": "Controls how Raven sends code to R. Auto mode pastes short blocks directly and switches to a temp file once a block has at least raven.sendToR.autoTempFileThresholdLines lines (≥ N); 'paste' always pastes, using bracketed paste mode for multi-line code; 'tempfile' always writes to a temp file and runs source()."
         },
         "raven.sendToR.autoTempFileThresholdLines": {
           "type": "integer",
@@ -901,7 +901,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "description": "Path to raven binary. If empty, uses bundled binary."
+          "description": "Path to the raven binary; if empty, the bundled binary is used."
         },
         "raven.trace.server": {
           "type": "string",
@@ -1200,7 +1200,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "description": "Path to the R executable used for non-interactive subprocess calls (package introspection, library path discovery). If empty, Raven searches for R in the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation. Must point to vanilla R, not radian or arf — those are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses. For the interactive terminal program, see raven.rTerminal.program."
+          "description": "Path to the R executable used for non-interactive subprocess calls such as package introspection and library-path discovery; if empty, Raven searches for R on the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation. Must point to vanilla R, not radian or arf — those are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses. For the interactive terminal program, see raven.rTerminal.program."
         },
         "raven.packages.missingPackageSeverity": {
           "type": "string",
@@ -1321,7 +1321,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "description": "Absolute path to a Pandoc binary. Leave empty to use PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.)."
+          "description": "Absolute path to a Pandoc binary; leave empty to search PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.)."
         },
         "raven.pandoc.pdfEngine": {
           "type": "string",

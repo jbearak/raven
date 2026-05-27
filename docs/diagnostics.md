@@ -198,3 +198,5 @@ When a parent file changes (e.g., a `library()` call is added or removed), Raven
 ## JAGS and Stan
 
 Diagnostics are suppressed for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files because Raven cannot statically determine what is in scope in these languages.
+
+R Markdown (`.Rmd`) and Quarto (`.qmd`) documents also produce no diagnostics: the tree-sitter R parser sees prose, YAML, and non-R fenced blocks as parse errors, so every non-R line would become spurious noise. Code intelligence for individual R chunks is covered in [chunks.md](chunks.md).

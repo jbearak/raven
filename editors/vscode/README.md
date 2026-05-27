@@ -16,19 +16,21 @@ Compared with [REditorSupport's R extension](https://marketplace.visualstudio.co
 - **[Go-to-definition](https://github.com/jbearak/raven/blob/main/docs/go-to-definition.md)** — Jump to definitions across file boundaries
 - **[Find references](https://github.com/jbearak/raven/blob/main/docs/find-references.md)** — Locate all usages of a symbol across your project
 - **[Hover](https://github.com/jbearak/raven/blob/main/docs/hover.md)** — Symbol info including source file and package origin
-- **[Diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
+- **[Diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages, plus opt-in [style/lint rules](https://github.com/jbearak/raven/blob/main/docs/linting.md)
 - **[Document outline](https://github.com/jbearak/raven/blob/main/docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
 - **[Smart indentation](https://github.com/jbearak/raven/blob/main/docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Cross-file awareness](https://github.com/jbearak/raven/blob/main/docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
+- **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS, Stan, and R package file syntax highlighting
 - **[Snippets](https://github.com/jbearak/raven/blob/main/docs/snippets.md)** — Built-in snippets for common R patterns (control flow, apply family, ggplot2 scaffolds, roxygen2 tags) plus R Markdown / Quarto chunk and YAML scaffolds
 
 ### R session integration
 
 - **[R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
+- **[Code chunks](https://github.com/jbearak/raven/blob/main/docs/chunks.md)** — R Markdown / Quarto chunk detection with Run Chunk / Run Above / Run All commands, CodeLens buttons, navigation, and background highlighting; `# %%` cell support in `.R` files
+- **[Knit Preview + Export](https://github.com/jbearak/raven/blob/main/docs/knit.md)** — `Raven: Knit Preview` renders R Markdown to an HTML preview without requiring Pandoc; companion `Export to HTML / PDF / Word` commands save the result next to the `.Rmd` via Pandoc
 - **[Plot viewer](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
 - **[Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
 - **[Help viewer](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred

@@ -37,9 +37,12 @@ Raven runs on the **workspace extension host** because it ships an LSP binary. I
 
 Raven therefore vendors the R and R Markdown grammars from REditorSupport (MIT) directly into `editors/vscode/syntaxes/r.tmLanguage.json` and `editors/vscode/syntaxes/rmd.tmLanguage.json`. The provenance and sync procedure live in `editors/vscode/syntaxes/SOURCE.md`. With this contribution in place:
 
-- `.Rmd` files highlight out of the box, with Markdown prose styling, R code chunks, and ~40 embedded-language scopes inside their respective fenced blocks.
+- `.Rmd` files highlight out of the box, with Markdown prose styling, R code chunks, and 13 embedded-language scopes inside their respective fenced blocks.
 - The knit pipeline's R-chunk tokenizer always finds a grammar, even in fresh remote sessions where the user hasn't (and can't) install a UI-only sibling.
-- Sibling grammars still win when present: the priority list is `REditorSupport.r-syntax` → `REditorSupport.r` → `vscode.r` → Raven's vendored copy. A user with the upstream extension keeps the freshest grammar; everyone else gets the synced snapshot Raven shipped.
+- Sibling grammars still win when present. The priority lists differ by file type:
+  - **`.R` files:** `REditorSupport.r-syntax` → `REditorSupport.r` → `vscode.r` → Raven's vendored copy.
+  - **`.Rmd` files:** `REditorSupport.r-syntax` → `REditorSupport.r` → Raven's vendored copy. `vscode.r` is intentionally absent — the VS Code built-in only contributes `source.r`, never the R Markdown grammar.
+  A user with the upstream extension keeps the freshest grammar; everyone else gets the synced snapshot Raven shipped.
 
 Raven still does **not** ship a `quarto` grammar — install [`quarto.quarto`](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) for `.qmd` highlighting and preview.
 

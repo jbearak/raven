@@ -2,6 +2,10 @@
 
 Raven runs over stdio (`raven --stdio`) and works with any editor that has an LSP client.
 
+## Getting the binary
+
+The VS Code extension bundles the binary — no separate download needed. For all other editors, download a pre-built `raven` binary from the [GitHub releases page](https://github.com/jbearak/raven/releases) and place it on your PATH (or note the full path for the snippets below).
+
 ## VS Code
 
 Install the extension (which bundles the binary) from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r).
@@ -25,8 +29,7 @@ Add to your `settings.json`:
 ```json
 "languages": {
   "R": {
-    "language_servers": ["r_language_server"],
-    "enable_language_server": true
+    "language_servers": ["r_language_server"]
   }
 },
 "lsp": {
@@ -41,7 +44,7 @@ Add to your `settings.json`:
 
 ## Neovim
 
-Configure via `lspconfig` or manual setup:
+Manual setup (Neovim 0.8+):
 
 ```lua
 vim.lsp.start({

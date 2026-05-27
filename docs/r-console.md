@@ -80,7 +80,7 @@ The Terminal submenu commands — `raven.terminal.runLineOrSelection`, `raven.te
 When no text is selected, **Run Line or Selection** uses heuristics to detect complete R statements spanning multiple lines. The extension recognizes:
 
 - **Unmatched brackets** — `(`, `[`, `{` that haven't been closed
-- **Trailing operators** — lines ending with `+`, `-`, `*`, `/`, `|>`, `%>%`, `%any%`, `||`, `&&`, `|`, `&`, `~`, `=`, `<-`, `->`, `,`, `::`, `:::`
+- **Trailing operators** — lines ending with `+`, `-`, `*`, `/`, `^`, `|>`, `%>%`, `%any%`, `||`, `&&`, `|`, `&`, `~`, `=`, `<-`, `->`, `<<-`, `->>`, `<=`, `>=`, `==`, `!=`, `<`, `>`, `,`, `::`, `:::`
 - **Continuation lines** — lines starting with `|>`, `%>%`, `)`, `]`, `}`, `+`, or other operators
 
 This means pipe chains, multi-line function calls, ggplot layers, and if/else blocks are sent as complete units:

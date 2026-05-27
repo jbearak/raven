@@ -27,7 +27,7 @@ Each step takes the first hit and stops; steps 2–4 never run once a match is f
 
 ## File Location Lines
 
-When the hover is built from a cross-file symbol, Raven adds one line underneath the code block so you can jump to the definition:
+When the hover is built from a local or sourced definition, Raven adds one line underneath the code block so you can jump to the definition (package exports use the help-panel link instead — see below):
 
 - Defined in the same file: `this file, line N`.
 - Defined in another file: `[rel/path.R](file:///…), line N` — click the link to open that file at the definition.
@@ -37,17 +37,15 @@ The relative path is computed against the workspace root when one is available, 
 
 ## Declared Symbols
 
-Symbols declared via [`@lsp-var` or `@lsp-func`](directives.md#declaration-directives) hover as:
+Symbols declared via [`@lsp-var` or `@lsp-func`](directives.md#declaration-directives) hover as an R code block with the declaration, followed by the directive line and (for cross-file declarations) a file attribution. For a function declared in another file, the hover renders the code block:
 
-```text
+```r
 name (declared function)
-
-Declared via @lsp-func directive at line 12
-
-*Defined in analysis/helpers.R*
 ```
 
-The "Defined in" line is omitted when the declaration lives in the current file. If the same name is declared more than once in the providing file, Raven uses the **first declaration by line number** — the same rule [diagnostics](diagnostics.md), [completions](completion.md), and [go-to-definition](go-to-definition.md#declared-symbols) follow.
+…then, as markdown beneath it, `Declared via @lsp-func directive at line 12` and *Defined in analysis/helpers.R*.
+
+The "Defined in" line is omitted when the declaration lives in the current file. If the same name is declared more than once in the providing file, hover shows the **most recent declaration at or before the cursor** — the same position-aware scope [completions](completion.md) and [diagnostics](diagnostics.md) use. [Go-to-definition](go-to-definition.md#declared-symbols) differs here: it navigates to the *first* declaration by line number.
 
 ## Package Exports and the Help-Panel Link
 
@@ -83,6 +81,7 @@ This isn't a Raven bug. Both extensions are answering the hover request independ
 
 - **No navigation to installed package sources.** Hover attributes a symbol to its package and links to the help viewer, but cmd-click on a package export does not jump into the package's source. See [Go-to-Definition: Package Exports](go-to-definition.md#package-exports).
 - **R-help fallback is async.** The first hover for a topic spawns an R subprocess to render help; re-hovering the same topic uses the cached result.
+- **Not available in R Markdown / Quarto.** Hover (and its help-panel link) is disabled in `.Rmd` and `.qmd` documents.
 
 ## Related
 

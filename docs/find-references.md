@@ -1,17 +1,19 @@
 # Find References
 
-Raven locates all usages of a symbol across the dependency graph — not just the current file.
+Raven locates all occurrences of a symbol — definitions and usages alike — across your project, not just the current file.
 
 ## How It Works
 
 When you invoke Find References (Shift+F12 / right-click → Find All References), Raven:
-1. Identifies the symbol at the cursor
-2. Determines which files are reachable through the dependency graph
-3. Returns all reference sites across those files
+1. Identifies the name of the identifier at the cursor.
+2. Searches the current file, all other open documents, and every workspace-indexed file for identifier nodes with that same name.
+3. Returns every match — both definition sites (assignments, function parameters) and usage sites.
+
+Find References is a **name-based** search: it matches on the identifier text, with no dependency-graph or scope filtering. It is intentionally broad — see [Scope and pooling](#scope-and-pooling).
 
 ## Cross-File Scoping
 
-References are found across files connected by `source()` calls and directives:
+Because the search spans all open and indexed files, a definition in one file and its usages in another are returned together:
 
 ```r
 # main.R
@@ -24,23 +26,28 @@ result <- helper_function(42)  # ← reference
 helper_function <- function(x) { x * 2 }  # ← definition
 ```
 
-Invoking Find References on `helper_function` in either file returns both locations.
+Invoking Find References on `helper_function` in either file returns both locations — whether or not a `source()` path connects them.
 
-## Reachability
+## Scope and pooling
 
-Two references to the same name are considered the same symbol if they are **mutually reachable** through the dependency graph. Files that are not connected (no `source()` path between them) are treated as having distinct symbols — even if the names match.
+Unlike completions and diagnostics, Find References does **not** consult the `source()` dependency graph or position-aware scope. Every identifier in the workspace whose name matches is returned, which means:
 
-This prevents pooling of coincidentally same-named symbols across unrelated analyses.
+- Definitions (left-hand sides of assignments, function parameters) are listed alongside usages.
+- Same-named symbols in files that are *not* connected by any `source()` path are pooled together rather than treated as distinct symbols.
+
+If you need a result scoped to one symbol's definition, use [Go-to-Definition](go-to-definition.md), which *is* scope- and dependency-aware.
+
+> Find References returns no results when invoked from an R Markdown / Quarto (`.Rmd` / `.qmd`) document.
 
 ## Workspace Symbols (Cmd/Ctrl+T)
 
-For project-wide symbol search without scoping constraints, use **Cmd/Ctrl+T**. This searches all indexed symbols across the workspace by name, regardless of dependency relationships.
+For project-wide symbol search by name, use **Cmd/Ctrl+T**. This searches all indexed symbols across the workspace by name, regardless of dependency relationships.
 
 The maximum number of results is configurable via `raven.symbols.workspaceMaxResults` (default: 1000).
 
 ## JAGS and Stan
 
-For `.stan`, `.jags`, and `.bugs` files, Find References returns all occurrences of the identifier across every open or indexed file of the same language. Unlike R, there is no dependency graph — results are collected by name match across all reachable Stan (or JAGS) files in the workspace.
+For `.stan`, `.jags`, and `.bugs` files, Find References returns all occurrences of the identifier across every open or indexed file of the same language. As with R, this is a flat name match — there is no dependency graph; results are collected by name across all Stan (or JAGS) files in the workspace.
 
 ## Go-to-Definition
 

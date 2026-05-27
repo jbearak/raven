@@ -33,7 +33,9 @@ Raven detects `source()` and `sys.source()` calls:
 - `local = TRUE` and `chdir = TRUE` parameters
 - Dynamic paths (variables, expressions) are skipped gracefully
 
-Raven also provides **file path intellisense** inside `source()` strings and path-taking directives: completion for `.R` files and directories, and cmd-click navigation to the target file.
+`sys.source()` defaults to a non-global environment, so its symbols are treated as local and do **not** propagate to the calling file unless you pass `envir = globalenv()` (or `.GlobalEnv`).
+
+Raven also provides **file path intellisense** inside `source()` strings and path-taking directives: completion for `.R`/`.r` files and directories, and cmd-click navigation to the target file.
 
 For dynamic or conditional paths that Raven can't detect, use [directives](directives.md) to declare relationships explicitly.
 
@@ -54,7 +56,7 @@ When you write `library(dplyr)`, Raven:
 
 ### Base Packages
 
-Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. At startup, Raven queries R for the default search path. If R is unavailable, it falls back to a hardcoded list.
+Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. Raven uses this fixed list directly — it does not query R to discover the base packages. The R subprocess is queried for *installed user packages* (via the library paths), not to determine which base packages exist.
 
 ### Position-Aware Loading
 
@@ -177,7 +179,7 @@ The dependency graph and scope model power several features:
 
 - **[Diagnostics](diagnostics.md)** — undefined variable warnings respect cross-file scope and loaded packages
 - **[Completions](completion.md)** — symbols from sourced files and packages appear with source attribution
-- **[Find References](find-references.md)** — locates usages across the dependency graph
+- **[Find References](find-references.md)** — locates occurrences by name across all open and indexed files (a flat name match, *not* dependency-graph-scoped)
 - **Go-to-definition** — navigates to definitions in other files
 - **Hover** — shows where a symbol is defined and which package it comes from
 
@@ -194,6 +196,14 @@ The `raven.crossFile.backwardDependencies` setting controls how Raven discovers 
 **Per-file opt-out:** Adding an explicit `@lsp-sourced-by` directive to a file disables auto-inference for that file.
 
 See [Configuration](configuration.md) for the setting.
+
+### Path Resolution
+
+When Raven resolves a relative path to another file, the base directory depends on where the path came from:
+
+- **Forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`) and **AST-detected `source()` calls** resolve relative to the directory of the file they appear in, and honor an in-effect [`@lsp-cd`](directives.md) working directory.
+- **Backward directives** (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) resolve relative to the file's own directory and **ignore `@lsp-cd`**.
+- **Workspace-root fallback** applies to AST-detected `source()` calls only, and only when no `@lsp-cd` is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. It never applies to forward or backward directives.
 
 ### Global Symbol Hoisting
 
@@ -213,8 +223,8 @@ This is enabled by default. Disable with `raven.crossFile.hoistGlobalsInFunction
 
 ### $ and @ Member Resolution
 
-When you cmd-click on `foo$bar`, Raven resolves `bar` as a member of `foo` — not as a free variable. It looks for:
-- Member assignments: `foo$bar <- …`, `foo[["bar"]] <- …`
-- Constructor-literal members: named arguments in `list()`, `data.frame()`, `tibble()`, etc.
+When you cmd-click on `foo$bar` (or `foo@slot` for S4 objects), Raven resolves the member against `foo` — not as a free variable. It looks for:
+- Member assignments: `foo$bar <- …`, `foo["bar"] <- …`, or `foo[["bar"]] <- …` (the string-subscript forms apply to `$` only); `foo@slot <- …` for S4 slots.
+- Constructor-literal members: named arguments in constructors such as `list()`, `c()`, `data.frame()`, `tibble()`, `data.table()`, `environment()`, `list2env()`, and `new()`.
 
 Scope-aware completions after `$` use the same rules: typing `foo$` offers known members of `foo`.

@@ -61,11 +61,13 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - [Document Outline](docs/document-outline.md) — Hierarchical symbol view
 - [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
 - [Syntax Highlighting](docs/syntax-highlighting.md) — LSP semantic tokens for R, plus JAGS, Stan, and R package file grammars
+- [Snippets](docs/snippets.md) — Built-in R and R Markdown / Quarto snippets
 
 **R session integration:**
 
 - [R Console](docs/r-console.md) — Interactive console, send-to-R commands, send method
 - [Code Chunks](docs/chunks.md) — R Markdown / Quarto chunk commands, CodeLens, navigation, highlighting
+- [Knit Preview & Export](docs/knit.md) — Render R Markdown to an HTML preview; export to HTML / PDF / Word via Pandoc
 - [Plot Viewer](docs/plot-viewer.md) — httpgd-backed plot panel
 - [Data Viewer](docs/data-viewer.md) — Arrow-backed `View()` replacement
 - [Help Viewer](docs/help-viewer.md) — Scope-aware R help
@@ -74,6 +76,9 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 
 - [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
 - [Configuration](docs/configuration.md) — All settings and options ([alphabetical reference](docs/settings-reference.md))
+- [CLI](docs/cli.md) — `raven lint` for CI and other command-line usage
+- [R Package Development](docs/r-package-dev.md) — Package mode, visibility rules, and build commands
+- [Coexistence](docs/coexistence.md) — Running alongside REditorSupport (vscode-R) and Positron
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools
 - [Limitations](docs/limitations.md) — Features not yet implemented
 
@@ -97,7 +102,7 @@ See [Development Notes](docs/development.md) for build/test, profiling, and inte
 
 ## Provenance
 
-Raven includes code derived from [Ark](https://github.com/posit-dev/ark) (MIT License, Posit Software, PBC) — initial LSP wiring and tree-sitter scaffolding — and [Sight](https://github.com/jbearak/sight) (GPL-3.0) — the cross-file awareness system (directives + position-aware scope model). See [NOTICE](NOTICE) for full attribution.
+Raven includes code derived from [Ark](https://github.com/posit-dev/ark) (MIT License, Posit Software, PBC) — initial LSP wiring and tree-sitter scaffolding — and from its sister project [Sight](https://github.com/jbearak/sight) (also GPL-3.0) — the cross-file awareness system (directives + position-aware scope model). The bundled R and R Markdown TextMate grammars come from [vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax) (MIT). See [NOTICE](NOTICE) for the third-party (MIT) attributions.
 
 ## License
 

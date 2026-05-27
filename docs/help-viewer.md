@@ -4,7 +4,7 @@ The extension provides a built-in help viewer that renders R help (Rd) documenta
 
 ## Why we built this
 
-Raven's help viewer uses the language server's scope analysis to disambiguate which package's help to show. If you hover over `filter(...)` after `library(dplyr)`, Raven's static scope model picks `dplyr::filter` over `stats::filter`. The scope-aware resolution looks at namespace qualifiers (`pkg::fn`), `library()` / `require()` / `loadNamespace()` calls in this file and any sourced files, any in-scope `@lsp-var` / `@lsp-func` declarations, and the standard package-search-path order. See [Comparison: Hover help](./comparison.md#hover-help) for how this differs from other R hover implementations.
+Raven's help viewer uses the language server's scope analysis to disambiguate which package's help to show. If you hover over `filter(...)` after `library(dplyr)`, Raven's static scope model picks `dplyr::filter` over `stats::filter`. The scope-aware resolution looks at namespace qualifiers (`pkg::fn`), `library()` / `require()` / `loadNamespace()` calls in this file and any sourced files, and the standard package-search-path order. (In-scope `@lsp-var` / `@lsp-func` declarations short-circuit to a declaration hover that shows where the symbol was declared, rather than contributing to package help selection.) See [Comparison: Hover help](./comparison.md#hover-help) for how this differs from other R hover implementations.
 
 > [!NOTE]
 > Code intelligence and the help viewer are unaffected by `raven.rConsole.activation`. Code intelligence doesn't depend on a live R session at all — Raven's semantic analysis is static, driven by scope resolution over your source files and installed package metadata. The help viewer, unlike the plot and data viewers, doesn't need the R session managed by Raven either — it shells out to R on demand to render Rd documentation as HTML.
@@ -13,7 +13,10 @@ Raven's help viewer uses the language server's scope analysis to disambiguate wh
 
 The help viewer is triggered from a hover:
 
-- **From a hover**: Hover over a function call (e.g., `dplyr::filter(...)` or `plot(1:10)`). When the symbol resolves to a known package, the hover bubble displays a bold `pkg::name` heading at the top — click it to open the help panel.
+- **From a hover**: Hover over an identifier (e.g., `dplyr::filter` or `plot`). When the symbol resolves to a known package, the hover bubble displays a bold `pkg::name` heading at the top — click it to open the help panel.
+
+> [!NOTE]
+> Hover-triggered help is only active in `.R` files. It is disabled in R Markdown (`.Rmd`) and Quarto (`.qmd`) files.
 
 There is no command-palette entry: the panel needs a resolved topic and package, which only the hover link supplies, so `raven.openHelpPanel` (and the `raven.help.back` / `raven.help.forward` navigation commands) are hidden from the palette.
 
