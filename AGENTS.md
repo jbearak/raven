@@ -65,13 +65,6 @@ Each item below either spans multiple systems or is a discipline that applies in
 - **Locking discipline in cross-file work**
   - Diagnostic computation and the libpath consumer's "which docs are affected" filter MUST NOT hold the `WorldState` read lock across cross-file scope resolution. Snapshot inputs (artifacts, metadata, graph clone, config) under the lock, drop the guard, then iterate — otherwise concurrent `did_change` writers starve.
 
-## Quick commands
-
-- Debug build: `cargo build -p raven`
-- Release build: `cargo build --release -p raven`
-- Tests: `cargo test -p raven`
-- Benchmarks: `cargo bench --bench startup`
-
 ## Learnings
 
 Items here have no natural code home — they span multiple systems, depend on environment, or are recurring LLM mistakes the user has explicitly flagged. Anything tied to a specific function belongs as a doc comment there instead.
