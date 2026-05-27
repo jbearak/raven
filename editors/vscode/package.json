@@ -17,11 +17,6 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:r",
-    "onLanguage:rmd",
-    "onLanguage:quarto",
-    "onLanguage:jags",
-    "onLanguage:stan",
     "onTerminalProfile:raven.rTerminal"
   ],
   "main": "./dist/extension.js",
