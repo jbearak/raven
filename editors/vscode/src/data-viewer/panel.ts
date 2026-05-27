@@ -32,7 +32,7 @@ import { SortStateStore } from './sort-state';
 import { FilterStateStore } from './filter-state';
 import { build_csp } from './csp';
 import { render_tsv, ResolvedLabels } from './tsv';
-import { viewerTabIcon } from '../viewer-tab-icon';
+import { applyViewerTabIcon } from '../viewer-tab-icon';
 
 let dataViewerTraceOutput: vscode.OutputChannel | undefined;
 
@@ -126,7 +126,7 @@ export class DataViewerPanel {
                 ],
             },
         );
-        webviewPanel.iconPath = viewerTabIcon('table');
+        applyViewerTabIcon(webviewPanel, 'table');
         webviewPanel.webview.html = build_html(webviewPanel.webview, extensionUri);
         const panel = new DataViewerPanel(
             panelName, webviewPanel, reader, filePath,

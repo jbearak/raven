@@ -9,7 +9,7 @@ import {
 } from './messages';
 import { createHelpStateMachine, type FetchResponse } from './state-machine';
 import { rewriteImageSrcs, type RewriteContext } from './image-rewriter';
-import { viewerTabIcon } from '../viewer-tab-icon';
+import { applyViewerTabIcon } from '../viewer-tab-icon';
 
 type ViewerColumn = 'active' | 'beside';
 
@@ -172,7 +172,7 @@ export class HelpPanel {
                 ],
             },
         );
-        panel.iconPath = viewerTabIcon('question');
+        applyViewerTabIcon(panel, 'question');
         const nonce = crypto.randomBytes(16).toString('base64');
         panel.webview.html = build_html(panel.webview, this.context.extensionUri, nonce);
         panel.webview.onDidReceiveMessage((msg) => this.on_webview_message(msg));
