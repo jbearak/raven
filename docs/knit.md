@@ -78,7 +78,7 @@ when an `.Rmd` file is open.
 4. **YAML output options.** Any `output:` format (`html_document`,
    `pdf_document`, `word_document`, `bookdown::pdf_document2`, etc.)
    previews as HTML. Nested options are partially honored — see the
-   "YAML output options honored / ignored" section below. When the
+   "YAML output options" section below. When the
    matching HTML options do not specify `dev`, Raven uses SVG figures
    for the preview so plot colors can be themed in the panel. An
    explicit `dev:` in YAML or in a chunk is still honored.
@@ -301,11 +301,11 @@ PDF export uses the PDF engine configured at `raven.pandoc.pdfEngine`
 instead and needs no LaTeX). If the engine isn't found Raven surfaces an
 "Install TinyTeX…" hint.
 
-### YAML output options honored / ignored
+### YAML output options
 
 | Key | Where it's applied |
 |---|---|
-| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting. HTML preview defaults `dev` to `svg` when you do not set it, so the theme toggle can recolor plots; explicit raster devices are honored but cannot be recolored live. |
+| `fig_width`, `fig_height`, `fig_retina`, `dpi`, `dev` | `knitr::opts_chunk$set` before knitting (preview and export). HTML preview defaults `dev` to `svg` when you do not set it, so the theme toggle can recolor plots; explicit raster devices are honored but cannot be recolored live. |
 | `toc`, `toc_depth` | Pandoc `--toc` / `--toc-depth` (export only) |
 | `number_sections` | Pandoc `--number-sections` (export only) |
 | `highlight` | Pandoc `--highlight-style` (export only; validated against the known list) |
@@ -314,12 +314,17 @@ instead and needs no LaTeX). If the engine isn't found Raven surfaces an
 | `mathjax` | Pandoc `--mathjax` |
 | `pandoc_args` | Appended verbatim to the Pandoc argv during export (after Raven's own flags), except entries that set destination (`-o`, `--output`) or output format (`-t`, `--to`, `-w`, `--write`) — those are stripped because the editor menu owns them. Stripped entries are logged to the `Raven: Knit` output channel. Preview never invokes Pandoc, so `pandoc_args` does not affect preview output. |
 
-Keys **not honored**: `theme`, `code_folding`, `df_print`,
-`code_download`, `template`, `includes`. They are logged to the
-`Raven: Knit` output channel when present in your YAML. The omissions
-are deliberate — these are html_document-specific Bootstrap / JS
-runtime features that Raven's preview pipeline can't reproduce without
-becoming `rmarkdown::html_document`.
+Keys **not honored (in preview *and* export)**: `theme`,
+`code_folding`, `df_print`, `code_download`, `template`, `includes`.
+They are logged to the `Raven: Knit` output channel when present in
+your YAML. The omission is deliberate and spans both pipelines: these
+are produced by `rmarkdown::html_document`'s own R-side machinery
+(Bootstrap theming, a JS runtime, data-frame print methods), and
+neither of Raven's pipelines goes through it — the preview renders
+knitr's markdown with VS Code's markdown engine, and export hands that
+same markdown straight to Pandoc. Pandoc alone has no equivalent, so
+exporting to HTML/PDF/Word doesn't honor them either. For full
+template fidelity, run `rmarkdown::render(...)` in the R console.
 
 ## Settings
 
