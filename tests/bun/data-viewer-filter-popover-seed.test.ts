@@ -32,9 +32,15 @@ describe('seed/build round-trip — every predicate kind survives open → apply
     // [name, predicate, setUsesChecklist?]
     const cases: [string, FilterPredicate, boolean?][] = [
         ['numCompare', { kind: 'numCompare', op: '>=', value: 42 }],
+        // value 0 is falsy — guards against truthiness checks dropping it.
+        ['numCompare zero', { kind: 'numCompare', op: '=', value: 0 }],
         ['numBetween', { kind: 'numBetween', lo: 1, hi: 9, inclusive: true }],
+        ['numBetween zero-width at origin', { kind: 'numBetween', lo: 0, hi: 0, inclusive: true }],
         ['numNotBetween', { kind: 'numNotBetween', lo: -3.5, hi: 2.5, inclusive: false }],
         ['setIn numeric codes (checklist)', { kind: 'setIn', values: [1, 2, 8] }, true],
+        // code 0 is a valid labelled-numeric level and must survive (checklist
+        // mode bypasses the free-text filter(Boolean) that would drop it).
+        ['setIn numeric codes incl. zero (checklist)', { kind: 'setIn', values: [0, 1, 2] }, true],
         ['setNotIn string labels (checklist)', { kind: 'setNotIn', values: ['Male', 'Female'] }, true],
         ['setIn string values (free-text)', { kind: 'setIn', values: ['a', 'b'] }, false],
         ['strContains', { kind: 'strContains', value: 'foo', caseSensitive: false, negate: false }],

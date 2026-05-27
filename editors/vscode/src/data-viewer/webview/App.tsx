@@ -1627,6 +1627,10 @@ export function App({
                     if (!editorColumn) return null;
                     return (
                         <FilterPopover
+                            // Key by target column so switching columns forces a
+                            // remount and re-seeds the form from that column's
+                            // filter; the seed runs only in useState initializers.
+                            key={editorColumnIndex}
                             column={editorColumn}
                             columnIndex={editorColumnIndex}
                             histogram={histograms[editorColumnIndex]}
