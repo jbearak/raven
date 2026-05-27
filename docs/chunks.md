@@ -24,6 +24,8 @@ Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct sy
 
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
+| `Cmd+Enter` | `Ctrl+Enter` | Run Line or Selection |
+| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`) |
 | `Cmd+Alt+Enter` | `Ctrl+Alt+Enter` | Run Current Chunk |
 | `Cmd+Alt+Shift+Enter` | `Ctrl+Alt+Shift+Enter` | Run Current Chunk and Move |
 | `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Previous Chunk |

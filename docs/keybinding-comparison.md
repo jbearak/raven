@@ -13,6 +13,8 @@ Raven's chunk keybindings are aligned with the [Quarto VS Code extension](https:
 
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
+| `Cmd+Enter` | `Ctrl+Enter` | Run Line or Selection |
+| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`) |
 | `Cmd+Alt+Enter` | `Ctrl+Alt+Enter` | Run Current Chunk |
 | `Cmd+Alt+Shift+Enter` | `Ctrl+Alt+Shift+Enter` | Run Current Chunk and Move |
 | `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Previous Chunk |
@@ -28,6 +30,8 @@ Raven's chunk keybindings are aligned with the [Quarto VS Code extension](https:
 
 | Shortcut (Mac) | Raven | Quarto | RStudio | REditorSupport |
 |----------------|-------|--------|---------|----------------|
+| `Cmd+Enter` | Run Line or Selection | Run Current Code | Run current line/selection | Run Selection |
+| `Cmd+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`) | Run Current Cell | Source document (with echo) | Run Current Chunk (`.Rmd`) / Source with Echo (`.R`) |
 | `Cmd+Alt+Enter` | Run Current Chunk | — | Send line to terminal | — |
 | `Cmd+Shift+Enter` | — | Run Current Cell | Source document (with echo) | Run Current Chunk |
 | `Cmd+Alt+P` | Run Previous Chunk | Run Previous Cell | Re-run previous region | Run Above Chunks |
