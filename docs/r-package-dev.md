@@ -102,7 +102,7 @@ test_that("works on demo_input", {
 ```
 
 Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
-for visibility purposes; declare any cross-file fixtures in `helper-*.R`.
+for visibility purposes; declare any cross-file fixtures in `helper*.R`.
 
 ### Build commands
 

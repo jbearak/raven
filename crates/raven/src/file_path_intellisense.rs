@@ -8521,6 +8521,40 @@ mod resolve_base_directory_tests {
     }
 
     #[test]
+    fn test_resolve_base_directory_forward_directive_file_relative_beats_fallback() {
+        // Precedence mirror of the workspace-fallback test: when the
+        // file-relative directory exists, source-like resolution wins and the
+        // workspace-root fallback is never consulted. Mirrors the SourceCall arm.
+        let temp_dir = TempDir::new().unwrap();
+        let child_dir = temp_dir.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let child_scripts = child_dir.join("scripts");
+        fs::create_dir(&child_scripts).unwrap();
+        let workspace_scripts = temp_dir.path().join("scripts");
+        fs::create_dir(&workspace_scripts).unwrap();
+
+        let file_uri = Url::from_file_path(child_dir.join("main.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let context = FilePathContext::Directive {
+            directive_type: DirectiveType::Source,
+            partial_path: "scripts/".to_string(),
+            path_start: Position {
+                line: 0,
+                character: 14,
+            },
+        };
+
+        let result = resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root));
+
+        assert!(result.is_some());
+        // Both <child>/scripts and <workspace>/scripts exist; the file-relative
+        // path wins over the workspace-root fallback.
+        assert_eq!(result.unwrap(), child_scripts);
+    }
+
+    #[test]
     fn test_resolve_base_directory_none_context() {
         // FilePathContext::None should return None
         let file_uri = Url::parse("file:///project/src/main.R").unwrap();
@@ -9195,6 +9229,53 @@ mod file_path_definition_tests {
             location.uri,
             Url::from_file_path(&workspace_target).unwrap()
         );
+    }
+
+    #[test]
+    fn test_file_path_definition_forward_directive_file_relative_beats_fallback() {
+        // Precedence mirror of the workspace-fallback test: when the
+        // file-relative target exists, cmd-click resolves to it and the
+        // workspace-root fallback is never consulted.
+        let temp_dir = TempDir::new().unwrap();
+        let child_dir = temp_dir.path().join("child");
+        fs::create_dir(&child_dir).unwrap();
+        let child_scripts = child_dir.join("scripts");
+        fs::create_dir(&child_scripts).unwrap();
+        let child_target = child_scripts.join("helpers.R");
+        fs::write(&child_target, "# child candidate").unwrap();
+        let workspace_scripts = temp_dir.path().join("scripts");
+        fs::create_dir(&workspace_scripts).unwrap();
+        let workspace_target = workspace_scripts.join("helpers.R");
+        fs::write(&workspace_target, "# workspace candidate").unwrap();
+
+        let main_path = child_dir.join("main.R");
+        let code = "# @lsp-source scripts/helpers.R";
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&main_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        let position = Position {
+            line: 0,
+            character: 22,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        // Both <child>/scripts/helpers.R and <workspace>/scripts/helpers.R
+        // exist; the file-relative target wins over the workspace-root fallback.
+        let location = result.expect(
+            "Forward directive cmd-click should resolve to the file-relative target when it exists",
+        );
+        assert_eq!(location.uri, Url::from_file_path(&child_target).unwrap());
     }
 
     #[test]

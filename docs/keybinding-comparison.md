@@ -33,7 +33,6 @@ Raven's chunk keybindings are aligned with the [Quarto VS Code extension](https:
 | `Cmd+Enter` | Run Line or Selection | Run Current Code | Run current line/selection | Run Selection |
 | `Cmd+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`) | Run Current Cell | Source document (with echo) | Run Current Chunk (`.Rmd`) / Source with Echo (`.R`) |
 | `Cmd+Alt+Enter` | Run Current Chunk | — | Send line to terminal | — |
-| `Cmd+Shift+Enter` | — | Run Current Cell | Source document (with echo) | Run Current Chunk |
 | `Cmd+Alt+P` | Run Previous Chunk | Run Previous Cell | Re-run previous region | Run Above Chunks |
 | `Cmd+Alt+N` | Run Next Chunk | Run Next Cell | Run next Sweave/Rmd chunk | *(unbound)* |
 | `Cmd+Alt+Shift+P` | Run Above Chunks | Run Cells Above | Run previous Sweave/Rmd code | *(unbound)* |
