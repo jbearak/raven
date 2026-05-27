@@ -2,7 +2,7 @@
   "name": "raven-r",
   "displayName": "Raven - R Language Server",
   "description": "R language server with cross-file awareness, plus an R console and plot, data, and help viewers",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "jbearak",
   "icon": "icon.png",
   "license": "GPL-3.0",
