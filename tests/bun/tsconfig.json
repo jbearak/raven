@@ -30,7 +30,6 @@
     "resolveJsonModule": true,
     "types": ["bun"],
     "typeRoots": ["../../editors/vscode/node_modules/@types"],
-    "baseUrl": ".",
     "paths": {
       "*": [
         "../../editors/vscode/node_modules/@types/*",
