@@ -86,7 +86,13 @@ test("VS Code package metadata registers mixed-case JAGS and Stan extensions", (
   expect(stan?.extensions).toEqual([".stan", ".Stan", ".STAN"]);
 });
 
-test("VS Code package metadata activates on JAGS and Stan languages", () => {
+test("VS Code package metadata activates on r/jags/stan via contributes.languages", () => {
+  // VS Code >= 1.74 auto-generates onLanguage:* activation events from
+  // contributes.languages, so Raven declares no explicit onLanguage entries
+  // (they were dropped to clear manifest warnings). The language contribution
+  // below is what now drives activation, so that is what we guard here. The
+  // live runtime confirmation that these languages are actually registered
+  // lives in the Mocha suite, editors/vscode/src/test/language-activation.test.ts.
   const packageJsonPath = path.join(
     import.meta.dir,
     "..",
@@ -96,10 +102,13 @@ test("VS Code package metadata activates on JAGS and Stan languages", () => {
     "package.json",
   );
   const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+  const languageIds = (pkg.contributes.languages as Array<{ id: string }>).map(
+    (language) => language.id,
+  );
 
-  expect(pkg.activationEvents).toContain("onLanguage:r");
-  expect(pkg.activationEvents).toContain("onLanguage:jags");
-  expect(pkg.activationEvents).toContain("onLanguage:stan");
+  expect(languageIds).toContain("r");
+  expect(languageIds).toContain("jags");
+  expect(languageIds).toContain("stan");
 });
 
 test("VS Code package metadata pins .Rmd files to the rmd language via files.associations", () => {
