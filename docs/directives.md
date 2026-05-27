@@ -34,7 +34,7 @@ Symbols from the target file become available after the directive's line. Option
 
 ```r
 # @lsp-source utils/helpers.R line=eof
-# Symbols become available at end of file
+# Symbols become available at end of file (line=end is an accepted synonym)
 ```
 
 **Path resolution:** Forward directives respect `@lsp-cd` (same as `source()` calls).

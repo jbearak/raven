@@ -63,7 +63,7 @@ Any LSP client that supports stdio transport:
 raven --stdio
 ```
 
-Configure your editor's LSP client to run this command for `.R`, `.r`, `.Rmd`, `.jags`, `.bugs`, and `.stan` files.
+Configure your editor's LSP client to run this command for `.R`, `.r`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, and `.stan` files.
 
 ## Agent Integration
 

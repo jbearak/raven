@@ -37,7 +37,7 @@ Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct sy
 
 The letter-key shortcuts (`P`/`N`) are execution commands aligned with the [Quarto VS Code extension](https://quarto.org/docs/tools/vscode.html): unshifted runs a single neighbor chunk, Shift escalates to all chunks above/below. Navigation uses `PageDown`/`PageUp`. See [Keybinding Comparison](./keybinding-comparison.md) for a cross-tool reference.
 
-In `.R` files without `# %%` cell markers the current-chunk shortcuts surface a warning; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
+In `.R` files without `# %%` cell markers the current-chunk shortcuts surface an information notification; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
 
 ## Commands
 

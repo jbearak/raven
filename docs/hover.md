@@ -30,10 +30,10 @@ Each step takes the first hit and stops; steps 2–4 never run once a match is f
 When the hover is built from a local or sourced definition, Raven adds one line underneath the code block so you can jump to the definition (package exports use the help-panel link instead — see below):
 
 - Defined in the same file: `this file, line N`.
-- Defined in another file: `[rel/path.R](file:///…), line N` — click the link to open that file at the definition.
+- Defined in another file: `[rel/path.R](file:///…), line N` — click the link to open that file. The link carries no line fragment, so the file opens at the top; the `line N` text is informational. To land on the definition, use go-to-definition instead.
 - Definition statement couldn't be extracted (e.g. the defining file has since moved or changed): Raven falls back to a `*Defined in rel/path.R*` italic attribution.
 
-The relative path is computed against the workspace root when one is available, so hovering a symbol defined in `R/utils.R` shows exactly that — not an absolute URI. This is the same path the go-to-definition navigation uses; see [Go-to-Definition](go-to-definition.md#cross-file-navigation).
+The relative path is computed against the workspace root when one is available, so hovering a symbol defined in `R/utils.R` shows exactly that — not an absolute URI. The link points at the same file go-to-definition navigates to (go-to-definition additionally positions the cursor on the definition); see [Go-to-Definition](go-to-definition.md#cross-file-navigation).
 
 ## Declared Symbols
 

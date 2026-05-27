@@ -45,13 +45,15 @@ side-by-side.
 - `matrix`. If the matrix has non-default rownames, they appear as a
   leading `rowname` column; auto-generated `1..N` rownames are dropped
   in favor of the viewer's row-number gutter.
-- Other classes raise an error in R, mirroring Positron:
+- Other classes raise an error in R:
 
   ```r
   > View(1)
-  Error in `View()`:
-  ! Can't `View()` an object of class `numeric`
+  Error: Can't `View()` an object of class `numeric`
   ```
+
+  The class is shown as `paste(class(x), collapse = "/")`, so an object with
+  multiple classes (e.g. a `tbl_df`) reports them joined with `/`.
 
 ## Triggering
 

@@ -81,6 +81,10 @@ See [Cross-File Awareness](cross-file.md#automatic-source-detection) and [Direct
 
 Cmd-click on a symbol that comes from an installed package (e.g. `dplyr::mutate` after `library(dplyr)`) does **not** navigate. Package exports are tracked for completions, diagnostics, and hover, but Raven doesn't currently open installed package sources. Use hover to see the `{package}` attribution instead.
 
+## R Markdown and Quarto
+
+Go-to-definition is disabled in `.Rmd` and `.qmd` documents — Raven returns no result rather than resolving across prose and chunk boundaries. Edit a chunk's R in a `.R` file if you need navigation. (Hover and find-references are likewise disabled in these documents.)
+
 ## JAGS and Stan
 
 For `.stan`, `.jags`, and `.bugs` files, Raven provides best-effort go-to-definition within the current file:

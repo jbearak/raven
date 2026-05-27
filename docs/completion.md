@@ -18,11 +18,11 @@ Raven offers context-aware completions for R symbols, package exports, function 
 Completions respect execution order. A symbol is only offered if it would be defined at the cursor's position at runtime:
 
 ```r
-# Line 1: only base + package symbols available
+# Before this line: only base symbols + earlier local definitions
 library(dplyr)
-# Line 3: dplyr exports now available
+# After the library() call: dplyr exports now available
 source("utils.R")
-# Line 5: symbols from utils.R now available
+# After the source() call: symbols from utils.R now available
 ```
 
 Symbols defined below the cursor in the same file are not offered at the global level. Inside function bodies, global definitions are hoisted (see [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting)).
@@ -36,7 +36,7 @@ library(dplyr)
 mut  # Offers: mutate {dplyr}, mutate_all {dplyr}, ...
 ```
 
-Package completions are position-aware — they only appear after the `library()` call. Packages loaded in parent files (before the `source()` call to the current file) are also available.
+Package completions are position-aware — they only appear after the `library()` call. Packages loaded in parent files (before the `source()` call to the current file) are also available. They require package awareness (`raven.packages.enabled`, on by default); base-package symbols additionally wait until the package library has finished loading.
 
 ## Function Parameter Completions
 
@@ -78,7 +78,7 @@ Symbols from sourced files appear with their source file indicated:
 ```r
 # main.R
 source("utils.R")
-help  # Offers: helper_function (from utils.R)
+help  # Offers: helper_function — "from utils.R" as the item detail
 ```
 
 ## JAGS and Stan

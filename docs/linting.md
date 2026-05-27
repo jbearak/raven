@@ -257,14 +257,14 @@ REditorSupport's LSP will surface `lintr` diagnostics; Raven will continue to su
 
 ## Suppression matrix
 
-Raven recognizes both `lintr` and its own suppression markers. All four apply to lint diagnostics. `# @lsp-ignore` and `# @lsp-ignore-next` additionally apply to Raven's other diagnostics — undefined-variable, cross-file, and invalid-assignment-target errors — but **not** to structural syntax parse errors (unbalanced brackets, orphan `else`, etc.), which can only be turned off with `raven.diagnostics.enabled`. `# nolint` and `# nolint start/end` apply to lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks only; they do not suppress any parse-error diagnostics.
+Raven recognizes both `lintr` and its own suppression markers. All four apply to lint diagnostics. `# @lsp-ignore` and `# @lsp-ignore-next` additionally apply to several of Raven's other diagnostics — undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol errors. They do **not** suppress structural syntax parse errors (unbalanced brackets, orphan `else`, etc.), which can only be turned off with `raven.diagnostics.enabled`, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth exceeded, redundant directive), which are governed only by their own [severity settings](diagnostics.md#cross-file-diagnostics). `# nolint` and `# nolint start/end` apply to lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks only; they do not suppress any parse-error diagnostics.
 
 | Marker | Scope | Origin | Applies to |
 |---|---|---|---|
 | `# nolint` (trailing) | The line it appears on | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
 | `# nolint: rule_a, rule_b` | The line it appears on | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks (rule filter accepted but currently ignored — suppresses all rules on the line) |
 | `# nolint start` … `# nolint end` | Inclusive range between the two markers | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
-| `# @lsp-ignore` | The line it appears on | Raven | All Raven diagnostics **except** structural syntax parse errors (those need `raven.diagnostics.enabled`) |
+| `# @lsp-ignore` | The line it appears on | Raven | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol diagnostics. **Not** parse errors, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth, redundant directive) |
 | `# @lsp-ignore-next` | The *following* source line | Raven | Same as `# @lsp-ignore` |
 
 Notes:
