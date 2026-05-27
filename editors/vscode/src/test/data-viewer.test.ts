@@ -16,12 +16,17 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { spawnSync } from 'child_process';
 import type { RavenExtensionApi } from '../extension';
-import { activate, isClaudeCodeSandbox, sleep } from './helper';
+import { activate, sleep } from './helper';
 
+/** Poll until a data-viewer panel named `panelName` exists, or the deadline
+ *  elapses. Default 60 s: the first `View()` in a suite pays the cold R-session
+ *  cost (R boot + `arrow` load + Arrow write + HTTP POST), which overruns a
+ *  tighter budget under CPU contention. Callers with a warm session or a large
+ *  frame may pass an explicit timeout. */
 async function pollForPanel(
     api: RavenExtensionApi,
     panelName: string,
-    timeoutMs = 10000,
+    timeoutMs = 60000,
 ): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -227,15 +232,6 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
     });
 
     test('End key reaches the last row in a 700K-row data frame', async function () {
-        // Under the Claude Code sandbox, CPU contention and the FSEvents
-        // disablement push this scenario past the 60 s scroll-budget. The
-        // test passes on CI and in isolation; under the sandbox it times
-        // out non-deterministically. Self-skip so local runs report
-        // "skipped (sandbox)" rather than a misleading timeout failure.
-        if (isClaudeCodeSandbox()) {
-            this.skip();
-            return;
-        }
         // R startup + 700K rnorm + arrow write + scroll round-trip can run
         // up against the suite's 120 s default when earlier suites have put
         // the runner under load. Give this test its own larger budget so
@@ -297,11 +293,6 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
     });
 
     test('Scroll to bottom reaches last row in 700K-row data frame', async function () {
-        // Sandbox self-skip — same reason as the End-key 700K test above.
-        if (isClaudeCodeSandbox()) {
-            this.skip();
-            return;
-        }
         // R startup + 700K rnorm + arrow write + scroll round-trip can
         // run up against the suite's 120 s default when earlier suites
         // have put the runner under load.
@@ -388,14 +379,6 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
     });
 
     test('Scroll to 50% lands near row N/2 in 700K-row data frame', async function () {
-        // Sandbox self-skip — same reason as the other two 700K-row tests
-        // above. Without the panel pre-warming the earlier tests provided
-        // (now skipped under sandbox), this one's cold start on top of
-        // sandbox CPU contention reliably overruns its budget too.
-        if (isClaudeCodeSandbox()) {
-            this.skip();
-            return;
-        }
         this.timeout(240000);
         const N = 700_000;
 

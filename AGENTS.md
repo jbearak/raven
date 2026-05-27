@@ -88,7 +88,6 @@ Items here have no natural code home — they span multiple systems, depend on e
 
 ### Environment / tooling
 
-- **macOS FSEvents** callbacks don't fire when the process is sandboxed by Claude Code; tests that depend on filesystem notifications self-skip via `isClaudeCodeSandbox()` in `editors/vscode/src/test/helper.ts`.
 - **VS Code test races**: `showTextDocument(doc)`'s promise resolves before VS Code finishes promoting the editor to active, and a focused webview can leave `activeTextEditor` `undefined`. Tests whose command handlers read `activeTextEditor` must call `awaitActive(editor)` (see `editors/vscode/src/test/helper.ts`) after `showTextDocument` and before each `executeCommand`.
 - **Linux inotify**: libpath watching is recursive (one watch per descendant directory, ~10–20 per installed package). On old distros capped at the legacy 8192 default, warn users to raise `fs.inotify.max_user_watches`.
 - **DOMPurify pin**: `dompurify` lives in `editors/vscode/package.json` (NOT the root) and is exact-pinned (no `^`). A version bump must re-pass `tests/bun/plot-webview-sanitize.test.ts`. Do NOT add `@types/dompurify` — the package ships its own types.
