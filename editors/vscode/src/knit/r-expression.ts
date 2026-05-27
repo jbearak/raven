@@ -10,9 +10,10 @@
  *      diagnostic output and have no legitimate place in a path), and
  *      DEL. Tab is allowed because some filesystems permit it.
  *   2. `validateFormatIdentifier` enforces a strict allow-pattern for the
- *      `output_format` argument: identifier chars plus `::`, `.`, and
- *      `-`. The pattern is defense in depth — the YAML parser already
- *      hands us a string from a controlled grammar.
+ *      YAML output-format value: identifier chars plus `::`, `.`, and
+ *      `-`. The HTML-only pipeline no longer passes this to R, but we
+ *      still validate its shape — defense in depth, since the YAML
+ *      parser already hands us a string from a controlled grammar.
  *
  * `escapeRString` itself is straightforward (backslash and apostrophe
  * escapes inside single quotes); the bulk of the security work is the
@@ -69,9 +70,12 @@ export function validatePathForRExpression(value: string): void {
 const FORMAT_IDENTIFIER_PATTERN = /^[A-Za-z0-9_:.-]+$/;
 
 /**
- * Enforce the strict allow-pattern for the `output_format` argument we
- * pass to `rmarkdown::render`. The pattern covers what YAML front matter
- * legitimately produces (`html_document`, `bookdown::pdf_document2`,
+ * Enforce the strict allow-pattern for the YAML output-format value. The
+ * current HTML-only pipeline no longer passes this to R (see
+ * `KnitInput.format`); we still validate its shape so a malformed value
+ * short-circuits before we spawn R, and so the check stays correct for
+ * any future format-passing path. The pattern covers what YAML front
+ * matter legitimately produces (`html_document`, `bookdown::pdf_document2`,
  * `default`, `all`, ...) and rejects anything that could break out of an
  * R identifier or call into a different function.
  */

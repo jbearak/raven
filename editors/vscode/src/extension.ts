@@ -63,6 +63,24 @@ function getInitializationOptions(): RavenInitializationOptions {
 let client: LanguageClient;
 const R_CONSOLE_ENABLED_CONTEXT = 'raven.rConsoleEnabled';
 const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
+
+/**
+ * Languages whose `editor.wordSeparators` we override so that dots are part of
+ * a word — affecting double-click selection and word-wise cursor motion over
+ * dotted names like `my.variable`.
+ *
+ * `rmd` and `quarto` are deliberately EXCLUDED, even though they reuse R's
+ * `language-configuration.json` and therefore already get the *other* half of
+ * this feature (the `wordPattern`, which drives Cmd+click / `getWordRangeAtPosition`
+ * across dotted names — see the wordPattern tests in `lsp.test.ts`).
+ *
+ * The asymmetry is intentional: `editor.wordSeparators` resolves per *document*
+ * language, not per embedded code chunk. An `.Rmd`/`.qmd` file is a single
+ * `rmd`/`quarto` document mixing Markdown prose with R chunks, so overriding
+ * `[rmd]`/`[quarto]` would change word selection in the prose too, not just the
+ * R code. We scope the separator override to pure R/JAGS documents and let the
+ * shared `wordPattern` cover dotted-name navigation inside `.Rmd`/`.qmd`.
+ */
 const DOT_IN_WORD_LANGUAGE_IDS = ['r', 'jags'] as const;
 
 function hasWordSeparatorsOverride(configValue: unknown): boolean {

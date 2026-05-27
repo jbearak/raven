@@ -176,11 +176,11 @@ User-facing explanation/examples live in `docs/cross-file.md`.
 
 For codebases without `@lsp-cd`, `source()` paths are often written relative to the workspace root.
 
-For **AST-detected `source()` calls only**, Raven attempts:
+For **AST-detected `source()` calls and forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`), Raven attempts:
 1. File-relative resolution
 2. If the file does not exist *and* there is no explicit/inherited working directory: try workspace-root-relative resolution
 
-This fallback must **not** apply to backward directives.
+Forward directives are semantically equivalent to `source()` calls (see `.kiro/specs/lsp-source-directive/`) and must resolve identically across dependency edges, scope, diagnostics, cmd-click, and path completion. This fallback must **not** apply to backward directives.
 
 ### Parent-prefix scope and forward-source traversal
 
@@ -275,6 +275,7 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 - **`roxygen.rs`** — Parses roxygen2 (`#'`) and plain comment blocks above function definitions. Extracts title, description, and `@param` entries for hover and completion documentation.
 - **`content_provider.rs`** — Unified file access abstraction. Respects the "open docs are authoritative" rule: open documents are read from the document store; closed files fall through to disk/cache.
 - **`editors/vscode/src/knit/knit-output-panel.ts`** — Per-source-path webview-panel registry for the `Raven: Knit` output viewer. Keyed by `sourceUri.fsPath` (aligned with the in-flight gate in `knit-commands.ts`). Tracks a `previewColumn` static so new panels stack as tabs in a single column rather than scattering; `recomputePreviewColumn` runs on every `onDidChangeViewState` / `onDidDispose` and adopts a surviving panel's column when the recorded one empties. The companion `help/help-panel.ts` remains a singleton (one R-help context per session is the right shape for that domain). See `docs/superpowers/specs/2026-05-17-knit-panel-per-file-design.md`.
+- **`editors/vscode/src/viewer-tab-icon.ts`** + **`version-gate.ts`** — Editor-tab icons for the four webview viewers, assigned via `WebviewPanel.iconPath`. Codicon ids: help → `question`, data → `table`, plot → `graph`, knit → `book`. `WebviewPanel.iconPath` only honors a `ThemeIcon` at runtime on VSCode ≥ 1.110 (microsoft/vscode#282608); Raven's engine floor is `^1.82.0`, so `viewerTabIcon` returns `undefined` on older hosts (leaving the default page icon) and is the single gate for the check. The `@types/vscode` dev-dependency floor is `^1.110.0` so the `ThemeIcon` `iconPath` variant type-checks — a compile-time-only bump; the runtime engine floor is intentionally lower, and the `vscode.version` guard is the standard pattern for using post-floor APIs. `version-gate.ts` stays free of any `vscode` import so the pure `meetsMinVersion` is bun-testable (`tests/bun/version-gate.test.ts`).
 
 ## Coding conventions (repo-level)
 

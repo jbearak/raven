@@ -169,7 +169,7 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     resolve_path_impl(path, context, false)
 }
 
-/// Resolve a path with workspace-root fallback for source() statements.
+/// Resolve a path with workspace-root fallback for source() statements and forward directives.
 ///
 /// This function first tries normal resolution (relative to file's directory or @lsp-cd).
 /// If that fails AND the file has no explicit working directory directive, it falls back
@@ -178,8 +178,11 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
 /// This is useful for codebases that haven't been annotated with LSP directives but where
 /// source() calls use paths relative to the project root (a common pattern in R projects).
 ///
-/// Use this for source() statements. Do NOT use for backward directives (@lsp-sourced-by)
-/// which should always resolve relative to the file's directory.
+/// Use this for AST-detected `source()` calls AND for forward directives (`@lsp-source`,
+/// `@lsp-run`, `@lsp-include`). Forward directives are semantically equivalent to
+/// `source()` calls (see `.kiro/specs/lsp-source-directive/`) and must resolve identically.
+/// Do NOT use for backward directives (`@lsp-sourced-by`, `@lsp-run-by`,
+/// `@lsp-included-by`) which always resolve relative to the file's directory.
 pub fn resolve_path_with_workspace_fallback(path: &str, context: &PathContext) -> Option<PathBuf> {
     resolve_path_impl(path, context, true)
 }

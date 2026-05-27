@@ -72,12 +72,12 @@ If the DESCRIPTION does not declare testthat, no implicit attachment happens —
 the diagnostic stays as "undefined variable" until the user either adds
 `Suggests: testthat` (the conventional fix) or adds an explicit `library(testthat)`.
 
-#### Helper files (`tests/testthat/helper-*.R`)
+#### Helper files (`tests/testthat/helper*.R`)
 
 `testthat::source_test_helpers` sources files matching `^helper.*\.[Rr]$`
 in `sort()` order before each test runs. Raven mirrors this:
 
-- Top-level definitions in any `tests/testthat/helper-*.R` file are visible
+- Top-level definitions in any `tests/testthat/helper*.R` file are visible
   from `test-*.R` (and other non-helper test files), because by the time a
   test runs all helpers have been sourced.
 - Between helpers, visibility follows sourcing order: a helper sees
@@ -102,7 +102,7 @@ test_that("works on demo_input", {
 ```
 
 Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
-for visibility purposes; declare any cross-file fixtures in `helper-*.R`.
+for visibility purposes; declare any cross-file fixtures in `helper*.R`.
 
 ### Build commands
 
@@ -132,7 +132,7 @@ so a stray `setwd()` in the R session — or a terminal launched from a
 subdirectory — can't redirect the build at the wrong project.
 
 The six commands also appear as a single `$(package)` submenu in the
-editor title bar when an R file is open in a package workspace.
+editor title bar when an R, R Markdown, or Quarto file is open in a package workspace.
 
 #### Terminal routing
 

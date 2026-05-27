@@ -29,6 +29,8 @@ Demonstrates R package mode. Contains a `DESCRIPTION` file that triggers mutual 
 - `R/analysis.R` — uses `validate_input` (no diagnostic expected)
 - `R/boundary.R` — references `test_only_helper` (diagnostic expected — tests/ symbols aren't visible from R/)
 - `tests/testthat/test-analysis.R` — uses `run_analysis` from R/ (no diagnostic expected)
+- `tests/testthat/helper-fixtures.R` — a `helper-*.R` file; its symbols are auto-sourced and visible to peer test files in the same directory (no diagnostic expected)
+- `tests/testthat.R` — the standard testthat runner
 
 ### `linting-raven-toml/`
 Demonstrates linting configured via `raven.toml`. Open this folder and check that `lint_violations.R` shows lint diagnostics.
@@ -46,7 +48,7 @@ Demonstrates chunk detection in R Markdown and Quarto files.
 - `report.qmd` — Quarto document with R chunks using `#|` options
 
 ### `data-viewer-smoke.R`
-Manual smoke tests for the data viewer (large frames, labels, copy, scrolling). Run sections interactively in the R console.
+Manual smoke tests for the data viewer, run section by section in the R console: a 10M-row synthetic frame (scrolling and bounded memory), variable and value labels via `haven` (NHANES variable labels plus a real SPSS file — the Western Electric study — for value labels), the Format/digits toggle, and copy-to-clipboard into a spreadsheet.
 
 ## Automated Coverage
 

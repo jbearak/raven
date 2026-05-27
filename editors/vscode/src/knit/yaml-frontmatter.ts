@@ -183,11 +183,12 @@ export function isSupportedHtmlFormat(format: string): boolean {
 }
 
 /**
- * Format identifier the knit subprocess should pass to
- * `rmarkdown::render`'s `output_format` argument. Returns
- * `"html_document"` whenever the document doesn't specify a format we
- * can recognize — matches rmarkdown's own default and lets a user with
- * no `output:` field still produce HTML.
+ * The rmarkdown `output_format` identifier named by the document's
+ * `output:` field. The HTML-only knit pipeline no longer passes this to
+ * R (chunks render via `knitr::knit`); it's kept for gating and logging.
+ * Returns `"html_document"` whenever the document doesn't specify a
+ * format we can recognize — matches rmarkdown's own default and lets a
+ * user with no `output:` field still produce HTML.
  */
 export function detectFormat(fm: FrontmatterDoc): string {
     const output = fm.output;

@@ -34,7 +34,7 @@ Symbols from the target file become available after the directive's line. Option
 
 ```r
 # @lsp-source utils/helpers.R line=eof
-# Symbols become available at end of file
+# Symbols become available at end of file (line=end is an accepted synonym)
 ```
 
 **Path resolution:** Forward directives respect `@lsp-cd` (same as `source()` calls).
@@ -187,9 +187,10 @@ eval(parse(text = code_string))
 Suppress diagnostics on a specific line:
 
 ```r
-# @lsp-ignore           # Suppress diagnostics on current line (when on own line: next line)
-# @lsp-ignore-next      # Suppress diagnostics on next line
-x <- foo # @lsp-ignore  # Works as trailing comment (suppresses this line)
+x <- foo # @lsp-ignore  # Trailing form: suppresses diagnostics on this line
+# @lsp-ignore-next      # Standalone form: suppresses diagnostics on the next line
 ```
+
+A standalone `# @lsp-ignore` on its own line has no effect — comment lines carry no diagnostics. Use `# @lsp-ignore-next` to suppress the following line, or place `# @lsp-ignore` as a trailing comment on the line you want suppressed.
 
 `@lsp-ignore` is the only directive that can appear as a trailing comment.

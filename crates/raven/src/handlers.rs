@@ -4436,14 +4436,7 @@ async fn collect_missing_file_diagnostics_standalone(
 
     for source in &meta.sources {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            if source.is_directive {
-                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
-            } else {
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                    &source.path,
-                    ctx,
-                )
-            }
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
         if let Some(path) = resolved {
             if let Some(root) = &workspace_root {
@@ -4666,17 +4659,16 @@ pub async fn collect_missing_file_diagnostics_async(
     // Collect all URIs to check: (uri, path, line, col, is_backward, is_directive)
     let mut uris_to_check: Vec<(Url, String, u32, u32, bool, bool)> = Vec::new();
 
-    // Workspace-root fallback is for AST source() calls only, not directives
+    // Workspace-root fallback applies to AST source() calls AND forward
+    // directives (`@lsp-source`, `@lsp-run`, `@lsp-include`). Forward
+    // directives are semantically equivalent to source() calls (see
+    // .kiro/specs/lsp-source-directive/requirements.md Req 3.4 and
+    // dependency.rs::do_resolve), so all four user-facing surfaces —
+    // graph edges, scope resolution, missing-file diagnostics, and file
+    // path intellisense — must agree.
     for source in &meta.sources {
         let resolved_path = forward_ctx.as_ref().and_then(|ctx| {
-            if source.is_directive {
-                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
-            } else {
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                    &source.path,
-                    ctx,
-                )
-            }
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
         if let Some(path) = resolved_path {
             // Guard against paths outside workspace
@@ -4937,14 +4929,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
 
     for source in &meta.sources {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            if source.is_directive {
-                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
-            } else {
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                    &source.path,
-                    ctx,
-                )
-            }
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
         if resolved.is_none() {
             let message = if source.is_directive {
@@ -5150,14 +5135,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         .iter()
         .map(|source| {
             let resolved_uri = source_path_ctx.as_ref().and_then(|ctx| {
-                let resolved = if source.is_directive {
-                    crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
-                } else {
+                let resolved =
                     crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
                         &source.path,
                         ctx,
-                    )
-                }?;
+                    )?;
                 Url::from_file_path(resolved).ok()
             });
             resolved_uri.and_then(|target_uri| {
@@ -5507,14 +5489,10 @@ fn collect_undefined_variables_from_snapshot(
         .filter(|source| source.inherits_symbols())
         .filter_map(|source| {
             let ctx = source_path_ctx.as_ref()?;
-            let resolved = if source.is_directive {
-                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
-            } else {
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                    &source.path,
-                    ctx,
-                )
-            }?;
+            let resolved = crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                &source.path,
+                ctx,
+            )?;
             let source_uri = Url::from_file_path(resolved).ok()?;
             Some((source.line, source.column, source_uri))
         })
@@ -38315,6 +38293,248 @@ result <- helper_with_spaces(42)"#;
                 .iter()
                 .map(|d| (d.message.clone(), d.range))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression lock for the workspace-root-fallback consistency
+    /// invariant: forward directives (`@lsp-source`, `@lsp-run`,
+    /// `@lsp-include`) and AST `source()` calls must resolve identically
+    /// across the four user-facing surfaces.
+    ///
+    /// Setup:
+    ///   workspace/scripts/main.R   `# @lsp-source: helpers.R` (then `foo()`)
+    ///   workspace/helpers.R        `foo <- function() 1`
+    ///   (no workspace/scripts/helpers.R)
+    ///
+    /// `dependency.rs::do_resolve` has used `resolve_path_with_workspace_fallback`
+    /// for forward directives since the directive was added in dda1d8ba.
+    /// `scope.rs` follows the dependency-graph edge, so symbols flow correctly.
+    /// The Camp B regressions in `handlers.rs` (missing-file diagnostics) and
+    /// `file_path_intellisense.rs` (cmd-click + path completion) used to
+    /// branch on `is_directive` and fall through to plain `resolve_path`,
+    /// producing a phony "missing file" diagnostic and broken navigation
+    /// even though the graph edge resolved correctly. The spec
+    /// (`.kiro/specs/lsp-source-directive/requirements.md` Req 3.4 and
+    /// `design.md`) mandates that forward directives are "semantically
+    /// equivalent to source() calls" — so all four surfaces must agree.
+    #[test]
+    fn test_workspace_root_fallback_for_forward_directive() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let scripts_path = workspace_path.join("scripts");
+        std::fs::create_dir(&scripts_path).unwrap();
+
+        let main_path = scripts_path.join("main.R");
+        let helpers_path = workspace_path.join("helpers.R");
+
+        // main.R lives in scripts/; uses `@lsp-source: helpers.R`. Literal
+        // `<scripts>/helpers.R` does NOT exist; only `<workspace>/helpers.R`
+        // does. Workspace-root fallback should resolve to the latter for
+        // forward directives, matching `source()` calls.
+        let main_code = "# @lsp-source: helpers.R\nresult <- foo()\n";
+        let helpers_code = "foo <- function() 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helpers_path, helpers_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helpers_url = Url::from_file_path(&helpers_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.missing_file_severity = Some(DiagnosticSeverity::WARNING);
+
+        state
+            .documents
+            .insert(helpers_url.clone(), Document::new(helpers_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helpers_url,
+            &crate::cross_file::extract_metadata(helpers_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        // (a) DependencyGraph: edge from main.R to <workspace>/helpers.R
+        // via workspace-root fallback. This was already correct before
+        // this fix (Camp A in dependency.rs:do_resolve since dda1d8ba).
+        let outgoing: Vec<_> = state
+            .cross_file_graph
+            .get_dependencies(&main_url)
+            .iter()
+            .map(|e| e.to.clone())
+            .collect();
+        assert!(
+            outgoing.iter().any(|u| u == &helpers_url),
+            "Expected dependency edge main.R -> <workspace>/helpers.R via \
+             workspace-root fallback for the @lsp-source directive. Edges: {:?}",
+            outgoing
+        );
+
+        // (b) Sync diagnostics() snapshot pipeline: no missing-file or
+        // unresolvable-path diagnostic on the directive line. The snapshot
+        // collector doesn't itself check existence, but it does emit
+        // "Cannot resolve path" when resolution returns None. With the fix,
+        // resolution returns Some(<workspace>/helpers.R).
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
+        let directive_path_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.range.start.line == 0
+                    && (d.message.contains("Cannot resolve")
+                        || d.message.contains("not found")
+                        || d.message.contains("does not exist")
+                        || d.message.contains("missing")
+                        || d.message.contains("@lsp-source"))
+            })
+            .collect();
+        assert!(
+            directive_path_diags.is_empty(),
+            "Expected NO missing-file/path diagnostic on the @lsp-source \
+             directive line — workspace-root fallback should resolve \
+             helpers.R to <workspace>/helpers.R. Got: {:?}",
+            directive_path_diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+
+        // (b') Async standalone missing-file collector (production
+        // did_open/did_change path with disk-existence checks). Camp B
+        // regressed here: plain `resolve_path` returned <scripts>/helpers.R
+        // which fails the existence check, emitting "File 'helpers.R'
+        // referenced by @lsp-source directive not found" even though the
+        // graph edge was fine. With the fix, resolution returns
+        // <workspace>/helpers.R which exists and no diagnostic fires.
+        let directive_meta = crate::cross_file::extract_metadata(main_code);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let async_missing_diags = rt.block_on(async {
+            crate::handlers::collect_missing_file_diagnostics_standalone_for_test(
+                &main_url,
+                &directive_meta,
+                Some(&workspace_url),
+                DiagnosticSeverity::WARNING,
+            )
+            .await
+        });
+        let async_directive_path_diags: Vec<_> = async_missing_diags
+            .iter()
+            .filter(|d| {
+                d.range.start.line == 0
+                    && (d.message.contains("Cannot resolve")
+                        || d.message.contains("not found")
+                        || d.message.contains("does not exist")
+                        || d.message.contains("missing")
+                        || d.message.contains("@lsp-source"))
+            })
+            .collect();
+        assert!(
+            async_directive_path_diags.is_empty(),
+            "Expected NO missing-file diagnostic from the async existence \
+             collector on the @lsp-source directive line — workspace-root \
+             fallback should resolve helpers.R to <workspace>/helpers.R. \
+             Got: {:?}",
+            async_directive_path_diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+
+        // (c) Scope: `foo` is in scope at line 1 in main.R (call site of
+        // foo()). This worked even on Camp B because scope.rs prefers the
+        // dependency-graph edge (Camp A) over re-resolving the path. The
+        // assertion guards against a regression in that fallback chain.
+        let foo_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.message.contains("foo")
+                    && (d.message.contains("Undefined")
+                        || d.message.contains("undefined")
+                        || d.message.contains("out of scope")
+                        || d.message.contains("used before"))
+            })
+            .collect();
+        assert!(
+            foo_diags.is_empty(),
+            "Expected `foo` to be in scope after the @lsp-source directive. \
+             Got: {:?}",
+            foo_diags
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+
+        // (d) Cmd-click on the directive path: file_path_definition should
+        // resolve `helpers.R` to <workspace>/helpers.R via workspace-root
+        // fallback. Camp B returned None here.
+        let tree =
+            crate::parser_pool::with_parser(|p| p.parse(main_code, None)).expect("parse main.R");
+        // Cursor at line 0, column 17 — inside `helpers.R`.
+        let cursor = Position::new(0, 17);
+        let metadata = crate::cross_file::CrossFileMetadata::default();
+        let location = crate::file_path_intellisense::file_path_definition(
+            &tree,
+            main_code,
+            cursor,
+            &main_url,
+            &metadata,
+            Some(&workspace_url),
+        );
+        let location = location.expect(
+            "Expected cmd-click on `helpers.R` inside @lsp-source directive \
+             to resolve to <workspace>/helpers.R via workspace-root fallback",
+        );
+        assert_eq!(
+            location.uri, helpers_url,
+            "Cmd-click on @lsp-source path should land at <workspace>/helpers.R"
+        );
+
+        // (e) Path completion inside the directive when typing `h`: the
+        // completions should include `helpers.R` (from <workspace>/, via
+        // workspace-root fallback). Camp B's base directory was <scripts>/
+        // which doesn't contain helpers.R, so the entry was missing.
+        let typing_main_code = "# @lsp-source: h\nresult <- foo()\n";
+        let typing_tree = crate::parser_pool::with_parser(|p| p.parse(typing_main_code, None))
+            .expect("parse typing main.R");
+        let typing_cursor = Position::new(0, 16); // right after `h`
+        let typing_context = crate::file_path_intellisense::detect_file_path_context(
+            &typing_tree,
+            typing_main_code,
+            typing_cursor,
+        );
+        let completions = crate::file_path_intellisense::file_path_completions(
+            &typing_context,
+            &main_url,
+            &metadata,
+            Some(&workspace_url),
+            typing_cursor,
+        );
+        let labels: Vec<_> = completions.iter().map(|c| c.label.clone()).collect();
+        assert!(
+            labels
+                .iter()
+                .any(|l| l == "helpers.R" || l.ends_with("/helpers.R")),
+            "Expected `helpers.R` in path completions for the @lsp-source \
+             directive (workspace-root fallback should list workspace files). \
+             Got: {:?}",
+            labels
         );
     }
 

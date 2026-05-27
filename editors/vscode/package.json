@@ -17,11 +17,6 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:r",
-    "onLanguage:rmd",
-    "onLanguage:quarto",
-    "onLanguage:jags",
-    "onLanguage:stan",
     "onTerminalProfile:raven.rTerminal"
   ],
   "main": "./dist/extension.js",
@@ -329,21 +324,39 @@
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
-        "command": "raven.runAboveChunks",
+        "command": "raven.runPreviousChunk",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p",
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
-        "command": "raven.goToNextChunk",
+        "command": "raven.runNextChunk",
         "key": "ctrl+alt+n",
         "mac": "cmd+alt+n",
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
-        "command": "raven.goToPreviousChunk",
+        "command": "raven.runAboveChunks",
+        "key": "ctrl+alt+shift+p",
+        "mac": "cmd+alt+shift+p",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.runBelowChunks",
         "key": "ctrl+alt+shift+n",
         "mac": "cmd+alt+shift+n",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.goToNextChunk",
+        "key": "ctrl+pagedown",
+        "mac": "cmd+pagedown",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.goToPreviousChunk",
+        "key": "ctrl+pageup",
+        "mac": "cmd+pageup",
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       }
     ],
@@ -419,6 +432,18 @@
         },
         {
           "command": "raven.knit.openOutputChannel"
+        },
+        {
+          "command": "raven.openHelpPanel",
+          "when": "false"
+        },
+        {
+          "command": "raven.help.back",
+          "when": "false"
+        },
+        {
+          "command": "raven.help.forward",
+          "when": "false"
         }
       ],
       "editor/title": [
@@ -882,7 +907,7 @@
             "Write code to a temporary file and run source() for both single-line and multi-line sends."
           ],
           "default": "auto",
-          "description": "Controls how Raven sends code to R. 'auto' pastes short blocks directly and switches to a temp file once a block has at least raven.sendToR.autoTempFileThresholdLines lines (≥ N). 'paste' always pastes, using bracketed paste mode for multi-line code. 'tempfile' always writes to a temp file and runs source()."
+          "description": "Controls how Raven sends code to R. Auto mode pastes short blocks directly and switches to a temp file once a block has at least raven.sendToR.autoTempFileThresholdLines lines (≥ N); 'paste' always pastes, using bracketed paste mode for multi-line code; 'tempfile' always writes to a temp file and runs source()."
         },
         "raven.sendToR.autoTempFileThresholdLines": {
           "type": "integer",
@@ -894,7 +919,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "description": "Path to raven binary. If empty, uses bundled binary."
+          "description": "Path to the raven binary; if empty, the bundled binary is used."
         },
         "raven.trace.server": {
           "type": "string",
@@ -1193,7 +1218,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "description": "Path to the R executable used for non-interactive subprocess calls (package introspection, library path discovery). If empty, Raven searches for R in the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation. Must point to vanilla R, not radian or arf — those are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses. For the interactive terminal program, see raven.rTerminal.program."
+          "description": "Path to the R executable used for non-interactive subprocess calls such as package introspection and library-path discovery; if empty, Raven searches for R on the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation. Must point to vanilla R, not radian or arf — those are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses. For the interactive terminal program, see raven.rTerminal.program."
         },
         "raven.packages.missingPackageSeverity": {
           "type": "string",
@@ -1262,7 +1287,7 @@
           ],
           "enumDescriptions": [
             "Aligns same-line arguments to opening paren (RStudio convention)",
-            "Indents all arguments relative to previous line",
+            "Indents all arguments one level in from the line that opens the call, ignoring the paren column",
             "Disables AST-aware indentation (Tier 2), keeping only basic declarative rules (Tier 1)"
           ],
           "default": "rstudio",
@@ -1314,7 +1339,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "description": "Absolute path to a Pandoc binary. Leave empty to use PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.)."
+          "description": "Absolute path to a Pandoc binary; leave empty to search PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.)."
         },
         "raven.pandoc.pdfEngine": {
           "type": "string",
@@ -1961,7 +1986,7 @@
     "@types/node": "^20.0.0",
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.1",
-    "@types/vscode": "^1.75.0",
+    "@types/vscode": "^1.110.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.3.9",
     "@vscode/vsce": "^3.9.1",

@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { activate, isClaudeCodeSandbox, sleep } from './helper';
+import { activate, sleep } from './helper';
 import { KnitOutputPanel } from '../knit/knit-output-panel';
 
 /**
@@ -103,16 +103,6 @@ suite('KnitOutputPanel iframe loads rendered HTML', () => {
                 'raw fragment-only href should not survive into the srcdoc',
             );
 
-            // Skip the probe section under the Claude Code sandbox — the
-            // `probe` postMessage handshake intermittently misses its
-            // budget there. The deterministic webview-HTML assertions
-            // above already ran, so we still catch any regression in
-            // marker inlining, `srcdoc` selection, or fragment-anchor
-            // rewriting; only the runtime iframe-loaded check is skipped.
-            if (isClaudeCodeSandbox()) {
-                this.skip();
-                return;
-            }
             // Force the panel to the front of its tab group before
             // probing — when this test runs after the per-source-
             // panel suites (knit-multi-panel, knit-rootdir-change,
@@ -150,17 +140,6 @@ suite('KnitOutputPanel iframe loads rendered HTML', () => {
     });
 
     test('relative <img> in the rendered HTML loads inside the iframe', async function () {
-        // Under the Claude Code sandbox the webview's `probe` postMessage
-        // handshake intermittently misses the 25 s budget under CPU
-        // contention. The test's image assertions all depend on the probe
-        // round-trip, so there's no deterministic portion to keep under
-        // sandbox — skip the whole test there. Self-skip locally so the
-        // suite reports "skipped (sandbox)" rather than a flaky timeout
-        // failure; CI is unaffected (gated on `!process.env.CI`).
-        if (isClaudeCodeSandbox()) {
-            this.skip();
-            return;
-        }
         this.timeout(30000);
         await activate();
 

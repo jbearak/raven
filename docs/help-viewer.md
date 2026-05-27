@@ -4,17 +4,21 @@ The extension provides a built-in help viewer that renders R help (Rd) documenta
 
 ## Why we built this
 
-Raven's help viewer uses the language server's scope analysis to disambiguate which package's help to show. If you hover over `filter(...)` after `library(dplyr)`, Raven's static scope model picks `dplyr::filter` over `stats::filter`. The scope-aware resolution looks at namespace qualifiers (`pkg::fn`), `library()` / `require()` / `loadNamespace()` calls in this file and any sourced files, any in-scope `@lsp-var` / `@lsp-func` declarations, and the standard package-search-path order. See [Comparison: Hover help](./comparison.md#hover-help) for how this differs from other R hover implementations.
+Raven's help viewer uses the language server's scope analysis to disambiguate which package's help to show. If you hover over `filter(...)` after `library(dplyr)`, Raven's static scope model picks `dplyr::filter` over `stats::filter`. The scope-aware resolution looks at namespace qualifiers (`pkg::fn`), `library()` / `require()` / `loadNamespace()` calls in this file and any sourced files, and the standard package-search-path order. (In-scope `@lsp-var` / `@lsp-func` declarations short-circuit to a declaration hover that shows where the symbol was declared, rather than contributing to package help selection.) See [Comparison: Hover help](./comparison.md#hover-help) for how this differs from other R hover implementations.
 
 > [!NOTE]
 > Code intelligence and the help viewer are unaffected by `raven.rConsole.activation`. Code intelligence doesn't depend on a live R session at all — Raven's semantic analysis is static, driven by scope resolution over your source files and installed package metadata. The help viewer, unlike the plot and data viewers, doesn't need the R session managed by Raven either — it shells out to R on demand to render Rd documentation as HTML.
 
 ## How to open it
 
-There are two ways to trigger the help viewer:
+The help viewer is triggered from a hover:
 
-- **From a hover**: Hover over a function call (e.g., `dplyr::filter(...)` or `plot(1:10)`). When the symbol resolves to a known package, the hover bubble displays a bold `pkg::name` heading at the top — click it to open the help panel.
-- **From the command palette**: Run `Raven: Open R Help Panel` (requires a topic argument; typically triggered indirectly via the hover link).
+- **From a hover**: Hover over an identifier (e.g., `dplyr::filter` or `plot`). When the symbol resolves to a known package, the hover bubble displays a bold `pkg::name` heading at the top — click it to open the help panel.
+
+> [!NOTE]
+> Hover-triggered help is only active in `.R` files. It is disabled in R Markdown (`.Rmd`) and Quarto (`.qmd`) files.
+
+There is no command-palette entry: the panel needs a resolved topic and package, which only the hover link supplies, so `raven.openHelpPanel` (and the `raven.help.back` / `raven.help.forward` navigation commands) are hidden from the palette.
 
 ## Navigation
 
@@ -36,7 +40,7 @@ Internal cross-references are rewritten to a custom URL scheme that correctly ro
 - Cross-references within and across packages navigate in-panel. When `Rd2HTML(dynamic = TRUE)` mis-attributes a link to its source package (e.g. `base::plot` linking to `base/plot.default` even though `plot.default` lives in `graphics`, or `graphics::plot.default` linking to `graphics/finite` for the `is.finite` alias in `base`), the renderer falls back to a global `help()` lookup so the link still resolves.
 - Operator topics (`` \`[\` ``, `` \`%in%\` ``, `+`, `if`, etc.) render and navigate correctly.
 - Images embedded in help pages (e.g., `?ggplot2::theme`) render — local files are served via webview URIs from package help directories.
-- External links (`https://`, `http://`, `mailto:`) open via `vscode.env.openExternal`.
+- External links (`https://`, `http://`, `mailto:`) are handed off to VS Code's built-in webview link handling, which shows a single "Do you want to open this URL?" trust prompt and then opens the link in your default browser (or mail client).
 - References to R's canonical bundled manuals — `R-intro`, `R-admin`, `R-data`, `R-exts`, `R-FAQ`, `R-ints`, `R-lang` — are rewritten from the local `<a href="/doc/manual/<name>.html">` form that `Rd2HTML` emits to the canonical CRAN URL (`https://cran.r-project.org/doc/manuals/r-release/<name>.html`) so they open in the user's browser. This is how the `Writing R Extensions` link in `?utils::package.skeleton` resolves. Anchors are percent-encoded and preserved. Manual paths outside this allowlist (e.g. `rw-FAQ.html`, custom or third-party docs) are not rewritten and click does nothing — those targets either live elsewhere on CRAN or aren't published.
 - `Run examples` and per-package `Index` footer links emitted by `Rd2HTML` are stripped before rendering — they pointed at endpoints that have no analog in the panel and would render as no-op links.
 - A failed in-panel navigation (e.g. a topic that genuinely cannot be resolved) leaves the previously rendered topic visible, with the error shown in the toolbar banner. Back/forward continues to operate from the last successful topic, not from the failed attempt.
@@ -65,5 +69,5 @@ Internal cross-references are rewritten to a custom URL scheme that correctly ro
 5. Hover `plot(1:5)` → bold `graphics::plot` heading; click → navigates correctly even cross-package.
 6. Hover an operator: `` ?\`[\` `` or `` ?\`%in%\` `` → bold heading uses the operator, click navigates and renders correctly (verifies percent-encoding round-trip and `is_valid_help_topic`).
 7. Trigger a help page with images (e.g., `?ggplot2::theme` if installed) → images load.
-8. Trigger an unknown topic by directly invoking the command → panel shows the not-found message; previous content & history preserved.
+8. Trigger an unknown topic (hover a symbol whose topic cannot be resolved, or invoke `raven.openHelpPanel` programmatically with a bogus topic) → panel shows the not-found message; previous content & history preserved.
 9. Configure a non-default R via `raven.packages.rPath` and verify help renders against that R installation (open a topic only available in a package installed for that R; should succeed where it would fail against system R).

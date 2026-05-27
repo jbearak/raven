@@ -21,7 +21,8 @@ intentionally narrow:
   so the `.Rmd`'s own directory stays clean. Export commands write the
   final file (HTML / PDF / DOCX) next to the `.Rmd`.
 - Export commands shell out to Pandoc. PDF export additionally needs a
-  LaTeX engine (`xelatex` by default).
+  PDF engine — `xelatex` (a LaTeX engine) by default, or `wkhtmltopdf`
+  (WebKit-based, no LaTeX required).
 - No `.qmd` rendering. That belongs to `quarto.quarto`'s
   `Quarto: Render`.
 
@@ -62,13 +63,15 @@ when an `.Rmd` file is open.
 1. **Trust check.** The command is disabled in untrusted workspaces and
    offers a button to open the trust manager.
 2. **YAML front matter parse.** Raven parses the `---` ... `---` block
-   with the YAML failsafe schema. Malformed YAML opens the
-   `Raven: Knit` output channel with the parse error.
+   with js-yaml's JSON schema (`JSON_SCHEMA`), which preserves YAML
+   `null`, booleans, and numbers as their JS equivalents. Malformed
+   YAML opens the `Raven: Knit` output channel with the parse error.
 3. **Deferred-feature detection.** Raven refuses three document
-   shapes it doesn't implement — `runtime: shiny`, a custom YAML
-   `knit:` hook, and the `site:` field for `rmarkdown::render_site` /
-   `bookdown::bookdown_site`. Each refusal includes a copy-pasteable
-   R command you can run yourself in the R console.
+   shapes it doesn't implement — Shiny documents (`runtime: shiny` or
+   `server: shiny`), a custom YAML `knit:` hook, and the `site:` field
+   for `rmarkdown::render_site` / `bookdown::bookdown_site`. Each
+   refusal includes a copy-pasteable R command you can run yourself in
+   the R console.
 4. **YAML output options.** Any `output:` format (`html_document`,
    `pdf_document`, `word_document`, `bookdown::pdf_document2`, etc.)
    previews as HTML. Nested options are partially honored — see the
@@ -85,8 +88,8 @@ when an `.Rmd` file is open.
      evaluate from R's startup working directory.
 6. **R expression construction.** Raven validates the file and output
    paths (rejecting NUL, most control characters, DEL) and escapes
-   each interpolated value as a single-quoted R literal. The result
-   is one expression:
+   each interpolated value as a single-quoted R literal. The result is
+   a single `local({ ... })` expression. Simplified, it looks like:
    ```r
    local({
      knitr::opts_knit$set(root.dir = '...');
@@ -95,6 +98,9 @@ when an `.Rmd` file is open.
      cat('Output created: ', out, '\n', sep = '')
    })
    ```
+   The real expression also sets `base.dir` and a chunk `fig.path`, and
+   writes the markdown to a `.tmp` sidecar that is atomically renamed
+   into place, so a failed render never overwrites a previous result.
 7. **Subprocess spawn.** Raven spawns `R --no-save --no-restore -e
    <expression>` via `child_process.spawn` (never a shell), inheriting
    the current environment. The R binary path is taken from
@@ -215,8 +221,8 @@ when an `.Rmd` file is open.
     Standard text copy works inside the rendered output:
     Cmd/Ctrl-C copies the current iframe selection to the system
     clipboard, Cmd/Ctrl-A selects all, and right-clicking opens a
-    small menu with **Copy**, **Select All**, and **Open in
-    Browser**. VS Code suppresses the browser's default context menu
+    small menu with **Copy**, **Copy image**, **Select All**, and
+    **Open in Browser**. VS Code suppresses the browser's default context menu
     and does not forward Cmd-C from a nested iframe to its own
     clipboard command, so Raven wires these by hand on the iframe's
     same-origin `contentWindow`.
@@ -287,8 +293,9 @@ output. A notification offers two buttons on success:
   experience for PDF/Word depends on whichever editor or extension
   the host has registered for that file type.
 
-PDF export uses the LaTeX engine configured at `raven.pandoc.pdfEngine`
-(default `xelatex`). If the engine isn't found Raven surfaces an
+PDF export uses the PDF engine configured at `raven.pandoc.pdfEngine`
+(default `xelatex`, a LaTeX engine; `wkhtmltopdf` renders via WebKit
+instead and needs no LaTeX). If the engine isn't found Raven surfaces an
 "Install TinyTeX…" hint.
 
 ### YAML output options honored / ignored
@@ -322,7 +329,7 @@ becoming `rmarkdown::html_document`.
 | `raven.knit.fontFamily` | `""` | Body/prose font for the preview. Empty inherits `markdown.preview.fontFamily`. |
 | `raven.knit.monospaceFontFamily` | `""` | Monospace font for code chunks and output. Empty inherits `editor.fontFamily`. |
 | `raven.pandoc.path` | `""` | Absolute path to a Pandoc binary. Empty uses PATH + standard install locations. |
-| `raven.pandoc.pdfEngine` | `xelatex` | LaTeX engine for PDF export (`xelatex`, `pdflatex`, `lualatex`, `tectonic`, `wkhtmltopdf`). |
+| `raven.pandoc.pdfEngine` | `xelatex` | PDF engine for export. `xelatex`, `pdflatex`, `lualatex`, `tectonic` are LaTeX engines; `wkhtmltopdf` renders via WebKit instead. |
 | `raven.packages.rPath` | (auto) | Path to the R binary. Empty means "search PATH". |
 
 ### Fonts

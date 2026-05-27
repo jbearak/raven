@@ -162,22 +162,3 @@ export async function awaitActive(
         await sleep(25);
     }
 }
-
-/**
- * True when the test runner is invoked under a local Claude Code sandbox.
- *
- * The sandbox env disables FSEvents callbacks on macOS and adds CPU
- * contention that pushes long-running smoke tests past their timeouts.
- * Suites that fail purely because of those constraints (e.g. the 700K-row
- * data-viewer scrolling tests, the knit iframe-load probe) self-skip when
- * this returns `true` so a local run reports "skipped (sandbox)" rather
- * than "failed (timeout)".
- *
- * `CLAUDECODE=1` alone is not enough — Claude-backed CI agents and review
- * lanes also set it (see the `LlmReporter` note in `problemMatchers.test.ts`).
- * Gating additionally on `!process.env.CI` keeps real CI lanes — including
- * Claude-backed ones — running the full suite, where they should.
- */
-export function isClaudeCodeSandbox(): boolean {
-    return process.env.CLAUDECODE === '1' && !process.env.CI;
-}

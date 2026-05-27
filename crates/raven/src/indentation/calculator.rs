@@ -35,8 +35,9 @@ pub enum IndentationStyle {
     /// next-line arguments indent +tab_size from function line.
     #[default]
     RStudio,
-    /// RStudio-minus style: all arguments indent +tab_size from
-    /// previous line regardless of paren position.
+    /// RStudio-minus style: all arguments indent +tab_size from the
+    /// opener line (the line containing the opening paren), ignoring the
+    /// paren column.
     RStudioMinus,
     /// Off: disable Tier 2 AST-aware indentation entirely.
     /// The onTypeFormatting handler returns None (no edits),

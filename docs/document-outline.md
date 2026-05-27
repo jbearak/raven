@@ -141,6 +141,8 @@ fit_model(data)
 
 Cells with no trailing text fall back to `Chunk #N`.
 
+> **Note:** A line like `# %% Setup ----` matches *both* the `# %%` cell-marker pattern and the section-divider pattern, so in a `.R` file it appears **twice** in the outline — once as a collapsible section (Module) and once as a cell entry (Chunk). Use `# %% Setup` (no trailing `----`) if you want only a plain cell.
+
 ## Symbol Types
 
 Raven recognizes the following R constructs and assigns appropriate symbol types:
@@ -160,13 +162,31 @@ calculate <- function(x, y, z = 10) {
 ### Variables
 
 ```r
-# Regular variable assignment
+# Regular variable assignment (RHS is a function call → Field)
 data <- read.csv("data.csv")
 result = process_data(data)
-global_value <<- 42
+cached_value <<- compute_default()
 ```
 
-**Icon:** Variable symbol
+**Icon:** Field symbol (LSP `SymbolKind::FIELD`)
+
+This Field fallback applies only when the right-hand side isn't a recognized literal value. When the RHS *is* a literal, Raven assigns a more specific kind — see [Value-typed variables](#value-typed-variables) below.
+
+### Value-typed variables
+
+When a non-constant-named variable is assigned a literal value, Raven classifies it by the value's type rather than as a plain Field:
+
+```r
+flag    <- TRUE          # Boolean
+count   <- 42            # Number (integer, float, or complex literal)
+label   <- "summary"     # String
+empty   <- NULL          # Null
+missing <- NA            # Constant (also NA_integer_/…, Inf, NaN)
+items   <- c(1, 2, 3)    # Array (c(), vector(), matrix(), array())
+config  <- list(a = 1)   # List
+```
+
+Classification order is: class constructor (`R6Class`/`setRefClass`) → ALL_CAPS constant name → function definition → value type (above) → Field. So `MAX <- 42` is a Constant (name wins), while `count <- 42` is a Number.
 
 ### Constants
 
@@ -381,7 +401,7 @@ Results:
 ```
 
 **Features:**
-- Fuzzy matching: "calc" matches "calculate"
+- Substring matching (case-insensitive): "calc" matches "calculate"
 - Shows file location for each symbol
 - Jump to definition with Enter
 - Searches open documents and indexed workspace files
@@ -506,12 +526,13 @@ Increase the limit:
 
 ### Wrong symbol type/icon
 
-Symbol types are determined by:
-- **Constants:** ALL_CAPS naming pattern (2+ characters)
+Symbol types are determined in this order (first match wins):
 - **Classes:** `R6Class()`, `setClass()`, `setRefClass()` calls
-- **Methods:** `setMethod()` calls
-- **Generics:** `setGeneric()` calls
+- **Constants:** ALL_CAPS naming pattern (2+ characters)
 - **Functions:** `function(...)` on right-hand side
-- **Variables:** All other assignments
+- **Value type:** literal right-hand side → Boolean (`TRUE`/`FALSE`), Number (numeric literal), String, Null (`NULL`), Constant (`NA`/`Inf`/`NaN`), Array (`c()`/`vector()`/`matrix()`/`array()`), or List (`list()`)
+- **Variables:** all other assignments (Field)
+
+So a literal assignment like `x <- 42` shows as a Number, not a Field — see [Value-typed variables](#value-typed-variables). A name like `MAX <- 42` is a Constant because the ALL_CAPS rule is checked before the value type.
 
 Reserved words (if, else, for, while, TRUE, FALSE, NULL, etc.) are automatically filtered out.

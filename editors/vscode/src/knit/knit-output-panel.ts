@@ -20,6 +20,7 @@ import {
     resolveActiveThemePalette,
     type ThemePaletteOutcome,
 } from './vscode-theme-palette';
+import { viewerTabIcon } from '../viewer-tab-icon';
 
 /**
  * Webview panel that renders a single `.Rmd`'s rendered HTML output in
@@ -385,6 +386,7 @@ export class KnitOutputPanel {
                 localResourceRoots: [vscode.Uri.file(rootDir)],
             },
         );
+        panel.iconPath = viewerTabIcon('book');
         const instance = new KnitOutputPanel(context, panel, rootDir, args);
         KnitOutputPanel.instances.set(key, instance);
 

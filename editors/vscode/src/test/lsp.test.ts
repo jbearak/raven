@@ -335,15 +335,45 @@ suite('Ark LSP Extension', () => {
         );
     });
 
-    test('JAGS language configuration treats dots as part of words', async () => {
-        const languageConfigPath = path.join(__dirname, '..', '..', 'jags-language-configuration.json');
-        const languageConfig = JSON.parse(fs.readFileSync(languageConfigPath, 'utf8')) as { wordPattern?: string };
+    // `wordPattern` in the language configs makes a dotted identifier like
+    // `my.variable` a single "word" — driving Cmd+click navigation,
+    // `getWordRangeAtPosition`, and expand-selection. `rmd`/`quarto` reuse the
+    // R `language-configuration.json` (so they inherit the pattern); `jags` has
+    // its own copy of the same pattern. With VS Code's default word definition
+    // (dots ARE separators) the word range starting on the first segment would
+    // stop at the dot and yield only "my", so asserting the full span proves
+    // the contributed pattern is actually live in the editor — not just present
+    // as a string in the JSON file.
+    for (const language of ['r', 'jags', 'rmd', 'quarto']) {
+        test(`treats a dotted identifier as one word in ${language} (wordPattern)`, async () => {
+            const doc = await vscode.workspace.openTextDocument({ language, content: 'my.variable <- 1\n' });
+            // The contributed `language-configuration.json` wordPattern is loaded
+            // (and its word definition synced to the extension host) lazily — only
+            // once a document of the language is shown in an editor. Before that,
+            // `getWordRangeAtPosition` falls back to the default word definition
+            // (where dots ARE separators), so the doc must be shown first.
+            await vscode.window.showTextDocument(doc);
 
-        assert.strictEqual(
-            languageConfig.wordPattern,
-            '([a-zA-Z_][a-zA-Z0-9_.]*)|(\\.[a-zA-Z_][a-zA-Z0-9_.]*)',
-        );
-    });
+            // Position on the 'm' of the first segment; the default word
+            // definition would stop at the dot and yield only "my". Poll to
+            // absorb the lazy config-load latency (observed < 100ms).
+            const pos = new vscode.Position(0, 0);
+            let word: string | undefined;
+            const deadline = Date.now() + 5000;
+            do {
+                const range = doc.getWordRangeAtPosition(pos);
+                word = range ? doc.getText(range) : undefined;
+                if (word === 'my.variable') break;
+                await sleep(50);
+            } while (Date.now() < deadline);
+
+            assert.strictEqual(
+                word,
+                'my.variable',
+                `[${language}] a dotted identifier should be treated as a single word`,
+            );
+        });
+    }
 
     test('package.json describes dot-in-word separators for JAGS too', async () => {
         const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');

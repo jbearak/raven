@@ -69,6 +69,8 @@ If the symbol is defined later in the same file at top level, the message also r
 | Out-of-scope symbol | warning | Symbol from a sourced file used before the `source()` call |
 | Redundant directive | hint | `@lsp-source` directive for a file already brought in by an earlier `source()` call |
 
+These dependency-graph diagnostics are **not** suppressible with `# @lsp-ignore`; turn each off via its severity setting (see [Configuration](configuration.md)). The out-of-scope-symbol diagnostic is the exception — it honors `# @lsp-ignore` / `# @lsp-ignore-next` on the offending usage line.
+
 ### Assignment Targets
 
 Always on whenever diagnostics are enabled; not configurable per rule. Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators the target is the right-hand side; for the others it's the left-hand side. Both tiers honor `# @lsp-ignore` / `# @lsp-ignore-next` on the affected line.
@@ -198,3 +200,5 @@ When a parent file changes (e.g., a `library()` call is added or removed), Raven
 ## JAGS and Stan
 
 Diagnostics are suppressed for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files because Raven cannot statically determine what is in scope in these languages.
+
+R Markdown (`.Rmd`) and Quarto (`.qmd`) documents also produce no diagnostics: the tree-sitter R parser sees prose, YAML, and non-R fenced blocks as parse errors, so every non-R line would become spurious noise. Code intelligence for individual R chunks is covered in [chunks.md](chunks.md).

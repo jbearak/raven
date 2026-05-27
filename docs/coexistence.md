@@ -14,6 +14,7 @@ Several editor surfaces that overlap with REditorSupport's R Markdown / Quarto t
 - **Chunk background highlighting** and the **active-cell indicator** in `.Rmd` / `.qmd` documents.
 - **`.R` cell mode** support: `# %%` cell markers and RStudio-style `# Section ----` dividers used for chunk navigation / highlighting in plain `.R` files.
 - **R-language snippets in `.Rmd` / `.qmd` fenced chunks** — Raven's `r.json` snippets (`if`, `fun`, `for`, etc.) are registered for `rmd` / `quarto` only when Raven's R console is active. R-Markdown- and Quarto-specific snippets that scaffold new chunks (`rchunk`, `setupchunk`, ...) always register, since REditorSupport doesn't ship equivalents.
+- **Knit Preview** keybinding (`Shift+Cmd+Enter` / `Shift+Ctrl+Enter`) and the `Raven: Knit Preview` command — gated on the R-console switch together with the `raven.rmdKnit.enabled` flag.
 
 ## Who benefits from Raven's R console?
 
@@ -26,7 +27,7 @@ Raven's R console, plot viewer, and data viewer overlap with [REditorSupport (R)
   > [!NOTE]
   > **Raven's knit preview is manual on purpose.** Re-knitting on every save would make the preview a moving target while you're mid-edit. Instead, `Shift+Cmd+Enter` (or `Shift+Ctrl+Enter` on Windows/Linux) saves the buffer if it's unsaved and re-knits in one keystroke — so you re-render exactly when you mean to, with one chord that already lives in your hand. The webview's **Knit again** toolbar button does the same thing for mouse-driven workflows.
 
-Raven's plot viewer ships an **Apply VS Code theme** toolbar toggle that recolors the live plot to match your editor theme — parity with REditorSupport.R's `r.plot.toggleStyle` / `r.plot.defaults.colorTheme: "vscode"`. The persistence and broadcast shape match REditorSupport's, so users migrating between extensions get the same on/off semantics. See [Plot Viewer → Color theme](./plot-viewer.md#color-theme) for details.
+Raven's plot viewer ships an **Apply VS Code theme** toolbar toggle that recolors the live plot to match your editor theme — parity with REditorSupport.r's `r.plot.toggleStyle` / `r.plot.defaults.colorTheme: "vscode"`. The persistence and broadcast shape match REditorSupport's, so users migrating between extensions get the same on/off semantics. See [Plot Viewer → Color theme](./plot-viewer.md#color-theme) for details.
 
 These last two cases are why `raven.rConsole.activation` defaults to `auto`, which steps Raven's R-session features aside whenever REditorSupport is enabled or VS Code is running as Positron. Raven's language server and help viewer activate either way — you don't lose cross-file intelligence by leaving the R console off.
 
@@ -34,7 +35,7 @@ For a broader list of Raven's gaps across features, see [Limitations](./limitati
 
 ## The `raven.rConsole.activation` setting
 
-The `raven.rConsole.activation` setting (default: `"auto"`) controls whether Raven's R console — and therefore its plot and data viewers — activates:
+The `raven.rConsole.activation` setting (default: `"auto"`) controls whether Raven's R console — and therefore its plot and data viewers, chunk run commands, and Knit Preview — activates:
 
 - **`"auto"`** (default) — Raven's R-session features activate *unless* the REditorSupport (R) extension is enabled or VS Code is running as Positron. This keeps Raven out of the way when you already have R-session integration.
 - **`"enabled"`** — Always activate Raven's R console, plot viewer, and data viewer, even when another R extension is present. With REditorSupport also enabled, both extensions' R consoles are available; `Cmd+Enter` / `Ctrl+Enter` can only be bound to one extension's send command, and VS Code's keybinding editor lets you rebind either.
@@ -77,9 +78,9 @@ If the duplication bothers you and you're not relying on Quarto's other features
 
 ### `.Rmd` files belong to the `rmd` language
 
-The Quarto extension contributes both `.qmd` and `.rmd` under `editorLangId == quarto`. When only Raven and Quarto are installed, VS Code's `contributes.languages` extension resolver can pick Quarto's claim over Raven's `rmd` contribution — the resolution order across extensions is not a documented invariant — so `.Rmd` files can end up tagged as `quarto`. Most Raven affordances handle both lang ids (run-line, navigation, CodeLens, the send-to-R menus), but **Knit Preview** is gated on `editorLangId == rmd || == r` and silently stops firing. The visible symptom is `Shift+Cmd+Enter` (`Shift+Ctrl+Enter` on Linux/Windows) triggering Quarto's "Editor selection is not within an executable cell" message instead of opening the knit preview.
+The Quarto extension contributes both `.qmd` and `.rmd` under `editorLangId == quarto`. When only Raven and Quarto are installed, VS Code's `contributes.languages` extension resolver can pick Quarto's claim over Raven's `rmd` contribution — the resolution order across extensions is not a documented invariant — so `.Rmd` files can end up tagged as `quarto`. Most Raven affordances handle both lang ids (run-line, navigation, CodeLens, the send-to-R menus), but **Knit Preview** is gated on `editorLangId == rmd || == r` (with a `resourceExtname =~ /\.(rmd|Rmd|RMD)$/` guard) and silently stops firing when the `.Rmd` buffer is tagged `quarto`. The visible symptom is `Shift+Cmd+Enter` (`Shift+Ctrl+Enter` on Linux/Windows) triggering Quarto's "Editor selection is not within an executable cell" message instead of opening the knit preview.
 
-Raven ships a `files.associations` default pinning `*.rmd` (the pattern is case-insensitive on VS Code's lookup, but Raven's `contributes.languages` extension list lives alongside as `.rmd` / `.Rmd` / `.RMD` for consistency) to the `rmd` language. `files.associations` is registered ahead of `contributes.languages` in VS Code's resolver, so this anchors `.Rmd` to `rmd` regardless of whether REditorSupport.r-syntax is installed alongside.
+Raven ships a `files.associations` default pinning three explicit case variants — `*.rmd`, `*.Rmd`, and `*.RMD` — all to the `rmd` language (matching the `.rmd` / `.Rmd` / `.RMD` extensions in Raven's `contributes.languages` block). `files.associations` is registered ahead of `contributes.languages` in VS Code's resolver, so this anchors `.Rmd` to `rmd` regardless of whether REditorSupport.r-syntax is installed alongside.
 
 Trade-off: this also disables Quarto's `.Rmd`-targeted UI (Run Cell, Insert Cell, preview-related menus, the chunk CodeLens) for users who keep the default, because those gate on `editorLangId == quarto`. Quarto's `.qmd` handling is untouched. If you'd rather hand `.rmd` files back to Quarto, override the default explicitly in user or workspace settings:
 

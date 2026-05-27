@@ -1,14 +1,15 @@
 /**
  * Spawns the `R --no-save --no-restore -e <expression>` subprocess that
- * runs `rmarkdown::render`, streams its output to a VS Code
- * OutputChannel, and supports cooperative cancel with a SIGINT → SIGTERM
- * → SIGKILL signal ladder.
+ * runs the knit R expression (a `knitr::knit` call built by
+ * `r-expression`), streams its output to a VS Code OutputChannel, and
+ * supports cooperative cancel with a SIGINT → SIGTERM → SIGKILL signal
+ * ladder.
  *
  * Process-group nuances:
  *   - POSIX: We spawn the child with `detached: true` so it leads a new
  *     process group, then signal that group via `process.kill(-pid, …)`
- *     so any pandoc / tinytex / xelatex helpers rmarkdown spawns are
- *     reaped along with R itself. This matches the spec's "kill the
+ *     so any helper processes R spawns (e.g. figure-device backends)
+ *     are reaped along with R itself. This matches the spec's "kill the
  *     group" requirement.
  *   - Windows: Node's POSIX-style signals are not meaningful on Windows.
  *     Both escalation steps use `taskkill /T /F`, which walks the
@@ -40,9 +41,10 @@ export interface KnitEngineResult {
     /** Captured stdout. */
     stdout: string;
     /**
-     * Captured stderr. `rmarkdown::render` emits its "Output created:"
-     * line via R's `message()`, which writes to stderr; that's where
-     * `parseRenderedOutputPath` will find it on a successful knit.
+     * Captured stderr. The knit expression writes its "Output created:"
+     * line to stdout via `cat()`, but `parseRenderedOutputPath` scans
+     * stdout and stderr together, so a line R routes through `message()`
+     * is still picked up.
      */
     stderr: string;
     /** True when the run was aborted by the user or by timeout. */

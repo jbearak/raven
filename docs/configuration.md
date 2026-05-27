@@ -18,7 +18,7 @@ Per-key. For each setting, project values win over the LSP client's `initializat
 
 ### Schema
 
-The TOML mirrors the LSP `initializationOptions` shape 1:1. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of VS Code-only settings whose behavior is most useful to document alongside them (R-console activation, plot/help viewer columns, the word-separator opt-in, and the server-binary override). Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
+The TOML mirrors the LSP `initializationOptions` shape 1:1. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of VS Code-only settings whose behavior is most useful to document alongside them (R-console activation, plot/help viewer columns, the word-separator opt-in, and the server-binary override). Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
 
 ```toml
 [linting]
@@ -111,7 +111,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | Setting | Default | Description |
 |---|---|---|
 | `raven.packages.enabled` | `true` | Enable package function awareness |
-| `raven.packages.rPath` | auto-detect | Path to R executable for subprocess calls. Must point to vanilla `R` — not `radian` or `arf`, which are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses for package introspection. For the interactive terminal program, see [`raven.rTerminal.program`](r-console.md#choosing-the-r-program). |
+| `raven.packages.rPath` | `""` | Path to R executable for subprocess calls. Empty by default, in which case Raven searches `PATH`. Must point to vanilla `R` — not `radian` or `arf`, which are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses for package introspection. For the interactive terminal program, see [`raven.rTerminal.program`](r-console.md#choosing-the-r-program). |
 | `raven.packages.additionalLibraryPaths` | `[]` | Additional R library paths for package discovery |
 | `raven.packages.missingPackageSeverity` | `"warning"` | Severity for missing package diagnostics (`"off"` to disable) |
 | `raven.packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on install/remove |
@@ -128,6 +128,7 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Command | File | Contents |
 |---|---|---|
+| `Raven: Create raven.toml` | `raven.toml` | A starter project config at the workspace root, with the sections Raven reads (`linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`) |
 | `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch dirs, and AI-tool user-local overrides |
 | `Raven: Create linting settings` | `.vscode/settings.json` | Every `raven.linting.*` key Raven understands, each prefaced with a `//` comment naming its `lintr` equivalent. Merges into an existing `settings.json` without disturbing unrelated keys or comments; prompts before overwriting an existing `raven.linting.*` block |
 
@@ -141,13 +142,13 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.plot.viewerColumn` | `beside` | Initial editor column for an R session's plot viewer panel when its first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. See [Plot Viewer](plot-viewer.md). |
+| `raven.plot.viewerColumn` | `"beside"` | Initial editor column for an R session's plot viewer panel when its first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. See [Plot Viewer](plot-viewer.md). |
 
 ## Help Viewer Settings
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.help.viewerColumn` | `beside` | Initial editor column when the R help viewer first opens. Once you move the panel, Raven leaves it where you put it. Values: `active`, `beside`. See [Help Viewer](help-viewer.md). |
+| `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens. Once you move the panel, Raven leaves it where you put it. Values: `active`, `beside`. See [Help Viewer](help-viewer.md). |
 
 ## Symbol Settings
 
@@ -172,10 +173,16 @@ Values:
 - `"rstudio-minus"` — All arguments indent relative to previous line, regardless of paren position
 - `"off"` — Disables AST-aware indentation (Tier 2); only basic declarative rules remain
 
-Raven sets `editor.formatOnType` to `true` for R files by default (lowest-priority VS Code default). This is required for Tier 2 indentation. Disable per-language:
+Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files by default (lowest-priority VS Code default). This is required for Tier 2 indentation — though Tier 2 itself applies only to plain R files, so the default has no indentation effect in `.Rmd` / `.qmd` (those use Tier 1 only). Disable per-language:
 
 ```json
 "[r]": {
+  "editor.formatOnType": false
+},
+"[rmd]": {
+  "editor.formatOnType": false
+},
+"[quarto]": {
   "editor.formatOnType": false
 }
 ```
@@ -228,4 +235,4 @@ To disable an individual rule while leaving the rest enabled, set its severity t
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.server.path` | bundled | Path to `raven` binary (if not using the bundled one) |
+| `raven.server.path` | `""` | Path to the `raven` binary. Empty by default, in which case the bundled binary is used. |

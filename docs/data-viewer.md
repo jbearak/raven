@@ -45,13 +45,15 @@ side-by-side.
 - `matrix`. If the matrix has non-default rownames, they appear as a
   leading `rowname` column; auto-generated `1..N` rownames are dropped
   in favor of the viewer's row-number gutter.
-- Other classes raise an error in R, mirroring Positron:
+- Other classes raise an error in R:
 
   ```r
   > View(1)
-  Error in `View()`:
-  ! Can't `View()` an object of class `numeric`
+  Error: Can't `View()` an object of class `numeric`
   ```
+
+  The class is shown as `paste(class(x), collapse = "/")`, so an object with
+  multiple classes (e.g. a `tbl_df`) reports them joined with `/`.
 
 ## Triggering
 
@@ -77,9 +79,10 @@ rows: 12,345 | Sort: mpg▲ cyl▼ ✕ | Filter: cyl ∈ {6,8} ✕ | [Labels] [F
 The `Sort` and `Filter` strips are hidden entirely when no sort or filter is active.
 
 Each toggle is filled when active; clicking flips it. The Labels and
-Format buttons are hidden entirely when no column in the current data
-set would be affected by them — e.g. an all-integer matrix hides both,
-while a frame with only factors hides Format but keeps Labels. The
+Format buttons are disabled (dimmed) when no column in the current data
+set would be affected by them — e.g. an all-integer matrix disables
+both, while a frame with only factors disables Format but keeps Labels
+active. The
 small badge on `Columns` shows the count of currently hidden columns
 (absent when none are hidden).
 
@@ -103,7 +106,7 @@ column-header tooltip, regardless of the toggle.
 ### Format
 
 Defaults to **on** in new panels. When on, non-integer numeric columns
-are rounded to the digits chosen in the dropdown (default 3, range 0–15).
+are rounded to the digits chosen in the dropdown (0–6, default 3).
 Integer columns, dates, timestamps, factors, and string columns are
 unaffected. `NaN` and ±Inf are rendered as `NaN` / `Inf` / `-Inf`
 literally — they aren't formatted away.
@@ -131,41 +134,52 @@ same `View(mtcars)` opened tomorrow remembers the layout.
   column headers to select multiple contiguous columns.
 - Click a row-number gutter cell to select that row; click-drag across
   row headers to select multiple contiguous rows.
-- Click the `#` corner cell (top-left) to select the whole table.
-- `Cmd/Ctrl+A` selects every row across all currently-visible columns
-  (equivalent to clicking `#`).
+- Click the `#` corner cell (top-left) to select every row across all
+  currently-visible columns (a *row* selection — see the copy note
+  below).
+- `Cmd/Ctrl+A` also selects every row across all currently-visible
+  columns, but as a *column* selection. The two are visually identical
+  but copy differently: a column selection includes the column-name
+  row, a row selection doesn't.
 - `Cmd/Ctrl+C` copies the selection as TSV. Copying respects the
   active Labels / Format / digits state — what you see is what you
   copy.
-- Column-header selections and whole-table selections (via
-  `Cmd/Ctrl+A`) include the column-name row when copied. Cell and
-  row-header selections copy data only, matching spreadsheet
-  conventions.
-- Right-click a cell, column header, or row header to show a Copy menu
-  (which copies the current selection, or the right-clicked target if
-  the click landed outside the selection). The platform's default
-  Cut/Copy/Paste menu is suppressed elsewhere in the panel.
+- Column-header selections and `Cmd/Ctrl+A` selections include the
+  column-name row when copied. Cell, row-header, and `#`-corner
+  selections copy data only, matching spreadsheet conventions.
+- Right-click a cell, column header, or row-gutter cell to show a Copy
+  menu that copies the current selection. Right-clicking a column
+  header always replaces the selection with that one column (so the
+  menu's Copy copies that column, even if other columns were
+  previously selected). For cell right-clicks, if the target isn't
+  already in the selection it gets selected first; right-clicking a
+  cell inside the existing selection leaves the selection unchanged.
+  The column-header menu also offers **Hide column**, plus the sort
+  and filter items described under [Sorting](#sorting) and
+  [Filtering](#filtering). The platform's default Cut/Copy/Paste menu
+  is suppressed elsewhere in the panel.
 - A 5,000,000-cell hard cap protects against accidental huge clipboard
   writes; over the cap the panel shows a toast and refuses the copy.
 
 ### Keyboard shortcuts
 
-| Key                | Action                                  |
-| ------------------ | --------------------------------------- |
-| `Home`             | Jump to the first row.                  |
-| `End`              | Jump to the last row.                   |
-| `PageUp`           | Scroll one viewport up.                 |
-| `PageDown`         | Scroll one viewport down.               |
-| `Cmd/Ctrl+A`       | Select all rows across visible columns. |
-| `Cmd/Ctrl+C`       | Copy the current selection as TSV.      |
-| `Shift+Alt+A`      | Sort focused column ascending.          |
-| `Shift+Alt+D`      | Sort focused column descending.         |
-| `Shift+Alt+0`      | Clear all sorts.                        |
+| Key                | Action                                          |
+| ------------------ | ----------------------------------------------- |
+| `Home`             | Jump to the first column of the current row.    |
+| `End`              | Jump to the last column of the current row.     |
+| `Cmd/Ctrl+Home`    | Jump to the first cell (top-left of the grid).  |
+| `Cmd/Ctrl+End`     | Jump to the last cell (bottom-right).           |
+| `PageUp`           | Scroll one viewport up.                         |
+| `PageDown`         | Scroll one viewport down.                       |
+| `Cmd/Ctrl+A`       | Select all rows across visible columns.         |
+| `Cmd/Ctrl+C`       | Copy the current selection as TSV.              |
+| `Shift+Alt+A`      | Sort focused column ascending.                  |
+| `Shift+Alt+D`      | Sort focused column descending.                 |
+| `Shift+Alt+0`      | Clear all sorts.                                |
 
-`Home` and `End` jump to the very first or very last row in a large data
-frame. Modifier combinations (`Shift`, `Cmd`/`Ctrl`, `Alt` on these
-navigation keys) fall through to the browser/OS unchanged so platform
-shortcuts are not hijacked.
+These are the data grid's built-in spreadsheet bindings: `Home` / `End`
+move within the current row (first / last column), while `Cmd`/`Ctrl`
++`Home` / `End` jump to the first / last cell of the whole grid.
 
 ## Sorting
 
@@ -215,7 +229,8 @@ the rows.
 
 Sort state is persisted per panel-name + schema-hash alongside layout
 and toolbar state, so a later `View(df)` against the same dataset
-restores the sort. Only the list of sort keys is stored — the row
+restores the sort. Only the sort keys (plus a snapshot of the Labels
+state) are stored — the row
 permutation is always recomputed against the current data on restore,
 because schema-hash equality is not evidence that two datasets share
 row values (column names and types can match while values differ).
@@ -303,8 +318,9 @@ are shown in the grid.
 Active filters appear as chips in the toolbar. Each chip shows a short
 summary of the filter condition (for example, `cyl ∈ {6, 8}` or `mpg > 20`).
 Click a chip to re-open its editor. The kebab menu on each chip offers
-**Enable** / **Disable** (disabled chips are shown greyed-out and are not
-applied) and **Remove**. The trailing **✕** on the strip clears all filters.
+**Edit**, **Enable** / **Disable** (disabled chips are shown greyed-out
+and are not applied), and **Remove**. The trailing **✕** on the strip
+clears all filters.
 
 ### Composition
 
@@ -323,8 +339,9 @@ is rebuilding the filter index the status bar shows `Filtering…`.
 
 Active filters are persisted per panel-name × schema-hash alongside layout,
 toolbar state, and sort, so a later `View(df)` against the same dataset
-restores the filter configuration. Only the chip descriptors (predicate type
-and values) are stored — filter membership is always recomputed against the
+restores the filter configuration. Only the chip descriptors (predicate
+type, values, enabled state, and the Include NA / NaN flag) are stored —
+filter membership is always recomputed against the
 current data on restore. Set `raven.dataViewer.persistFilters` to `false` to
 open every panel unfiltered.
 
@@ -344,7 +361,7 @@ open every panel unfiltered.
 | --- | --- | --- |
 | `raven.dataViewer.missingValueStyle` | `foreground` | How NA / NaN cells are highlighted: `foreground` (colorize the text), `background` (tint the cell), or `none`. |
 | `raven.dataViewer.maxStoredLayouts` | `10000` | LRU cap on persisted column-width / visibility entries. Each unique panel-name × schema-hash pair counts once. |
-| `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on (Format defaults to on). |
+| `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on (Format defaults to on). Accepts `0`–`15`; the toolbar's digits dropdown only exposes `0`–`6`, so values above `6` only take effect as the *initial* digits and can't be picked from the dropdown afterwards. |
 | `raven.dataViewer.persistSort` | `true` | Persist the active row sort per panel-name × schema hash. Set to `false` to make every `View(df)` open unsorted. |
 | `raven.dataViewer.persistFilters` | `true` | Persist active filters per panel-name × schema hash. Set to `false` to open every panel unfiltered. |
 

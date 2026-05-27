@@ -24,13 +24,20 @@ Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct sy
 
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
+| `Cmd+Enter` | `Ctrl+Enter` | Run Line or Selection |
+| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`) |
 | `Cmd+Alt+Enter` | `Ctrl+Alt+Enter` | Run Current Chunk |
 | `Cmd+Alt+Shift+Enter` | `Ctrl+Alt+Shift+Enter` | Run Current Chunk and Move |
-| `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Above Chunks |
-| `Cmd+Alt+N` | `Ctrl+Alt+N` | Go to Next Chunk |
-| `Cmd+Alt+Shift+N` | `Ctrl+Alt+Shift+N` | Go to Previous Chunk |
+| `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Previous Chunk |
+| `Cmd+Alt+N` | `Ctrl+Alt+N` | Run Next Chunk |
+| `Cmd+Alt+Shift+P` | `Ctrl+Alt+Shift+P` | Run Above Chunks |
+| `Cmd+Alt+Shift+N` | `Ctrl+Alt+Shift+N` | Run Below Chunks |
+| `Cmd+PageDown` | `Ctrl+PageDown` | Go to Next Chunk |
+| `Cmd+PageUp` | `Ctrl+PageUp` | Go to Previous Chunk |
 
-In `.R` files without `# %%` cell markers the current-chunk shortcuts surface a warning; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
+The letter-key shortcuts (`P`/`N`) are execution commands aligned with the [Quarto VS Code extension](https://quarto.org/docs/tools/vscode.html): unshifted runs a single neighbor chunk, Shift escalates to all chunks above/below. Navigation uses `PageDown`/`PageUp`. See [Keybinding Comparison](./keybinding-comparison.md) for a cross-tool reference.
+
+In `.R` files without `# %%` cell markers the current-chunk shortcuts surface an information notification; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
 
 ## Commands
 
@@ -46,8 +53,8 @@ In `.R` files without `# %%` cell markers the current-chunk shortcuts surface a 
 | **Run Next Chunk** | Runs the R chunk immediately below the cursor (skipping non-R chunks). The cursor does not move. |
 | **Run Next Chunk and Move** | Runs the next R chunk and moves the cursor into its first body line (or the header line if the chunk is empty). Quarto's "Run Next Chunk" behavior. |
 | **Run All Chunks** | Runs every R chunk in the document, top to bottom. |
-| **Go to Next Chunk** | Moves the cursor to the body of the next R chunk (or its header line if the chunk is empty). |
-| **Go to Previous Chunk** | Moves the cursor to the body of the previous R chunk (or its header line if the chunk is empty). |
+| **Go to Next Chunk** | Moves the cursor to the body of the next chunk (or its header line if the chunk is empty). Navigation visits every chunk, not just R chunks. |
+| **Go to Previous Chunk** | Moves the cursor to the body of the previous chunk (or its header line if the chunk is empty). Navigation visits every chunk, not just R chunks. |
 | **Select Current Chunk** | Selects the body of the chunk at the cursor (excludes header and closing fence). |
 
 ## CodeLens buttons
