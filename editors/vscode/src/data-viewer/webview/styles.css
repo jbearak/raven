@@ -872,3 +872,18 @@ body,
     fill: var(--vscode-button-hoverBackground, #1177bb);
     outline: none;
 }
+
+/* Labelled-numeric filter checklist: label fills the row, code is dimmed. */
+.filter-popover-check-row .filter-popover-label-text {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.filter-popover-check-row .filter-popover-code-dim {
+    flex: 0 0 auto;
+    margin-left: auto;
+    padding-left: 8px;
+    opacity: 0.6;
+    font-variant-numeric: tabular-nums;
+}

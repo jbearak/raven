@@ -4,6 +4,9 @@
  *
  * Behaviour by column kind:
  *  Numeric (Int/Uint/Float)    → numCompare | numBetween | numNotBetween + histogram brush
+ *  Labelled numeric (numeric type + valueLabels) → setIn / setNotIn (label
+ *      checklist, stored & matched as codes) | numCompare | numBetween |
+ *      numNotBetween. setIn/setNotIn pre-selected.
  *  Factor (Dictionary) / has valueLabels + dictionaryShipped  → setIn / setNotIn checklist
  *  Factor without shipped dict → setIn / setNotIn + free-text list
  *  String (Utf8/LargeUtf8)     → strContains / strStartsWith / strEndsWith / strCompare / strRegex
@@ -25,6 +28,7 @@ import type { ColumnSchema } from '../arrow-reader';
 import type { FilterEntry, FilterPredicate, HistogramBin } from '../messages';
 import { useDismiss } from './use-dismiss';
 import { FilterHistogram } from './filter-histogram';
+import { colKind, kindOptions, labelledNumericChoices } from './filter-column-kind';
 
 /** A small uid helper that avoids a `crypto` availability issue in older
  *  webview runtimes. Falls back gracefully if crypto.randomUUID is present. */
@@ -45,71 +49,6 @@ type Props = {
     onCancel: () => void;
     anchor: { leftPx: number; topPx: number };
 };
-
-// ── Column-type categorisation ──────────────────────────────────────────────
-
-type ColKind = 'numeric' | 'factor' | 'string' | 'bool' | 'date';
-
-function colKind(col: ColumnSchema): ColKind {
-    const t = col.arrowType;
-    if (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float')) return 'numeric';
-    if (t.startsWith('Dictionary')) return 'factor';
-    if (col.valueLabels) return 'factor';
-    if (t.startsWith('Utf8') || t.startsWith('LargeUtf8')) return 'string';
-    if (t === 'Bool') return 'bool';
-    if (t.startsWith('Date') || t.startsWith('Timestamp')) return 'date';
-    return 'string'; // safe fallback
-}
-
-// ── Predicate-kind option lists per column type ─────────────────────────────
-
-type KindOption = { value: string; label: string };
-
-function kindOptions(kind: ColKind): KindOption[] {
-    switch (kind) {
-        case 'numeric':
-            return [
-                { value: 'numCompare', label: 'Compare (=, ≠, <, ≤, >, ≥)' },
-                { value: 'numBetween', label: 'Between' },
-                { value: 'numNotBetween', label: 'Not between' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'factor':
-            return [
-                { value: 'setIn', label: 'Is one of' },
-                { value: 'setNotIn', label: 'Is not one of' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'string':
-            return [
-                { value: 'strContains', label: 'Contains' },
-                { value: 'strNotContains', label: 'Does not contain' },
-                { value: 'strStartsWith', label: 'Starts with' },
-                { value: 'strEndsWith', label: 'Ends with' },
-                { value: 'strCompareEq', label: 'Equals (=)' },
-                { value: 'strCompareNe', label: 'Not equals (≠)' },
-                { value: 'strRegex', label: 'Matches regex' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'bool':
-            return [
-                { value: 'bool', label: 'Is true / false' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-        case 'date':
-            return [
-                { value: 'dateCompare', label: 'Compare (=, ≠, <, ≤, >, ≥)' },
-                { value: 'dateBetween', label: 'Between' },
-                { value: 'dateNotBetween', label: 'Not between' },
-                { value: 'isEmpty', label: 'Is empty / NA' },
-                { value: 'isNotEmpty', label: 'Is not empty' },
-            ];
-    }
-}
 
 /** Map a persisted FilterPredicate back to our internal kind-select value. */
 function predicateToKindValue(p: FilterPredicate): string {
@@ -302,6 +241,9 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     const hasShippedDictionary = kind === 'factor' && column.dictionaryShipped && Array.isArray(column.dictionary);
     const dictValues: string[] = hasShippedDictionary ? (column.dictionary ?? []) : [];
 
+    const isLabelledNumeric = kind === 'labelledNumeric';
+    const labelledChoices = isLabelledNumeric ? labelledNumericChoices(column) : [];
+
     // ── Factor search state ───────────────────────────────────────────────
     const [factorSearch, setFactorSearch] = useState('');
 
@@ -388,7 +330,8 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
     }
 
     function effectiveSetValues(): (string | number)[] {
-        if (hasShippedDictionary) {
+        if (isLabelledNumeric || hasShippedDictionary) {
+            // labelled-numeric → numeric codes; shipped dictionary → label strings.
             return setSelected.selected;
         }
         // Free-text: split on comma or newline
@@ -520,7 +463,46 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
                 )}
 
                 {(selectedKind === 'setIn' || selectedKind === 'setNotIn') && (
-                    hasShippedDictionary ? (
+                    isLabelledNumeric ? (
+                        <>
+                            <input
+                                type="text"
+                                className="filter-popover-input filter-popover-search"
+                                placeholder="Search labels…"
+                                value={factorSearch}
+                                onChange={e => setFactorSearch(e.target.value)}
+                            />
+                            <div className="filter-popover-checklist">
+                                {labelledChoices
+                                    .filter(c => !factorSearch
+                                        || c.label.toLowerCase().includes(factorSearch.toLowerCase())
+                                        || String(c.code).includes(factorSearch))
+                                    .map(c => {
+                                        const checked = setSelected.selected.includes(c.code);
+                                        return (
+                                            <label key={c.code} className="filter-popover-check-row">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={checked}
+                                                    onChange={e => {
+                                                        setSetSelected(s => ({
+                                                            selected: e.target.checked
+                                                                ? [...s.selected, c.code]
+                                                                : s.selected.filter(x => x !== c.code),
+                                                        }));
+                                                    }}
+                                                />
+                                                <span className="filter-popover-label-text">{c.label}</span>
+                                                <span className="filter-popover-code-dim">{c.code}</span>
+                                            </label>
+                                        );
+                                    })}
+                                {labelledChoices.length === 0 && (
+                                    <div className="filter-popover-hint">No labels available</div>
+                                )}
+                            </div>
+                        </>
+                    ) : hasShippedDictionary ? (
                         <>
                             <input
                                 type="text"
