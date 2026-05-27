@@ -26,9 +26,14 @@ Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct sy
 |-----|---------------|--------|
 | `Cmd+Alt+Enter` | `Ctrl+Alt+Enter` | Run Current Chunk |
 | `Cmd+Alt+Shift+Enter` | `Ctrl+Alt+Shift+Enter` | Run Current Chunk and Move |
-| `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Above Chunks |
-| `Cmd+Alt+N` | `Ctrl+Alt+N` | Go to Next Chunk |
-| `Cmd+Alt+Shift+N` | `Ctrl+Alt+Shift+N` | Go to Previous Chunk |
+| `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Previous Chunk |
+| `Cmd+Alt+N` | `Ctrl+Alt+N` | Run Next Chunk |
+| `Cmd+Alt+Shift+P` | `Ctrl+Alt+Shift+P` | Run Above Chunks |
+| `Cmd+Alt+Shift+N` | `Ctrl+Alt+Shift+N` | Run Below Chunks |
+| `Cmd+PageDown` | `Ctrl+PageDown` | Go to Next Chunk |
+| `Cmd+PageUp` | `Ctrl+PageUp` | Go to Previous Chunk |
+
+The letter-key shortcuts (`P`/`N`) are execution commands aligned with the [Quarto VS Code extension](https://quarto.org/docs/tools/vscode.html): unshifted runs a single neighbor chunk, Shift escalates to all chunks above/below. Navigation uses `PageDown`/`PageUp`. See [Keybinding Comparison](./keybinding-comparison.md) for a cross-tool reference.
 
 In `.R` files without `# %%` cell markers the current-chunk shortcuts surface a warning; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
 

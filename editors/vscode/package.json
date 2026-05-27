@@ -324,21 +324,39 @@
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
-        "command": "raven.runAboveChunks",
+        "command": "raven.runPreviousChunk",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p",
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
-        "command": "raven.goToNextChunk",
+        "command": "raven.runNextChunk",
         "key": "ctrl+alt+n",
         "mac": "cmd+alt+n",
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       },
       {
-        "command": "raven.goToPreviousChunk",
+        "command": "raven.runAboveChunks",
+        "key": "ctrl+alt+shift+p",
+        "mac": "cmd+alt+shift+p",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.runBelowChunks",
         "key": "ctrl+alt+shift+n",
         "mac": "cmd+alt+shift+n",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.goToNextChunk",
+        "key": "ctrl+pagedown",
+        "mac": "cmd+pagedown",
+        "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
+      },
+      {
+        "command": "raven.goToPreviousChunk",
+        "key": "ctrl+pageup",
+        "mac": "cmd+pageup",
         "when": "editorTextFocus && (editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled"
       }
     ],

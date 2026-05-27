@@ -80,6 +80,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - [R Package Development](docs/r-package-dev.md) — Package mode, visibility rules, and build commands
 - [Coexistence](docs/coexistence.md) — Running alongside REditorSupport (vscode-R) and Positron
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools
+- [Chunk Keybinding Comparison](docs/keybinding-comparison.md) — Chunk shortcuts across Raven, Quarto, RStudio, and REditorSupport
 - [Limitations](docs/limitations.md) — Features not yet implemented
 
 ## Installation
