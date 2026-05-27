@@ -11,10 +11,11 @@ Raven's help viewer uses the language server's scope analysis to disambiguate wh
 
 ## How to open it
 
-There are two ways to trigger the help viewer:
+The help viewer is triggered from a hover:
 
 - **From a hover**: Hover over a function call (e.g., `dplyr::filter(...)` or `plot(1:10)`). When the symbol resolves to a known package, the hover bubble displays a bold `pkg::name` heading at the top — click it to open the help panel.
-- **From the command palette**: Run `Raven: Open R Help Panel` (requires a topic argument; typically triggered indirectly via the hover link).
+
+There is no command-palette entry: the panel needs a resolved topic and package, which only the hover link supplies, so `raven.openHelpPanel` (and the `raven.help.back` / `raven.help.forward` navigation commands) are hidden from the palette.
 
 ## Navigation
 
@@ -65,5 +66,5 @@ Internal cross-references are rewritten to a custom URL scheme that correctly ro
 5. Hover `plot(1:5)` → bold `graphics::plot` heading; click → navigates correctly even cross-package.
 6. Hover an operator: `` ?\`[\` `` or `` ?\`%in%\` `` → bold heading uses the operator, click navigates and renders correctly (verifies percent-encoding round-trip and `is_valid_help_topic`).
 7. Trigger a help page with images (e.g., `?ggplot2::theme` if installed) → images load.
-8. Trigger an unknown topic by directly invoking the command → panel shows the not-found message; previous content & history preserved.
+8. Trigger an unknown topic (hover a symbol whose topic cannot be resolved, or invoke `raven.openHelpPanel` programmatically with a bogus topic) → panel shows the not-found message; previous content & history preserved.
 9. Configure a non-default R via `raven.packages.rPath` and verify help renders against that R installation (open a topic only available in a package installed for that R; should succeed where it would fail against system R).

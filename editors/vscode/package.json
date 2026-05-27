@@ -419,6 +419,18 @@
         },
         {
           "command": "raven.knit.openOutputChannel"
+        },
+        {
+          "command": "raven.openHelpPanel",
+          "when": "false"
+        },
+        {
+          "command": "raven.help.back",
+          "when": "false"
+        },
+        {
+          "command": "raven.help.forward",
+          "when": "false"
         }
       ],
       "editor/title": [
