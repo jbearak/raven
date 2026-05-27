@@ -10,6 +10,7 @@ import {
 import { RSessionServer } from '../r-session-server';
 import { download_to_buffer } from './http-download';
 import { csp_sources_for_external_base } from './csp';
+import { viewerTabIcon } from '../viewer-tab-icon';
 
 type ViewerColumn = 'active' | 'beside';
 
@@ -208,6 +209,7 @@ export class PlotViewerPanel {
                 ],
             },
         );
+        panel.iconPath = viewerTabIcon('graph');
         const nonce = crypto.randomBytes(16).toString('base64');
         const initialThemeApplied = PlotViewerPanel.readThemePreference(this.context);
         panel.webview.html = build_html(
