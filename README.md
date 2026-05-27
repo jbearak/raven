@@ -1,13 +1,13 @@
 # Raven
 
-Raven is an R language server with cross-file code intelligence (completions, diagnostics, navigation), plus a VS Code extension that adds an [R console](docs/r-console.md) and [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers on top. The language server also runs in any LSP-compatible [editor](docs/editor-integrations.md).
+Raven is an R language server with cross-file code intelligence (completions, diagnostics, navigation), plus a VS Code extension that adds an [R console](docs/r-console.md) and [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers. The language server can run alongside or instead of [r-language-server](https://github.com/REditorSupport/languageserver).
 
 The language server analyzes your code in realtime: it completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
 
 Among the R language servers we've surveyed — [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), [Positron](https://github.com/posit-dev/positron) (via [Ark](https://github.com/posit-dev/ark)), and RStudio — Raven is the only one that traces `source()` chains, so completions, diagnostics, and navigation reflect the actual order of execution at each cursor position. Of those three, REditorSupport is the only other VS Code option; the [comparison page](docs/comparison.md) lays out the differences in detail, including where the existing tools cover ground Raven doesn't.
 
 > [!NOTE]
-> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — see [Coexistence](docs/coexistence.md). Raven still provides code intelligence and scope-aware help in either setup.
+> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](docs/coexistence.md). Raven still provides code intelligence and scope-aware help in either setup.
 
 
 > **Status:** Raven is under active development. It works well for day-to-day use but hasn't been widely announced yet. Bug reports and feedback are welcome!
@@ -31,8 +31,7 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **[Syntax highlighting](docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS, Stan, and R package file syntax highlighting
-- **[Snippets](docs/snippets.md)** — Built-in snippets for common R patterns (control flow, apply family, ggplot2 scaffolds, roxygen2 tags) plus R Markdown / Quarto chunk and YAML scaffolds
+- **[Syntax highlighting](docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
 ### R session integration
 
@@ -61,7 +60,6 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - [Document Outline](docs/document-outline.md) — Hierarchical symbol view
 - [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
 - [Syntax Highlighting](docs/syntax-highlighting.md) — LSP semantic tokens for R, plus JAGS, Stan, and R package file grammars
-- [Snippets](docs/snippets.md) — Built-in R and R Markdown / Quarto snippets
 
 **R session integration:**
 
@@ -91,11 +89,11 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 
 **Build from source:** See [Development Notes](docs/development.md).
 
-## How Raven Compares
-
-For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — covering both language intelligence and R session integration — see [docs/comparison.md](docs/comparison.md).
+## How Raven Differs
 
 Raven takes a static-analysis approach rather than attaching to a live R session, so it can start answering questions the moment a file is opened, without running user code. See [Why Raven exists](docs/comparison.md#why-raven-exists) for the origin and rationale.
+
+For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — covering both language intelligence and R session integration — see [docs/comparison.md](docs/comparison.md).
 
 ## Development
 
