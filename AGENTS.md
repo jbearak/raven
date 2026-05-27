@@ -1,8 +1,6 @@
-# AGENTS.md - LLM Guidance for Raven
-
 This file is intentionally short: a map to the docs and a list of invariants that span multiple systems. Invariants tied to one function or module belong as a doc comment on that function or module, not here.
 
-## What to read (in order)
+## What to read
 
 User-facing:
 - `README.md`
@@ -100,8 +98,3 @@ Items here have no natural code home — they span multiple systems, depend on e
 - **Bun test discovery** must NOT recurse into `editors/vscode/src/test` or `editors/vscode/out/test`; those are Mocha/`vscode-test` suites. Invoke them via a wrapper subprocess test from the root.
 - **VS Code test compile** runs before `vscode-test`, so dependency type-resolution breakage in `node_modules` can make root `bun test` fail before any VS Code tests run.
 - **`tests/bun/tsconfig.json`** exists only so VS Code's TS language server can resolve `bun:test` and bare imports like `fast-check` (whose `node_modules` lives under `editors/vscode/`) — bun itself runs the suite without it. The `include` list is deliberately narrow because several bun test files have long-standing latent type errors. Add a file there only after `./editors/vscode/node_modules/.bin/tsc --project tests/bun/tsconfig.json --noEmit` stays clean.
-
-### Markdown / doc maintenance
-
-- Add language identifiers (e.g. `text`) to ASCII diagram/timeline fences to satisfy markdownlint (MD040).
-- Keep doc comments and markdown examples aligned with current behavior; normalize markdown table spacing to match project lint expectations.
