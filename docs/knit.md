@@ -71,7 +71,10 @@ when an `.Rmd` file is open.
    `server: shiny`), a custom YAML `knit:` hook, and the `site:` field
    for `rmarkdown::render_site` / `bookdown::bookdown_site`. Each
    refusal includes a copy-pasteable R command you can run yourself in
-   the R console.
+   the R console. This check belongs to the preview pipeline but gates
+   the export commands too: they re-knit through the preview (or reuse
+   its cached output), so a refused document is never exportable
+   either.
 4. **YAML output options.** Any `output:` format (`html_document`,
    `pdf_document`, `word_document`, `bookdown::pdf_document2`, etc.)
    previews as HTML. Nested options are partially honored — see the
