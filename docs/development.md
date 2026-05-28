@@ -60,6 +60,18 @@ cargo build --release -p raven
 - VS Code extension tests: `cd editors/vscode && bun run test`
 - Setup (build + install + package): `./scripts/setup.sh`
 
+The VS Code extension tests include a real-layout webview harness for the
+data-viewer toolbar's responsive chip-wrap behavior
+(`editors/vscode/src/test/toolbar-wrap-layout.test.ts` +
+`toolbar-wrap-harness-panel.ts`). The harness mounts the production
+toolbar JSX in a webview, pins its width via `postMessage`, and posts the
+measured geometry back to the host for assertions. The harness bundle
+lives at `editors/vscode/dist-test/toolbar-wrap-harness/` — separate from
+the shipped `dist/`, built by `bun run bundle:webview-test` (already
+wired into `pretest`), excluded from the VSIX. Set
+`RAVEN_SKIP_LAYOUT_TESTS=1` to skip the suite in sandboxes that can't
+render a webview.
+
 ### Benchmarks
 
 All benchmarks except `startup` require `--features test-support`. Set `RAVEN_BENCH_ALLOC=1` for allocation tracking.

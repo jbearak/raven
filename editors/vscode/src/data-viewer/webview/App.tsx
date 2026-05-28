@@ -62,6 +62,7 @@ import { ColumnContextMenu } from './column-context-menu';
 import { ToolbarSortStrip } from './sort-strip';
 import { FilterStrip } from './filter-strip';
 import { FilterPopover } from './filter-popover';
+import { useToolbarWrap } from './use-toolbar-wrap';
 
 type VscodeApi = {
     postMessage(msg: WebviewToExtension): void;
@@ -303,6 +304,13 @@ export function App({
     const toolbarBootstrappedRef = useRef(false);
     const missingRowRequestRef = useRef<VisibleRange | null>(null);
     const missingRowRequestTimerRef = useRef<number | null>(null);
+    /** Toolbar wrap measurement refs: when the sort/filter chips can't fit
+     *  beside the action buttons, the chip group drops to its own second row
+     *  via `.toolbar.is-wrapped`. See `useToolbarWrap` for the policy. */
+    const toolbarRef = useRef<HTMLDivElement>(null);
+    const rowCountRef = useRef<HTMLSpanElement>(null);
+    const toolbarChipsRef = useRef<HTMLDivElement>(null);
+    const toolbarActionsRef = useRef<HTMLDivElement>(null);
 
     const [panelGeneration, setPanelGeneration] = useState(restored?.panelGeneration ?? 0);
     const [nrow, setNrow] = useState(restored?.nrow ?? 0);
@@ -361,6 +369,18 @@ export function App({
      *  exceed the permutation length; display/identity contexts still use nrow. */
     const effectiveNrow = nrowFiltered ?? nrow;
     const rowCountText = describeVisibleRows(effectiveNrow, visibleRange);
+    /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
+     *  is in the deps because the Columns count badge widens the action buttons without
+     *  changing the toolbar width — without that the wrap state can be stale. */
+    const toolbarChipsWrapped = useToolbarWrap(
+        {
+            toolbar: toolbarRef,
+            lead: rowCountRef,
+            chips: toolbarChipsRef,
+            actions: toolbarActionsRef,
+        },
+        [sort.keys, filter.entries, rowCountText, layout.hiddenColumns.length],
+    );
     /** Summary text appended to the status bar when a sort is active.
      *  Truncates to 4 keys with an ellipsis so the bar never wraps; the
      *  toolbar chip strip is the full picture. */
@@ -1343,70 +1363,77 @@ export function App({
 
     return (
         <div className="data-viewer-root">
-            <div className="toolbar">
-                <span className="row-count">{rowCountText}</span>
-                <ToolbarSortStrip
-                    sort={sort}
-                    columns={columns}
-                    onChange={applySort}
-                    onClearAll={clearAllSorts}
-                />
-                <FilterStrip
-                    filter={filter}
-                    columns={columns}
-                    onEdit={onEditFilter}
-                    onToggleEnabled={onToggleFilterEnabled}
-                    onRemove={onRemoveFilter}
-                    onClearAll={onClearAllFilters}
-                />
-                <button
-                    type="button"
-                    className={toolbar.labelsOn ? 'toggle active' : 'toggle'}
-                    disabled={!labelsHaveEffect}
-                    onClick={() => setToolbar(t => ({ ...t, labelsOn: !t.labelsOn }))}
-                >
-                    Labels
-                </button>
-                <button
-                    type="button"
-                    className={toolbar.formatOn ? 'toggle active' : 'toggle'}
-                    disabled={!formatHasEffect}
-                    onClick={() => setToolbar(t => ({ ...t, formatOn: !t.formatOn }))}
-                >
-                    Format
-                </button>
-                <select
-                    className="digits"
-                    value={toolbar.digits}
-                    disabled={!toolbar.formatOn || !formatHasEffect}
-                    onChange={event => setToolbar(t => ({ ...t, digits: Number(event.target.value) }))}
-                    aria-label="Digits"
-                >
-                    {[0, 1, 2, 3, 4, 5, 6].map(d => (
-                        <option key={d} value={d}>{d}</option>
-                    ))}
-                </select>
-                <div className="columns-popover-anchor">
+            <div
+                className={toolbarChipsWrapped ? 'toolbar is-wrapped' : 'toolbar'}
+                ref={toolbarRef}
+            >
+                <span className="row-count" ref={rowCountRef}>{rowCountText}</span>
+                <div className="toolbar-chips" ref={toolbarChipsRef}>
+                    <ToolbarSortStrip
+                        sort={sort}
+                        columns={columns}
+                        onChange={applySort}
+                        onClearAll={clearAllSorts}
+                    />
+                    <FilterStrip
+                        filter={filter}
+                        columns={columns}
+                        onEdit={onEditFilter}
+                        onToggleEnabled={onToggleFilterEnabled}
+                        onRemove={onRemoveFilter}
+                        onClearAll={onClearAllFilters}
+                    />
+                </div>
+                <div className="toolbar-actions" ref={toolbarActionsRef}>
                     <button
                         type="button"
-                        className={columnsPopoverOpen ? 'toggle active' : 'toggle'}
-                        onClick={() => setColumnsPopoverOpen(open => !open)}
+                        className={toolbar.labelsOn ? 'toggle active' : 'toggle'}
+                        disabled={!labelsHaveEffect}
+                        onClick={() => setToolbar(t => ({ ...t, labelsOn: !t.labelsOn }))}
                     >
-                        Columns
-                        {layout.hiddenColumns.length > 0 && (
-                            <span className="hidden-count-badge">{layout.hiddenColumns.length}</span>
-                        )}
+                        Labels
                     </button>
-                    {columnsPopoverOpen && (
-                        <ColumnVisibilityPopover
-                            columns={columns}
-                            hiddenColumns={layout.hiddenColumns}
-                            onToggle={index => updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, index))}
-                            onShowAll={() => updateHiddenColumns(showAllColumns())}
-                            onHideAll={() => updateHiddenColumns(hideAllColumns(columns))}
-                            onClose={() => setColumnsPopoverOpen(false)}
-                        />
-                    )}
+                    <button
+                        type="button"
+                        className={toolbar.formatOn ? 'toggle active' : 'toggle'}
+                        disabled={!formatHasEffect}
+                        onClick={() => setToolbar(t => ({ ...t, formatOn: !t.formatOn }))}
+                    >
+                        Format
+                    </button>
+                    <select
+                        className="digits"
+                        value={toolbar.digits}
+                        disabled={!toolbar.formatOn || !formatHasEffect}
+                        onChange={event => setToolbar(t => ({ ...t, digits: Number(event.target.value) }))}
+                        aria-label="Digits"
+                    >
+                        {[0, 1, 2, 3, 4, 5, 6].map(d => (
+                            <option key={d} value={d}>{d}</option>
+                        ))}
+                    </select>
+                    <div className="columns-popover-anchor">
+                        <button
+                            type="button"
+                            className={columnsPopoverOpen ? 'toggle active' : 'toggle'}
+                            onClick={() => setColumnsPopoverOpen(open => !open)}
+                        >
+                            Columns
+                            {layout.hiddenColumns.length > 0 && (
+                                <span className="hidden-count-badge">{layout.hiddenColumns.length}</span>
+                            )}
+                        </button>
+                        {columnsPopoverOpen && (
+                            <ColumnVisibilityPopover
+                                columns={columns}
+                                hiddenColumns={layout.hiddenColumns}
+                                onToggle={index => updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, index))}
+                                onShowAll={() => updateHiddenColumns(showAllColumns())}
+                                onHideAll={() => updateHiddenColumns(hideAllColumns(columns))}
+                                onClose={() => setColumnsPopoverOpen(false)}
+                            />
+                        )}
+                    </div>
                 </div>
             </div>
             <div className="grid-shell" ref={gridShellRef}>
