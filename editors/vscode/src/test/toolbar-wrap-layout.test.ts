@@ -51,9 +51,22 @@ function assertSingleRow(snap: LayoutSnapshot, opts: { chipsPresent: boolean }):
     );
     assert.notStrictEqual(snap.chipsOrder, '1', 'chips must not be ordered onto row 2');
     if (opts.chipsPresent) {
+        // "Same flex row" = the two boxes' vertical extents overlap.
+        // Comparing tops directly is fragile: when the strip's inner
+        // `overflow-x: auto` shows a *classic* horizontal scrollbar
+        // (Linux/Windows Chromium, including Ubuntu CI), the chips
+        // region grows ~8 px taller than the actions box, and the
+        // toolbar's `align-items: center` then offsets the shorter
+        // actions box downward by half that — past any tight pixel
+        // threshold. On macOS overlay scrollbars take no space, which
+        // is why this passed locally and failed in CI. Mirrors
+        // `assertActionsOnTopRow`'s overlap check for lead vs actions.
+        const verticallyOverlaps =
+            snap.chipsRect.top < snap.actionsRect.bottom
+            && snap.actionsRect.top < snap.chipsRect.bottom;
         assert.ok(
-            Math.abs(snap.chipsRect.top - snap.actionsRect.top) < 4,
-            `chips should share the actions row (chips.top=${snap.chipsRect.top}, actions.top=${snap.actionsRect.top})`,
+            verticallyOverlaps,
+            `chips should share the actions row (chips=[${snap.chipsRect.top}, ${snap.chipsRect.bottom}], actions=[${snap.actionsRect.top}, ${snap.actionsRect.bottom}])`,
         );
     } else {
         // An empty chip group is a zero-height, vertically-centered flex
