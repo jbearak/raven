@@ -78,6 +78,13 @@ rows: 12,345 | Sort: mpg▲ cyl▼ ✕ | Filter: cyl ∈ {6,8} ✕ | [Labels] [F
 
 The `Sort` and `Filter` strips are hidden entirely when no sort or filter is active.
 
+When the panel is too narrow to fit the chip strips beside the action
+buttons, the strips drop onto their own second row so Labels / Format /
+Columns stay reachable. Each strip still scrolls horizontally on its own
+row when its chips overflow even that full-width row. The wrap decision
+holds a small hysteresis band so the toolbar doesn't flap between one
+and two rows as the panel is resized across the boundary.
+
 Each toggle is filled when active; clicking flips it. The Labels and
 Format buttons are disabled (dimmed) when no column in the current data
 set would be affected by them — e.g. an all-integer matrix disables

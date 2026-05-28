@@ -1950,11 +1950,12 @@
   "scripts": {
     "vscode:prepublish": "bun run bundle && bun run copy-binary",
     "bundle": "bun scripts/build.js",
+    "bundle:webview-test": "bun scripts/build-test-harness.js",
     "copy-binary": "bun scripts/bundle-binary.js",
     "compile": "bun run bundle",
     "compile:test": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "bun run compile:test && bun run bundle && bun run copy-binary",
+    "pretest": "bun run compile:test && bun run bundle && bun run bundle:webview-test && bun run copy-binary",
     "test": "vscode-test",
     "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
     "package:target": "bun run bundle && bun run copy-binary && vsce package --target",

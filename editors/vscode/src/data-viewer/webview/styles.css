@@ -40,13 +40,50 @@ body,
 }
 
 .row-count {
-    flex: 1 1 auto;
+    /* `flex: 0 1 auto` — won't grow, can shrink under pressure. The toolbar
+       wrap measurement reads `scrollWidth` as intrinsic content width; a
+       flex-grown element instead reports its grown width and the decision
+       would flap. See `use-toolbar-wrap.ts`. */
+    flex: 0 1 auto;
     min-width: 80px;
     overflow: hidden;
     color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
     text-overflow: ellipsis;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+}
+
+/* Sort + filter chip strips. Sits between the row count and the action
+   buttons on a single row, and drops to its own full-width row (via the
+   .is-wrapped modifier below) when it would otherwise crowd the buttons. */
+.toolbar-chips {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+/* Action buttons (Labels / Format / digits / Columns) stay pinned to the
+   right, even when the sort/filter chips are open to their left. */
+.toolbar-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* When the chips don't fit beside the buttons, allow the toolbar to wrap
+   and push the chip group onto its own second row. Row-count and the
+   action buttons (order 0) stay on the top row; the chips (order 1,
+   full width) wrap below. Each strip then scrolls via its own
+   overflow-x. The wrap decision is driven by `use-toolbar-wrap.ts`. */
+.toolbar.is-wrapped {
+    flex-wrap: wrap;
+}
+
+.toolbar.is-wrapped .toolbar-chips {
+    order: 1;
+    flex-basis: 100%;
 }
 
 .toggle {
