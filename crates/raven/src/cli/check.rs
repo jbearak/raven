@@ -21,8 +21,7 @@ use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use crate::cli::shared::{
     collect_r_file_paths, is_chunk_file, is_r_file, parse_output_format, parse_severity_level,
-    print_json, print_sarif, print_text, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK,
-    EXIT_OPERATOR_ERROR,
+    render, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -219,11 +218,7 @@ pub async fn run(args: CheckArgs) -> i32 {
         .iter()
         .any(|(_, d)| SeverityLevel::from_diag(d) > args.max_severity);
 
-    match args.format {
-        OutputFormat::Text => print_text(&all_diags, &root, args.quiet),
-        OutputFormat::Json => print_json(&all_diags, &root),
-        OutputFormat::Sarif => print_sarif(&all_diags, &root),
-    }
+    render(args.format, &all_diags, &root, args.quiet);
 
     // Operator error takes priority over a threshold breach: a half-read run
     // shouldn't masquerade as a clean (or merely failing) lint result.
@@ -270,17 +265,22 @@ fn build_indexed_state(
     // independent of the R subprocess — it's derived from the workspace files,
     // DESCRIPTION, and NAMESPACE — but MUST run after `apply_workspace_index`,
     // which resets package state.
+    //
+    // The disk seed is empty: `initialize_package_inputs_from_state` hydrates
+    // every package R file from the workspace index we just applied, so reading
+    // them from disk here would only be overwritten. This mirrors the LSP's
+    // with-scan startup path, which seeds package inputs from disk only on the
+    // no-scan branch (see `backend.rs`).
     let desc_text: Option<std::sync::Arc<str>> =
         std::fs::read_to_string(root.join("DESCRIPTION")).ok().map(|t| t.into());
     let ns_text: Option<std::sync::Arc<str>> =
         std::fs::read_to_string(root.join("NAMESPACE")).ok().map(|t| t.into());
-    let disk_r_files = crate::backend::collect_package_r_file_inputs_from_disk(root);
     crate::backend::initialize_package_inputs_from_state(
         &mut state,
         root.to_path_buf(),
         desc_text,
         ns_text,
-        disk_r_files,
+        Default::default(),
     );
 
     Ok(state)
@@ -298,14 +298,17 @@ fn resolve_project_config(
     if no_config {
         return Ok((None, None));
     }
+    // Every loader yields `settings` + `warnings`; emit the warnings and tag the
+    // settings with the config path they came from.
+    let loaded = |warnings: Vec<String>, settings: serde_json::Value, path: PathBuf| {
+        for w in warnings {
+            eprintln!("{w}");
+        }
+        Ok((Some(settings), Some(path)))
+    };
     if let Some(explicit) = config_path {
         return match crate::config_file::load_toml(explicit) {
-            Some(l) => {
-                for w in l.warnings {
-                    eprintln!("{w}");
-                }
-                Ok((Some(l.settings), Some(explicit.to_path_buf())))
-            }
+            Some(l) => loaded(l.warnings, l.settings, explicit.to_path_buf()),
             None => {
                 eprintln!("raven check: failed to load --config {}", explicit.display());
                 Err(EXIT_OPERATOR_ERROR)
@@ -315,12 +318,7 @@ fn resolve_project_config(
     match crate::config_file::find_config(search_start) {
         crate::config_file::DiscoveredConfig::RavenToml(p) => {
             match crate::config_file::load_toml(&p) {
-                Some(l) => {
-                    for w in l.warnings {
-                        eprintln!("{w}");
-                    }
-                    Ok((Some(l.settings), Some(p)))
-                }
+                Some(l) => loaded(l.warnings, l.settings, p),
                 None => {
                     eprintln!("raven check: failed to load {}", p.display());
                     Err(EXIT_OPERATOR_ERROR)
@@ -330,10 +328,7 @@ fn resolve_project_config(
         crate::config_file::DiscoveredConfig::Lintr(p) => match std::fs::read_to_string(&p) {
             Ok(text) => {
                 let l = crate::config_file::load_lintr_str(&text);
-                for w in l.warnings {
-                    eprintln!("{w}");
-                }
-                Ok((Some(l.settings), Some(p)))
+                loaded(l.warnings, l.settings, p)
             }
             Err(e) => {
                 eprintln!("raven check: cannot read {}: {e}", p.display());
@@ -344,45 +339,60 @@ fn resolve_project_config(
     }
 }
 
-/// Auto-detect R on PATH and initialize the package library so installed-package
-/// exports and base R symbols are available. On success the library and
-/// `package_library_ready = true` are stored on `state`. Every degradation path
-/// (R absent, init error, no library paths) leaves the default empty library in
-/// place and prints a specific one-line note to stderr so the message reflects
-/// what actually happened.
+/// Auto-detect R and initialize the package library so installed-package
+/// exports and base R symbols are available. Honors the same `raven.toml`
+/// package settings the editor does — `packages.rPath`
+/// (`cross_file_config.packages_r_path`) selects the R binary, and
+/// `packages.additionalLibraryPaths`
+/// (`cross_file_config.packages_additional_library_paths`) augments the
+/// discovered search paths — applying them exactly as
+/// [`crate::backend::rebuild_package_library`] does so the two init paths can't
+/// drift. On success the library and `package_library_ready = true` are stored
+/// on `state`. Every degradation path (R absent, init error, no library paths)
+/// leaves the default empty library in place and prints a specific one-line note
+/// to stderr so the message reflects what actually happened.
 async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
+    let r_path = state.cross_file_config.packages_r_path.clone();
+    let additional_paths = state
+        .cross_file_config
+        .packages_additional_library_paths
+        .clone();
     let root_owned = root.to_path_buf();
     // R discovery performs synchronous IO (which/where, R --version); run it off
     // the async executor, mirroring the LSP startup path in backend.rs.
     let subprocess = tokio::task::spawn_blocking(move || {
-        crate::r_subprocess::RSubprocess::new(None).map(|s| s.with_working_dir(root_owned))
+        crate::r_subprocess::RSubprocess::new(r_path).map(|s| s.with_working_dir(root_owned))
     })
     .await
     .unwrap_or(None);
 
-    let Some(subprocess) = subprocess else {
+    // Build the library even when R is absent, mirroring `rebuild_package_library`:
+    // `initialize()` does static, offline base-symbol loading, and the configured
+    // additional paths must still be honored. `r_found` only selects the right
+    // degradation message below.
+    let r_found = subprocess.is_some();
+    let mut lib = crate::package_library::PackageLibrary::with_subprocess(subprocess);
+    let init_result = lib.initialize().await;
+    // Apply user-configured additional library paths *after* R discovery so they
+    // augment (never suppress) the paths R reported — same ordering as
+    // `rebuild_package_library`.
+    lib.add_library_paths(&additional_paths);
+
+    if init_result.is_ok() && !lib.lib_paths().is_empty() {
+        state.package_library = std::sync::Arc::new(lib);
+        state.package_library_ready = true;
+    } else if !r_found {
         eprintln!(
             "raven check: R not found on PATH; package and base-symbol diagnostics will be limited"
         );
-        return;
-    };
-
-    let mut lib = crate::package_library::PackageLibrary::with_subprocess(Some(subprocess));
-    match lib.initialize().await {
-        Ok(()) if !lib.lib_paths().is_empty() => {
-            state.package_library = std::sync::Arc::new(lib);
-            state.package_library_ready = true;
-        }
-        Ok(()) => {
-            eprintln!(
-                "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "raven check: R found but its package library failed to initialize ({e}); package and base-symbol diagnostics will be limited"
-            );
-        }
+    } else if let Err(e) = init_result {
+        eprintln!(
+            "raven check: R found but its package library failed to initialize ({e}); package and base-symbol diagnostics will be limited"
+        );
+    } else {
+        eprintln!(
+            "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
+        );
     }
 }
 
@@ -637,5 +647,32 @@ mod tests {
         let mut args = base_args(tmp.path());
         args.max_severity = SeverityLevel::Warning;
         assert_eq!(run_blocking(args), EXIT_OK);
+    }
+
+    /// Regression: `raven check` must honor `packages.additionalLibraryPaths`
+    /// from `raven.toml`, exactly as the language server does via
+    /// `backend::rebuild_package_library`. The configured path must end up in
+    /// the resulting `PackageLibrary`'s search paths. R-independent: the
+    /// additional paths are applied after R discovery, so the assertion holds
+    /// whether or not R is installed.
+    #[tokio::test]
+    async fn maybe_init_r_honors_additional_library_paths() {
+        let workspace = TempDir::new().unwrap();
+        let extra_lib = TempDir::new().unwrap();
+        let mut state = crate::state::WorldState::new(vec![]);
+        state.cross_file_config.packages_additional_library_paths =
+            vec![extra_lib.path().to_path_buf()];
+
+        maybe_init_r(&mut state, workspace.path()).await;
+
+        assert!(
+            state
+                .package_library
+                .lib_paths()
+                .iter()
+                .any(|p| p == extra_lib.path()),
+            "check must honor packages.additionalLibraryPaths; got {:?}",
+            state.package_library.lib_paths()
+        );
     }
 }

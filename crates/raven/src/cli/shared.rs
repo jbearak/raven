@@ -112,7 +112,18 @@ pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-pub fn print_text(diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
+/// Render diagnostics in the requested format. The single dispatch point both
+/// `lint` and `check` call after collecting their `(path, diagnostic)` pairs,
+/// so the format → renderer mapping lives in one place next to the renderers.
+pub fn render(format: OutputFormat, diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
+    match format {
+        OutputFormat::Text => print_text(diags, root, quiet),
+        OutputFormat::Json => print_json(diags, root),
+        OutputFormat::Sarif => print_sarif(diags, root),
+    }
+}
+
+fn print_text(diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
     let mut errors = 0;
     let mut warnings = 0;
     let mut infos = 0;
@@ -176,7 +187,7 @@ pub fn print_text(diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
     }
 }
 
-pub fn print_json(diags: &[(PathBuf, Diagnostic)], root: &Path) {
+fn print_json(diags: &[(PathBuf, Diagnostic)], root: &Path) {
     let arr: Vec<_> = diags
         .iter()
         .map(|(p, d)| {
@@ -187,7 +198,7 @@ pub fn print_json(diags: &[(PathBuf, Diagnostic)], root: &Path) {
     println!("{}", serde_json::to_string_pretty(&json!(arr)).unwrap());
 }
 
-pub fn print_sarif(diags: &[(PathBuf, Diagnostic)], root: &Path) {
+fn print_sarif(diags: &[(PathBuf, Diagnostic)], root: &Path) {
     use std::collections::BTreeSet;
     let rule_ids: BTreeSet<String> = diags
         .iter()

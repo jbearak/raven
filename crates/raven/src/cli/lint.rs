@@ -6,8 +6,8 @@ use serde_json::json;
 use tower_lsp::lsp_types::Diagnostic;
 
 use crate::cli::shared::{
-    is_chunk_file, is_r_file, parse_output_format, parse_severity_level, print_json, print_sarif,
-    print_text, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+    is_chunk_file, is_r_file, parse_output_format, parse_severity_level, render, OutputFormat,
+    SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -197,11 +197,7 @@ pub fn run(args: LintArgs) -> i32 {
         .iter()
         .any(|(_, d)| SeverityLevel::from_diag(d) > args.max_severity);
 
-    match args.format {
-        OutputFormat::Text => print_text(&diagnostics, &root, args.quiet),
-        OutputFormat::Json => print_json(&diagnostics, &root),
-        OutputFormat::Sarif => print_sarif(&diagnostics, &root),
-    }
+    render(args.format, &diagnostics, &root, args.quiet);
 
     if any_above_threshold {
         EXIT_LINT_FAILED

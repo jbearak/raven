@@ -1498,7 +1498,7 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
     })
 }
 
-pub(crate) fn collect_package_r_file_inputs_from_disk(
+fn collect_package_r_file_inputs_from_disk(
     root: &std::path::Path,
 ) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
     let mut r_files = std::collections::BTreeMap::new();
