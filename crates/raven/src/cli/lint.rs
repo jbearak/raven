@@ -3,14 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+use tower_lsp::lsp_types::Diagnostic;
 
-/// Exit codes are returned as plain `i32` so `main()` can pass them directly
-/// to `std::process::exit`. Avoids the `ExitCode` cast trap (`ExitCode` is not
-/// a primitive and cannot be cast with `as`).
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_LINT_FAILED: i32 = 1;
-pub const EXIT_OPERATOR_ERROR: i32 = 2;
+use crate::cli::shared::{
+    is_chunk_file, is_r_file, parse_output_format, parse_severity_level, print_json, print_sarif,
+    print_text, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct LintArgs {
@@ -21,34 +19,6 @@ pub struct LintArgs {
     pub max_severity: SeverityLevel,
     pub quiet: bool,
     pub no_color: bool,
-}
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum OutputFormat {
-    Text,
-    Json,
-    Sarif,
-}
-
-#[derive(Debug, PartialEq, Clone, Copy, PartialOrd, Eq, Ord)]
-pub enum SeverityLevel {
-    Off,
-    Hint,
-    Info,
-    Warning,
-    Error,
-}
-
-impl SeverityLevel {
-    fn from_diag(d: &Diagnostic) -> Self {
-        match d.severity {
-            Some(DiagnosticSeverity::ERROR) => SeverityLevel::Error,
-            Some(DiagnosticSeverity::WARNING) => SeverityLevel::Warning,
-            Some(DiagnosticSeverity::INFORMATION) => SeverityLevel::Info,
-            Some(DiagnosticSeverity::HINT) => SeverityLevel::Hint,
-            _ => SeverityLevel::Off,
-        }
-    }
 }
 
 pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<LintArgs, String> {
@@ -68,23 +38,11 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<LintArgs, St
             "--no-config" => no_config = true,
             "--format" => {
                 let v = argv.next().ok_or("--format needs a value")?;
-                format = match v.as_str() {
-                    "text" => OutputFormat::Text,
-                    "json" => OutputFormat::Json,
-                    "sarif" => OutputFormat::Sarif,
-                    other => return Err(format!("unknown --format value: {other}")),
-                };
+                format = parse_output_format(&v)?;
             }
             "--max-severity" => {
                 let v = argv.next().ok_or("--max-severity needs a value")?;
-                max_severity = match v.as_str() {
-                    "off" => SeverityLevel::Off,
-                    "hint" => SeverityLevel::Hint,
-                    "info" => SeverityLevel::Info,
-                    "warning" => SeverityLevel::Warning,
-                    "error" => SeverityLevel::Error,
-                    other => return Err(format!("unknown --max-severity value: {other}")),
-                };
+                max_severity = parse_severity_level(&v)?;
             }
             "--quiet" => quiet = true,
             "--no-color" => no_color = true,
@@ -240,7 +198,7 @@ pub fn run(args: LintArgs) -> i32 {
         .any(|(_, d)| SeverityLevel::from_diag(d) > args.max_severity);
 
     match args.format {
-        OutputFormat::Text => print_text(&diagnostics, &args, &root),
+        OutputFormat::Text => print_text(&diagnostics, &root, args.quiet),
         OutputFormat::Json => print_json(&diagnostics, &root),
         OutputFormat::Sarif => print_sarif(&diagnostics, &root),
     }
@@ -348,151 +306,6 @@ fn walk(
         eprintln!("raven lint: path does not exist: {}", path.display());
         *operator_error = true;
     }
-}
-
-fn is_r_file(p: &Path) -> bool {
-    matches!(p.extension().and_then(|s| s.to_str()), Some("R") | Some("r"))
-}
-
-fn is_chunk_file(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|s| s.to_str()),
-        Some("Rmd") | Some("rmd") | Some("RMD") | Some("qmd") | Some("Qmd") | Some("QMD")
-    )
-}
-
-fn print_text(diags: &[(PathBuf, Diagnostic)], args: &LintArgs, root: &Path) {
-    let mut errors = 0;
-    let mut warnings = 0;
-    let mut infos = 0;
-    let mut hints = 0;
-    let mut notes = 0;
-    for (path, d) in diags {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        let level = match d.severity {
-            Some(DiagnosticSeverity::ERROR) => {
-                errors += 1;
-                "error"
-            }
-            Some(DiagnosticSeverity::WARNING) => {
-                warnings += 1;
-                "warning"
-            }
-            Some(DiagnosticSeverity::INFORMATION) => {
-                infos += 1;
-                "info"
-            }
-            Some(DiagnosticSeverity::HINT) => {
-                hints += 1;
-                "hint"
-            }
-            _ => {
-                notes += 1;
-                "note"
-            }
-        };
-        let line = d.range.start.line + 1;
-        let col = d.range.start.character + 1;
-        let rule = match &d.code {
-            Some(NumberOrString::String(s)) => s.as_str(),
-            _ => "",
-        };
-        println!(
-            "{}:{}:{} {}: {} [{}]",
-            rel.display(),
-            line,
-            col,
-            level,
-            d.message,
-            rule
-        );
-    }
-    if !args.quiet {
-        // Buckets sum to diags.len(): errors + warnings + infos + hints
-        // + notes (severity-less / unrecognized). Per-bucket reporting
-        // keeps INFORMATION distinct from WARNING in summaries — SARIF
-        // collapses them onto "note" by spec, but the human-readable
-        // CLI output should reflect the original LSP severity.
-        println!(
-            "{} issues ({} errors, {} warnings, {} infos, {} hints, {} notes)",
-            diags.len(),
-            errors,
-            warnings,
-            infos,
-            hints,
-            notes
-        );
-    }
-}
-
-fn print_json(diags: &[(PathBuf, Diagnostic)], root: &Path) {
-    let arr: Vec<_> = diags
-        .iter()
-        .map(|(p, d)| {
-            let rel = p.strip_prefix(root).unwrap_or(p);
-            json!({ "path": rel.display().to_string(), "diagnostic": d })
-        })
-        .collect();
-    println!("{}", serde_json::to_string_pretty(&json!(arr)).unwrap());
-}
-
-fn print_sarif(diags: &[(PathBuf, Diagnostic)], root: &Path) {
-    use std::collections::BTreeSet;
-    let rule_ids: BTreeSet<String> = diags
-        .iter()
-        .filter_map(|(_, d)| match &d.code {
-            Some(NumberOrString::String(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
-    let rules: Vec<_> = rule_ids
-        .iter()
-        .map(|id| {
-            json!({
-                "id": id, "name": id, "shortDescription": { "text": id }
-            })
-        })
-        .collect();
-    let results: Vec<_> = diags
-        .iter()
-        .map(|(p, d)| {
-            let rel = p.strip_prefix(root).unwrap_or(p);
-            let level = match d.severity {
-                Some(DiagnosticSeverity::ERROR) => "error",
-                Some(DiagnosticSeverity::WARNING) => "warning",
-                _ => "note",
-            };
-            let rule_id = match &d.code {
-                Some(NumberOrString::String(s)) => s.clone(),
-                _ => String::new(),
-            };
-            json!({
-                "ruleId": rule_id,
-                "level": level,
-                "message": { "text": d.message },
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": { "uri": rel.display().to_string() },
-                        "region": {
-                            "startLine": d.range.start.line + 1,
-                            "startColumn": d.range.start.character + 1,
-                            "endLine": d.range.end.line + 1,
-                            "endColumn": d.range.end.character + 1,
-                        }
-                    }
-                }]
-            })
-        })
-        .collect();
-    let sarif = json!({
-        "version": "2.1.0",
-        "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/cos02/schemas/sarif-schema-2.1.0.json",
-        "runs": [{
-            "tool": { "driver": { "name": "raven", "rules": rules } },
-            "results": results
-        }]
-    });
-    println!("{}", serde_json::to_string_pretty(&sarif).unwrap());
 }
 
 #[cfg(test)]

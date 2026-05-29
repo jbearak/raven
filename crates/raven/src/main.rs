@@ -54,6 +54,7 @@ fn print_usage() {
     print!(
         r#"
 Usage: raven [OPTIONS]
+       raven check [PATHS...] [--workspace DIR]
        raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
 
@@ -65,6 +66,9 @@ Available options:
 
 Subcommands:
 
+check [PATHS...]             Index the workspace and report full diagnostics
+                             (syntax, semantic, cross-file, package, lints)
+  --workspace DIR            Workspace root to index (default: current directory)
 lint [PATHS...]              Run the native style linter on files / directories
 analysis-stats <path>        Profile workspace analysis phases
   --csv                      Output results in CSV format
@@ -119,6 +123,26 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(msg) => {
                     return Err(anyhow::anyhow!("raven lint: {}", msg));
+                }
+            }
+        }
+
+        if first == "check" {
+            env_logger::init();
+            let rest = args.into_iter().skip(1);
+            match cli::check::parse_args(rest) {
+                Ok(check_args) => {
+                    // `main` is already `#[tokio::main]`, so await directly —
+                    // no nested runtime.
+                    let code = cli::check::run(check_args).await;
+                    std::process::exit(code);
+                }
+                Err(msg) if msg == "HELP" => {
+                    cli::check::print_help();
+                    return Ok(());
+                }
+                Err(msg) => {
+                    return Err(anyhow::anyhow!("raven check: {}", msg));
                 }
             }
         }

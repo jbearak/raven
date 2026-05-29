@@ -6,7 +6,7 @@ Most settings are exposed as VS Code settings — search for "raven" in Settings
 
 ## Project config: `raven.toml`
 
-The recommended way to configure Raven is a `raven.toml` file at the project root. Every editor and the `raven lint` CLI read this file, so a single committed config governs both interactive editing and CI.
+The recommended way to configure Raven is a `raven.toml` file at the project root. Every editor and the `raven check` / `raven lint` CLIs read this file, so a single committed config governs both interactive editing and CI.
 
 ### Discovery
 

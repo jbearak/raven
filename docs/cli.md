@@ -1,6 +1,73 @@
 # CLI
 
-Raven ships a single binary that serves the LSP via stdio *and* exposes a `lint` subcommand for use outside an editor. This page documents `lint`. The binary also has an `analysis-stats <path> [--csv] [--only <phase>]` subcommand for profiling workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help` for the current invocation.
+Raven ships a single binary that serves the LSP via stdio *and* exposes subcommands for use outside an editor:
+
+- `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes), for CI gating.
+- `raven lint` — run the native **style** linter only.
+- `analysis-stats <path> [--csv] [--only <phase>]` — profile workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help`.
+
+The difference between `check` and `lint`: `lint` parses each file in isolation and runs only the style rules, so it is fast and needs no R installation, but it cannot see relationships between files. `check` builds the same workspace index the language server builds, so it additionally reports cross-file, undefined-variable, and package diagnostics. Reach for `lint` when you only want style gating; reach for `check` when you want the editor's full analysis in CI.
+
+## `raven check`
+
+Index the workspace, then report the full diagnostic set for the requested files and exit with a code suitable for CI gating.
+
+```text
+raven check [OPTIONS] [PATHS...]
+```
+
+Diagnostics reported (subject to configured severities — see [diagnostics.md](diagnostics.md)):
+
+- Syntax errors and semantic checks (e.g. assignment-in-condition, mixed logical operators).
+- The native style lints (when enabled via `raven.toml` / `.lintr`).
+- Cross-file diagnostics: missing sourced files, circular dependencies, exceeded max source-chain depth, redundant directives, and out-of-scope usage.
+- Missing-package warnings (`library(notInstalled)`).
+- Undefined-variable diagnostics, accounting for cross-file and package scope.
+
+### Workspace and paths
+
+The whole workspace is always indexed so cross-file resolution is accurate. The workspace root is `--workspace DIR`, defaulting to the current directory. `PATHS` only filter **which files have their diagnostics reported**:
+
+- With no `PATHS`, every R file in the workspace is reported.
+- With `PATHS`, only those files are reported (directories are walked recursively for R files). Indexing still covers the whole workspace, so a reported file's `source()` targets resolve even when they aren't named.
+
+### Options
+
+- `--workspace DIR` — workspace root to index (default: current directory).
+- `--config PATH` — explicit path to a `raven.toml` (default: walk upward from the workspace root, discovering a `raven.toml` or `.lintr`).
+- `--no-config` — ignore `raven.toml` and `.lintr`; use Raven's built-in defaults.
+- `--format text|json|sarif` — default `text`.
+- `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold.
+- `--quiet` — suppress the trailing summary line.
+- `--no-color` — accepted for forward compatibility. `text` output is currently uncolored regardless, so this flag has no visible effect yet.
+
+### R and packages
+
+`raven check` auto-detects R on `PATH` to resolve installed-package exports and base R symbols (it runs `.libPaths()` and parses package `NAMESPACE` files, the same as the language server). If R is not found, package and base-symbol diagnostics are limited — `library()` calls aren't checked against installed packages, and undefined-variable detection falls back to a built-in symbol list — and a one-line note is printed to stderr. All other diagnostics still run.
+
+### Exit codes
+
+- `0` — no diagnostic exceeded `--max-severity`.
+- `1` — at least one diagnostic exceeded `--max-severity`. An unknown flag is a usage error and also exits `1`.
+- `2` — operator error detected while running (config parse failure, unreadable path, invalid workspace).
+
+### GitHub Actions example
+
+```yaml
+- name: Check R sources
+  run: |
+    cargo install --git https://github.com/jbearak/raven raven
+    raven check --format sarif > raven.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: raven.sarif
+```
+
+To get installed-package and base-symbol awareness in CI, install R (e.g. `r-lib/actions/setup-r`) before running `raven check`. Without R, the command still runs and reports everything else.
+
+### Scope
+
+Only plain R files (`.R` / `.r`) are reported. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped — chunk extraction isn't supported on the command line — with a one-line note on stderr when one is named explicitly. Other file types (JAGS / Stan) are indexed for cross-file purposes where applicable but are not diagnosed.
 
 ## `raven lint`
 
@@ -22,14 +89,8 @@ raven lint [OPTIONS] [PATHS...]
 ### Exit codes
 
 - `0` — no diagnostic exceeded `--max-severity`.
-- `1` — at least one diagnostic exceeded `--max-severity`.
-- `2` — operator error detected while running (config parse failure, unreadable or missing path). An unknown flag is a usage error and exits `1`.
-
-### Output formats
-
-- `text` — `path:line:col level: message [rule]`, one per line.
-- `json` — array of `{ path, diagnostic }` objects (`diagnostic` is a verbatim LSP `Diagnostic`).
-- `sarif` — SARIF 2.1.0 envelope. Tool name `raven`; `ruleId` from `Diagnostic.code`.
+- `1` — at least one diagnostic exceeded `--max-severity`. An unknown flag is a usage error and exits `1`.
+- `2` — operator error detected while running (config parse failure, unreadable or missing path).
 
 ### GitHub Actions example
 
@@ -45,6 +106,14 @@ raven lint [OPTIONS] [PATHS...]
 
 ### Scope
 
-`raven lint` runs the native style linter only. Cross-file, undefined-variable, and package diagnostics need a workspace scan and are LSP-only.
+`raven lint` runs the native style linter only. Cross-file, undefined-variable, and package diagnostics need a workspace scan; use [`raven check`](#raven-check) for those.
 
 Only plain R files (`.R` / `.r`) are linted. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped with a one-line note on stderr — chunk extraction isn't supported on the command line — and other file types are ignored silently. Passing a directory walks it recursively for R files.
+
+## Output formats
+
+Both `check` and `lint` share the same renderers:
+
+- `text` — `path:line:col level: message [rule]`, one per line.
+- `json` — array of `{ path, diagnostic }` objects (`diagnostic` is a verbatim LSP `Diagnostic`).
+- `sarif` — SARIF 2.1.0 envelope. Tool name `raven`; `ruleId` from `Diagnostic.code`.

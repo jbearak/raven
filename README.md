@@ -55,7 +55,7 @@ Raven takes a static-analysis approach rather than attaching to a live R session
 - **Available immediately, even for code you haven't run** — answers the moment you open a file, including code that errors halfway, is missing a dependency, or that you're only reading (onboarding to a repo, reviewing a pull request). A session-based tool can offer little until the code runs cleanly.
 - **Reflects what your code says, not what your session remembers** — a tool tied to a live session sees whatever is in `globalenv()` right now, possibly stale. Comment out `library(dplyr)` while it's still attached in your session and a session-based tool keeps completing `dplyr` functions; Raven reads the file and knows it isn't loaded there.
 - **Read-only and side-effect-free** — computing scope never runs your code, so nothing it does (writing files, hitting a database, a long job) can be triggered. This is also what makes Raven safe to run behind an agentic/AI tool.
-- **Runs in CI and other headless environments** — scope resolution needs no live R session, so Raven's diagnostics and lints run in a CI pipeline or any headless context (see the [`raven lint` CLI](docs/cli.md)).
+- **Runs in CI and other headless environments** — scope resolution needs no live R session, so Raven's diagnostics and lints run in a CI pipeline or any headless context. Use [`raven check`](docs/cli.md#raven-check) for the full diagnostic set (cross-file, undefined-variable, package) and [`raven lint`](docs/cli.md#raven-lint) for style-only gating.
 
 See [Why Raven exists](docs/comparison.md#why-raven-exists) for the origin and rationale.
 
@@ -81,7 +81,7 @@ Each feature above links to its own page. Beyond those:
 
 - [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
 - [Configuration](docs/configuration.md) — All settings and options ([alphabetical reference](docs/settings-reference.md))
-- [CLI](docs/cli.md) — `raven lint` for CI and other command-line usage
+- [CLI](docs/cli.md) — `raven check` (full diagnostics) and `raven lint` (style) for CI and command-line usage
 - [R Package Development](docs/r-package-dev.md) — Package mode, visibility rules, and build commands
 - [Coexistence](docs/coexistence.md) — Running alongside REditorSupport (vscode-R) and Positron
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools

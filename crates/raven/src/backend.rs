@@ -1498,7 +1498,7 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
     })
 }
 
-fn collect_package_r_file_inputs_from_disk(
+pub(crate) fn collect_package_r_file_inputs_from_disk(
     root: &std::path::Path,
 ) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
     let mut r_files = std::collections::BTreeMap::new();
@@ -1588,7 +1588,7 @@ fn hydrate_package_r_files_from_state(
     r_files
 }
 
-fn initialize_package_inputs_from_state(
+pub(crate) fn initialize_package_inputs_from_state(
     state: &mut WorldState,
     root: std::path::PathBuf,
     desc_text: Option<Arc<str>>,
