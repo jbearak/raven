@@ -15,5 +15,3 @@ Raven is under active development. The gaps below reflect features that exist in
 - **List / environment viewer** — REditorSupport's `View()` on lists and environments opens a collapsible tree view. Raven's `View()` only handles data frames and matrices. See [Data Viewer](./data-viewer.md).
 
 If you rely on any of the fully-absent features above (workspace viewer, htmlwidget/Shiny viewer, list/environment viewer) and have REditorSupport installed, see [Coexistence](./coexistence.md) for how to run both extensions together.
-
-If you're interested in any of these features in Raven, please [file an issue](https://github.com/jbearak/raven/issues) — I'd consider them if there's interest.

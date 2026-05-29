@@ -90,8 +90,6 @@ Raven takes a different approach. Its language server is a separate Rust process
 - **htmlwidget / Shiny viewer** — Interactive HTML output (plotly, DT, profvis, etc.) and Shiny apps render in VS Code webview panels.
 - **List / environment viewer** — `View()` on lists and environments opens a collapsible tree view. Raven's `View()` only handles data frames and matrices.
 
-If you're interested in any of these, please [file an issue](https://github.com/jbearak/raven/issues) or submit a PR.
-
 ## Coexistence
 
 See [Coexistence with Other R Extensions](./coexistence.md) for how Raven's R-session features interact with the REditorSupport extension and Positron, how `raven.rConsole.activation` works, and how to run REditorSupport's lintr alongside Raven.
