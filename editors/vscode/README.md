@@ -1,16 +1,14 @@
 # Raven
 
-Raven is a language server for R, Stan, and JAGS. With Raven, what's in scope depends on where your cursor is. The language server traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files and within a single script (a variable defined on line 50 isn't in scope on line 10).
+Raven is a language server for R, Stan, and JAGS. Its defining idea: **what's in scope depends on where your cursor is.** Raven traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files, and within a single script (a variable defined on line 50 isn't in scope on line 10).
 
-As you type, Raven resolves scope — so it can flag undefined variables. It also reports parse errors — unclosed or mismatched brackets, or an `else` that isn't on the same line as the closing `}` — plus likely-bug patterns like mixed logical operators (`a & b | c`).
+Because scope is resolved by position, Raven can flag genuinely undefined variables — and, parsing as you type, it catches parse errors (unclosed brackets, an `else` stranded from its `}`) and likely-bug patterns like mixed logical operators (`a & b | c`).
 
-[REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus RStudio-style indentation) on top of what you already have.
+[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (REditorSupport's R extension) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus RStudio-style indentation) on top of what you already have.
 
-REditorSupport's language intelligence comes from [r-language-server](https://github.com/REditorSupport/languageserver), an R package that runs inside an R session and indexes the documents you have open (and, in an R package, its `R/` directory). Raven is written in Rust to be fast, and needs no R session: it indexes your whole workspace and follows `source()` chains, so completions and navigation reach symbols in files you haven't opened — jump straight to a variable's definition in another file.
+vscode-R's language intelligence comes from [r-language-server](https://github.com/REditorSupport/languageserver), an R package that runs inside an R session and indexes the documents you have open (and, in an R package, its `R/` directory). Raven is written in Rust to be fast, and needs no R session: it indexes your whole workspace and follows `source()` chains, so completions and navigation reach symbols in files you haven't opened — jump straight to a variable's definition in another file.
 
-Raven is designed to complement, not replace, your existing tools. But it *can* run without REditorSupport installed, if you want: then Raven uses its own R console, with data and plot viewers. Otherwise — if REditorSupport is installed, or you're running inside Positron — those features stay off by default; they simply don't appear, so Raven leaves your existing setup untouched.
-
-
+Raven is designed to complement, not replace, your existing tools. But it *can* run without vscode-R installed, if you want: then Raven uses its own R console, with data and plot viewers. Otherwise — if vscode-R is installed, or you're running inside Positron — those features stay off by default; they simply don't appear, so Raven leaves your existing setup untouched.
 
 ## Features
 
@@ -20,17 +18,14 @@ Raven is designed to complement, not replace, your existing tools. But it *can* 
 - **[Go-to-definition](https://github.com/jbearak/raven/blob/main/docs/go-to-definition.md)** — Jump to definitions across file boundaries
 - **[Find references](https://github.com/jbearak/raven/blob/main/docs/find-references.md)** — Locate all usages of a symbol across your project
 - **[Hover](https://github.com/jbearak/raven/blob/main/docs/hover.md)** — Symbol info including source file and package origin
-- **[Diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
-- **[Linting](https://github.com/jbearak/raven/blob/main/docs/linting.md)** — Opt-in style/lint rules (line length, trailing whitespace, trailing blank lines, tabs, assignment operator, object names, infix spaces, commented code, indentation)
+- **[Diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages, plus opt-in [style/lint rules](https://github.com/jbearak/raven/blob/main/docs/linting.md)
 - **[Document outline](https://github.com/jbearak/raven/blob/main/docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
 - **[Smart indentation](https://github.com/jbearak/raven/blob/main/docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
 - **[Cross-file awareness](https://github.com/jbearak/raven/blob/main/docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — function names via LSP semantic tokens
-- Raven provides lightweight support for **Stan** (`.stan`), **JAGS** (`.jags`), and **BUGS** (`.bugs`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation.
-
+- **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
 ### R session integration
 
@@ -41,9 +36,29 @@ Raven is designed to complement, not replace, your existing tools. But it *can* 
 - **[Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
 - **[Help viewer](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
 
+> Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation.
+
 ## Settings
 
 All settings live under the `raven.*` prefix. See the [full configuration reference](https://github.com/jbearak/raven/blob/main/docs/configuration.md) for the complete list.
+
+## Coexistence with vscode-R and Positron
+
+Raven's R-console features (R console, plot viewer, data viewer) and [vscode-R](https://github.com/REditorSupport/vscode-R) cover overlapping ground. By default `raven.rConsole.activation` is `"auto"`, which leaves Raven's R-console features off when vscode-R is enabled or you're running inside Positron. Raven's help viewer and language server activate either way.
+
+Raven ships its own [opt-in style linter](https://github.com/jbearak/raven/blob/main/docs/linting.md) — a subset of `lintr`'s rules re-implemented natively, with no R session or `lintr` install required. For `lintr` rules [outside that subset](https://github.com/jbearak/raven/blob/main/docs/linting.md#gaps-vs-lintr), vscode-R's `lintr` diagnostics run from its own language server.
+
+Two vscode-R settings (both default to `true`) let you trim that overlap:
+
+- **`r.lsp.diagnostics`** — set to `false` to silence `lintr` while keeping vscode-R's session-based completions.
+- **`r.lsp.enabled`** — set to `false` to shut vscode-R's language server down entirely. Use this when you only want vscode-R for its R-session features (console, viewers) and are happy to let Raven handle all code intelligence.
+
+```json
+"r.lsp.diagnostics": false,   // keep vscode-R's LSP, drop only its lintr diagnostics
+"r.lsp.enabled": false        // or: disable vscode-R's LSP entirely
+```
+
+For a deeper comparison see [docs/comparison.md](https://github.com/jbearak/raven/blob/main/docs/comparison.md).
 
 ## More Information
 
