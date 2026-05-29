@@ -4,7 +4,7 @@ This page compares Raven with other R tools across two dimensions: **language in
 
 ## Language intelligence
 
-Compares Raven's language server against the language servers and code-intelligence systems in RStudio IDE, [Positron](https://github.com/posit-dev/positron) (via [Ark](https://github.com/posit-dev/ark)), and [REditorSupport/languageserver](https://github.com/REditorSupport/languageserver) (the R-package-based LSP that powers the [REditorSupport (R) VS Code extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) and various other LSP clients).
+Compares Raven's language server against the language servers and code-intelligence systems in RStudio IDE, [Positron](https://github.com/posit-dev/positron) (via [Ark](https://github.com/posit-dev/ark)), and [REditorSupport/languageserver](https://github.com/REditorSupport/languageserver) (the R-package-based LSP that powers the [REditorSupport VS Code extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) and various other LSP clients).
 
 Two newer Rust-based tools occupy adjacent niches rather than competing on the same axis, so they aren't in the table below: [Air](https://github.com/posit-dev/air) (Posit) is a code formatter (and formatting language server), and [Jarl](https://github.com/etiennebacher/jarl) (Etienne Bacher) is a linter. Raven is a cross-file language server. It does fold a couple of lighter conveniences into the same process — RStudio-style auto-indentation as you type, and an opt-in subset of common [style lints](linting.md) (off by default) — so if all you need is basic tidying, you can get it without launching a separate tool, saving the CPU and memory a second process would cost. But it doesn't reformat whole files, and the lint set is deliberately a subset, so Raven is meant to complement these, not compete with them. The comparisons here are therefore against the language servers and IDEs that overlap with what Raven does.
 
@@ -38,7 +38,7 @@ Raven takes the same approach as language servers for statically-typed languages
 - **It's read-only and side-effect-free.** Computing scope never executes your code, so there's no risk of triggering what that code does (writing files, hitting a database, a long-running job). This is also what makes Raven safe to run behind an agentic/AI tool.
 - **It runs in CI and other headless environments.** Because scope resolution needs no live R session, Raven's diagnostics and lints can run in a CI pipeline or any headless context. (Raven still shells out to its own R subprocess for package metadata when R is available — never your interactive session — but the core static analysis doesn't depend on it.)
 
-Those two approaches aren't exclusive: you can install Raven alongside the REditorSupport (R) extension and run both language servers at once — their different models let them coexist, each contributing what it's best at. Raven also detects when REditorSupport is enabled and declines to register its own R console by default, so REditorSupport's R-session integration stays in charge of running code, rendering plots, and opening data frames. See [Coexistence](./coexistence.md) for details.
+Those two approaches aren't exclusive: you can install Raven alongside the REditorSupport extension and run both language servers at once — their different models let them coexist, each contributing what it's best at. Raven also detects when REditorSupport is enabled and declines to register its own R console by default, so REditorSupport's R-session integration stays in charge of running code, rendering plots, and opening data frames. See [Coexistence](./coexistence.md) for details.
 
 ### What REditorSupport's language server offers that Raven doesn't
 
@@ -47,7 +47,7 @@ Those two approaches aren't exclusive: you can install Raven alongside the REdit
 
 ## R session integration
 
-Raven's VS Code extension also includes an R console, plot viewer, data viewer, and help viewer. The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) provides equivalents (it's a long-standing, widely used extension), and Positron has its own first-party versions. We chose to build these features rather than rely on REditorSupport because they let us address specific limitations our team has run into — described below.
+Raven's VS Code extension also includes an R console, plot viewer, data viewer, and help viewer. The [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) provides equivalents (it's a long-standing, widely used extension), and Positron has its own first-party versions. We chose to build these features rather than rely on REditorSupport because they let us address specific limitations our team has run into — described below.
 
 These comparisons are based on reading the current upstream sources (links cited inline) at the time of writing. Both projects iterate, so a claim that's accurate today may be out of date tomorrow — if you spot something that no longer matches the code, please [file an issue](https://github.com/jbearak/raven/issues).
 
@@ -94,4 +94,4 @@ If you're interested in any of these, please [file an issue](https://github.com/
 
 ## Coexistence
 
-See [Coexistence with Other R Extensions](./coexistence.md) for how Raven's R-session features interact with the REditorSupport (R) extension and Positron, how `raven.rConsole.activation` works, and how to run REditorSupport's lintr alongside Raven.
+See [Coexistence with Other R Extensions](./coexistence.md) for how Raven's R-session features interact with the REditorSupport extension and Positron, how `raven.rConsole.activation` works, and how to run REditorSupport's lintr alongside Raven.

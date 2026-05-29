@@ -5,7 +5,7 @@ Raven provides an integrated R console inside VS Code, plus commands to send R c
 The R console is the entry point to Raven's [plot viewer](./plot-viewer.md) and [data viewer](./data-viewer.md): plots produced in this console render in a VS Code panel via httpgd, and `View(df)` opens Raven's data viewer instead of R's default. Raven's [help viewer](./help-viewer.md) works independently of the R console.
 
 > [!NOTE]
-> Whether the R console activates is controlled by `raven.rConsole.activation` (default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore its plot and data viewers — is off by default. See [Coexistence](./coexistence.md) for details.
+> Whether the R console activates is controlled by `raven.rConsole.activation` (default: `auto`). When the REditorSupport extension is enabled or VS Code is running as Positron, Raven's R console — and therefore its plot and data viewers — is off by default. See [Coexistence](./coexistence.md) for details.
 
 ## R Terminal Profile
 
@@ -124,7 +124,7 @@ Writing larger blocks to a temp file and `source()`-ing them sidesteps this, avo
 
 The cutover point is controlled by `raven.sendToR.autoTempFileThresholdLines` — a block with at least this many lines (≥ N) goes through a temp file; smaller blocks are pasted. The default of 25 is arbitrary but reasonable — most blocks below it paste fast and reliably on a local terminal. Lower it for slow remote connections; raise it if you prefer to see your code echoed in the terminal.
 
-For a comparison with how the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) sends code, see [Comparison: R console](./comparison.md#r-console). If you prefer paste-everywhere behavior — for example, because you want raw paste output rather than `source()` echoing — set `raven.sendToR.sendMethod` to `"paste"`.
+For a comparison with how the [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) sends code, see [Comparison: R console](./comparison.md#r-console). If you prefer paste-everywhere behavior — for example, because you want raw paste output rather than `source()` echoing — set `raven.sendToR.sendMethod` to `"paste"`.
 
 ## Configuration Options
 

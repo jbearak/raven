@@ -237,14 +237,14 @@ If you also want to run `lintr` itself alongside Raven, see [below](#filling-the
 - `pipe_continuation_linter`, `pipe_call_linter`.
 - `absolute_path_linter`.
 
-If you rely on any of these, the recommended setup is to run `lintr` via the `REditorSupport (R)` extension alongside Raven — Raven's language server is designed to coexist with REditorSupport. See [below](#filling-the-gaps-with-lintr-itself).
+If you rely on any of these, the recommended setup is to run `lintr` via the `REditorSupport` extension alongside Raven — Raven's language server is designed to coexist with REditorSupport. See [below](#filling-the-gaps-with-lintr-itself).
 
 ### Filling the gaps with `lintr` itself
 
-The [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) runs `lintr` from inside its own R-based language server, so it covers every linter `lintr` ships. To run both at once:
+The [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) runs `lintr` from inside its own R-based language server, so it covers every linter `lintr` ships. To run both at once:
 
 1. Keep Raven installed and enabled.
-2. Install the REditorSupport (R) extension. Leave `r.lsp.enabled` at its default (`true`).
+2. Install the REditorSupport extension. Leave `r.lsp.enabled` at its default (`true`).
 3. Place a `.lintr` file at your project root. Raven does not scaffold this file — its format is `lintr`'s own DSL. (Raven reads a [documented subset](#migrating-from-lintr) of `.lintr` at runtime when no `raven.toml` is present, but the file primarily exists so `lintr` itself can consume it from REditorSupport's R session.) A minimal starter that mirrors the `lintr` default rule set with a 120-character line limit is one line:
 
    ```r

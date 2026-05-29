@@ -1,12 +1,12 @@
 # Coexistence with Other R Extensions
 
-Raven's VS Code extension includes both a **language server** (completions, diagnostics, navigation) and **R-session features** (R console, plot viewer, data viewer, help viewer). If you also use the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) or [Positron](https://github.com/posit-dev/positron), Raven is designed to stay out of the way by default.
+Raven's VS Code extension includes both a **language server** (completions, diagnostics, navigation) and **R-session features** (R console, plot viewer, data viewer, help viewer). If you also use the [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) or [Positron](https://github.com/posit-dev/positron), Raven is designed to stay out of the way by default.
 
 ## The `raven.rConsole.activation` setting
 
 The `raven.rConsole.activation` setting (default: `"auto"`) controls whether Raven's R console — and therefore its plot and data viewers, chunk run commands, and Knit Preview — activates:
 
-- **`"auto"`** (default) — Raven's R-session features activate *unless* the REditorSupport (R) extension is enabled or VS Code is running as Positron. This keeps Raven out of the way when you already have R-session integration.
+- **`"auto"`** (default) — Raven's R-session features activate *unless* the REditorSupport extension is enabled or VS Code is running as Positron. This keeps Raven out of the way when you already have R-session integration.
 - **`"enabled"`** — Always activate Raven's R console, plot viewer, and data viewer, even when another R extension is present. With REditorSupport also enabled, both extensions' R consoles are available; `Cmd+Enter` / `Ctrl+Enter` can only be bound to one extension's send command, and VS Code's keybinding editor lets you rebind either.
 - **`"disabled"`** — Never activate Raven's R-session features, even when no other R extension is present.
 
@@ -29,7 +29,7 @@ Several editor surfaces that overlap with REditorSupport's R Markdown / Quarto t
 
 ## Who benefits from Raven's R console?
 
-Raven's R console, plot viewer, and data viewer overlap with [REditorSupport (R)](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r)'s equivalents. Whether Raven's versions help you depends on your workflow:
+Raven's R console, plot viewer, and data viewer overlap with [REditorSupport](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r)'s equivalents. Whether Raven's versions help you depends on your workflow:
 
 - **You'd benefit** — e.g., you send large blocks to R (Raven's temp-file `source()` sidesteps bracketed-paste delays); you regularly view large frames (Raven's data viewer streams Arrow rows on demand); you work with labelled data (Raven's data viewer reads variable and value labels from `haven` imports of Stata / SPSS files, showing value labels instead of the underlying codes); or you want a themeable `.Rmd` preview (`Raven: Knit Preview` renders through VS Code's built-in Markdown pipeline rather than a Pandoc round-trip, and its **Apply VS Code theme** toggle recolors the whole rendered document — prose, syntax highlighting, and plots — to match your editor theme in real time). See [Comparison: R session integration](./comparison.md#r-session-integration).
 - **You'd lose something** — REditorSupport ships a few R-session features Raven doesn't: a workspace viewer, an htmlwidget / Shiny viewer, and `View()` on lists and environments (Raven's data viewer handles only data frames and matrices).

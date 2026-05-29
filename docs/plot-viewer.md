@@ -3,7 +3,7 @@
 Raven shows plots from its managed R terminal directly in VS Code via a built-in viewer panel. The viewer is backed by [httpgd](https://nx10.dev/httpgd/), a headless graphics device for R that exposes plots over a local HTTP/WebSocket server. Each R session gets its own plot panel with independent history, theme-aware backgrounds, and export to PNG, SVG, or PDF.
 
 > [!NOTE]
-> The plot viewer is reached through Raven's R console: it activates only when Raven's R console activates (`raven.rConsole.activation`, default: `auto`). When the REditorSupport (R) extension is enabled or VS Code is running as Positron, Raven's R console — and therefore the plot viewer — is off by default. See [Coexistence](./coexistence.md) for details.
+> The plot viewer is reached through Raven's R console: it activates only when Raven's R console activates (`raven.rConsole.activation`, default: `auto`). When the REditorSupport extension is enabled or VS Code is running as Positron, Raven's R console — and therefore the plot viewer — is off by default. See [Coexistence](./coexistence.md) for details.
 
 ## Prerequisites
 
@@ -53,4 +53,4 @@ The viewer's overall enable/disable is controlled by `raven.rConsole.activation`
 
 - **No viewer appears.** Confirm httpgd is installed (`packageVersion("httpgd")`) and that you're running R inside a terminal launched via Raven (the terminal profile dropdown's "R" entry, or any of Raven's send-to-R commands). Plots from terminals you opened manually outside Raven won't trigger the viewer.
 - **httpgd console message about installing or upgrading.** Follow the printed `install.packages("httpgd")` instructions. Plots fall back to R's default graphics device until httpgd is available.
-- **The plot viewer doesn't activate at all.** Check `raven.rConsole.activation`. If you have the REditorSupport (R) extension enabled or you're using Positron, the default `auto` value leaves Raven's R-session features off. Set it to `"enabled"` to turn them on.
+- **The plot viewer doesn't activate at all.** Check `raven.rConsole.activation`. If you have the REditorSupport extension enabled or you're using Positron, the default `auto` value leaves Raven's R-session features off. Set it to `"enabled"` to turn them on.

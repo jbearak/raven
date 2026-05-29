@@ -34,7 +34,7 @@ side-by-side.
 > [!NOTE]
 > The data viewer is reached through Raven's R console: it activates only
 > when Raven's R console activates (`raven.rConsole.activation`, default:
-> `auto`). When the REditorSupport (R) extension is enabled or VS Code is
+> `auto`). When the REditorSupport extension is enabled or VS Code is
 > running as Positron, Raven's R console — and therefore the data viewer
 > — is off by default. See
 > [Coexistence](./coexistence.md) for details.
@@ -416,7 +416,7 @@ directory is swept of files older than 24 hours.
   was started by Raven (the terminal profile dropdown's "R" entry,
   or via send-to-R). Confirm `requireNamespace("arrow")`
   returns `TRUE`. Check `raven.rConsole.activation`: if it's
-  `"disabled"`, or `"auto"` while REditorSupport (R) is enabled or
+  `"disabled"`, or `"auto"` while REditorSupport is enabled or
   you're in Positron, Raven's R console — and the data viewer — won't
   activate.
 - **"Raven data viewer requires the 'arrow' package" warning.** Run
