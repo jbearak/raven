@@ -136,7 +136,7 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.rConsole.activation` | `"auto"` | When Raven's R console — and the surfaces gated alongside it (plot viewer, data viewer, chunk navigation / highlighting / active-cell indicator, `.R` cell mode, and the `r.json` snippets contributed to `.Rmd` / `.qmd`) — activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport (R) extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Coexistence](coexistence.md). |
+| `raven.rConsole.activation` | `"auto"` | When Raven's R console — and the surfaces gated alongside it (plot viewer, data viewer, chunk navigation / highlighting / active-cell indicator, `.R` cell mode, and the `r.json` snippets contributed to `.Rmd` / `.qmd`) — activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Coexistence](coexistence.md). |
 
 ## Plot Settings
 

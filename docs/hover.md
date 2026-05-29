@@ -71,7 +71,7 @@ Explicit qualifiers short-circuit this — `dplyr::filter` and `stats::filter` a
 
 ## With REditorSupport Also Installed
 
-VS Code runs hover providers from every enabled extension and stacks their output, separated by horizontal rules. If you have both Raven and the [REditorSupport (R) extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) active, you'll see REditorSupport's bold help link at the top of the hover and Raven's result below it — and sometimes REditorSupport contributes several bold links instead of one.
+VS Code runs hover providers from every enabled extension and stacks their output, separated by horizontal rules. If you have both Raven and the [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) active, you'll see REditorSupport's bold help link at the top of the hover and Raven's result below it — and sometimes REditorSupport contributes several bold links instead of one.
 
 REditorSupport's hover doesn't resolve scope at the cursor. When its `guess_namespace` heuristic can't narrow a name down to a single package, it falls through to an unqualified `utils::help((topic))` lookup, which returns matches across every installed package. Hovering `filter` after `library(dplyr)`, for example, may show **both** `dplyr::filter` and `stats::filter` as bold links at the top — see [Comparison: Hover help](comparison.md#hover-help) for the mechanism. Raven's single scope-aware result (`dplyr::filter`, in this case) appears underneath.
 
