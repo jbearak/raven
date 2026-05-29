@@ -8,7 +8,7 @@ REditorSupport's language intelligence comes from [r-language-server](https://gi
 
 As you type, Raven resolves scope — so it can flag undefined variables. It also reports parse errors — unclosed or mismatched brackets, or an `else` that isn't on the same line as the closing `}` — plus likely-bug patterns like mixed logical operators (`a & b | c`).
 
-Raven *can* run without REditorSupport installed. Its language server deliberately needs no live R session, so rather than make you pair it with a session-based tool, I built a complete R workflow — an R console with plot and data viewers — into the extension. When REditorSupport or Positron is already present, those features stay off by default — they simply don't appear — so Raven leaves your existing setup untouched.
+Raven *can* run without REditorSupport installed. Its language server deliberately needs no live R session, so rather than be forced to pair it with a tool that injects itself into a session, I built a complete R workflow — an R console with plot and data viewers — into the extension. When REditorSupport or Positron is already present, those features stay off by default — they simply don't appear — so Raven leaves your existing setup untouched.
 
 ## Features
 
