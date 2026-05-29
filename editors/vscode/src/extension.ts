@@ -116,7 +116,10 @@ function getServerPath(context: vscode.ExtensionContext): string {
  * is a fixed integer, so the server falls back to `lint_config.indentation_unit`.
  */
 function sendDocumentIndentUnitsNotification() {
-    if (!client) {
+    // Fires from document/editor listeners that can run before the async
+    // client.start() resolves, or when it never started (unusable binary).
+    // sendNotification throws "Client is not running" in those states.
+    if (!client || !client.isRunning()) {
         return;
     }
 
@@ -144,7 +147,10 @@ function sendDocumentIndentUnitsNotification() {
  * Send activity notification to the server for cross-file revalidation prioritization.
  */
 function sendActivityNotification() {
-    if (!client) {
+    // Same guard as sendDocumentIndentUnitsNotification: editor-activity
+    // listeners can fire before the client starts (or when it never did),
+    // and sendNotification throws unless the client is running.
+    if (!client || !client.isRunning()) {
         return;
     }
 
