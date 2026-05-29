@@ -237,7 +237,7 @@ If you also want to run `lintr` itself alongside Raven, see [below](#filling-the
 - `pipe_continuation_linter`, `pipe_call_linter`.
 - `absolute_path_linter`.
 
-If you rely on any of these, the recommended setup is to run `lintr` via the `REditorSupport` extension alongside Raven — Raven's language server is designed to coexist with REditorSupport. See [below](#filling-the-gaps-with-lintr-itself).
+If you rely on any of these, the recommended setup is to run `lintr` via the REditorSupport extension alongside Raven — Raven's language server is designed to coexist with REditorSupport. See [below](#filling-the-gaps-with-lintr-itself).
 
 ### Filling the gaps with `lintr` itself
 
