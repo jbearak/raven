@@ -2,13 +2,15 @@
 
 Raven is a language server for R, Stan, and JAGS. With Raven, what's in scope depends on where your cursor is. The language server traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files and within a single script (a variable defined on line 50 isn't in scope on line 10).
 
-Raven adds this to your existing setup. [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus RStudio-style indentation) on top of what you already have.
+As you type, Raven resolves scope — so it can flag undefined variables. It also reports parse errors — unclosed or mismatched brackets, or an `else` that isn't on the same line as the closing `}` — plus likely-bug patterns like mixed logical operators (`a & b | c`).
+
+[REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus RStudio-style indentation) on top of what you already have.
 
 REditorSupport's language intelligence comes from [r-language-server](https://github.com/REditorSupport/languageserver), an R package that runs inside an R session and indexes the documents you have open (and, in an R package, its `R/` directory). Raven is written in Rust to be fast, and needs no R session: it indexes your whole workspace and follows `source()` chains, so completions and navigation reach symbols in files you haven't opened — jump straight to a variable's definition in another file.
 
-As you type, Raven resolves scope — so it can flag undefined variables. It also reports parse errors — unclosed or mismatched brackets, or an `else` that isn't on the same line as the closing `}` — plus likely-bug patterns like mixed logical operators (`a & b | c`).
+Raven is designed to complement, not replace, your existing tools. But it *can* run without REditorSupport installed, if you want: then Raven uses its own R console, with data and plot viewers. Otherwise — if REditorSupport is installed, or you're running inside Positron — those features stay off by default; they simply don't appear, so Raven leaves your existing setup untouched.
 
-Raven *can* run without REditorSupport installed. Its language server deliberately needs no live R session, and I wanted the rest of the workflow to follow suit — so the extension also includes a complete R workflow: an R console with plot and data viewers. When REditorSupport or Positron is already present, those features stay off by default — they simply don't appear — so Raven leaves your existing setup untouched.
+
 
 ## Features
 
@@ -41,20 +43,7 @@ Raven *can* run without REditorSupport installed. Its language server deliberate
 
 ## Settings
 
-Key settings (all under the `raven.*` prefix):
-
-| Setting | Default | Description |
-|---|---|---|
-| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates: `"enabled"`, `"disabled"`, or `"auto"` (defers when REditorSupport.r is enabled or running in Positron). See [Coexistence](https://github.com/jbearak/raven/blob/main/docs/coexistence.md). |
-| `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens (`"active"` or `"beside"`). Code intelligence and the help viewer are unaffected by `raven.rConsole.activation`. |
-| `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
-| `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
-| `raven.linting.enabled` | `"auto"` | Opt-in style/lint rules (a native subset of `lintr`): `"auto"` turns them on when a `.lintr` or `raven.toml` opts in, or set `true` to force them on. See [Linting](https://github.com/jbearak/raven/blob/main/docs/linting.md). |
-| `raven.packages.rPath` | auto-detect | Path to R executable |
-| `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |
-| `raven.server.path` | bundled | Path to `raven` binary (if not using the bundled one) |
-
-See the [full configuration reference](https://github.com/jbearak/raven/blob/main/docs/configuration.md) for all options.
+All settings live under the `raven.*` prefix. See the [full configuration reference](https://github.com/jbearak/raven/blob/main/docs/configuration.md) for the complete list.
 
 ## More Information
 
