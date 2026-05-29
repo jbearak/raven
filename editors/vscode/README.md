@@ -4,7 +4,7 @@ Raven is a language server for R, Stan, and JAGS. In Raven, what's in scope depe
 
 Raven adds this to your existing setup. [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus RStudio-style indentation) on top of what you already have.
 
-> If you already have the REditorSupport extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) defer by default — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](#coexistence-with-vscode-r-and-positron) below. Raven still provides code intelligence and scope-aware help in either setup.
+> Raven's R-console features (R console, plot and data viewers) defer by default when REditorSupport is enabled or you're in Positron — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](#coexistence-with-vscode-r-and-positron) below. Code intelligence and the scope-aware help viewer run either way.
 
 ## Features
 
