@@ -1,6 +1,6 @@
 # Raven
 
-Raven is a language server for R, Stan, and JAGS. In Raven, what's in scope depends on where your cursor is. The language server traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files and within a single script (a variable defined on line 50 isn't in scope on line 10).
+Raven is a language server for R, Stan, and JAGS. With Raven, what's in scope depends on where your cursor is. The language server traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files and within a single script (a variable defined on line 50 isn't in scope on line 10).
 
 Raven adds this to your existing setup. [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus RStudio-style indentation) on top of what you already have.
 
