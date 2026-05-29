@@ -939,6 +939,16 @@
           "default": "off",
           "description": "Trace level for the Raven language server. 'messages' shows debug output, 'verbose' shows full trace output including diagnostic decisions."
         },
+        "raven.editor.dotInWord": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "description": "Whether to treat `.` as part of a word in R and JAGS files. 'yes' (the default) treats dots as word characters by overriding editor.wordSeparators for [r] / [jags] — matching RStudio and Positron — 'no' leaves dots as separators, and 'ask' prompts on first use."
+        },
         "raven.editor.dotInWordSeparators": {
           "type": "string",
           "enum": [
@@ -947,7 +957,9 @@
             "no"
           ],
           "default": "yes",
-          "description": "Whether to exclude dots from word separators in R and JAGS files. 'yes' (the default) always applies the override, 'no' never applies it, and 'ask' prompts on first use."
+          "description": "Whether to exclude dots from word separators in R and JAGS files. 'yes' (the default) always applies the override, 'no' never applies it, and 'ask' prompts on first use.",
+          "deprecationMessage": "Renamed to raven.editor.dotInWord. Raven migrates this value automatically on activation; you can delete this setting.",
+          "markdownDeprecationMessage": "Renamed to `raven.editor.dotInWord`. Raven migrates this value automatically on activation; you can delete this setting."
         },
         "raven.crossFile.maxBackwardDepth": {
           "type": "number",

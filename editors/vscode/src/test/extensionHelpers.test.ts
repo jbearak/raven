@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import {
     getUpdatedGlobalLanguageConfig,
     isRDocument,
+    planDotInWordMigration,
     resolveTabSizeForDocument,
 } from '../extensionHelpers';
 
@@ -152,6 +153,74 @@ suite('Extension Helpers', () => {
             ],
         );
         assert.strictEqual(tabSize, 4);
+    });
+
+    test('planDotInWordMigration migrates an explicit old value to the new key', () => {
+        const actions = planDotInWordMigration(
+            { globalValue: 'no' },
+            undefined,
+        );
+        assert.deepStrictEqual(actions, [
+            { target: vscode.ConfigurationTarget.Global, newValue: 'no' },
+        ]);
+    });
+
+    test('planDotInWordMigration is a no-op when the old key is unset', () => {
+        assert.deepStrictEqual(planDotInWordMigration(undefined, undefined), []);
+        assert.deepStrictEqual(
+            planDotInWordMigration({ globalValue: undefined }, { globalValue: 'yes' }),
+            [],
+        );
+    });
+
+    test('planDotInWordMigration lets the new key win and only clears the old', () => {
+        // Both set at the same scope: new value is kept (newValue undefined =>
+        // do not overwrite), old key still gets cleared at that scope.
+        const actions = planDotInWordMigration(
+            { globalValue: 'yes' },
+            { globalValue: 'no' },
+        );
+        assert.deepStrictEqual(actions, [
+            { target: vscode.ConfigurationTarget.Global, newValue: undefined },
+        ]);
+    });
+
+    test('planDotInWordMigration migrates per scope independently', () => {
+        // Old set at Global (new unset there) and at WorkspaceFolder (new also
+        // set there); Workspace untouched. Global migrates the value; the
+        // workspace-folder scope only clears the old key.
+        const actions = planDotInWordMigration(
+            { globalValue: 'yes', workspaceFolderValue: 'no' },
+            { workspaceFolderValue: 'yes' },
+        );
+        assert.deepStrictEqual(actions, [
+            { target: vscode.ConfigurationTarget.Global, newValue: 'yes' },
+            { target: vscode.ConfigurationTarget.WorkspaceFolder, newValue: undefined },
+        ]);
+    });
+
+    test('planDotInWordMigration honors a restricted target list', () => {
+        // The workspace-wide pass must ignore workspaceFolderValue (it only
+        // resolves on a resource-scoped configuration) even when present.
+        const actions = planDotInWordMigration(
+            { globalValue: 'no', workspaceFolderValue: 'ask' },
+            undefined,
+            [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace],
+        );
+        assert.deepStrictEqual(actions, [
+            { target: vscode.ConfigurationTarget.Global, newValue: 'no' },
+        ]);
+    });
+
+    test('planDotInWordMigration plans only the folder scope when so targeted', () => {
+        const actions = planDotInWordMigration(
+            { globalValue: 'no', workspaceFolderValue: 'ask' },
+            undefined,
+            [vscode.ConfigurationTarget.WorkspaceFolder],
+        );
+        assert.deepStrictEqual(actions, [
+            { target: vscode.ConfigurationTarget.WorkspaceFolder, newValue: 'ask' },
+        ]);
     });
 
     test('getUpdatedGlobalLanguageConfig ignores workspace-only overrides', () => {

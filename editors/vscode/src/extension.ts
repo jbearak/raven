@@ -16,6 +16,7 @@ import {
 import {
     getUpdatedGlobalLanguageConfig,
     isRDocument,
+    planDotInWordMigration,
     resolveTabSizeForDocument,
 } from './extensionHelpers';
 import {
@@ -634,8 +635,16 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         }),
     );
 
-    // Prompt for word separators configuration
-    promptWordSeparators();
+    // Migrate the deprecated `dotInWordSeparators` to `dotInWord`, then apply.
+    // The prompt reads the new key, so it must run only after migration settles.
+    // A `config.update` failure must not swallow the prompt, so log and proceed.
+    void migrateDotInWordSetting()
+        .catch((err) => {
+            outputChannel.appendLine(
+                `Raven: failed to migrate dotInWordSeparators -> dotInWord: ${err}`,
+            );
+        })
+        .then(() => promptWordSeparators());
 
     return {
         getLanguageClient: () => client,
@@ -662,13 +671,65 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     };
 }
 
+async function applyDotInWordActions(
+    config: vscode.WorkspaceConfiguration,
+    actions: ReturnType<typeof planDotInWordMigration>,
+) {
+    for (const action of actions) {
+        if (action.newValue !== undefined) {
+            await config.update('editor.dotInWord', action.newValue, action.target);
+        }
+        await config.update('editor.dotInWordSeparators', undefined, action.target);
+    }
+}
+
+/**
+ * One-time, idempotent migration from the deprecated
+ * `raven.editor.dotInWordSeparators` to `raven.editor.dotInWord`. Copies any
+ * explicitly-set old value to the new key at the same scope and clears the old
+ * key, so a user's `settings.json` ends up using the new name rather than
+ * relying on a silent fallback. Safe to run on every activation: it's a no-op
+ * once the old key is gone, and it re-runs if Settings Sync reintroduces it.
+ *
+ * Global and Workspace values are workspace-wide, so they're read and written
+ * through an unscoped configuration. `workspaceFolderValue` only resolves on a
+ * resource-scoped configuration, so each workspace folder is migrated through a
+ * configuration scoped to that folder's URI — otherwise folder-specific
+ * overrides in a multi-root workspace would be missed (and a `WorkspaceFolder`
+ * update without a resource would throw).
+ */
+export async function migrateDotInWordSetting() {
+    const wideConfig = vscode.workspace.getConfiguration('raven');
+    await applyDotInWordActions(
+        wideConfig,
+        planDotInWordMigration(
+            wideConfig.inspect('editor.dotInWordSeparators'),
+            wideConfig.inspect('editor.dotInWord'),
+            [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace],
+        ),
+    );
+
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+        const folderConfig = vscode.workspace.getConfiguration('raven', folder.uri);
+        await applyDotInWordActions(
+            folderConfig,
+            planDotInWordMigration(
+                folderConfig.inspect('editor.dotInWordSeparators'),
+                folderConfig.inspect('editor.dotInWord'),
+                [vscode.ConfigurationTarget.WorkspaceFolder],
+            ),
+        );
+    }
+}
+
 async function promptWordSeparators() {
     const config = vscode.workspace.getConfiguration('raven');
     // Keep this fallback in sync with the manifest default in package.json. VS
     // Code returns the manifest default for an unset key, so this only fires if
     // the schema entry is ever removed — but a divergence here would be a silent
-    // behavior change, so they must match.
-    const setting = config.get<string>('editor.dotInWordSeparators', 'yes');
+    // behavior change, so they must match. `migrateDotInWordSetting()` has
+    // already run, so any pre-existing old value now lives under `dotInWord`.
+    const setting = config.get<string>('editor.dotInWord', 'yes');
 
     // If set to 'yes', ensure the setting is applied
     if (setting === 'yes') {
@@ -702,7 +763,7 @@ async function promptWordSeparators() {
     );
 
     if (choice === 'Enable') {
-        await config.update('editor.dotInWordSeparators', 'yes', vscode.ConfigurationTarget.Global);
+        await config.update('editor.dotInWord', 'yes', vscode.ConfigurationTarget.Global);
         await ensureWordSeparators(WORD_SEPARATORS);
         
         const reload = await vscode.window.showInformationMessage(
@@ -714,7 +775,7 @@ async function promptWordSeparators() {
             vscode.commands.executeCommand('workbench.action.reloadWindow');
         }
     } else if (choice === 'No thanks') {
-        await config.update('editor.dotInWordSeparators', 'no', vscode.ConfigurationTarget.Global);
+        await config.update('editor.dotInWord', 'no', vscode.ConfigurationTarget.Global);
     }
 }
 
