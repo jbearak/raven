@@ -4,9 +4,9 @@ R language support with cross-file code intelligence (completions, diagnostics, 
 
 The language server analyzes your code in realtime: it completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
 
-Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), [Positron](https://github.com/posit-dev/positron), and RStudio, Raven's language server is the only one that traces `source()` chains, so completions, diagnostics, and navigation reflect the actual order of execution at each cursor position. Of those three, REditorSupport is the only other VS Code option; against REditorSupport specifically, Raven adds RStudio-style indentation on Enter without disturbing the surrounding code, sends large blocks of code to R faster, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
+Compared with [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r), [Positron](https://github.com/posit-dev/positron), and RStudio, Raven traces `source()` chains and resolves what's in scope at your cursor, so completions, diagnostics, and navigation reflect the actual order of execution rather than every symbol defined somewhere in the project. Of those three, REditorSupport is the only other VS Code option; against REditorSupport specifically, Raven adds RStudio-style indentation on Enter without disturbing the surrounding code, sends large blocks of code to R faster, and uses a virtualized Arrow-backed data viewer that stays responsive on large frames.
 
-> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](#coexistence-with-vscode-r-and-positron) below. Raven still provides code intelligence and scope-aware help in either setup.
+> If you already have the REditorSupport extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) defer by default — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](#coexistence-with-vscode-r-and-positron) below. Raven still provides code intelligence and scope-aware help in either setup.
 
 ## Features
 
@@ -16,7 +16,8 @@ Compared with [REditorSupport's R extension](https://marketplace.visualstudio.co
 - **[Go-to-definition](https://github.com/jbearak/raven/blob/main/docs/go-to-definition.md)** — Jump to definitions across file boundaries
 - **[Find references](https://github.com/jbearak/raven/blob/main/docs/find-references.md)** — Locate all usages of a symbol across your project
 - **[Hover](https://github.com/jbearak/raven/blob/main/docs/hover.md)** — Symbol info including source file and package origin
-- **[Diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages, plus opt-in [style/lint rules](https://github.com/jbearak/raven/blob/main/docs/linting.md)
+- **[Diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
+- **[Linting](https://github.com/jbearak/raven/blob/main/docs/linting.md)** — Opt-in style/lint rules (line length, trailing whitespace, trailing blank lines, tabs, assignment operator, object names, infix spaces, commented code, indentation)
 - **[Document outline](https://github.com/jbearak/raven/blob/main/docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
@@ -42,7 +43,7 @@ Key settings (all under the `raven.*` prefix):
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates: `"enabled"`, `"disabled"`, or `"auto"` (off when REditorSupport.r is enabled or running in Positron). See [Coexistence](https://github.com/jbearak/raven/blob/main/docs/coexistence.md). |
+| `raven.rConsole.activation` | `"auto"` | When Raven's R console (and the plot and data viewers it powers) activates: `"enabled"`, `"disabled"`, or `"auto"` (defers when REditorSupport.r is enabled or running in Positron). See [Coexistence](https://github.com/jbearak/raven/blob/main/docs/coexistence.md). |
 | `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens (`"active"` or `"beside"`). Code intelligence and the help viewer are unaffected by `raven.rConsole.activation`. |
 | `raven.diagnostics.enabled` | `true` | Enable/disable all diagnostics |
 | `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Severity for undefined variable diagnostics (`"off"` to disable) |
