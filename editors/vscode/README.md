@@ -58,8 +58,6 @@ See the [full configuration reference](https://github.com/jbearak/raven/blob/mai
 
 ## Coexistence with vscode-R and Positron
 
-Raven's R-console features (R console, plot viewer, data viewer) and REditorSupport's [vscode-R](https://github.com/REditorSupport/vscode-R) cover overlapping ground. By default `raven.rConsole.activation` is `"auto"`, which leaves Raven's R-console features off when vscode-R is enabled or you're running inside Positron. Raven's help viewer and language server activate either way.
-
 Raven ships its own [opt-in style linter](https://github.com/jbearak/raven/blob/main/docs/linting.md) — a subset of `lintr`'s rules re-implemented natively, with no R session or `lintr` install required. For `lintr` rules [outside that subset](https://github.com/jbearak/raven/blob/main/docs/linting.md#gaps-vs-lintr), REditorSupport's `lintr` diagnostics run from its own language server. To run both alongside Raven, leave `r.lsp.enabled` at its default (`true`) — both language servers will run, with some overlap in completions and diagnostics. If you don't need lintr beyond Raven's subset and only want vscode-R for its R-session features, disable its language server:
 
 ```json
