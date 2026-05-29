@@ -26,7 +26,8 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Go-to-definition](docs/go-to-definition.md)** — Jump to definitions across file boundaries
 - **[Find references](docs/find-references.md)** — Locate all usages of a symbol across your project
 - **[Hover](docs/hover.md)** — Symbol info including source file and package origin
-- **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages, plus opt-in [style/lint rules](docs/linting.md) (line length, trailing whitespace, trailing blank lines, tabs, assignment operator, object names, infix spaces, commented code, indentation)
+- **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
+- **[Linting](docs/linting.md)** — Opt-in style/lint rules (line length, trailing whitespace, trailing blank lines, tabs, assignment operator, object names, infix spaces, commented code, indentation)
 - **[Document outline](docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
@@ -76,30 +77,7 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 ## Documentation
 
-**Code intelligence:**
-
-- [Cross-File & Package Awareness](docs/cross-file.md) — How Raven understands multi-file projects
-- [Directives](docs/directives.md) — All `@lsp-*` directive syntax
-- [Diagnostics](docs/diagnostics.md) — What's reported and how to suppress
-- [Linting](docs/linting.md) — Configuring Raven's opt-in style lints; mapping from `lintr` / `.lintr`; how to run `lintr` alongside Raven
-- [Completions](docs/completion.md) — What's offered and scope rules
-- [Go-to-Definition](docs/go-to-definition.md) — Cross-file navigation, `$`/`@` members, declared symbols
-- [Find References](docs/find-references.md) — Cross-file reference finding
-- [Hover](docs/hover.md) — What the hover bubble shows and how it resolves package attribution
-- [Document Outline](docs/document-outline.md) — Hierarchical symbol view
-- [Smart Indentation](docs/indentation.md) — AST-aware indentation styles
-- [Syntax Highlighting](docs/syntax-highlighting.md) — LSP semantic tokens for R, plus JAGS, Stan, and R package file grammars
-
-**R session integration:**
-
-- [R Console](docs/r-console.md) — Interactive console, send-to-R commands, send method
-- [Code Chunks](docs/chunks.md) — R Markdown / Quarto chunk commands, CodeLens, navigation, highlighting
-- [Knit Preview & Export](docs/knit.md) — Render R Markdown to an HTML preview; export to HTML / PDF / Word via Pandoc
-- [Plot Viewer](docs/plot-viewer.md) — httpgd-backed plot panel
-- [Data Viewer](docs/data-viewer.md) — Arrow-backed `View()` replacement
-- [Help Viewer](docs/help-viewer.md) — Scope-aware R help
-
-**Setup and reference:**
+Each feature above links to its own page. Beyond those:
 
 - [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
 - [Configuration](docs/configuration.md) — All settings and options ([alphabetical reference](docs/settings-reference.md))
