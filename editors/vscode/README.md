@@ -8,7 +8,7 @@ REditorSupport's language intelligence comes from [r-language-server](https://gi
 
 As you type, Raven resolves scope — so it can flag undefined variables. It also reports parse errors — unclosed or mismatched brackets, or an `else` that isn't on the same line as the closing `}` — plus likely-bug patterns like mixed logical operators (`a & b | c`).
 
-> Raven's R-console features (R console, plot and data viewers) defer by default when REditorSupport is enabled or you're in Positron — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](#coexistence-with-vscode-r-and-positron) below. Code intelligence and the scope-aware help viewer run either way.
+Raven *can* run without REditorSupport installed. Its language server deliberately needs no live R session, so rather than make you pair it with a session-based tool, I built a complete R workflow — an R console with plot and data viewers — into the extension. When REditorSupport or Positron is already present, those features defer by default, so Raven never displaces the setup you have.
 
 ## Features
 
@@ -55,16 +55,6 @@ Key settings (all under the `raven.*` prefix):
 | `raven.server.path` | bundled | Path to `raven` binary (if not using the bundled one) |
 
 See the [full configuration reference](https://github.com/jbearak/raven/blob/main/docs/configuration.md) for all options.
-
-## Coexistence with vscode-R and Positron
-
-Raven ships its own [opt-in style linter](https://github.com/jbearak/raven/blob/main/docs/linting.md) — a subset of `lintr`'s rules re-implemented natively, with no R session or `lintr` install required. For `lintr` rules [outside that subset](https://github.com/jbearak/raven/blob/main/docs/linting.md#gaps-vs-lintr), REditorSupport's `lintr` diagnostics run from its own language server. To run both alongside Raven, leave `r.lsp.enabled` at its default (`true`) — both language servers will run, with some overlap in completions and diagnostics. If you don't need lintr beyond Raven's subset and only want vscode-R for its R-session features, disable its language server:
-
-```json
-"r.lsp.enabled": false
-```
-
-For a deeper comparison see [docs/comparison.md](https://github.com/jbearak/raven/blob/main/docs/comparison.md).
 
 ## More Information
 
