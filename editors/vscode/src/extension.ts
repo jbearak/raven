@@ -531,11 +531,16 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
                 event.affectsConfiguration('r.lsp.enabled') ||
                 event.affectsConfiguration('r.lsp.diagnostics')
             ) {
-                // Send updated configuration to LSP server
-                const settings = getInitializationOptions();
-                client.sendNotification('workspace/didChangeConfiguration', {
-                    settings: settings
-                });
+                // Send updated configuration to LSP server. Guard on
+                // isRunning(): client.start() is gated on the binary check
+                // above and is async, so the client may never have started
+                // (unusable binary) or still be starting — sendNotification
+                // throws "Client is not running" otherwise.
+                if (client && client.isRunning()) {
+                    client.sendNotification('workspace/didChangeConfiguration', {
+                        settings: getInitializationOptions(),
+                    });
+                }
             }
             // editor.tabSize changes affect per-document indent units when
             // raven.linting.indentationUnit is "auto".
