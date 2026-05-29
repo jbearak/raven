@@ -199,6 +199,30 @@ suite('Extension Helpers', () => {
         ]);
     });
 
+    test('planDotInWordMigration honors a restricted target list', () => {
+        // The workspace-wide pass must ignore workspaceFolderValue (it only
+        // resolves on a resource-scoped configuration) even when present.
+        const actions = planDotInWordMigration(
+            { globalValue: 'no', workspaceFolderValue: 'ask' },
+            undefined,
+            [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace],
+        );
+        assert.deepStrictEqual(actions, [
+            { target: vscode.ConfigurationTarget.Global, newValue: 'no' },
+        ]);
+    });
+
+    test('planDotInWordMigration plans only the folder scope when so targeted', () => {
+        const actions = planDotInWordMigration(
+            { globalValue: 'no', workspaceFolderValue: 'ask' },
+            undefined,
+            [vscode.ConfigurationTarget.WorkspaceFolder],
+        );
+        assert.deepStrictEqual(actions, [
+            { target: vscode.ConfigurationTarget.WorkspaceFolder, newValue: 'ask' },
+        ]);
+    });
+
     test('getUpdatedGlobalLanguageConfig ignores workspace-only overrides', () => {
         assert.deepStrictEqual(
             getUpdatedGlobalLanguageConfig(

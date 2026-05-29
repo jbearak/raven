@@ -664,6 +664,18 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     };
 }
 
+async function applyDotInWordActions(
+    config: vscode.WorkspaceConfiguration,
+    actions: ReturnType<typeof planDotInWordMigration>,
+) {
+    for (const action of actions) {
+        if (action.newValue !== undefined) {
+            await config.update('editor.dotInWord', action.newValue, action.target);
+        }
+        await config.update('editor.dotInWordSeparators', undefined, action.target);
+    }
+}
+
 /**
  * One-time, idempotent migration from the deprecated
  * `raven.editor.dotInWordSeparators` to `raven.editor.dotInWord`. Copies any
@@ -671,18 +683,35 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
  * key, so a user's `settings.json` ends up using the new name rather than
  * relying on a silent fallback. Safe to run on every activation: it's a no-op
  * once the old key is gone, and it re-runs if Settings Sync reintroduces it.
+ *
+ * Global and Workspace values are workspace-wide, so they're read and written
+ * through an unscoped configuration. `workspaceFolderValue` only resolves on a
+ * resource-scoped configuration, so each workspace folder is migrated through a
+ * configuration scoped to that folder's URI — otherwise folder-specific
+ * overrides in a multi-root workspace would be missed (and a `WorkspaceFolder`
+ * update without a resource would throw).
  */
 export async function migrateDotInWordSetting() {
-    const config = vscode.workspace.getConfiguration('raven');
-    const actions = planDotInWordMigration(
-        config.inspect('editor.dotInWordSeparators'),
-        config.inspect('editor.dotInWord'),
+    const wideConfig = vscode.workspace.getConfiguration('raven');
+    await applyDotInWordActions(
+        wideConfig,
+        planDotInWordMigration(
+            wideConfig.inspect('editor.dotInWordSeparators'),
+            wideConfig.inspect('editor.dotInWord'),
+            [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace],
+        ),
     );
-    for (const action of actions) {
-        if (action.newValue !== undefined) {
-            await config.update('editor.dotInWord', action.newValue, action.target);
-        }
-        await config.update('editor.dotInWordSeparators', undefined, action.target);
+
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+        const folderConfig = vscode.workspace.getConfiguration('raven', folder.uri);
+        await applyDotInWordActions(
+            folderConfig,
+            planDotInWordMigration(
+                folderConfig.inspect('editor.dotInWordSeparators'),
+                folderConfig.inspect('editor.dotInWord'),
+                [vscode.ConfigurationTarget.WorkspaceFolder],
+            ),
+        );
     }
 }
 
