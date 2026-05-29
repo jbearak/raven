@@ -664,7 +664,11 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
 async function promptWordSeparators() {
     const config = vscode.workspace.getConfiguration('raven');
-    const setting = config.get<string>('editor.dotInWordSeparators', 'ask');
+    // Keep this fallback in sync with the manifest default in package.json. VS
+    // Code returns the manifest default for an unset key, so this only fires if
+    // the schema entry is ever removed — but a divergence here would be a silent
+    // behavior change, so they must match.
+    const setting = config.get<string>('editor.dotInWordSeparators', 'yes');
 
     // If set to 'yes', ensure the setting is applied
     if (setting === 'yes') {
