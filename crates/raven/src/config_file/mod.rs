@@ -49,6 +49,29 @@ fn strip_project_auto_enabled(project: Option<&serde_json::Value>) -> Option<ser
     Some(cloned)
 }
 
+/// Whether a discovered `.lintr` is allowed to auto-enable Raven's native
+/// linting, per the client-only `linting.autoEnableFromDotLintr` signal.
+///
+/// `.lintr` is REditorSupport's / `lintr`'s config file; its mere presence
+/// only signals "I want lintr-style linting" in a context where that
+/// diagnostic path is actually live. The VS Code client clears this flag to
+/// `false` when REditorSupport is installed+enabled with its LSP lint path on
+/// (`r.lsp.enabled` and `r.lsp.diagnostics`), or when running inside Positron —
+/// contexts where a `.lintr` is dormant config for another tool and must not
+/// flip Raven's lints on. See #337.
+///
+/// Read from the CLIENT layer only: this is a VS Code environment signal and
+/// must not be overridable by a project `raven.toml`. Absent or malformed
+/// (non-VS-Code clients, older clients, the CLI) defaults to `true`,
+/// preserving the historical behavior.
+fn lintr_auto_enable_allowed(raw_client: &serde_json::Value) -> bool {
+    raw_client
+        .get("linting")
+        .and_then(|l| l.get("autoEnableFromDotLintr"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
     let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
@@ -78,7 +101,12 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         .and_then(|p| p.file_name())
         .map(|n| n == std::ffi::OsStr::new(".lintr"))
         .unwrap_or(false);
-    state.lint_config = crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
+    // Gate ONLY the `.lintr` auto-enable path on the client environment signal
+    // (#337). An explicit client `on`/`off` and `raven.toml enabled = true`
+    // flow through `merged` independently and are unaffected, because they
+    // resolve via `On`/`Off` and never route through `lintr_discovered`.
+    let lintr_auto = lintr_discovered && lintr_auto_enable_allowed(&state.raw_client_settings);
+    state.lint_config = crate::backend::parse_lint_config(&merged, lintr_auto).unwrap_or_default();
 
     // Recompile per-document lint overrides as part of the centralized
     // recompute. Splitting this into a separate caller step (as earlier
@@ -95,5 +123,111 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         // resolve against patches whose globs were computed against a
         // since-removed root.
         state.lint_overrides = Vec::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::WorldState;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn state_with(
+        client: serde_json::Value,
+        project_config_path: &str,
+        project: Option<serde_json::Value>,
+    ) -> WorldState {
+        let mut state = WorldState::new(vec![]);
+        state.raw_client_settings = client;
+        state.raw_project_settings = project;
+        state.project_config_path = Some(PathBuf::from(project_config_path));
+        state
+    }
+
+    #[test]
+    fn dot_lintr_auto_enable_gated_off_disables_lint() {
+        // #337: a `.lintr` is discovered, but the client signals that
+        // REditorSupport's lintr path is live (or we're in Positron). The
+        // dormant `.lintr` must not flip Raven's lints on.
+        let mut state = state_with(
+            json!({ "linting": { "enabled": "auto", "autoEnableFromDotLintr": false } }),
+            "/ws/.lintr",
+            None,
+        );
+        recompute_parsed_configs(&mut state);
+        assert!(!state.lint_config.enabled);
+    }
+
+    #[test]
+    fn dot_lintr_auto_enable_allowed_enables_lint() {
+        // #337: the signal is present and `true` → historical opt-in survives.
+        let mut state = state_with(
+            json!({ "linting": { "enabled": "auto", "autoEnableFromDotLintr": true } }),
+            "/ws/.lintr",
+            None,
+        );
+        recompute_parsed_configs(&mut state);
+        assert!(state.lint_config.enabled);
+    }
+
+    #[test]
+    fn dot_lintr_auto_enable_absent_defaults_on() {
+        // #337: older clients and the CLI omit the signal entirely. Absent
+        // defaults to "allowed" so the pre-#337 behavior is preserved.
+        let mut state = state_with(
+            json!({ "linting": { "enabled": "auto" } }),
+            "/ws/.lintr",
+            None,
+        );
+        recompute_parsed_configs(&mut state);
+        assert!(state.lint_config.enabled);
+    }
+
+    #[test]
+    fn dot_lintr_gate_does_not_touch_raven_toml_enabled_true() {
+        // #337: the gate is scoped to the `.lintr` discovery branch only. A
+        // discovered `raven.toml` with `enabled = true` keeps linting on even
+        // when the client clears the `.lintr` signal — that resolves through
+        // `On`, never through `lintr_discovered`.
+        let mut state = state_with(
+            json!({ "linting": { "autoEnableFromDotLintr": false } }),
+            "/ws/raven.toml",
+            Some(json!({ "linting": { "enabled": true } })),
+        );
+        recompute_parsed_configs(&mut state);
+        assert!(state.lint_config.enabled);
+    }
+
+    #[test]
+    fn dot_lintr_gate_does_not_override_explicit_client_on() {
+        // #337: an explicit client `enabled = "on"` wins regardless of the
+        // `.lintr` gate — the gate only governs `Auto` resolution.
+        let mut state = state_with(
+            json!({ "linting": { "enabled": "on", "autoEnableFromDotLintr": false } }),
+            "/ws/.lintr",
+            None,
+        );
+        recompute_parsed_configs(&mut state);
+        assert!(state.lint_config.enabled);
+    }
+
+    #[test]
+    fn lintr_auto_enable_allowed_reads_client_flag() {
+        // Explicit false suppresses; explicit true allows.
+        assert!(!lintr_auto_enable_allowed(
+            &json!({ "linting": { "autoEnableFromDotLintr": false } })
+        ));
+        assert!(lintr_auto_enable_allowed(
+            &json!({ "linting": { "autoEnableFromDotLintr": true } })
+        ));
+        // Absent (no key, no section, non-VS-Code clients) → allowed.
+        assert!(lintr_auto_enable_allowed(&json!({ "linting": {} })));
+        assert!(lintr_auto_enable_allowed(&json!({})));
+        assert!(lintr_auto_enable_allowed(&serde_json::Value::Null));
+        // Malformed (non-bool) → allowed (defensive default).
+        assert!(lintr_auto_enable_allowed(
+            &json!({ "linting": { "autoEnableFromDotLintr": "no" } })
+        ));
     }
 }

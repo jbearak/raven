@@ -42,6 +42,8 @@ Raven's language server traces `source()` chains across your project, so its com
 
 REditorSupport's language server provides [`lintr`](https://lintr.r-lib.org/) diagnostics, which covers a different surface than Raven's diagnostics: it catches style violations and certain correctness issues that Raven doesn't flag, while Raven catches cross-file scope problems that lintr doesn't see. Raven also has its own [opt-in style linter](./linting.md) that re-implements 18 of `lintr`'s default linters — most of its default rule set; for the rules Raven doesn't ship, run `lintr` via REditorSupport alongside Raven.
 
+To avoid double-reporting style issues, Raven's default `raven.linting.enabled: "auto"` will *not* auto-enable its native linter from a discovered `.lintr` while REditorSupport's `lintr` path is live (installed and enabled with `r.lsp.enabled` and `r.lsp.diagnostics` on) or while you're in Positron — that `.lintr` is REditorSupport's / Positron's to lint. If you want both linters running on the same project on purpose, set `raven.linting.enabled` to `true`. See [Linting § `"auto"` and REditorSupport / Positron](./linting.md#auto-and-reditorsupport--positron).
+
 If you want both, leave `r.lsp.enabled` at its default (`true`). Both language servers will run, with some overlap in completions and diagnostics.
 
 One reason to keep REditorSupport installed even if Raven covers your language-intelligence needs is its workspace viewer — a sidebar panel that introspects your active R session, showing live objects, their types, and dimensions. Raven doesn't have an equivalent.

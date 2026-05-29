@@ -49,6 +49,7 @@ import {
 import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit';
 import { registerInstallNags } from './recommendations/install-nag';
 import { validateServerBinary } from './server-binary-check';
+import { dotLintrAutoEnableAllowed } from './lintr-auto-enable';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
@@ -57,7 +58,13 @@ import { validateServerBinary } from './server-binary-check';
  * are included when the server contract requires them.
  */
 function getInitializationOptions(): RavenInitializationOptions {
-    return buildInitializationOptions(vscode.workspace.getConfiguration('raven'));
+    return buildInitializationOptions(
+        vscode.workspace.getConfiguration('raven'),
+        // Client-only environment signal gating `.lintr` auto-enable (#337).
+        // Recomputed on every call so it tracks REditorSupport / Positron and
+        // `r.lsp.*` state when settings change (see the config listener below).
+        dotLintrAutoEnableAllowed(),
+    );
 }
 
 let client: LanguageClient;
@@ -515,7 +522,15 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // Register configuration change listener
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((event) => {
-            if (event.affectsConfiguration('raven')) {
+            // `raven.*` carries the user-facing settings. `r.lsp.enabled` /
+            // `r.lsp.diagnostics` feed the client-only `autoEnableFromDotLintr`
+            // signal (#337), so a change there must also re-push init options
+            // — the resolved value lives only inside getInitializationOptions().
+            if (
+                event.affectsConfiguration('raven') ||
+                event.affectsConfiguration('r.lsp.enabled') ||
+                event.affectsConfiguration('r.lsp.diagnostics')
+            ) {
                 // Send updated configuration to LSP server
                 const settings = getInitializationOptions();
                 client.sendNotification('workspace/didChangeConfiguration', {
@@ -530,6 +545,34 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             ) {
                 sendDocumentIndentUnitsNotification();
             }
+        })
+    );
+
+    // Installing/uninstalling/enabling/disabling REditorSupport flips the
+    // `.lintr` auto-enable signal (#337) without any settings change, so
+    // re-push init options when the extension set changes. The server
+    // hot-applies the new value; unlike the R-console features, linting needs
+    // no window reload to retrack it.
+    //
+    // `onDidChange` can fire during the activation window (before the
+    // fire-and-forget `client.start()` above resolves) and after shutdown, so
+    // guard on `client.isRunning()` — `sendNotification` throws otherwise. Only
+    // re-push when the resolved signal actually flips: extension-set changes
+    // are noisy and the value rarely moves.
+    let lastDotLintrAutoEnable = dotLintrAutoEnableAllowed();
+    context.subscriptions.push(
+        vscode.extensions.onDidChange(() => {
+            const next = dotLintrAutoEnableAllowed();
+            if (next === lastDotLintrAutoEnable) {
+                return;
+            }
+            lastDotLintrAutoEnable = next;
+            if (!client || !client.isRunning()) {
+                return;
+            }
+            client.sendNotification('workspace/didChangeConfiguration', {
+                settings: getInitializationOptions(),
+            });
         })
     );
 

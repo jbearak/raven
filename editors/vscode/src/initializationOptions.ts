@@ -97,6 +97,13 @@ export interface RavenInitializationOptions {
     };
     linting?: {
         enabled?: boolean | "auto" | "on" | "off";
+        /**
+         * Client-only environment signal: whether a discovered `.lintr` may
+         * auto-enable native linting under `enabled: "auto"`. Omitted by
+         * non-VS-Code clients (the server then defaults to allowing it). See
+         * `lintr-auto-enable.ts` and #337.
+         */
+        autoEnableFromDotLintr?: boolean;
         lineLength?: number;
         objectLength?: number;
         indentationUnit?: number | "auto";
@@ -152,8 +159,16 @@ function getExplicitSetting<T>(config: RavenWorkspaceConfiguration, key: string)
 /**
  * Read Raven settings from the provided configuration object and construct the
  * LSP initialization options payload.
+ *
+ * `autoEnableFromDotLintr` is a client-only environment signal (not a `raven.*`
+ * setting): when provided it is forwarded under `linting` so the server can
+ * gate `.lintr` auto-enable. Omitting it (e.g. the CLI, older callers) leaves
+ * the field out, and the server defaults to allowing auto-enable. See #337.
  */
-export function getInitializationOptions(config: RavenWorkspaceConfiguration): RavenInitializationOptions {
+export function getInitializationOptions(
+    config: RavenWorkspaceConfiguration,
+    autoEnableFromDotLintr?: boolean,
+): RavenInitializationOptions {
     const options: RavenInitializationOptions = {};
 
     const backwardDependencies = getExplicitSetting<"auto" | "explicit">(config, 'crossFile.backwardDependencies');
@@ -403,6 +418,13 @@ export function getInitializationOptions(config: RavenWorkspaceConfiguration): R
         spacesInsideSeverity: config.get<SeverityLevel>('linting.spacesInsideSeverity', 'hint'),
         indentationSeverity: config.get<SeverityLevel>('linting.indentationSeverity', 'hint'),
     };
+
+    // Computed environment signal, not a user setting — include it only when
+    // the caller supplied one. Absent leaves the server on its back-compat
+    // default (allow `.lintr` auto-enable). See #337.
+    if (autoEnableFromDotLintr !== undefined) {
+        options.linting.autoEnableFromDotLintr = autoEnableFromDotLintr;
+    }
 
     const helpViewerColumn = getExplicitSetting<'active' | 'beside'>(config, 'help.viewerColumn');
     if (helpViewerColumn !== undefined) {
