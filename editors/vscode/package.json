@@ -1,7 +1,15 @@
 {
   "name": "raven-r",
   "displayName": "Raven - R Language Server",
-  "description": "R language server with cross-file awareness, plus an R console and plot, data, and help viewers",
+  "description": "R language server with cross-file awareness, diagnostics, completion, and navigation. Also provides lightweight support for Stan and JAGS/BUGS (syntax highlighting, completions, navigation, outline).",
+  "keywords": [
+    "R",
+    "Rmarkdown",
+    "Quarto",
+    "Stan",
+    "JAGS",
+    "BUGS"
+  ],
   "version": "0.7.1",
   "publisher": "jbearak",
   "icon": "icon.png",
