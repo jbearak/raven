@@ -4,18 +4,22 @@ import { migrateDotInWordSetting } from '../extension';
 
 declare const suite: Mocha.SuiteFunction;
 declare const test: Mocha.TestFunction;
+declare const setup: Mocha.HookFunction;
 declare const teardown: Mocha.HookFunction;
+
+async function resetDotInWordSettings() {
+    const config = vscode.workspace.getConfiguration('raven');
+    await config.update('editor.dotInWord', undefined, vscode.ConfigurationTarget.Global);
+    await config.update('editor.dotInWordSeparators', undefined, vscode.ConfigurationTarget.Global);
+}
 
 // Integration coverage for the rename `dotInWordSeparators` -> `dotInWord`.
 // Exercises the migration against the real VS Code configuration store (the
 // per-scope decision logic itself is unit-tested via `planDotInWordMigration`
 // in extensionHelpers.test.ts).
 suite('Raven dotInWord migration', () => {
-    teardown(async () => {
-        const config = vscode.workspace.getConfiguration('raven');
-        await config.update('editor.dotInWord', undefined, vscode.ConfigurationTarget.Global);
-        await config.update('editor.dotInWordSeparators', undefined, vscode.ConfigurationTarget.Global);
-    });
+    setup(resetDotInWordSettings);
+    teardown(resetDotInWordSettings);
 
     test('migrates an explicitly-set old key to the new key and clears the old', async () => {
         const config = vscode.workspace.getConfiguration('raven');

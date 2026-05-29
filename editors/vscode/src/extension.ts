@@ -637,7 +637,14 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     // Migrate the deprecated `dotInWordSeparators` to `dotInWord`, then apply.
     // The prompt reads the new key, so it must run only after migration settles.
-    void migrateDotInWordSetting().then(() => promptWordSeparators());
+    // A `config.update` failure must not swallow the prompt, so log and proceed.
+    void migrateDotInWordSetting()
+        .catch((err) => {
+            outputChannel.appendLine(
+                `Raven: failed to migrate dotInWordSeparators -> dotInWord: ${err}`,
+            );
+        })
+        .then(() => promptWordSeparators());
 
     return {
         getLanguageClient: () => client,
