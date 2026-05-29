@@ -56,6 +56,56 @@ export function resolveTabSizeForDocument(
         .get<number>('tabSize', 2);
 }
 
+export type DotInWordMigrationAction = {
+    target: vscode.ConfigurationTarget;
+    /**
+     * Value to write to `editor.dotInWord` at this scope, or `undefined` to
+     * leave the new key untouched and only clear the deprecated old key.
+     */
+    newValue?: string;
+};
+
+/**
+ * Plan the migration from the deprecated `raven.editor.dotInWordSeparators` to
+ * `raven.editor.dotInWord`, scope by scope.
+ *
+ * For each scope (Global / Workspace / WorkspaceFolder) where the old key is
+ * explicitly set, the old key must be cleared; if the new key is not already
+ * set at that scope, the old value is copied to it (the new key wins when both
+ * are set). The returned actions are idempotent — once the old key is gone the
+ * plan is empty — so the caller can run this on every activation, which also
+ * catches a stale old key re-introduced by Settings Sync.
+ *
+ * Pure so it can be unit-tested without a live VS Code configuration.
+ */
+export function planDotInWordMigration(
+    oldInspect: LanguageConfigurationInspection | undefined,
+    newInspect: LanguageConfigurationInspection | undefined,
+): DotInWordMigrationAction[] {
+    const scopes: Array<{
+        target: vscode.ConfigurationTarget;
+        key: keyof LanguageConfigurationInspection;
+    }> = [
+        { target: vscode.ConfigurationTarget.Global, key: 'globalValue' },
+        { target: vscode.ConfigurationTarget.Workspace, key: 'workspaceValue' },
+        { target: vscode.ConfigurationTarget.WorkspaceFolder, key: 'workspaceFolderValue' },
+    ];
+
+    const actions: DotInWordMigrationAction[] = [];
+    for (const { target, key } of scopes) {
+        const oldValue = oldInspect?.[key];
+        if (oldValue === undefined) {
+            continue;
+        }
+        const newValue = newInspect?.[key];
+        actions.push({
+            target,
+            newValue: newValue === undefined ? (oldValue as string) : undefined,
+        });
+    }
+    return actions;
+}
+
 export function getUpdatedGlobalLanguageConfig(
     inspection: LanguageConfigurationInspection | undefined,
     wordSeparators: string,

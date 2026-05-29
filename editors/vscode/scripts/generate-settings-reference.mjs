@@ -231,10 +231,18 @@ function main() {
     console.error("Could not find contributes.configuration.properties in package.json");
     process.exit(2);
   }
+  // Drop deprecated keys: they remain in package.json (for Settings-UI styling
+  // and a graceful transition) but should not clutter the user-facing index.
+  const activeSchemaProperties = Object.fromEntries(
+    Object.entries(schemaProperties).filter(
+      ([, schema]) =>
+        !schema?.deprecationMessage && !schema?.markdownDeprecationMessage,
+    ),
+  );
   // Merge in LSP-init-only entries that aren't surfaced through the VS Code
   // Settings UI. Schema-derived keys still win on collision so a future
   // promotion of one of these to the UI just removes the entry here.
-  const properties = { ...LSP_INIT_ONLY_SETTINGS, ...schemaProperties };
+  const properties = { ...LSP_INIT_ONLY_SETTINGS, ...activeSchemaProperties };
   const generated = buildMarkdown(properties);
 
   const args = new Set(process.argv.slice(2));

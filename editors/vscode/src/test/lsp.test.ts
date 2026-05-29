@@ -375,7 +375,7 @@ suite('Ark LSP Extension', () => {
         });
     }
 
-    test('package.json describes dot-in-word separators for JAGS too', async () => {
+    test('package.json describes dot-in-word handling for JAGS too', async () => {
         const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
         const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {
             contributes: {
@@ -385,16 +385,16 @@ suite('Ark LSP Extension', () => {
             };
         };
 
-        const description = pkg.contributes.configuration.properties['raven.editor.dotInWordSeparators']?.description;
+        const description = pkg.contributes.configuration.properties['raven.editor.dotInWord']?.description;
 
         assert.ok(description?.includes('R and JAGS files'));
     });
 
     // RStudio and Positron treat dots as part of words out of the box, so Raven
-    // defaults `dotInWordSeparators` to "yes" — applying the override silently
+    // defaults `dotInWord` to "yes" — applying the override silently
     // rather than prompting. `"ask"` remains opt-in for users who want a prompt.
     // See https://github.com/jbearak/raven/issues/265.
-    test('package.json defaults dot-in-word separators to yes', async () => {
+    test('package.json defaults dot-in-word to yes', async () => {
         const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
         const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {
             contributes: {
@@ -404,9 +404,33 @@ suite('Ark LSP Extension', () => {
             };
         };
 
-        const schema = pkg.contributes.configuration.properties['raven.editor.dotInWordSeparators'];
+        const schema = pkg.contributes.configuration.properties['raven.editor.dotInWord'];
 
         assert.strictEqual(schema?.default, 'yes');
         assert.deepStrictEqual(schema?.enum, ['ask', 'yes', 'no']);
+    });
+
+    // The setting was renamed from `dotInWordSeparators` (whose `yes`/`no` read
+    // backwards) to `dotInWord`. The old key stays in the manifest marked
+    // deprecated so existing users get Settings-UI deprecation styling and no
+    // "unknown setting" warning while migration runs. See the migration in
+    // `extension.ts` (`migrateDotInWordSetting`).
+    test('package.json keeps deprecated dotInWordSeparators alias', async () => {
+        const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {
+            contributes: {
+                configuration: {
+                    properties: Record<string, { deprecationMessage?: string }>;
+                };
+            };
+        };
+
+        const schema = pkg.contributes.configuration.properties['raven.editor.dotInWordSeparators'];
+
+        assert.ok(schema, 'deprecated alias must remain in the manifest');
+        assert.ok(
+            schema?.deprecationMessage?.includes('raven.editor.dotInWord'),
+            'deprecation message should point to the new key',
+        );
     });
 });
