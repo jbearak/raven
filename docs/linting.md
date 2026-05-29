@@ -9,7 +9,7 @@ This page is the landing point for users coming from `lintr` or `REditorSupport`
 
 ## Quick start
 
-By default (`"auto"`), Raven turns linting on when it discovers a `.lintr` or a `raven.toml` opt-in, and stays off otherwise. To force linting on regardless of project state, set:
+By default (`"auto"`), Raven turns linting on when it discovers a `.lintr` or a `raven.toml` opt-in, and stays off otherwise. The one exception: a discovered `.lintr` is *ignored* when [REditorSupport's own `lintr` diagnostics are live or you're running in Positron](#auto-and-reditorsupport--positron) — there the `.lintr` belongs to `lintr` itself, so Raven doesn't pile its native lints on top. To force linting on regardless of project state, set:
 
 ```json
 {
@@ -47,7 +47,7 @@ Lint diagnostics carry the `source` field `raven (lint)`, so they're easy to fil
 
 `raven.linting.enabled` is tri-state: `"auto"` (the default), `true` (or `"on"`), or `false` (or `"off"`). Booleans are accepted for backward compatibility with existing settings.
 
-- `"auto"` — lint when a project config opts in. Specifically: when a `.lintr` is discovered on the upward walk from the workspace (matching `lintr`'s own ancestor lookup, including a `~/.lintr` in your home directory), or when a `raven.toml` sets `[linting] enabled = true`. Otherwise off.
+- `"auto"` — lint when a project config opts in. Specifically: when a `.lintr` is discovered on the upward walk from the workspace (matching `lintr`'s own ancestor lookup, including a `~/.lintr` in your home directory), or when a `raven.toml` sets `[linting] enabled = true`. Otherwise off. The `.lintr` half of this is suppressed when REditorSupport / Positron already owns the `lintr` path — see [`"auto"` and REditorSupport / Positron](#auto-and-reditorsupport--positron) below.
 - `true` / `"on"` — force linting on. Discovered rule severities still apply.
 - `false` / `"off"` — disable linting unless a discovered `raven.toml` explicitly sets `enabled = true` (raven.toml always wins at the leaf — the project-policy contract). A discovered `.lintr` alone never re-enables linting.
 
@@ -60,7 +60,7 @@ Resolution by client setting × project state:
 | Client (`raven.linting.enabled`) | Project state | Result |
 |---|---|---|
 | `"auto"` (default) | no `.lintr`, no `raven.toml` | off |
-| `"auto"` | `.lintr` discovered (workspace or any ancestor incl. `~`) | on |
+| `"auto"` | `.lintr` discovered (workspace or any ancestor incl. `~`) | on — **unless** REditorSupport's `lintr` path is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
 | `"auto"` | `raven.toml` with `enabled = true` (or `"on"`) | on |
 | `"auto"` | `raven.toml` with `enabled = false` (or `"off"`) | off — `.lintr` not consulted (raven.toml wins discovery) |
 | `"auto"` | `raven.toml` with `enabled = "auto"` or no `[linting]` | off (no `.lintr` discovered; raven.toml was discovered instead) |
@@ -77,6 +77,23 @@ Resolution by client setting × project state:
 <!-- markdownlint-enable MD013 -->
 
 `raven.toml` and `.lintr` are mutually exclusive at discovery: `raven.toml` wins on the same walk and `.lintr` is not consulted.
+
+### `"auto"` and REditorSupport / Positron
+
+Under `"auto"`, a discovered `.lintr` is treated as an opt-in *only* when nothing else is already running `lintr` against it. A `.lintr` is REditorSupport's / `lintr`'s own config file, so when that tool is already linting your project, letting the same file also flip Raven's native lints on would double-report style issues. Raven therefore ignores a discovered `.lintr` (under `"auto"`) when **either**:
+
+- the **REditorSupport (R) extension** is installed and enabled **and** both `r.lsp.enabled` and `r.lsp.diagnostics` are on (its default) — i.e. its language server is actively emitting `lintr` diagnostics; **or**
+- you are running inside **Positron**, which ships its own R-session linting.
+
+In those environments, `"auto"` + a discovered `.lintr` resolves to **off**. This affects the `.lintr` path only:
+
+- A `raven.toml` opt-in (`[linting] enabled = true`) is **unaffected** — it always turns Raven's linting on regardless of REditorSupport / Positron.
+- An explicit client `true` / `"on"` (or `false` / `"off"`) is **unaffected** — only `"auto"` consults this heuristic.
+- Turning REditorSupport's `r.lsp.diagnostics` (or `r.lsp.enabled`) **off**, or uninstalling/disabling the extension, re-enables the `.lintr` auto opt-in live — no window reload needed.
+
+To run Raven's native lints *alongside* REditorSupport's `lintr` on purpose, set `raven.linting.enabled` to `true` (or migrate the project to `raven.toml`). See [Coexistence § Language servers](coexistence.md#language-servers-raven-alone-vs-both).
+
+> This is a VS Code **environment** signal: it is computed by the extension (from REditorSupport's state and `r.lsp.*`) and is not something a project `raven.toml` can override. Editors other than VS Code, and the bare CLI, don't send it, so they keep the historical "`.lintr` ⇒ on" behavior.
 
 ## Settings reference by rule
 

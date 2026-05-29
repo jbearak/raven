@@ -1456,7 +1456,7 @@
             false
           ],
           "default": "auto",
-          "description": "Controls native lint diagnostics. \"auto\" (default) enables linting when a .lintr or raven.toml opts in. true/\"on\" forces linting on. false/\"off\" disables linting unless a discovered raven.toml explicitly sets enabled = true (it always overrides .lintr auto-discovery). See docs/linting.md for the full resolution matrix."
+          "description": "Controls native lint diagnostics. \"auto\" (default) enables linting when a .lintr or raven.toml opts in — but a discovered .lintr is ignored when REditorSupport's own lintr diagnostics are live (it is installed and enabled with r.lsp.enabled and r.lsp.diagnostics on) or when running in Positron, so the same .lintr isn't linted twice. true/\"on\" forces linting on. false/\"off\" disables linting unless a discovered raven.toml explicitly sets enabled = true (it always overrides .lintr auto-discovery). See docs/linting.md for the full resolution matrix."
         },
         "raven.linting.lineLength": {
           "type": "integer",
