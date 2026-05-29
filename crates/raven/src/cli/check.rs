@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use crate::cli::shared::{
-    is_chunk_file, is_r_file, parse_output_format, parse_severity_level, print_json, print_sarif,
-    print_text, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+    collect_r_file_paths, is_chunk_file, is_r_file, parse_output_format, parse_severity_level,
+    print_json, print_sarif, print_text, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK,
+    EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -431,13 +432,13 @@ async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -
 fn collect_report_targets(paths: &[PathBuf], root: &Path, operator_error: &mut bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if paths.is_empty() {
-        collect_r_files_recursively(root, &mut out);
+        collect_r_file_paths(root, &mut out);
     } else {
         for p in paths {
             let abs = if p.is_absolute() { p.clone() } else { root.join(p) };
             let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
             if abs.is_dir() {
-                collect_r_files_recursively(&abs, &mut out);
+                collect_r_file_paths(&abs, &mut out);
             } else if abs.is_file() {
                 if is_r_file(&abs) || is_chunk_file(&abs) {
                     out.push(abs);
@@ -452,28 +453,6 @@ fn collect_report_targets(paths: &[PathBuf], root: &Path, operator_error: &mut b
     out.sort();
     out.dedup();
     out
-}
-
-fn collect_r_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_symlink() {
-            continue;
-        }
-        if p.is_dir() {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if crate::state::should_skip_directory(name) {
-                    continue;
-                }
-            }
-            collect_r_files_recursively(&p, out);
-        } else if is_r_file(&p) {
-            out.push(p);
-        }
-    }
 }
 
 #[cfg(test)]

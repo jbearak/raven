@@ -80,6 +80,38 @@ pub fn is_chunk_file(p: &Path) -> bool {
     )
 }
 
+/// Recursively collect `.R` / `.r` file paths under `dir`. Symlinks (files and
+/// directories) are skipped to avoid cycles and double-counting, and the
+/// non-source directories listed in [`crate::state::should_skip_directory`]
+/// (`.git`, `node_modules`, `renv`, `target`, …) are pruned. Results are
+/// unsorted; callers that need deterministic order sort afterwards.
+///
+/// Shared by `raven check` (which reports diagnostics for the collected files)
+/// and `analysis-stats` (which reads their contents in a second pass). `.r` and
+/// `.R` are the only matched extensions — equivalent to a case-insensitive
+/// match on the single-character extension.
+pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_symlink() {
+            continue;
+        }
+        if p.is_dir() {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if crate::state::should_skip_directory(name) {
+                    continue;
+                }
+            }
+            collect_r_file_paths(&p, out);
+        } else if is_r_file(&p) {
+            out.push(p);
+        }
+    }
+}
+
 pub fn print_text(diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
     let mut errors = 0;
     let mut warnings = 0;
@@ -281,5 +313,41 @@ mod tests {
         assert!(is_chunk_file(Path::new("a.Rmd")));
         assert!(is_chunk_file(Path::new("a.qmd")));
         assert!(!is_chunk_file(Path::new("a.R")));
+    }
+
+    #[test]
+    fn collect_r_file_paths_walks_and_prunes() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.R"), "1\n").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/b.r"), "2\n").unwrap();
+        fs::write(tmp.path().join("c.Rmd"), "prose\n").unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".git/d.R"), "3\n").unwrap();
+
+        let mut out = Vec::new();
+        collect_r_file_paths(tmp.path(), &mut out);
+        // a.R + sub/b.r; .Rmd is not an R source; .git is pruned.
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|p| is_r_file(p)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_r_file_paths_skips_symlinks() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("real.R"), "1\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real.R"), tmp.path().join("link.R")).unwrap();
+        // A symlinked directory must not be followed (cycle / double-count guard).
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        fs::write(tmp.path().join("d/inner.R"), "2\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("d"), tmp.path().join("dlink")).unwrap();
+
+        let mut out = Vec::new();
+        collect_r_file_paths(tmp.path(), &mut out);
+        // real.R and d/inner.R only; the symlinked file and directory are skipped.
+        assert_eq!(out.len(), 2);
     }
 }

@@ -21,7 +21,6 @@ use url::Url;
 use crate::cross_file;
 use crate::parser_pool;
 use crate::perf::TimingGuard;
-use crate::state::should_skip_directory;
 
 /// Parsed arguments for the `analysis-stats` subcommand.
 #[derive(Debug)]
@@ -327,9 +326,17 @@ pub fn print_results_csv(results: &[PhaseResult]) {
 }
 
 /// Recursively discover all `.R` files under `root` and read their contents.
+///
+/// Path discovery is shared with `raven check` via
+/// [`crate::cli::shared::collect_r_file_paths`]; this reads the contents in a
+/// second pass. Unreadable files are skipped.
 fn discover_r_files(root: &Path) -> Vec<(PathBuf, String)> {
-    let mut files = Vec::new();
-    collect_r_files(root, &mut files);
+    let mut paths = Vec::new();
+    crate::cli::shared::collect_r_file_paths(root, &mut paths);
+    let mut files: Vec<(PathBuf, String)> = paths
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(&p).ok().map(|content| (p, content)))
+        .collect();
     // Sort for deterministic ordering
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
@@ -350,33 +357,11 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn collect_r_files(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // Skip common non-R directories (mirrors state.rs logic)
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if should_skip_directory(name) {
-                    continue;
-                }
-            }
-            collect_r_files(&path, out);
-        } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if ext.eq_ignore_ascii_case("r") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    out.push((path, content));
-                }
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::should_skip_directory;
 
     #[test]
     fn test_parse_args_basic() {
