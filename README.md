@@ -8,13 +8,9 @@ Among the alternatives — [Positron](https://github.com/posit-dev/positron) (vi
 
 Raven's static analysis also reaches into accessors: start typing `fruit$a` and it can suggest `apple` the moment you open the file, with no R session — Positron offers the same only from a live session (Raven's accessor analysis currently goes one level deep). The [comparison page](docs/comparison.md) lays out the differences in detail, including where the existing tools cover ground Raven doesn't.
 
-Beyond code intelligence, Raven's VS Code extension can bring the rest of an R workflow into the editor: an [R console](docs/r-console.md) plus [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers — optional features that defer by default if you already run REditorSupport or Positron. Its language server can run alongside or instead of [r-language-server](https://github.com/REditorSupport/languageserver), so you don't have to change your current setup to try it.
+Beyond code intelligence, Raven's VS Code extension can bring the rest of an R workflow into the editor — an [R console](docs/r-console.md) with [plot](docs/plot-viewer.md) and [data](docs/data-viewer.md) viewers — but it's built to add to your setup rather than change it: those R-session features defer by default to REditorSupport or Positron, and the language server runs alongside or instead of [r-language-server](https://github.com/REditorSupport/languageserver) ([details below](#how-raven-differs)).
 
 Raven is fully open source ([GPL-3.0](LICENSE)) and editor-agnostic: it speaks the Language Server Protocol, so it runs in VS Code, Neovim, Zed, or any LSP client — including over VS Code Remote-SSH, so you can develop on a remote server with more compute than your laptop.
-
-> [!NOTE]
-> If you already have the REditorSupport (R) extension installed, or you're using Positron, Raven's R-console features (R console, plot viewer, data viewer) step aside by default — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](docs/coexistence.md). Raven still provides code intelligence and scope-aware help in either setup.
-
 
 > **Status:** Raven is under active development. It works well for day-to-day use but hasn't been widely announced yet. Bug reports and feedback are welcome!
 
