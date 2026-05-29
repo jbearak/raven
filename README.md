@@ -1,12 +1,14 @@
 # Raven
 
-Raven is an R language server with cross-file code intelligence. It traces `source()` chains, so completions, diagnostics, and navigation reflect the actual order in which your code runs — across files and within a single script. The VS Code extension adds an [R console](docs/r-console.md) and [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers, and the language server can run alongside or instead of [r-language-server](https://github.com/REditorSupport/languageserver).
+Raven is an R language server with cross-file code intelligence. It traces `source()` chains, so completions, diagnostics, and navigation reflect the actual order in which your code runs — across files and within a single script.
 
 The language server analyzes your code in realtime: it completes variable and accessor names as you type, flags syntax errors and undefined variables — including use-before-definition, because scope is position-aware even within a single script (a variable defined on line 50 isn't in scope on line 10) — and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
 
 Among the alternatives — [Positron](https://github.com/posit-dev/positron) (via [Ark](https://github.com/posit-dev/ark)), RStudio, and [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (the only other VS Code option) — Positron comes closest: its workspace indexer completes variable and function names defined anywhere in your project. But it treats the project as one flat namespace, offering a symbol everywhere it's defined, regardless of whether your code actually reaches it. Raven follows your code's execution order instead — it traces `source()` chains and resolves what's in scope at your cursor — so its completions, diagnostics, and navigation reflect what's actually defined when that line runs, not just what exists somewhere in the project.
 
 Raven's static analysis also reaches into accessors: start typing `fruit$a` and it can suggest `apple` the moment you open the file, with no R session — Positron offers the same only from a live session (Raven's accessor analysis currently goes one level deep). The [comparison page](docs/comparison.md) lays out the differences in detail, including where the existing tools cover ground Raven doesn't.
+
+Beyond code intelligence, Raven's VS Code extension brings the rest of an R workflow into the editor: an [R console](docs/r-console.md) plus [plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers. Its language server can run alongside or instead of [r-language-server](https://github.com/REditorSupport/languageserver), so you don't have to change your current setup to try it.
 
 Raven is fully open source ([GPL-3.0](LICENSE)) and editor-agnostic: it speaks the Language Server Protocol, so it runs in VS Code, Neovim, Zed, or any LSP client — including over VS Code Remote-SSH, so you can develop on a remote server with more compute than your laptop.
 
