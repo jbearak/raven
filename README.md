@@ -47,6 +47,33 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 > [!TIP]
 > Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: [syntax highlighting](docs/syntax-highlighting.md#jags-and-stan), [completions](docs/completion.md#jags-and-stan) (keywords, distributions, file-local symbols), [go-to-definition](docs/go-to-definition.md#jags-and-stan), [find references](docs/find-references.md#jags-and-stan), and [document outline with model structure navigation](docs/document-outline.md#jags-and-stan-model-structure).
 
+## How Raven Differs
+
+Raven takes a static-analysis approach rather than attaching to a live R session, so it can start answering questions the moment a file is opened, without running user code. That has four practical consequences:
+
+- **Available immediately, even for code you haven't run** — answers the moment you open a file, including code that errors halfway, is missing a dependency, or that you're only reading (onboarding to a repo, reviewing a pull request). A session-based tool can offer little until the code runs cleanly.
+- **Reflects what your code says, not what your session remembers** — a tool tied to a live session sees whatever is in `globalenv()` right now, possibly stale. Comment out `library(dplyr)` while it's still attached in your session and a session-based tool keeps completing `dplyr` functions; Raven reads the file and knows it isn't loaded there.
+- **Read-only and side-effect-free** — computing scope never runs your code, so nothing it does (writing files, hitting a database, a long job) can be triggered. This is also what makes Raven safe to run behind an agentic/AI tool.
+- **Runs in CI and other headless environments** — scope resolution needs no live R session, so Raven's diagnostics and lints run in a CI pipeline or any headless context (see the [`raven lint` CLI](docs/cli.md)).
+
+See [Why Raven exists](docs/comparison.md#why-raven-exists) for the origin and rationale.
+
+**Built to coexist, not replace.** Raven layers onto your existing R setup two different ways, and neither one takes anything over.
+
+*The language server is additive.* Its reason for being is static, cross-file analysis, and it runs happily next to [r-language-server](https://github.com/REditorSupport/languageserver): install Raven and you get its diagnostics, completions, and navigation on top of whatever you already run. If you'd rather not have two providers offering completions, set `r.lsp.enabled` to `false` to turn REditorSupport's language server off and let Raven handle code intelligence alone. If you want to keep REditorSupport's language server but not its [`lintr`](https://lintr.r-lib.org/) style diagnostics, set `r.lsp.diagnostics` to `false` — you'll keep Raven's syntax and scope diagnostics without style linting. And if you want some of that style linting back, Raven ships its own (`raven.linting.enabled`, off by default), configurable through a `.lintr` file for backward compatibility, a `raven.toml`, or VS Code's settings UI — a point-and-click alternative to writing `.lintr` syntax by hand. Raven also folds in [RStudio-style auto-indentation](docs/indentation.md) as you type; it never reformats whole files, so there's nothing for a dedicated formatter like [Air](https://github.com/posit-dev/air) (Posit) to collide with. The community has dedicated tools for these jobs — Air for formatting, [lintr](https://lintr.r-lib.org/) or [Jarl](https://github.com/etiennebacher/jarl) for linting — and Raven is built to run alongside them.
+
+*The R console and viewers defer to whatever you already run.* Raven's [R console](docs/r-console.md), its [plot](docs/plot-viewer.md) and [data](docs/data-viewer.md) viewers, and its [Knit Preview](docs/knit.md) overlap with what REditorSupport, RStudio, and Positron already give you — and if you like their live-session, workspace-watcher style of working, Raven isn't trying to replace it. By default these features defer: under `raven.rConsole.activation`'s `auto` setting they step aside whenever REditorSupport is enabled or you're running in Positron, so installing Raven never displaces the R integration you already have. They exist for two reasons. First, having built a language server that deliberately needs no live R session, I didn't want to then be forced to pair it with a tool that injects itself into one — so Raven gives you a complete R workflow you *can* run on its own. Second, I had particular preferences these viewers are built around: a data viewer that stays responsive on millions of rows, reopens after a VS Code restart, remembers sorts and filters across repeated `View()` calls, and shows value labels from imported Stata / SPSS data, all without waiting on a live R session (the frame streams out to Arrow on disk); help that lists only the function actually in scope (hover `print()` and you get `base::print`, not a list of every package that happens to define a `print`); and a fast `.Rmd` preview that themes prose, syntax highlighting, and plots to match your editor. Turn them on everywhere with `raven.rConsole.activation: "enabled"`. (Raven's scope-aware [help viewer](docs/help-viewer.md) always runs regardless — it doesn't tie up a live R session, so there's nothing for it to defer to.)
+
+For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — covering both language intelligence and R session integration — see [docs/comparison.md](docs/comparison.md).
+
+## Installation
+
+**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r).
+
+**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
+
+**Build from source:** See [Development Notes](docs/development.md).
+
 ## Documentation
 
 **Code intelligence:**
@@ -82,33 +109,6 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools
 - [Chunk Keybinding Comparison](docs/keybinding-comparison.md) — Chunk shortcuts across Raven, Quarto, RStudio, and REditorSupport
 - [Limitations](docs/limitations.md) — Features not yet implemented
-
-## Installation
-
-**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r).
-
-**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
-
-**Build from source:** See [Development Notes](docs/development.md).
-
-## How Raven Differs
-
-Raven takes a static-analysis approach rather than attaching to a live R session, so it can start answering questions the moment a file is opened, without running user code. That has four practical consequences:
-
-- **Available immediately, even for code you haven't run** — answers the moment you open a file, including code that errors halfway, is missing a dependency, or that you're only reading (onboarding to a repo, reviewing a pull request). A session-based tool can offer little until the code runs cleanly.
-- **Reflects what your code says, not what your session remembers** — a tool tied to a live session sees whatever is in `globalenv()` right now, possibly stale. Comment out `library(dplyr)` while it's still attached in your session and a session-based tool keeps completing `dplyr` functions; Raven reads the file and knows it isn't loaded there.
-- **Read-only and side-effect-free** — computing scope never runs your code, so nothing it does (writing files, hitting a database, a long job) can be triggered. This is also what makes Raven safe to run behind an agentic/AI tool.
-- **Runs in CI and other headless environments** — scope resolution needs no live R session, so Raven's diagnostics and lints run in a CI pipeline or any headless context (see the [`raven lint` CLI](docs/cli.md)).
-
-See [Why Raven exists](docs/comparison.md#why-raven-exists) for the origin and rationale.
-
-**Built to coexist, not replace.** Raven layers onto your existing R setup two different ways, and neither one takes anything over.
-
-*The language server is additive.* Its reason for being is static, cross-file analysis, and it runs happily next to [r-language-server](https://github.com/REditorSupport/languageserver): install Raven and you get its diagnostics, completions, and navigation on top of whatever you already run. If you'd rather not have two providers offering completions, set `r.lsp.enabled` to `false` to turn REditorSupport's language server off and let Raven handle code intelligence alone. If you want to keep REditorSupport's language server but not its [`lintr`](https://lintr.r-lib.org/) style diagnostics, set `r.lsp.diagnostics` to `false` — you'll keep Raven's syntax and scope diagnostics without style linting. And if you want some of that style linting back, Raven ships its own (`raven.linting.enabled`, off by default), configurable through a `.lintr` file for backward compatibility, a `raven.toml`, or VS Code's settings UI — a point-and-click alternative to writing `.lintr` syntax by hand. Raven also folds in [RStudio-style auto-indentation](docs/indentation.md) as you type; it never reformats whole files, so there's nothing for a dedicated formatter like [Air](https://github.com/posit-dev/air) (Posit) to collide with. The community has dedicated tools for these jobs — Air for formatting, [lintr](https://lintr.r-lib.org/) or [Jarl](https://github.com/etiennebacher/jarl) for linting — and Raven is built to run alongside them.
-
-*The R console and viewers defer to whatever you already run.* Raven's [R console](docs/r-console.md), its [plot](docs/plot-viewer.md) and [data](docs/data-viewer.md) viewers, and its [Knit Preview](docs/knit.md) overlap with what REditorSupport, RStudio, and Positron already give you — and if you like their live-session, workspace-watcher style of working, Raven isn't trying to replace it. By default these features defer: under `raven.rConsole.activation`'s `auto` setting they step aside whenever REditorSupport is enabled or you're running in Positron, so installing Raven never displaces the R integration you already have. They exist for two reasons. First, having built a language server that deliberately needs no live R session, I didn't want to then be forced to pair it with a tool that injects itself into one — so Raven gives you a complete R workflow you *can* run on its own. Second, I had particular preferences these viewers are built around: a data viewer that stays responsive on millions of rows, reopens after a VS Code restart, remembers sorts and filters across repeated `View()` calls, and shows value labels from imported Stata / SPSS data, all without waiting on a live R session (the frame streams out to Arrow on disk); help that lists only the function actually in scope (hover `print()` and you get `base::print`, not a list of every package that happens to define a `print`); and a fast `.Rmd` preview that themes prose, syntax highlighting, and plots to match your editor. Turn them on everywhere with `raven.rConsole.activation: "enabled"`. (Raven's scope-aware [help viewer](docs/help-viewer.md) always runs regardless — it doesn't tie up a live R session, so there's nothing for it to defer to.)
-
-For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — covering both language intelligence and R session integration — see [docs/comparison.md](docs/comparison.md).
 
 ## Development
 
