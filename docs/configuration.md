@@ -229,7 +229,7 @@ To disable an individual rule while leaving the rest enabled, set its severity t
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.editor.dotInWordSeparators` | `"ask"` | Whether to treat `.` as part of words (rather than a word separator) in R and JAGS files. `"ask"` prompts on first use, `"yes"` applies the override to `editor.wordSeparators` for `[r]` / `[jags]`, `"no"` never applies it. |
+| `raven.editor.dotInWordSeparators` | `"yes"` | Whether to treat `.` as part of words (rather than a word separator) in R and JAGS files. `"yes"` (the default) applies the override to `editor.wordSeparators` for `[r]` / `[jags]` — matching RStudio and Positron — `"no"` never applies it, and `"ask"` prompts on first use. Change it any time by editing the setting. |
 
 ## Server Settings
 

@@ -946,8 +946,8 @@
             "yes",
             "no"
           ],
-          "default": "ask",
-          "description": "Whether to exclude dots from word separators in R and JAGS files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it."
+          "default": "yes",
+          "description": "Whether to exclude dots from word separators in R and JAGS files. 'yes' (the default) always applies the override, 'no' never applies it, and 'ask' prompts on first use."
         },
         "raven.crossFile.maxBackwardDepth": {
           "type": "number",

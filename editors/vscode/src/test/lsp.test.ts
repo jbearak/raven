@@ -389,4 +389,24 @@ suite('Ark LSP Extension', () => {
 
         assert.ok(description?.includes('R and JAGS files'));
     });
+
+    // RStudio and Positron treat dots as part of words out of the box, so Raven
+    // defaults `dotInWordSeparators` to "yes" — applying the override silently
+    // rather than prompting. `"ask"` remains opt-in for users who want a prompt.
+    // See https://github.com/jbearak/raven/issues/265.
+    test('package.json defaults dot-in-word separators to yes', async () => {
+        const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {
+            contributes: {
+                configuration: {
+                    properties: Record<string, { default?: string; enum?: string[] }>;
+                };
+            };
+        };
+
+        const schema = pkg.contributes.configuration.properties['raven.editor.dotInWordSeparators'];
+
+        assert.strictEqual(schema?.default, 'yes');
+        assert.deepStrictEqual(schema?.enum, ['ask', 'yes', 'no']);
+    });
 });
