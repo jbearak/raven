@@ -1,8 +1,6 @@
 # Raven
 
-R language support with cross-file code intelligence (completions, diagnostics, navigation), an [R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md), and [plot](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md), [data](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md), and [help](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md) viewers.
-
-The language server analyzes your code in realtime: it completes variable and accessor names as you type, flags syntax errors and undefined variables, and lets you jump to where a variable or function is defined or list all the other places that your codebase references it.
+In Raven, what's in scope depends on where your cursor is. The language server traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files and within a single script (a variable defined on line 50 isn't in scope on line 10).
 
 [REditorSupport's R extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) is the established R extension for VS Code. When you add Raven, its language server traces `source()` chains and resolves what's in scope at your cursor — so it knows what's actually defined when each line runs, including symbols from the files your code sources, even ones you haven't opened. Raven runs alongside REditorSupport, contributing this code intelligence (plus RStudio-style indentation on Enter) on top of your existing setup.
 
