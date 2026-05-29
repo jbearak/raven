@@ -6,7 +6,7 @@ Raven adds this to your existing setup. [REditorSupport's R extension](https://m
 
 REditorSupport's language intelligence comes from [r-language-server](https://github.com/REditorSupport/languageserver), an R package that runs inside an R session and indexes the documents you have open (and, in an R package, its `R/` directory). Raven is written in Rust to be fast, and needs no R session: it indexes your whole workspace and follows `source()` chains, so completions and navigation reach symbols in files you haven't opened — jump straight to a variable's definition in another file.
 
-Because it resolves scope, Raven can flag undefined variables. It also reports parse errors as you type — unclosed or mismatched brackets, or an `else` that isn't on the same line as the closing `}` — plus likely-bug patterns like mixed logical operators (`a & b | c`).
+As you type, Raven resolves scope — so it can flag undefined variables. It also reports parse errors — unclosed or mismatched brackets, or an `else` that isn't on the same line as the closing `}` — plus likely-bug patterns like mixed logical operators (`a & b | c`).
 
 > Raven's R-console features (R console, plot and data viewers) defer by default when REditorSupport is enabled or you're in Positron — set `raven.rConsole.activation` to `enabled` to override. See [Coexistence](#coexistence-with-vscode-r-and-positron) below. Code intelligence and the scope-aware help viewer run either way.
 
