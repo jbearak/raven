@@ -2159,7 +2159,9 @@ impl<'a> SymbolExtractor<'a> {
         let mut sections = Vec::new();
         let mut consumed_lines: HashSet<usize> = HashSet::new();
         let pattern = section_pattern();
-        let lines: Vec<&str> = self.text.lines().collect();
+        // BOM-tolerant split: the section pattern anchors at column 0 (`^\s*#`),
+        // and a first-line section may sit behind a raw BOM. #346.
+        let lines = crate::utf16::lines_for_column0_scan(self.text);
 
         // Phase 1: Single-line section detection (existing logic)
         for (line_num, line) in lines.iter().enumerate() {
@@ -2355,7 +2357,9 @@ impl<'a> SymbolExtractor<'a> {
     fn extract_decorative_sections(&self, style: ModelCommentStyle) -> Vec<RawSymbol> {
         let mut sections = Vec::new();
         let mut consumed_lines: HashSet<usize> = HashSet::new();
-        let lines: Vec<&str> = self.text.lines().collect();
+        // BOM-tolerant split: the model-comment prefix scan anchors at column 0,
+        // so a first-line banner delimiter may sit behind a raw BOM. #346.
+        let lines = crate::utf16::lines_for_column0_scan(self.text);
 
         if lines.len() >= 3 {
             for i in 1..lines.len() - 1 {
@@ -3482,6 +3486,9 @@ impl BlockDetector {
 
     /// Core detection: find block keyword matches and compute ranges via brace matching.
     fn detect_blocks(text: &str, pattern: &Regex) -> Vec<RawSymbol> {
+        // BOM-tolerant scan anchor: a leading U+FEFF defeats the `(?m)^` block-keyword
+        // match (line-0 `model {`/`data {`). Strip so byte offsets below stay aligned. #346.
+        let text = crate::utf16::strip_leading_bom_for_scan(text);
         let lines: Vec<&str> = text.lines().collect();
         let total_lines = lines.len();
         let mut symbols = Vec::new();
@@ -21156,6 +21163,36 @@ setMethod("show", "MyClass", function(object) { print(object@value) })
         assert_eq!(section.section_level, Some(1));
         assert_eq!(section.range.start.line, 0);
         assert_eq!(section.range.end.line, 0);
+    }
+
+    // Issue #346: the section_pattern anchors at column 0 (`^\s*#`). A raw
+    // leading U+FEFF on the first line (in-memory text from a non-VS-Code
+    // client) would defeat the anchor and drop a first-line section header from
+    // the document outline.
+    #[test]
+    fn test_extract_sections_first_line_after_bom() {
+        let code = "\u{FEFF}# Data Loading ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Data Loading").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+        assert_eq!(section.range.start.line, 0);
+    }
+
+    // Issue #346: a JAGS/Stan banner whose top delimiter is the file's first
+    // line is dropped when a raw BOM precedes it, because the model-comment
+    // prefix scan anchors at column 0.
+    #[test]
+    fn test_extract_decorative_sections_first_line_after_bom() {
+        let code = "\u{FEFF}# ====\n# Title\n# ====\n";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let sections = extractor.extract_decorative_sections(ModelCommentStyle::Hash);
+        assert_eq!(sections.len(), 1, "got {:?}", sections);
+        assert_eq!(sections[0].name, "Title");
     }
 
     #[test]
@@ -46829,6 +46866,25 @@ mod block_detector_tests {
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].selection_range.start, pos(0, 2));
         assert_eq!(syms[0].selection_range.end, pos(0, 7));
+    }
+
+    // Issue #346: JAGS/Stan files routinely open with a block keyword on line 0
+    // (`model {`, `data {`, `functions {`). A raw leading U+FEFF on that first
+    // line (in-memory text from a non-VS-Code client) must not drop the first
+    // block — and its nested symbols — from the document outline.
+    #[test]
+    fn test_jags_first_line_block_after_bom() {
+        let syms = BlockDetector::detect_jags("\u{FEFF}model { y ~ dnorm(0,1) }");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "model");
+        assert_eq!(syms[0].section_level, Some(0));
+    }
+
+    #[test]
+    fn test_stan_first_line_block_after_bom() {
+        let syms = BlockDetector::detect_stan("\u{FEFF}data {\n  int N;\n}\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "data");
     }
 
     #[test]

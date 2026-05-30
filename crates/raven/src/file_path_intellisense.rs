@@ -1534,13 +1534,19 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
     PATTERNS.get_or_init(|| {
         // Patterns match the directive keyword and trailing whitespace/colon
         // Consistent with cross_file/directive.rs patterns
-        // The @ is required, colon is optional, leading whitespace is allowed
+        // The @ is required, colon is optional, leading whitespace is allowed.
+        // `\u{feff}` in the leading class tolerates a raw BOM on a first-line
+        // directive (in-memory text keeps it verbatim); matching against the
+        // BOM-bearing line keeps the reported path column client-aligned. #346.
         DirectivePathPatterns {
             backward: Regex::new(
-                r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#,
+                r#"^[\s\u{feff}]*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#,
             )
             .unwrap(),
-            forward: Regex::new(r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)"#).unwrap(),
+            forward: Regex::new(
+                r#"^[\s\u{feff}]*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)"#,
+            )
+            .unwrap(),
         }
     })
 }
@@ -1567,6 +1573,30 @@ mod tests {
     #[test]
     fn test_file_path_context_none() {
         assert_eq!(FilePathContext::None, FilePathContext::None);
+    }
+
+    // Issue #346: a first-line `@lsp-source` directive preceded by a raw BOM
+    // must still offer path completion. `parse_directives` was fixed, but the
+    // path-intellisense seam matches its own column-0-anchored patterns.
+    #[test]
+    fn test_directive_path_context_first_line_after_bom() {
+        let content = "\u{FEFF}# @lsp-source foo";
+        let tree = parse_r(content);
+        // Cursor at end of line. UTF-16: BOM(1) + "# @lsp-source foo"(17) = 18.
+        let ctx = detect_file_path_context(&tree, content, Position::new(0, 18));
+        match ctx {
+            FilePathContext::Directive {
+                directive_type,
+                partial_path,
+                path_start,
+            } => {
+                assert_eq!(directive_type, DirectiveType::Source);
+                assert_eq!(partial_path, "foo");
+                // Path starts after the BOM (col 1) + "# @lsp-source " (14) = 15.
+                assert_eq!(path_start, Position::new(0, 15));
+            }
+            other => panic!("expected Directive context, got {:?}", other),
+        }
     }
 
     #[test]

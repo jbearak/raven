@@ -6,7 +6,7 @@
 // incomplete syntax (matching the official R language server's approach).
 //
 
-use crate::utf16::utf16_column_to_byte_offset;
+use crate::utf16::{strip_leading_bom_for_scan, utf16_column_to_byte_offset};
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Point, Tree};
 
@@ -52,9 +52,11 @@ pub fn detect_function_call_context(
 
 /// Check if the document text looks like R Markdown (contains code fences).
 fn is_rmarkdown(text: &str) -> bool {
-    // R Markdown files contain ```{r ...} code fences.
-    // A simple heuristic: look for the pattern at the start of a line.
-    text.lines()
+    // R Markdown files contain ```{r ...} code fences. A simple heuristic: look
+    // for the pattern at the start of a line. Stripping a raw leading U+FEFF from
+    // the whole text only affects line 0 — the one place a BOM can hide. #346.
+    strip_leading_bom_for_scan(text)
+        .lines()
         .any(|line| line.trim_start().starts_with("```{r"))
 }
 
@@ -64,6 +66,12 @@ fn is_inside_r_code_block(text: &str, position: Position) -> bool {
     let mut in_r_block = false;
 
     for (line_idx, line) in text.lines().enumerate() {
+        // A first-line fence may be preceded by a raw BOM; skip it (#346).
+        let line = if line_idx == 0 {
+            strip_leading_bom_for_scan(line)
+        } else {
+            line
+        };
         let trimmed = line.trim_start();
         if trimmed.starts_with("```{r") {
             in_r_block = true;
@@ -1348,6 +1356,20 @@ y <- second(a, )
     #[test]
     fn test_is_rmarkdown_false() {
         assert!(!is_rmarkdown("x <- 1\nfunc(x)"));
+    }
+
+    // Issue #346: a raw leading U+FEFF on a first-line fence (in-memory text
+    // from a non-VS-Code client) must not defeat the column-0 `^```{r` check.
+    #[test]
+    fn test_is_rmarkdown_true_with_leading_bom_on_first_line_fence() {
+        assert!(is_rmarkdown("\u{FEFF}```{r}\nx <- 1\n```\n"));
+    }
+
+    #[test]
+    fn test_is_inside_r_code_block_first_line_fence_after_bom() {
+        let code = "\u{FEFF}```{r}\nx <- 1\n```\n";
+        // Line 1 is "x <- 1" — inside the R block opened by the first-line fence.
+        assert!(is_inside_r_code_block(code, Position::new(1, 0)));
     }
 
     #[test]

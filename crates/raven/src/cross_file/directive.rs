@@ -112,6 +112,10 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
     let patterns = patterns();
     let mut meta = CrossFileMetadata::default();
 
+    // BOM-tolerant scan anchor (see `strip_leading_bom_for_scan`). Directive
+    // positions are line-based — column is always 0 — so this shifts nothing. #346.
+    let content = crate::utf16::strip_leading_bom_for_scan(content);
+
     // Header tracking: backward and working-dir directives are only recognized
     // in the file header (consecutive blank/comment lines from the start).
     let mut in_header = true;
@@ -1341,5 +1345,37 @@ x <- undefined"#;
         let meta = parse_directives(content);
         assert_eq!(meta.declared_functions.len(), 1);
         assert_eq!(meta.declared_functions[0].name, "my.func");
+    }
+
+    // Issue #346: a raw leading U+FEFF (BOM) in in-memory text must not hide a
+    // first-line directive. tree-sitter-r skips the BOM as whitespace, but
+    // Rust's `\s`/`str::trim` follow Unicode `White_Space`, which excludes
+    // U+FEFF, so the column-0 scan anchor here would otherwise miss the `#`.
+    #[test]
+    fn bom_prefixed_forward_directive_on_first_line_parses() {
+        let content = "\u{FEFF}# @lsp-source utils.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+        assert_eq!(meta.sources[0].directive_line, 0);
+    }
+
+    #[test]
+    fn bom_prefixed_backward_directive_on_first_line_parses() {
+        let content = "\u{FEFF}# @lsp-sourced-by ../main.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sourced_by[0].path, "../main.R");
+        assert_eq!(meta.sourced_by[0].call_site, CallSiteSpec::Default);
+    }
+
+    #[test]
+    fn bom_on_first_line_does_not_prematurely_end_header() {
+        // The BOM-prefixed first comment line must still count as header, so a
+        // backward directive on the next line is still recognised.
+        let content = "\u{FEFF}# a header comment\n# @lsp-sourced-by ../main.R";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.sourced_by[0].path, "../main.R");
     }
 }
