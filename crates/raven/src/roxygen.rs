@@ -1215,7 +1215,7 @@ fn process_roxygen_tag(
 /// assignment target).
 pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
     let mut ns = RoxygenNamespace::default();
-    let lines: Vec<&str> = content.lines().collect();
+    let lines = crate::utf16::lines_for_column0_scan(content);
     let mut i = 0;
 
     while i < lines.len() {
@@ -1701,6 +1701,18 @@ bar <- function() {}
         let content = "#' @export\n\"[<-\" <- function(x, i, value) x\n";
         let ns = extract_roxygen_namespace_tags(content);
         assert_eq!(ns.exports, vec!["[<-"]);
+    }
+
+    #[test]
+    fn export_on_first_line_after_bom() {
+        // #346: a roxygen block whose first `#'` line is line 0 preceded by a raw
+        // U+FEFF must still be recognized; `trim_start` does not strip the BOM.
+        let content = "\u{FEFF}#' @export\nfoo <- function() {}\n";
+        let ns = extract_roxygen_namespace_tags(content);
+        assert!(
+            ns.exports.contains(&"foo".to_string()),
+            "line-0 @export behind a BOM should still export `foo`"
+        );
     }
 
     #[test]

@@ -52,18 +52,12 @@ pub fn detect_function_call_context(
 
 /// Check if the document text looks like R Markdown (contains code fences).
 fn is_rmarkdown(text: &str) -> bool {
-    // R Markdown files contain ```{r ...} code fences.
-    // A simple heuristic: look for the pattern at the start of a line. Tolerate
-    // a raw leading U+FEFF on the first line (a first-line fence is the only
-    // place a BOM can hide — open documents keep it verbatim). Issue #346.
-    text.lines().enumerate().any(|(idx, line)| {
-        let line = if idx == 0 {
-            strip_leading_bom_for_scan(line)
-        } else {
-            line
-        };
-        line.trim_start().starts_with("```{r")
-    })
+    // R Markdown files contain ```{r ...} code fences. A simple heuristic: look
+    // for the pattern at the start of a line. Stripping a raw leading U+FEFF from
+    // the whole text only affects line 0 — the one place a BOM can hide. #346.
+    strip_leading_bom_for_scan(text)
+        .lines()
+        .any(|line| line.trim_start().starts_with("```{r"))
 }
 
 /// Check if the cursor position is inside an R code block in R Markdown.
