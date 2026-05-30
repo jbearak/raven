@@ -1149,16 +1149,43 @@ struct ProcessedFile {
     new_index_entry: crate::workspace_index::IndexEntry,
 }
 
-/// Recursively collect file paths from a directory (serial walk, fast).
-fn collect_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Recursively collect file paths under `dir` whose leaf matches `accept`
+/// (serial walk, fast). Symlinked directories ARE followed, with canonical-path
+/// cycle detection to terminate on loops and avoid double-counting; the
+/// non-source directories in [`should_skip_directory`] (`.git`, `node_modules`,
+/// `renv`, `target`, …) are pruned. Results are unsorted; callers that need
+/// deterministic order sort afterwards.
+///
+/// This is the single directory walk shared by the workspace indexer (which
+/// passes [`is_stat_model_extension`] to collect `.r`/`.jags`/`.bugs`/`.stan`)
+/// and the CLI's [`crate::cli::shared::collect_r_file_paths`] (R-only). Sharing
+/// one walk is what keeps `raven check`'s *reported* file set equal to its
+/// *indexed* set: a `.R` file reachable only through a symlinked directory
+/// (e.g. a monorepo `src -> ../shared` layout) is both indexed for cross-file
+/// resolution and reported, instead of one walk following the symlink while the
+/// other skips it. Only the leaf predicate differs between callers; the
+/// symlink/cycle/skip logic — the part that would otherwise drift — lives here
+/// once.
+pub(crate) fn collect_files_matching(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+) {
     let mut visited = HashSet::new();
+    // Seed with the canonical root so a symlink pointing back at the root (or
+    // any already-visited directory) is detected as a cycle and skipped.
     if let Ok(canonical) = fs::canonicalize(dir) {
         visited.insert(canonical);
     }
-    collect_file_paths_inner(dir, out, &mut visited);
+    collect_files_matching_inner(dir, out, &mut visited, accept);
 }
 
-fn collect_file_paths_inner(dir: &Path, out: &mut Vec<PathBuf>, visited: &mut HashSet<PathBuf>) {
+fn collect_files_matching_inner(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+    accept: fn(&Path) -> bool,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -1166,6 +1193,9 @@ fn collect_file_paths_inner(dir: &Path, out: &mut Vec<PathBuf>, visited: &mut Ha
     for entry in entries.flatten() {
         let path = entry.path();
 
+        // `is_dir()` follows symlinks, so a symlink to a directory is walked
+        // (after the cycle check) and a symlink to a file falls through to the
+        // `accept` branch.
         if path.is_dir() {
             if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                 if should_skip_directory(dir_name) {
@@ -1185,8 +1215,8 @@ fn collect_file_paths_inner(dir: &Path, out: &mut Vec<PathBuf>, visited: &mut Ha
                     continue;
                 }
             }
-            collect_file_paths_inner(&path, out, visited);
-        } else if is_stat_model_extension(&path) {
+            collect_files_matching_inner(&path, out, visited, accept);
+        } else if accept(&path) {
             out.push(path);
         }
     }
@@ -1255,7 +1285,7 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            collect_file_paths(&path, &mut file_paths);
+            collect_files_matching(&path, &mut file_paths, is_stat_model_extension);
         }
     }
 
@@ -1434,7 +1464,7 @@ fn is_stat_model_extension(path: &Path) -> bool {
         })
 }
 
-// `scan_directory` was replaced by `collect_file_paths` + `process_workspace_file`
+// `scan_directory` was replaced by `collect_files_matching` + `process_workspace_file`
 // for parallel scanning via rayon. See `scan_workspace`.
 
 #[cfg(test)]

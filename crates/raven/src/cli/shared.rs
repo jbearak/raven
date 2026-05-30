@@ -90,72 +90,21 @@ pub fn absolute_path(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
-/// Recursively collect `.R` / `.r` file paths under `dir`. Symlinked
-/// directories ARE followed, with canonical-path cycle detection to terminate
-/// on loops and avoid double-counting; the non-source directories listed in
-/// [`crate::state::should_skip_directory`] (`.git`, `node_modules`, `renv`,
-/// `target`, …) are pruned. Results are unsorted; callers that need
-/// deterministic order sort afterwards.
-///
-/// This deliberately mirrors the workspace indexer's walk
-/// (`state.rs::collect_file_paths_inner`): both follow symlinked directories
-/// with a `visited` set of canonical paths and include symlinked files. Keeping
-/// the two walks consistent is what makes `raven check`'s *reported* file set
-/// equal its *indexed* file set — otherwise a `.R` file reachable only through a
-/// symlink (e.g. a monorepo `src -> ../shared` layout) would be indexed for
-/// cross-file resolution yet never have its own diagnostics reported, and CI
-/// would pass over a file the editor flags.
+/// Recursively collect `.R` / `.r` file paths under `dir`. A thin R-only
+/// wrapper over the shared directory walk [`crate::state::collect_files_matching`]:
+/// symlinked directories are followed with canonical-path cycle detection and
+/// non-source directories are pruned. Reusing the indexer's walk is what keeps
+/// `raven check`'s *reported* file set equal to its *indexed* set — a `.R` file
+/// reachable only through a symlink (e.g. a monorepo `src -> ../shared` layout)
+/// is both indexed and reported, not one or the other. Results are unsorted;
+/// callers that need deterministic order sort afterwards.
 ///
 /// Shared by `raven check` (which reports diagnostics for the collected files)
 /// and `analysis-stats` (which reads their contents in a second pass). `.r` and
 /// `.R` are the only matched extensions — equivalent to a case-insensitive
 /// match on the single-character extension.
 pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
-    let mut visited = std::collections::HashSet::new();
-    // Seed with the canonical root so a symlink pointing back at the root (or
-    // any already-visited directory) is detected as a cycle and skipped.
-    if let Ok(canonical) = std::fs::canonicalize(dir) {
-        visited.insert(canonical);
-    }
-    collect_r_file_paths_inner(dir, out, &mut visited);
-}
-
-fn collect_r_file_paths_inner(
-    dir: &Path,
-    out: &mut Vec<PathBuf>,
-    visited: &mut std::collections::HashSet<PathBuf>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        // `is_dir()` follows symlinks, so a symlink to a directory is walked
-        // (after the cycle check) and a symlink to a file falls through to the
-        // `is_r_file` branch — matching the indexer.
-        if p.is_dir() {
-            if p.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(crate::state::should_skip_directory)
-            {
-                continue;
-            }
-            match std::fs::canonicalize(&p) {
-                Ok(canonical) => {
-                    if !visited.insert(canonical) {
-                        // Already visited (symlink cycle or alias) — skip.
-                        continue;
-                    }
-                }
-                // An unresolvable directory (e.g. broken symlink) can't be
-                // walked; skip it rather than error.
-                Err(_) => continue,
-            }
-            collect_r_file_paths_inner(&p, out, visited);
-        } else if is_r_file(&p) {
-            out.push(p);
-        }
-    }
+    crate::state::collect_files_matching(dir, out, is_r_file);
 }
 
 /// Render diagnostics in the requested format. The single dispatch point both
