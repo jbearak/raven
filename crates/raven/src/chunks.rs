@@ -105,7 +105,15 @@ pub fn classify_chunk_document_for(language_id: Option<&str>, path_or_uri: &str)
 /// Detect all chunks in the document, in source order. `kind` controls which
 /// detection path runs.
 pub fn detect_chunks(text: &str, kind: ChunkKind) -> Vec<Chunk> {
-    let lines: Vec<&str> = text.lines().collect();
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Both detection paths anchor their fence/cell/divider regexes at column 0
+    // (`^`). A raw leading U+FEFF on the first line of in-memory text (open
+    // documents keep the BOM verbatim — see `did_open`) would defeat the anchor
+    // and hide a first-line chunk; skip it here, once, for both paths. Chunks
+    // report only line numbers, so this shifts no reported position. Issue #346.
+    if let Some(first) = lines.first_mut() {
+        *first = crate::utf16::strip_leading_bom_for_scan(first);
+    }
     match kind {
         ChunkKind::Rmd => detect_rmd_chunks(&lines),
         ChunkKind::R => detect_r_cells(&lines),
@@ -368,6 +376,28 @@ mod tests {
         assert_eq!(chunks[0].closing_fence_line, Some(5));
         assert_eq!(chunks[0].end_line, 4);
         assert_eq!(chunks[0].language, "r");
+    }
+
+    // Issue #346: the fence-header and cell-marker regexes anchor at column 0
+    // (`^`). A raw leading U+FEFF on the first line of in-memory text (open
+    // documents keep the BOM verbatim) would otherwise defeat the `^` anchor and
+    // hide a first-line chunk/cell.
+    #[test]
+    fn detects_first_line_fence_header_after_bom() {
+        let src = "\u{FEFF}```{r}\nx <- 1\n```\n";
+        let chunks = detect(src, ChunkKind::Rmd);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].header_line, 0);
+        assert_eq!(chunks[0].language, "r");
+    }
+
+    #[test]
+    fn detects_first_line_cell_marker_after_bom() {
+        let src = "\u{FEFF}# %% setup\nx <- 1\n";
+        let chunks = detect(src, ChunkKind::R);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].header_line, 0);
+        assert_eq!(chunks[0].label.as_deref(), Some("setup"));
     }
 
     #[test]

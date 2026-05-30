@@ -21,10 +21,10 @@ pub(crate) fn collect(
         if suppressions.is_suppressed(line_no) {
             continue;
         }
-        // A raw leading U+FEFF on the first line (in-memory text from a
-        // non-VS-Code client; open documents keep the BOM verbatim) is invisible
-        // and must not count toward line width — matching tree-sitter and the
-        // disk-read seam, both of which drop it. Issue #346.
+        // Don't count a raw leading U+FEFF toward the width (see
+        // `strip_leading_bom_for_scan`). Only line 0 can carry a BOM; a later
+        // U+FEFF is a zero-width no-break space that must still count, so the
+        // guard is load-bearing, not defensive. Issue #346.
         let line = if line_no == 0 {
             crate::utf16::strip_leading_bom_for_scan(line)
         } else {
