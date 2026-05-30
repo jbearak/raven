@@ -105,11 +105,8 @@ pub fn classify_chunk_document_for(language_id: Option<&str>, path_or_uri: &str)
 /// Detect all chunks in the document, in source order. `kind` controls which
 /// detection path runs.
 pub fn detect_chunks(text: &str, kind: ChunkKind) -> Vec<Chunk> {
-    // Both detection paths anchor their fence/cell/divider regexes at column 0
-    // (`^`). A raw leading U+FEFF on the first line of in-memory text (open
-    // documents keep the BOM verbatim — see `did_open`) would defeat the anchor
-    // and hide a first-line chunk; split BOM-tolerantly so both paths see it.
-    // Chunks report only line numbers, so this shifts no position. Issue #346.
+    // BOM-tolerant split: both paths anchor their fence/cell/divider regexes at
+    // column 0 (see `lines_for_column0_scan`). Chunks report only line numbers. #346.
     let lines = crate::utf16::lines_for_column0_scan(text);
     match kind {
         ChunkKind::Rmd => detect_rmd_chunks(&lines),

@@ -112,10 +112,8 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
     let patterns = patterns();
     let mut meta = CrossFileMetadata::default();
 
-    // Skip a raw leading U+FEFF so a first-line directive is recognised (see
-    // `strip_leading_bom_for_scan` for why the BOM survives into in-memory
-    // text). Directive positions are line-based — columns are always 0 — so
-    // dropping the leading BOM here shifts no reported position. Issue #346.
+    // BOM-tolerant scan anchor (see `strip_leading_bom_for_scan`). Directive
+    // positions are line-based — column is always 0 — so this shifts nothing. #346.
     let content = crate::utf16::strip_leading_bom_for_scan(content);
 
     // Header tracking: backward and working-dir directives are only recognized

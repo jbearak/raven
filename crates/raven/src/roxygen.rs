@@ -30,7 +30,11 @@ pub struct RoxygenBlock {
 /// Prefers `#'` (roxygen) lines; falls back to plain `#` comments if no `#'` lines
 /// are found. Returns `None` if no contiguous comment block exists above the function.
 pub fn extract_roxygen_block(text: &str, func_line: u32) -> Option<RoxygenBlock> {
-    let lines: Vec<&str> = text.lines().collect();
+    // A roxygen block can begin on line 0 (above the file's first function). A
+    // raw leading U+FEFF there (in-memory text keeps the BOM verbatim) would
+    // make the backward `#'`/`#` scan stop short and drop the first doc line;
+    // strip it so line 0 is recognised. Reports no columns. Issue #346.
+    let lines = crate::utf16::lines_for_column0_scan(text);
     let func_line = func_line as usize;
 
     if func_line == 0 || func_line >= lines.len() {
@@ -342,6 +346,16 @@ my_mean <- function(x) mean(x)
         assert!(block.params.is_empty());
         // No tags → fallback is populated
         assert!(block.fallback.is_some());
+    }
+
+    // Issue #346: an R file may open with a roxygen block on line 0 (above the
+    // first function). A raw leading U+FEFF on that first `#'` line would make
+    // the backward scan stop short, dropping the title from hover/completion.
+    #[test]
+    fn test_roxygen_first_line_title_after_bom() {
+        let code = "\u{FEFF}#' Calculate the mean\nmy_mean <- function(x) mean(x)\n";
+        let block = extract_roxygen_block(code, 1).unwrap();
+        assert_eq!(block.title.as_deref(), Some("Calculate the mean"));
     }
 
     #[test]
