@@ -78,12 +78,32 @@ decompression crate.
 Full parity is achievable for **what R serializes to disk**, but two cases are
 unreachable in principle by *any* static implementation:
 
-1. **Runtime-generated symbols.** `getNamespaceExports()` reflects the namespace
-   *after* `.onLoad()` runs. A package can `assign()` into its namespace,
-   `makeActiveBinding`, or register S4 classes/methods at load time. Those objects
-   are not in the on-disk `.rdx` index. A static reader matches what is
-   serialized, not what only exists after evaluation. Rare, but unbounded (it is
-   arbitrary R code).
+1. **Symbols created by load hooks.** `getNamespaceExports()` reflects the
+   namespace *after* `loadNamespace` runs the package's `.onLoad`/`.onAttach`
+   hooks. Most exports are *not* affected by this, so it is worth being precise
+   about the true size of the gap:
+   - Export *names* for `export()`, `exportClasses()`, `exportMethods()` are
+     literal in `NAMESPACE` — known statically today (e.g. `raster` lists all 7
+     classes and ~250 methods verbatim).
+   - S4 class/method objects from *top-level* `setClass`/`setGeneric`/`setMethod`
+     **are** serialized into `.rdx` at build time, so they are reachable.
+     **Verified empirically:** decompressing `raster`'s `.rdx` shows the class and
+     method-table objects directly (`.__C__RasterLayer`, `.__C__Extent`,
+     `.__T__$:base`, … — 1650 objects). An earlier draft of this memo wrongly
+     listed S4-at-load as a blind spot; it is not.
+   - The only genuinely unreachable exports are bindings an `.onLoad`/`.onAttach`
+     hook creates at *load* time (`assign()` into the namespace,
+     `makeActiveBinding`) **and** that match an `exportPattern()` /
+     `exportClassPattern()`. That intersection — a rare mechanism, within the ~5%
+     pattern packages, with the pattern actually matching the dynamic name — is
+     vanishingly small.
+
+   The deeper point: R sees those stragglers only because
+   `getNamespaceExports(asNamespace(pkg))` *loads the package and runs `.onLoad`*.
+   Being provably 100% complete requires executing the package's load code —
+   exactly the subprocess we are removing. FFI to `libR` would not close it either
+   unless it loaded the namespace (ran `.onLoad`), i.e. ran R. So this residual is
+   the irreducible cost of static analysis, not a weakness of a Rust reader.
 2. **Programmatic library paths.** `.Rprofile` / `Rprofile.site` can call
    `.libPaths(...)` with arbitrary logic. `renv.lock` + env vars + standard
    locations cover the overwhelming majority, but arbitrary startup code is
