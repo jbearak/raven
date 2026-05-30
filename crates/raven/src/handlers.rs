@@ -3486,11 +3486,8 @@ impl BlockDetector {
 
     /// Core detection: find block keyword matches and compute ranges via brace matching.
     fn detect_blocks(text: &str, pattern: &Regex) -> Vec<RawSymbol> {
-        // A block keyword on line 0 (`model {`, `data {`, …) is the norm for
-        // JAGS/Stan. A raw leading U+FEFF in in-memory text defeats the `(?m)^`
-        // anchor, dropping that first block (and its children) from the outline.
-        // Strip it here so every byte offset below stays BOM-free and aligned.
-        // Issue #346.
+        // BOM-tolerant scan anchor: a leading U+FEFF defeats the `(?m)^` block-keyword
+        // match (line-0 `model {`/`data {`). Strip so byte offsets below stay aligned. #346.
         let text = crate::utf16::strip_leading_bom_for_scan(text);
         let lines: Vec<&str> = text.lines().collect();
         let total_lines = lines.len();
