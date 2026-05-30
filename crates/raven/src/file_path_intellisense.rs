@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Location, Position, Url};
 use tree_sitter::{Node, Tree};
 
+use crate::cross_file::directive::{BACKWARD_DIRECTIVE_KEYWORDS, FORWARD_DIRECTIVE_KEYWORDS};
 use crate::cross_file::path_resolve::PathContext;
 use crate::cross_file::types::{byte_offset_to_utf16_column, CrossFileMetadata};
 use crate::utf16::utf16_column_to_byte_offset;
@@ -1532,19 +1533,35 @@ struct DirectivePathPatterns {
 fn directive_path_patterns() -> &'static DirectivePathPatterns {
     static PATTERNS: OnceLock<DirectivePathPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
-        // Patterns match the directive keyword and trailing whitespace/colon
-        // Consistent with cross_file/directive.rs patterns
+        // Patterns match the directive keyword and trailing whitespace/colon.
+        // The keyword alternations are shared verbatim with
+        // cross_file/directive.rs via {FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS so
+        // the recognized keyword set cannot drift between the two regex sets;
+        // they are plugged into the middle of each pattern by concatenation.
         // The @ is required, colon is optional, leading whitespace is allowed.
         // `\u{feff}` in the leading class tolerates a raw BOM on a first-line
         // directive (in-memory text keeps it verbatim); matching against the
         // BOM-bearing line keeps the reported path column client-aligned. #346.
+        // The leading class deliberately differs from directive.rs, which strips
+        // the BOM up-front and uses `^\s*`. Concatenation (rather than `format!`)
+        // keeps `\u{feff}` written verbatim — no brace-escaping to get wrong.
         DirectivePathPatterns {
             backward: Regex::new(
-                r#"^[\s\u{feff}]*#\s*@lsp-(?:sourced-by|run-by|included-by)(?:\s+:?\s*|:\s*)"#,
+                &[
+                    r#"^[\s\u{feff}]*#\s*@lsp-(?:"#,
+                    BACKWARD_DIRECTIVE_KEYWORDS,
+                    r#")(?:\s+:?\s*|:\s*)"#,
+                ]
+                .concat(),
             )
             .unwrap(),
             forward: Regex::new(
-                r#"^[\s\u{feff}]*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)"#,
+                &[
+                    r#"^[\s\u{feff}]*#\s*@lsp-(?:"#,
+                    FORWARD_DIRECTIVE_KEYWORDS,
+                    r#")(?:\s+:?\s*|:\s*)"#,
+                ]
+                .concat(),
             )
             .unwrap(),
         }
@@ -2178,6 +2195,58 @@ mod tests {
         assert_eq!(directive_type, DirectiveType::Source);
         assert_eq!(partial, "utils");
         assert_eq!(path_start.character, 17);
+    }
+
+    /// Every keyword in the shared `FORWARD_DIRECTIVE_KEYWORDS` /
+    /// `BACKWARD_DIRECTIVE_KEYWORDS` source of truth must round-trip through BOTH
+    /// directive regex sets: the full parser in `cross_file::directive` and the
+    /// column-aligned path-context matcher here. Each side wraps the shared
+    /// alternation in its own (deliberately different) surrounding regex; this
+    /// test pins that the vocabulary stays mutually recognized after composition,
+    /// so the two seams cannot drift apart.
+    #[test]
+    fn test_shared_directive_keywords_recognized_by_both_regex_sets() {
+        use crate::cross_file::directive::parse_directives;
+
+        for kw in FORWARD_DIRECTIVE_KEYWORDS.split('|') {
+            let content = format!("# @lsp-{kw} utils.R");
+            let eol = Position::new(0, content.chars().count() as u32);
+
+            // file_path_intellisense seam (column-aligned, BOM-tolerant).
+            assert!(
+                matches!(
+                    is_directive_path_context(&content, eol),
+                    Some((DirectiveType::Source, _, _))
+                ),
+                "path-context matcher did not recognize forward keyword `{kw}`",
+            );
+
+            // cross_file::directive seam (full parser, capture groups).
+            assert_eq!(
+                parse_directives(&content).sources.len(),
+                1,
+                "directive parser did not recognize forward keyword `{kw}`",
+            );
+        }
+
+        for kw in BACKWARD_DIRECTIVE_KEYWORDS.split('|') {
+            let content = format!("# @lsp-{kw} ../main.R");
+            let eol = Position::new(0, content.chars().count() as u32);
+
+            assert!(
+                matches!(
+                    is_directive_path_context(&content, eol),
+                    Some((DirectiveType::SourcedBy, _, _))
+                ),
+                "path-context matcher did not recognize backward keyword `{kw}`",
+            );
+
+            assert_eq!(
+                parse_directives(&content).sourced_by.len(),
+                1,
+                "directive parser did not recognize backward keyword `{kw}`",
+            );
+        }
     }
 
     #[test]
