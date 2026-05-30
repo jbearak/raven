@@ -1149,6 +1149,16 @@ impl Backend {
             )
         };
 
+        // Disabled-preserve gate (load-bearing — do NOT collapse into a
+        // `build_package_library(..., enabled)` call). When packages are
+        // disabled this returns without touching `state.package_library`, so a
+        // library the user built before disabling is left intact. Routing
+        // through the helper instead would build `new_empty()` and, under the
+        // race re-check below, could swap it in — clobbering that library. This
+        // is the same hazard the `raven.refreshPackages` early-return guards
+        // against; the two disabled-preserve gates are intentionally kept out
+        // of the shared helper for this reason. (The helper still owns the
+        // *install-empty-when-disabled* policy for the rebuild/startup sites.)
         if !enabled {
             return false;
         }
@@ -1944,24 +1954,20 @@ impl LanguageServer for Backend {
             .unwrap_or(serde_json::Value::Null);
         let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
         if let Some(root) = &project_root {
-            match crate::config_file::find_config(root) {
-                crate::config_file::DiscoveredConfig::RavenToml(p) => {
-                    if let Some(loaded) = crate::config_file::load_toml(&p) {
-                        for w in &loaded.warnings {
-                            log::warn!("{w}");
-                        }
-                        loaded_project = Some((p, loaded.settings));
-                    }
+            // Discovery + load is shared with `raven check` via
+            // `discover_and_load`. The server treats a discovered-but-unloadable
+            // config as "no project layer" (collapse `LoadFailed`/`None`), since
+            // a startup config error should degrade gracefully, not abort.
+            if let crate::config_file::DiscoveredLoad::Loaded {
+                path,
+                settings,
+                warnings,
+            } = crate::config_file::discover_and_load(root)
+            {
+                for w in &warnings {
+                    log::warn!("{w}");
                 }
-                crate::config_file::DiscoveredConfig::Lintr(p) => {
-                    if let Some(loaded) = crate::config_file::load_lintr(&p) {
-                        for w in &loaded.warnings {
-                            log::warn!("{w}");
-                        }
-                        loaded_project = Some((p, loaded.settings));
-                    }
-                }
-                crate::config_file::DiscoveredConfig::None => {}
+                loaded_project = Some((path, settings));
             }
         }
 
@@ -4171,24 +4177,19 @@ impl LanguageServer for Backend {
 
             let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
             if let Some(root) = &project_root {
-                match crate::config_file::find_config(root) {
-                    crate::config_file::DiscoveredConfig::RavenToml(p) => {
-                        if let Some(loaded) = crate::config_file::load_toml(&p) {
-                            for w in &loaded.warnings {
-                                log::warn!("{w}");
-                            }
-                            loaded_project = Some((p, loaded.settings));
-                        }
+                // Same shared discovery+load seam as startup (`discover_and_load`);
+                // a discovered-but-unloadable config collapses to "no project
+                // layer" so a bad edit degrades gracefully rather than aborting.
+                if let crate::config_file::DiscoveredLoad::Loaded {
+                    path,
+                    settings,
+                    warnings,
+                } = crate::config_file::discover_and_load(root)
+                {
+                    for w in &warnings {
+                        log::warn!("{w}");
                     }
-                    crate::config_file::DiscoveredConfig::Lintr(p) => {
-                        if let Some(loaded) = crate::config_file::load_lintr(&p) {
-                            for w in &loaded.warnings {
-                                log::warn!("{w}");
-                            }
-                            loaded_project = Some((p, loaded.settings));
-                        }
-                    }
-                    crate::config_file::DiscoveredConfig::None => {}
+                    loaded_project = Some((path, settings));
                 }
             }
 
