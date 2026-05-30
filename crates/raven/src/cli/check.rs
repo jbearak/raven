@@ -268,13 +268,19 @@ pub async fn run(args: CheckArgs) -> i32 {
 /// single offending byte to name.
 fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
     use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
-    let detail = if byte == 0 {
+    // Compose the whole message per branch rather than gluing a fixed
+    // "not valid UTF-8" prefix onto the detail: the `byte == 0` case can be a
+    // malformed UTF-16 file (which carried a BOM), so a "not valid UTF-8" prefix
+    // would contradict its own tail.
+    let message = if byte == 0 {
         // No single offending byte to name: a truncated multibyte sequence at
-        // EOF, or malformed/odd-length UTF-16 (which carried a BOM). Keep this
-        // encoding-agnostic so it doesn't misattribute either case.
-        "could not be decoded as UTF-8 or UTF-16".to_string()
+        // EOF, or malformed/odd-length UTF-16.
+        "File could not be decoded as UTF-8 or UTF-16. Re-save the file as UTF-8.".to_string()
     } else {
-        format!("first invalid byte {byte:#04x} at offset {offset} (looks like Latin-1/Windows-1252)")
+        format!(
+            "File is not valid UTF-8: first invalid byte {byte:#04x} at offset {offset} \
+             (looks like Latin-1/Windows-1252). Re-save the file as UTF-8."
+        )
     };
     Diagnostic {
         range: Range {
@@ -282,7 +288,7 @@ fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
             end: Position { line: 0, character: 0 },
         },
         severity: Some(DiagnosticSeverity::ERROR),
-        message: format!("File is not valid UTF-8: {detail}. Re-save the file as UTF-8."),
+        message,
         ..Default::default()
     }
 }
@@ -796,6 +802,22 @@ mod tests {
         let mut args = base_args(workspace.path());
         args.paths = vec![broken];
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn encoding_diagnostic_message_matches_the_failure_kind() {
+        // Latin-1 (a concrete offending byte): names UTF-8 and the byte/offset.
+        let latin1 = encoding_diagnostic(930, 0xA0);
+        assert!(
+            latin1.message.contains("not valid UTF-8") && latin1.message.contains("0xa0"),
+            "{}",
+            latin1.message
+        );
+        // Malformed/odd-length UTF-16 (byte == 0): the file carried a BOM, so the
+        // message must NOT claim "not valid UTF-8" and must mention UTF-16.
+        let utf16 = encoding_diagnostic(0, 0);
+        assert!(!utf16.message.contains("not valid UTF-8"), "{}", utf16.message);
+        assert!(utf16.message.contains("UTF-16"), "{}", utf16.message);
     }
 
     #[test]
