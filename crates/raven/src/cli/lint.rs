@@ -137,11 +137,18 @@ fn resolve_lint_config(
                 // every per-file `[[linting.overrides]]` patch (same failure
                 // mode as commit 81978f0 fixed for the non-explicit root).
                 let parent = explicit.parent().unwrap_or(cwd).to_path_buf();
-                let root = if parent.is_absolute() {
+                let absolute = if parent.is_absolute() {
                     parent
                 } else {
                     cwd.join(&parent)
                 };
+                // Then normalize away `.`/`..`: `strip_prefix(root)` is purely
+                // lexical, so a `..` left in `root` (e.g. `--config
+                // ../pkg/raven.toml`) wouldn't prefix-match a file given by its
+                // absolute path under that config root, again silently dropping
+                // its overrides. Normalize lexically (not via `canonicalize`) so
+                // a non-existent root still resolves predictably.
+                let root = crate::cross_file::normalize_path_public(&absolute).unwrap_or(absolute);
                 Ok((root, Some(l.settings), false))
             }
             None => {
@@ -431,6 +438,36 @@ mod tests {
             resolve_lint_config(tmp.path(), &discovery_args()),
             Err(EXIT_OPERATOR_ERROR)
         );
+    }
+
+    #[test]
+    fn resolve_lint_config_normalizes_explicit_config_root() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::create_dir(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/raven.toml"), "[linting]\nenabled = true\n").unwrap();
+
+        // An absolute --config that routes through `sub/..`: the `..` must not
+        // survive into `root`, or the purely lexical `strip_prefix(root)` in
+        // `resolve_lint_for_document` would drop every override for a file given
+        // by its (normalized) absolute path under the pkg root.
+        let dotted = tmp.path().join("sub").join("..").join("pkg").join("raven.toml");
+        let mut args = discovery_args();
+        args.config_path = Some(dotted);
+
+        let (root, _settings, lintr_discovered) =
+            resolve_lint_config(tmp.path(), &args).unwrap();
+        assert!(!lintr_discovered);
+        assert!(
+            !root.components().any(|c| matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )),
+            "root still carries . / .. components: {root:?}"
+        );
+        assert!(root.ends_with("pkg"), "expected the pkg dir as root, got {root:?}");
     }
 
     #[test]

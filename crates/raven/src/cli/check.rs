@@ -269,7 +269,10 @@ pub async fn run(args: CheckArgs) -> i32 {
 fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
     use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
     let detail = if byte == 0 {
-        "no UTF-16 byte-order mark and not valid UTF-8".to_string()
+        // No single offending byte to name: a truncated multibyte sequence at
+        // EOF, or malformed/odd-length UTF-16 (which carried a BOM). Keep this
+        // encoding-agnostic so it doesn't misattribute either case.
+        "could not be decoded as UTF-8 or UTF-16".to_string()
     } else {
         format!("first invalid byte {byte:#04x} at offset {offset} (looks like Latin-1/Windows-1252)")
     };

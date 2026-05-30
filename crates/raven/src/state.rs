@@ -1197,23 +1197,41 @@ fn collect_files_matching_inner(
         // (after the cycle check) and a symlink to a file falls through to the
         // `accept` branch.
         if path.is_dir() {
-            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                if should_skip_directory(dir_name) {
-                    log::trace!("Skipping directory: {}", path.display());
-                    continue;
-                }
+            // Cheap first pass: prune by the entry name (a real `node_modules`,
+            // `.git`, … — no canonicalize needed for the common case).
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(should_skip_directory)
+            {
+                log::trace!("Skipping directory: {}", path.display());
+                continue;
             }
-            match fs::canonicalize(&path) {
-                Ok(canonical) => {
-                    if !visited.insert(canonical) {
-                        log::trace!("Skipping symlink cycle: {}", path.display());
-                        continue;
-                    }
-                }
+            let canonical = match fs::canonicalize(&path) {
+                Ok(c) => c,
                 Err(e) => {
                     log::trace!("Skipping unresolvable dir {}: {}", path.display(), e);
                     continue;
                 }
+            };
+            // A symlink whose own name isn't skip-listed but whose TARGET is
+            // (e.g. `deps -> node_modules`) must be pruned too, or it pulls the
+            // whole vendored tree back into the scan.
+            if canonical
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(should_skip_directory)
+            {
+                log::trace!(
+                    "Skipping symlinked directory {} -> {}",
+                    path.display(),
+                    canonical.display()
+                );
+                continue;
+            }
+            if !visited.insert(canonical) {
+                log::trace!("Skipping symlink cycle: {}", path.display());
+                continue;
             }
             collect_files_matching_inner(&path, out, visited, accept);
         } else if accept(&path) {
@@ -1287,8 +1305,14 @@ fn decode_utf8_slice(bytes: &[u8], base_offset: usize) -> Result<String, SourceR
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, SourceReadError> {
-    // A trailing odd byte can't form a code unit; `chunks_exact` drops it. UTF-16
-    // source is vanishingly rare, so we don't pinpoint a byte offset here.
+    // An odd byte count means the final code unit is truncated; surface that
+    // rather than letting `chunks_exact` silently drop the dangling byte and
+    // accept corrupted input. UTF-16 source is vanishingly rare, so we don't
+    // pinpoint a byte offset here (`byte == 0` selects the encoding-agnostic
+    // diagnostic message in `encoding_diagnostic`).
+    if bytes.len() % 2 != 0 {
+        return Err(SourceReadError::InvalidEncoding { offset: 0, byte: 0 });
+    }
     let units = bytes.chunks_exact(2).map(|c| {
         let pair = [c[0], c[1]];
         if little_endian {
@@ -1580,6 +1604,21 @@ mod tests {
     }
 
     #[test]
+    fn decode_source_rejects_truncated_utf16() {
+        // UTF-16 LE BOM followed by an odd number of bytes: the final code unit
+        // is truncated. We must surface this rather than silently dropping the
+        // dangling byte and accepting corrupted input.
+        let bytes = vec![0xFF, 0xFE, b'a', 0x00, b'b']; // 'a', then a lone 0x62
+        match decode_source(bytes) {
+            Err(SourceReadError::InvalidEncoding { byte, .. }) => {
+                // byte == 0 selects the encoding-agnostic message (it had a BOM).
+                assert_eq!(byte, 0);
+            }
+            other => panic!("expected InvalidEncoding for truncated UTF-16, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn decode_source_reports_first_bad_byte_for_latin1() {
         // The real-world case: a non-breaking space (0xA0) after valid ASCII,
         // no BOM. We must point at the offending byte, not silently mangle it.
@@ -1593,6 +1632,30 @@ mod tests {
             }
             other => panic!("expected InvalidEncoding, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_matching_skips_symlink_to_skiplisted_dir() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("real.R"), "1\n").unwrap();
+        // A skip-listed directory with a source file inside (pruned by name).
+        fs::create_dir(tmp.path().join("node_modules")).unwrap();
+        fs::write(tmp.path().join("node_modules").join("inner.R"), "1\n").unwrap();
+        // A symlink whose own name is NOT skip-listed but whose target IS
+        // (`deps -> node_modules`) must also be pruned, or it pulls the whole
+        // vendored tree back into the scan via the symlink alias.
+        std::os::unix::fs::symlink(tmp.path().join("node_modules"), tmp.path().join("deps"))
+            .unwrap();
+
+        let mut out = Vec::new();
+        collect_files_matching(tmp.path(), &mut out, is_stat_model_extension);
+
+        // Only real.R: inner.R is unreachable both directly (node_modules entry
+        // name) and via the symlink (deps' canonical target name).
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].ends_with("real.R"), "got {out:?}");
     }
 
     // Include workspace scanning tests
