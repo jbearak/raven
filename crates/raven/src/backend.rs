@@ -4644,7 +4644,7 @@ impl LanguageServer for Backend {
                     let content = match crate::state::read_source_async(&path).await {
                         Ok(c) => c,
                         Err(e) => {
-                            log::trace!("Failed to read/decode file {}: {:?}", uri, e);
+                            log::trace!("Failed to read/decode file {}: {}", uri, e);
                             continue;
                         }
                     };
@@ -5809,7 +5809,7 @@ impl Backend {
         let content = match crate::state::read_source_async(&path).await {
             Ok(c) => c,
             Err(e) => {
-                log::trace!("Failed to read/decode file {}: {:?}", file_uri, e);
+                log::trace!("Failed to read/decode file {}: {}", file_uri, e);
                 return None;
             }
         };
@@ -6134,7 +6134,7 @@ impl Backend {
         let content = match crate::state::read_source_async(&path).await {
             Ok(c) => c,
             Err(e) => {
-                log::trace!("Failed to read/decode file {}: {:?}", file_uri, e);
+                log::trace!("Failed to read/decode file {}: {}", file_uri, e);
                 return None;
             }
         };

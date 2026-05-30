@@ -277,7 +277,7 @@ fn collect_r_file_inputs_from_dir(
             Err(err) => {
                 complete_scan = false;
                 log::trace!(
-                    "Package R directory scan could not read {}: {:?}",
+                    "Package R directory scan could not read {}: {}",
                     path.display(),
                     err
                 );

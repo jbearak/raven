@@ -1253,6 +1253,32 @@ pub(crate) enum SourceReadError {
     InvalidEncoding { offset: usize, byte: u8 },
 }
 
+impl std::fmt::Display for SourceReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceReadError::Io(e) => write!(f, "{e}"),
+            // `byte == 0` is the malformed/odd-length UTF-16 case (the file
+            // carried a BOM): no single offending byte is meaningful to name.
+            SourceReadError::InvalidEncoding { byte: 0, .. } => {
+                f.write_str("could not be decoded as UTF-8 or UTF-16")
+            }
+            SourceReadError::InvalidEncoding { offset, byte } => write!(
+                f,
+                "not valid UTF-8: first invalid byte {byte:#04x} at offset {offset}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SourceReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SourceReadError::Io(e) => Some(e),
+            SourceReadError::InvalidEncoding { .. } => None,
+        }
+    }
+}
+
 /// Read a source file as UTF-8 text, transparently handling byte-order marks:
 /// a UTF-8 BOM is stripped, and BOM-marked UTF-16 LE/BE is decoded to UTF-8.
 /// Any other input must already be valid UTF-8.
@@ -1282,12 +1308,12 @@ pub(crate) async fn read_source_async(path: &Path) -> Result<String, SourceReadE
 }
 
 /// Decode raw file bytes per the [`read_source`] rules. Split out so the
-/// BOM/UTF-8 logic is unit-testable without touching the filesystem, and so the
-/// async readers (the background indexer and cross-file LSP reads, which read
-/// bytes via `tokio::fs::read`) share the exact same decode as the synchronous
-/// [`read_source`]. Takes an owned `Vec` so the common no-BOM UTF-8 path moves
-/// the buffer straight into the `String` without copying.
-pub(crate) fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
+/// BOM/UTF-8 logic is unit-testable without touching the filesystem, and so
+/// both [`read_source`] (sync, via `fs::read`) and [`read_source_async`]
+/// (async, via `tokio::fs::read`) share the exact same decode regardless of how
+/// they read the bytes. Takes an owned `Vec` so the common no-BOM UTF-8 path
+/// moves the buffer straight into the `String` without copying.
+fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         // UTF-8 BOM: strip it; an error's file offset is then `3 + valid_up_to`.
         return decode_utf8_slice(&bytes[3..], 3);

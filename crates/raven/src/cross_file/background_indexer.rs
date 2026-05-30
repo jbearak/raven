@@ -281,14 +281,13 @@ impl BackgroundIndexer {
             .to_file_path()
             .map_err(|_| anyhow!("Invalid file path: {}", uri))?;
 
-        // Read raw bytes and decode through the shared BOM-aware seam, exactly
-        // as the synchronous workspace scan does, so the background index agrees
-        // with it on UTF-8-BOM and UTF-16-BOM files. An undecodable file
-        // propagates an error here; the caller logs it and leaves the file
-        // unindexed (a silent skip, like the scan) — index paths never publish
+        // Read through the shared BOM-aware seam, exactly as the synchronous
+        // workspace scan does, so the background index agrees with it on
+        // UTF-8-BOM and UTF-16-BOM files. An undecodable file propagates its
+        // error here; the caller logs it (with the uri) and leaves the file
+        // unindexed — a silent skip, like the scan. Index paths never publish
         // encoding diagnostics.
-        let content = crate::state::decode_source(tokio::fs::read(&path).await?)
-            .map_err(|e| anyhow!("{} is not valid UTF-8/UTF-16: {e:?}", path.display()))?;
+        let content = crate::state::read_source_async(&path).await?;
         let metadata_fs = tokio::fs::metadata(&path).await?;
 
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
