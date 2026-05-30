@@ -89,8 +89,8 @@ async fn main() -> anyhow::Result<()> {
     // Collect args to peek at the first one for subcommand detection
     let args: Vec<String> = argv.collect();
 
-    if let Some(first) = args.first() {
-        if first == "analysis-stats" {
+    match args.first().map(String::as_str) {
+        Some("analysis-stats") => {
             env_logger::init();
             let mut rest = args.into_iter().skip(1);
             match cli::analysis_stats::parse_args(&mut rest) {
@@ -108,8 +108,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-
-        if first == "lint" {
+        Some("lint") => {
             env_logger::init();
             let rest = args.into_iter().skip(1);
             match cli::lint::parse_args(rest) {
@@ -126,8 +125,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-
-        if first == "check" {
+        Some("check") => {
             env_logger::init();
             let rest = args.into_iter().skip(1);
             match cli::check::parse_args(rest) {
@@ -146,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        _ => {}
     }
 
     for arg in &args {

@@ -6,8 +6,8 @@ use serde_json::json;
 use tower_lsp::lsp_types::Diagnostic;
 
 use crate::cli::shared::{
-    is_chunk_file, is_r_file, parse_output_format, parse_severity_level, render, OutputFormat,
-    SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+    absolute_path, is_chunk_file, is_r_file, parse_output_format, parse_severity_level, render,
+    OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -239,11 +239,7 @@ fn walk(
         // `resolve_lint_for_document`'s `strip_prefix(root)` check
         // silently drops every per-file `[[linting.overrides]]` patch.
         // Canonicalize against `root` to preserve file identity.
-        let abs_path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            root.join(path)
-        };
+        let abs_path = absolute_path(root, path);
         let uri = tower_lsp::lsp_types::Url::from_file_path(&abs_path)
             .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///").unwrap());
         let effective = crate::config_file::resolve_lint_for_document(

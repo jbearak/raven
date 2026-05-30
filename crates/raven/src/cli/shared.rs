@@ -80,6 +80,16 @@ pub fn is_chunk_file(p: &Path) -> bool {
     )
 }
 
+/// Return `path` unchanged when already absolute; otherwise resolve it against
+/// `base`.
+pub fn absolute_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
 /// Recursively collect `.R` / `.r` file paths under `dir`. Symlinks (files and
 /// directories) are skipped to avoid cycles and double-counting, and the
 /// non-source directories listed in [`crate::state::should_skip_directory`]
@@ -100,10 +110,11 @@ pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         if p.is_dir() {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if crate::state::should_skip_directory(name) {
-                    continue;
-                }
+            if p.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(crate::state::should_skip_directory)
+            {
+                continue;
             }
             collect_r_file_paths(&p, out);
         } else if is_r_file(&p) {

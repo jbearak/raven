@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use crate::cli::shared::{
-    collect_r_file_paths, is_chunk_file, is_r_file, parse_output_format, parse_severity_level,
-    render, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+    absolute_path, collect_r_file_paths, is_chunk_file, is_r_file, parse_output_format,
+    parse_severity_level, render, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK,
+    EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -467,11 +468,7 @@ fn collect_report_targets(
         collect_r_file_paths(root, &mut out);
     } else {
         for p in paths {
-            let abs = if p.is_absolute() {
-                p.clone()
-            } else {
-                root.join(p)
-            };
+            let abs = absolute_path(root, p);
             let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
             if abs.is_dir() {
                 collect_r_file_paths(&abs, &mut out);

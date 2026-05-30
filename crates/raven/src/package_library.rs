@@ -69,6 +69,21 @@ fn meta_attached_packages(name: &str) -> &'static [&'static str] {
     }
 }
 
+fn is_meta_package_name(name: &str) -> bool {
+    matches!(name, "tidyverse" | "tidymodels")
+}
+
+fn meta_attached_package_names(name: &str) -> Vec<String> {
+    meta_attached_packages(name)
+        .iter()
+        .map(|package| (*package).to_string())
+        .collect()
+}
+
+fn is_readable_file(path: &Path) -> bool {
+    path.is_file() && std::fs::File::open(path).is_ok()
+}
+
 /// Cached package information
 ///
 /// Stores all relevant information about an R package including its exports,
@@ -92,14 +107,8 @@ pub struct PackageInfo {
 impl PackageInfo {
     /// Create a new PackageInfo with the given name and exports
     pub fn new(name: String, exports: HashSet<String>) -> Self {
-        let is_meta_package = name == "tidyverse" || name == "tidymodels";
-        let attached_packages = if name == "tidyverse" {
-            TIDYVERSE_PACKAGES.iter().map(|s| s.to_string()).collect()
-        } else if name == "tidymodels" {
-            TIDYMODELS_PACKAGES.iter().map(|s| s.to_string()).collect()
-        } else {
-            Vec::new()
-        };
+        let is_meta_package = is_meta_package_name(&name);
+        let attached_packages = meta_attached_package_names(&name);
 
         Self {
             name,
@@ -118,14 +127,8 @@ impl PackageInfo {
         depends: Vec<String>,
         lazy_data: Vec<String>,
     ) -> Self {
-        let is_meta_package = name == "tidyverse" || name == "tidymodels";
-        let attached_packages = if name == "tidyverse" {
-            TIDYVERSE_PACKAGES.iter().map(|s| s.to_string()).collect()
-        } else if name == "tidymodels" {
-            TIDYMODELS_PACKAGES.iter().map(|s| s.to_string()).collect()
-        } else {
-            Vec::new()
-        };
+        let is_meta_package = is_meta_package_name(&name);
+        let attached_packages = meta_attached_package_names(&name);
 
         Self {
             name,
@@ -1342,7 +1345,9 @@ impl PackageLibrary {
             let package_dir = lib_path.join(name);
             // Check for NAMESPACE or DESCRIPTION file to ensure it's a valid R package
             // Note: `base` package doesn't have NAMESPACE, only DESCRIPTION
-            if package_dir.join("NAMESPACE").exists() || package_dir.join("DESCRIPTION").exists() {
+            if is_readable_file(&package_dir.join("NAMESPACE"))
+                || is_readable_file(&package_dir.join("DESCRIPTION"))
+            {
                 return Some(package_dir);
             }
         }
@@ -2248,6 +2253,47 @@ mod tests {
                 lib.base_exports().len(),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_skips_unusable_package_dir_for_later_valid_dir() {
+        let unusable_root = tempfile::tempdir().unwrap();
+        let valid_root = tempfile::tempdir().unwrap();
+
+        let unusable_datasets = unusable_root.path().join("datasets");
+        std::fs::create_dir_all(unusable_datasets.join("NAMESPACE")).unwrap();
+
+        let valid_datasets = valid_root.path().join("datasets");
+        let valid_data = valid_datasets.join("data");
+        std::fs::create_dir_all(&valid_data).unwrap();
+        std::fs::write(
+            valid_datasets.join("DESCRIPTION"),
+            "Package: datasets\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            valid_datasets.join("NAMESPACE"),
+            "# This package exports nothing (it uses lazydata)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            valid_datasets.join("INDEX"),
+            "mtcars                  Motor Trend Car Road Tests\n",
+        )
+        .unwrap();
+        std::fs::write(valid_data.join("Rdata.rdx"), b"").unwrap();
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![
+            unusable_root.path().to_path_buf(),
+            valid_root.path().to_path_buf(),
+        ]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        assert!(
+            lib.is_base_export("mtcars"),
+            "initialize() should keep searching after an unusable package directory"
+        );
     }
 
     #[tokio::test]
