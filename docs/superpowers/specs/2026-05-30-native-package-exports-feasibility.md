@@ -104,6 +104,24 @@ unreachable in principle by *any* static implementation:
    exactly the subprocess we are removing. FFI to `libR` would not close it either
    unless it loaded the namespace (ran `.onLoad`), i.e. ran R. So this residual is
    the irreducible cost of static analysis, not a weakness of a Rust reader.
+
+   **Crucially, today's subprocess already catches this corner.** Raven currently
+   runs `getNamespaceExports(asNamespace(pkg))`, and `asNamespace` loads the
+   namespace (runs `.onLoad`) — so for the ~5% pattern packages where Raven shells
+   out today, it *does* see `.onLoad`-created pattern matches. A native reader is
+   therefore not "parity minus nothing": going **pure-native** would *regress* this
+   sliver. For the pattern packages, the four cases are:
+
+   | | R present | R absent |
+   |---|---|---|
+   | **Today** | subprocess loads → **full** (incl. `.onLoad`∩pattern) | `INDEX` + explicit → **crude** |
+   | **Native** | keep subprocess → **full** (unchanged); *or* pure-native → **loses** `.onLoad`∩pattern | `.rdx` → **near-full** (misses only `.onLoad`∩pattern) |
+
+   So the native reader is a *strict improvement* to the R-absent path (beats
+   `INDEX`) and only forfeits a current capability if the subprocess is also
+   deleted. This is the decisive argument for the **hybrid** architecture (§6):
+   native reader as the R-free floor, subprocess as the ceiling when R is present —
+   no regression anywhere.
 2. **Programmatic library paths.** `.Rprofile` / `Rprofile.site` can call
    `.libPaths(...)` with arbitrary logic. `renv.lock` + env vars + standard
    locations cover the overwhelming majority, but arbitrary startup code is
@@ -210,9 +228,13 @@ version/platform-derived defaults. No RDS reader needed; brittle only at the
 `.Rprofile` edge (Ceiling 2).
 
 **Architecture.** Native-first behind a `PackageMetadataProvider` trait with
-`NativeRds` + `RSubprocess` impls. When R is present, keep it as a
-**differential-testing oracle** — CI diffs both paths over a package corpus so
-the reader never silently drifts. Never silently wrong; zero-R works without it.
+`NativeRds` + `RSubprocess` impls. When R is present it serves two roles: at
+runtime it stays the **authority for the `.onLoad`∩pattern corner** the native
+reader cannot reach (§3), so the hybrid regresses nothing relative to today; and
+in CI it is a **differential-testing oracle** — diff both paths over a package
+corpus so the reader never silently drifts. Native reader as the R-free floor,
+subprocess as the ceiling when R is present. Never silently wrong; zero-R works
+without it.
 
 **Build order** (each milestone ships and self-validates against R):
 1. minimal RDS reader + gzip → `exportPattern` expansion (~1–2 weeks; kills the
