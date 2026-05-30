@@ -2430,6 +2430,23 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
         match params.command.as_str() {
             "raven.refreshPackages" => {
+                // refreshPackages is meaningless when package awareness is
+                // disabled, and must leave the library the user built before
+                // disabling completely untouched — not just its `Arc`, but its
+                // cache, readiness flag, libpath watcher, and prefetch state.
+                // Bail out before any of that work runs. (This is also why the
+                // command does NOT route through the self-gating
+                // `rebuild_package_library`: that would swap in `new_empty()`
+                // and clobber the existing library.)
+                let packages_enabled =
+                    { self.state.read().await.cross_file_config.packages_enabled };
+                if !packages_enabled {
+                    log::info!(
+                        "raven.refreshPackages ignored: package function awareness is disabled"
+                    );
+                    return Ok(Some(serde_json::json!({ "cleared": 0 })));
+                }
+
                 // Collect open URIs for force-republish (needed before rebuild).
                 let open_uris: Vec<tower_lsp::lsp_types::Url> = {
                     let state = self.state.read().await;
@@ -2438,11 +2455,9 @@ impl LanguageServer for Backend {
 
                 // Capture the cache size of the *current* library before any
                 // rebuild/refresh so the user-visible "cleared N entries"
-                // count is meaningful even when `packages_enabled` triggers a
-                // full library rebuild. After a rebuild, `pkg_lib` points at a
-                // fresh empty library whose `cached_count()` starts at 0.
-                // We compute the user-visible delta against the pre-rebuild
-                // count instead.
+                // count is meaningful even when the rebuild swaps in a fresh
+                // empty library whose `cached_count()` starts at 0. We compute
+                // the user-visible delta against the pre-rebuild count instead.
                 let before_count = self.state.read().await.package_library.cached_count().await;
 
                 // Rebuild the PackageLibrary first — this re-runs `.libPaths()`
@@ -2451,17 +2466,8 @@ impl LanguageServer for Backend {
                 // up. `clear_cache` alone would leave the stale libpath
                 // snapshot in place and the refresh would re-populate with the
                 // same wrong paths.
-                let packages_enabled =
-                    { self.state.read().await.cross_file_config.packages_enabled };
-                // Load-bearing gate (do not collapse into `rebuild_package_library`
-                // the way the settings-reload site does): here the swap into
-                // `state` happens *inside* this `if`. Routing through the helper
-                // unconditionally would swap in `new_empty()` when packages are
-                // disabled, clobbering the library the user built before
-                // disabling — a `refreshPackages` issued while disabled must
-                // leave the existing library untouched.
-                if packages_enabled {
-                    let (new_lib, ready) = rebuild_package_library(&self.state).await;
+                let (new_lib, ready) = rebuild_package_library(&self.state).await;
+                {
                     let mut state = self.state.write().await;
                     state.package_library = new_lib;
                     state.package_library_ready = ready;
@@ -10077,13 +10083,22 @@ mod refresh_packages_tests {
             );
         }
 
-        /// refreshPackages site (load-bearing gate kept): a refresh issued while
-        /// packages are disabled must NOT clobber an already-populated library.
-        /// The gate skips the swap entirely, so the same library Arc survives.
+        /// refreshPackages site: a refresh issued while packages are disabled
+        /// must NOT touch the library the user built before disabling. The
+        /// command early-returns, so the same `Arc` survives *and* its cache is
+        /// left intact — the rest of the command (`clear_cache`, prefetch,
+        /// libpath-watcher restart, republish) is skipped entirely.
         #[tokio::test]
         async fn refresh_packages_disabled_keeps_existing_library() {
             let backend = make_backend();
             let original = ready_library(std::path::PathBuf::from("/tmp/libs"));
+            // Seed a cache entry so a stray `clear_cache()` would be observable.
+            original
+                .insert_package(crate::package_library::PackageInfo::new(
+                    "dplyr".to_string(),
+                    std::collections::HashSet::new(),
+                ))
+                .await;
             {
                 let mut state = backend.state.write().await;
                 state.cross_file_config.packages_enabled = false;
@@ -10108,6 +10123,10 @@ mod refresh_packages_tests {
             assert!(
                 !state.package_library.lib_paths().is_empty() && state.package_library_ready,
                 "refresh while disabled must leave lib_paths and readiness intact"
+            );
+            assert!(
+                state.package_library.is_cached("dplyr").await,
+                "refresh while disabled must not clear the existing library's cache"
             );
         }
     }
