@@ -1222,10 +1222,90 @@ fn collect_files_matching_inner(
     }
 }
 
+/// Why a source file could not be read as text by [`read_source`].
+#[derive(Debug)]
+pub(crate) enum SourceReadError {
+    /// The file could not be read from disk at all (missing, permissions, …).
+    Io(std::io::Error),
+    /// The bytes are not valid UTF-8 and carry no UTF-16 byte-order mark —
+    /// almost always a legacy single-byte encoding (Latin-1 / Windows-1252).
+    /// `offset` is the byte index of the first undecodable byte and `byte` its
+    /// value, for an actionable diagnostic. `byte` is `0` only in the rare
+    /// malformed-UTF-16 case, where no single offending byte is meaningful.
+    InvalidEncoding { offset: usize, byte: u8 },
+}
+
+/// Read a source file as UTF-8 text, transparently handling byte-order marks:
+/// a UTF-8 BOM is stripped, and BOM-marked UTF-16 LE/BE is decoded to UTF-8.
+/// Any other input must already be valid UTF-8.
+///
+/// This is the single disk-read seam shared by the workspace scan
+/// ([`process_workspace_file`]) and `raven check`'s report loop, so the two
+/// decode files identically. It deliberately does NOT guess legacy encodings: a
+/// non-UTF-8 file with no UTF-16 BOM is reported as
+/// [`SourceReadError::InvalidEncoding`] rather than silently mis-decoded —
+/// guessing would hide bugs (e.g. a non-breaking space sitting inside a string
+/// comparison reads as a normal space). The scan discards the error (an
+/// undecodable file is simply left unindexed); `raven check` turns it into a
+/// reported finding. This governs only files raven reads from disk — open
+/// documents arrive already-decoded from the editor over LSP.
+pub(crate) fn read_source(path: &Path) -> Result<String, SourceReadError> {
+    decode_source(fs::read(path).map_err(SourceReadError::Io)?)
+}
+
+/// Decode raw file bytes per the [`read_source`] rules. Split out so the
+/// BOM/UTF-8 logic is unit-testable without touching the filesystem. Takes an
+/// owned `Vec` so the common no-BOM UTF-8 path moves the buffer straight into
+/// the `String` without copying.
+fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        // UTF-8 BOM: strip it; an error's file offset is then `3 + valid_up_to`.
+        return decode_utf8_slice(&bytes[3..], 3);
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16(&bytes[2..], true);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16(&bytes[2..], false);
+    }
+    String::from_utf8(bytes).map_err(|e| {
+        let offset = e.utf8_error().valid_up_to();
+        SourceReadError::InvalidEncoding {
+            offset,
+            byte: e.as_bytes().get(offset).copied().unwrap_or(0),
+        }
+    })
+}
+
+fn decode_utf8_slice(bytes: &[u8], base_offset: usize) -> Result<String, SourceReadError> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|e| SourceReadError::InvalidEncoding {
+            offset: base_offset + e.valid_up_to(),
+            byte: bytes.get(e.valid_up_to()).copied().unwrap_or(0),
+        })
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, SourceReadError> {
+    // A trailing odd byte can't form a code unit; `chunks_exact` drops it. UTF-16
+    // source is vanishingly rare, so we don't pinpoint a byte offset here.
+    let units = bytes.chunks_exact(2).map(|c| {
+        let pair = [c[0], c[1]];
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    });
+    char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .map_err(|_| SourceReadError::InvalidEncoding { offset: 0, byte: 0 })
+}
+
 /// Process a single file: read, parse, compute metadata and artifacts.
 /// Returns `None` if the file can't be read or converted to a URI.
 fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
-    let text = fs::read_to_string(path).ok()?;
+    let text = read_source(path).ok()?;
     let uri = Url::from_file_path(path).ok()?;
     let metadata_result = fs::metadata(path).ok()?;
 
@@ -1471,6 +1551,49 @@ fn is_stat_model_extension(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    #[test]
+    fn decode_source_plain_utf8() {
+        assert_eq!(decode_source(b"x <- 1\n".to_vec()).unwrap(), "x <- 1\n");
+    }
+
+    #[test]
+    fn decode_source_strips_utf8_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"x <- 1\n");
+        // The BOM must not survive into the parsed content (a leading U+FEFF
+        // would otherwise corrupt the first token).
+        assert_eq!(decode_source(bytes).unwrap(), "x <- 1\n");
+    }
+
+    #[test]
+    fn decode_source_decodes_utf16le_bom() {
+        // "ab\n" as UTF-16 little-endian, BOM-prefixed.
+        let bytes = vec![0xFF, 0xFE, b'a', 0x00, b'b', 0x00, b'\n', 0x00];
+        assert_eq!(decode_source(bytes).unwrap(), "ab\n");
+    }
+
+    #[test]
+    fn decode_source_decodes_utf16be_bom() {
+        let bytes = vec![0xFE, 0xFF, 0x00, b'a', 0x00, b'b', 0x00, b'\n'];
+        assert_eq!(decode_source(bytes).unwrap(), "ab\n");
+    }
+
+    #[test]
+    fn decode_source_reports_first_bad_byte_for_latin1() {
+        // The real-world case: a non-breaking space (0xA0) after valid ASCII,
+        // no BOM. We must point at the offending byte, not silently mangle it.
+        let mut bytes = b"x <- 1".to_vec(); // 6 valid bytes
+        bytes.push(0xA0); // offset 6: invalid UTF-8 start byte
+        bytes.extend_from_slice(b"\n");
+        match decode_source(bytes) {
+            Err(SourceReadError::InvalidEncoding { offset, byte }) => {
+                assert_eq!(offset, 6);
+                assert_eq!(byte, 0xA0);
+            }
+            other => panic!("expected InvalidEncoding, got {other:?}"),
+        }
+    }
 
     // Include workspace scanning tests
     include!("state_tests.rs");

@@ -209,11 +209,19 @@ pub async fn run(args: CheckArgs) -> i32 {
         if let Some(doc) = state.workspace_index.get(&uri).cloned() {
             state.documents.insert(uri.clone(), doc);
         } else {
-            let text = match std::fs::read_to_string(path) {
+            let text = match crate::state::read_source(path) {
                 Ok(t) => t,
-                Err(e) => {
+                Err(crate::state::SourceReadError::Io(e)) => {
                     eprintln!("raven check: cannot read {}: {e}", path.display());
                     operator_error = true;
+                    continue;
+                }
+                // A mis-encoded file is a property of the code, like a syntax
+                // error — not an operator error. Report it as a finding (see
+                // `encoding_diagnostic`) and keep going, so the exit code
+                // reflects findings rather than a half-read abort.
+                Err(crate::state::SourceReadError::InvalidEncoding { offset, byte }) => {
+                    all_diags.push((path.clone(), encoding_diagnostic(offset, byte)));
                     continue;
                 }
             };
@@ -247,6 +255,32 @@ pub async fn run(args: CheckArgs) -> i32 {
         EXIT_LINT_FAILED
     } else {
         EXIT_OK
+    }
+}
+
+/// Build the reported finding for a target that isn't valid UTF-8. A
+/// mis-encoded source file (typically Latin-1 / Windows-1252 saved without a
+/// BOM) can't be parsed, but it's a property of the user's code — so it's an
+/// error-severity diagnostic (exit 1, like a syntax error) rather than an
+/// operator error (exit 2). The range is `0:0` because the file can't be
+/// decoded into lines; the byte offset in the message is the actionable
+/// pointer. `byte == 0` marks the rare malformed-UTF-16 case, where there's no
+/// single offending byte to name.
+fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
+    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
+    let detail = if byte == 0 {
+        "no UTF-16 byte-order mark and not valid UTF-8".to_string()
+    } else {
+        format!("first invalid byte {byte:#04x} at offset {offset} (looks like Latin-1/Windows-1252)")
+    };
+    Diagnostic {
+        range: Range {
+            start: Position { line: 0, character: 0 },
+            end: Position { line: 0, character: 0 },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: format!("File is not valid UTF-8: {detail}. Re-save the file as UTF-8."),
+        ..Default::default()
     }
 }
 
@@ -759,6 +793,22 @@ mod tests {
         let mut args = base_args(workspace.path());
         args.paths = vec![broken];
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn non_utf8_file_is_reported_not_operator_error() {
+        // A Latin-1 / Windows-1252 source file (here a bare 0xA0 non-breaking
+        // space) is a property of the user's code, like a syntax error — not an
+        // operator error. raven check reports it as a finding (exit 1) instead
+        // of aborting the whole run (exit 2). The scan silently skips the
+        // undecodable file; the report loop's disk fallback turns the encoding
+        // failure into the diagnostic.
+        let workspace = TempDir::new().unwrap();
+        let mut bytes = b"x <- 1\n".to_vec();
+        bytes.push(0xA0); // invalid UTF-8 start byte
+        bytes.push(b'\n');
+        fs::write(workspace.path().join("latin1.R"), bytes).unwrap();
+        assert_eq!(run_blocking(base_args(workspace.path())), EXIT_LINT_FAILED);
     }
 
     #[cfg(unix)]
