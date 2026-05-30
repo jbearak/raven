@@ -2159,7 +2159,14 @@ impl<'a> SymbolExtractor<'a> {
         let mut sections = Vec::new();
         let mut consumed_lines: HashSet<usize> = HashSet::new();
         let pattern = section_pattern();
-        let lines: Vec<&str> = self.text.lines().collect();
+        let mut lines: Vec<&str> = self.text.lines().collect();
+        // The section pattern anchors at column 0 (`^\s*#`). A raw leading
+        // U+FEFF on the first line of in-memory text (open documents keep the
+        // BOM verbatim — see `did_open`) would defeat the anchor and drop a
+        // first-line section from the outline; skip it. Issue #346.
+        if let Some(first) = lines.first_mut() {
+            *first = crate::utf16::strip_leading_bom_for_scan(first);
+        }
 
         // Phase 1: Single-line section detection (existing logic)
         for (line_num, line) in lines.iter().enumerate() {
@@ -21156,6 +21163,23 @@ setMethod("show", "MyClass", function(object) { print(object@value) })
         assert_eq!(section.section_level, Some(1));
         assert_eq!(section.range.start.line, 0);
         assert_eq!(section.range.end.line, 0);
+    }
+
+    // Issue #346: the section_pattern anchors at column 0 (`^\s*#`). A raw
+    // leading U+FEFF on the first line (in-memory text from a non-VS-Code
+    // client) would defeat the anchor and drop a first-line section header from
+    // the document outline.
+    #[test]
+    fn test_extract_sections_first_line_after_bom() {
+        let code = "\u{FEFF}# Data Loading ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Data Loading").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+        assert_eq!(section.range.start.line, 0);
     }
 
     #[test]

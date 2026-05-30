@@ -1018,6 +1018,22 @@ print.data.frame <- function(x, ...) NULL
         assert!(diags.is_empty(), "prose must not be flagged: {:?}", diags);
     }
 
+    // Issue #346: a raw leading U+FEFF on the first line (in-memory text from a
+    // non-VS-Code client) must not hide first-line commented-out code. The
+    // commented-code rule's raw-text seams (`strip_hash_prefix`, `is_skip_line`,
+    // the standalone-prefix check) use BOM-insensitive `trim_start`, so without
+    // tolerance the `#` is never recognised and the line is silently not flagged.
+    #[test]
+    fn commented_code_flags_first_line_after_bom() {
+        let config = commented_code_only_config();
+        let diags = lint("\u{FEFF}# x <- 1 + 2\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 0);
+        // The BOM occupies UTF-16 column 0, so the `#` reports at column 1 —
+        // the diagnostic stays aligned with the client's BOM-bearing buffer.
+        assert_eq!(diags[0].range.start.character, 1);
+    }
+
     #[test]
     fn commented_code_skips_roxygen() {
         let config = commented_code_only_config();

@@ -36,7 +36,7 @@ use crate::linting::nolint::Suppressions;
 use crate::linting::parse_gate::looks_like_code;
 use crate::linting::rule_ids;
 use crate::linting::LINT_SOURCE;
-use crate::utf16::byte_offset_to_utf16_column;
+use crate::utf16::{byte_offset_to_utf16_column, strip_leading_bom_for_scan};
 
 /// Annotation prefixes (case-insensitive). `TODO`, `FIXME`, etc. — these are
 /// almost always prose even though `TODO` happens to be a syntactically valid
@@ -151,8 +151,15 @@ fn collect_standalone<'a>(node: Node<'a>, lines: &[&str], out: &mut Vec<Standalo
         // nested anywhere in the tree, so we still walk every node.
         if let Some(line) = lines.get(line_idx).copied() {
             let col_bytes = start.column;
+            // tree-sitter counts a leading U+FEFF in its byte column (the BOM is
+            // an `extras`/whitespace token), so on a BOM-prefixed first line the
+            // prefix before the `#` is the 3-byte BOM. Strip it before the
+            // all-whitespace test so a first-line standalone comment is still
+            // recognised; `col_bytes` stays tree-sitter-aligned. Issue #346.
             if col_bytes <= line.len()
-                && line[..col_bytes].bytes().all(|b| b == b' ' || b == b'\t')
+                && strip_leading_bom_for_scan(&line[..col_bytes])
+                    .bytes()
+                    .all(|b| b == b' ' || b == b'\t')
             {
                 out.push(StandaloneComment {
                     line: line_idx as u32,
@@ -190,7 +197,9 @@ fn group_contiguous(comments: &[StandaloneComment]) -> Vec<Vec<StandaloneComment
 /// skip-line boundary, so that one stray `# TODO:` or `# @lsp-source ...`
 /// doesn't silently swallow neighbouring commented-out code.
 fn is_skip_line(line: &str, is_first_line_of_file: bool) -> bool {
-    let trimmed = line.trim_start();
+    // Skip a raw leading U+FEFF so a BOM-prefixed first line is classified the
+    // same as a bare one (e.g. a line-0 shebang still counts as a skip). #346.
+    let trimmed = strip_leading_bom_for_scan(line).trim_start();
     if is_first_line_of_file && trimmed.starts_with("#!") {
         return true;
     }
@@ -273,7 +282,9 @@ fn is_annotation_comment(trimmed_line: &str) -> bool {
 /// Strip leading `#` characters and following whitespace, returning the
 /// comment body. Returns `None` if the input is not a comment line.
 fn strip_hash_prefix(line: &str) -> Option<&str> {
-    let mut rest = line.trim_start();
+    // Tolerate a raw leading U+FEFF so a BOM-prefixed first-line comment body is
+    // still extracted (the BOM survives into in-memory text — see #346).
+    let mut rest = strip_leading_bom_for_scan(line).trim_start();
     if !rest.starts_with('#') {
         return None;
     }
