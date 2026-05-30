@@ -5609,20 +5609,23 @@ impl Backend {
             .await
             .unwrap_or((None, None, Default::default()));
 
-            // Re-acquire write lock to apply results.
+            // Re-acquire write lock to apply results. Route through the same
+            // seeding helper the startup paths use, so config-reload and startup
+            // share one implementation: it sets workspace_root, package_mode,
+            // description, and namespace, hydrates R files from disk + index +
+            // open buffers, then applies the `Initial` delta. Seeding from disk
+            // matters here so a packageMode switch still sees closed R files when
+            // the background workspace index has not populated yet. (Re-setting
+            // package_mode is a no-op: `translate(SettingChanged)` above already
+            // set it to this same mode.)
             let mut state = self.state.write().await;
-            state.package_inputs.workspace_root = Some(root.clone());
-            state.package_inputs.description =
-                desc_text.map(|text| crate::package_state::DescriptionInput { text });
-            state.package_inputs.namespace =
-                ns_text.map(|text| crate::package_state::NamespaceInput { text });
-            // Seed from disk so packageMode switches still see closed R
-            // files when the background workspace index has not populated
-            // yet; then overlay index entries and open buffers through the
-            // shared helper.
-            let new_r_files = hydrate_package_r_files_from_state(&state, &root, disk_r_files);
-            state.package_inputs.r_files = new_r_files;
-            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+            initialize_package_inputs_from_state(
+                &mut state,
+                root,
+                desc_text,
+                ns_text,
+                disk_r_files,
+            );
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
 
