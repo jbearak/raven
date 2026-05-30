@@ -118,7 +118,19 @@ pub struct PackageInfo {
     pub is_meta_package: bool,
     /// Packages attached by meta-package (e.g., tidyverse attaches dplyr, ggplot2, etc.)
     pub attached_packages: Vec<String>,
-    /// Lazy-loaded dataset names
+    /// Lazy-loaded dataset names (e.g. `flights`, `diamonds`) — data objects a
+    /// package ships under `data/` that appear in neither `export()` nor
+    /// `getNamespaceExports()`. Kept distinct from `exports` so hover and
+    /// completion can attribute functions vs. data, but `collect_exports_recursive`
+    /// folds both into the resolvable set so datasets resolve as symbols
+    /// (issue #350).
+    ///
+    /// For non-base packages this is populated by [`package_info_from_dir`],
+    /// the single chokepoint every on-disk load path routes through (both
+    /// `get_package` and `prefetch_packages`, which inserts straight into the
+    /// cache and so bypasses `get_package`). Base-package datasets take a
+    /// separate route: `initialize` merges them into `base_exports`, so their
+    /// `PackageInfo.lazy_data` is left empty by design.
     pub lazy_data: Vec<String>,
 }
 
@@ -155,6 +167,24 @@ impl PackageInfo {
             lazy_data,
         }
     }
+}
+
+/// Assemble a `PackageInfo` for a package found on disk, reading its datasets
+/// from `data/` (issue #350). The single chokepoint every non-base on-disk
+/// load path routes through, so dataset discovery can't regress when a new
+/// path is added — see the `lazy_data` field doc for the full rationale and
+/// the base-package exception.
+///
+/// `parse_data_symbols` is best-effort and runs its filesystem walk in
+/// `spawn_blocking`, so this stays off the synchronous diagnostic hot path.
+async fn package_info_from_dir(
+    name: String,
+    pkg_dir: &Path,
+    exports: HashSet<String>,
+    depends: Vec<String>,
+) -> PackageInfo {
+    let lazy_data = parse_data_symbols(pkg_dir).await;
+    PackageInfo::with_details(name, exports, depends, lazy_data)
 }
 
 /// Result of parsing a package's NAMESPACE and DESCRIPTION files statically.
@@ -559,6 +589,28 @@ impl PackageLibrary {
         combined.clear();
     }
 
+    /// Load pattern packages via the INDEX + explicit-exports fallback and
+    /// cache them. Shared by the two `prefetch_packages` branches that need it
+    /// — no R subprocess available, and a batched R query that failed — which
+    /// otherwise do byte-identical per-package work.
+    async fn prefetch_pattern_packages_via_index(&self, pattern_packages: &[String]) {
+        for pkg_name in pattern_packages {
+            if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
+                if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
+                    let exports = self.load_with_index_fallback(&pkg_dir, &parse_result).await;
+                    let info = package_info_from_dir(
+                        pkg_name.clone(),
+                        &pkg_dir,
+                        exports,
+                        parse_result.depends,
+                    )
+                    .await;
+                    self.insert_package(info).await;
+                }
+            }
+        }
+    }
+
     /// Prefetch packages by loading their exports into cache
     ///
     /// This method asynchronously loads package exports for the given package names,
@@ -624,14 +676,15 @@ impl PackageLibrary {
         );
 
         // Step 1: Load static packages immediately (no R subprocess needed)
-        for (name, _pkg_dir, parse_result) in static_packages {
+        for (name, pkg_dir, parse_result) in static_packages {
             let exports: HashSet<String> = parse_result.explicit_exports.into_iter().collect();
             let info =
-                PackageInfo::with_details(name.clone(), exports, parse_result.depends, vec![]);
+                package_info_from_dir(name.clone(), &pkg_dir, exports, parse_result.depends).await;
 
             log::trace!(
-                "Loaded {} exports for package '{}' statically",
+                "Loaded {} exports + {} datasets for package '{}' statically",
                 info.exports.len(),
+                info.lazy_data.len(),
                 name
             );
 
@@ -654,24 +707,33 @@ impl PackageLibrary {
                         // Populate the per-package cache with the R subprocess results
                         for (pkg_name, exports) in exports_map {
                             let exports_set: HashSet<String> = exports.into_iter().collect();
-                            // Get depends from static parse
-                            let depends =
-                                if let Some(pkg_dir) = self.find_package_directory(&pkg_name) {
-                                    parse_description_depends(&pkg_dir.join("DESCRIPTION"))
-                                        .unwrap_or_default()
-                                } else {
-                                    Vec::new()
-                                };
-
-                            let info = PackageInfo::with_details(
-                                pkg_name.clone(),
-                                exports_set,
-                                depends,
-                                Vec::new(),
-                            );
+                            // Depends and datasets come from the on-disk dir: the
+                            // batched R export result carries neither. Datasets
+                            // live under `data/`, not in `getNamespaceExports()`.
+                            let info = match self.find_package_directory(&pkg_name) {
+                                Some(pkg_dir) => {
+                                    let depends =
+                                        parse_description_depends(&pkg_dir.join("DESCRIPTION"))
+                                            .unwrap_or_default();
+                                    package_info_from_dir(
+                                        pkg_name.clone(),
+                                        &pkg_dir,
+                                        exports_set,
+                                        depends,
+                                    )
+                                    .await
+                                }
+                                None => PackageInfo::with_details(
+                                    pkg_name.clone(),
+                                    exports_set,
+                                    Vec::new(),
+                                    Vec::new(),
+                                ),
+                            };
                             log::trace!(
-                                "Cached {} exports for pattern package '{}' from R",
+                                "Cached {} exports + {} datasets for pattern package '{}' from R",
                                 info.exports.len(),
+                                info.lazy_data.len(),
                                 pkg_name
                             );
                             self.insert_package(info).await;
@@ -684,22 +746,8 @@ impl PackageLibrary {
                         );
 
                         // Fall back to INDEX + explicit exports for pattern packages
-                        for pkg_name in &pattern_packages {
-                            if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
-                                if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
-                                    let exports = self
-                                        .load_with_index_fallback(&pkg_dir, &parse_result)
-                                        .await;
-                                    let info = PackageInfo::with_details(
-                                        pkg_name.clone(),
-                                        exports,
-                                        parse_result.depends,
-                                        Vec::new(),
-                                    );
-                                    self.insert_package(info).await;
-                                }
-                            }
-                        }
+                        self.prefetch_pattern_packages_via_index(&pattern_packages)
+                            .await;
                     }
                 }
             } else {
@@ -709,21 +757,8 @@ impl PackageLibrary {
                     pattern_packages.len()
                 );
 
-                for pkg_name in &pattern_packages {
-                    if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
-                        if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
-                            let exports =
-                                self.load_with_index_fallback(&pkg_dir, &parse_result).await;
-                            let info = PackageInfo::with_details(
-                                pkg_name.clone(),
-                                exports,
-                                parse_result.depends,
-                                Vec::new(),
-                            );
-                            self.insert_package(info).await;
-                        }
-                    }
-                }
+                self.prefetch_pattern_packages_via_index(&pattern_packages)
+                    .await;
             }
         }
 
@@ -1078,6 +1113,9 @@ impl PackageLibrary {
         // Preserve depends so get_all_exports() can follow transitive dependencies.
         for (pkg_name, exports) in per_package_exports {
             let depends = per_package_depends.remove(&pkg_name).unwrap_or_default();
+            // `lazy_data` is intentionally empty here: these are base packages,
+            // whose datasets are merged into `base_exports` above (issue #276) —
+            // so this deliberately does NOT route through `package_info_from_dir`.
             let info = PackageInfo::with_details(pkg_name, exports, depends, Vec::new());
             self.insert_package(info).await;
         }
@@ -1231,9 +1269,9 @@ impl PackageLibrary {
             parse_result.explicit_exports.into_iter().collect()
         };
 
-        // Step 5: Create PackageInfo and insert into cache
+        // Step 5: Create PackageInfo (incl. datasets from `data/`) and cache it.
         let info =
-            PackageInfo::with_details(name.to_string(), exports, parse_result.depends, Vec::new());
+            package_info_from_dir(name.to_string(), &pkg_dir, exports, parse_result.depends).await;
 
         log::trace!(
             "Created PackageInfo for '{}': {} exports, {} depends, is_meta_package={}",
@@ -1495,14 +1533,16 @@ impl PackageLibrary {
             }
         };
 
-        // Add this package's exports to the result
-        for export in &package_info.exports {
-            all_exports.insert(export.clone());
-        }
+        // Add this package's exports and datasets to the result. Datasets
+        // (lazy_data) resolve as in-scope symbols too; see the `lazy_data`
+        // field doc for why they are folded in here.
+        all_exports.extend(package_info.exports.iter().cloned());
+        all_exports.extend(package_info.lazy_data.iter().cloned());
 
         log::trace!(
-            "Added {} exports from package '{}' (total: {})",
+            "Added {} exports + {} datasets from package '{}' (total: {})",
             package_info.exports.len(),
+            package_info.lazy_data.len(),
             name,
             all_exports.len()
         );
@@ -2862,6 +2902,211 @@ mod tests {
 
         assert!(all_exports.contains("func"));
         // nonexistent package contributes nothing (empty exports)
+    }
+
+    // ============================================================================
+    // Tests for package-dataset (lazy_data) resolution - issue #350
+    // ============================================================================
+
+    /// Build a fake installed package on disk and return `(lib_root, lib)` with
+    /// `lib`'s search path pointing at it. `namespace` is the NAMESPACE body and
+    /// `datasets` are written one-per-line to `data/datalist`. The returned
+    /// `TempDir` must stay alive for the duration of the test.
+    fn fake_installed_pkg(
+        pkg_name: &str,
+        namespace: &str,
+        datasets: &[&str],
+    ) -> (tempfile::TempDir, PackageLibrary) {
+        let lib_root = tempfile::tempdir().unwrap();
+        let pkg_dir = lib_root.path().join(pkg_name);
+        let data_dir = pkg_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            format!("Package: {pkg_name}\nVersion: 1.0.0\n"),
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), namespace).unwrap();
+        std::fs::write(data_dir.join("datalist"), datasets.join("\n") + "\n").unwrap();
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        (lib_root, lib)
+    }
+
+    #[tokio::test]
+    async fn test_get_all_exports_includes_lazy_data() {
+        // A package's datasets (lazy_data) must be resolvable as symbols, not
+        // just its function exports. `nycflights13` exports no functions but
+        // ships the `flights`/`airports` datasets.
+        let lib = PackageLibrary::new_empty();
+
+        let info = PackageInfo::with_details(
+            "nycflights13".to_string(),
+            HashSet::new(),
+            Vec::new(),
+            vec!["flights".to_string(), "airports".to_string()],
+        );
+        lib.insert_package(info).await;
+
+        let all_exports = lib.get_all_exports("nycflights13").await;
+
+        assert!(
+            all_exports.contains("flights"),
+            "dataset `flights` should resolve as a symbol"
+        );
+        assert!(
+            all_exports.contains("airports"),
+            "dataset `airports` should resolve as a symbol"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_all_exports_includes_transitive_lazy_data() {
+        // Datasets must resolve transitively through `Depends`, the same as
+        // function exports do.
+        let lib = PackageLibrary::new_empty();
+
+        let dep = PackageInfo::with_details(
+            "datapkg".to_string(),
+            HashSet::new(),
+            Vec::new(),
+            vec!["bundled_dataset".to_string()],
+        );
+        lib.insert_package(dep).await;
+
+        let mut main_exports = HashSet::new();
+        main_exports.insert("main_func".to_string());
+        let main = PackageInfo::with_details(
+            "mainpkg".to_string(),
+            main_exports,
+            vec!["datapkg".to_string()],
+            Vec::new(),
+        );
+        lib.insert_package(main).await;
+
+        let all_exports = lib.get_all_exports("mainpkg").await;
+
+        assert!(all_exports.contains("main_func"), "Should have main export");
+        assert!(
+            all_exports.contains("bundled_dataset"),
+            "dataset from a Depends package should resolve transitively"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_all_exports_includes_meta_attached_lazy_data() {
+        // Datasets must resolve through meta-package `attached_packages` —
+        // e.g. `library(tidyverse); diamonds` where `diamonds` ships with the
+        // attached `ggplot2`.
+        let lib = PackageLibrary::new_empty();
+
+        let ggplot2 = PackageInfo::with_details(
+            "ggplot2".to_string(),
+            HashSet::new(),
+            Vec::new(),
+            vec!["diamonds".to_string()],
+        );
+        lib.insert_package(ggplot2).await;
+
+        // tidyverse is a meta-package that attaches ggplot2.
+        lib.insert_package(PackageInfo::new("tidyverse".to_string(), HashSet::new()))
+            .await;
+
+        let all_exports = lib.get_all_exports("tidyverse").await;
+
+        assert!(
+            all_exports.contains("diamonds"),
+            "dataset from an attached meta-package member should resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_package_populates_lazy_data_from_disk() {
+        // `get_package` must walk the installed package's `data/` directory and
+        // record dataset names in `lazy_data` (issue #350).
+        let (_lib_root, lib) = fake_installed_pkg(
+            "nycflights13",
+            "# exports nothing\n",
+            &["flights", "airports", "planes"],
+        );
+
+        let info = lib
+            .get_package("nycflights13")
+            .await
+            .expect("package should load");
+
+        assert!(
+            info.lazy_data.contains(&"flights".to_string()),
+            "lazy_data should contain `flights`, got {:?}",
+            info.lazy_data
+        );
+        assert!(
+            info.lazy_data.contains(&"airports".to_string()),
+            "lazy_data should contain `airports`, got {:?}",
+            info.lazy_data
+        );
+        assert!(
+            info.lazy_data.contains(&"planes".to_string()),
+            "lazy_data should contain `planes`, got {:?}",
+            info.lazy_data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disk_package_dataset_resolves_as_loaded_symbol() {
+        // End-to-end: a dataset from an installed package resolves through the
+        // synchronous diagnostic check `is_symbol_from_loaded_packages`, closing
+        // the false-positive undefined-variable gap (issue #350).
+        let (_lib_root, lib) =
+            fake_installed_pkg("nycflights13", "# exports nothing\n", &["flights"]);
+
+        // Warm the combined-exports cache the way the diagnostic prefetch does.
+        lib.get_all_exports("nycflights13").await;
+
+        let loaded = vec!["nycflights13".to_string()];
+        assert!(
+            lib.is_symbol_from_loaded_packages("flights", &loaded),
+            "dataset `flights` should resolve via is_symbol_from_loaded_packages"
+        );
+        assert_eq!(
+            lib.find_package_for_symbol("flights", &loaded),
+            Some("nycflights13".to_string()),
+            "find_package_for_symbol should attribute the dataset to its package"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_static_package_resolves_dataset() {
+        // The production LSP warm-up path is `prefetch_packages`, which inserts
+        // PackageInfo and combined_exports directly — bypassing `get_package`.
+        // A statically-loaded package's datasets must resolve through it too,
+        // or `library(nycflights13); flights` stays a false positive in the
+        // editor (issue #350).
+        //
+        // Explicit export only (no exportPattern) -> static prefetch path.
+        let (_lib_root, lib) = fake_installed_pkg(
+            "nycflights13",
+            "export(nycflights13)\n",
+            &["flights", "airports"],
+        );
+
+        lib.prefetch_packages(&["nycflights13".to_string()]).await;
+
+        let loaded = vec!["nycflights13".to_string()];
+        assert!(
+            lib.is_symbol_from_loaded_packages("flights", &loaded),
+            "dataset `flights` should resolve after prefetch_packages"
+        );
+        assert!(
+            lib.is_symbol_from_loaded_packages("airports", &loaded),
+            "dataset `airports` should resolve after prefetch_packages"
+        );
+        // Function exports must still resolve (no regression).
+        assert!(
+            lib.is_symbol_from_loaded_packages("nycflights13", &loaded),
+            "function export should still resolve after prefetch_packages"
+        );
     }
 
     #[tokio::test]
