@@ -69,10 +69,6 @@ fn meta_attached_packages(name: &str) -> &'static [&'static str] {
     }
 }
 
-fn is_meta_package_name(name: &str) -> bool {
-    matches!(name, "tidyverse" | "tidymodels")
-}
-
 fn meta_attached_package_names(name: &str) -> Vec<String> {
     meta_attached_packages(name)
         .iter()
@@ -107,8 +103,10 @@ pub struct PackageInfo {
 impl PackageInfo {
     /// Create a new PackageInfo with the given name and exports
     pub fn new(name: String, exports: HashSet<String>) -> Self {
-        let is_meta_package = is_meta_package_name(&name);
         let attached_packages = meta_attached_package_names(&name);
+        // A package is a meta-package exactly when it attaches children, so
+        // `meta_attached_packages` is the single source of truth for the set.
+        let is_meta_package = !attached_packages.is_empty();
 
         Self {
             name,
@@ -127,8 +125,10 @@ impl PackageInfo {
         depends: Vec<String>,
         lazy_data: Vec<String>,
     ) -> Self {
-        let is_meta_package = is_meta_package_name(&name);
         let attached_packages = meta_attached_package_names(&name);
+        // A package is a meta-package exactly when it attaches children, so
+        // `meta_attached_packages` is the single source of truth for the set.
+        let is_meta_package = !attached_packages.is_empty();
 
         Self {
             name,
@@ -1533,10 +1533,10 @@ pub struct PackageLibraryOutcome {
 }
 
 /// The single source of truth for package-library readiness and the reason a
-/// build degraded. Sites #1 (`backend::rebuild_package_library`) and #2
-/// (`cli::check::maybe_init_r`) route through [`build_package_library`]; the
-/// two startup sites (`backend::ensure_package_library_initialized` and the
-/// Task B post-scan init) follow in phase 2. Routing them all through one
+/// build degraded. All four package-library init sites route through
+/// [`build_package_library`]: `backend::rebuild_package_library`,
+/// `cli::check::maybe_init_r`, `backend::ensure_package_library_initialized`,
+/// and the Task B post-scan startup init. Routing them all through one
 /// builder is what stops the editor and `raven check` from drifting, and this
 /// enum's [`classify`](PackageLibraryStatus::classify) is where the readiness
 /// predicate and degradation precedence live — not duplicated per site.
@@ -1581,9 +1581,9 @@ impl PackageLibraryStatus {
 }
 
 /// Build a `PackageLibrary` from current configuration — the shared constructor
-/// package-library init sites route through (sites #1 `rebuild_package_library`
-/// and #2 `maybe_init_r` today; the two startup sites follow in phase 2), so
-/// editor and CI can't drift.
+/// all four package-library init sites route through (`rebuild_package_library`,
+/// `maybe_init_r`, `ensure_package_library_initialized`, and the Task B
+/// post-scan startup init), so editor and CI can't drift.
 ///
 /// Lock-free by design: takes owned/cloned inputs and no `WorldState`, so it
 /// adds no logging/perf/state dependency to this module. R discovery does
