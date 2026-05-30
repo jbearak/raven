@@ -1,10 +1,11 @@
 //! Shared "discover the nearest project config, then load it" seam.
 //!
-//! The LSP startup path, the watched-files reload, and `raven check` all need
-//! the same sequence: run [`find_config`] from the workspace root, then load
-//! whichever file it discovered (`raven.toml` beats `.lintr`). Hand-reproducing
-//! that match in each site let them drift — notably on which loader reads
-//! `.lintr`. [`discover_and_load`] is the single implementation they share.
+//! The LSP startup path, the watched-files reload, `raven check`, and
+//! `raven lint` all need the same sequence: run [`find_config`] from the
+//! workspace root, then load whichever file it discovered (`raven.toml` beats
+//! `.lintr`). Hand-reproducing that match in each site let them drift — notably
+//! on which loader reads `.lintr`. [`discover_and_load`] is the single
+//! implementation they share.
 
 use std::path::{Path, PathBuf};
 
@@ -36,8 +37,8 @@ pub enum DiscoveredLoad {
 
 /// Discover the nearest project config (`raven.toml` beats `.lintr`) at or above
 /// `search_start` and load it. The single discovery+load seam shared by the LSP
-/// startup path, the watched-files reload, and `raven check`, so the three can't
-/// drift on discovery precedence or which loader reads each file.
+/// startup path, the watched-files reload, `raven check`, and `raven lint`, so
+/// they can't drift on discovery precedence or which loader reads each file.
 pub fn discover_and_load(search_start: &Path) -> DiscoveredLoad {
     match find_config(search_start) {
         DiscoveredConfig::RavenToml(path) => match load_toml(&path) {

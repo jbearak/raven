@@ -92,6 +92,86 @@ Exit codes:
     );
 }
 
+/// Resolve the project root, project settings, and lintr-discovered signal for
+/// `raven lint`. Factored out of [`run`] and parameterized on `cwd` so the
+/// discover-and-load branch is unit-testable without mutating the
+/// process-global current directory.
+///
+/// Precedence matches the editor: `--no-config` wins, then an explicit
+/// `--config` (raven.toml only — see the tri-state-enabled design spec,
+/// section 7), then auto-discovery via the shared
+/// [`crate::config_file::discover_and_load`] seam. Routing `raven lint` through
+/// that seam — the same one the LSP startup path, the watched-files reload, and
+/// `raven check` use — keeps the four from drifting on discovery precedence or
+/// which loader reads `.lintr`.
+///
+/// `lintr_discovered` is the input to `Auto` resolution in
+/// [`crate::backend::parse_lint_config`]: true only when a `.lintr` (not a
+/// `raven.toml`) is the discovered config. [`crate::config_file::find_config`]
+/// names the discovered file `.lintr` or `raven.toml`, so its file name is a
+/// reliable toml-vs-lintr discriminator — the same derivation
+/// `build_project_config_loaded_payload` uses for its notification payload.
+///
+/// Warnings go to stderr. Returns `Err(EXIT_OPERATOR_ERROR)` for an
+/// unreadable/unparseable config (the explicit `--config` and discovery paths
+/// print a one-line note first); `Ok((root, project_settings, lintr_discovered))`
+/// otherwise.
+fn resolve_lint_config(
+    cwd: &Path,
+    args: &LintArgs,
+) -> Result<(PathBuf, Option<serde_json::Value>, bool), i32> {
+    if args.no_config {
+        return Ok((cwd.to_path_buf(), None, false));
+    }
+
+    if let Some(explicit) = args.config_path.as_ref() {
+        return match crate::config_file::load_toml(explicit) {
+            Some(l) => {
+                for w in l.warnings {
+                    eprintln!("{w}");
+                }
+                // Resolve the parent so `root` is absolute even when `--config`
+                // points at a relative path. Without this,
+                // `resolve_lint_for_document`'s `strip_prefix(root)` check fails
+                // for the absolute URIs produced by `walk` — silently dropping
+                // every per-file `[[linting.overrides]]` patch (same failure
+                // mode as commit 81978f0 fixed for the non-explicit root).
+                let parent = explicit.parent().unwrap_or(cwd).to_path_buf();
+                let root = if parent.is_absolute() {
+                    parent
+                } else {
+                    cwd.join(&parent)
+                };
+                Ok((root, Some(l.settings), false))
+            }
+            None => {
+                eprintln!("raven lint: failed to load --config {}", explicit.display());
+                Err(EXIT_OPERATOR_ERROR)
+            }
+        };
+    }
+
+    match crate::config_file::discover_and_load(cwd) {
+        crate::config_file::DiscoveredLoad::Loaded {
+            path,
+            settings,
+            warnings,
+        } => {
+            for w in warnings {
+                eprintln!("{w}");
+            }
+            let lintr_discovered = path.file_name() == Some(std::ffi::OsStr::new(".lintr"));
+            let root = path.parent().unwrap_or(cwd).to_path_buf();
+            Ok((root, Some(settings), lintr_discovered))
+        }
+        crate::config_file::DiscoveredLoad::LoadFailed { path } => {
+            eprintln!("raven lint: failed to load {}", path.display());
+            Err(EXIT_OPERATOR_ERROR)
+        }
+        crate::config_file::DiscoveredLoad::None => Ok((cwd.to_path_buf(), None, false)),
+    }
+}
+
 pub fn run(args: LintArgs) -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
@@ -102,68 +182,9 @@ pub fn run(args: LintArgs) -> i32 {
     };
 
     // Resolve project root + project settings + lintr-discovered signal.
-    // `lintr_discovered` is the input to `Auto` resolution in
-    // `parse_lint_config`. `--config` is currently raven.toml-only — see
-    // the design spec for tri-state enabled, section 7.
-    let (root, project_settings, lintr_discovered) = if args.no_config {
-        (cwd.clone(), None, false)
-    } else if let Some(explicit) = args.config_path.as_ref() {
-        match crate::config_file::load_toml(explicit) {
-            Some(l) => {
-                for w in l.warnings {
-                    eprintln!("{w}");
-                }
-                // Canonicalize the parent so `root` is absolute even when
-                // `--config` points at a relative path. Without this,
-                // `resolve_lint_for_document`'s `strip_prefix(root)`
-                // check fails for the absolute URIs produced by `walk`
-                // — silently dropping every per-file
-                // `[[linting.overrides]]` patch (same failure mode as
-                // commit 81978f0 fixed for the non-explicit root).
-                let parent = explicit.parent().unwrap_or(&cwd).to_path_buf();
-                let root = if parent.is_absolute() {
-                    parent
-                } else {
-                    cwd.join(&parent)
-                };
-                (root, Some(l.settings), false)
-            }
-            None => {
-                eprintln!(
-                    "raven lint: failed to load --config {}",
-                    explicit.display()
-                );
-                return EXIT_OPERATOR_ERROR;
-            }
-        }
-    } else {
-        match crate::config_file::find_config(&cwd) {
-            crate::config_file::DiscoveredConfig::RavenToml(p) => {
-                let l = match crate::config_file::load_toml(&p) {
-                    Some(v) => v,
-                    None => return EXIT_OPERATOR_ERROR,
-                };
-                for w in l.warnings {
-                    eprintln!("{w}");
-                }
-                (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings), false)
-            }
-            crate::config_file::DiscoveredConfig::Lintr(p) => {
-                let text = match std::fs::read_to_string(&p) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("raven lint: cannot read {}: {e}", p.display());
-                        return EXIT_OPERATOR_ERROR;
-                    }
-                };
-                let l = crate::config_file::load_lintr_str(&text);
-                for w in l.warnings {
-                    eprintln!("{w}");
-                }
-                (p.parent().unwrap_or(&cwd).to_path_buf(), Some(l.settings), true)
-            }
-            crate::config_file::DiscoveredConfig::None => (cwd.clone(), None, false),
-        }
+    let (root, project_settings, lintr_discovered) = match resolve_lint_config(&cwd, &args) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
 
     // Parse the base lint config from the (project-only) settings, since the
@@ -337,6 +358,79 @@ mod tests {
     #[test]
     fn unknown_flag_errors() {
         assert!(parse_args(["--bogus"].iter().map(|s| s.to_string())).is_err());
+    }
+
+    /// Args that route `resolve_lint_config` through the discover-and-load
+    /// branch (no `--no-config`, no explicit `--config`).
+    fn discovery_args() -> LintArgs {
+        LintArgs {
+            paths: vec![PathBuf::from(".")],
+            config_path: None,
+            no_config: false,
+            format: OutputFormat::Text,
+            max_severity: SeverityLevel::Info,
+            quiet: true,
+            no_color: true,
+        }
+    }
+
+    #[test]
+    fn resolve_lint_config_honors_discovered_lintr() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults()\n",
+        )
+        .unwrap();
+        let (root, settings, lintr_discovered) =
+            resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
+        assert_eq!(root, tmp.path().to_path_buf());
+        assert!(settings.is_some(), "a discovered .lintr yields project settings");
+        assert!(
+            lintr_discovered,
+            "a discovered .lintr must set lintr_discovered so Auto resolution opts in"
+        );
+    }
+
+    #[test]
+    fn resolve_lint_config_honors_discovered_raven_toml() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("raven.toml"), "[linting]\nenabled = true\n").unwrap();
+        let (root, settings, lintr_discovered) =
+            resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
+        assert_eq!(root, tmp.path().to_path_buf());
+        assert!(settings.is_some(), "a discovered raven.toml yields project settings");
+        assert!(
+            !lintr_discovered,
+            "raven.toml is not a .lintr, so lintr_discovered must stay false"
+        );
+    }
+
+    #[test]
+    fn resolve_lint_config_none_when_no_config_present() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let (root, settings, lintr_discovered) =
+            resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
+        assert_eq!(root, tmp.path().to_path_buf());
+        assert!(settings.is_none());
+        assert!(!lintr_discovered);
+    }
+
+    #[test]
+    fn resolve_lint_config_errors_on_malformed_raven_toml() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("raven.toml"), "not valid = = toml [[[\n").unwrap();
+        assert_eq!(
+            resolve_lint_config(tmp.path(), &discovery_args()),
+            Err(EXIT_OPERATOR_ERROR)
+        );
     }
 
     #[test]
