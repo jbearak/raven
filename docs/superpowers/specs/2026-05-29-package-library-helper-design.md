@@ -23,7 +23,7 @@ This is a **refactor, not a bug fix**: present per-site behavior is what it is, 
 
 1. **`PackageLibrary::initialize()` never returns `Err`.** It has a single `Ok(())` return (`package_library.rs:1074`) and swallows every R failure with `log::trace!` + a fallback. So the `InitFailed` branch is dead in all four sites today. We keep the variant for the CLI's three-note contract and because `initialize()`'s signature is fallible, but we do not write tests or caller logic implying it is reachable via the real pipeline.
 
-2. **`get_fallback_lib_paths()` is unconditionally non-empty on macOS/Linux/Windows** (hardcoded framework/system/Homebrew pushes, `r_subprocess.rs:1189-1248`). `initialize()` falls back to it whenever R reports nothing (`package_library.rs:943-945`, `1095-1098`). Consequence: post-`initialize()`, `lib_paths()` is **always non-empty** on supported platforms. Therefore `RNotFound` / `NoLibraryPaths`, the CLI's R-degradation `eprintln!` notes, **and the phase-2 before/after readiness difference are all unreachable end-to-end** on dev/CI machines (they require an exotic target where the cfg fallback is empty). This is why the readiness predicate is pinned by a pure, platform-independent classifier rather than by end-to-end tests, and why phase 2 is a no-op on supported platforms.
+2. **`get_fallback_lib_paths()` is non-empty only when R is actually installed.** It pushes hardcoded framework/system/Homebrew locations (`r_subprocess.rs:1189-1248`) **but then filters to only paths that exist** (`r_subprocess.rs:1262`, `.filter(|p| p.exists())`). `initialize()` falls back to it whenever R reports nothing (`package_library.rs:943-945`, `1095-1098`). Consequence on a dev machine with R installed: `lib_paths()` is non-empty even when R discovery itself fails, so `RNotFound` / `NoLibraryPaths` are not reached *there*. **But on a headless CI runner with no R installed — `raven check`'s explicit primary use case — none of those directories exist, the filtered fallback is empty, and `classify` returns `RNotFound` (or `NoLibraryPaths` if only `additionalLibraryPaths` is set).** So `RNotFound`, `NoLibraryPaths`, and their CLI degradation notes are **load-bearing in the no-R-in-CI case, not dead** — and the phase-2 readiness-timing difference is observable there whenever `additionalLibraryPaths` is configured. Only **`InitFailed` is genuinely unreachable** (finding #1: `initialize()` never returns `Err`). The readiness predicate is still pinned by a pure, platform-independent classifier because the *combination* of inputs (R-absent × fallback-empty × additional-paths) is awkward to stage end-to-end, not because the branches can't occur.
 
 ## Decisions
 
@@ -230,7 +230,7 @@ Two intended changes fall out, both behavior-neutral on supported platforms (fin
 
 ## Test plan
 
-The interesting predicate branches are unreachable end-to-end on supported platforms (finding #2), so the predicate is pinned by the pure classifier, and the anti-drift guarantee is "all four sites route through one helper" (verified by code, not by four parallel end-to-end tests).
+The interesting predicate branches are awkward to stage end-to-end (they need R-absent × empty-fallback × specific `additionalLibraryPaths` combinations — finding #2), though `RNotFound`/`NoLibraryPaths` do occur in real no-R CI runs. So the predicate is pinned by the pure classifier, and the anti-drift guarantee is "all four sites route through one helper" (verified by code, not by four parallel end-to-end tests).
 
 ### Stay green (regression net)
 - `cli/check.rs::maybe_init_r_honors_additional_library_paths`
@@ -278,5 +278,5 @@ TDD applies within each commit (helper `classify` tests are RED before the helpe
 ## Out of scope
 - Removing the now-provably-dead `InitFailed` path (and collapsing the CLI from three R-notes to two).
 - Reworking the `did_open` race re-check in `ensure_package_library_initialized`.
-- Any change to `initialize()`'s fallback behavior or to `get_fallback_lib_paths()` (incl. the quirk that R-absent still yields fallback paths on supported platforms).
+- Any change to `initialize()`'s fallback behavior or to `get_fallback_lib_paths()` (which yields fallback paths only when the standard R install directories actually exist — so on a machine *with* R it can mask R-discovery failure, but on a no-R CI runner it is empty and `RNotFound`/`NoLibraryPaths` are reached; see finding #2).
 - Changing `backend.rs:2476`'s behavior (its `packages_enabled` gate is load-bearing — see Decision 4 — so it stays; only a clarifying comment is added). The `backend.rs:5719` redundant branch **is** removed, but as its own isolated commit, not folded into the extraction.
