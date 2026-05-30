@@ -471,6 +471,70 @@ mod tests {
     }
 
     #[test]
+    fn walk_resolves_overrides_for_dotdot_paths_like_clean_paths() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("R")).unwrap();
+        // A line well over 20 chars, so the base config flags it...
+        fs::write(
+            root.join("R").join("foo.R"),
+            "x <- 'this line is intentionally way more than twenty characters wide'\n",
+        )
+        .unwrap();
+        // ...but an `enabled = false` override for `R/*.R` skips the file
+        // entirely. This exercises the `is_skipped_by_overrides` path, which
+        // (unlike `resolve_lint_for_document`) does NOT round-trip through a URL
+        // — so it sees the raw path and is the one that breaks on `..`.
+        let settings = serde_json::json!({
+            "linting": {
+                "enabled": true,
+                "lineLength": 20,
+                "lineLengthSeverity": "warning",
+                "overrides": [ { "files": ["R/*.R"], "enabled": false } ]
+            }
+        });
+        let base_lint = crate::backend::parse_lint_config(&settings, false).unwrap();
+        let base_section = settings.get("linting").cloned().unwrap();
+        let overrides = crate::config_file::compile_lint_overrides(&settings, root);
+
+        let run = |p: &Path| {
+            let mut diags = Vec::new();
+            let mut operator_error = false;
+            walk(
+                p,
+                root,
+                &base_section,
+                &base_lint,
+                &overrides,
+                &mut diags,
+                &mut operator_error,
+            );
+            assert!(!operator_error, "unexpected operator error for {p:?}");
+            diags.len()
+        };
+
+        // Characterization guard: a file referenced via a `..`-laden absolute
+        // path must resolve `[[linting.overrides]]` exactly as the clean path
+        // does. This already holds because `Url::from_file_path` performs
+        // RFC-3986 dot-segment removal, so `resolve_lint_for_document` (the
+        // authoritative override application) sees a normalized path and the
+        // `R/*.R` glob still matches. (`is_skipped_by_overrides` does see the
+        // raw `R/../R/foo.R` and miss, but that's only a pre-parse skip
+        // optimization — `run_lints` returns nothing for the disabled override
+        // either way, so the diagnostics are identical.) Locks the behavior in
+        // so a future change to the URI construction can't silently regress it.
+        let clean = root.join("R").join("foo.R");
+        let dotted = root.join("R").join("..").join("R").join("foo.R");
+        assert_eq!(
+            run(&dotted),
+            run(&clean),
+            "a `..`-laden path must resolve overrides the same as the clean path"
+        );
+    }
+
+    #[test]
     fn end_to_end_finds_line_length_violation() {
         use std::fs;
         use tempfile::TempDir;
