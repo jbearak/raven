@@ -69,6 +69,16 @@ Rationale (researched): the `(lib, bool)` + separate-reason option is the desync
 
 Idiomatic Rust co-locates construction logic with the type it builds ([Rustonomicon — constructors](https://doc.rust-lang.org/nomicon/constructors.html)). The helper takes owned/cloned inputs and no `WorldState`, so it stays lock-free and adds no `WorldState`/`Client`/logging/perf dependency to the module — keeping the model type from becoming a backend module, and stopping the CLI reaching deeper into `backend`.
 
+### 4. Adjacent disabled-gates — remove the redundant one, keep the load-bearing one
+
+Two *callers* of `rebuild_package_library` hold `packages_enabled` semantics in a second place. They look alike but need opposite treatment:
+
+- **`backend.rs:5719` (settings reload) — remove the redundant branch.** It is `if packages_enabled { rebuild } else { (new_empty, false) }`, and it *always* swaps the result into `state`. Since `rebuild_package_library` already self-gates (`backend.rs:6734`) and returns exactly `(new_empty, false)` when disabled, the `else` branch is pure duplication of the disabled→empty decision — the very drift surface this refactor targets. DRY / single-source-of-truth says collapse it to an unconditional `let (lib, ready) = rebuild_package_library(&self.state).await;`. Behavior-neutral (when disabled, the helper returns `new_empty`/`false` either way; the only difference is one extra brief read-lock acquisition and no R discovery, exactly as before). `packages_enabled` stays captured for the later prefetch guard at `backend.rs:5754`.
+
+- **`backend.rs:2476` (`raven.refreshPackages`) — keep it; it is load-bearing.** When disabled, the swap is *inside* the `if`, so the existing library is left in place. Removing the gate would route through the helper and swap in `new_empty`, **clobbering** the user's current library on a refresh issued while packages are disabled. Leave it unchanged and add a one-line comment explaining the gate guards against that clobber, so it isn't "tidied" away later.
+
+Best-practice basis: DRY for the redundant gate ([replace-nested-conditional-with-guard-clauses](https://refactoring.guru/replace-nested-conditional-with-guard-clauses)); isolate the cleanup in its own commit to keep the extraction reviewable ([focused / "campsite" PRs](https://blog.thepete.net/blog/2019/05/10/6-practices-for-effective-pull-requests/)).
+
 ## Architecture
 
 ### The helper (`package_library.rs`)
@@ -232,10 +242,9 @@ The interesting predicate branches are unreachable end-to-end on supported platf
 - **`build_package_library` disabled:** `packages_enabled = false` → `status == Disabled`, `library.lib_paths()` empty, `!is_ready()`. R-independent.
 - **`build_package_library` honors additional paths:** with `packages_enabled = true` and a **real temp dir** in `additional_paths`, that path appears in `outcome.library.lib_paths()`. Uses a temp dir (not a bogus path) because `add_library_paths` appends without existence checks (`package_library.rs:721`), so the test reflects the "valid additional path" intent.
 
-### Adjacent disabled-gates — verify, don't refactor
-These are *callers* of `rebuild_package_library`, not builders, so they are out of refactor scope; but they hold `packages_enabled` semantics in a second place and could drift. Confirm (add a small assertion if not already covered) that each yields `Disabled + empty + not-ready`:
-- Settings reload, `backend.rs:5719` — `if packages_enabled { rebuild } else { new_empty }`. The outer gate is now redundant with the helper's gate; leave a one-line comment noting the helper self-gates, or drop the redundant branch (a judgment call for the plan).
-- `raven.refreshPackages`, `backend.rs:2476` — checks `packages_enabled` before rebuild.
+### Adjacent disabled-gate cleanup (its own commit — see Decision 4)
+- **`backend.rs:5719` removal:** add a regression test that a settings reload with `packages_enabled == false` yields `package_library` empty and `package_library_ready == false` (locking in that the now-unconditional `rebuild_package_library` call preserves the disabled outcome). Confirm the existing settings-reload tests stay green.
+- **`backend.rs:2476` (kept):** verify (assert if not already covered) that `refreshPackages` while disabled does **not** clear an already-populated library — the behavior the load-bearing gate protects.
 
 ### Verification commands (run from the worktree, NOT the main checkout)
 ```
@@ -244,6 +253,17 @@ cargo test -p raven --lib cli::               # CLI module
 cargo test -p raven --lib maybe_init_r        # gate/additional-paths tests
 cargo test -p raven --lib rebuild_package     # backend builder tests
 ```
+
+## Commit / PR strategy
+
+Separate commits, **one PR**. Ordered so each commit builds and tests green on its own:
+
+1. **Precondition.** Commit the prior session's existing working-tree changes (the `packages.enabled` gate in `maybe_init_r`, the `should_skip_directory` test relocation, the `docs/cli.md` wording) — the refactor edits the same code, so preserve them first (per the handoff).
+2. **Phase 1 — extract + converge the two matching sites.** Add `build_package_library`, `PackageLibraryOutcome`, `PackageLibraryStatus`, `is_ready`, `classify`, and the helper/`classify` tests in `package_library.rs`; route `rebuild_package_library` (#1) and `maybe_init_r` (#2) through it; update the CLI doc comment + `docs/cli.md` wording. Pure refactor.
+3. **Phase 2 — converge the two startup sites.** Route `ensure_package_library_initialized` (#3) and Task B (#4) through the helper, preserving each site's surrounding context; add the phase-2 notes. Explicit (no-op on supported platforms) behavior change.
+4. **Cleanup — adjacent gate (Decision 4).** Remove the redundant `packages_enabled` branch at `backend.rs:5719` + regression test; add the load-bearing comment at `backend.rs:2476`.
+
+TDD applies within each commit (helper `classify` tests are RED before the helper exists, etc.).
 
 ## Documentation updates
 - `cli/check.rs:342-361` doc comment: point at the shared `build_package_library` / status rules, not at `backend::rebuild_package_library`, so maintainers don't reintroduce backend↔CLI coupling by hand. Tighten the "degradation paths" wording: there are **three R-related** `eprintln!` notes; `Disabled` is a degradation path that prints **nothing**.
@@ -259,4 +279,4 @@ cargo test -p raven --lib rebuild_package     # backend builder tests
 - Removing the now-provably-dead `InitFailed` path (and collapsing the CLI from three R-notes to two).
 - Reworking the `did_open` race re-check in `ensure_package_library_initialized`.
 - Any change to `initialize()`'s fallback behavior or to `get_fallback_lib_paths()` (incl. the quirk that R-absent still yields fallback paths on supported platforms).
-- Refactoring the adjacent disabled-gates at `backend.rs:5719` / `2476` beyond an optional redundancy comment.
+- Changing `backend.rs:2476`'s behavior (its `packages_enabled` gate is load-bearing — see Decision 4 — so it stays; only a clarifying comment is added). The `backend.rs:5719` redundant branch **is** removed, but as its own isolated commit, not folded into the extraction.
