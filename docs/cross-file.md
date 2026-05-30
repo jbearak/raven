@@ -50,13 +50,25 @@ Raven recognizes `library()`, `require()`, and `loadNamespace()` calls and makes
 
 When you write `library(dplyr)`, Raven:
 1. Detects the call and extracts the package name
-2. Queries R (via subprocess) for the package's exported symbols
+2. Resolves the package's exported symbols — usually by reading its installed `NAMESPACE` file directly, with no R involved (see [When Raven calls R](#when-raven-calls-r) for the cases that need a subprocess)
 3. Makes those symbols available with `{dplyr}` attribution in completions
 4. Suppresses "undefined variable" warnings for package exports
 
+### When Raven calls R
+
+Raven's analysis is static: it parses your code and your installed packages' `NAMESPACE` files without a running R session. It does, however, launch a short-lived, non-interactive R subprocess — the `R` on your `PATH`, or [`raven.packages.rPath`](configuration.md#package-settings) — in two situations. These are Raven's own processes; they never touch your interactive R session, and when no R is found Raven falls back gracefully.
+
+**1. To find where your packages are installed.** Raven runs `.libPaths()` to discover your library directories. Where packages live depends on your R installation, version, and project setup — including [`renv`](https://rstudio.github.io/renv/) project-local libraries, which Raven activates before reading the paths — so there's no reliable way to determine it statically. Without R, Raven falls back to the standard platform install locations plus any [`raven.packages.additionalLibraryPaths`](configuration.md#package-settings), which may miss user- or project-local libraries.
+
+**2. To expand exports that can't be read from `NAMESPACE` text.** Most packages list their exports with explicit `export(name)` directives, which Raven reads straight from the installed `NAMESPACE` file — no R required. But a package can instead (or additionally) declare `exportPattern("<regex>")`: "export every object in my namespace whose name matches this regex." Raven can't expand that from the file alone — it would need to know every object the namespace actually defines once loaded — so for these packages it asks R via `getNamespaceExports()`. Several base R packages use `exportPattern`, as do a minority of installed CRAN packages. When R isn't available, Raven approximates their exports from the package's `INDEX` file plus any explicit `export()` entries; this covers documented functions but may miss pattern-only or dynamically generated symbols.
+
+Run **Raven: Refresh package cache** after changing `.libPaths()` or running `renv::activate()` to re-run these queries.
+
 ### Base Packages
 
-Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. Raven uses this fixed list directly — it does not query R to discover the base packages. The R subprocess is queried for *installed user packages* (via the library paths), not to determine which base packages exist.
+Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. Raven uses this fixed list directly — it does not query R to discover the base packages. The R subprocess is queried for *installed user packages* (via the library paths), not to determine which base packages exist — though base-package *exports* are still expanded via R, since they use `exportPattern` (see [When Raven calls R](#when-raven-calls-r)).
+
+Lazy-loaded datasets are a related special case that does *not* require R. Base packages like `datasets` expose objects such as `mtcars` and `iris` that are auto-attached at startup but appear in neither `NAMESPACE` `export()` lines nor `getNamespaceExports()`. Raven discovers these statically, by walking the package's `data/` directory and `INDEX` file — so, unlike `exportPattern` exports, they're available with no subprocess.
 
 ### Position-Aware Loading
 
