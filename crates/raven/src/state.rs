@@ -1110,7 +1110,9 @@ impl WorldState {
                 }
                 self.index_directory(&path);
             } else if is_stat_model_extension(&path) {
-                if let Ok(text) = fs::read_to_string(&path) {
+                // Route through the shared BOM-aware seam; an undecodable file
+                // is left unindexed. See `read_source` for the decode policy.
+                if let Ok(text) = read_source(&path) {
                     if let Ok(uri) = Url::from_file_path(&path) {
                         log::trace!("Indexing file: {}", uri);
                         self.workspace_index
