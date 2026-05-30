@@ -247,7 +247,7 @@ The interesting predicate branches are unreachable end-to-end on supported platf
 - **`backend.rs:2476` (kept):** verify (assert if not already covered) that `refreshPackages` while disabled does **not** clear an already-populated library — the behavior the load-bearing gate protects.
 
 ### Verification commands (run from the worktree, NOT the main checkout)
-```
+```bash
 cargo test -p raven --lib package_library::   # helper + classify tests
 cargo test -p raven --lib cli::               # CLI module
 cargo test -p raven --lib maybe_init_r        # gate/additional-paths tests
