@@ -45,6 +45,8 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 
 `raven check` auto-detects R on `PATH` to resolve installed-package exports and base R symbols (it runs `.libPaths()` and parses package `NAMESPACE` files, the same as the language server). It honors the same `raven.toml` package settings the editor does: `packages.enabled = false` disables R detection entirely (no R subprocess, no package or base-symbol diagnostics — matching the editor), `packages.rPath` selects the R binary instead of `PATH` auto-detection, and `packages.additionalLibraryPaths` adds extra library directories to the search path. If R is not found, package and base-symbol diagnostics are limited — `library()` calls aren't checked against installed packages, and undefined-variable detection falls back to a built-in symbol list — and a one-line note is printed to stderr. All other diagnostics still run.
 
+Before reporting, `raven check` warms the export cache for the packages each reported file attaches with `library()` / `require()`, so a bare call into an attached package that isn't one of its exports is flagged the same way the editor flags it. One narrow gap remains: a package attached only *indirectly* — in a `source()`d file rather than in the reported file itself — is not pre-warmed, so calls that could resolve to such a package are left unflagged rather than risk a false positive. Attach the package directly in the file (or rely on the editor) if you need those calls checked.
+
 ### Exit codes
 
 - `0` — no diagnostic exceeded `--max-severity`.

@@ -146,6 +146,7 @@ use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::WorkspaceIndex;
 
 /// A parsed document
+#[derive(Clone)]
 pub struct Document {
     pub contents: Rope,
     pub tree: Option<Tree>,

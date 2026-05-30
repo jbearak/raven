@@ -172,6 +172,10 @@ pub async fn run(args: CheckArgs) -> i32 {
     let mut operator_error = false;
     let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
 
+    // Warm the package-export cache before computing diagnostics, matching the
+    // editor's post-scan prefetch (see [`prefetch_reported_packages`]).
+    prefetch_reported_packages(&state, &targets).await;
+
     let mut all_diags: Vec<(PathBuf, Diagnostic)> = Vec::new();
 
     for path in &targets {
@@ -183,14 +187,6 @@ pub async fn run(args: CheckArgs) -> i32 {
             );
             continue;
         }
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("raven check: cannot read {}: {e}", path.display());
-                operator_error = true;
-                continue;
-            }
-        };
         let Ok(uri) = Url::from_file_path(path) else {
             eprintln!(
                 "raven check: cannot convert path to URL: {}",
@@ -199,11 +195,30 @@ pub async fn run(args: CheckArgs) -> i32 {
             operator_error = true;
             continue;
         };
-        // The diagnostic snapshot reads the target from `state.documents`, which
-        // the workspace scan does NOT populate — so each reported file must be
-        // opened explicitly. Close it afterwards to bound memory across a large
-        // report set.
-        state.open_document_with_language_id(uri.clone(), &text, Some(1), Some("r"));
+        // `DiagnosticsSnapshot::build` reads the target from `state.documents`,
+        // which the workspace scan does NOT populate — it stores parsed
+        // `Document`s (tree included) in `state.workspace_index`. Reuse that
+        // already-parsed `Document` instead of re-reading the file from disk
+        // and re-parsing it: in the common "report the whole workspace" run
+        // that halves the tree-sitter work (parse once during the scan, not
+        // again here). Fall back to reading from disk only for a target the
+        // scan didn't index (e.g. a path the report walk reached through a
+        // different symlink alias). Either way the document is removed
+        // afterwards to bound memory across a large report set; the clone keeps
+        // the index entry intact for other files' cross-file resolution.
+        if let Some(doc) = state.workspace_index.get(&uri).cloned() {
+            state.documents.insert(uri.clone(), doc);
+        } else {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("raven check: cannot read {}: {e}", path.display());
+                    operator_error = true;
+                    continue;
+                }
+            };
+            state.open_document_with_language_id(uri.clone(), &text, Some(1), Some("r"));
+        }
         let diags = compute_file_diagnostics(&state, &uri).await;
         state.close_document(&uri);
         for d in diags {
@@ -238,6 +253,17 @@ pub async fn run(args: CheckArgs) -> i32 {
 /// Build a fully-indexed `WorldState`: load project config, scan the workspace,
 /// and derive package-mode scope. The R package library is initialized
 /// separately (see [`maybe_init_r`]) since it depends on an external process.
+///
+/// This is the synchronous, single-owner counterpart to the LSP server's
+/// startup (`backend::initialized`, "Task B"). The two intentionally differ
+/// only in *wiring* — the server is async, takes write locks, and records perf;
+/// the CLI owns `state` exclusively — while every piece of *logic* that could
+/// drift is single-sourced through shared seams: config discovery+load
+/// ([`crate::config_file::discover_and_load`]), the workspace scan
+/// ([`crate::state::scan_workspace`] + [`WorldState::apply_workspace_index`]),
+/// package-input seeding ([`crate::backend::initialize_package_inputs_from_state`]),
+/// and the R package library ([`crate::package_library::build_package_library`]).
+/// Keep new startup logic in those seams, not duplicated here.
 fn build_indexed_state(
     root: &Path,
     workspace_url: &Url,
@@ -324,50 +350,39 @@ fn resolve_project_config(
             }
         };
     }
-    match crate::config_file::find_config(search_start) {
-        crate::config_file::DiscoveredConfig::RavenToml(p) => {
-            match crate::config_file::load_toml(&p) {
-                Some(l) => loaded(l.warnings, l.settings, p),
-                None => {
-                    eprintln!("raven check: failed to load {}", p.display());
-                    Err(EXIT_OPERATOR_ERROR)
-                }
-            }
+    // Discovery (raven.toml beats .lintr) and loading are shared with the LSP
+    // server via `config_file::discover_and_load`, so the CLI and editor can't
+    // drift on discovery precedence or which loader reads `.lintr`.
+    match crate::config_file::discover_and_load(search_start) {
+        crate::config_file::DiscoveredLoad::Loaded {
+            path,
+            settings,
+            warnings,
+        } => loaded(warnings, settings, path),
+        crate::config_file::DiscoveredLoad::LoadFailed { path } => {
+            eprintln!("raven check: failed to load {}", path.display());
+            Err(EXIT_OPERATOR_ERROR)
         }
-        crate::config_file::DiscoveredConfig::Lintr(p) => match std::fs::read_to_string(&p) {
-            Ok(text) => {
-                let l = crate::config_file::load_lintr_str(&text);
-                loaded(l.warnings, l.settings, p)
-            }
-            Err(e) => {
-                eprintln!("raven check: cannot read {}: {e}", p.display());
-                Err(EXIT_OPERATOR_ERROR)
-            }
-        },
-        crate::config_file::DiscoveredConfig::None => Ok((None, None)),
+        crate::config_file::DiscoveredLoad::None => Ok((None, None)),
     }
 }
 
-/// Auto-detect R and initialize the package library so installed-package
-/// exports and base R symbols are available. Routes through the shared
-/// [`crate::package_library::build_package_library`] helper, which is the
-/// single source of the readiness predicate and degradation classification, so
-/// this CLI path and the editor's startup paths can't drift. It honors the
-/// same `raven.toml` package settings the editor does:
-/// - `packages.enabled` gates the whole thing — when `false`, the helper
-///   returns `Disabled` *before* any R discovery, so this leaves the default
-///   empty library and `package_library_ready = false` and a user who disabled
-///   package awareness in their editor doesn't get package diagnostics in CI.
-/// - `packages.rPath` selects the R binary.
-/// - `packages.additionalLibraryPaths` augments the discovered search paths
-///   (applied after R discovery, so configured paths never suppress R-reported
-///   ones and count toward readiness).
+/// Auto-detect R and store the resulting package library on `state`, so
+/// installed-package exports and base R symbols are available.
 ///
-/// On `Ready` the library and `package_library_ready = true` are stored on
-/// `state`. Every other status leaves the default empty library in place. There
-/// are **three** R-related degradation notes printed to stderr (R absent, init
-/// error, no library paths) so the message reflects what actually happened;
-/// `Disabled` is a degradation path that prints **nothing**.
+/// The shared construction and classification rules — the `packages.enabled`
+/// gate *before* any R discovery, `packages.rPath` selection, applying
+/// `packages.additionalLibraryPaths` *after* discovery, and the readiness
+/// predicate — all live in [`crate::package_library::build_package_library`];
+/// see its doc comment for that contract. Routing through it is what keeps this
+/// CLI path and the editor's startup paths from drifting.
+///
+/// This function owns only the *caller policy*: on `Ready` it installs the
+/// library and sets `package_library_ready = true`; every other status leaves
+/// the default empty library in place (`ready` stays false). The three
+/// R-related degradations each print a one-line note to stderr so CI shows what
+/// was missing; `Disabled` (the user turned package awareness off in
+/// `raven.toml`) is silent, matching the editor.
 async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
     // Snapshot config into locals before the call so the later `state`
     // mutation doesn't conflict with the borrow.
@@ -386,12 +401,9 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
     )
     .await;
 
-    // The shared helper gates on `packages.enabled` *before* any R discovery
-    // (returning `Disabled`), applies `additionalLibraryPaths` after discovery,
-    // and computes readiness from non-empty `lib_paths()` — exactly as the
-    // editor's `backend::rebuild_package_library` does, so the two init paths
-    // can't drift. Each status surfaces its own way; only the R-related
-    // degradations print a note, and `Disabled` is silent.
+    // Caller policy (see the doc comment): install only on `Ready`; otherwise
+    // keep the default empty library, printing a note for the R-related
+    // degradations and staying silent on `Disabled`.
     use crate::package_library::PackageLibraryStatus::*;
     match outcome.status {
         Ready => {
@@ -412,6 +424,44 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
         NoLibraryPaths => eprintln!(
             "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
         ),
+    }
+}
+
+/// Warm the package-export cache for the packages the reported files attach,
+/// matching the editor's post-scan prefetch
+/// ([`crate::backend::prefetch_packages_for_open_documents`]).
+///
+/// The undefined-variable check is synchronous and treats an installed-but-
+/// uncached package as "pending", suppressing bare calls that could resolve to
+/// it (`handlers.rs`). Without this warm-up `raven check` would under-report
+/// undefined symbols from attached packages relative to the editor whenever R
+/// (or a configured library path) makes the package installed-but-uncached.
+///
+/// Covers the directly-attached packages (`library()` / `require()`) of each
+/// reported file, read from the already-parsed workspace index. Cross-file
+/// *inherited* packages (attached in a `source()`d file) and packages of
+/// targets the scan did not index are not prefetched here, so calls relying on
+/// those stay conservatively suppressed — a narrower gap than before, noted in
+/// `docs/cli.md`. No-op when the library isn't ready (e.g. R absent with no
+/// configured library paths).
+async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &[PathBuf]) {
+    if !state.package_library_ready {
+        return;
+    }
+    let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in targets {
+        if let Ok(uri) = Url::from_file_path(path) {
+            if let Some(doc) = state.workspace_index.get(&uri) {
+                packages.extend(doc.loaded_packages.iter().cloned());
+            }
+        }
+    }
+    let packages: Vec<String> = packages
+        .into_iter()
+        .filter(|p| crate::r_subprocess::is_valid_package_name(p))
+        .collect();
+    if !packages.is_empty() {
+        state.package_library.prefetch_packages(&packages).await;
     }
 }
 
@@ -645,6 +695,89 @@ mod tests {
         // Unbalanced paren — a hard syntax error, always reported at ERROR.
         fs::write(tmp.path().join("broken.R"), "f <- function( {\n").unwrap();
         assert_eq!(run_blocking(base_args(tmp.path())), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn reports_undefined_symbol_from_attached_package() {
+        // Regression (#8): editor/CI parity. When an installed package is
+        // attached (`library(pkg)`), the editor prefetches its exports so a
+        // bare call that ISN'T an export is flagged undefined. `raven check`
+        // must do the same; without warming the cache the package reads as
+        // "pending" and the call is suppressed, so the build would silently
+        // pass over a real undefined symbol the editor flags.
+        //
+        // R-free: a fake installed package (a NAMESPACE with no exportPattern)
+        // is parsed statically, and `additionalLibraryPaths` makes the library
+        // `Ready` without R.
+        let workspace = TempDir::new().unwrap();
+        let libdir = TempDir::new().unwrap();
+        let pkgdir = libdir.path().join("fakepkg");
+        fs::create_dir_all(&pkgdir).unwrap();
+        fs::write(
+            pkgdir.join("DESCRIPTION"),
+            "Package: fakepkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        // Exports exactly one symbol; `fakepkg_missing` is deliberately absent.
+        fs::write(pkgdir.join("NAMESPACE"), "export(real_export)\n").unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            format!(
+                "[packages]\nadditionalLibraryPaths = [\"{}\"]\n",
+                libdir.path().display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("main.R"),
+            "library(fakepkg)\nfakepkg_missing()\n",
+        )
+        .unwrap();
+
+        let args = CheckArgs {
+            paths: Vec::new(),
+            workspace: Some(workspace.path().to_path_buf()),
+            config_path: None,
+            no_config: false,
+            format: OutputFormat::Json,
+            max_severity: SeverityLevel::Info,
+            quiet: true,
+            no_color: true,
+        };
+        assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn nonindexed_explicit_file_uses_disk_fallback() {
+        // Regression (#3): the report loop reuses the workspace index's parsed
+        // Document when present, but a target the scan didn't index — here an
+        // explicit file outside the (empty) workspace root — must still be read
+        // from disk and reported. A syntax error proves the fallback branch ran.
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let broken = outside.path().join("broken.R");
+        fs::write(&broken, "g <- function( {\n").unwrap();
+        let mut args = base_args(workspace.path());
+        args.paths = vec![broken];
+        assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dir_file_is_reported() {
+        // Regression (#1): a .R file reachable only through a symlinked
+        // directory must have its diagnostics reported, not silently skipped.
+        // Before the fix, the report walk skipped the symlink while the
+        // indexer followed it, so `raven check` exited clean over a real
+        // syntax error the editor would flag.
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        // A hard syntax error lives in a directory OUTSIDE the workspace root,
+        // reachable only via a symlink inside the workspace.
+        fs::write(external.path().join("broken.R"), "f <- function( {\n").unwrap();
+        std::os::unix::fs::symlink(external.path(), workspace.path().join("linked")).unwrap();
+
+        assert_eq!(run_blocking(base_args(workspace.path())), EXIT_LINT_FAILED);
     }
 
     #[test]
