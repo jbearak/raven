@@ -39,7 +39,8 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 - `--format text|json|sarif` — default `text`.
 - `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold.
 - `--quiet` — suppress the trailing summary line.
-- `--no-color` — accepted for forward compatibility. `text` output is currently uncolored regardless, so this flag has no visible effect yet.
+- `--color auto|always|never` — when to colorize `text` output (default `auto`). See [Color output](#color-output).
+- `--no-color` — alias for `--color never`.
 
 ### R and packages
 
@@ -90,7 +91,8 @@ raven lint [OPTIONS] [PATHS...]
 - `--format text|json|sarif` — default `text`.
 - `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). Linting is opt-in: with no `raven.toml` / `.lintr` discovered (or under `--no-config`) the linter is disabled and emits no diagnostics, so `raven lint .` exits 0. A discovered config enables rules; raising any to `warning` or `error` is what then gates CI.
 - `--quiet` — suppress the trailing summary line.
-- `--no-color` — accepted for forward compatibility. `text` output is currently uncolored regardless, so this flag has no visible effect yet.
+- `--color auto|always|never` — when to colorize `text` output (default `auto`). See [Color output](#color-output).
+- `--no-color` — alias for `--color never`.
 
 ### File encoding
 
@@ -127,3 +129,17 @@ Both `check` and `lint` share the same renderers:
 - `text` — `path:line:col level: message [rule]`, one per line.
 - `json` — array of `{ path, diagnostic }` objects (`diagnostic` is a verbatim LSP `Diagnostic`).
 - `sarif` — SARIF 2.1.0 envelope. Tool name `raven`; `ruleId` from `Diagnostic.code`.
+
+## Color output
+
+Both `check` and `lint` colorize the **severity word** (`error`, `warning`, `info`, `hint`) in `text` output — the rest of the line stays uncolored so it remains easy to grep. The `json` and `sarif` formats are machine-readable and are **never** colorized regardless of the flag or environment.
+
+`--color auto|always|never` controls it (default `auto`), and `--no-color` is a familiar alias for `--color never`. Resolution precedence, highest first:
+
+1. An explicit `--color always` / `--color never` (or `--no-color` ⇒ `never`) always wins, overriding the environment.
+2. Otherwise (`auto`):
+   - [`NO_COLOR`](https://no-color.org/) set and non-empty ⇒ **off**.
+   - else [`FORCE_COLOR`](https://force-color.org/) set and non-empty ⇒ **on**.
+   - else **on** when stdout is a terminal, **off** when piped or redirected.
+
+So `--color always` forces color even through a pipe (e.g. into `less -R` or a CI log viewer), `--color never` / `--no-color` / `NO_COLOR` suppress it, and the default tracks whether you're looking at a terminal. Conflicting explicit flags are last-one-wins (`--no-color --color always` ⇒ color on).
