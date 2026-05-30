@@ -21,8 +21,8 @@ use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use crate::cli::shared::{
     absolute_path, collect_r_file_paths, encoding_diagnostic, is_chunk_file, is_r_file,
-    parse_output_format, parse_severity_level, render, OutputFormat, SeverityLevel,
-    EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+    parse_color_choice, parse_output_format, parse_severity_level, render, resolve_color_from_env,
+    ColorChoice, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -38,9 +38,11 @@ pub struct CheckArgs {
     pub format: OutputFormat,
     pub max_severity: SeverityLevel,
     pub quiet: bool,
-    /// Accepted for forward compatibility; `text` output is currently uncolored,
-    /// so this has no visible effect yet (parity with `raven lint`).
-    pub no_color: bool,
+    /// Color control for `text` output. `--no-color` parses to
+    /// [`ColorChoice::Never`]; `--color auto|always|never` sets it directly.
+    /// Resolved to on/off by [`resolve_color_from_env`] (TTY +
+    /// `NO_COLOR`/`FORCE_COLOR`).
+    pub color: ColorChoice,
 }
 
 pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, String> {
@@ -51,7 +53,9 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
     let mut format = OutputFormat::Text;
     let mut max_severity = SeverityLevel::Info;
     let mut quiet = false;
-    let mut no_color = false;
+    // `--color` and `--no-color` write the same field; last-one-wins on conflict
+    // (`--no-color --color always` ⇒ always), matching cargo/ripgrep.
+    let mut color = ColorChoice::Auto;
 
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -73,7 +77,11 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
                 max_severity = parse_severity_level(&v)?;
             }
             "--quiet" => quiet = true,
-            "--no-color" => no_color = true,
+            "--color" => {
+                let v = argv.next().ok_or("--color needs a value")?;
+                color = parse_color_choice(&v)?;
+            }
+            "--no-color" => color = ColorChoice::Never,
             "--help" => return Err("HELP".into()),
             s if s.starts_with("--") => return Err(format!("unknown flag: {s}")),
             p => paths.push(PathBuf::from(p)),
@@ -87,7 +95,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
         format,
         max_severity,
         quiet,
-        no_color,
+        color,
     })
 }
 
@@ -111,7 +119,11 @@ Options:
   --max-severity LEVEL        Highest severity that does NOT fail the build
                               (off, hint, info, warning, error; default: info)
   --quiet                     Suppress summary line in text output
-  --no-color                  Disable ANSI colors
+  --color auto|always|never   When to colorize text output (default: auto —
+                              color when stdout is a terminal). Honors NO_COLOR
+                              and FORCE_COLOR under auto; json/sarif are never
+                              colorized.
+  --no-color                  Alias for --color never
 
 R / packages:
   raven check auto-detects R on PATH to resolve installed-package exports and
@@ -245,7 +257,8 @@ pub async fn run(args: CheckArgs) -> i32 {
         .iter()
         .any(|(_, d)| SeverityLevel::from_diag(d) > args.max_severity);
 
-    render(args.format, &all_diags, &root, args.quiet);
+    let use_color = resolve_color_from_env(args.color);
+    render(args.format, &all_diags, &root, args.quiet, use_color);
 
     // Operator error takes priority over a threshold breach: a half-read run
     // shouldn't masquerade as a clean (or merely failing) lint result.
@@ -564,7 +577,7 @@ mod tests {
             format: OutputFormat::Json,
             max_severity: SeverityLevel::Info,
             quiet: true,
-            no_color: true,
+            color: ColorChoice::Never,
         }
     }
 
@@ -576,6 +589,25 @@ mod tests {
         assert_eq!(args.format, OutputFormat::Text);
         assert_eq!(args.max_severity, SeverityLevel::Info);
         assert!(!args.no_config);
+        assert_eq!(args.color, ColorChoice::Auto);
+    }
+
+    #[test]
+    fn parse_color_and_no_color_alias() {
+        let always = parse_args(["--color", "always"].iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(always.color, ColorChoice::Always);
+        let never = parse_args(["--no-color"].iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(never.color, ColorChoice::Never);
+        // Last-one-wins on conflict: `--no-color --color always` ⇒ always.
+        let conflict = parse_args(
+            ["--no-color", "--color", "always"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(conflict.color, ColorChoice::Always);
+        // A bad --color value is a usage error.
+        assert!(parse_args(["--color", "sometimes"].iter().map(|s| s.to_string())).is_err());
     }
 
     #[test]
@@ -749,7 +781,7 @@ mod tests {
             format: OutputFormat::Json,
             max_severity: SeverityLevel::Info,
             quiet: true,
-            no_color: true,
+            color: ColorChoice::Never,
         };
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
     }

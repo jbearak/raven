@@ -7,6 +7,8 @@
 //! chunk-bearing documents. That common surface lives here so the two commands
 //! share one implementation without depending on each other's internals.
 
+use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -24,6 +26,18 @@ pub enum OutputFormat {
     Text,
     Json,
     Sarif,
+}
+
+/// Tri-state color control for the `text` renderer, mirroring `cargo`/`ripgrep`.
+/// `--no-color` is kept as an alias for `Never`. The choice is resolved to a
+/// concrete on/off by [`resolve_color`]; the CLI entrypoints reach it through
+/// [`resolve_color_from_env`], which reads `NO_COLOR` / `FORCE_COLOR` and TTY
+/// state and applies them under `Auto`.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, PartialOrd, Eq, Ord)]
@@ -67,6 +81,69 @@ pub fn parse_severity_level(v: &str) -> Result<SeverityLevel, String> {
         "error" => Ok(SeverityLevel::Error),
         other => Err(format!("unknown --max-severity value: {other}")),
     }
+}
+
+/// Parse a `--color` value into a [`ColorChoice`].
+pub fn parse_color_choice(v: &str) -> Result<ColorChoice, String> {
+    match v {
+        "auto" => Ok(ColorChoice::Auto),
+        "always" => Ok(ColorChoice::Always),
+        "never" => Ok(ColorChoice::Never),
+        other => Err(format!("unknown --color value: {other}")),
+    }
+}
+
+/// Whether an environment variable counts as "set" for color control. Per
+/// no-color.org / force-color.org, that means present **and non-empty** —
+/// regardless of UTF-8 validity, which is why the value is an `OsStr` (a
+/// non-UTF-8 but non-empty `NO_COLOR` still counts; `std::env::var` would have
+/// dropped it). Reading the env stays at the call site (see
+/// [`resolve_color_from_env`]); this predicate is pure so the rule is
+/// unit-testable without racing process-global env across parallel tests.
+pub fn env_flag_is_set(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
+/// Resolve a [`ColorChoice`] to a concrete on/off, applying the precedence from
+/// no-color.org: an explicit `Always`/`Never` (including the `--no-color` alias)
+/// always wins, overriding the environment. Only under `Auto` do the env signals
+/// apply — `no_color` forces off, then `force_color` forces on, otherwise color
+/// follows whether stdout is a terminal. The two flags are "is the var set?"
+/// booleans (see [`env_flag_is_set`]), so this stays a pure precedence function
+/// over already-resolved inputs — unit-testable without touching the real env.
+pub fn resolve_color(
+    choice: ColorChoice,
+    no_color: bool,
+    force_color: bool,
+    stdout_is_tty: bool,
+) -> bool {
+    match choice {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => {
+            if no_color {
+                false
+            } else if force_color {
+                true
+            } else {
+                stdout_is_tty
+            }
+        }
+    }
+}
+
+/// Resolve a [`ColorChoice`] against the live process environment — the impure
+/// counterpart to [`resolve_color`], which it delegates to after reading
+/// `NO_COLOR`/`FORCE_COLOR` and probing stdout for a TTY. Both `check` and
+/// `lint` call this once in their `run()` epilogue so the env+TTY gathering
+/// lives in one place; the pure `resolve_color` stays separate for unit tests.
+pub fn resolve_color_from_env(choice: ColorChoice) -> bool {
+    resolve_color(
+        choice,
+        env_flag_is_set(std::env::var_os("NO_COLOR").as_deref()),
+        env_flag_is_set(std::env::var_os("FORCE_COLOR").as_deref()),
+        std::io::stdout().is_terminal(),
+    )
 }
 
 pub fn is_r_file(p: &Path) -> bool {
@@ -146,18 +223,48 @@ pub fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
     }
 }
 
+/// Wrap a severity word in a minimal ANSI color span when `use_color` is set,
+/// returning it unchanged otherwise. Only the severity word is colorized (per
+/// the design); the path, location, message, and `[rule]` stay uncolored so the
+/// output remains easy to grep. `note` (severity-less / unrecognized) is left
+/// uncolored intentionally.
+///
+/// The colored forms are a closed set of `&'static str` literals (color code +
+/// word + `\x1b[0m` reset), so this allocates nothing and returns a borrow — the
+/// uncolored cases return the input `level` unchanged.
+fn colorize_level(level: &str, use_color: bool) -> &str {
+    if !use_color {
+        return level;
+    }
+    match level {
+        "error" => "\x1b[31merror\x1b[0m",     // red
+        "warning" => "\x1b[33mwarning\x1b[0m", // yellow
+        "info" => "\x1b[34minfo\x1b[0m",       // blue
+        "hint" => "\x1b[36mhint\x1b[0m",       // cyan
+        _ => level,
+    }
+}
+
 /// Render diagnostics in the requested format. The single dispatch point both
 /// `lint` and `check` call after collecting their `(path, diagnostic)` pairs,
 /// so the format → renderer mapping lives in one place next to the renderers.
-pub fn render(format: OutputFormat, diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
+/// `use_color` colorizes only the `text` renderer's severity word; `json` /
+/// `sarif` are machine formats and never colorized regardless.
+pub fn render(
+    format: OutputFormat,
+    diags: &[(PathBuf, Diagnostic)],
+    root: &Path,
+    quiet: bool,
+    use_color: bool,
+) {
     match format {
-        OutputFormat::Text => print_text(diags, root, quiet),
+        OutputFormat::Text => print_text(diags, root, quiet, use_color),
         OutputFormat::Json => print_json(diags, root),
         OutputFormat::Sarif => print_sarif(diags, root),
     }
 }
 
-fn print_text(diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
+fn print_text(diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool, use_color: bool) {
     let mut errors = 0;
     let mut warnings = 0;
     let mut infos = 0;
@@ -198,7 +305,7 @@ fn print_text(diags: &[(PathBuf, Diagnostic)], root: &Path, quiet: bool) {
             rel.display(),
             line,
             col,
-            level,
+            colorize_level(level, use_color),
             d.message,
             rule
         );
@@ -364,6 +471,72 @@ mod tests {
         assert_eq!(parse_severity_level("off").unwrap(), SeverityLevel::Off);
         assert_eq!(parse_severity_level("error").unwrap(), SeverityLevel::Error);
         assert!(parse_severity_level("fatal").is_err());
+    }
+
+    #[test]
+    fn color_parsing() {
+        assert_eq!(parse_color_choice("auto").unwrap(), ColorChoice::Auto);
+        assert_eq!(parse_color_choice("always").unwrap(), ColorChoice::Always);
+        assert_eq!(parse_color_choice("never").unwrap(), ColorChoice::Never);
+        assert!(parse_color_choice("yes").is_err());
+    }
+
+    #[test]
+    fn env_flag_is_set_requires_present_and_non_empty() {
+        assert!(!env_flag_is_set(None), "unset ⇒ not set");
+        assert!(!env_flag_is_set(Some(OsStr::new(""))), "empty ⇒ not set");
+        assert!(env_flag_is_set(Some(OsStr::new("1"))), "non-empty ⇒ set");
+    }
+
+    /// A non-UTF-8 but non-empty value must still count as set (no-color.org
+    /// cares only about presence + non-emptiness). This is the case `var_os`
+    /// preserves and `var().ok()` would silently drop to "unset".
+    #[cfg(unix)]
+    #[test]
+    fn env_flag_is_set_treats_non_utf8_value_as_set() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = OsStr::from_bytes(&[0xFF]); // not valid UTF-8, non-empty
+        assert!(env_flag_is_set(Some(invalid)));
+    }
+
+    #[test]
+    fn resolve_color_explicit_overrides_win_over_env_and_tty() {
+        // `always` forces on even when piped (no TTY) and NO_COLOR is set.
+        assert!(resolve_color(ColorChoice::Always, true, false, false));
+        // `never` forces off even on a TTY with FORCE_COLOR set.
+        assert!(!resolve_color(ColorChoice::Never, false, true, true));
+    }
+
+    #[test]
+    fn resolve_color_auto_honors_no_color() {
+        // NO_COLOR set disables color even on a TTY.
+        assert!(!resolve_color(ColorChoice::Auto, true, false, true));
+        // NO_COLOR unset falls through to TTY detection.
+        assert!(resolve_color(ColorChoice::Auto, false, false, true));
+        // NO_COLOR beats FORCE_COLOR when both are set.
+        assert!(!resolve_color(ColorChoice::Auto, true, true, true));
+    }
+
+    #[test]
+    fn resolve_color_auto_honors_force_color_then_tty() {
+        // FORCE_COLOR forces on even when piped.
+        assert!(resolve_color(ColorChoice::Auto, false, true, false));
+        // No env overrides: color follows the TTY flag.
+        assert!(resolve_color(ColorChoice::Auto, false, false, true));
+        assert!(!resolve_color(ColorChoice::Auto, false, false, false));
+    }
+
+    #[test]
+    fn colorize_level_wraps_only_when_enabled() {
+        // Disabled: returned verbatim, no escapes.
+        assert_eq!(colorize_level("error", false), "error");
+        // Enabled: wrapped in an SGR span that resets at the end.
+        let colored = colorize_level("error", true);
+        assert!(colored.starts_with("\x1b["), "{colored}");
+        assert!(colored.ends_with("\x1b[0m"), "{colored}");
+        assert!(colored.contains("error"), "{colored}");
+        // `note` is intentionally left uncolored even when enabled.
+        assert_eq!(colorize_level("note", true), "note");
     }
 
     #[test]
