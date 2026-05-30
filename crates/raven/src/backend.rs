@@ -2650,6 +2650,15 @@ impl LanguageServer for Backend {
     /// **Note for maintainers**: If adding new operations that need state access,
     /// ensure they happen AFTER the write lock is released, or use interior mutability
     /// patterns (like the diagnostics_gate) that don't require exclusive access.
+    ///
+    /// **BOM handling**: editor-supplied text is stored verbatim — a leading
+    /// U+FEFF is **not** stripped here, unlike disk reads (`state::decode_source`).
+    /// Stripping server-side would desync LSP positions on line 0 for any client
+    /// whose text model includes the BOM (tsserver's `ScriptInfo.open()` stores
+    /// open-document text verbatim for the same reason). Analysis stays correct
+    /// because tree-sitter-r treats U+FEFF as whitespace, and the raw-text
+    /// column-0 scanners skip it at their scan anchor via
+    /// [`crate::utf16::strip_leading_bom_for_scan`]. Issues #345, #346.
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let language_id = params.text_document.language_id;

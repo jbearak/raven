@@ -397,6 +397,24 @@ mod tests {
         assert!(!s.is_suppressed(0));
     }
 
+    // Issue #346: a raw leading U+FEFF (BOM) must not hide a first-line nolint
+    // marker. This already holds because `first_hash_body` scans bytes for the
+    // first `#` and skips the BOM's bytes, but the marker scan is column-0
+    // sensitive in spirit, so guard it against regression.
+    #[test]
+    fn bom_prefixed_nolint_marker_on_first_line_suppresses() {
+        let s = Suppressions::from_text("\u{FEFF}x = 1 # nolint\n");
+        assert!(s.is_suppressed(0));
+    }
+
+    #[test]
+    fn bom_prefixed_nolint_start_on_first_line_opens_block() {
+        let s = Suppressions::from_text("\u{FEFF}# nolint start\nx = 1\n# nolint end\n");
+        assert!(s.is_suppressed(0));
+        assert!(s.is_suppressed(1));
+        assert!(s.is_suppressed(2));
+    }
+
     #[test]
     fn inline_lsp_ignore_next_is_not_honoured() {
         // `@lsp-ignore-next` semantically points at the *following* line.
