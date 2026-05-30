@@ -43,7 +43,7 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 
 ### R and packages
 
-`raven check` auto-detects R on `PATH` to resolve installed-package exports and base R symbols (it runs `.libPaths()` and parses package `NAMESPACE` files, the same as the language server). It honors the same `raven.toml` package settings the editor does: `packages.rPath` selects the R binary instead of `PATH` auto-detection, and `packages.additionalLibraryPaths` adds extra library directories to the search path. If R is not found, package and base-symbol diagnostics are limited — `library()` calls aren't checked against installed packages, and undefined-variable detection falls back to a built-in symbol list — and a one-line note is printed to stderr. All other diagnostics still run.
+`raven check` auto-detects R on `PATH` to resolve installed-package exports and base R symbols (it runs `.libPaths()` and parses package `NAMESPACE` files, the same as the language server). It honors the same `raven.toml` package settings the editor does: `packages.enabled = false` disables R detection entirely (no R subprocess, no package or base-symbol diagnostics — matching the editor), `packages.rPath` selects the R binary instead of `PATH` auto-detection, and `packages.additionalLibraryPaths` adds extra library directories to the search path. If R is not found, package and base-symbol diagnostics are limited — `library()` calls aren't checked against installed packages, and undefined-variable detection falls back to a built-in symbol list — and a one-line note is printed to stderr. All other diagnostics still run.
 
 ### Exit codes
 

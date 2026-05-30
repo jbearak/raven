@@ -1445,6 +1445,17 @@ mod tests {
     include!("state_tests.rs");
 
     #[test]
+    fn test_should_skip_directory() {
+        assert!(should_skip_directory(".git"));
+        assert!(should_skip_directory("node_modules"));
+        assert!(should_skip_directory("renv"));
+        assert!(should_skip_directory("target"));
+        assert!(!should_skip_directory("R"));
+        assert!(!should_skip_directory("src"));
+        assert!(!should_skip_directory("data"));
+    }
+
+    #[test]
     fn test_document_apply_change_ascii() {
         let mut doc = Document::new("hello world", None);
 

@@ -360,7 +360,6 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::should_skip_directory;
 
     #[test]
     fn test_parse_args_basic() {
@@ -450,17 +449,6 @@ mod tests {
             assert!(result.is_ok(), "Phase '{}' should be valid", phase);
             assert_eq!(result.unwrap().only.as_deref(), Some(*phase));
         }
-    }
-
-    #[test]
-    fn test_should_skip_directory() {
-        assert!(should_skip_directory(".git"));
-        assert!(should_skip_directory("node_modules"));
-        assert!(should_skip_directory("renv"));
-        assert!(should_skip_directory("target"));
-        assert!(!should_skip_directory("R"));
-        assert!(!should_skip_directory("src"));
-        assert!(!should_skip_directory("data"));
     }
 
     #[test]

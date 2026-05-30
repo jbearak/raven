@@ -341,17 +341,34 @@ fn resolve_project_config(
 
 /// Auto-detect R and initialize the package library so installed-package
 /// exports and base R symbols are available. Honors the same `raven.toml`
-/// package settings the editor does — `packages.rPath`
-/// (`cross_file_config.packages_r_path`) selects the R binary, and
-/// `packages.additionalLibraryPaths`
-/// (`cross_file_config.packages_additional_library_paths`) augments the
-/// discovered search paths — applying them exactly as
+/// package settings the editor does, applying them exactly as
 /// [`crate::backend::rebuild_package_library`] does so the two init paths can't
-/// drift. On success the library and `package_library_ready = true` are stored
-/// on `state`. Every degradation path (R absent, init error, no library paths)
-/// leaves the default empty library in place and prints a specific one-line note
-/// to stderr so the message reflects what actually happened.
+/// drift:
+/// - `packages.enabled` (`cross_file_config.packages_enabled`) gates the whole
+///   thing — when `false`, this returns immediately (before any R discovery),
+///   leaving the default empty library and `package_library_ready = false`, so
+///   a user who disabled package awareness in their editor doesn't get package
+///   diagnostics in CI.
+/// - `packages.rPath` (`cross_file_config.packages_r_path`) selects the R binary.
+/// - `packages.additionalLibraryPaths`
+///   (`cross_file_config.packages_additional_library_paths`) augments the
+///   discovered search paths.
+///
+/// On success the library and `package_library_ready = true` are stored on
+/// `state`. Every degradation path (packages disabled, R absent, init error, no
+/// library paths) leaves the default empty library in place; the R-related ones
+/// print a specific one-line note to stderr so the message reflects what
+/// actually happened.
 async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
+    // Gate on `packages.enabled` *before* any R discovery, exactly as
+    // `rebuild_package_library` does. A user who disabled package awareness in
+    // their editor must not get package / base-symbol diagnostics in CI; the
+    // default empty library stays in place and `package_library_ready` stays
+    // false.
+    if !state.cross_file_config.packages_enabled {
+        return;
+    }
+
     let r_path = state.cross_file_config.packages_r_path.clone();
     let additional_paths = state
         .cross_file_config
@@ -672,6 +689,35 @@ mod tests {
                 .iter()
                 .any(|p| p == extra_lib.path()),
             "check must honor packages.additionalLibraryPaths; got {:?}",
+            state.package_library.lib_paths()
+        );
+    }
+
+    /// Regression: `raven check` must honor `packages.enabled = false`,
+    /// matching the language server's `backend::rebuild_package_library`, which
+    /// returns an empty library without spawning R when packages are disabled.
+    /// With the gate, even a configured additional library path is left
+    /// unapplied and the library stays not-ready — so a user who disabled
+    /// package awareness in their editor doesn't get package diagnostics in CI.
+    /// R-independent: the gate short-circuits before R discovery.
+    #[tokio::test]
+    async fn maybe_init_r_skips_when_packages_disabled() {
+        let workspace = TempDir::new().unwrap();
+        let extra_lib = TempDir::new().unwrap();
+        let mut state = crate::state::WorldState::new(vec![]);
+        state.cross_file_config.packages_enabled = false;
+        state.cross_file_config.packages_additional_library_paths =
+            vec![extra_lib.path().to_path_buf()];
+
+        maybe_init_r(&mut state, workspace.path()).await;
+
+        assert!(
+            !state.package_library_ready,
+            "packages.enabled = false must leave the library not-ready"
+        );
+        assert!(
+            state.package_library.lib_paths().is_empty(),
+            "packages.enabled = false must not populate library paths; got {:?}",
             state.package_library.lib_paths()
         );
     }
