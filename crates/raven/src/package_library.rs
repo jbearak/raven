@@ -1513,9 +1513,195 @@ impl PackageLibrary {
     }
 }
 
+/// Outcome of [`build_package_library`]: the constructed library plus a single
+/// status that is the sole source of truth for readiness and the degradation
+/// reason. Encoding state as one enum (not a `(lib, bool)` pair + a separate
+/// reason) makes the illegal "ready, but with a degradation reason" state
+/// unrepresentable — the drift this helper exists to prevent.
+pub struct PackageLibraryOutcome {
+    /// Always present. `new_empty()` for `Disabled`. A non-`Ready` library may
+    /// still carry useful offline data (base symbols, configured additional
+    /// paths), so "install it anyway" vs "discard it" is a *caller policy*, not
+    /// implied by the status.
+    pub library: Arc<PackageLibrary>,
+    pub status: PackageLibraryStatus,
+}
+
+/// The single source of truth for package-library readiness and the reason a
+/// build degraded. Sites #1 (`backend::rebuild_package_library`) and #2
+/// (`cli::check::maybe_init_r`) route through [`build_package_library`]; the
+/// two startup sites (`backend::ensure_package_library_initialized` and the
+/// Task B post-scan init) follow in phase 2. Routing them all through one
+/// builder is what stops the editor and `raven check` from drifting, and this
+/// enum's [`classify`](PackageLibraryStatus::classify) is where the readiness
+/// predicate and degradation precedence live — not duplicated per site.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PackageLibraryStatus {
+    /// `packages.enabled == false`; no R discovery attempted.
+    Disabled,
+    /// Initialized with >= 1 library path — the only ready state.
+    Ready,
+    /// No R subprocess located (incl. `spawn_blocking` join failure).
+    RNotFound,
+    /// `initialize()` errored — currently unreachable end-to-end (it has a
+    /// single `Ok(())` return and swallows R failures), kept for the CLI's
+    /// degradation-note contract and `initialize()`'s fallible signature.
+    InitFailed(String),
+    /// R found, init ok, but zero lib paths discovered/configured.
+    NoLibraryPaths,
+}
+
+impl PackageLibraryStatus {
+    /// Only `Ready` is ready.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Classify an *enabled* build. `init_error == None` means `initialize()`
+    /// succeeded. Precedence is `Ready -> RNotFound -> InitFailed ->
+    /// NoLibraryPaths`, mirroring the CLI's pre-refactor order exactly so the
+    /// extraction is behavior-identical. `Disabled` is set by the gate in
+    /// [`build_package_library`] before this is called.
+    fn classify(init_error: Option<String>, r_found: bool, has_lib_paths: bool) -> Self {
+        if init_error.is_none() && has_lib_paths {
+            Self::Ready
+        } else if !r_found {
+            Self::RNotFound
+        } else if let Some(err) = init_error {
+            Self::InitFailed(err)
+        } else {
+            Self::NoLibraryPaths
+        }
+    }
+}
+
+/// Build a `PackageLibrary` from current configuration — the shared constructor
+/// package-library init sites route through (sites #1 `rebuild_package_library`
+/// and #2 `maybe_init_r` today; the two startup sites follow in phase 2), so
+/// editor and CI can't drift.
+///
+/// Lock-free by design: takes owned/cloned inputs and no `WorldState`, so it
+/// adds no logging/perf/state dependency to this module. R discovery does
+/// synchronous IO, so it runs in `spawn_blocking`; a join failure collapses to
+/// "R not found" (matching the existing builders' `.unwrap_or(None)`), never
+/// `InitFailed`. The helper never logs or prints — each caller surfaces
+/// `status` its own way. Configured `additional_paths` are applied *after* R
+/// discovery so they augment (never suppress) R-reported paths and count toward
+/// readiness.
+pub async fn build_package_library(
+    r_path: Option<PathBuf>,
+    additional_paths: &[PathBuf],
+    workspace_root: Option<PathBuf>,
+    packages_enabled: bool,
+) -> PackageLibraryOutcome {
+    if !packages_enabled {
+        return PackageLibraryOutcome {
+            library: Arc::new(PackageLibrary::new_empty()),
+            status: PackageLibraryStatus::Disabled,
+        };
+    }
+
+    let subprocess =
+        tokio::task::spawn_blocking(move || match (RSubprocess::new(r_path), workspace_root) {
+            (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
+            (sub, _) => sub,
+        })
+        .await
+        .unwrap_or(None);
+
+    let r_found = subprocess.is_some();
+    let mut lib = PackageLibrary::with_subprocess(subprocess);
+    let init_error = lib.initialize().await.err().map(|e| e.to_string());
+    lib.add_library_paths(additional_paths);
+    let has_lib_paths = !lib.lib_paths().is_empty();
+
+    let status = PackageLibraryStatus::classify(init_error, r_found, has_lib_paths);
+    PackageLibraryOutcome {
+        library: Arc::new(lib),
+        status,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the readiness predicate and degradation precedence
+    /// platform-independently. The `Some(_)` rows exercise classification
+    /// *logic* only — `initialize()` never returns `Err` end-to-end, so those
+    /// statuses are unreachable via the real pipeline.
+    #[test]
+    fn classify_truth_table() {
+        use PackageLibraryStatus::*;
+        let none: Option<String> = None;
+        let err = || Some("boom".to_string());
+        // (init_error, r_found, has_lib_paths) -> status
+        assert_eq!(
+            PackageLibraryStatus::classify(none.clone(), true, true),
+            Ready
+        );
+        assert_eq!(
+            PackageLibraryStatus::classify(none.clone(), true, false),
+            NoLibraryPaths
+        );
+        assert_eq!(
+            PackageLibraryStatus::classify(none.clone(), false, true),
+            Ready
+        );
+        assert_eq!(
+            PackageLibraryStatus::classify(none, false, false),
+            RNotFound
+        );
+        assert_eq!(
+            PackageLibraryStatus::classify(err(), true, true),
+            InitFailed("boom".to_string())
+        );
+        assert_eq!(
+            PackageLibraryStatus::classify(err(), true, false),
+            InitFailed("boom".to_string())
+        );
+        assert_eq!(
+            PackageLibraryStatus::classify(err(), false, true),
+            RNotFound
+        );
+        assert_eq!(
+            PackageLibraryStatus::classify(err(), false, false),
+            RNotFound
+        );
+    }
+
+    #[test]
+    fn is_ready_only_for_ready() {
+        use PackageLibraryStatus::*;
+        assert!(Ready.is_ready());
+        for s in [Disabled, RNotFound, InitFailed("x".into()), NoLibraryPaths] {
+            assert!(!s.is_ready(), "{s:?} must not be ready");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_package_library_disabled_is_empty_and_not_ready() {
+        let outcome = build_package_library(None, &[], None, false).await;
+        assert_eq!(outcome.status, PackageLibraryStatus::Disabled);
+        assert!(!outcome.status.is_ready());
+        assert!(outcome.library.lib_paths().is_empty());
+    }
+
+    /// A real temp dir is used because `add_library_paths` appends without an
+    /// existence check, so this reflects the "valid additional path" intent.
+    /// R-independent: additional paths are applied after R discovery.
+    #[tokio::test]
+    async fn build_package_library_honors_additional_paths() {
+        let extra = tempfile::TempDir::new().unwrap();
+        let extra_path = extra.path().to_path_buf();
+        let outcome =
+            build_package_library(None, std::slice::from_ref(&extra_path), None, true).await;
+        assert!(
+            outcome.library.lib_paths().iter().any(|p| p == &extra_path),
+            "additional path must appear in lib_paths; got {:?}",
+            outcome.library.lib_paths()
+        );
+    }
 
     #[test]
     fn test_package_info_new() {

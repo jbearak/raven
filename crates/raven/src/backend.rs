@@ -338,10 +338,7 @@ pub(crate) fn parse_cross_file_config(
             config.undefined_variable_severity = parse_severity(sev);
         }
         // Parse diagnostics.mixedLogicalSeverity
-        if let Some(sev) = diag
-            .get("mixedLogicalSeverity")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(sev) = diag.get("mixedLogicalSeverity").and_then(|v| v.as_str()) {
             config.mixed_logical_severity = parse_severity(sev);
         }
         // Parse diagnostics.conditionAssignmentSeverity
@@ -502,9 +499,7 @@ fn parse_lint_enabled(raw: Option<&serde_json::Value>) -> crate::linting::LintEn
             "on" | "true" => LintEnabled::On,
             "off" | "false" => LintEnabled::Off,
             other => {
-                log::warn!(
-                    "Unrecognised linting.enabled value '{other}'; defaulting to 'auto'."
-                );
+                log::warn!("Unrecognised linting.enabled value '{other}'; defaulting to 'auto'.");
                 LintEnabled::Auto
             }
         },
@@ -645,9 +640,7 @@ pub(crate) fn parse_lint_config(
             "\"" => crate::linting::StringDelimiter::Double,
             "'" => crate::linting::StringDelimiter::Single,
             other => {
-                log::warn!(
-                    "Unrecognised linting.stringDelimiter '{other}', defaulting to '\"'."
-                );
+                log::warn!("Unrecognised linting.stringDelimiter '{other}', defaulting to '\"'.");
                 crate::linting::StringDelimiter::Double
             }
         };
@@ -680,19 +673,22 @@ pub(crate) fn parse_lint_config(
         .get("objectNameStyleFunction")
         .and_then(|v| v.as_str())
     {
-        config.object_name_style_function = parse_object_name_style(style, "objectNameStyleFunction");
+        config.object_name_style_function =
+            parse_object_name_style(style, "objectNameStyleFunction");
     }
     if let Some(style) = linting
         .get("objectNameStyleVariable")
         .and_then(|v| v.as_str())
     {
-        config.object_name_style_variable = parse_object_name_style(style, "objectNameStyleVariable");
+        config.object_name_style_variable =
+            parse_object_name_style(style, "objectNameStyleVariable");
     }
     if let Some(style) = linting
         .get("objectNameStyleArgument")
         .and_then(|v| v.as_str())
     {
-        config.object_name_style_argument = parse_object_name_style(style, "objectNameStyleArgument");
+        config.object_name_style_argument =
+            parse_object_name_style(style, "objectNameStyleArgument");
     }
     if let Some(sev) = linting.get("objectNameSeverity").and_then(|v| v.as_str()) {
         config.object_name_severity = parse_severity(sev);
@@ -712,10 +708,7 @@ pub(crate) fn parse_lint_config(
     if let Some(sev) = linting.get("commasSeverity").and_then(|v| v.as_str()) {
         config.commas_severity = parse_severity(sev);
     }
-    if let Some(sev) = linting
-        .get("tAndFSymbolSeverity")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(sev) = linting.get("tAndFSymbolSeverity").and_then(|v| v.as_str()) {
         config.t_and_f_symbol_severity = parse_severity(sev);
     }
     if let Some(sev) = linting.get("semicolonSeverity").and_then(|v| v.as_str()) {
@@ -724,10 +717,7 @@ pub(crate) fn parse_lint_config(
     if let Some(sev) = linting.get("equalsNaSeverity").and_then(|v| v.as_str()) {
         config.equals_na_severity = parse_severity(sev);
     }
-    if let Some(sev) = linting
-        .get("objectLengthSeverity")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(sev) = linting.get("objectLengthSeverity").and_then(|v| v.as_str()) {
         config.object_length_severity = parse_severity(sev);
     }
     if let Some(sev) = linting.get("vectorLogicSeverity").and_then(|v| v.as_str()) {
@@ -739,16 +729,10 @@ pub(crate) fn parse_lint_config(
     {
         config.function_left_parentheses_severity = parse_severity(sev);
     }
-    if let Some(sev) = linting
-        .get("spacesInsideSeverity")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(sev) = linting.get("spacesInsideSeverity").and_then(|v| v.as_str()) {
         config.spaces_inside_severity = parse_severity(sev);
     }
-    if let Some(sev) = linting
-        .get("indentationSeverity")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(sev) = linting.get("indentationSeverity").and_then(|v| v.as_str()) {
         config.indentation_severity = parse_severity(sev);
     }
 
@@ -4156,7 +4140,9 @@ impl LanguageServer for Backend {
                 let Ok(p) = c.uri.to_file_path() else {
                     return false;
                 };
-                let Some(name) = p.file_name() else { return false };
+                let Some(name) = p.file_name() else {
+                    return false;
+                };
                 name == std::ffi::OsStr::new("raven.toml") || name == std::ffi::OsStr::new(".lintr")
             })
             .cloned()
@@ -5462,10 +5448,7 @@ impl Backend {
     /// Returns the open URIs the caller should republish. Empty when only
     /// `packagesWatch*` flipped — nothing about diagnostic content moved,
     /// so the workspace-wide republish is a waste.
-    async fn reconcile_after_config_recompute(
-        &self,
-        prev: ConfigChangeSnapshot,
-    ) -> Vec<Url> {
+    async fn reconcile_after_config_recompute(&self, prev: ConfigChangeSnapshot) -> Vec<Url> {
         // Brief write lock: change detection, package_mode translate,
         // hier_support restore, force-republish marking. NO blocking I/O
         // happens inside this scope.
@@ -5477,8 +5460,9 @@ impl Backend {
             // set from client capabilities at initialize() time.
             state.symbol_config.hierarchical_document_symbol_support = prev.prev_hier_support;
 
-            let scope_changed =
-                prev.prev_cross_file.scope_settings_changed(&state.cross_file_config);
+            let scope_changed = prev
+                .prev_cross_file
+                .scope_settings_changed(&state.cross_file_config);
 
             let old_diagnostics_enabled = prev.prev_cross_file.diagnostics_enabled;
             let new_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
@@ -5488,8 +5472,7 @@ impl Backend {
             // subprocess call (~100ms). Keep this narrow.
             let package_settings_changed = state.cross_file_config.packages_enabled
                 != prev.prev_cross_file.packages_enabled
-                || state.cross_file_config.packages_r_path
-                    != prev.prev_cross_file.packages_r_path
+                || state.cross_file_config.packages_r_path != prev.prev_cross_file.packages_r_path
                 || state.cross_file_config.packages_additional_library_paths
                     != prev.prev_cross_file.packages_additional_library_paths;
 
@@ -5514,16 +5497,13 @@ impl Backend {
             // extend the chain when adding another such struct.
             let lint_config_changed = state.lint_config != prev.prev_lint;
 
-            let only_watch_changed = watch_settings_changed
-                && !lint_config_changed
-                && {
-                    let mut probe = state.cross_file_config.clone();
-                    probe.packages_watch_library_paths =
-                        prev.prev_cross_file.packages_watch_library_paths;
-                    probe.packages_watch_debounce_ms =
-                        prev.prev_cross_file.packages_watch_debounce_ms;
-                    probe == prev.prev_cross_file
-                };
+            let only_watch_changed = watch_settings_changed && !lint_config_changed && {
+                let mut probe = state.cross_file_config.clone();
+                probe.packages_watch_library_paths =
+                    prev.prev_cross_file.packages_watch_library_paths;
+                probe.packages_watch_debounce_ms = prev.prev_cross_file.packages_watch_debounce_ms;
+                probe == prev.prev_cross_file
+            };
 
             let packages_enabled = state.cross_file_config.packages_enabled;
 
@@ -5536,9 +5516,8 @@ impl Backend {
             let pkg_mode_io_needed: Option<std::path::PathBuf> = if package_mode_changed {
                 use crate::cross_file::config::PackageMode;
                 let mode = state.cross_file_config.package_mode;
-                let event = crate::package_state::event::HandlerEvent::SettingChanged {
-                    new_mode: mode,
-                };
+                let event =
+                    crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
                 if let Some(delta) =
                     crate::package_state::event::translate(&mut state.package_inputs, event)
                 {
@@ -6362,10 +6341,7 @@ impl Backend {
     ///
     /// Replaces the per-document indent unit map wholesale and triggers a
     /// force-republish for every document whose effective indent unit changed.
-    async fn handle_document_indent_units_changed(
-        &self,
-        params: DocumentIndentUnitsChangedParams,
-    ) {
+    async fn handle_document_indent_units_changed(&self, params: DocumentIndentUnitsChangedParams) {
         log::trace!(
             "Received documentIndentUnitsChanged: {} entries",
             params.units.len()
@@ -6411,12 +6387,8 @@ impl Backend {
         };
 
         for uri in affected_uris {
-            Backend::publish_diagnostics_via_arc(
-                self.state.clone(),
-                self.client.clone(),
-                &uri,
-            )
-            .await;
+            Backend::publish_diagnostics_via_arc(self.state.clone(), self.client.clone(), &uri)
+                .await;
         }
     }
 }
@@ -6531,12 +6503,8 @@ pub(crate) async fn publish_diagnostics_inner(
             if snap.file_type == crate::file_type::FileType::R
                 && snap.chunk_kind != crate::chunks::ChunkKind::Rmd =>
         {
-            handlers::diagnostics_from_snapshot(
-                &snap,
-                uri,
-                &handlers::DiagCancelToken::never(),
-            )
-            .unwrap_or_default()
+            handlers::diagnostics_from_snapshot(&snap, uri, &handlers::DiagCancelToken::never())
+                .unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -6731,40 +6699,17 @@ pub(crate) async fn rebuild_package_library(
         )
     };
 
-    if !packages_enabled {
-        return (
-            Arc::new(crate::package_library::PackageLibrary::new_empty()),
-            false,
-        );
+    let outcome = crate::package_library::build_package_library(
+        packages_r_path,
+        &additional_paths,
+        workspace_root,
+        packages_enabled,
+    )
+    .await;
+    if let crate::package_library::PackageLibraryStatus::InitFailed(e) = &outcome.status {
+        log::warn!("rebuild_package_library: initialize failed: {e}");
     }
-
-    // R discovery does synchronous IO (which/where/R --version); run it off
-    // the async runtime.
-    let r_subprocess = tokio::task::spawn_blocking(move || {
-        let subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
-        match (subprocess, workspace_root) {
-            (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
-            (sub, _) => sub,
-        }
-    })
-    .await
-    .unwrap_or(None);
-
-    let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-    let initialized = match lib.initialize().await {
-        Ok(()) => true,
-        Err(e) => {
-            log::warn!("rebuild_package_library: initialize failed: {e}");
-            false
-        }
-    };
-    lib.add_library_paths(&additional_paths);
-    // Readiness requires both a successful initialize() and non-empty
-    // lib_paths(): otherwise downstream code would treat a half-initialized
-    // library (e.g. R subprocess unavailable) as ready and emit false-positive
-    // missing-package diagnostics.
-    let ready = initialized && !lib.lib_paths().is_empty();
-    (Arc::new(lib), ready)
+    (outcome.library, outcome.status.is_ready())
 }
 
 /// Tear down any running libpath watcher and, if watching is enabled and the
@@ -8379,15 +8324,27 @@ mod tests {
         fn parse_lint_config_string_on_off() {
             let on = json!({ "linting": { "enabled": "on" } });
             let off = json!({ "linting": { "enabled": "off" } });
-            assert!(crate::backend::parse_lint_config(&on, false).unwrap().enabled);
-            assert!(!crate::backend::parse_lint_config(&off, true).unwrap().enabled);
+            assert!(
+                crate::backend::parse_lint_config(&on, false)
+                    .unwrap()
+                    .enabled
+            );
+            assert!(
+                !crate::backend::parse_lint_config(&off, true)
+                    .unwrap()
+                    .enabled
+            );
         }
 
         #[test]
         fn parse_lint_config_string_true_false_backcompat() {
             let t = json!({ "linting": { "enabled": "true" } });
             let f = json!({ "linting": { "enabled": "false" } });
-            assert!(crate::backend::parse_lint_config(&t, false).unwrap().enabled);
+            assert!(
+                crate::backend::parse_lint_config(&t, false)
+                    .unwrap()
+                    .enabled
+            );
             assert!(!crate::backend::parse_lint_config(&f, true).unwrap().enabled);
         }
 
@@ -8395,7 +8352,11 @@ mod tests {
         fn parse_lint_config_bool_backcompat() {
             let t = json!({ "linting": { "enabled": true } });
             let f = json!({ "linting": { "enabled": false } });
-            assert!(crate::backend::parse_lint_config(&t, false).unwrap().enabled);
+            assert!(
+                crate::backend::parse_lint_config(&t, false)
+                    .unwrap()
+                    .enabled
+            );
             assert!(!crate::backend::parse_lint_config(&f, true).unwrap().enabled);
         }
 
@@ -8416,10 +8377,7 @@ mod tests {
                 let settings = json!({ "linting": { "enabled": bad } });
                 // Auto with no lintr_discovered → off.
                 let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
-                assert!(
-                    !cfg.enabled,
-                    "expected off for invalid enabled value {bad}"
-                );
+                assert!(!cfg.enabled, "expected off for invalid enabled value {bad}");
             }
         }
 
@@ -10374,11 +10332,17 @@ mod project_config_initialize_tests {
             .await
             .unwrap();
         // Sanity: project file initially enables packages.
-        assert!(backend.state.read().await.cross_file_config.packages_enabled);
+        assert!(
+            backend
+                .state
+                .read()
+                .await
+                .cross_file_config
+                .packages_enabled
+        );
         // Capture the package_library Arc identity so we can prove the
         // reload's rebuild path replaced the instance.
-        let library_before =
-            std::sync::Arc::as_ptr(&backend.state.read().await.package_library);
+        let library_before = std::sync::Arc::as_ptr(&backend.state.read().await.package_library);
 
         // Edit raven.toml to disable packages on disk.
         fs::write(

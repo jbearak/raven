@@ -191,7 +191,10 @@ pub async fn run(args: CheckArgs) -> i32 {
             }
         };
         let Ok(uri) = Url::from_file_path(path) else {
-            eprintln!("raven check: cannot convert path to URL: {}", path.display());
+            eprintln!(
+                "raven check: cannot convert path to URL: {}",
+                path.display()
+            );
             operator_error = true;
             continue;
         };
@@ -271,10 +274,12 @@ fn build_indexed_state(
     // them from disk here would only be overwritten. This mirrors the LSP's
     // with-scan startup path, which seeds package inputs from disk only on the
     // no-scan branch (see `backend.rs`).
-    let desc_text: Option<std::sync::Arc<str>> =
-        std::fs::read_to_string(root.join("DESCRIPTION")).ok().map(|t| t.into());
-    let ns_text: Option<std::sync::Arc<str>> =
-        std::fs::read_to_string(root.join("NAMESPACE")).ok().map(|t| t.into());
+    let desc_text: Option<std::sync::Arc<str>> = std::fs::read_to_string(root.join("DESCRIPTION"))
+        .ok()
+        .map(|t| t.into());
+    let ns_text: Option<std::sync::Arc<str>> = std::fs::read_to_string(root.join("NAMESPACE"))
+        .ok()
+        .map(|t| t.into());
     crate::backend::initialize_package_inputs_from_state(
         &mut state,
         root.to_path_buf(),
@@ -310,7 +315,10 @@ fn resolve_project_config(
         return match crate::config_file::load_toml(explicit) {
             Some(l) => loaded(l.warnings, l.settings, explicit.to_path_buf()),
             None => {
-                eprintln!("raven check: failed to load --config {}", explicit.display());
+                eprintln!(
+                    "raven check: failed to load --config {}",
+                    explicit.display()
+                );
                 Err(EXIT_OPERATOR_ERROR)
             }
         };
@@ -340,76 +348,69 @@ fn resolve_project_config(
 }
 
 /// Auto-detect R and initialize the package library so installed-package
-/// exports and base R symbols are available. Honors the same `raven.toml`
-/// package settings the editor does, applying them exactly as
-/// [`crate::backend::rebuild_package_library`] does so the two init paths can't
-/// drift:
-/// - `packages.enabled` (`cross_file_config.packages_enabled`) gates the whole
-///   thing — when `false`, this returns immediately (before any R discovery),
-///   leaving the default empty library and `package_library_ready = false`, so
-///   a user who disabled package awareness in their editor doesn't get package
-///   diagnostics in CI.
-/// - `packages.rPath` (`cross_file_config.packages_r_path`) selects the R binary.
-/// - `packages.additionalLibraryPaths`
-///   (`cross_file_config.packages_additional_library_paths`) augments the
-///   discovered search paths.
+/// exports and base R symbols are available. Routes through the shared
+/// [`crate::package_library::build_package_library`] helper, which is the
+/// single source of the readiness predicate and degradation classification, so
+/// this CLI path and the editor's startup paths can't drift. It honors the
+/// same `raven.toml` package settings the editor does:
+/// - `packages.enabled` gates the whole thing — when `false`, the helper
+///   returns `Disabled` *before* any R discovery, so this leaves the default
+///   empty library and `package_library_ready = false` and a user who disabled
+///   package awareness in their editor doesn't get package diagnostics in CI.
+/// - `packages.rPath` selects the R binary.
+/// - `packages.additionalLibraryPaths` augments the discovered search paths
+///   (applied after R discovery, so configured paths never suppress R-reported
+///   ones and count toward readiness).
 ///
-/// On success the library and `package_library_ready = true` are stored on
-/// `state`. Every degradation path (packages disabled, R absent, init error, no
-/// library paths) leaves the default empty library in place; the R-related ones
-/// print a specific one-line note to stderr so the message reflects what
-/// actually happened.
+/// On `Ready` the library and `package_library_ready = true` are stored on
+/// `state`. Every other status leaves the default empty library in place. There
+/// are **three** R-related degradation notes printed to stderr (R absent, init
+/// error, no library paths) so the message reflects what actually happened;
+/// `Disabled` is a degradation path that prints **nothing**.
 async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
-    // Gate on `packages.enabled` *before* any R discovery, exactly as
-    // `rebuild_package_library` does. A user who disabled package awareness in
-    // their editor must not get package / base-symbol diagnostics in CI; the
-    // default empty library stays in place and `package_library_ready` stays
-    // false.
-    if !state.cross_file_config.packages_enabled {
-        return;
-    }
-
+    // Snapshot config into locals before the call so the later `state`
+    // mutation doesn't conflict with the borrow.
     let r_path = state.cross_file_config.packages_r_path.clone();
-    let additional_paths = state
+    let additional = state
         .cross_file_config
         .packages_additional_library_paths
         .clone();
-    let root_owned = root.to_path_buf();
-    // R discovery performs synchronous IO (which/where, R --version); run it off
-    // the async executor, mirroring the LSP startup path in backend.rs.
-    let subprocess = tokio::task::spawn_blocking(move || {
-        crate::r_subprocess::RSubprocess::new(r_path).map(|s| s.with_working_dir(root_owned))
-    })
-    .await
-    .unwrap_or(None);
+    let enabled = state.cross_file_config.packages_enabled;
 
-    // Build the library even when R is absent, mirroring `rebuild_package_library`:
-    // `initialize()` does static, offline base-symbol loading, and the configured
-    // additional paths must still be honored. `r_found` only selects the right
-    // degradation message below.
-    let r_found = subprocess.is_some();
-    let mut lib = crate::package_library::PackageLibrary::with_subprocess(subprocess);
-    let init_result = lib.initialize().await;
-    // Apply user-configured additional library paths *after* R discovery so they
-    // augment (never suppress) the paths R reported — same ordering as
-    // `rebuild_package_library`.
-    lib.add_library_paths(&additional_paths);
+    let outcome = crate::package_library::build_package_library(
+        r_path,
+        &additional,
+        Some(root.to_path_buf()),
+        enabled,
+    )
+    .await;
 
-    if init_result.is_ok() && !lib.lib_paths().is_empty() {
-        state.package_library = std::sync::Arc::new(lib);
-        state.package_library_ready = true;
-    } else if !r_found {
-        eprintln!(
+    // The shared helper gates on `packages.enabled` *before* any R discovery
+    // (returning `Disabled`), applies `additionalLibraryPaths` after discovery,
+    // and computes readiness from non-empty `lib_paths()` — exactly as the
+    // editor's `backend::rebuild_package_library` does, so the two init paths
+    // can't drift. Each status surfaces its own way; only the R-related
+    // degradations print a note, and `Disabled` is silent.
+    use crate::package_library::PackageLibraryStatus::*;
+    match outcome.status {
+        Ready => {
+            state.package_library = outcome.library;
+            state.package_library_ready = true;
+        }
+        // Packages disabled in `raven.toml`: keep the default empty library and
+        // `package_library_ready = false`, silently — a user who disabled
+        // package awareness in their editor doesn't get package diagnostics in
+        // CI.
+        Disabled => {}
+        RNotFound => eprintln!(
             "raven check: R not found on PATH; package and base-symbol diagnostics will be limited"
-        );
-    } else if let Err(e) = init_result {
-        eprintln!(
+        ),
+        InitFailed(e) => eprintln!(
             "raven check: R found but its package library failed to initialize ({e}); package and base-symbol diagnostics will be limited"
-        );
-    } else {
-        eprintln!(
+        ),
+        NoLibraryPaths => eprintln!(
             "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
-        );
+        ),
     }
 }
 
@@ -456,13 +457,21 @@ async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -
 ///
 /// A named path that does not exist sets `*operator_error`, so the caller can
 /// return exit code 2 — matching `raven lint`.
-fn collect_report_targets(paths: &[PathBuf], root: &Path, operator_error: &mut bool) -> Vec<PathBuf> {
+fn collect_report_targets(
+    paths: &[PathBuf],
+    root: &Path,
+    operator_error: &mut bool,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if paths.is_empty() {
         collect_r_file_paths(root, &mut out);
     } else {
         for p in paths {
-            let abs = if p.is_absolute() { p.clone() } else { root.join(p) };
+            let abs = if p.is_absolute() {
+                p.clone()
+            } else {
+                root.join(p)
+            };
             let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
             if abs.is_dir() {
                 collect_r_file_paths(&abs, &mut out);
@@ -610,7 +619,11 @@ mod tests {
         // sourced path would read as "outside workspace".
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("R")).unwrap();
-        fs::write(tmp.path().join("R/helpers.R"), "add_one <- function(x) x + 1\n").unwrap();
+        fs::write(
+            tmp.path().join("R/helpers.R"),
+            "add_one <- function(x) x + 1\n",
+        )
+        .unwrap();
         fs::write(
             tmp.path().join("R/main.R"),
             "source(\"helpers.R\")\nresult <- add_one(41)\n",
@@ -643,11 +656,7 @@ mod tests {
         // a `source()` of a file that does not exist (missing-file = WARNING by
         // default, which exceeds the default --max-severity of `info`).
         let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("main.R"),
-            "source(\"does_not_exist.R\")\n",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("main.R"), "source(\"does_not_exist.R\")\n").unwrap();
         assert_eq!(run_blocking(base_args(tmp.path())), EXIT_LINT_FAILED);
     }
 
@@ -656,11 +665,7 @@ mod tests {
         // With --max-severity warning, a WARNING-level missing-file diagnostic
         // no longer fails the build.
         let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("main.R"),
-            "source(\"does_not_exist.R\")\n",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("main.R"), "source(\"does_not_exist.R\")\n").unwrap();
         let mut args = base_args(tmp.path());
         args.max_severity = SeverityLevel::Warning;
         assert_eq!(run_blocking(args), EXIT_OK);
