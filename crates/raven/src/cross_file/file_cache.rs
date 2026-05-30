@@ -167,7 +167,10 @@ impl CrossFileFileCache {
     /// wrapper to avoid blocking the event loop.
     pub fn read_and_cache(&self, uri: &Url) -> Option<String> {
         let path = uri.to_file_path().ok()?;
-        let content = std::fs::read_to_string(&path).ok()?;
+        // Decode through the shared BOM-aware seam so cached cross-file content
+        // matches the workspace scan (UTF-8 BOM stripped, UTF-16 decoded); an
+        // undecodable file yields `None` and is left uncached.
+        let content = crate::state::read_source(&path).ok()?;
         let metadata = std::fs::metadata(&path).ok()?;
         let snapshot = FileSnapshot::with_content_hash(&metadata, &content);
         self.insert(uri.clone(), snapshot, content.clone());
@@ -310,6 +313,22 @@ mod tests {
 
         // Should be cached now
         assert!(cache.get(&uri).is_some());
+    }
+
+    #[test]
+    fn read_and_cache_strips_utf8_bom() {
+        let cache = CrossFileFileCache::new();
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(&[0xEF, 0xBB, 0xBF]).unwrap();
+        temp.write_all(b"x <- 1\n").unwrap();
+        temp.flush().unwrap();
+        let uri = Url::from_file_path(temp.path()).unwrap();
+
+        // The cross-file content cache feeds scope/metadata extraction; a
+        // leftover U+FEFF would corrupt the first token, so the read must strip
+        // it through the shared BOM-aware seam like the workspace scan does.
+        let content = cache.read_and_cache(&uri).expect("content read");
+        assert_eq!(content, "x <- 1\n");
     }
 
     #[test]

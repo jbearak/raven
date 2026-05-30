@@ -49,7 +49,7 @@ Before reporting, `raven check` warms the export cache for the packages each rep
 
 ### File encoding
 
-Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked UTF-16 (LE/BE) is decoded, but anything else must already be valid UTF-8 — Raven does not guess legacy single-byte encodings (Latin-1 / Windows-1252). Guessing would silently mis-decode: a non-breaking space (`0xA0`) inside a string comparison, for instance, would read as an ordinary space and quietly change what your code matches. A *reported* file that isn't valid UTF-8 is therefore flagged as an **error diagnostic** (`File is not valid UTF-8: first invalid byte 0x… at offset …`) that fails the build like any other error finding — it is **not** an operator error. Re-save the file as UTF-8 to fix it. A file that is only *indexed* for cross-file resolution (not itself reported) and can't be decoded is silently skipped, matching the editor.
+Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked UTF-16 (LE/BE) is decoded, but anything else must already be valid UTF-8 — Raven does not guess legacy single-byte encodings (Latin-1 / Windows-1252). Guessing would silently mis-decode: a non-breaking space (`0xA0`) inside a string comparison, for instance, would read as an ordinary space and quietly change what your code matches. A *reported* file that isn't valid UTF-8 is therefore flagged as an **error diagnostic** (`File is not valid UTF-8: first invalid byte 0x… at offset …`) that fails the build like any other error finding — it is **not** an operator error. Re-save the file as UTF-8 to fix it. A file that is only *indexed* for cross-file resolution (not itself reported) and can't be decoded is silently skipped, matching the editor. `raven lint` and `analysis-stats` read through the same decoder, so encoding handling is uniform across the CLI.
 
 ### Exit codes
 
@@ -92,11 +92,15 @@ raven lint [OPTIONS] [PATHS...]
 - `--quiet` — suppress the trailing summary line.
 - `--no-color` — accepted for forward compatibility. `text` output is currently uncolored regardless, so this flag has no visible effect yet.
 
+### File encoding
+
+`raven lint` reads each file through the same BOM-aware decoder as `raven check` and the editor: a UTF-8 byte-order mark is stripped and BOM-marked UTF-16 (LE/BE) is decoded, while legacy single-byte encodings (Latin-1 / Windows-1252) are never guessed — see [File encoding](#file-encoding) under `raven check` for the rationale. A file that isn't valid UTF-8 is reported as an **error diagnostic** (`File is not valid UTF-8: first invalid byte 0x… at offset …`) that fails the build (exit `1`) like any other error finding — it is **not** an operator error, so it no longer exits `2` with a cryptic decode message. Re-save the file as UTF-8 to fix it.
+
 ### Exit codes
 
 - `0` — no diagnostic exceeded `--max-severity`.
-- `1` — at least one diagnostic exceeded `--max-severity`. An unknown flag is a usage error and exits `1`.
-- `2` — operator error detected while running (config parse failure, unreadable or missing path).
+- `1` — at least one diagnostic exceeded `--max-severity`. An unknown flag is a usage error and exits `1`. A file that isn't valid UTF-8 is an error diagnostic, so it also exits `1`.
+- `2` — operator error detected while running (config parse failure, unreadable or missing path). A *readable* but mis-encoded file is a finding (exit `1`), not an operator error.
 
 ### GitHub Actions example
 

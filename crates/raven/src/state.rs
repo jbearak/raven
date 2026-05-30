@@ -1271,11 +1271,23 @@ pub(crate) fn read_source(path: &Path) -> Result<String, SourceReadError> {
     decode_source(fs::read(path).map_err(SourceReadError::Io)?)
 }
 
+/// Async counterpart to [`read_source`]: read the file's bytes off the Tokio
+/// runtime, then decode them through the shared [`decode_source`] rules. Used by
+/// the LSP's async cross-file readers (watched-file reindex, on-demand indexing)
+/// so they handle a UTF-8 BOM and UTF-16 identically to the synchronous scan.
+/// Like `read_source`, error *policy* is the caller's: those index paths discard
+/// the error and skip the file — they never publish encoding diagnostics.
+pub(crate) async fn read_source_async(path: &Path) -> Result<String, SourceReadError> {
+    decode_source(tokio::fs::read(path).await.map_err(SourceReadError::Io)?)
+}
+
 /// Decode raw file bytes per the [`read_source`] rules. Split out so the
-/// BOM/UTF-8 logic is unit-testable without touching the filesystem. Takes an
-/// owned `Vec` so the common no-BOM UTF-8 path moves the buffer straight into
-/// the `String` without copying.
-fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
+/// BOM/UTF-8 logic is unit-testable without touching the filesystem, and so the
+/// async readers (the background indexer and cross-file LSP reads, which read
+/// bytes via `tokio::fs::read`) share the exact same decode as the synchronous
+/// [`read_source`]. Takes an owned `Vec` so the common no-BOM UTF-8 path moves
+/// the buffer straight into the `String` without copying.
+pub(crate) fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         // UTF-8 BOM: strip it; an error's file offset is then `3 + valid_up_to`.
         return decode_utf8_slice(&bytes[3..], 3);
@@ -1631,6 +1643,29 @@ mod tests {
                 assert_eq!(byte, 0xA0);
             }
             other => panic!("expected InvalidEncoding, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_source_async_matches_read_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // UTF-8 BOM is stripped, exactly like the synchronous read_source.
+        let bom = tmp.path().join("bom.R");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"x <- 1\n");
+        std::fs::write(&bom, bytes).unwrap();
+        assert_eq!(read_source_async(&bom).await.unwrap(), "x <- 1\n");
+
+        // UTF-16 LE BOM is decoded.
+        let u16_path = tmp.path().join("u16.R");
+        std::fs::write(&u16_path, vec![0xFF, 0xFE, b'a', 0x00, b'b', 0x00, b'\n', 0x00]).unwrap();
+        assert_eq!(read_source_async(&u16_path).await.unwrap(), "ab\n");
+
+        // A missing file is an Io error, not InvalidEncoding.
+        match read_source_async(&tmp.path().join("missing.R")).await {
+            Err(SourceReadError::Io(_)) => {}
+            other => panic!("expected Io error for a missing file, got {other:?}"),
         }
     }
 

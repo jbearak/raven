@@ -107,6 +107,45 @@ pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     crate::state::collect_files_matching(dir, out, is_r_file);
 }
 
+/// Build the reported finding for a target that isn't valid UTF-8. A
+/// mis-encoded source file (typically Latin-1 / Windows-1252 saved without a
+/// BOM) can't be parsed, but it's a property of the user's code — so it's an
+/// error-severity diagnostic (exit 1, like a syntax error) rather than an
+/// operator error (exit 2). The range is `0:0` because the file can't be
+/// decoded into lines; the byte offset in the message is the actionable
+/// pointer. `byte == 0` marks the rare malformed-UTF-16 case, where there's no
+/// single offending byte to name.
+///
+/// Shared by `raven check` (report loop) and `raven lint` (`walk`) so the two
+/// emit the identical message for an undecodable [`crate::state::read_source`]
+/// failure.
+pub fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
+    use tower_lsp::lsp_types::{Position, Range};
+    // Compose the whole message per branch rather than gluing a fixed
+    // "not valid UTF-8" prefix onto the detail: the `byte == 0` case can be a
+    // malformed UTF-16 file (which carried a BOM), so a "not valid UTF-8" prefix
+    // would contradict its own tail.
+    let message = if byte == 0 {
+        // No single offending byte to name: a truncated multibyte sequence at
+        // EOF, or malformed/odd-length UTF-16.
+        "File could not be decoded as UTF-8 or UTF-16. Re-save the file as UTF-8.".to_string()
+    } else {
+        format!(
+            "File is not valid UTF-8: first invalid byte {byte:#04x} at offset {offset} \
+             (looks like Latin-1/Windows-1252). Re-save the file as UTF-8."
+        )
+    };
+    Diagnostic {
+        range: Range {
+            start: Position { line: 0, character: 0 },
+            end: Position { line: 0, character: 0 },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        message,
+        ..Default::default()
+    }
+}
+
 /// Render diagnostics in the requested format. The single dispatch point both
 /// `lint` and `check` call after collecting their `(path, diagnostic)` pairs,
 /// so the format → renderer mapping lives in one place next to the renderers.
@@ -266,6 +305,22 @@ mod tests {
             severity: Some(severity),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn encoding_diagnostic_message_matches_the_failure_kind() {
+        // Latin-1 (a concrete offending byte): names UTF-8 and the byte/offset.
+        let latin1 = encoding_diagnostic(930, 0xA0);
+        assert!(
+            latin1.message.contains("not valid UTF-8") && latin1.message.contains("0xa0"),
+            "{}",
+            latin1.message
+        );
+        // Malformed/odd-length UTF-16 (byte == 0): the file carried a BOM, so the
+        // message must NOT claim "not valid UTF-8" and must mention UTF-16.
+        let utf16 = encoding_diagnostic(0, 0);
+        assert!(!utf16.message.contains("not valid UTF-8"), "{}", utf16.message);
+        assert!(utf16.message.contains("UTF-16"), "{}", utf16.message);
     }
 
     #[test]

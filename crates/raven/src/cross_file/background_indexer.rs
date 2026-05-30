@@ -281,7 +281,14 @@ impl BackgroundIndexer {
             .to_file_path()
             .map_err(|_| anyhow!("Invalid file path: {}", uri))?;
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        // Read raw bytes and decode through the shared BOM-aware seam, exactly
+        // as the synchronous workspace scan does, so the background index agrees
+        // with it on UTF-8-BOM and UTF-16-BOM files. An undecodable file
+        // propagates an error here; the caller logs it and leaves the file
+        // unindexed (a silent skip, like the scan) — index paths never publish
+        // encoding diagnostics.
+        let content = crate::state::decode_source(tokio::fs::read(&path).await?)
+            .map_err(|e| anyhow!("{} is not valid UTF-8/UTF-16: {e:?}", path.display()))?;
         let metadata_fs = tokio::fs::metadata(&path).await?;
 
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
@@ -479,6 +486,42 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///test/{}", name)).unwrap()
+    }
+
+    /// Control: a plain UTF-8 file indexes successfully against a fresh
+    /// `WorldState`, so the UTF-16 test below isolates the *decode* path rather
+    /// than some unrelated empty-state failure.
+    #[tokio::test]
+    async fn index_file_indexes_plain_utf8_with_empty_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("plain.R");
+        std::fs::write(&file, "x <- 1\n").unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new(vec![])));
+        let uri = Url::from_file_path(&file).unwrap();
+        let result = BackgroundIndexer::index_file(&state, &uri).await;
+        assert!(result.is_ok(), "plain UTF-8 must index: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn index_file_decodes_utf16_through_the_shared_seam() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("u16.R");
+        // A UTF-16 LE file (BOM + "x <- 1\n"). A raw `read_to_string` rejects
+        // this as invalid UTF-8, so the file would never be indexed; decoding
+        // through `decode_source` reads it exactly as the synchronous scan does.
+        let mut bytes = vec![0xFF, 0xFE]; // UTF-16 LE BOM
+        for u in "x <- 1\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&file, bytes).unwrap();
+
+        let state = Arc::new(RwLock::new(WorldState::new(vec![])));
+        let uri = Url::from_file_path(&file).unwrap();
+        let result = BackgroundIndexer::index_file(&state, &uri).await;
+        assert!(
+            result.is_ok(),
+            "a UTF-16-BOM file must index via the BOM-aware seam: {result:?}"
+        );
     }
 
     #[test]

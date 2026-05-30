@@ -1510,7 +1510,10 @@ fn collect_package_r_file_inputs_from_disk(
             let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            // Decode through the shared BOM-aware seam so package R-file inputs
+            // match the workspace scan (which uses read_source); an undecodable
+            // file is skipped, like the scan.
+            let Ok(text) = crate::state::read_source(&path) else {
                 continue;
             };
             let text: std::sync::Arc<str> = text.into();
@@ -3963,7 +3966,9 @@ impl LanguageServer for Backend {
             let path = uri.to_file_path().ok();
             if let Some(path) = path {
                 tokio::task::spawn_blocking(move || {
-                    std::fs::read_to_string(path)
+                    // BOM-aware decode (read off the async runtime); an
+                    // undecodable closed file simply yields no text.
+                    crate::state::read_source(&path)
                         .ok()
                         .map(|text| Arc::from(text.as_str()))
                 })
@@ -4636,10 +4641,10 @@ impl LanguageServer for Backend {
                         Err(_) => continue,
                     };
 
-                    let content = match tokio::fs::read_to_string(&path).await {
+                    let content = match crate::state::read_source_async(&path).await {
                         Ok(c) => c,
                         Err(e) => {
-                            log::trace!("Failed to read file {}: {}", uri, e);
+                            log::trace!("Failed to read/decode file {}: {:?}", uri, e);
                             continue;
                         }
                     };
@@ -5801,10 +5806,10 @@ impl Backend {
             }
         };
 
-        let content = match tokio::fs::read_to_string(&path).await {
+        let content = match crate::state::read_source_async(&path).await {
             Ok(c) => c,
             Err(e) => {
-                log::trace!("Failed to read file {}: {}", file_uri, e);
+                log::trace!("Failed to read/decode file {}: {:?}", file_uri, e);
                 return None;
             }
         };
@@ -6126,10 +6131,10 @@ impl Backend {
             }
         };
 
-        let content = match tokio::fs::read_to_string(&path).await {
+        let content = match crate::state::read_source_async(&path).await {
             Ok(c) => c,
             Err(e) => {
-                log::trace!("Failed to read file {}: {}", file_uri, e);
+                log::trace!("Failed to read/decode file {}: {:?}", file_uri, e);
                 return None;
             }
         };

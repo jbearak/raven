@@ -329,13 +329,16 @@ pub fn print_results_csv(results: &[PhaseResult]) {
 ///
 /// Path discovery is shared with `raven check` via
 /// [`crate::cli::shared::collect_r_file_paths`]; this reads the contents in a
-/// second pass. Unreadable files are skipped.
+/// second pass through the shared BOM-aware [`crate::state::read_source`] seam,
+/// so the profiler sees the same decoded text the scan does. Unreadable or
+/// undecodable files are silently skipped — this is a profiler, not a
+/// diagnostic tool, so it emits no findings.
 fn discover_r_files(root: &Path) -> Vec<(PathBuf, String)> {
     let mut paths = Vec::new();
     crate::cli::shared::collect_r_file_paths(root, &mut paths);
     let mut files: Vec<(PathBuf, String)> = paths
         .into_iter()
-        .filter_map(|p| std::fs::read_to_string(&p).ok().map(|content| (p, content)))
+        .filter_map(|p| crate::state::read_source(&p).ok().map(|content| (p, content)))
         .collect();
     // Sort for deterministic ordering
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -564,6 +567,37 @@ mod tests {
         let files = discover_r_files(dir.path());
         assert_eq!(files.len(), 1);
         assert!(files[0].0.ends_with("real.R"));
+    }
+
+    #[test]
+    fn test_discover_r_files_strips_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"x <- 1\n");
+        std::fs::write(dir.path().join("bom.R"), bytes).unwrap();
+
+        let files = discover_r_files(dir.path());
+        assert_eq!(files.len(), 1);
+        // Reading through the BOM-aware seam strips the leading U+FEFF; a raw
+        // read_to_string would leave it on the first token, skewing the profiled
+        // parse/scope work and diverging from the workspace scan.
+        assert_eq!(files[0].1, "x <- 1\n");
+    }
+
+    #[test]
+    fn test_discover_r_files_skips_undecodable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A Latin-1 file (a bare 0xA0 with no UTF-16 BOM) can't be decoded.
+        // analysis-stats is a profiler, not a diagnostic tool, so it silently
+        // skips the file rather than reporting a finding.
+        let mut bytes = b"x <- 1\n".to_vec();
+        bytes.push(0xA0);
+        std::fs::write(dir.path().join("latin1.R"), bytes).unwrap();
+        std::fs::write(dir.path().join("clean.R"), "y <- 2\n").unwrap();
+
+        let files = discover_r_files(dir.path());
+        assert_eq!(files.len(), 1, "the undecodable file must be skipped; got {files:?}");
+        assert!(files[0].0.ends_with("clean.R"));
     }
 
     #[test]

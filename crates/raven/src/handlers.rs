@@ -12990,9 +12990,11 @@ fn read_file_content(document_contents: &HashMap<Url, String>, uri_str: &str) ->
         return Some(content.clone());
     }
 
-    // Fall back to reading from disk
+    // Fall back to reading from disk through the shared BOM-aware seam (UTF-8
+    // BOM stripped, UTF-16 BOM decoded), matching the workspace scan. An
+    // undecodable file yields `None` — the caller treats it as "no content".
     let path = uri.to_file_path().ok()?;
-    std::fs::read_to_string(path).ok()
+    crate::state::read_source(&path).ok()
 }
 
 /// Clear the data field from a completion item (helper for early returns).
@@ -15348,6 +15350,23 @@ fn hover_blocking(state: &WorldState, uri: &Url, position: Position) -> Option<H
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn read_file_content_strips_bom_on_disk_fallback() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("x.R");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"x <- 1\n");
+        std::fs::write(&file, bytes).unwrap();
+        let uri = Url::from_file_path(&file).unwrap();
+        // Empty doc store → falls through to the disk read, which now decodes
+        // through the shared BOM-aware seam. A raw read_to_string would leave
+        // the leading U+FEFF on the first token.
+        let docs: HashMap<Url, String> = HashMap::new();
+        let content = read_file_content(&docs, uri.as_str()).unwrap();
+        assert_eq!(content, "x <- 1\n");
+    }
 
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();

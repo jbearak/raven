@@ -163,7 +163,12 @@ fn translate_watched(
             inputs.r_files.remove(&path);
             return Some(PackageInputDelta::RFileDeleted { path, kind });
         }
-        let text = on_disk_text.or_else(|| fs::read_to_string(&path).ok().map(Arc::from))?;
+        // Decode the disk fallback through the shared BOM-aware seam so this
+        // incremental path matches the bulk scan
+        // (collect_package_r_file_inputs_from_disk); an undecodable file yields
+        // no text and is treated as "no signal" (leaves the prior input).
+        let text = on_disk_text
+            .or_else(|| crate::state::read_source(&path).ok().map(Arc::from))?;
         let digest = ContentDigest::of(&text);
         inputs.r_files.insert(
             path.clone(),
@@ -265,12 +270,14 @@ fn collect_r_file_inputs_from_dir(
         let Some(kind) = is_r_source_path(&path, root) else {
             continue;
         };
-        let text = match fs::read_to_string(&path) {
+        // BOM-aware decode, matching the bulk scan; an undecodable file is
+        // skipped (and marks the scan incomplete so prior inputs are preserved).
+        let text = match crate::state::read_source(&path) {
             Ok(text) => text,
             Err(err) => {
                 complete_scan = false;
                 log::trace!(
-                    "Package R directory scan could not read {}: {}",
+                    "Package R directory scan could not read {}: {:?}",
                     path.display(),
                     err
                 );
@@ -626,6 +633,78 @@ mod tests {
 
         assert!(matches!(delta, Some(PackageInputDelta::Batch(_))));
         assert!(inputs.r_files.is_empty());
+    }
+
+    #[test]
+    fn watched_r_file_change_strips_bom_when_reading_from_disk() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let r_dir = root.join("R");
+        std::fs::create_dir_all(&r_dir).unwrap();
+        let path = r_dir.join("foo.R");
+        // A UTF-8-BOM package R file. The watched-file path falls back to a disk
+        // read here (on_disk_text is None when the cross-file cache is cold), and
+        // must strip the BOM so the incremental path agrees with the bulk scan
+        // (collect_package_r_file_inputs_from_disk) on RFileInput.text and its
+        // ContentDigest — otherwise the same file yields two digests/parses
+        // depending on ingestion path.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"foo <- 2\n");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&path).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert!(matches!(delta, Some(PackageInputDelta::RFileChanged { .. })));
+        let entry = inputs.r_files.get(&path).expect("file input");
+        assert_eq!(
+            &*entry.text, "foo <- 2\n",
+            "BOM must be stripped on the watched-file disk read"
+        );
+    }
+
+    #[test]
+    fn watched_directory_scan_strips_bom() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let r_dir = root.join("R");
+        std::fs::create_dir_all(&r_dir).unwrap();
+        let path = r_dir.join("foo.R");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"foo <- 1\n");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+
+        // A directory-level watched event triggers the recursive rescan, which
+        // must decode through the same BOM-aware seam as the bulk scan.
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&r_dir).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert!(matches!(delta, Some(PackageInputDelta::Batch(_))));
+        let entry = inputs.r_files.get(&path).expect("file input");
+        assert_eq!(
+            &*entry.text, "foo <- 1\n",
+            "BOM must be stripped in the directory rescan"
+        );
     }
 
     #[test]

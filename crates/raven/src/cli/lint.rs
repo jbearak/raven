@@ -6,8 +6,9 @@ use serde_json::json;
 use tower_lsp::lsp_types::Diagnostic;
 
 use crate::cli::shared::{
-    absolute_path, is_chunk_file, is_r_file, parse_output_format, parse_severity_level, render,
-    OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+    absolute_path, encoding_diagnostic, is_chunk_file, is_r_file, parse_output_format,
+    parse_severity_level, render, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK,
+    EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -276,11 +277,24 @@ fn walk(
             overrides,
             &uri,
         );
-        let text = match std::fs::read_to_string(path) {
+        // Decode through the shared BOM-aware seam so `raven lint` reads files
+        // identically to the workspace scan and `raven check` (UTF-8 BOM
+        // stripped, UTF-16 BOM decoded).
+        let text = match crate::state::read_source(path) {
             Ok(t) => t,
-            Err(e) => {
+            Err(crate::state::SourceReadError::Io(e)) => {
                 eprintln!("raven lint: cannot read {}: {e}", path.display());
                 *operator_error = true;
+                return;
+            }
+            // A mis-encoded file (typically Latin-1 / Windows-1252 saved without
+            // a BOM) is a property of the user's code, like a syntax error — so
+            // report it as an ERROR finding (exit 1) instead of aborting the run
+            // as an operator error (exit 2). This brings lint to parity with
+            // `raven check`, replacing the cryptic "stream did not contain valid
+            // UTF-8" abort with the actionable `encoding_diagnostic` message.
+            Err(crate::state::SourceReadError::InvalidEncoding { offset, byte }) => {
+                out.push((path.to_path_buf(), encoding_diagnostic(offset, byte)));
                 return;
             }
         };
@@ -567,5 +581,110 @@ mod tests {
         // suite that runs the binary.
         let code = run(args);
         assert_eq!(code, EXIT_LINT_FAILED); // warning > info default
+    }
+
+    /// Args that lint one file with `enabled` linting, sharing the boilerplate
+    /// the encoding tests need (`walk` requires a parsed config + overrides).
+    fn lint_one(root: &Path, file: &Path, settings: &serde_json::Value) -> (Vec<(PathBuf, Diagnostic)>, bool) {
+        let base_lint = crate::backend::parse_lint_config(settings, false).unwrap();
+        let base_section = settings.get("linting").cloned().unwrap();
+        let overrides = crate::config_file::compile_lint_overrides(settings, root);
+        let mut diags = Vec::new();
+        let mut operator_error = false;
+        walk(
+            file,
+            root,
+            &base_section,
+            &base_lint,
+            &overrides,
+            &mut diags,
+            &mut operator_error,
+        );
+        (diags, operator_error)
+    }
+
+    #[test]
+    fn walk_reports_non_utf8_as_finding_not_operator_error() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // A Latin-1 / Windows-1252 file: a bare 0xA0 (non-breaking space) with
+        // no UTF-16 BOM. `raven check` reports this as an ERROR finding (exit 1),
+        // not an operator error (exit 2); `raven lint` must match instead of
+        // aborting with the cryptic "stream did not contain valid UTF-8".
+        let mut bytes = b"x <- 1\n".to_vec();
+        bytes.push(0xA0);
+        bytes.push(b'\n');
+        let file = root.join("latin1.R");
+        fs::write(&file, bytes).unwrap();
+
+        let settings = serde_json::json!({ "linting": { "enabled": true } });
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(
+            !operator_error,
+            "a mis-encoded file is a property of the code, not an operator error"
+        );
+        assert_eq!(diags.len(), 1, "expected exactly one encoding finding, got {diags:?}");
+        let d = &diags[0].1;
+        assert_eq!(
+            d.severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert!(d.message.contains("not valid UTF-8"), "{}", d.message);
+    }
+
+    #[test]
+    fn walk_strips_utf8_bom_before_measuring_line_length() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Line 1 is exactly 20 UTF-16 units (the clamp floor for `lineLength`)
+        // *after* the BOM is stripped. With a leftover U+FEFF (len_utf16 == 1)
+        // it would measure 21 and trip line_length; reading through the
+        // BOM-aware seam strips it, so the file is clean. (Pre-migration
+        // `read_to_string` keeps the BOM → this fails.)
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"x <- \"aaaaaaaaaaaaa\"\n"); // 20 chars after the BOM
+        let file = root.join("bom.R");
+        fs::write(&file, bytes).unwrap();
+
+        let settings = serde_json::json!({
+            "linting": { "enabled": true, "lineLength": 20, "lineLengthSeverity": "warning" }
+        });
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(!operator_error);
+        assert!(
+            !diags.iter().any(|(_, d)| d.message.contains("characters long")),
+            "BOM must be stripped before line-length measurement; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn run_reports_non_utf8_file_as_finding_exit_1() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("raven.toml"), "[linting]\nenabled = true\n").unwrap();
+        let mut bytes = b"x <- 1\n".to_vec();
+        bytes.push(0xA0);
+        bytes.push(b'\n');
+        fs::write(tmp.path().join("latin1.R"), bytes).unwrap();
+
+        let args = LintArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            config_path: Some(tmp.path().join("raven.toml")),
+            no_config: false,
+            format: OutputFormat::Json,
+            max_severity: SeverityLevel::Info,
+            quiet: true,
+            no_color: true,
+        };
+        // Before this migration a non-UTF-8 file set operator_error → exit 2.
+        // Now it is an ERROR finding (parity with `raven check`) → exit 1.
+        assert_eq!(run(args), EXIT_LINT_FAILED);
     }
 }
