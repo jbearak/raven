@@ -1172,25 +1172,25 @@ impl Backend {
         };
 
         log::trace!("Initializing PackageLibrary on demand (not yet ready)");
-        let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
-        let r_subprocess = match (r_subprocess, workspace_root) {
-            (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
-            (sub, _) => sub,
-        };
-        let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-        let ready = match lib.initialize().await {
-            Ok(()) => !lib.lib_paths().is_empty(),
-            Err(e) => {
-                log::warn!("Failed to initialize PackageLibrary: {}", e);
-                false
-            }
-        };
-        lib.add_library_paths(&additional_paths);
+        // We only get here with packages enabled (early-returned above), so pass
+        // `true`. The shared helper runs R discovery in spawn_blocking and
+        // computes readiness after applying additional paths.
+        let outcome = crate::package_library::build_package_library(
+            packages_r_path,
+            &additional_paths,
+            workspace_root,
+            true,
+        )
+        .await;
+        if let crate::package_library::PackageLibraryStatus::InitFailed(e) = &outcome.status {
+            log::warn!("Failed to initialize PackageLibrary: {}", e);
+        }
+        let ready = outcome.status.is_ready();
         let mut state = self.state.write().await;
         // Re-check under write lock: `initialized()` may have raced ahead
         // and already written a library with prefetched caches.
         if !state.package_library_ready {
-            state.package_library = std::sync::Arc::new(lib);
+            state.package_library = outcome.library;
             state.package_library_ready = ready;
         } else {
             log::trace!("PackageLibrary already initialized (race), keeping existing");
@@ -2305,50 +2305,45 @@ impl LanguageServer for Backend {
             let pkg_start = std::time::Instant::now();
             let r_calls_before = crate::perf::get_r_subprocess_calls();
 
-            if packages_enabled {
-                // Get workspace root from folders (if available) for R working directory (e.g. for renv)
-                let workspace_root = folders.first().and_then(|url| url.to_file_path().ok());
+            // Get workspace root from folders (if available) for R working
+            // directory (e.g. for renv).
+            let workspace_root = folders.first().and_then(|url| url.to_file_path().ok());
 
-                // Move R discovery to blocking task since it performs synchronous IO (which/where/R --version)
-                let r_subprocess = tokio::task::spawn_blocking(move || {
-                    let subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
-                    match (subprocess, workspace_root) {
-                        (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
-                        (sub, _) => sub,
-                    }
-                })
-                .await
-                .unwrap_or(None);
+            // The shared helper self-gates on `packages_enabled` (returning
+            // `Disabled` with an empty library and no R discovery), moves R
+            // discovery into spawn_blocking, and computes readiness after
+            // applying additional paths. Perf metrics, the count log, and the
+            // "disabled" log stay here — the helper never logs.
+            let outcome = crate::package_library::build_package_library(
+                packages_r_path,
+                &additional_paths,
+                workspace_root,
+                packages_enabled,
+            )
+            .await;
 
-                // Create and initialize library
-                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-                let ready = match lib.initialize().await {
-                    Ok(()) => !lib.lib_paths().is_empty(),
-                    Err(e) => {
-                        log::warn!("Failed to initialize PackageLibrary: {}", e);
-                        false
-                    }
-                };
-                // Add additional library paths (dedup)
-                lib.add_library_paths(&additional_paths);
-
+            use crate::package_library::PackageLibraryStatus;
+            let status = outcome.status;
+            let library = outcome.library;
+            if status == PackageLibraryStatus::Disabled {
+                log::info!("Package function awareness disabled");
+                (library, false)
+            } else {
+                if let PackageLibraryStatus::InitFailed(e) = &status {
+                    log::warn!("Failed to initialize PackageLibrary: {}", e);
+                }
                 let pkg_duration = pkg_start.elapsed();
                 let r_calls = crate::perf::get_r_subprocess_calls() - r_calls_before;
                 crate::perf::record_package_init(pkg_duration, r_calls);
 
                 log::info!(
                     "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
-                    lib.lib_paths().len(),
-                    lib.base_packages().len(),
-                    lib.base_exports().len()
+                    library.lib_paths().len(),
+                    library.base_packages().len(),
+                    library.base_exports().len()
                 );
-                (std::sync::Arc::new(lib), ready)
-            } else {
-                log::info!("Package function awareness disabled");
-                (
-                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
-                    false,
-                )
+                let ready = status.is_ready();
+                (library, ready)
             }
         };
 
