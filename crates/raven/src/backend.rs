@@ -2453,6 +2453,13 @@ impl LanguageServer for Backend {
                 // same wrong paths.
                 let packages_enabled =
                     { self.state.read().await.cross_file_config.packages_enabled };
+                // Load-bearing gate (do not collapse into `rebuild_package_library`
+                // the way the settings-reload site does): here the swap into
+                // `state` happens *inside* this `if`. Routing through the helper
+                // unconditionally would swap in `new_empty()` when packages are
+                // disabled, clobbering the library the user built before
+                // disabling — a `refreshPackages` issued while disabled must
+                // leave the existing library untouched.
                 if packages_enabled {
                     let (new_lib, ready) = rebuild_package_library(&self.state).await;
                     let mut state = self.state.write().await;
@@ -5690,14 +5697,13 @@ impl Backend {
         if package_settings_changed {
             log::info!("Package settings changed, reinitializing PackageLibrary");
 
-            let (new_package_library, package_library_ready) = if packages_enabled {
-                rebuild_package_library(&self.state).await
-            } else {
-                (
-                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
-                    false,
-                )
-            };
+            // No `packages_enabled` gate here: `rebuild_package_library`
+            // self-gates and returns `(new_empty(), false)` when packages are
+            // disabled, which is exactly what the old `else` branch produced.
+            // Unconditionally swapping the result in is therefore behavior-
+            // neutral and keeps the disabled→empty decision in one place.
+            let (new_package_library, package_library_ready) =
+                rebuild_package_library(&self.state).await;
 
             // Replace under brief write lock.
             {
@@ -9985,6 +9991,124 @@ mod refresh_packages_tests {
                     "libPaths element must be a string, got {p:?}"
                 );
             }
+        }
+    }
+
+    // ============================================================================
+    // Regression tests for the two adjacent `packages_enabled` gates around
+    // `rebuild_package_library` (design Decision 4).
+    // ============================================================================
+    mod package_enabled_gates {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use tower_lsp::lsp_types::{
+            DidChangeConfigurationParams, ExecuteCommandParams, InitializeParams, InitializeResult,
+        };
+        use tower_lsp::{LanguageServer, LspService};
+
+        use super::super::{Backend, RequestCancellationRegistry};
+        use crate::package_library::PackageLibrary;
+
+        struct StubServer;
+
+        #[tower_lsp::async_trait]
+        impl LanguageServer for StubServer {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn make_backend() -> Arc<Backend> {
+            let (client_tx, client_rx) = mpsc::channel();
+            let (_service, _socket) = LspService::new(|client| {
+                client_tx.send(client).expect("capture client");
+                StubServer
+            });
+            let client = client_rx.recv().expect("client captured");
+            Arc::new(Backend::new_with_request_cancellation(
+                client,
+                Arc::new(RequestCancellationRegistry::new()),
+            ))
+        }
+
+        /// Build a populated, ready library so a clobber is observable.
+        fn ready_library(path: std::path::PathBuf) -> Arc<PackageLibrary> {
+            let mut lib = PackageLibrary::new_empty();
+            lib.set_lib_paths(vec![path]);
+            Arc::new(lib)
+        }
+
+        /// Settings-reload site (redundant gate removed): flipping
+        /// `packages.enabled` to false must leave the library empty and
+        /// not-ready. Locks in that the now-unconditional
+        /// `rebuild_package_library` call still produces the disabled outcome.
+        #[tokio::test]
+        async fn settings_reload_disabled_yields_empty_not_ready() {
+            let backend = make_backend();
+            {
+                let mut state = backend.state.write().await;
+                state.package_library = ready_library(std::path::PathBuf::from("/tmp/libs"));
+                state.package_library_ready = true;
+            }
+
+            // packages_enabled defaults to true, so flipping it to false makes
+            // `package_settings_changed` fire and routes through the rebuild.
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "packages": { "enabled": false } }),
+                })
+                .await;
+
+            let state = backend.state.read().await;
+            assert!(
+                !state.package_library_ready,
+                "reload with packages disabled must leave the library not-ready"
+            );
+            assert!(
+                state.package_library.lib_paths().is_empty(),
+                "reload with packages disabled must swap in an empty library; got {:?}",
+                state.package_library.lib_paths()
+            );
+        }
+
+        /// refreshPackages site (load-bearing gate kept): a refresh issued while
+        /// packages are disabled must NOT clobber an already-populated library.
+        /// The gate skips the swap entirely, so the same library Arc survives.
+        #[tokio::test]
+        async fn refresh_packages_disabled_keeps_existing_library() {
+            let backend = make_backend();
+            let original = ready_library(std::path::PathBuf::from("/tmp/libs"));
+            {
+                let mut state = backend.state.write().await;
+                state.cross_file_config.packages_enabled = false;
+                state.package_library = Arc::clone(&original);
+                state.package_library_ready = true;
+            }
+
+            backend
+                .execute_command(ExecuteCommandParams {
+                    command: "raven.refreshPackages".into(),
+                    arguments: vec![],
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .expect("execute_command must not error");
+
+            let state = backend.state.read().await;
+            assert!(
+                Arc::ptr_eq(&state.package_library, &original),
+                "refresh while disabled must not swap the library Arc"
+            );
+            assert!(
+                !state.package_library.lib_paths().is_empty() && state.package_library_ready,
+                "refresh while disabled must leave lib_paths and readiness intact"
+            );
         }
     }
 }
