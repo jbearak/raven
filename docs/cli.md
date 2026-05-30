@@ -67,7 +67,7 @@ To get installed-package and base-symbol awareness in CI, install R (e.g. `r-lib
 
 ### Scope
 
-Only plain R files (`.R` / `.r`) are reported. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped — chunk extraction isn't supported on the command line — with a one-line note on stderr when one is named explicitly. Other file types (JAGS / Stan) are indexed for cross-file purposes where applicable but are not diagnosed.
+Only plain R files (`.R` / `.r`) are reported. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped — chunk extraction isn't supported on the command line — with a one-line note on stderr when one is named explicitly.
 
 ## `raven lint`
 
