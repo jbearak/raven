@@ -76,6 +76,28 @@ fn meta_attached_package_names(name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Meta-package fields for a package name: `(is_meta_package, attached_packages)`.
+/// A package is a meta-package exactly when it attaches children, so
+/// `meta_attached_packages` is the single source of truth — and deriving both
+/// fields here keeps the two `PackageInfo` constructors from drifting apart.
+fn meta_package_fields(name: &str) -> (bool, Vec<String>) {
+    let attached_packages = meta_attached_package_names(name);
+    (!attached_packages.is_empty(), attached_packages)
+}
+
+/// True when `path` is a regular file whose contents can actually be opened
+/// for reading.
+///
+/// Validates a candidate package directory's `NAMESPACE` / `DESCRIPTION` in
+/// [`PackageLibrary::find_package_directory`]. `is_file()` alone already rejects
+/// the case where a directory is *named* `NAMESPACE`; the extra `File::open`
+/// also skips a metadata file that exists but cannot be read (wrong
+/// permissions, a dangling symlink target), so discovery moves on to the next
+/// library path instead of treating an unusable directory as the package — the
+/// "skip unreadable package directories" behavior. Opening is the only reliable
+/// readability probe (a permissions stat is racy and platform-dependent); the
+/// cost is one `open`/`close` per *resolved* package, paid once and then cached,
+/// so it is negligible on the init / package-resolution path.
 fn is_readable_file(path: &Path) -> bool {
     path.is_file() && std::fs::File::open(path).is_ok()
 }
@@ -103,10 +125,7 @@ pub struct PackageInfo {
 impl PackageInfo {
     /// Create a new PackageInfo with the given name and exports
     pub fn new(name: String, exports: HashSet<String>) -> Self {
-        let attached_packages = meta_attached_package_names(&name);
-        // A package is a meta-package exactly when it attaches children, so
-        // `meta_attached_packages` is the single source of truth for the set.
-        let is_meta_package = !attached_packages.is_empty();
+        let (is_meta_package, attached_packages) = meta_package_fields(&name);
 
         Self {
             name,
@@ -125,10 +144,7 @@ impl PackageInfo {
         depends: Vec<String>,
         lazy_data: Vec<String>,
     ) -> Self {
-        let attached_packages = meta_attached_package_names(&name);
-        // A package is a meta-package exactly when it attaches children, so
-        // `meta_attached_packages` is the single source of truth for the set.
-        let is_meta_package = !attached_packages.is_empty();
+        let (is_meta_package, attached_packages) = meta_package_fields(&name);
 
         Self {
             name,
@@ -1766,6 +1782,21 @@ mod tests {
         assert_eq!(info.depends, depends);
         assert_eq!(info.lazy_data, lazy_data);
         assert!(!info.is_meta_package);
+    }
+
+    #[test]
+    fn test_package_info_with_details_meta_matches_new() {
+        // Pins that `with_details` derives the meta-package fields identically
+        // to `new` — the invariant the two constructors must share. Guards the
+        // single derivation helper against the two constructors drifting apart.
+        let via_details =
+            PackageInfo::with_details("tidyverse".to_string(), HashSet::new(), vec![], vec![]);
+        let via_new = PackageInfo::new("tidyverse".to_string(), HashSet::new());
+
+        assert!(via_details.is_meta_package);
+        assert_eq!(via_details.is_meta_package, via_new.is_meta_package);
+        assert_eq!(via_details.attached_packages, via_new.attached_packages);
+        assert!(via_details.attached_packages.contains(&"dplyr".to_string()));
     }
 
     #[tokio::test]
