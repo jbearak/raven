@@ -460,9 +460,8 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
         .into_iter()
         .filter(|p| crate::r_subprocess::is_valid_package_name(p))
         .collect();
-    if !packages.is_empty() {
-        state.package_library.prefetch_packages(&packages).await;
-    }
+    // `prefetch_packages` is a no-op on an empty slice, so no length guard here.
+    state.package_library.prefetch_packages(&packages).await;
 }
 
 /// Run the full diagnostic pipeline for one already-opened document. Returns an
