@@ -37,6 +37,22 @@ pub fn strip_leading_bom_for_scan(s: &str) -> &str {
     s.strip_prefix('\u{FEFF}').unwrap_or(s)
 }
 
+/// Split `text` into lines for a column-0 raw-text scan, with a leading U+FEFF
+/// stripped from the first line via [`strip_leading_bom_for_scan`].
+///
+/// Use this for line scanners that anchor at column 0 and report only line
+/// numbers (not byte/column offsets within line 0) — e.g. chunk/section
+/// detectors. Scanners that map raw line text back to tree-sitter byte offsets
+/// must NOT use this: they need the BOM kept so offsets stay aligned (see
+/// `commented_code::collect`). Issue #346.
+pub fn lines_for_column0_scan(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if let Some(first) = lines.first_mut() {
+        *first = strip_leading_bom_for_scan(first);
+    }
+    lines
+}
+
 /// Convert a byte offset (e.g. tree-sitter `Point.column`) to a UTF-16 column
 /// offset within the given line, suitable for an LSP `Position.character`.
 ///
@@ -83,5 +99,20 @@ mod tests {
     #[test]
     fn strip_leading_bom_ignores_a_non_leading_feff() {
         assert_eq!(strip_leading_bom_for_scan("x\u{FEFF}"), "x\u{FEFF}");
+    }
+
+    #[test]
+    fn lines_for_column0_scan_strips_only_the_first_line_bom() {
+        // First line loses its BOM; a later U+FEFF (a ZWNBSP) is preserved.
+        assert_eq!(
+            lines_for_column0_scan("\u{FEFF}a\nb\n\u{FEFF}c"),
+            vec!["a", "b", "\u{FEFF}c"]
+        );
+    }
+
+    #[test]
+    fn lines_for_column0_scan_handles_empty_and_bomless_input() {
+        assert_eq!(lines_for_column0_scan(""), Vec::<&str>::new());
+        assert_eq!(lines_for_column0_scan("a\nb"), vec!["a", "b"]);
     }
 }

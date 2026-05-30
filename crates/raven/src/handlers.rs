@@ -2159,14 +2159,10 @@ impl<'a> SymbolExtractor<'a> {
         let mut sections = Vec::new();
         let mut consumed_lines: HashSet<usize> = HashSet::new();
         let pattern = section_pattern();
-        let mut lines: Vec<&str> = self.text.lines().collect();
-        // The section pattern anchors at column 0 (`^\s*#`). A raw leading
-        // U+FEFF on the first line of in-memory text (open documents keep the
-        // BOM verbatim — see `did_open`) would defeat the anchor and drop a
-        // first-line section from the outline; skip it. Issue #346.
-        if let Some(first) = lines.first_mut() {
-            *first = crate::utf16::strip_leading_bom_for_scan(first);
-        }
+        // The section pattern anchors at column 0 (`^\s*#`); split BOM-tolerantly
+        // so a first-line section preceded by a raw BOM still appears in the
+        // outline (open documents keep the BOM verbatim — see `did_open`). #346.
+        let lines = crate::utf16::lines_for_column0_scan(self.text);
 
         // Phase 1: Single-line section detection (existing logic)
         for (line_num, line) in lines.iter().enumerate() {
@@ -2362,7 +2358,10 @@ impl<'a> SymbolExtractor<'a> {
     fn extract_decorative_sections(&self, style: ModelCommentStyle) -> Vec<RawSymbol> {
         let mut sections = Vec::new();
         let mut consumed_lines: HashSet<usize> = HashSet::new();
-        let lines: Vec<&str> = self.text.lines().collect();
+        // The model-comment prefix scan anchors at column 0, so a first-line
+        // banner delimiter preceded by a raw BOM would be missed; split
+        // BOM-tolerantly. Issue #346.
+        let lines = crate::utf16::lines_for_column0_scan(self.text);
 
         if lines.len() >= 3 {
             for i in 1..lines.len() - 1 {
@@ -21180,6 +21179,19 @@ setMethod("show", "MyClass", function(object) { print(object@value) })
         assert!(matches!(section.kind, DocumentSymbolKind::Module));
         assert_eq!(section.section_level, Some(1));
         assert_eq!(section.range.start.line, 0);
+    }
+
+    // Issue #346: a JAGS/Stan banner whose top delimiter is the file's first
+    // line is dropped when a raw BOM precedes it, because the model-comment
+    // prefix scan anchors at column 0.
+    #[test]
+    fn test_extract_decorative_sections_first_line_after_bom() {
+        let code = "\u{FEFF}# ====\n# Title\n# ====\n";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let sections = extractor.extract_decorative_sections(ModelCommentStyle::Hash);
+        assert_eq!(sections.len(), 1, "got {:?}", sections);
+        assert_eq!(sections[0].name, "Title");
     }
 
     #[test]
