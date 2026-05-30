@@ -57,6 +57,25 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
     Some(name)
 }
 
+/// Keyword alternation for forward source directives: `@lsp-source`, `@lsp-run`,
+/// `@lsp-include`. This is the inner body of the `@lsp-(?:…)` group only — the
+/// surrounding regex (anchoring, separator, capture groups) is supplied by each
+/// call site.
+///
+/// Single source of truth: the directive vocabulary is recognized by two
+/// independent regex sets — the full parser in [`patterns`] (capture groups,
+/// BOM-stripped input) and the column-aligned, BOM-tolerant prefix matchers in
+/// `file_path_intellisense::directive_path_patterns`. Those sets differ
+/// deliberately in everything *except* the keyword vocabulary, so only the
+/// alternation bodies are shared here to keep the recognized keywords from
+/// drifting between them.
+pub(crate) const FORWARD_DIRECTIVE_KEYWORDS: &str = "source|run|include";
+
+/// Keyword alternation for backward provenance directives: `@lsp-sourced-by`,
+/// `@lsp-run-by`, `@lsp-included-by`. See [`FORWARD_DIRECTIVE_KEYWORDS`] for why
+/// this is factored out.
+pub(crate) const BACKWARD_DIRECTIVE_KEYWORDS: &str = "sourced-by|run-by|included-by";
+
 fn patterns() -> &'static DirectivePatterns {
     static PATTERNS: OnceLock<DirectivePatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -64,13 +83,28 @@ fn patterns() -> &'static DirectivePatterns {
         // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
         // All directive regexes are anchored to start of line (^\s*) except
         // @lsp-ignore, which can appear as a trailing comment (e.g., x <- foo # @lsp-ignore).
+        // The forward/backward keyword alternations are shared with
+        // file_path_intellisense via {FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS,
+        // plugged into the middle of each pattern by concatenation.
         DirectivePatterns {
             backward: Regex::new(
-                r#"^\s*#\s*@lsp-(?:sourced-by|run-by|included-by)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#
-            ).unwrap(),
+                &[
+                    r#"^\s*#\s*@lsp-(?:"#,
+                    BACKWARD_DIRECTIVE_KEYWORDS,
+                    r#")\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#,
+                ]
+                .concat(),
+            )
+            .unwrap(),
             forward: Regex::new(
-                r#"^\s*#\s*@lsp-(?:source|run|include)(?:\s+:?\s*|:\s*)(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?"#
-            ).unwrap(),
+                &[
+                    r#"^\s*#\s*@lsp-(?:"#,
+                    FORWARD_DIRECTIVE_KEYWORDS,
+                    r#")(?:\s+:?\s*|:\s*)(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?"#,
+                ]
+                .concat(),
+            )
+            .unwrap(),
             working_dir: Regex::new(
                 r#"^\s*#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
