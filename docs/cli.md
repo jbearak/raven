@@ -4,7 +4,7 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 
 - `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes), for CI gating.
 - `raven lint` — run the native **style** linter only.
-- `analysis-stats <path> [--csv] [--only <phase>]` — profile workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help`.
+- `raven analysis-stats <path> [--csv] [--only <phase>]` — profile workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help`.
 
 The difference between `check` and `lint`: `lint` parses each file in isolation and runs only the style rules, so it is fast and needs no R installation, but it cannot see relationships between files. `check` builds the same workspace index the language server builds, so it additionally reports cross-file, undefined-variable, and package diagnostics. Reach for `lint` when you only want style gating; reach for `check` when you want the editor's full analysis in CI.
 
