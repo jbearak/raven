@@ -1624,6 +1624,11 @@ pub struct PackageLibraryOutcome {
     /// implied by the status.
     pub library: Arc<PackageLibrary>,
     pub status: PackageLibraryStatus,
+    /// Non-fatal notes accumulated while opening Tier 2/3 fallback DBs
+    /// (e.g. a present-but-unusable DB explained-and-continued). Empty on the
+    /// `Disabled` early-return and the Tier-1-only capture path, which wire no
+    /// providers.
+    pub load_notes: Vec<String>,
 }
 
 /// The single source of truth for package-library readiness and the reason a
@@ -1697,9 +1702,66 @@ pub async fn build_package_library(
         return PackageLibraryOutcome {
             library: Arc::new(PackageLibrary::new_empty()),
             status: PackageLibraryStatus::Disabled,
+            load_notes: Vec::new(),
         };
     }
 
+    // Tier 2 (repo DB) path is derived from the workspace root, so clone it
+    // before `workspace_root` is moved into the shared core below.
+    let repo_db_path = workspace_root
+        .as_ref()
+        .map(|r| r.join(".raven").join("packages.json"));
+
+    let (mut lib, status) =
+        build_library_inner(r_path, additional_paths, workspace_root).await;
+
+    // Open the fallback DBs off the async runtime (mmap + ~10-20 ms blake3).
+    let shipped_db_path = crate::package_db::locate_shipped_db();
+    let (providers, notes) = tokio::task::spawn_blocking(move || {
+        let mut providers: Vec<Box<dyn crate::package_db::PackageMetadataProvider>> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        // Tier 2 first (repo DB), then Tier 3 (shipped DB).
+        if let Some(path) = repo_db_path {
+            match crate::package_db::json_db::RepoDbProvider::from_file(&path) {
+                Ok(Some(p)) => providers.push(Box::new(p)),
+                Ok(None) => {}                       // Absent -> silent
+                Err(e) => notes.push(e.to_string()), // explain-and-continue
+            }
+        }
+        if let Some(path) = shipped_db_path {
+            match crate::package_db::binary_db::ShippedDbProvider::from_file(&path) {
+                Ok(Some(p)) => providers.push(Box::new(p)),
+                Ok(None) => {}
+                Err(e) => notes.push(e.to_string()),
+            }
+        }
+        (providers, notes)
+    })
+    .await
+    .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+
+    for note in &notes {
+        log::warn!("{note}");
+    }
+    lib.set_providers(providers);
+
+    PackageLibraryOutcome {
+        library: Arc::new(lib),
+        status,
+        load_notes: notes,
+    }
+}
+
+/// Shared construction core for both the runtime ([`build_package_library`]) and
+/// capture ([`build_package_library_tier1_only`]) paths: R discovery, Tier-1
+/// initialization, additional-path augmentation, and status classification. It
+/// wires **no** Tier 2/3 providers and does not `Arc`-wrap — callers add
+/// providers (or deliberately omit them) and own the wrapping.
+async fn build_library_inner(
+    r_path: Option<PathBuf>,
+    additional_paths: &[PathBuf],
+    workspace_root: Option<PathBuf>,
+) -> (PackageLibrary, PackageLibraryStatus) {
     let subprocess =
         tokio::task::spawn_blocking(move || match (RSubprocess::new(r_path), workspace_root) {
             (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
@@ -1715,15 +1777,58 @@ pub async fn build_package_library(
     let has_lib_paths = !lib.lib_paths().is_empty();
 
     let status = PackageLibraryStatus::classify(init_error, r_found, has_lib_paths);
+    (lib, status)
+}
+
+/// Build a Tier-1-only library with **no** fallback providers wired. This is the
+/// capture path used by `freeze` and `build-shipped-db`, which must observe only
+/// the live R installation and never resolve names from a Tier 2/3 DB (otherwise
+/// captured data would be contaminated by the very DBs it produces).
+pub async fn build_package_library_tier1_only(
+    r_path: Option<PathBuf>,
+    additional_paths: &[PathBuf],
+    workspace_root: Option<PathBuf>,
+) -> PackageLibraryOutcome {
+    let (lib, status) = build_library_inner(r_path, additional_paths, workspace_root).await;
     PackageLibraryOutcome {
         library: Arc::new(lib),
         status,
+        load_notes: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn build_library_wires_shipped_db_provider_from_env() {
+        use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+        use crate::package_db::model::PackageRecord;
+
+        // Use a synthetic name that cannot exist in any real R install, so the
+        // ONLY way it can resolve is via the wired Tier 3 provider. (A real
+        // package like `dplyr` would resolve from Tier 1 on a developer machine
+        // that has it installed, masking whether providers were wired.)
+        let pkg = "ravenfaketier3pkg";
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("names.db");
+        write_shipped_db(
+            &db_path,
+            &[PackageRecord { name: pkg.into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] }],
+            ShippedDbProvenance { source: "test".into(), snapshot_date: "2026-05-30".into(), package_count: 1, raven_version: "9.9.9".into() },
+        )
+        .unwrap();
+
+        std::env::set_var("RAVEN_NAMES_DB", &db_path);
+        let outcome = build_package_library(None, &[], None, true).await;   // runtime path -> wires providers
+        let outcome_t1 = build_package_library_tier1_only(None, &[], None).await; // capture path -> no providers
+        std::env::remove_var("RAVEN_NAMES_DB");
+
+        assert!(outcome.library.get_package(pkg).await.expect("Tier 3 resolves synthetic pkg").exports.contains("mutate"));
+        // Provider-less capture must NOT resolve the synthetic pkg from Tier 3.
+        assert!(outcome_t1.library.get_package(pkg).await.is_none());
+    }
 
     /// Pins the readiness predicate and degradation precedence
     /// platform-independently. The `Some(_)` rows exercise classification
