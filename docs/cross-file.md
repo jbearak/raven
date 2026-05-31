@@ -54,6 +54,21 @@ When you write `library(dplyr)`, Raven:
 3. Makes those symbols available with `{dplyr}` attribution in completions
 4. Suppresses "undefined variable" warnings for package exports
 
+### Three-Tier Export Resolution
+
+> **Status: planned — tracking [the CI package-exports DB work]. Not yet available in a released build.**
+
+To ensure package exports and lazy-loaded datasets resolve correctly without spurious \"undefined variable\" diagnostics in all environments (including offline editors and zero-install CI pipelines), Raven uses an ordered, three-tier fallback mechanism:
+
+1. **Tier 1 — Installed Library (Authoritative):** Raven attempts to find and inspect the package on disk (running R `.libPaths()` or `renv` detection, then parsing package `NAMESPACE` files). A real local installation always wins and provides full fidelity, including function parameter signatures and internal `:::` resolution.
+2. **Tier 2 — Repository Database (`.raven/packages.json`):** If a package is not installed on disk, Raven checks for a committed, repo-level database. This is generated locally via `raven packages freeze` and lists the specific exports and datasets of packages used in the project.
+3. **Tier 3 — Shipped Database (`names.db`):** If the package is not found in Tiers 1 or 2, Raven falls back to its own bundled binary metadata database. This database is updated weekly from CRAN/Bioconductor and contains export and dataset names for the vast majority of public packages.
+
+#### Fidelity Caveats:
+Tiers 2 and 3 are **export-names-only**. They map package names to their public exports and dataset names to suppress undefined-variable noise and power simple autocompletions. Because they do not contain the full package binaries:
+- They **cannot** resolve internal unexported symbols (e.g. `dplyr:::some_internal_fn`).
+- They **cannot** supply function signatures (the parameter lists used for autocomplete hints and parameter hover help).
+
 ### When Raven calls R
 
 Raven's analysis is static: it parses your code and your installed packages' `NAMESPACE` files without a running R session. It does, however, launch a short-lived, non-interactive R subprocess — the `R` on your `PATH`, or [`raven.packages.rPath`](configuration.md#package-settings) — in two situations. These are Raven's own processes; they never touch your interactive R session, and when no R is found Raven falls back gracefully.

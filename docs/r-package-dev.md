@@ -249,6 +249,22 @@ imports remain visible if some `R/*.R` files don't carry roxygen tags.
 
 Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running `devtools::document()` or editing these files directly, diagnostics update automatically without restarting the editor.
 
+## Package Database for CI Gating
+
+> **Status: planned — tracking [the CI package-exports DB work]. Not yet available in a released build.**
+
+When running `raven check` inside a CI/CD pipeline, the runner usually does not have your package's full set of dependencies (including external CRAN/Bioconductor packages) installed. To prevent spurious \"undefined variable\" diagnostics, you can generate and commit a static \"frozen\" package export database.
+
+Run the following command on a provisioned machine or container where your package's dependencies are fully installed (e.g. immediately after `renv::restore()`):
+
+```bash
+raven packages freeze
+```
+
+This scans your codebase and reads from your local library paths (prioritizing `renv` environments when present — the **renv-first library order**), writing a deterministic, diff-friendly list of exports and datasets to `.raven/packages.json` (Tier 2).
+
+Committing this file enables zero-install, completely offline export resolution in your CI pipeline, ensuring that only undefined symbols from *unreferenced* packages or real code typos are flagged, while everything else resolves seamlessly.
+
 ## Configuration
 
 | Setting | Default | Description |
