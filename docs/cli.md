@@ -4,6 +4,8 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 
 - `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes), for CI gating.
 - `raven lint` — run the native **style** linter only.
+- `raven packages freeze` — planned: generate a committed package-export database for CI package-name resolution.
+- `raven packages build-shipped-db` — planned: maintainer/CI-only builder for Raven's bundled package-export database.
 - `raven analysis-stats <path> [--csv] [--only <phase>]` — profile workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help`.
 
 The difference between `check` and `lint` is **scope**: `lint` parses each file in isolation and runs only the style rules, so it needs no R installation and no workspace index — but it can't see relationships between files. `check` builds the same workspace index the language server builds (and, unless packages are disabled, runs R to resolve installed-package exports and base R symbols), so it additionally reports cross-file, undefined-variable, and package diagnostics. `lint` is therefore the cheaper, R-free option for pure style gating; `check` does more work per run in exchange for the editor's full analysis in CI.
@@ -48,6 +50,14 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 
 Before reporting, `raven check` warms the export cache for the packages each reported file attaches with `library()` / `require()`, so a bare call into an attached package that isn't one of its exports is flagged the same way the editor flags it. One narrow gap remains: a package attached only *indirectly* — in a `source()`d file rather than in the reported file itself — is not pre-warmed, so calls that could resolve to such a package are left unflagged rather than risk a false positive. Attach the package directly in the file (or rely on the editor) if you need those calls checked.
 
+#### Planned package-database behavior
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+When the package-export database work ships, `raven check` will resolve package export names through three tiers: installed packages first, then a committed `.raven/packages.json`, then Raven's bundled `names.db`. This suppresses undefined-variable noise in CI without requiring package installation.
+
+The package database provides names only; it never makes a package count as installed. For CI, `raven check` will therefore suppress the missing-package diagnostic by default. Pass `--report-uninstalled` to re-enable it when your pipeline intentionally installs packages and wants to catch failures. The flag reports `library()` calls whose packages are **not present in the local library paths**. It is not checked relative to `.raven/packages.json` or the bundled `names.db`.
+
 ### File encoding
 
 Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked UTF-16 (LE/BE) is decoded, but anything else must already be valid UTF-8 — Raven does not guess legacy single-byte encodings (Latin-1 / Windows-1252). Guessing would silently mis-decode: a non-breaking space (`0xA0`) inside a string comparison, for instance, would read as an ordinary space and quietly change what your code matches. A *reported* file that isn't valid UTF-8 is therefore flagged as an **error diagnostic** (`File is not valid UTF-8: first invalid byte 0x… at offset …`) that fails the build like any other error finding — it is **not** an operator error. Re-save the file as UTF-8 to fix it. A file that is only *indexed* for cross-file resolution (not itself reported) and can't be decoded is silently skipped, matching the editor. `raven lint` and `analysis-stats` read through the same decoder, so encoding handling is uniform across the CLI.
@@ -75,6 +85,40 @@ To get installed-package and base-symbol awareness in CI, install R (e.g. `r-lib
 ### Scope
 
 Only plain R files (`.R` / `.r`) are reported. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped — chunk extraction isn't supported on the command line — with a one-line note on stderr when one is named explicitly.
+
+## `raven packages`
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+The planned `raven packages` command group owns package-export database generation. The Raven binary and language server never query the network during analysis; network access belongs only to the maintainer-side shipped-database builder.
+
+### `raven packages freeze`
+
+Generate a repo-specific package-export snapshot and write it to `.raven/packages.json` by default:
+
+```text
+raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]
+```
+
+Commit the generated file so CI can resolve package export names without compiling or installing those packages. The file is generated, not hand-edited; when the computed package content is unchanged, regeneration is a no-op and leaves the file untouched.
+
+Scopes:
+
+- `--used` (default) — include a maximally-inclusive set of packages the repo uses: `library()` / `require()` / `loadNamespace()` / `requireNamespace()` calls, the left-hand side of `::` and `:::`, packages in `renv.lock`, the repo `DESCRIPTION` `Imports` and `Depends`, and transitive `Depends`.
+- `--installed` / `--all` — include every package found across the renv and system library paths.
+
+Library resolution is renv-first: Raven activates the project renv before reading `.libPaths()`, takes package records from the renv project library first, and uses system libraries only to fill gaps. `renv.lock` is a set selector, not a version oracle: packages listed there are included in the freeze set, but a locked package that is not installed locally cannot be captured and falls through to Tier 3 in CI. For best coverage, run `renv::restore()` before `raven packages freeze`.
+
+Options:
+
+- `--output PATH` — write somewhere other than the default `.raven/packages.json`.
+- `--workspace DIR` — workspace root used for scanning scripts, `renv.lock`, and `DESCRIPTION` (default: current directory).
+
+The planned VS Code entry point is **Raven: Generate Package Database for CI**, which runs the same generation path.
+
+### `raven packages build-shipped-db`
+
+Build Raven's bundled `names.db` and base-exports companion file. This is a maintainer/CI command, not an ordinary project command. It consumes a reference R installation and CRAN + Bioconductor r-universe metadata, merges them append-only, records provenance and `blake3` integrity data, and publishes the result through Raven's `names-db` GitHub Release for later bundling.
 
 ## `raven lint`
 
