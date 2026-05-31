@@ -1701,14 +1701,21 @@ pub struct PackageLibraryOutcome {
     pub load_notes: Vec<String>,
 }
 
-/// The single source of truth for package-library readiness and the reason a
-/// build degraded. All four package-library init sites route through
+/// The single source of truth for package-library **build status** and the
+/// reason a build degraded. All four package-library init sites route through
 /// [`build_package_library`]: `backend::rebuild_package_library`,
 /// `cli::check::maybe_init_r`, `backend::ensure_package_library_initialized`,
 /// and the Task B post-scan startup init. Routing them all through one
 /// builder is what stops the editor and `raven check` from drifting, and this
-/// enum's [`classify`](PackageLibraryStatus::classify) is where the readiness
-/// predicate and degradation precedence live — not duplicated per site.
+/// enum's [`classify`](PackageLibraryStatus::classify) is where the status
+/// classification and degradation precedence live — not duplicated per site.
+///
+/// Build status is distinct from the *consumer readiness gate*
+/// (`package_library_ready`), which is **not** uniform across sites: the editor
+/// gates on [`is_ready()`](PackageLibraryStatus::is_ready) (R-only), while
+/// `cli::check` deliberately widens its gate to also accept offline Tier 2/3
+/// providers (`|| library.has_providers()`) so `raven check` resolves packages
+/// in CI without R — see the comment in `cli::check::maybe_init_r`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PackageLibraryStatus {
     /// `packages.enabled == false`; no R discovery attempted.
