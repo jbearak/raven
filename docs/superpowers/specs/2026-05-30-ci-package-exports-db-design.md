@@ -1,8 +1,22 @@
 # Design: CI package-exports database (three-tier export resolution)
 
 **Date:** 2026-05-30
-**Status:** Approved design — ready for implementation planning.
+**Status:** Approved design — refined during implementation-planning review (see §0). The implementation plan ([`docs/superpowers/plans/2026-05-30-ci-package-exports-db.md`](../plans/2026-05-30-ci-package-exports-db.md)) is the build-of-record; where this spec and the plan once differed, the plan's decisions ledger and §0 below govern.
+**Depends on:** [raven#350](https://github.com/jbearak/raven/issues/350) — package-dataset (lazy-data) resolution — must land first (see §0.6, §11).
 **Companion:** Builds on [`2026-05-30-native-package-exports-feasibility.md`](2026-05-30-native-package-exports-feasibility.md), which asked whether Raven *could* obtain package exports without R. This spec answers a narrower, concrete question: **how does Raven get export knowledge in CI without installing or compiling R packages?**
+
+---
+
+## 0. Post-review refinements (2026-05-30)
+
+The §17 open items were resolved and several design points sharpened during a planning-review (grilling) pass. These **supersede** anything contradictory in the body below; the implementation plan's "Decisions revised in design review" ledger (#6–#15) carries the full rationale.
+
+1. **Resolution seam (§5.2, §17):** a synchronous `PackageMetadataProvider` trait covering **only** Tier 2/3; Tier 1 stays a bespoke first step in `get_package` (the single hook). `package_exists()` never consults providers. `prefetch_packages` is unchanged — meta-packages and `Depends` chains resolve via the existing `get_all_exports → get_package` recursion.
+2. **Tier 3 source & storage (§8):** the shipped `names.db` is built from **the build machine's entire installed library (authoritative reference-R capture) ∪ CRAN + Bioc r-universe, append-only** — *not* r-universe alone. The full installed library is the point: hard-to-install / GitHub-only / internal packages enter the floor this way and append-only never drops them. Precedence reference-R > r-universe > retained-from-prior. Stored on a **GitHub Release** (`names-db` tag), bootstrapped once from a richly-provisioned machine; bundled exe-relative with the binary/VSIX. r-universe is fetched from both `cran.r-universe.dev` and `bioc.r-universe.dev`.
+3. **Base/recommended + base datasets (§6, §8):** ship in a **separate base-exports file** (also from the reference R), loaded into `base_exports` in CI when the base packages aren't on disk — so base symbols and base datasets (`mtcars`/`iris`) resolve without R.
+4. **Tier 2 generation (§7, §9):** `raven packages freeze` builds a **provider-less** (Tier-1-only) library so the "frozen Tier 1" file can't be contaminated by Tier 2/3; the `--used` set is **maximally inclusive** (adds `requireNamespace`, `::`/`:::` LHS, and the repo's own `DESCRIPTION` `Imports`); regeneration is a **no-op when content is unchanged**.
+5. **Robustness:** unreadable DBs are **explained, not silently dropped** (typed reader errors → stderr / `window/showMessage`, then degrade); Tier 2 carries a `schema_version`; the Tier 3 checksum is verified at open off-thread; tiny committed fixtures guard format back-compat. Names: `raven packages freeze`, `raven check --report-uninstalled`.
+6. **Datasets scope (§3, §11):** *package* (non-base) dataset resolution is split to a prerequisite, **[raven#350](https://github.com/jbearak/raven/issues/350)** — implemented first. This work captures `lazy_data` in the records; #350 wires resolution so CI consumes it automatically.
 
 ---
 
@@ -41,7 +55,7 @@ Settled during design Q&A:
 2. **Shipped database is "latest CRAN/Bioc," permanently** — no version-history indexing. Export names are stable enough that latest-only is an acceptable floor.
 3. **Pre-built databases, not live API queries** — Raven never depends on a live external service during a CI run.
 4. **Three tiers, all in v1** (§5). The marginal cost of the user-built tier is low because it reuses machinery the shipped tier already requires.
-5. **Shipped database is sourced from r-universe `_exports`** (`_dependencies`, `_datasets`).
+5. **Shipped database is sourced from an authoritative reference-R capture ∪ r-universe `_exports`/`_dependencies`/`_datasets`, append-only** (revised — see §0.2; the original draft said r-universe alone).
 
 ---
 
@@ -126,11 +140,11 @@ Generation reuses existing machinery — installed-package enumeration, the code
 
 A Raven-bundled, latest-CRAN/Bioc export database.
 
-- **Source:** r-universe. A release-time / scheduled build job enumerates packages via `/api/ls`, pulls `_exports` (export-only, `exportPattern`-expanded), `_dependencies` (so `Depends` transitive attach is modeled, not just exports), and `_datasets`, and writes `names.db`.
-- **Contents:** export names + `Depends` + dataset names for all CRAN + Bioconductor + base/recommended packages. **Export-only** — no internal (`:::`) objects, no signatures.
-- **Delivery:** bundled as a **sidecar file** shipped with both the binary and the VS Code extension, located exe-relative with an override. **Not** `include_bytes!` (avoids binary bloat) and **not** committed to git (the build job produces it; release packaging bundles it). A small fixture database is checked in for tests.
-- **Integrity & provenance:** the build job records the r-universe snapshot date and a checksum; the build is reproducible. Bundling third-party data carries supply-chain responsibility — provenance and a tamper check are part of the pipeline, not an afterthought.
-- **Freshness:** equals Raven's release cadence. Acceptable because the database is latest-only by decision and export names are stable.
+- **Source (revised — see §0.2):** an **authoritative reference-R capture of the build machine's entire installed library** ∪ **CRAN + Bioc r-universe**, merged **append-only**. The reference-R capture (via Raven's Tier-1 path: `NAMESPACE` + subprocess `exportPattern` expansion + `data/` datasets) covers base/recommended *and* every installed package — including hard-to-install / GitHub-only / internal ones that r-universe lacks. r-universe (`/api/ls` + per-package `_exports`/`_dependencies`/`_datasets`, from both `cran.r-universe.dev` and `bioc.r-universe.dev`) appends packages not already present. Precedence: reference-R > r-universe > retained-from-prior; rebuilds never drop a package.
+- **Contents:** export names + `Depends` + dataset names for the union above. **Export-only** — no internal (`:::`) objects, no signatures. A companion **base-exports file** (base/recommended records, from the reference R) ships alongside so base symbols + base datasets resolve in CI (§0.3).
+- **Delivery (revised — see §0.2):** bundled as a **sidecar file** shipped with both the binary and the VS Code extension, located exe-relative with an override (`RAVEN_NAMES_DB`). **Not** `include_bytes!` (avoids binary bloat) and **not** committed to git. Stored on a **GitHub Release** (`names-db` tag) — durable across runs, which a per-run CI artifact is not — bootstrapped once from a richly-provisioned machine, then refreshed append-only. Small fixture databases (`names.db` + `.raven/packages.json`) **are** checked in, as format back-compat guards (§0.5).
+- **Integrity & provenance:** the build records source, snapshot date, package count, Raven version, and a `blake3` checksum in the db header; verified at open (off-thread). The build is reproducible. Bundling third-party data carries supply-chain responsibility — provenance and a tamper check are part of the pipeline, not an afterthought.
+- **Freshness:** equals Raven's release/refresh cadence (weekly + on release). Acceptable because the database is latest-only by decision and export names are stable; append-only means coverage only grows.
 
 ---
 
@@ -234,9 +248,11 @@ The locking-discipline invariant for cross-file work (snapshot inputs under the 
 
 ---
 
-## 17. Open items for the plan
+## 17. Open items for the plan — RESOLVED
 
-- Final names: the generation subcommand and the `--report-uninstalled` flag.
-- The Tier 3 binary encoding (custom vs an existing crate) and its mmap/lazy-load shape.
-- Whether the ordered-resolution seam is a full `PackageMetadataProvider` trait or a lighter inline ordered fallback — settle during planning, defaulting to the trait if the refactor stays contained.
-- Build-job hosting and refresh cadence for `names.db`.
+All resolved during planning review (§0; full rationale in the plan's decisions ledger):
+
+- **Names** → `raven packages freeze` and `raven check --report-uninstalled` (§0.4–0.5).
+- **Tier 3 encoding** → custom container + `postcard` payloads + `memmap2`, `blake3` integrity, header-index preloaded at open + lazy per-package payload decode (§0.5; plan decision #3).
+- **Resolution seam** → synchronous `PackageMetadataProvider` trait over Tier 2/3 only; Tier 1 bespoke (§0.1).
+- **Build-job hosting & cadence** → GitHub Actions `build-names-db.yml` publishing to the `names-db` GitHub Release; weekly + `workflow_dispatch` + on release; append-only (§0.2).
