@@ -552,14 +552,12 @@ fn should_check_missing_export_metadata(
         && has_package_metadata_sensitive_undefined_diagnostic(all_diags)
 }
 
+/// Caller must gate on [`should_check_missing_export_metadata`] (which already
+/// requires `packages_enabled`); this only walks the reported packages.
 async fn collect_missing_export_metadata_packages(
     state: &crate::state::WorldState,
     reported_loaded_packages: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
-    if !state.cross_file_config.packages_enabled {
-        return Vec::new();
-    }
-
     let mut missing = Vec::new();
     for package in reported_loaded_packages
         .iter()
@@ -579,15 +577,17 @@ fn format_missing_export_metadata_warning(packages: &[String], tier3_present: bo
     names.truncate(8);
     let names = names.join(", ");
 
-    if tier3_present {
-        format!(
-            "raven check: package export metadata is missing for {names}.\nRaven checked installed packages, .raven/packages.json, and names.db.\nRun `raven packages update` to refresh names.db, or `raven packages freeze` to capture project package metadata."
+    let (detail, verb) = if tier3_present {
+        (
+            "Raven checked installed packages, .raven/packages.json, and names.db.",
+            "refresh",
         )
     } else {
-        format!(
-            "raven check: package export metadata is missing for {names}.\nTier 3 names.db is not installed.\nRun `raven packages update` to install names.db, or `raven packages freeze` to capture project package metadata."
-        )
-    }
+        ("Tier 3 names.db is not installed.", "install")
+    };
+    format!(
+        "raven check: package export metadata is missing for {names}.\n{detail}\nRun `raven packages update` to {verb} names.db, or `raven packages freeze` to capture project package metadata."
+    )
 }
 
 /// Run the full diagnostic pipeline for one already-opened document. Returns an

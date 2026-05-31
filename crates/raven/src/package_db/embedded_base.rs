@@ -190,23 +190,17 @@ const BASE_DATASETS: &[&str] = &[
     "women",
 ];
 
-const BASE_PACKAGES: &[&str] = &[
-    "base",
-    "methods",
-    "utils",
-    "grDevices",
-    "graphics",
-    "stats",
-    "datasets",
-];
-
 pub fn load() -> (HashSet<String>, HashSet<String>) {
     let exports = BASE_EXPORTS
         .iter()
         .chain(BASE_DATASETS.iter())
         .map(|s| (*s).to_string())
         .collect();
-    let packages = BASE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
+    // The base/recommended package floor is owned by `get_fallback_base_packages`;
+    // derive it here rather than maintaining a second copy that can drift.
+    let packages = crate::r_subprocess::get_fallback_base_packages()
+        .into_iter()
+        .collect();
     (exports, packages)
 }
 

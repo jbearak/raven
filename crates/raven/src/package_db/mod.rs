@@ -48,26 +48,9 @@ pub trait PackageMetadataProvider: Send + Sync {
     fn lookup(&self, name: &str) -> Option<PackageInfo>;
 }
 
-/// Resolve one `names.db` sidecar path for compatibility callers.
-///
-/// Explicit non-empty env overrides are returned verbatim. Otherwise this picks
-/// the first existing non-env candidate, falling back to the first constructed
-/// non-env candidate so an absent sidecar is still representable to callers.
-pub fn locate_shipped_db() -> Option<PathBuf> {
-    locate_first_sidecar("RAVEN_NAMES_DB", "names.db")
-}
-
 /// Resolve ordered `names.db` sidecar candidates.
 pub fn locate_shipped_db_candidates() -> Vec<PathBuf> {
     locate_sidecar_candidates("RAVEN_NAMES_DB", "names.db")
-}
-
-/// Resolve one `base-exports.json` sidecar path for compatibility callers.
-///
-/// Uses the same env-override and existing-file preference as
-/// [`locate_shipped_db`].
-pub fn locate_base_exports() -> Option<PathBuf> {
-    locate_first_sidecar("RAVEN_BASE_EXPORTS", "base-exports.json")
 }
 
 /// Resolve ordered `base-exports.json` sidecar candidates.
@@ -99,33 +82,6 @@ fn locate_sidecar_candidates(env_var: &str, file_name: &str) -> Vec<PathBuf> {
     out
 }
 
-fn locate_first_sidecar(env_var: &str, file_name: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(env_var) {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Some(p) = user_data_sidecar_path(file_name) {
-        push_unique(&mut candidates, p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            push_unique(&mut candidates, dir.join(file_name));
-        }
-    }
-    first_existing_or_first_constructed(candidates)
-}
-
-fn first_existing_or_first_constructed(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|path| path.exists())
-        .cloned()
-        .or_else(|| candidates.into_iter().next())
-}
-
 fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
     if !out.iter().any(|existing| existing == &path) {
         out.push(path);
@@ -147,19 +103,27 @@ fn user_data_dir() -> Option<PathBuf> {
 
     #[cfg(not(windows))]
     {
-        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-            if let Some(path) = absolute_non_empty_path(data_home) {
-                return Some(path.join(USER_DATA_APP_DIR_UNIX));
-            }
-        }
-        std::env::var_os("HOME")
-            .and_then(absolute_non_empty_path)
-            .map(|home| {
-                home.join(".local")
-                    .join("share")
-                    .join(USER_DATA_APP_DIR_UNIX)
-            })
+        unix_user_data_dir(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
     }
+}
+
+/// Derive the Unix user-data directory from `XDG_DATA_HOME` / `HOME` values:
+/// an absolute, non-empty `XDG_DATA_HOME` wins, otherwise `HOME/.local/share`.
+/// Takes the env values as parameters so both `user_data_dir` and its tests
+/// exercise one copy of the rule.
+#[cfg(not(windows))]
+fn unix_user_data_dir(
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(path) = xdg_data_home.and_then(absolute_non_empty_path) {
+        return Some(path.join(USER_DATA_APP_DIR_UNIX));
+    }
+    home.and_then(absolute_non_empty_path).map(|home| {
+        home.join(".local")
+            .join("share")
+            .join(USER_DATA_APP_DIR_UNIX)
+    })
 }
 
 fn absolute_non_empty_path(value: std::ffi::OsString) -> Option<PathBuf> {
@@ -168,21 +132,6 @@ fn absolute_non_empty_path(value: std::ffi::OsString) -> Option<PathBuf> {
     }
     let path = PathBuf::from(value);
     path.is_absolute().then_some(path)
-}
-
-#[cfg(all(test, not(windows)))]
-fn unix_user_data_dir_from_env(xdg_data_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    if let Some(data_home) = xdg_data_home {
-        if let Some(path) = absolute_non_empty_path(data_home.into()) {
-            return Some(path.join(USER_DATA_APP_DIR_UNIX));
-        }
-    }
-    home.and_then(|home| absolute_non_empty_path(home.into()))
-        .map(|home| {
-            home.join(".local")
-                .join("share")
-                .join(USER_DATA_APP_DIR_UNIX)
-        })
 }
 
 #[cfg(test)]
@@ -245,8 +194,8 @@ pub fn write_base_exports_file(
 /// Serializes tests that mutate the process-global package-DB env vars
 /// (`RAVEN_NAMES_DB`, `RAVEN_BASE_EXPORTS`). Without this, parallel test threads
 /// race: one test's `set_var` / `remove_var` window can be observed by another's
-/// `build_package_library` / `initialize` call (or `locate_shipped_db` /
-/// `locate_base_exports`), producing spurious failures. Every test in the crate's
+/// `build_package_library` / `initialize` call (or `locate_shipped_db_candidates`
+/// / `locate_base_exports_candidates`), producing spurious failures. Every test in the crate's
 /// lib test binary that touches those vars MUST hold this lock. An async
 /// (`tokio`) mutex is required because some holders keep the guard across an
 /// `.await` on the build. Lives here (not in a test submodule) so both
@@ -258,16 +207,6 @@ pub(crate) static RAVEN_NAMES_DB_ENV_LOCK: tokio::sync::Mutex<()> =
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn env_override_wins_over_exe_relative() {
-        // RAVEN_NAMES_DB, when set, is returned verbatim.
-        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
-        std::env::set_var("RAVEN_NAMES_DB", "/tmp/custom-names.db");
-        let p = locate_shipped_db().expect("override path");
-        assert_eq!(p, std::path::PathBuf::from("/tmp/custom-names.db"));
-        std::env::remove_var("RAVEN_NAMES_DB");
-    }
 
     #[tokio::test]
     async fn sidecar_candidates_prefer_env_then_user_data_then_exe_relative() {
@@ -327,95 +266,24 @@ mod tests {
         assert!(candidates[2..].contains(&exe_relative));
     }
 
-    #[test]
-    fn single_path_wrapper_prefers_existing_non_env_candidate() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing.db");
-        let existing = dir.path().join("existing.db");
-        std::fs::write(&existing, b"sidecar").unwrap();
-
-        let selected = first_existing_or_first_constructed(vec![missing.clone(), existing.clone()]);
-
-        assert_eq!(selected, Some(existing));
-    }
-
-    #[test]
-    fn single_path_wrapper_preserves_absent_non_env_candidate_when_none_exist() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing.db");
-        let also_missing = dir.path().join("also-missing.db");
-
-        let selected = first_existing_or_first_constructed(vec![missing.clone(), also_missing]);
-
-        assert_eq!(selected, Some(missing));
-    }
-
-    #[tokio::test]
-    async fn locate_first_sidecar_returns_first_constructed_non_env_candidate_when_none_exist() {
-        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
-        let user_data = dir.path().join("data");
-        let expected = user_data.join("names.db");
-        let exe_relative = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("names.db");
-        assert!(!expected.exists());
-        assert!(!exe_relative.exists());
-
-        let _user_data_guard = test_user_data_dir_guard(user_data);
-        std::env::remove_var("RAVEN_NAMES_DB");
-        assert_eq!(
-            locate_first_sidecar("RAVEN_NAMES_DB", "names.db"),
-            Some(expected.clone())
-        );
-
-        std::env::set_var("RAVEN_NAMES_DB", "");
-        assert_eq!(
-            locate_first_sidecar("RAVEN_NAMES_DB", "names.db"),
-            Some(expected)
-        );
-        std::env::remove_var("RAVEN_NAMES_DB");
-    }
-
-    #[tokio::test]
-    async fn locate_shipped_db_preserves_absent_env_override() {
-        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
-        let user_data = dir.path().join("data");
-        let custom = dir.path().join("custom.db");
-        assert!(!custom.exists());
-
-        let _user_data_guard = test_user_data_dir_guard(user_data);
-        std::env::set_var("RAVEN_NAMES_DB", &custom);
-        let selected = locate_shipped_db();
-        std::env::remove_var("RAVEN_NAMES_DB");
-
-        assert_eq!(selected, Some(custom));
-    }
-
     #[cfg(not(windows))]
     #[test]
     fn user_data_roots_ignore_empty_and_relative_values() {
         assert_eq!(
-            unix_user_data_dir_from_env(Some(""), Some("/home/me")),
+            unix_user_data_dir(Some("".into()), Some("/home/me".into())),
             Some(PathBuf::from("/home/me/.local/share/raven"))
         );
         assert_eq!(
-            unix_user_data_dir_from_env(Some("relative"), Some("/home/me")),
+            unix_user_data_dir(Some("relative".into()), Some("/home/me".into())),
             Some(PathBuf::from("/home/me/.local/share/raven"))
         );
+        assert_eq!(unix_user_data_dir(None, Some("relative-home".into())), None);
         assert_eq!(
-            unix_user_data_dir_from_env(None, Some("relative-home")),
-            None
-        );
-        assert_eq!(
-            unix_user_data_dir_from_env(Some("/xdg"), Some("/home/me")),
+            unix_user_data_dir(Some("/xdg".into()), Some("/home/me".into())),
             Some(PathBuf::from("/xdg/raven"))
         );
         assert_eq!(
-            unix_user_data_dir_from_env(None, Some("/home/me")),
+            unix_user_data_dir(None, Some("/home/me".into())),
             Some(PathBuf::from("/home/me/.local/share/raven"))
         );
     }
