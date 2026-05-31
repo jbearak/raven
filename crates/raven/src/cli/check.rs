@@ -43,6 +43,11 @@ pub struct CheckArgs {
     /// Resolved to on/off by [`resolve_color_from_env`] (TTY +
     /// `NO_COLOR`/`FORCE_COLOR`).
     pub color: ColorChoice,
+    /// Re-enable the missing-package ("not installed") diagnostic in CI. By
+    /// default `raven check` suppresses it because CI deliberately omits package
+    /// installation. Reports `library()` calls absent from the local library
+    /// paths — NOT relative to Tier 2/Tier 3 metadata (see docs/diagnostics.md).
+    pub report_uninstalled: bool,
 }
 
 pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, String> {
@@ -56,6 +61,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
     // `--color` and `--no-color` write the same field; last-one-wins on conflict
     // (`--no-color --color always` ⇒ always), matching cargo/ripgrep.
     let mut color = ColorChoice::Auto;
+    let mut report_uninstalled = false;
 
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -82,6 +88,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
                 color = parse_color_choice(&v)?;
             }
             "--no-color" => color = ColorChoice::Never,
+            "--report-uninstalled" => report_uninstalled = true,
             "--help" => return Err("HELP".into()),
             s if s.starts_with("--") => return Err(format!("unknown flag: {s}")),
             p => paths.push(PathBuf::from(p)),
@@ -96,6 +103,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
         max_severity,
         quiet,
         color,
+        report_uninstalled,
     })
 }
 
@@ -129,6 +137,11 @@ R / packages:
   raven check auto-detects R on PATH to resolve installed-package exports and
   base R symbols. If R is not found, package and base-symbol diagnostics are
   limited and a note is printed to stderr; all other diagnostics still run.
+
+  --report-uninstalled        Report packages from library() calls that are not
+                              present in the local library paths. Off by default
+                              in CI; useful when the pipeline DID install packages
+                              (e.g. renv::restore()) and you want to catch failures.
 
 Exit codes:
   0   No diagnostic exceeded --max-severity
@@ -173,6 +186,14 @@ pub async fn run(args: CheckArgs) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
+
+    // CI default: suppress the missing-package ("not installed") diagnostic,
+    // because CI deliberately omits installation (spec §10.1). The CLI owns
+    // `state` exclusively, so a direct field set here is safe.
+    // `--report-uninstalled` opts back in.
+    if !args.report_uninstalled {
+        state.cross_file_config.packages_missing_package_severity = None;
+    }
 
     // Auto-detect R for installed-package / base-symbol awareness. Any failure
     // (R absent, init error, no library paths) degrades gracefully and prints
@@ -578,7 +599,17 @@ mod tests {
             max_severity: SeverityLevel::Info,
             quiet: true,
             color: ColorChoice::Never,
+            report_uninstalled: false,
         }
+    }
+
+    #[test]
+    fn parse_report_uninstalled_flag() {
+        let args = parse_args(["--report-uninstalled".to_string()].into_iter()).unwrap();
+        assert!(args.report_uninstalled);
+
+        let default = parse_args(std::iter::empty()).unwrap();
+        assert!(!default.report_uninstalled);
     }
 
     #[test]
@@ -782,6 +813,7 @@ mod tests {
             max_severity: SeverityLevel::Info,
             quiet: true,
             color: ColorChoice::Never,
+            report_uninstalled: false,
         };
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
     }
