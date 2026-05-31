@@ -1504,6 +1504,17 @@ impl PackageLibrary {
         names.into_iter().collect()
     }
 
+    /// Read a package's `DESCRIPTION` `Version` field from disk, if the package
+    /// is installed in a library path. Used by the Tier 3 build's reference-R
+    /// capture and `raven packages freeze` to stamp each record's version.
+    pub fn package_version(&self, name: &str) -> Option<String> {
+        let dir = self.find_package_directory(name)?;
+        let content = std::fs::read_to_string(dir.join("DESCRIPTION")).ok()?;
+        crate::namespace_parser::parse_description_field_pub(&content, "Version")
+            .into_iter()
+            .next()
+    }
+
     /// Check if a package exists (is installed)
     ///
     /// This is a synchronous method that checks installation by:
@@ -4665,5 +4676,21 @@ mod tests {
         let mut found = pl.enumerate_installed_packages();
         found.sort();
         assert_eq!(found, vec!["dplyr".to_string(), "ggplot2".to_string()]);
+    }
+
+    #[test]
+    fn package_version_reads_description_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("dplyr")).unwrap();
+        std::fs::write(
+            lib.join("dplyr").join("DESCRIPTION"),
+            "Package: dplyr\nVersion: 1.2.3\n",
+        )
+        .unwrap();
+        let mut pl = PackageLibrary::new_empty();
+        pl.set_lib_paths(vec![lib]);
+        assert_eq!(pl.package_version("dplyr"), Some("1.2.3".to_string()));
+        assert_eq!(pl.package_version("nonexistent"), None);
     }
 }
