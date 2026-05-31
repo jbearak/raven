@@ -59,6 +59,23 @@ If the symbol is defined later in the same file at top level, the message also r
 |---|---|---|
 | Missing package | warning | `library()` references a package not installed on the system |
 
+### Planned CI package-export databases: names are not install status
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+The planned package-export database helps Raven answer one question: "what names does this package export?" It does **not** answer "is this package installed?" Knowing that a package exports `mutate` can suppress undefined-variable noise, but it must never make `library(dplyr)` count as installed.
+
+Install status stays Tier-1-only: Raven checks base packages and local library paths. The Tier 2 repo database (`.raven/packages.json`) and Tier 3 bundled database (`names.db`) are export-name sources only.
+
+| Mode | Export resolution | Missing-package diagnostic |
+|---|---|---|
+| Language server | Installed packages → committed repo DB → bundled DB | Fires when install state is known and the package is absent, regardless of whether the database knows the package's exports. |
+| `raven check` | Installed packages → committed repo DB → bundled DB | Suppressed by default, because CI often omits package installation intentionally. Pass `--report-uninstalled` to report `library()` calls absent from the local library paths. |
+
+`--report-uninstalled` is deliberately about local library paths, not Tier 2 or Tier 3 metadata. A package present only in `.raven/packages.json` or bundled `names.db` can still be reported as uninstalled when the flag is enabled.
+
+Accepted gap: with missing-package off by default in `raven check`, a typo such as `library(dpylr)` is silent unless `--report-uninstalled` is passed. A future refinement may report packages unknown to every tier by default, but that is not part of the planned v1 behavior.
+
 ### Cross-File Diagnostics
 
 | Diagnostic | Default Severity | Trigger |
