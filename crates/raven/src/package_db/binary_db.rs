@@ -219,10 +219,6 @@ impl ShippedDb {
         })
     }
 
-    pub fn provenance(&self) -> &ShippedDbProvenance {
-        &self.provenance
-    }
-
     /// Decode one package's record, lazily, from the mmap. Index bounds are
     /// validated at `open`, so the checked arithmetic here is defense-in-depth.
     fn decode_at(&self, offset: u64, len: u32) -> Option<PackageRecord> {
@@ -326,7 +322,7 @@ mod tests {
         assert!(dplyr.exports.contains("mutate"));
         assert_eq!(dplyr.depends, vec!["R".to_string()]);
         assert!(db.lookup("nonexistent").is_none());
-        assert_eq!(db.provenance().snapshot_date, "2026-05-30");
+        assert_eq!(db.provenance.snapshot_date, "2026-05-30");
     }
 
     #[test]
