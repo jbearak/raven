@@ -1154,6 +1154,25 @@ impl PackageLibrary {
             }
         }
 
+        // CI fallback: if no base exports were found on disk, load the bundled
+        // base-exports file (built from a reference R) so base symbols and base
+        // datasets (mtcars/iris) still resolve without R. The guard is
+        // all-or-nothing: a non-empty disk merge (a real install) always wins and
+        // skips the file entirely. It does not recover a *partially* populated
+        // disk state (e.g. `base` present but `datasets` missing) — acceptable
+        // because base R ships these packages together.
+        if all_base_exports.is_empty() {
+            if let Some(path) = crate::package_db::locate_base_exports() {
+                if let Some((file_exports, file_packages)) =
+                    crate::package_db::base_exports::load_base_exports(&path)
+                {
+                    log::info!("Loaded base exports from {:?}", path);
+                    all_base_exports.extend(file_exports);
+                    self.base_packages.extend(file_packages);
+                }
+            }
+        }
+
         // Step 5: Store per-package exports in the packages cache for completion attribution
         // This allows get_exports_for_completions() to find base packages with correct
         // package names (e.g., {base}, {utils}, {stats}).
@@ -4533,5 +4552,51 @@ mod tests {
         // The provider KNOWS dplyr's exports, but it is not installed on disk.
         // package_exists answers "is it installed?", which stays Tier-1-only.
         assert!(!lib.package_exists("dplyr"));
+    }
+
+    // NOTE: this test only *discriminates* the fallback in a truly R-free
+    // environment (the intended CI target). On a machine with any R library on
+    // the hardcoded fallback paths, the disk loop populates `datasets`/`mtcars`
+    // and the `is_empty()` guard skips the file — the assertion then passes via
+    // disk, not the bundled file. The actual fallback logic is covered
+    // discriminatingly by the unit tests in `package_db::base_exports`.
+    #[tokio::test]
+    async fn initialize_loads_base_exports_file_when_disk_absent() {
+        use crate::package_db::json_db::{write_repo_db_file, RepoDb, RepoDbProvenance};
+        use crate::package_db::model::PackageRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base-exports.json");
+        // 'datasets' base package contributing the mtcars dataset name.
+        write_repo_db_file(
+            &path,
+            &RepoDb {
+                schema_version: crate::package_db::json_db::REPO_DB_SCHEMA_VERSION,
+                provenance: RepoDbProvenance {
+                    raven_version: "t".into(),
+                    r_version: "4.4.0".into(),
+                    generated_unix: 0,
+                },
+                packages: vec![PackageRecord {
+                    name: "datasets".into(),
+                    version: "4.4.0".into(),
+                    exports: vec![],
+                    depends: vec![],
+                    lazy_data: vec!["mtcars".into()],
+                }],
+            },
+        )
+        .unwrap();
+
+        std::env::set_var("RAVEN_BASE_EXPORTS", &path);
+        // new_empty + initialize with no lib paths simulates CI (no disk base packages).
+        let mut lib = PackageLibrary::new_empty();
+        lib.initialize().await.unwrap();
+        std::env::remove_var("RAVEN_BASE_EXPORTS");
+
+        assert!(
+            lib.is_base_export("mtcars"),
+            "base dataset resolves from the base-exports file"
+        );
     }
 }

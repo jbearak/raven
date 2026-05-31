@@ -15,6 +15,7 @@
 //! misses. Providers feed *export resolution* only; they never affect
 //! install-status (the missing-package diagnostic), which stays Tier-1-only.
 
+pub mod base_exports;
 pub mod binary_db;
 pub mod json_db;
 pub mod model;
@@ -54,6 +55,19 @@ pub fn locate_shipped_db() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     Some(dir.join("names.db"))
+}
+
+/// Resolve the bundled `base-exports.json` path: the `RAVEN_BASE_EXPORTS` env
+/// var if set, else `base-exports.json` next to the current executable.
+pub fn locate_base_exports() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RAVEN_BASE_EXPORTS") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    Some(dir.join("base-exports.json"))
 }
 
 #[cfg(test)]
