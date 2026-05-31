@@ -70,6 +70,37 @@ pub fn locate_base_exports() -> Option<PathBuf> {
     Some(dir.join("base-exports.json"))
 }
 
+/// Write the base/recommended subset of `records` to a base-exports file at
+/// `path`, reusing the Tier 2 JSON encoding. The Tier 3 build calls this with
+/// its merged record set so CI can resolve base symbols/datasets without R
+/// (loaded by `initialize()` when disk base packages are absent — decision #7).
+/// The base set is the canonical one used everywhere else
+/// (`r_subprocess::get_fallback_base_packages`).
+pub fn write_base_exports_file(
+    path: &std::path::Path,
+    records: &[crate::package_db::model::PackageRecord],
+) -> std::io::Result<()> {
+    use std::collections::HashSet;
+    let base: HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
+        .into_iter()
+        .collect();
+    let packages: Vec<crate::package_db::model::PackageRecord> = records
+        .iter()
+        .filter(|r| base.contains(&r.name))
+        .cloned()
+        .collect();
+    let db = crate::package_db::json_db::RepoDb {
+        schema_version: crate::package_db::json_db::REPO_DB_SCHEMA_VERSION,
+        provenance: crate::package_db::json_db::RepoDbProvenance {
+            raven_version: env!("CARGO_PKG_VERSION").to_string(),
+            r_version: String::new(),
+            generated_unix: 0,
+        },
+        packages,
+    };
+    crate::package_db::json_db::write_repo_db_file(path, &db)
+}
+
 /// Serializes tests that mutate the process-global `RAVEN_NAMES_DB` env var.
 /// Without this, parallel test threads race: one test's `set_var` / `remove_var`
 /// window can be observed by another's `build_package_library` call (or
@@ -93,5 +124,21 @@ mod tests {
         let p = locate_shipped_db().expect("override path");
         assert_eq!(p, std::path::PathBuf::from("/tmp/custom-names.db"));
         std::env::remove_var("RAVEN_NAMES_DB");
+    }
+
+    #[test]
+    fn write_base_exports_filters_to_base_packages() {
+        use crate::package_db::model::PackageRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base-exports.json");
+        let records = vec![
+            PackageRecord { name: "datasets".into(), version: "4.4.0".into(), exports: vec![], depends: vec![], lazy_data: vec!["mtcars".into()] },
+            PackageRecord { name: "dplyr".into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] },
+        ];
+        write_base_exports_file(&path, &records).unwrap();
+        let db = crate::package_db::json_db::read_repo_db_file(&path).unwrap();
+        let names: Vec<&str> = db.packages.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"datasets"), "base package datasets is kept");
+        assert!(!names.contains(&"dplyr"), "non-base dplyr is filtered out");
     }
 }
