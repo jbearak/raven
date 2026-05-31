@@ -443,6 +443,14 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
     )
     .await;
 
+    // Surface present-but-unusable package-DB notes (e.g. a `.raven/packages.json`
+    // from a newer Raven, or a corrupt/incompatible `names.db`). These are
+    // build-time events carried on the outcome; print them before the status
+    // match below partially moves `outcome.library`.
+    for note in &outcome.load_notes {
+        eprintln!("raven check: {note}");
+    }
+
     // Caller policy (see the doc comment): install only on `Ready`; otherwise
     // keep the default empty library, printing a note for the R-related
     // degradations and staying silent on `Disabled`.

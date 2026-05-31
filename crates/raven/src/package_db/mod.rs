@@ -70,13 +70,25 @@ pub fn locate_base_exports() -> Option<PathBuf> {
     Some(dir.join("base-exports.json"))
 }
 
+/// Serializes tests that mutate the process-global `RAVEN_NAMES_DB` env var.
+/// Without this, parallel test threads race: one test's `set_var` / `remove_var`
+/// window can be observed by another's `build_package_library` call (or
+/// `locate_shipped_db`), producing spurious failures. Every test in the crate's
+/// lib test binary that touches `RAVEN_NAMES_DB` MUST hold this lock. An async
+/// (`tokio`) mutex is required because some holders keep the guard across an
+/// `.await` on the build. Lives here (not in a test submodule) so both
+/// `package_db` and `package_library` tests can share the one instance.
+#[cfg(test)]
+pub(crate) static RAVEN_NAMES_DB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn env_override_wins_over_exe_relative() {
+    #[tokio::test]
+    async fn env_override_wins_over_exe_relative() {
         // RAVEN_NAMES_DB, when set, is returned verbatim.
+        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
         std::env::set_var("RAVEN_NAMES_DB", "/tmp/custom-names.db");
         let p = locate_shipped_db().expect("override path");
         assert_eq!(p, std::path::PathBuf::from("/tmp/custom-names.db"));

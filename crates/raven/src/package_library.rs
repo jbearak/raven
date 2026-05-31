@@ -1837,6 +1837,10 @@ pub async fn build_package_library_tier1_only(
 mod tests {
     use super::*;
 
+    /// The shared `RAVEN_NAMES_DB` env-var serialization lock (defined in
+    /// `package_db` so every lib-test that touches the var shares one instance).
+    use crate::package_db::RAVEN_NAMES_DB_ENV_LOCK;
+
     #[tokio::test]
     async fn build_library_wires_shipped_db_provider_from_env() {
         use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
@@ -1846,6 +1850,7 @@ mod tests {
         // ONLY way it can resolve is via the wired Tier 3 provider. (A real
         // package like `dplyr` would resolve from Tier 1 on a developer machine
         // that has it installed, masking whether providers were wired.)
+        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
         let pkg = "ravenfaketier3pkg";
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("names.db");
@@ -1864,6 +1869,27 @@ mod tests {
         assert!(outcome.library.get_package(pkg).await.expect("Tier 3 resolves synthetic pkg").exports.contains("mutate"));
         // Provider-less capture must NOT resolve the synthetic pkg from Tier 3.
         assert!(outcome_t1.library.get_package(pkg).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_library_reports_unreadable_shipped_db_in_load_notes() {
+        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("names.db");
+        // Too short / bad magic => ShippedDb::open returns Corrupt => a load note.
+        std::fs::write(&bad, b"NOT A RAVEN DB").unwrap();
+
+        std::env::set_var("RAVEN_NAMES_DB", &bad);
+        let outcome = build_package_library(None, &[], None, true).await;
+        std::env::remove_var("RAVEN_NAMES_DB");
+
+        // The build degrades (does not panic) AND explains the unreadable DB.
+        assert!(!outcome.load_notes.is_empty(), "a corrupt names.db must produce a load note");
+        assert!(
+            outcome.load_notes.iter().any(|n| n.contains("names.db")),
+            "the note should mention names.db; got {:?}",
+            outcome.load_notes
+        );
     }
 
     /// Pins the readiness predicate and degradation precedence

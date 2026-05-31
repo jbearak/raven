@@ -1195,6 +1195,13 @@ impl Backend {
         if let crate::package_library::PackageLibraryStatus::InitFailed(e) = &outcome.status {
             log::warn!("Failed to initialize PackageLibrary: {}", e);
         }
+        // Surface present-but-unusable package-DB notes (e.g. a `.raven/packages.json`
+        // from a newer Raven, or a corrupt/incompatible `names.db`) as editor
+        // warnings. These are build-time events carried on the outcome; emit them
+        // before `outcome.library` is moved into state below.
+        for note in &outcome.load_notes {
+            self.client.show_message(MessageType::WARNING, note).await;
+        }
         let ready = outcome.status.is_ready();
         let mut state = self.state.write().await;
         // Re-check under write lock: `initialized()` may have raced ahead
@@ -2330,6 +2337,13 @@ impl LanguageServer for Backend {
                 packages_enabled,
             )
             .await;
+
+            // Surface present-but-unusable package-DB notes (e.g. a
+            // `.raven/packages.json` from a newer Raven, or a corrupt/incompatible
+            // `names.db`) as editor warnings, before `outcome` is destructured below.
+            for note in &outcome.load_notes {
+                self.client.show_message(MessageType::WARNING, note).await;
+            }
 
             use crate::package_library::PackageLibraryStatus;
             let status = outcome.status;
