@@ -186,6 +186,25 @@ impl ShippedDb {
             ));
         }
 
+        // The payload checksum covers the payload region but NOT the header
+        // (which holds the index). So a corrupt/tampered index can survive the
+        // checks above. Validate every index entry's [offset, offset+len) lies
+        // within the payload here — rejecting an out-of-range index loudly
+        // (decision #9) rather than letting `decode_at` overflow or mis-read.
+        let payload_len = payload.len() as u64;
+        for e in &header.index {
+            let out_of_bounds = match e.offset.checked_add(e.len as u64) {
+                Some(end) => end > payload_len,
+                None => true, // offset + len overflowed u64
+            };
+            if out_of_bounds {
+                return Err(ShippedDbError::Corrupt(format!(
+                    "index entry '{}' is out of bounds (offset {}, len {}, payload {})",
+                    e.name, e.offset, e.len, payload_len
+                )));
+            }
+        }
+
         let index = header
             .index
             .iter()
@@ -204,10 +223,11 @@ impl ShippedDb {
         &self.provenance
     }
 
-    /// Decode one package's record, lazily, from the mmap.
+    /// Decode one package's record, lazily, from the mmap. Index bounds are
+    /// validated at `open`, so the checked arithmetic here is defense-in-depth.
     fn decode_at(&self, offset: u64, len: u32) -> Option<PackageRecord> {
-        let start = self.payload_start + offset as usize;
-        let end = start + len as usize;
+        let start = self.payload_start.checked_add(usize::try_from(offset).ok()?)?;
+        let end = start.checked_add(len as usize)?;
         let slice = self.mmap.get(start..end)?;
         match postcard::from_bytes::<PackageRecord>(slice) {
             Ok(rec) => Some(rec),
@@ -344,6 +364,41 @@ mod tests {
             ShippedDb::open(&path).is_err(),
             "checksum mismatch must be rejected"
         );
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_index_entry() {
+        // The payload checksum does NOT cover the header/index, so a tampered
+        // index with a valid (unchanged) payload survives the checksum. open()
+        // must still reject an out-of-range index entry rather than overflow or
+        // mis-read in decode_at.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        write_shipped_db(&path, &records(), provenance()).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let header_bytes = &bytes[16..16 + header_len];
+        let payload = bytes[16 + header_len..].to_vec(); // unchanged → checksum stays valid
+
+        let mut header: ShippedDbHeader = postcard::from_bytes(header_bytes).unwrap();
+        // Point the first record far past the payload, keeping payload (and thus
+        // its checksum) intact.
+        header.index[0].offset = payload.len() as u64 + 1_000;
+
+        let new_header = postcard::to_stdvec(&header).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(new_header.len() as u32).to_le_bytes());
+        out.extend_from_slice(&new_header);
+        out.extend_from_slice(&payload);
+        std::fs::write(&path, &out).unwrap();
+
+        match ShippedDb::open(&path) {
+            Err(ShippedDbError::Corrupt(msg)) => assert!(msg.contains("out of bounds"), "got {msg}"),
+            other => panic!("expected Corrupt(out of bounds), got {other:?}"),
+        }
     }
 
     #[test]

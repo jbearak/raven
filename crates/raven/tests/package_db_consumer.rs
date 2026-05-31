@@ -7,8 +7,16 @@ use raven::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
 use raven::package_db::model::PackageRecord;
 use raven::package_library::build_package_library;
 
+/// Serializes the tests in this (separate) integration-test binary that mutate
+/// the process-global `RAVEN_NAMES_DB`, or call `build_package_library` (which
+/// reads it). The crate-internal lock lives in the lib test binary and can't be
+/// reached here, so this file keeps its own. An async mutex is required because
+/// the guard is held across `build_package_library(...).await`.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn tier3_resolves_export_with_no_r() {
+    let _guard = ENV_LOCK.lock().await;
     let pkg = "ravenfaketier3consumer";
     let sym = "ravenfakeexportsym";
 
@@ -60,6 +68,7 @@ async fn freeze_round_trip_matches_tier1_when_r_present() {
     };
     use raven::package_db::model::PackageRecord;
 
+    let _guard = ENV_LOCK.lock().await;
     let outcome = build_package_library(None, &[], None, true).await;
     let lib = &outcome.library;
     if lib.r_subprocess().is_none() {
@@ -88,4 +97,94 @@ async fn freeze_round_trip_matches_tier1_when_r_present() {
     // Parity: same export set + name after the round-trip.
     assert_eq!(back.exports, live.exports);
     assert_eq!(back.name, live.name);
+}
+
+/// End-to-end Tier 2: a real `<workspace>/.raven/packages.json` is wired as a
+/// provider (index 0, ahead of Tier 3) and resolves a package. Also proves
+/// Tier 2 outranks Tier 3 from actual files, and a Tier-3-only package still
+/// resolves — the one tier whose file→provider seam had no integration test.
+#[tokio::test]
+async fn tier2_repo_db_from_workspace_outranks_tier3() {
+    use raven::package_db::json_db::{
+        write_repo_db_file, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+    };
+
+    let _guard = ENV_LOCK.lock().await;
+    let shared = "ravenfaketier2shared"; // present in BOTH tiers
+    let t3only = "ravenfaketier3only"; // present only in Tier 3
+
+    let workspace = tempfile::tempdir().unwrap();
+    // Tier 2: committed .raven/packages.json with the shared package.
+    write_repo_db_file(
+        &workspace.path().join(".raven").join("packages.json"),
+        &RepoDb {
+            schema_version: REPO_DB_SCHEMA_VERSION,
+            provenance: RepoDbProvenance {
+                raven_version: "test".into(),
+                r_version: "test".into(),
+                generated_unix: 0,
+            },
+            packages: vec![PackageRecord {
+                name: shared.into(),
+                version: "2.0.0".into(),
+                exports: vec!["from_tier2".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            }],
+        },
+    )
+    .unwrap();
+
+    // Tier 3: a names.db with the SAME shared package (different export) + a
+    // Tier-3-only package.
+    let names_db = tempfile::tempdir().unwrap();
+    let db_path = names_db.path().join("names.db");
+    write_shipped_db(
+        &db_path,
+        &[
+            PackageRecord {
+                name: shared.into(),
+                version: "1.0.0".into(),
+                exports: vec!["from_tier3".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            },
+            PackageRecord {
+                name: t3only.into(),
+                version: "1.0.0".into(),
+                exports: vec!["t3sym".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            },
+        ],
+        ShippedDbProvenance {
+            source: "test".into(),
+            snapshot_date: "2026-05-30".into(),
+            package_count: 2,
+            raven_version: "9.9.9".into(),
+        },
+    )
+    .unwrap();
+
+    std::env::set_var("RAVEN_NAMES_DB", &db_path);
+    let outcome =
+        build_package_library(None, &[], Some(workspace.path().to_path_buf()), true).await;
+    std::env::remove_var("RAVEN_NAMES_DB");
+    let lib = &outcome.library;
+
+    // Tier 2 wins for the shared package.
+    let shared_info = lib.get_package(shared).await.expect("shared resolves");
+    assert!(
+        shared_info.exports.contains("from_tier2"),
+        "Tier 2 must outrank Tier 3"
+    );
+    assert!(!shared_info.exports.contains("from_tier3"));
+
+    // Tier-3-only package still resolves through the fallback.
+    let t3 = lib.get_package(t3only).await.expect("tier3-only resolves");
+    assert!(t3.exports.contains("t3sym"));
+
+    // Neither is "installed" — install status stays Tier-1-only.
+    assert!(!lib.package_exists(shared));
+    assert!(!lib.package_exists(t3only));
 }

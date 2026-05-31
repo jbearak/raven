@@ -320,7 +320,19 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
         let seed_path = args.seed.clone().unwrap_or_else(|| args.output.clone());
         match ShippedDb::open(&seed_path) {
             Ok(db) => db.all_records(),
-            Err(_) => Vec::new(),
+            // A missing seed is normal (first build / no prior Release). Any
+            // OTHER failure (corrupt, or a newer Tier-3 format) means the prior
+            // DB's accumulated history would be silently dropped — warn loudly so
+            // a maintainer notices rather than shipping a regressed (shrunken) DB.
+            Err(crate::package_db::binary_db::ShippedDbError::Absent) => Vec::new(),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read seed DB {}: {e} — building without the prior DB \
+                     (accumulated packages from earlier builds will be dropped unless this is fixed)",
+                    seed_path.display()
+                );
+                Vec::new()
+            }
         }
     };
 
