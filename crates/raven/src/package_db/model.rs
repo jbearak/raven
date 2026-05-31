@@ -29,7 +29,10 @@ pub struct PackageRecord {
     pub lazy_data: Vec<String>,
 }
 
-fn sorted_unique<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
+/// Normalize a string collection to the sorted, de-duplicated form every
+/// `PackageRecord` vector is documented to hold. The single enforcer of that
+/// invariant — used by `from_info` and the r-universe ingester alike.
+pub(crate) fn sorted_unique<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
     let mut v: Vec<String> = items.into_iter().collect();
     v.sort_unstable();
     v.dedup();

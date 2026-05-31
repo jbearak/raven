@@ -130,22 +130,23 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
             .await;
     let lib = &outcome.library;
 
-    let mut wanted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // BFS work-list seeded from the scope's sources. `seen` (below) is the sole
+    // dedup mechanism and pop order is irrelevant — the reachable set is a
+    // transitive closure and `records` is sorted before writing — so the seeds
+    // go straight into `queue` with no intermediate dedup set.
+    let mut queue: Vec<String> = Vec::new();
     match args.scope {
-        FreezeScope::All => {
-            wanted.extend(lib.enumerate_installed_packages());
-        }
+        FreezeScope::All => queue.extend(lib.enumerate_installed_packages()),
         FreezeScope::Used => {
-            wanted.extend(scan_workspace_referenced_packages(&root));
-            wanted.extend(read_description_depends_imports(&root.join("DESCRIPTION")));
-            wanted.extend(
+            queue.extend(scan_workspace_referenced_packages(&root));
+            queue.extend(read_description_depends_imports(&root.join("DESCRIPTION")));
+            queue.extend(
                 read_renv_lock_package_names(&root.join("renv.lock")).map_err(|e| e.to_string())?,
             );
         }
     }
 
     let mut records: Vec<PackageRecord> = Vec::new();
-    let mut queue: Vec<String> = wanted.iter().cloned().collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some(name) = queue.pop() {
         if !seen.insert(name.clone()) {

@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::package_db::model::PackageRecord;
+use crate::package_db::model::{sorted_unique, PackageRecord};
 
 #[derive(Debug, Deserialize)]
 struct RUniversePackage {
@@ -42,20 +42,14 @@ struct RUniverseDataset {
 /// Parse a single r-universe package JSON string into a `PackageRecord`.
 pub fn parse_runiverse_json(text: &str) -> anyhow::Result<PackageRecord> {
     let pkg: RUniversePackage = serde_json::from_str(text)?;
-    let mut exports = pkg.exports;
-    let mut depends: Vec<String> = pkg
-        .dependencies
-        .into_iter()
-        .filter(|d| d.role.as_deref() == Some("Depends"))
-        .map(|d| d.package)
-        .collect();
-    let mut lazy_data: Vec<String> = pkg.datasets.into_iter().filter_map(|d| d.name).collect();
-    exports.sort_unstable();
-    exports.dedup();
-    depends.sort_unstable();
-    depends.dedup();
-    lazy_data.sort_unstable();
-    lazy_data.dedup();
+    let exports = sorted_unique(pkg.exports);
+    let depends = sorted_unique(
+        pkg.dependencies
+            .into_iter()
+            .filter(|d| d.role.as_deref() == Some("Depends"))
+            .map(|d| d.package),
+    );
+    let lazy_data = sorted_unique(pkg.datasets.into_iter().filter_map(|d| d.name));
     Ok(PackageRecord { name: pkg.package, version: pkg.version, exports, depends, lazy_data })
 }
 
