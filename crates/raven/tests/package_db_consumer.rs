@@ -49,3 +49,43 @@ async fn tier3_resolves_export_with_no_r() {
     // And the package is NOT considered installed (install status stays Tier-1-only).
     assert!(!lib.package_exists(pkg));
 }
+
+/// R-gated: capture a Tier 2 record for an installed package and assert the
+/// round-tripped record matches the live Tier 1 result. Skips when R is absent
+/// (both the skip and the assertion path are green).
+#[tokio::test]
+async fn freeze_round_trip_matches_tier1_when_r_present() {
+    use raven::package_db::json_db::{
+        read_repo_db_str, write_repo_db_string, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+    };
+    use raven::package_db::model::PackageRecord;
+
+    let outcome = build_package_library(None, &[], None, true).await;
+    let lib = &outcome.library;
+    if lib.r_subprocess().is_none() {
+        eprintln!("skipping freeze_round_trip: R not available");
+        return;
+    }
+    // 'stats' is a base package present wherever R is.
+    let Some(live) = lib.get_package("stats").await else {
+        eprintln!("skipping freeze_round_trip: stats not resolvable");
+        return;
+    };
+    let rec = PackageRecord::from_info(&live);
+    let db = RepoDb {
+        schema_version: REPO_DB_SCHEMA_VERSION,
+        provenance: RepoDbProvenance {
+            raven_version: "test".into(),
+            r_version: "present".into(),
+            generated_unix: 0,
+        },
+        packages: vec![rec.clone()],
+    };
+    let text = write_repo_db_string(&db);
+    let parsed = read_repo_db_str(&text).unwrap();
+    let back = parsed.packages.into_iter().next().unwrap().into_info();
+
+    // Parity: same export set + name after the round-trip.
+    assert_eq!(back.exports, live.exports);
+    assert_eq!(back.name, live.name);
+}
