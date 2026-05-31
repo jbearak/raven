@@ -65,11 +65,11 @@ Export resolution becomes an **ordered fallback over three sources**, consulted 
 
 | Tier | When it applies | Source | Fidelity |
 |---|---|---|---|
-| **1 — Installed** | Package installed locally (and R reachable for `exportPattern`) | Existing on-disk path: static `NAMESPACE` parse + R subprocess to expand `exportPattern` | Authoritative, version-exact to the install |
-| **2 — Repo DB** | Not installed, or R can't launch | A repo-specific, committed `.raven/packages.json` generated locally (see §7) | "Frozen Tier 1": full structure, version-exact to when it was generated |
-| **3 — Shipped DB** | Otherwise | A Raven-bundled `names.db` built from r-universe latest (see §8) | Latest CRAN/Bioc; export-only |
+| **1 — Installed** | Package found in a local library path (R only affects `exportPattern` fidelity, not whether Tier 1 applies) | Existing on-disk path: static `NAMESPACE` parse + R subprocess to expand `exportPattern` (or `INDEX` approximation when R is absent) | Authoritative, version-exact to the install |
+| **2 — Repo DB** | No package directory found on disk (e.g. CI with an empty `.libPaths()`) | A repo-specific, committed `.raven/packages.json` generated locally (see §7) | "Frozen Tier 1": full structure, version-exact to when it was generated |
+| **3 — Shipped DB** | Otherwise (no Tier 1 directory and no Tier 2 record) | A Raven-bundled `names.db`: reference-R capture ∪ CRAN + Bioc r-universe, version-monotonic union, append-only (see §8) | Highest version per package; exports + `Depends` + datasets (no `:::`/signatures) |
 
-Tier 2 outranks Tier 3 because it is project-specific and built through the authoritative path. A repo that never generates a Tier 2 file still works in CI via Tier 3 alone — the bundled latest-CRAN/Bioc floor (subject to the drift caveat in §13). The two databases share one in-memory model, one reader, and one writer (§6).
+The fallback trigger is a **missing package directory**, never a missing R: the only hook is at `find_package_directory` misses (§5.2). An installed package still resolves from Tier 1 even with no R — its `exportPattern` exports merely degrade to the `INDEX` approximation. Tier 2 outranks Tier 3 because it is project-specific and built through the authoritative path. A repo that never generates a Tier 2 file still works in CI via Tier 3 alone — the bundled floor (subject to the drift caveat in §13). The two databases share one in-memory model, one reader, and one writer (§6).
 
 ---
 

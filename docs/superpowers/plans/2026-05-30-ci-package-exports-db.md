@@ -61,7 +61,7 @@ The Stage-1 docs were authored against the ledger above, then reviewed across th
 
 16. **Tier 3 merge is version-driven and monotonic (corrects the old "reference-R > r-universe > prior" rule, which was a flaw).** The old rule made the reference-R capture unconditionally outrank r-universe — so if CRAN/Bioc had a *newer* release than the build machine's installed copy, the build would have frozen the **older** export set and Tier 3 could miss symbols the newer version added. Corrected rule (**version-driven, monotonic**): for each package, the merge keeps the record with the **highest package version across all three sources** — the prior `names.db`, the reference-R install, and r-universe. The database therefore **never regresses** a package to an older export set: a newer CRAN/Bioc release in r-universe overrides an older reference-R install (and a newer local/dev build overrides an older CRAN release), and a still-newer version already captured in the prior DB is retained. Equal versions prefer reference-R, then r-universe, then prior (the export sets are identical at equal version, so this is just a deterministic tiebreak). Nothing is ever dropped — append-only is preserved and strengthened to "a package's version never goes backwards."
 
-    **Implementation consequence:** the merge compares package **versions**, so every record carries one. `PackageRecord` gains a `version: String` field, stored in **both** encodings — so the prior `names.db` carries versions for the next merge, **and** Tier 2 `.raven/packages.json` shows version changes in `git diff` (e.g. "dplyr 1.1.0 → 1.1.4"). It is populated on the build-side capture paths: the reference-R seed **and** `raven packages freeze` read it from each package's `DESCRIPTION` `Version` (a small build-side read next to the existing `Depends` parse); the r-universe ingester reads the JSON `Version`. `PackageInfo` itself is **not** changed (it has no version today and Tier 1 resolution doesn't need one) — `version` is set on the record during capture and ignored by `into_info()`. Version comparison is a small numeric-aware compare (split on `.`/`-`); an empty/unparseable version sorts lowest. See the REVISED notes on Tasks 1.2, 4.1, and 4.2.
+    **Implementation consequence:** the merge compares package **versions**, so every record carries one. `PackageRecord` gains a `version: String` field, stored in **both** encodings — so the prior `names.db` carries versions for the next merge, **and** Tier 2 `.raven/packages.json` shows version changes in `git diff` (e.g. "dplyr 1.1.0 → 1.1.4"). It is populated on the build-side capture paths: the reference-R seed **and** `raven packages freeze` read it from each package's `DESCRIPTION` `Version` (a small build-side read next to the existing `Depends` parse); the r-universe ingester reads the JSON `Version`. `PackageInfo` itself is **not** changed (it has no version today and Tier 1 resolution doesn't need one) — `version` is set on the record during capture and ignored by `into_info()`. Version comparison (`merge::version_cmp`, Task 4.2) follows R's own `numeric_version` semantics: split on `.` **or** `-` (the two separators are equivalent, so `1.1-3` == `1.1.3`), compare components left-to-right as integers, and treat the version with more components as greater when one is a prefix of the other (`1.1.0` > `1.1`); an empty or unparseable version sorts **lowest**, and — unlike SemVer — there is no pre-release ordering. See the REVISED notes on Tasks 1.2, 4.1, and 4.2.
 
     **Cadence (folds in the old decision #5/#14 wording):** the refresh **interval is not yet committed.** `build-names-db.yml` ships with `workflow_dispatch` + on-release triggers; the scheduled `schedule:` cron is left as a commented placeholder until an interval is chosen, so the plan commits to no specific frequency (the earlier "weekly" was dropped in review).
 
@@ -274,6 +274,8 @@ mod tests {
         // Exports are sorted and de-duplicated for deterministic encoding.
         assert_eq!(rec.exports, vec!["filter".to_string(), "mutate".to_string()]);
         assert_eq!(rec.name, "dplyr");
+        // from_info has no version to read; capture paths fill it in later.
+        assert_eq!(rec.version, "");
 
         let back = rec.clone().into_info();
         assert_eq!(back.name, "dplyr");
@@ -322,6 +324,11 @@ use crate::package_library::PackageInfo;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageRecord {
     pub name: String,
+    /// Package version (`DESCRIPTION` `Version`); `""` when unknown. Drives the
+    /// Tier 3 monotonic merge (Task 4.2) and rides in both encodings, so a Tier 2
+    /// `git diff` shows version bumps too. Filled by the capture paths
+    /// (reference-R seed, `freeze`, r-universe ingest), not by `from_info`.
+    pub version: String,
     /// Sorted, de-duplicated export names.
     pub exports: Vec<String>,
     /// Sorted, de-duplicated `Depends` package names.
@@ -343,6 +350,8 @@ impl PackageRecord {
     pub fn from_info(info: &PackageInfo) -> Self {
         Self {
             name: info.name.clone(),
+            // PackageInfo carries no version; capture paths fill this in.
+            version: String::new(),
             exports: sorted_unique(info.exports.iter().cloned()),
             depends: sorted_unique(info.depends.iter().cloned()),
             lazy_data: sorted_unique(info.lazy_data.iter().cloned()),
@@ -431,8 +440,8 @@ mod tests {
             },
             // intentionally out of order to prove the writer sorts.
             packages: vec![
-                PackageRecord { name: "dplyr".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] },
-                PackageRecord { name: "cli".into(), exports: vec!["cli_alert".into()], depends: vec![], lazy_data: vec![] },
+                PackageRecord { name: "dplyr".into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] },
+                PackageRecord { name: "cli".into(), version: "3.6.2".into(), exports: vec!["cli_alert".into()], depends: vec![], lazy_data: vec![] },
             ],
         }
     }
@@ -446,6 +455,8 @@ mod tests {
         // packages are sorted by name on write.
         assert_eq!(parsed.packages[0].name, "cli");
         assert_eq!(parsed.packages[1].name, "dplyr");
+        // version survives the JSON round-trip.
+        assert_eq!(parsed.packages[1].version, "1.1.4");
         assert_eq!(parsed.provenance.r_version, "4.4.0");
     }
 
@@ -604,8 +615,8 @@ mod tests {
 
     fn records() -> Vec<PackageRecord> {
         vec![
-            PackageRecord { name: "dplyr".into(), exports: vec!["filter".into(), "mutate".into()], depends: vec!["R".into()], lazy_data: vec!["starwars".into()] },
-            PackageRecord { name: "ggplot2".into(), exports: vec!["aes".into(), "ggplot".into()], depends: vec![], lazy_data: vec![] },
+            PackageRecord { name: "dplyr".into(), version: "1.1.4".into(), exports: vec!["filter".into(), "mutate".into()], depends: vec!["R".into()], lazy_data: vec!["starwars".into()] },
+            PackageRecord { name: "ggplot2".into(), version: "3.5.1".into(), exports: vec!["aes".into(), "ggplot".into()], depends: vec![], lazy_data: vec![] },
         ]
     }
 
@@ -1269,7 +1280,7 @@ Add to the test module:
         let db_path = dir.path().join("names.db");
         write_shipped_db(
             &db_path,
-            &[PackageRecord { name: "dplyr".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] }],
+            &[PackageRecord { name: "dplyr".into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] }],
             ShippedDbProvenance { source: "test".into(), snapshot_date: "2026-05-30".into(), package_count: 1, raven_version: "9.9.9".into() },
         )
         .unwrap();
@@ -1375,6 +1386,7 @@ async fn tier3_resolves_export_with_no_r() {
         &db_path,
         &[PackageRecord {
             name: "dplyr".into(),
+            version: "1.1.4".into(),
             exports: vec!["filter".into(), "mutate".into()],
             depends: vec![],
             lazy_data: vec![],
@@ -1595,7 +1607,7 @@ git commit -m "build: bundle names.db + base-exports from the names-db Release i
         write_repo_db_file(&path, &RepoDb {
             schema_version: crate::package_db::json_db::REPO_DB_SCHEMA_VERSION,
             provenance: RepoDbProvenance { raven_version: "t".into(), r_version: "4.4.0".into(), generated_unix: 0 },
-            packages: vec![PackageRecord { name: "datasets".into(), exports: vec![], depends: vec![], lazy_data: vec!["mtcars".into()] }],
+            packages: vec![PackageRecord { name: "datasets".into(), version: "4.4.0".into(), exports: vec![], depends: vec![], lazy_data: vec!["mtcars".into()] }],
         }).unwrap();
 
         std::env::set_var("RAVEN_BASE_EXPORTS", &path);
@@ -1795,6 +1807,8 @@ mod tests {
         assert_eq!(dplyr.depends, vec!["R".to_string()]);
         // Datasets come from _datasets[].name.
         assert_eq!(dplyr.lazy_data, vec!["starwars".to_string(), "storms".to_string()]);
+        // Version is captured from the JSON "Version" field (drives the merge).
+        assert_eq!(dplyr.version, "1.1.4");
         assert!(records.iter().any(|r| r.name == "ggplot2"));
     }
 }
@@ -1828,6 +1842,8 @@ use crate::package_db::model::PackageRecord;
 struct RUniversePackage {
     #[serde(rename = "Package")]
     package: String,
+    #[serde(rename = "Version", default)]
+    version: String,
     #[serde(rename = "_exports", default)]
     exports: Vec<String>,
     #[serde(rename = "_dependencies", default)]
@@ -1870,7 +1886,7 @@ pub fn parse_runiverse_json(text: &str) -> anyhow::Result<PackageRecord> {
     let mut lazy_data = lazy_data;
     lazy_data.sort_unstable();
     lazy_data.dedup();
-    Ok(PackageRecord { name: pkg.package, exports, depends, lazy_data })
+    Ok(PackageRecord { name: pkg.package, version: pkg.version, exports, depends, lazy_data })
 }
 
 /// Read every `*.json` in `dir` and parse it into a `PackageRecord`. Files that
@@ -1925,17 +1941,11 @@ git commit -m "feat(package_db): ingest r-universe per-package JSON into Package
 >
 > **Revised args:** `--reference-lib` (capture installed R; optional — omit in pure-ingest tests), `--runiverse-cran <dir>`, `--runiverse-bioc <dir>`, `--fresh`/`--no-seed` (skip the default prior-DB seed), `--seed <prior names.db>` (override the seed path), `--output <names.db>`, `--base-exports-output <base-exports.json>`, `--snapshot-date`, `--source`. The `parse_build_shipped_db_args` test below extends to cover the new flags; the version-driven, monotonic merge gets dedicated `merge.rs` unit tests: a name only in `prior` is retained; a name in both `reference_r` and `runiverse` takes the **higher-version** record (include the case where **r-universe is newer than reference-R**, proving the corrected precedence, *and* the reverse — a newer local/dev build beating CRAN); a name whose **`prior` version is higher than both current sources** is retained at the prior version (the no-regression / monotonic guarantee); equal versions take the reference-R record.
 >
-> The Step-3 code below is the **v1 skeleton** (single `--input` ingest); extend it to the merge flow above. The `parse_build_shipped_db_args`/dispatch/`print_help` wiring is otherwise reused as-is.
+> The Step-3 code below implements the **full merge flow** (it is no longer a single-`--input` ingest skeleton). The `Files:` list above is authoritative — note `merge.rs` and its tests.
 
-**Files:**
-- Modify: `crates/raven/src/cli/mod.rs` (add `pub mod packages;`)
-- Create: `crates/raven/src/cli/packages.rs`
-- Modify: `crates/raven/src/main.rs` (dispatch arm)
-- Test: inline `#[cfg(test)]` in `packages.rs`
+- [ ] **Step 1: Write the failing tests**
 
-- [ ] **Step 1: Write the failing test**
-
-Create `crates/raven/src/cli/packages.rs` with just the test first (implementation follows in Step 3):
+Create `crates/raven/src/cli/packages.rs` with just the arg-parsing test first (implementation follows in Step 3):
 
 ```rust
 #[cfg(test)]
@@ -1945,17 +1955,29 @@ mod tests {
     #[test]
     fn parse_build_shipped_db_args() {
         let args = parse_build_shipped_db_args(
-            ["--input".to_string(), "in".to_string(), "--output".to_string(), "out.db".to_string(),
+            ["--runiverse-cran".to_string(), "cran".to_string(),
+             "--runiverse-bioc".to_string(), "bioc".to_string(),
+             "--output".to_string(), "out.db".to_string(),
+             "--base-exports-output".to_string(), "base.json".to_string(),
+             "--fresh".to_string(),
              "--snapshot-date".to_string(), "2026-05-30".to_string()]
                 .into_iter(),
         )
         .unwrap();
-        assert_eq!(args.input, std::path::PathBuf::from("in"));
+        assert_eq!(args.runiverse_cran, Some(std::path::PathBuf::from("cran")));
+        assert_eq!(args.runiverse_bioc, Some(std::path::PathBuf::from("bioc")));
         assert_eq!(args.output, std::path::PathBuf::from("out.db"));
+        assert_eq!(args.base_exports_output, Some(std::path::PathBuf::from("base.json")));
+        assert!(args.fresh, "--fresh skips the default prior-DB seed");
         assert_eq!(args.snapshot_date, "2026-05-30");
+        // No reference-R capture and no explicit seed override by default.
+        assert_eq!(args.reference_lib, None);
+        assert_eq!(args.seed, None);
     }
 }
 ```
+
+The version-driven, monotonic merge gets its own tests in `merge.rs` (Step 3 below).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1970,18 +1992,34 @@ Replace the contents of `crates/raven/src/cli/packages.rs` with (test module kep
 //! `raven packages {freeze,build-shipped-db}` — package-database commands.
 //!
 //! `freeze` (Task 5.3) generates a repo's Tier 2 `.raven/packages.json`.
-//! `build-shipped-db` is the maintainer-only ingester that turns a directory of
-//! r-universe JSON into the Tier 3 `names.db`. The shipped binary never fetches
-//! from the network; a build job supplies the JSON directory.
+//! `build-shipped-db` is the maintainer-only Tier 3 builder. It merges, **append-only
+//! and version-monotonic**, three sources into `names.db`: the prior DB (the seed),
+//! an authoritative reference-R capture of the build machine's installed library,
+//! and CRAN + Bioc r-universe JSON. The shipped binary never fetches from the
+//! network; a build job supplies the r-universe JSON directories with `curl`.
 
 use std::path::PathBuf;
 
-use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+use crate::package_db::binary_db::{write_shipped_db, ShippedDb, ShippedDbProvenance};
+use crate::package_db::merge::merge_append_only;
+use crate::package_db::model::PackageRecord;
 use crate::package_db::runiverse::ingest_runiverse_dir;
 
 pub struct BuildShippedDbArgs {
-    pub input: PathBuf,
+    /// Capture the build machine's installed R library (Tier-1 path) as an extra
+    /// lib path. Optional — omit for a pure r-universe ingest (e.g. tests).
+    pub reference_lib: Option<PathBuf>,
+    /// Directory of CRAN r-universe per-package JSON (`cran.r-universe.dev`).
+    pub runiverse_cran: Option<PathBuf>,
+    /// Directory of Bioc r-universe per-package JSON (`bioc.r-universe.dev`).
+    pub runiverse_bioc: Option<PathBuf>,
+    /// Skip the default prior-DB seed (`--fresh` / `--no-seed`).
+    pub fresh: bool,
+    /// Override which prior `names.db` to seed from (default: the `--output` path).
+    pub seed: Option<PathBuf>,
     pub output: PathBuf,
+    /// Where to write the companion base-exports file (base/recommended subset).
+    pub base_exports_output: Option<PathBuf>,
     pub snapshot_date: String,
     pub source: String,
 }
@@ -1989,14 +2027,24 @@ pub struct BuildShippedDbArgs {
 pub fn parse_build_shipped_db_args(
     mut argv: impl Iterator<Item = String>,
 ) -> Result<BuildShippedDbArgs, String> {
-    let mut input = None;
+    let mut reference_lib = None;
+    let mut runiverse_cran = None;
+    let mut runiverse_bioc = None;
+    let mut fresh = false;
+    let mut seed = None;
     let mut output = None;
+    let mut base_exports_output = None;
     let mut snapshot_date = String::new();
-    let mut source = "r-universe".to_string();
+    let mut source = "reference-R ∪ r-universe".to_string();
     while let Some(arg) = argv.next() {
         match arg.as_str() {
-            "--input" => input = Some(PathBuf::from(argv.next().ok_or("--input needs a path")?)),
+            "--reference-lib" => reference_lib = Some(PathBuf::from(argv.next().ok_or("--reference-lib needs a path")?)),
+            "--runiverse-cran" => runiverse_cran = Some(PathBuf::from(argv.next().ok_or("--runiverse-cran needs a path")?)),
+            "--runiverse-bioc" => runiverse_bioc = Some(PathBuf::from(argv.next().ok_or("--runiverse-bioc needs a path")?)),
+            "--fresh" | "--no-seed" => fresh = true,
+            "--seed" => seed = Some(PathBuf::from(argv.next().ok_or("--seed needs a path")?)),
             "--output" => output = Some(PathBuf::from(argv.next().ok_or("--output needs a path")?)),
+            "--base-exports-output" => base_exports_output = Some(PathBuf::from(argv.next().ok_or("--base-exports-output needs a path")?)),
             "--snapshot-date" => snapshot_date = argv.next().ok_or("--snapshot-date needs a value")?,
             "--source" => source = argv.next().ok_or("--source needs a value")?,
             "--help" => return Err("HELP".into()),
@@ -2004,23 +2052,71 @@ pub fn parse_build_shipped_db_args(
         }
     }
     Ok(BuildShippedDbArgs {
-        input: input.ok_or("--input is required")?,
+        reference_lib,
+        runiverse_cran,
+        runiverse_bioc,
+        fresh,
+        seed,
         output: output.ok_or("--output is required")?,
+        base_exports_output,
         snapshot_date,
         source,
     })
 }
 
-pub fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String> {
-    let records = ingest_runiverse_dir(&args.input).map_err(|e| e.to_string())?;
+pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String> {
+    // 1) Prior-DB seed (append is the default; --fresh/--no-seed skips it). A
+    //    missing/unreadable/older-format seed is treated as empty — never fatal.
+    let prior: Vec<PackageRecord> = if args.fresh {
+        Vec::new()
+    } else {
+        let seed_path = args.seed.clone().unwrap_or_else(|| args.output.clone());
+        match ShippedDb::open(&seed_path) {
+            Ok(db) => db.all_records(),  // decode every indexed record (Task 1.4 helper)
+            Err(_) => Vec::new(),
+        }
+    };
+
+    // 2) r-universe ingest (CRAN ∪ Bioc directories).
+    let mut runiverse: Vec<PackageRecord> = Vec::new();
+    for dir in [args.runiverse_cran.as_ref(), args.runiverse_bioc.as_ref()].into_iter().flatten() {
+        runiverse.extend(ingest_runiverse_dir(dir).map_err(|e| e.to_string())?);
+    }
+
+    // 3) Authoritative reference-R capture (optional). The provider-less Tier-1
+    //    path captures the build machine's entire installed library — versions
+    //    read from each package's DESCRIPTION right where Depends is read.
+    let mut reference_r: Vec<PackageRecord> = Vec::new();
+    if let Some(lib) = &args.reference_lib {
+        let outcome = crate::package_library::build_package_library_tier1_only(
+            None, std::slice::from_ref(lib), None,
+        )
+        .await;
+        for name in outcome.library.enumerate_installed_packages() {
+            if let Some(info) = outcome.library.get_package(&name).await {
+                let mut rec = PackageRecord::from_info(&info);
+                rec.version = outcome.library.package_version(&name).unwrap_or_default();
+                reference_r.push(rec);
+            }
+        }
+    }
+
+    // 4) Merge: append-only, version-driven, monotonic (decision #16).
+    let merged = merge_append_only(prior, runiverse, reference_r);
+
+    // 5) Write names.db, then the companion base-exports file (base/recommended
+    //    subset — Task 6.x / decision #7).
     let provenance = ShippedDbProvenance {
         source: args.source,
         snapshot_date: args.snapshot_date,
-        package_count: records.len() as u32,
+        package_count: merged.len() as u32,
         raven_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    write_shipped_db(&args.output, &records, provenance).map_err(|e| e.to_string())?;
-    eprintln!("Wrote {} packages to {}", records.len(), args.output.display());
+    write_shipped_db(&args.output, &merged, provenance).map_err(|e| e.to_string())?;
+    if let Some(base_out) = &args.base_exports_output {
+        crate::package_db::write_base_exports_file(base_out, &merged).map_err(|e| e.to_string())?;
+    }
+    eprintln!("Wrote {} packages to {}", merged.len(), args.output.display());
     Ok(())
 }
 
@@ -2029,7 +2125,7 @@ pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
     match argv.next().as_deref() {
         Some("build-shipped-db") => {
             let args = parse_build_shipped_db_args(argv)?;
-            run_build_shipped_db(args)
+            run_build_shipped_db(args).await
         }
         // "freeze" arm is added in Task 5.3.
         Some(other) => Err(format!("unknown packages subcommand: {other}")),
@@ -2037,6 +2133,146 @@ pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
     }
 }
 ```
+
+**New helpers this task assumes** (thin additions, kept out of the block above for focus): `ShippedDb::all_records()` decodes every indexed `PackageRecord` from the mmap (the Task 1.4 reader already holds the `{name, offset, len}` index; this just iterates it); `PackageLibrary::package_version(&name)` reads the package's `DESCRIPTION` `Version` (same place `Depends` is parsed); and `package_db::write_base_exports_file` filters the merged set to base/recommended names and reuses the Tier 2 JSON writer.
+
+Then create `crates/raven/src/package_db/merge.rs` with the version-monotonic merge and its tests:
+
+```rust
+//! Append-only, version-monotonic merge for the Tier 3 build (decision #16).
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
+use crate::package_db::model::PackageRecord;
+
+/// Compare two R package version strings numerically.
+///
+/// R version syntax is one or more non-negative integers separated by `.` **or**
+/// `-` (the two separators are equivalent, as in R's own `numeric_version`, so
+/// `1.1-3` == `1.1.3`). Components are compared left-to-right as integers; if one
+/// is a prefix of the other the longer (more components) is greater (`1.1.0` >
+/// `1.1`). An empty or unparseable version sorts **lowest**, so any known version
+/// beats an unknown one. (Unlike SemVer, R has no pre-release ordering.)
+pub fn version_cmp(a: &str, b: &str) -> Ordering {
+    fn parts(v: &str) -> Vec<i64> {
+        v.split(|c| c == '.' || c == '-')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<i64>().unwrap_or(-1)) // non-numeric component sorts low
+            .collect()
+    }
+    parts(a).cmp(&parts(b))
+}
+
+/// Merge three sources into one append-only, version-monotonic set.
+///
+/// For each package name the record with the **highest version across all three
+/// sources** is kept; equal versions tiebreak **reference-R → r-universe → prior**.
+/// A name present in only one source is retained — nothing is ever dropped, and no
+/// package is ever moved to an older version than it already had.
+pub fn merge_append_only(
+    prior: Vec<PackageRecord>,
+    runiverse: Vec<PackageRecord>,
+    reference_r: Vec<PackageRecord>,
+) -> Vec<PackageRecord> {
+    // Priority encodes the equal-version tiebreak: prior(0) < r-universe(1) < reference-R(2).
+    // Iterating in that order means a later, higher-priority source overwrites only
+    // when its version is >= the incumbent's.
+    let mut best: BTreeMap<String, (u8, PackageRecord)> = BTreeMap::new();
+    for (prio, recs) in [(0u8, prior), (1u8, runiverse), (2u8, reference_r)] {
+        for rec in recs {
+            let take = match best.get(&rec.name) {
+                None => true,
+                Some((cur_prio, cur)) => match version_cmp(&rec.version, &cur.version) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => prio >= *cur_prio,
+                    Ordering::Less => false,
+                },
+            };
+            if take {
+                best.insert(rec.name.clone(), (prio, rec));
+            }
+        }
+    }
+    // BTreeMap → sorted-by-name, deterministic output.
+    best.into_values().map(|(_, rec)| rec).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(name: &str, version: &str, export: &str) -> PackageRecord {
+        PackageRecord {
+            name: name.into(),
+            version: version.into(),
+            exports: vec![export.into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }
+    }
+
+    #[test]
+    fn version_cmp_is_numeric_and_separator_agnostic() {
+        assert_eq!(version_cmp("1.1.10", "1.1.9"), Ordering::Greater); // numeric, not lexicographic
+        assert_eq!(version_cmp("1.1-3", "1.1.3"), Ordering::Equal);    // '.' and '-' equivalent
+        assert_eq!(version_cmp("1.1.0", "1.1"), Ordering::Greater);    // longer prefix wins
+        assert_eq!(version_cmp("", "0.0.1"), Ordering::Less);          // empty sorts lowest
+    }
+
+    #[test]
+    fn prior_only_package_is_retained() {
+        let merged = merge_append_only(vec![rec("orphan", "1.0", "old")], vec![], vec![]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "orphan");
+    }
+
+    #[test]
+    fn runiverse_newer_than_reference_r_wins() {
+        // CRAN release is ahead of the build machine's installed copy.
+        let merged = merge_append_only(
+            vec![],
+            vec![rec("dplyr", "1.1.4", "from_runiverse")],
+            vec![rec("dplyr", "1.1.0", "from_reference")],
+        );
+        assert_eq!(merged[0].exports, vec!["from_runiverse".to_string()]);
+    }
+
+    #[test]
+    fn reference_r_newer_than_runiverse_wins() {
+        // A newer local/dev build beats the CRAN release.
+        let merged = merge_append_only(
+            vec![],
+            vec![rec("dplyr", "1.1.0", "from_runiverse")],
+            vec![rec("dplyr", "1.2.0", "from_reference")],
+        );
+        assert_eq!(merged[0].exports, vec!["from_reference".to_string()]);
+    }
+
+    #[test]
+    fn prior_higher_than_both_is_not_regressed() {
+        // Monotonic guarantee: the DB never moves a package to an older version.
+        let merged = merge_append_only(
+            vec![rec("dplyr", "2.0.0", "from_prior")],
+            vec![rec("dplyr", "1.1.4", "from_runiverse")],
+            vec![rec("dplyr", "1.1.0", "from_reference")],
+        );
+        assert_eq!(merged[0].exports, vec!["from_prior".to_string()]);
+    }
+
+    #[test]
+    fn equal_version_tiebreaks_to_reference_r() {
+        let merged = merge_append_only(
+            vec![rec("dplyr", "1.1.4", "from_prior")],
+            vec![rec("dplyr", "1.1.4", "from_runiverse")],
+            vec![rec("dplyr", "1.1.4", "from_reference")],
+        );
+        assert_eq!(merged[0].exports, vec!["from_reference".to_string()]);
+    }
+}
+```
+
+In `crates/raven/src/package_db/mod.rs`, add `pub mod merge;` (and `pub fn write_base_exports_file` per the helper note).
 
 In `crates/raven/src/cli/mod.rs`, add:
 
@@ -2069,7 +2305,9 @@ pub fn print_help() {
         "raven packages — package-database commands\n\n\
          Usage:\n  \
          raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]\n  \
-         raven packages build-shipped-db --input DIR --output names.db [--snapshot-date S] [--source S]\n"
+         raven packages build-shipped-db [--reference-lib DIR] [--runiverse-cran DIR] \
+[--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
+[--base-exports-output base-exports.json] [--snapshot-date S] [--source S]\n"
     );
 }
 ```
@@ -2081,10 +2319,11 @@ Expected: PASS.
 
 - [ ] **Step 5: End-to-end check via the binary**
 
-Run:
+Run (pure r-universe ingest: `--fresh` skips the seed, no `--reference-lib` so no R needed):
 ```bash
 cargo run -p raven -- packages build-shipped-db \
-  --input crates/raven/tests/fixtures/package_db/runiverse \
+  --runiverse-cran crates/raven/tests/fixtures/package_db/runiverse \
+  --fresh \
   --output /tmp/test-names.db --snapshot-date 2026-05-30
 ```
 Expected: prints "Wrote 2 packages to /tmp/test-names.db".
@@ -2092,8 +2331,10 @@ Expected: prints "Wrote 2 packages to /tmp/test-names.db".
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/raven/src/cli/mod.rs crates/raven/src/cli/packages.rs crates/raven/src/main.rs
-git commit -m "feat(cli): raven packages build-shipped-db ingester subcommand"
+git add crates/raven/src/cli/mod.rs crates/raven/src/cli/packages.rs \
+  crates/raven/src/package_db/mod.rs crates/raven/src/package_db/merge.rs \
+  crates/raven/src/main.rs
+git commit -m "feat(cli): raven packages build-shipped-db (append-only version-monotonic merge)"
 ```
 
 ---
@@ -2390,7 +2631,7 @@ This reuses the authoritative path: build a library with R, resolve the `--used`
 >    - `library`/`require`/`loadNamespace`/**`requireNamespace`** call args (extend the existing detection), and
 >    - the `namespace_identifier` (LHS) of every **`namespace_operator`** node (`::` and `:::`),
 >
->    unioned with `renv.lock` names, the repo's own **`DESCRIPTION` `Depends`+`Imports`** (parse via `parse_description_depends` for Depends; add an `Imports` parse — exclude `LinkingTo`), and transitive `Depends`. A small tree-walk helper:
+>    unioned with `renv.lock` names, the repo's own **`DESCRIPTION` `Depends`+`Imports`** (parse both fields via the existing public `namespace_parser::parse_description_field_pub(content, field)` — `namespace_parser.rs:307` — and exclude `LinkingTo`), and transitive `Depends`. A small tree-walk helper:
 >    ```rust
 >    fn collect_referenced_packages(doc_tree: &tree_sitter::Tree, text: &str, out: &mut BTreeSet<String>) {
 >        let mut stack = vec![doc_tree.root_node()];
@@ -2448,7 +2689,9 @@ Expected: FAIL — `parse_freeze_args` / `FreezeScope` not defined.
 Add to `crates/raven/src/cli/packages.rs` (above the test module):
 
 ```rust
-use crate::package_db::json_db::{write_repo_db_file, RepoDb, RepoDbProvenance};
+use crate::package_db::json_db::{
+    read_repo_db_file, write_repo_db_file, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+};
 use crate::package_db::model::PackageRecord;
 use crate::package_db::renv_lock::read_renv_lock_package_names;
 
@@ -2504,13 +2747,14 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
         None => cwd.clone(),
     };
 
-    // Authoritative path: real R + renv-aware lib order (get_lib_paths sources
+    // Provider-less capture (decision #6): build a Tier-1-ONLY library so a
+    // not-installed package can never resolve from Tier 2/3 and leak into the
+    // "frozen Tier 1" file. Real R + renv-aware lib order (get_lib_paths sources
     // renv/activate.R, so .libPaths() is [renv_lib, system_libs…]).
-    let outcome = crate::package_library::build_package_library(
+    let outcome = crate::package_library::build_package_library_tier1_only(
         None,                 // auto-detect R on PATH
         &[],                  // no extra lib paths
         Some(root.clone()),   // working dir → renv-aware
-        true,                 // packages enabled
     )
     .await;
     let lib = &outcome.library;
@@ -2522,11 +2766,12 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
             wanted.extend(lib.enumerate_installed_packages());
         }
         FreezeScope::Used => {
-            // scripts-referenced: scan the workspace for library/require/:: .
-            for pkg in scan_workspace_loaded_packages(&root) {
-                wanted.insert(pkg);
-            }
-            // renv.lock-listed.
+            // Maximally-inclusive (decision #10): library/require/loadNamespace/
+            // requireNamespace args ∪ `::`/`:::` LHS ∪ the repo's DESCRIPTION
+            // Depends+Imports ∪ renv.lock. Over-inclusion is harmless — the
+            // package_exists gate below drops anything not installed.
+            wanted.extend(scan_workspace_referenced_packages(&root));
+            wanted.extend(read_description_depends_imports(&root.join("DESCRIPTION")));
             for pkg in read_renv_lock_package_names(&root.join("renv.lock")).map_err(|e| e.to_string())? {
                 wanted.insert(pkg);
             }
@@ -2534,11 +2779,22 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     }
 
     // 2) Resolve each (authoritative), then add transitive Depends for --used.
+    //    Gate on package_exists (Tier-1-only) and skip base packages, so only
+    //    genuinely-installed, non-builtin packages reach the frozen file.
     let mut records: Vec<PackageRecord> = Vec::new();
     let mut queue: Vec<String> = wanted.iter().cloned().collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some(name) = queue.pop() {
         if !seen.insert(name.clone()) {
+            continue;
+        }
+        // Base packages are always builtins/Tier-1; never freeze them.
+        if lib.is_base_package(&name) {
+            continue;
+        }
+        // package_exists() is the explicit install-status gate (Tier-1-only):
+        // belt-and-suspenders over the provider-less library.
+        if !lib.package_exists(&name) {
             continue;
         }
         if let Some(info) = lib.get_package(&name).await {
@@ -2551,12 +2807,30 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
                     }
                 }
             }
-            records.push(PackageRecord::from_info(&info));
+            // Capture the package version (decision #16) — same DESCRIPTION read
+            // path as Depends. Rides into the Tier 2 JSON so a `git diff` shows
+            // version bumps.
+            let mut rec = PackageRecord::from_info(&info);
+            rec.version = lib.package_version(&name).unwrap_or_default();
+            records.push(rec);
         }
     }
     records.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // 3) Provenance + write.
+    // 3) No-op when content is unchanged (decision #11): if the target exists and
+    //    its `.packages` already equal the freshly-computed set (ignoring
+    //    provenance), leave the file untouched so a re-run produces a zero-line diff.
+    let out = if args.output.is_absolute() { args.output.clone() } else { root.join(&args.output) };
+    if out.exists() {
+        if let Ok(existing) = read_repo_db_file(&out) {
+            if existing.packages == records {
+                eprintln!("no changes; left {} untouched", out.display());
+                return Ok(());
+            }
+        }
+    }
+
+    // 4) Provenance + write.
     let r_version = lib
         .r_subprocess()
         .map(|_| "present".to_string())   // exact version is best-effort; see note
@@ -2566,6 +2840,7 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let db = RepoDb {
+        schema_version: REPO_DB_SCHEMA_VERSION,
         provenance: RepoDbProvenance {
             raven_version: env!("CARGO_PKG_VERSION").to_string(),
             r_version,
@@ -2573,38 +2848,51 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
         },
         packages: records,
     };
-    let out = if args.output.is_absolute() { args.output.clone() } else { root.join(&args.output) };
     write_repo_db_file(&out, &db).map_err(|e| e.to_string())?;
     eprintln!("Wrote {} packages to {}", db.packages.len(), out.display());
     Ok(())
 }
 
-/// Scan the workspace's R/Rmd scripts for `library()` / `require()` / `pkg::`
-/// references. Reuses the workspace indexer (the same scan `raven check` uses).
-/// `scan_workspace` returns `WorkspaceScanResult` — a tuple type alias whose
-/// first element is `HashMap<Url, Document>` (verified at `state.rs:1140`); each
-/// `Document.loaded_packages` (`state.rs:153`) is populated during the scan, so
-/// no `apply_workspace_index` is needed just to read it. The `is_valid_package_name`
-/// filter mirrors `prefetch_reported_packages` (`cli/check.rs:476-483`).
-fn scan_workspace_loaded_packages(root: &std::path::Path) -> Vec<String> {
+/// Scan the workspace's R/Rmd scripts for the **maximally-inclusive** referenced
+/// set (decision #10): `library`/`require`/`loadNamespace`/`requireNamespace`
+/// call args ∪ the `namespace_identifier` (LHS) of every `::`/`:::` operator.
+/// Walks each `Document`'s tree (the same scan `raven check` uses); see the
+/// `collect_referenced_packages` helper in the REVISED note above. The
+/// `is_valid_package_name` filter mirrors `prefetch_reported_packages`
+/// (`cli/check.rs:476-483`).
+fn scan_workspace_referenced_packages(root: &std::path::Path) -> Vec<String> {
     use tower_lsp::lsp_types::Url;
     let Ok(workspace_url) = Url::from_file_path(root) else { return Vec::new() };
-    // max_chain_depth is irrelevant to per-file loaded_packages extraction; 0 is fine.
+    // max_chain_depth is irrelevant to per-file reference extraction; 0 is fine.
     let (index, _cross_file_entries, _new_index_entries) =
         crate::state::scan_workspace(std::slice::from_ref(&workspace_url), 0);
     let mut names = std::collections::BTreeSet::new();
     for doc in index.values() {
-        for pkg in &doc.loaded_packages {
-            if crate::r_subprocess::is_valid_package_name(pkg) {
-                names.insert(pkg.clone());
-            }
+        // Document.contents is a Rope; Document.tree is Option<Tree> (state.rs:150).
+        if let Some(tree) = &doc.tree {
+            let text = doc.contents.to_string();
+            collect_referenced_packages(tree, &text, &mut names);
         }
     }
     names.into_iter().collect()
 }
+
+/// Parse the repo's own `DESCRIPTION` `Depends` + `Imports` (excluding
+/// `LinkingTo`, which is C-level and has no R exports). Missing file → empty.
+/// Reuses the existing public field parser (`namespace_parser.rs:307`).
+fn read_description_depends_imports(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    let mut out = std::collections::BTreeSet::new();
+    out.extend(crate::namespace_parser::parse_description_field_pub(&text, "Depends"));
+    out.extend(crate::namespace_parser::parse_description_field_pub(&text, "Imports"));
+    out.remove("R");
+    out.into_iter().filter(|p| crate::r_subprocess::is_valid_package_name(p)).collect()
+}
 ```
 
-> **Note (R version):** capturing the exact R version requires a subprocess query. To avoid scope creep, v1 records `"present"`/`"unknown"`; a follow-up can add an `RSubprocess::r_version()` one-liner (`cat(as.character(getRversion()))`) and store it. This is provenance-for-debuggability only (spec §7.3) and does not affect resolution. The `scan_workspace` API was verified during planning (3-tuple alias at `state.rs:1140`, first element `HashMap<Url, Document>`, `Document.loaded_packages` at `state.rs:153`), so the helper above compiles as written.
+> **New helper this task assumes:** `PackageLibrary::package_version(&name) -> Option<String>` reads the package's `DESCRIPTION` `Version` via the existing package-directory lookup (`find_package_directory` + `parse_description_field_pub(.., "Version")`), the same place `Depends` is read (decision #16). It returns `None` for a package with no resolvable directory — so `unwrap_or_default()` yields `""`, which the merge treats as lowest.
+
+> **Note (R version):** capturing the exact R version requires a subprocess query. To avoid scope creep, v1 records `"present"`/`"unknown"`; a follow-up can add an `RSubprocess::r_version()` one-liner (`cat(as.character(getRversion()))`) and store it. This is provenance-for-debuggability only (spec §7.3) and does not affect resolution. The `scan_workspace` API was verified during planning (3-tuple alias at `state.rs:1140`, first element `HashMap<Url, Document>`); the `Document` fields the helper reads are `contents: Rope` and `tree: Option<Tree>` (`state.rs:150`), so `scan_workspace_referenced_packages` extracts text via `contents.to_string()` and walks the parsed `tree`.
 
 Update `print_help` (already lists `freeze`) — no change needed.
 
@@ -2616,7 +2904,7 @@ Expected: PASS.
 - [ ] **Step 5: Build to verify `run_freeze` compiles against the real APIs**
 
 Run: `cargo build -p raven`
-Expected: PASS. (If `scan_workspace`'s signature or `loaded_packages` field differs, fix `scan_workspace_loaded_packages` to match — see the note.)
+Expected: PASS. (If `scan_workspace`'s signature or the `Document.tree`/`Document.text` fields differ, fix `scan_workspace_referenced_packages` to match — see the note.)
 
 - [ ] **Step 6: Commit**
 

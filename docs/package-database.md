@@ -10,11 +10,11 @@ The package database fixes this by giving Raven a pre-built source of export **n
 
 | Tier | When it applies | Source | Fidelity |
 |---|---|---|---|
-| **1 — Installed** | Package installed locally (and R reachable for `exportPattern`) | The existing on-disk path: static `NAMESPACE` parse + an R subprocess to expand `exportPattern` | Authoritative, version-exact to the install |
-| **2 — Repo DB** | Not installed, or R can't launch | A repo-specific, committed `.raven/packages.json` you generate locally | "Frozen Tier 1": full structure, version-exact to when it was generated |
-| **3 — Shipped DB** | Otherwise | A Raven-bundled `names.db` built from a reference-R capture ∪ latest CRAN + Bioconductor | Latest CRAN/Bioc; export names only |
+| **1 — Installed** | Package found in a local library path (R only affects `exportPattern` fidelity, not whether Tier 1 applies) | The existing on-disk path: static `NAMESPACE` parse + an R subprocess to expand `exportPattern` (or the `INDEX` approximation when R is absent) | Authoritative, version-exact to the install |
+| **2 — Repo DB** | No package directory found on disk (e.g. CI with an empty `.libPaths()`) | A repo-specific, committed `.raven/packages.json` you generate locally | "Frozen Tier 1": full structure, version-exact to when it was generated |
+| **3 — Shipped DB** | Otherwise (no Tier 1 directory and no Tier 2 record) | A Raven-bundled `names.db`: a reference-R capture ∪ CRAN + Bioconductor (via r-universe), merged **append-only** into a version-monotonic union | Highest version per package; exports + `Depends` + datasets (no `:::`/signatures) |
 
-**Tier 2 outranks Tier 3** because it is project-specific and built through the authoritative path. A repo that never generates a Tier 2 file still works in CI via Tier 3 alone — the bundled latest-CRAN/Bioc floor (subject to the [drift caveat](#fidelity-caveats) below). The two databases share one in-memory model, one reader, and one writer.
+The fallback trigger is a **missing package directory**, never a missing R: the tiers below Tier 1 are consulted only when the package isn't found on disk at all. A package that *is* installed still resolves from Tier 1 even with no R — its `exportPattern` exports just degrade to the `INDEX` approximation. **Tier 2 outranks Tier 3** because it is project-specific and built through the authoritative path. A repo that never generates a Tier 2 file still works in CI via Tier 3 alone — the bundled floor (subject to the [drift caveat](#fidelity-caveats) below). The two databases share one in-memory model, one reader, and one writer.
 
 The tiers are a **floor, never a replacement**: whenever a package resolves from a real local install (Tier 1), that path stays in charge and is version-exact. Nothing here regresses behavior when packages *are* installed.
 
@@ -69,6 +69,7 @@ A Raven-bundled, latest-CRAN/Bioc export database — the R-free floor that work
 - **Delivery.** A sidecar file shipped with both the standalone binary and the VS Code extension, located next to the executable (override with the `RAVEN_NAMES_DB` environment variable). It is **not** compiled into the binary (which would bloat it) and **not** committed to git. It lives on a **GitHub Release** (a moving `names-db` tag) — a durable URL, unlike a per-run CI artifact — alongside the base-exports file and their checksums.
 - **Integrity & provenance.** The build records its source, snapshot date, package count, and Raven version in the database header, plus a [`blake3`](https://github.com/BLAKE3-team/BLAKE3) checksum of the payload that is verified when the file is opened. Bundling third-party data carries supply-chain responsibility, so provenance and a tamper check are part of the pipeline.
 - **Freshness.** Equals Raven's release/refresh cadence — a rebuild on each release plus on-demand rebuilds; the **exact refresh interval is not yet committed**. Acceptable because the database tracks the latest CRAN/Bioc and export names are stable; append-only means coverage only ever grows.
+- **Growth bound.** Because the merge is append-only, `names.db` grows monotonically — but slowly: at CRAN's ~2k-packages-per-year rate the file gains only ~1.7 MB/year, so a ~20–25 MB database is still well under ~40 MB a decade out. Names-only storage keeps the bound comfortable; no pruning is planned.
 
 A stale or corrupt `names.db` (for example a custom `RAVEN_NAMES_DB` from an incompatible Raven) is **explained and skipped**, exactly like a version-skewed Tier 2 file — Raven never hard-fails over it.
 
@@ -85,7 +86,7 @@ Knowing a package's exports is deliberately **separate** from knowing whether it
 - **Export resolution** (suppresses undefined-variable noise) uses all three tiers, in every mode.
 - **Install status** (drives the *missing-package* diagnostic) is **Tier 1 only** — it reflects what is present in the local library paths, never the database.
 
-In CI, `raven check` **suppresses missing-package warnings by default** (CI deliberately omits installation); re-enable them with [`--report-uninstalled`](cli.md#missing-package-reporting-in-ci), which reports `library()` calls not present in the local library paths — *not* relative to the database. The full per-mode behavior and the accepted typo gap are documented in [Diagnostics](diagnostics.md#package-names-vs-install-status).
+In CI, `raven check` **suppresses missing-package warnings by default** (CI deliberately omits installation); re-enable them with [`--report-uninstalled`](cli.md#missing-package-reporting-in-ci), which reports `library()` calls not present in the local library paths — *not* relative to the database. One consequence is an **accepted gap**: a genuine typo such as `library(dpylr)` is silent by default — no tier knows it, but `raven check` isn't checking install status — and surfaces only under `--report-uninstalled`. The full per-mode behavior and this gap are documented in [Diagnostics](diagnostics.md#package-names-vs-install-status).
 
 ## Fidelity caveats
 

@@ -300,11 +300,15 @@ encoding/decoding. `package_library.rs` is not moved or rewritten; it only gains
 the seam.
 
 - **One serializable record:** `model::PackageRecord` is the on-disk projection
-  of `PackageInfo` — `{ name, exports, depends, lazy_data }`, all vectors kept
-  **sorted and de-duplicated** so the Tier 2 JSON is deterministic and
-  diff-friendly. `is_meta_package` / `attached_packages` are a pure function of
-  the package name, so they are **re-derived on read** (via
-  `PackageInfo::with_details`), never stored.
+  of `PackageInfo` — `{ name, version, exports, depends, lazy_data }`, with all
+  vectors kept **sorted and de-duplicated** so the Tier 2 JSON is deterministic
+  and diff-friendly. `version` (the `DESCRIPTION` `Version`, `""` when unknown)
+  rides in both encodings and drives the Tier 3 monotonic merge (see below);
+  `PackageInfo` itself carries no version, so `from_info` defaults it to `""` and
+  `into_info` drops it — the field is populated only by the capture paths
+  (reference-R seed, `freeze`, r-universe ingest). `is_meta_package` /
+  `attached_packages` are a pure function of the package name, so they are
+  **re-derived on read** (via `PackageInfo::with_details`), never stored.
 - **Two encodings, one reader each:**
   - **Tier 2 — `json_db.rs`** (`RepoDb`): deterministic, sorted, pretty JSON,
     committed as `.raven/packages.json`. Carries minimal provenance (Raven
@@ -366,6 +370,11 @@ and must not take a disk/page-fault stall. So:
 
 - the Tier 3 index is **preloaded at open**; per-package payloads decode lazily
   from the mmap on first lookup;
+- optionally, a one-shot `madvise(MADV_WILLNEED)` over the header/index region
+  (~500 KB) right after `mmap` faults the offset table in before the first
+  lookup — one syscall, eliminating even the first index page fault. A cheap
+  nicety, not required for correctness, and a no-op on platforms without
+  `madvise`;
 - the `blake3` payload checksum is verified **at open, in `spawn_blocking`**
   (decision #13) — ~10–20 ms once during library init, off the async runtime —
   catching truncation/corruption/tampering;
@@ -416,6 +425,19 @@ coverage.
   VSIX. Located via `locate_shipped_db()` — `RAVEN_NAMES_DB` override, else
   exe-relative. **Not** `include_bytes!` (avoids binary bloat), **not** committed
   to git (except tiny back-compat fixtures).
+- **Replacing the file (Windows mmap lock):** while `names.db` is mapped, Windows
+  holds the file open (`CreateFileMapping` keeps a handle), so it cannot be
+  overwritten in place. Writers (the bundle step, and any future in-process
+  refresh) must use **atomic rename** — write `names.db.tmp`, then rename over the
+  old file. On POSIX the rename succeeds even with the old inode still mapped
+  (readers keep the old mapping until they re-open); on Windows an in-process
+  refresh must **unmap → replace → remap**, tolerating a brief window with no
+  mapping. This is a solved pattern (SQLite, clangd) but is called out so the
+  implementation doesn't assume in-place overwrite works everywhere.
+- **Growth bound:** append-only means the file grows monotonically, but slowly —
+  at CRAN's ~2k-packages/year rate, ~1.7 MB/year, so a ~20–25 MB database stays
+  under ~40 MB a decade out. Names-only storage keeps the bound comfortable; no
+  pruning is planned.
 
 ### Dependency on #350 (package-dataset resolution)
 

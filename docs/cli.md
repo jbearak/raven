@@ -5,7 +5,7 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 - `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes), for CI gating.
 - `raven lint` — run the native **style** linter only.
 - `raven analysis-stats <path> [--csv] [--only <phase>]` — profile workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help`.
-- `raven packages freeze` — generate a committed `.raven/packages.json` export database so `raven check` can resolve package symbols in CI when no R or packages are installed. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
+- `raven packages freeze` — **planned; not yet in a released build** ([status](#raven-packages)) — generate a committed `.raven/packages.json` export database so `raven check` can resolve package symbols in CI when no R or packages are installed. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
 
 The difference between `check` and `lint` is **scope**: `lint` parses each file in isolation and runs only the style rules, so it needs no R installation and no workspace index — but it can't see relationships between files. `check` builds the same workspace index the language server builds (and, unless packages are disabled, runs R to resolve installed-package exports and base R symbols), so it additionally reports cross-file, undefined-variable, and package diagnostics. `lint` is therefore the cheaper, R-free option for pure style gating; `check` does more work per run in exchange for the editor's full analysis in CI.
 
@@ -39,7 +39,7 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 - `--no-config` — ignore `raven.toml` and `.lintr`; use Raven's built-in defaults.
 - `--format text|json|sarif` — default `text`.
 - `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold.
-- `--report-uninstalled` — re-enable missing-package warnings, which `raven check` otherwise suppresses by default. See [Missing-package reporting in CI](#missing-package-reporting-in-ci).
+- `--report-uninstalled` **(planned; not yet implemented — see [Missing-package reporting in CI](#missing-package-reporting-in-ci))** — re-enable missing-package warnings, which `raven check` will otherwise suppress by default once the package database lands.
 - `--quiet` — suppress the trailing summary line.
 - `--color auto|always|never` — when to colorize `text` output (default `auto`). See [Color output](#color-output).
 - `--no-color` — alias for `--color never`.
