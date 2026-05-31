@@ -81,6 +81,15 @@ jobs:
             cargo build --release --target ${{ matrix.target }} --bin raven
           fi
 
+      - name: Download package DB from the names-db Release
+        run: |
+          mkdir -p dist
+          gh release download names-db --repo "$GITHUB_REPOSITORY" \
+            --pattern 'names.db' --pattern 'base-exports.json' --dir dist || \
+            echo "no names-db release yet; Tier 3/base-exports unavailable in this build"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create archive
         run: |
           mkdir -p dist
@@ -160,6 +169,14 @@ jobs:
             win32-arm64) cp ../../lsp-binaries/lsp-windows-arm64/raven-windows-arm64.zip bin/ && cd bin && unzip raven-windows-arm64.zip && rm -f raven-windows-arm64.zip ;;
             *) echo "ERROR: Unknown target '${{ matrix.target }}'" && exit 1 ;;
           esac
+
+      - name: Download package DB from the names-db Release
+        run: |
+          gh release download names-db --repo "$GITHUB_REPOSITORY" \
+            --pattern 'names.db' --pattern 'base-exports.json' --dir editors/vscode/bin || \
+            echo "no names-db release yet; Tier 3/base-exports unavailable in this build"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Package extension
         run: |
