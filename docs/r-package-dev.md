@@ -253,13 +253,18 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 > **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
 
-To gate diagnostics on your package in CI without installing R packages there, generate a committed export database and check it in:
+`raven check` already gives you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's bundled package database (Tier 3), so they don't show as undefined variables. You generate a committed `.raven/packages.json` (Tier 2) only to make those diagnostics *more accurate* in two cases:
+
+1. you depend on packages whose exports **aren't shipped** in Raven's bundled database (GitHub-only, internal, or not-yet-indexed packages), or
+2. you pin package versions whose exports **differ** from the versions Raven captured, in ways that could change your diagnostics (see the [drift caveat](package-database.md#fidelity-caveats)).
+
+If either applies, generate the file and check it in:
 
 ```bash
 raven packages freeze
 ```
 
-This writes `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets — which `raven check` then uses to resolve package symbols when no R is present, so symbols from `library()`/`@importFrom` dependencies don't show as undefined variables in CI. Run it on a machine that has R and the project's dependencies installed; the file is generated, not hand-edited, and is meant to be reviewed in PRs (a `git diff` shows "package X gained export Y").
+This writes `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets — which `raven check` then prefers over the bundled database when no R is present. Run it on a machine that has R and the project's dependencies installed; the file is generated, not hand-edited, and is meant to be reviewed in PRs (a `git diff` shows "package X gained export Y").
 
 Generation uses a **renv-first** library order: the renv project library first, system libraries only for packages renv doesn't cover. If your project uses [`renv`](https://rstudio.github.io/renv/), run `freeze` after `renv::restore()` for the best coverage — `renv.lock` acts as a *set selector* (which packages to include), while the exports are read from whatever is actually installed locally. Regeneration is a no-op when nothing changed, so re-running it produces no diff unless your dependencies' exports actually moved.
 

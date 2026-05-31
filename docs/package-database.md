@@ -14,7 +14,7 @@ The package database fixes this by giving Raven a pre-built source of export **n
 | **2 — Repo DB** | Not installed, or R can't launch | A repo-specific, committed `.raven/packages.json` you generate locally | "Frozen Tier 1": full structure, version-exact to when it was generated |
 | **3 — Shipped DB** | Otherwise | A Raven-bundled `names.db` built from a reference-R capture ∪ latest CRAN + Bioconductor | Latest CRAN/Bioc; export names only |
 
-**Tier 2 outranks Tier 3** because it is project-specific and built through the authoritative path. A repo that never generates a Tier 2 file still works in CI via Tier 3 alone (latest-only). The two databases share one in-memory model, one reader, and one writer.
+**Tier 2 outranks Tier 3** because it is project-specific and built through the authoritative path. A repo that never generates a Tier 2 file still works in CI via Tier 3 alone — the bundled latest-CRAN/Bioc floor (subject to the [drift caveat](#fidelity-caveats) below). The two databases share one in-memory model, one reader, and one writer.
 
 The tiers are a **floor, never a replacement**: whenever a package resolves from a real local install (Tier 1), that path stays in charge and is version-exact. Nothing here regresses behavior when packages *are* installed.
 
@@ -23,6 +23,8 @@ The tiers are a **floor, never a replacement**: whenever a package resolves from
 ## Tier 2 — the committed `.raven/packages.json`
 
 A repo-specific snapshot, generated on a machine that has R and the project's packages installed, and **committed to the repo**. Because it is produced through Raven's authoritative path, it is effectively *frozen Tier 1*: it captures the full structure — exports (with `exportPattern` correctly expanded), `Depends`, datasets, and meta-package attaches.
+
+**Why generate one at all?** You get package-aware diagnostics in CI **regardless** — the bundled Tier 3 database is always there. A Tier 2 file isn't how you turn diagnostics on; it makes them *more accurate* in two cases: (1) your repo uses packages whose exports **aren't shipped** in Raven's bundled database (GitHub-only, internal, or not-yet-indexed packages), and (2) you pin package versions whose exports **differ** from the versions Tier 3 captured, in ways that could change diagnostics (the [drift caveat](#fidelity-caveats) below). If neither applies, Tier 3 alone is enough and you don't need to run `freeze`.
 
 - **Opt-in.** It exists only if you run the generation command; Raven never auto-creates it.
 - **Location.** `.raven/packages.json` at the repo root, auto-discovered like `raven.toml` / `.lintr`.
@@ -61,12 +63,12 @@ If a committed `.raven/packages.json` was written by a **newer** Raven than the 
 
 A Raven-bundled, latest-CRAN/Bioc export database — the R-free floor that works with no setup at all.
 
-- **Source.** An authoritative **reference-R capture of the build machine's entire installed library** (via Raven's Tier-1 path) **∪** **CRAN + Bioconductor** from [r-universe](https://r-universe.dev) (`cran.r-universe.dev` and `bioc.r-universe.dev`). r-universe's `_exports` is the *true post-load namespace export set* — `exportPattern()` already expanded — for the whole ecosystem. The two sources are merged **append-only**: each rebuild starts from the previous database, overlays the reference-R capture, appends r-universe packages not already present, and **never drops** a package. Precedence: reference-R > r-universe > retained-from-prior.
+- **Source.** An authoritative **reference-R capture of the build machine's entire installed library** (via Raven's Tier-1 path) **∪** **CRAN + Bioconductor** from [r-universe](https://r-universe.dev) (`cran.r-universe.dev` and `bioc.r-universe.dev`). r-universe's `_exports` is the *true post-load namespace export set* — `exportPattern()` already expanded — for the whole ecosystem. The two sources are merged **append-only**: each rebuild **seeds from the previous database by default**, merges in the reference-R capture and r-universe, and **never drops** a package. When more than one source carries a package, the merge keeps the **newest package version's** exports — so a newer CRAN/Bioc release overrides an older copy installed on the build machine (and vice-versa); equal versions prefer the reference-R capture (post-load truth, and it alone covers GitHub-only / internal packages). The prior database is the floor, retained only for packages absent from both current sources.
 - **Why the full installed library.** Hard-to-install, GitHub-only, internal, or fallback-built packages are absent from CRAN/Bioc and only ever enter the floor through the reference-R capture; append-only guarantees they're never lost on later rebuilds. The maintainer **bootstraps** the floor once from a richly-provisioned machine, after which automated runs seed from it and append. Teams can likewise build a private `names.db` from their own library for richer in-house coverage (point Raven at it with `RAVEN_NAMES_DB`).
 - **Contents.** Export names + `Depends` + dataset names. **Export-only** — no internal (`:::`) objects, no signatures.
 - **Delivery.** A sidecar file shipped with both the standalone binary and the VS Code extension, located next to the executable (override with the `RAVEN_NAMES_DB` environment variable). It is **not** compiled into the binary (which would bloat it) and **not** committed to git. It lives on a **GitHub Release** (a moving `names-db` tag) — a durable URL, unlike a per-run CI artifact — alongside the base-exports file and their checksums.
 - **Integrity & provenance.** The build records its source, snapshot date, package count, and Raven version in the database header, plus a [`blake3`](https://github.com/BLAKE3-team/BLAKE3) checksum of the payload that is verified when the file is opened. Bundling third-party data carries supply-chain responsibility, so provenance and a tamper check are part of the pipeline.
-- **Freshness.** Equals Raven's release/refresh cadence — a **weekly** rebuild plus a rebuild on each release. Acceptable because the database is latest-only by design and export names are stable; append-only means coverage only ever grows.
+- **Freshness.** Equals Raven's release/refresh cadence — a rebuild on each release plus on-demand rebuilds; the **exact refresh interval is not yet committed**. Acceptable because the database tracks the latest CRAN/Bioc and export names are stable; append-only means coverage only ever grows.
 
 A stale or corrupt `names.db` (for example a custom `RAVEN_NAMES_DB` from an incompatible Raven) is **explained and skipped**, exactly like a version-skewed Tier 2 file — Raven never hard-fails over it.
 
@@ -88,7 +90,7 @@ In CI, `raven check` **suppresses missing-package warnings by default** (CI deli
 ## Fidelity caveats
 
 - **`exportPattern` → solved.** r-universe `_exports` is the post-load truth, so the minority of packages whose exports require a built-and-loaded namespace are correct, including the `.onLoad` ∩ pattern corner. Tier 2, generated via `asNamespace()`, is equally correct.
-- **Tier 3 latest-only drift.** A just-removed export may linger, or a brand-new export may not yet be in the latest rebuild — rare and soft. A project that needs exactness can pin it via Tier 2.
+- **Tier 3 tracks the latest CRAN/Bioc as of Raven's last database refresh.** Two soft drifts follow: (a) a just-removed export may linger until the next rebuild; (b) if your project uses a **newer** version of a package than Tier 3 captured, a symbol added in that newer version is unknown to Tier 3 and can surface as a **false-positive undefined-variable** diagnostic. Both are rare and soft — a project that needs exactness pins it via Tier 2 (`raven packages freeze`), which reads exports from the version actually installed.
 - **Exports + `Depends` + datasets only.** Tiers 2 and 3 carry no `:::` internal objects and no function signatures (`formals`); those still come only from a local install (Tier 1/2 from a machine with the package). Signatures stay R-subprocess-only.
 - **Bioconductor cadence** differs from CRAN, so the shipped latest snapshot may not match a project's Bioc release train. Tier 2 covers projects that need exactness.
 

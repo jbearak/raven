@@ -379,8 +379,15 @@ capture of the build machine's **entire installed library**
 (`enumerate_installed_packages` across all lib paths, via the Tier 1 path:
 `NAMESPACE` + subprocess `exportPattern` expansion + `data/` datasets) **∪** CRAN
 + Bioc r-universe (`cran.r-universe.dev` and `bioc.r-universe.dev` per-package
-`_exports`/`_dependencies`/`_datasets`). Precedence: **reference-R > r-universe >
-retained-from-prior**; a rebuild never drops a package (decision #8). The full
+`_exports`/`_dependencies`/`_datasets`). Each rebuild **seeds from the previous
+database by default** (append-only; `--fresh` rebuilds from scratch) and **never
+drops** a package. **Merge precedence is version-aware (decision #16):** among the
+sources carrying a package in the current build, the record with the **highest
+package version** wins — so a newer CRAN/Bioc release overrides an older
+reference-R install; equal versions prefer the reference-R capture; the prior
+database is the floor, retained only for packages absent from both current
+sources. The comparison reads a `version` field on `PackageRecord` (captured from
+`DESCRIPTION` / r-universe `Version`). The full
 installed library is the point — hard-to-install / GitHub-only / internal
 packages enter the floor only this way, and append-only keeps them. The
 maintainer **bootstraps** the floor once from a richly-provisioned machine; teams
@@ -398,8 +405,9 @@ coverage.
   datasets resolve in CI in v1, independent of #350. A real R install still wins.
 - **Delivery (decision #14):** `names.db` + the base-exports file + checksums live
   on a **GitHub Release** (moving `names-db` tag) — durable across runs, unlike a
-  per-run CI artifact. A weekly + `workflow_dispatch` + on-release job
-  (`.github/workflows/build-names-db.yml`) downloads the current asset (the seed),
+  per-run CI artifact. A `workflow_dispatch` + on-release job
+  (`.github/workflows/build-names-db.yml`; the scheduled refresh interval is **not
+  yet committed**) downloads the current asset (the seed),
   rebuilds, and re-uploads. `release-build.yml` / `bundle-binary.js` download the
   same asset to place `names.db` exe-relative next to the binary and into the
   VSIX. Located via `locate_shipped_db()` — `RAVEN_NAMES_DB` override, else
