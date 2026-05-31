@@ -211,6 +211,7 @@ pub async fn run(args: CheckArgs) -> i32 {
     prefetch_reported_packages(&state, &targets).await;
 
     let mut all_diags: Vec<(PathBuf, Diagnostic)> = Vec::new();
+    let mut reported_loaded_packages = std::collections::BTreeSet::new();
 
     for path in &targets {
         if is_chunk_file(path) {
@@ -241,6 +242,7 @@ pub async fn run(args: CheckArgs) -> i32 {
         // afterwards to bound memory across a large report set; the clone keeps
         // the index entry intact for other files' cross-file resolution.
         if let Some(doc) = state.workspace_index.get(&uri).cloned() {
+            reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
             state.documents.insert(uri.clone(), doc);
         } else {
             let text = match crate::state::read_source(path) {
@@ -260,6 +262,9 @@ pub async fn run(args: CheckArgs) -> i32 {
                 }
             };
             state.open_document_with_language_id(uri.clone(), &text, Some(1), Some("r"));
+            if let Some(doc) = state.documents.get(&uri) {
+                reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
+            }
         }
         let diags = compute_file_diagnostics(&state, &uri).await;
         state.close_document(&uri);
@@ -279,8 +284,28 @@ pub async fn run(args: CheckArgs) -> i32 {
         .iter()
         .any(|(_, d)| SeverityLevel::from_diag(d) > args.max_severity);
 
+    let missing_export_metadata_packages =
+        if should_check_missing_export_metadata(&state, &all_diags) {
+            collect_missing_export_metadata_packages(&state, &reported_loaded_packages).await
+        } else {
+            Vec::new()
+        };
+
     let use_color = resolve_color_from_env(args.color);
     render(args.format, &all_diags, &root, args.quiet, use_color);
+
+    if !missing_export_metadata_packages.is_empty() {
+        let tier3_present = crate::package_db::locate_shipped_db_candidates()
+            .into_iter()
+            .any(|p| p.exists());
+        eprintln!(
+            "{}",
+            format_missing_export_metadata_warning(
+                &missing_export_metadata_packages,
+                tier3_present
+            )
+        );
+    }
 
     // Operator error takes priority over a threshold breach: a half-read run
     // shouldn't masquerade as a clean (or merely failing) lint result.
@@ -420,12 +445,11 @@ fn resolve_project_config(
 /// see its doc comment for that contract. Routing through it is what keeps this
 /// CLI path and the editor's startup paths from drifting.
 ///
-/// This function owns only the *caller policy*: on `Ready` it installs the
-/// library and sets `package_library_ready = true`; every other status leaves
-/// the default empty library in place (`ready` stays false). The three
-/// R-related degradations each print a one-line note to stderr so CI shows what
-/// was missing; `Disabled` (the user turned package awareness off in
-/// `raven.toml`) is silent, matching the editor.
+/// This function owns only the *caller policy*: it always installs the returned
+/// library, then uses `PackageLibraryOutcome::consumer_ready` for the diagnostic
+/// readiness gate. The three R-related degradations each print a one-line note
+/// to stderr so CI shows what was missing; `Disabled` (the user turned package
+/// awareness off in `raven.toml`) is silent, matching the editor.
 async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
     // Snapshot config into locals before the call so the later `state`
     // mutation doesn't conflict with the borrow.
@@ -452,17 +476,13 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
         eprintln!("raven check: {note}");
     }
 
-    // Always install the returned library: on a non-`Ready` status it still
-    // carries the Tier 2/3 providers and bundled base exports, which are the
-    // whole point of CI resolution without R. Dropping it here would send
-    // `raven check` back to an empty library and lose the offline path.
-    // `package_library_ready` (which gates prefetch + diagnostics) is true when R
-    // initialized OR offline providers are present — so a names.db / repo DB makes
-    // the library usable even when R is absent. `Disabled` carries `new_empty()`
-    // (no providers), so it stays not-ready, matching the prior behavior.
+    // Always install the returned library: on a non-`Ready` status it may still
+    // carry Tier 2/3 providers or bundled base exports, which are the whole
+    // point of CI resolution without R. Dropping it here would send `raven
+    // check` back to an empty library and lose the offline path.
     use crate::package_library::PackageLibraryStatus::*;
+    state.package_library_ready = outcome.consumer_ready();
     let status = outcome.status;
-    state.package_library_ready = matches!(status, Ready) || outcome.library.has_providers();
     state.package_library = outcome.library;
     match status {
         Ready | Disabled => {}
@@ -513,6 +533,61 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
         .collect();
     // `prefetch_packages` is a no-op on an empty slice, so no length guard here.
     state.package_library.prefetch_packages(&packages).await;
+}
+
+fn has_package_metadata_sensitive_undefined_diagnostic(
+    all_diags: &[(PathBuf, Diagnostic)],
+) -> bool {
+    all_diags.iter().any(|(_, d)| {
+        d.message.starts_with("Undefined variable:")
+            && !d.message.contains("(defined later on line ")
+    })
+}
+
+fn should_check_missing_export_metadata(
+    state: &crate::state::WorldState,
+    all_diags: &[(PathBuf, Diagnostic)],
+) -> bool {
+    state.cross_file_config.packages_enabled
+        && has_package_metadata_sensitive_undefined_diagnostic(all_diags)
+}
+
+async fn collect_missing_export_metadata_packages(
+    state: &crate::state::WorldState,
+    reported_loaded_packages: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    if !state.cross_file_config.packages_enabled {
+        return Vec::new();
+    }
+
+    let mut missing = Vec::new();
+    for package in reported_loaded_packages
+        .iter()
+        .filter(|p| crate::r_subprocess::is_valid_package_name(p))
+    {
+        if state.package_library.export_metadata_missing(package).await {
+            missing.push(package.clone());
+        }
+    }
+    missing
+}
+
+fn format_missing_export_metadata_warning(packages: &[String], tier3_present: bool) -> String {
+    let mut names = packages.to_vec();
+    names.sort();
+    names.dedup();
+    names.truncate(8);
+    let names = names.join(", ");
+
+    if tier3_present {
+        format!(
+            "raven check: package export metadata is missing for {names}.\nRaven checked installed packages, .raven/packages.json, and names.db.\nRun `raven packages update` to refresh names.db, or `raven packages freeze` to capture project package metadata."
+        )
+    } else {
+        format!(
+            "raven check: package export metadata is missing for {names}.\nTier 3 names.db is not installed.\nRun `raven packages update` to install names.db, or `raven packages freeze` to capture project package metadata."
+        )
+    }
 }
 
 /// Run the full diagnostic pipeline for one already-opened document. Returns an
@@ -619,6 +694,72 @@ mod tests {
 
         let default = parse_args(std::iter::empty()).unwrap();
         assert!(!default.report_uninstalled);
+    }
+
+    #[test]
+    fn formats_missing_metadata_warning_for_absent_tier3() {
+        let msg =
+            super::format_missing_export_metadata_warning(&["foo".into(), "bar".into()], false);
+        assert!(
+            msg.contains("package export metadata is missing for bar, foo")
+                || msg.contains("package export metadata is missing for foo, bar")
+        );
+        assert!(msg.contains("Tier 3 names.db is not installed"));
+        assert!(msg.contains("raven packages update"));
+        assert!(msg.contains("raven packages freeze"));
+    }
+
+    #[test]
+    fn formats_missing_metadata_warning_for_present_tier3_miss() {
+        let msg = super::format_missing_export_metadata_warning(&["foo".into()], true);
+        assert!(
+            msg.contains("Raven checked installed packages, .raven/packages.json, and names.db")
+        );
+        assert!(msg.contains("raven packages update"));
+        assert!(msg.contains("raven packages freeze"));
+    }
+
+    #[test]
+    fn missing_metadata_gate_respects_packages_disabled() {
+        let mut state = crate::state::WorldState::new(vec![]);
+        state.cross_file_config.packages_enabled = false;
+        let diags = vec![(
+            PathBuf::from("main.R"),
+            Diagnostic {
+                message: "Undefined variable: missing_fun".into(),
+                ..Default::default()
+            },
+        )];
+
+        assert!(!super::should_check_missing_export_metadata(&state, &diags));
+    }
+
+    #[test]
+    fn missing_metadata_gate_ignores_defined_later_diagnostics() {
+        let state = crate::state::WorldState::new(vec![]);
+        let defined_later = vec![(
+            PathBuf::from("main.R"),
+            Diagnostic {
+                message: "Undefined variable: x (defined later on line 3)".into(),
+                ..Default::default()
+            },
+        )];
+        assert!(!super::should_check_missing_export_metadata(
+            &state,
+            &defined_later
+        ));
+
+        let package_sensitive = vec![(
+            PathBuf::from("main.R"),
+            Diagnostic {
+                message: "Undefined variable: mutate".into(),
+                ..Default::default()
+            },
+        )];
+        assert!(super::should_check_missing_export_metadata(
+            &state,
+            &package_sensitive
+        ));
     }
 
     #[test]

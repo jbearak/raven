@@ -280,7 +280,7 @@ This subsystem lets Raven resolve package **export names** without an installed
 package or a running R — the case that makes `raven check` usable in CI. It is an
 **ordered fallback over three tiers**: Tier 1 (installed, authoritative — the
 existing path above) → Tier 2 (a committed, repo-specific `.raven/packages.json`)
-→ Tier 3 (a Raven-bundled `names.db`). The user-facing contract lives in
+→ Tier 3 (a `names.db` sidecar). Release archives, VSIX installs, and package-manager builds ship `names.db` and `base-exports.json` next to the executable; raw Cargo/source installs install only the executable and need `raven packages update` for broad CRAN/Bioconductor coverage. They still retain embedded base/recommended R platform coverage. The user-facing contract lives in
 [`docs/package-database.md`](package-database.md); this section is the internals.
 
 **Critical invariant — names ≠ install status.** The databases feed *export
@@ -292,8 +292,8 @@ See `docs/diagnostics.md` and `crates/raven/src/handlers.rs`.
 
 ### The `package_db` module
 
-A new top-level module (`crates/raven/src/package_db/`) — declared in **both**
-`lib.rs` and `main.rs` per the module-declaration invariant — owns all
+A new top-level module (`crates/raven/src/package_db/`) — declared in
+`crates/raven/src/lib.rs` only, while `main.rs` remains a thin shim — owns all
 encoding/decoding. `package_library.rs` is not moved or rewritten; it only gains
 the seam.
 
@@ -326,6 +326,11 @@ the seam.
   continues**: `raven check` prints a specific stderr note, the language server
   raises `window/showMessage`, then resolution degrades to the next tier. A
   missing or unreadable database never hard-fails the LSP or the build.
+- **Tier 3 locator order:** environment overrides still win, then the user-data
+  sidecars installed by `raven packages update`, then exe-relative sidecars shipped
+  by release archives, VSIX installs, and package-manager builds. Source/Cargo
+  installs normally have only the user-data candidate unless the sidecars were
+  placed manually next to the executable.
 
 ### The `PackageMetadataProvider` seam
 
@@ -409,20 +414,24 @@ coverage.
   r-universe JSON into a directory that the command then transforms). Code:
   `cli/packages.rs`, `package_db/{merge,runiverse}.rs`.
 - **Companion base-exports file (decision #7):** base/recommended records (also
-  from the reference R) ship in a separate file, loaded in `initialize()` to
-  populate `base_exports` when the base packages aren't on disk (CI). Base
-  **datasets** (`mtcars`/`iris`) are merged exactly as the disk path does, so base
-  datasets resolve in CI in v1, independent of #350. A real R install still wins.
+  from the reference R) are delivered as a separate sidecar and also have an
+  embedded fallback in the binary. `initialize()` uses them to populate
+  `base_exports` when the base packages aren't on disk (CI). Base **datasets**
+  (`mtcars`/`iris`) are merged exactly as the disk path does, so base datasets
+  resolve in CI in v1, independent of #350. A real R install still wins.
 - **Delivery (decision #14):** `names.db` + the base-exports file + checksums live
   on a **GitHub Release** (moving `names-db` tag) — durable across runs, unlike a
-  per-run CI artifact. A `workflow_dispatch` + on-release job
+  per-run CI artifact. `raven packages update` is the explicit network boundary for
+  source/Cargo installs and should be part of CI image setup/cache warmup, not
+  normal LSP startup, completion, hover, package lookup, or `raven check`. A
+  `workflow_dispatch` + on-release job
   (`.github/workflows/build-names-db.yml`; the scheduled refresh interval is **not
   yet committed**) downloads the current asset (the seed),
   rebuilds, and re-uploads. `release-build.yml` / `bundle-binary.js` download the
   same asset to place `names.db` exe-relative next to the binary and into the
-  VSIX. Located via `locate_shipped_db()` — `RAVEN_NAMES_DB` override, else
-  exe-relative. **Not** `include_bytes!` (avoids binary bloat), **not** committed
-  to git (except tiny back-compat fixtures).
+  VSIX. Located via the Tier 3 candidate locator — `RAVEN_NAMES_DB` override, then
+  user data, then exe-relative. **Not** `include_bytes!` (avoids binary bloat),
+  **not** committed to git (except tiny back-compat fixtures).
 - **Replacing the file (Windows mmap lock):** while `names.db` is mapped, Windows
   holds the file open (`CreateFileMapping` keeps a handle), so it cannot be
   overwritten in place. Writers (the bundle step, and any future in-process

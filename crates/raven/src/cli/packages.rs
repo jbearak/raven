@@ -1,4 +1,4 @@
-//! `raven packages {freeze,build-shipped-db}` — package-database commands.
+//! `raven packages {freeze,update,build-shipped-db}` — package-database commands.
 //!
 //! `freeze` (Task 5.3) generates a repo's Tier 2 `.raven/packages.json`.
 //! `build-shipped-db` is the maintainer-only Tier 3 builder. It merges, **append-only
@@ -7,7 +7,9 @@
 //! and CRAN + Bioc r-universe JSON. The shipped binary never fetches from the
 //! network; a build job supplies the r-universe JSON directories with `curl`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::{fs::OpenOptions, io::Write};
 
 use crate::cli::shared::absolute_path;
 use crate::package_db::binary_db::{write_shipped_db, ShippedDb, ShippedDbProvenance};
@@ -19,6 +21,37 @@ use crate::package_db::model::PackageRecord;
 use crate::package_db::renv_lock::read_renv_lock_package_names;
 use crate::package_db::runiverse::ingest_runiverse_dir;
 use crate::r_subprocess::is_valid_package_name;
+
+const DEFAULT_NAMES_DB_RELEASE_BASE: &str =
+    "https://github.com/jbearak/raven/releases/download/names-db";
+
+pub struct UpdateArgs {
+    pub base_url: String,
+    pub dest_dir: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct InstalledSidecars {
+    pub names_db_path: PathBuf,
+    pub base_exports_path: PathBuf,
+    pub names_db_provenance: ShippedDbProvenance,
+}
+
+pub fn parse_update_args(mut argv: impl Iterator<Item = String>) -> Result<UpdateArgs, String> {
+    let mut base_url = DEFAULT_NAMES_DB_RELEASE_BASE.to_string();
+    let mut dest_dir = None;
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "--base-url" => base_url = argv.next().ok_or("--base-url needs a URL")?,
+            "--dest-dir" => {
+                dest_dir = Some(PathBuf::from(argv.next().ok_or("--dest-dir needs a path")?))
+            }
+            "--help" => return Err("HELP".into()),
+            s => return Err(format!("unknown flag: {s}")),
+        }
+    }
+    Ok(UpdateArgs { base_url, dest_dir })
+}
 
 pub struct BuildShippedDbArgs {
     pub reference_lib: Option<PathBuf>,
@@ -428,9 +461,320 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
     Ok(())
 }
 
+pub async fn run_update(args: UpdateArgs) -> Result<(), String> {
+    let dest_dir = match args.dest_dir {
+        Some(dir) => dir,
+        None => crate::package_db::user_data_sidecar_path("names.db")
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .ok_or_else(|| {
+                "could not determine Raven user-data directory; rerun with --dest-dir, or set \
+                 RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup"
+                    .to_string()
+            })?,
+    };
+
+    let names_bytes = download_asset(&args.base_url, "names.db").await?;
+    let base_bytes = download_asset(&args.base_url, "base-exports.json").await?;
+    let installed = install_downloaded_sidecars(&dest_dir, names_bytes, base_bytes)?;
+    eprintln!(
+        "Installed names.db to {}",
+        installed.names_db_path.display()
+    );
+    eprintln!(
+        "Installed base-exports.json to {}",
+        installed.base_exports_path.display()
+    );
+    eprintln!(
+        "names.db source: {}; snapshot: {}; packages: {}",
+        installed.names_db_provenance.source,
+        installed.names_db_provenance.snapshot_date,
+        installed.names_db_provenance.package_count
+    );
+    Ok(())
+}
+
+async fn download_asset(base_url: &str, name: &str) -> Result<Vec<u8>, String> {
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), name);
+    tokio::task::spawn_blocking(move || download_asset_blocking(&url))
+        .await
+        .map_err(|e| format!("download task failed for {name}: {e}"))?
+}
+
+fn download_asset_blocking(url: &str) -> Result<Vec<u8>, String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!(
+            "refusing to download {url}: only http:// and https:// URLs are supported. {}",
+            manual_sidecar_guidance()
+        ));
+    }
+
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "300",
+            "--max-filesize",
+            "209715200",
+            url,
+        ])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to run curl for {url}: {e}. `raven packages update` requires curl; \
+                 {}",
+                manual_sidecar_guidance()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(curl_failure_error(
+            url,
+            &output.status.to_string(),
+            stderr.trim(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn curl_failure_error(url: &str, status: &str, stderr: &str) -> String {
+    format!(
+        "curl failed to download {url} with status {status}: {stderr}. {}",
+        manual_sidecar_guidance()
+    )
+}
+
+fn manual_sidecar_guidance() -> &'static str {
+    "Alternatively, set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to manually installed sidecars"
+}
+
+pub fn install_downloaded_sidecars(
+    dest_dir: &Path,
+    names_bytes: Vec<u8>,
+    base_bytes: Vec<u8>,
+) -> Result<InstalledSidecars, String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| sidecar_write_error(dest_dir, "create", e))?;
+    let names_final = dest_dir.join("names.db");
+    let base_final = dest_dir.join("base-exports.json");
+
+    let names_tmp = write_unique_temp(dest_dir, "names.db", names_bytes)?;
+    let base_tmp = write_unique_temp(dest_dir, "base-exports.json", base_bytes)?;
+
+    let db = match ShippedDb::open(&names_tmp) {
+        Ok(db) => db,
+        Err(e) => {
+            remove_tmp_sidecars(&names_tmp, &base_tmp);
+            return Err(format!(
+                "downloaded names.db failed validation: {e}. {}",
+                manual_sidecar_guidance()
+            ));
+        }
+    };
+    let names_db_provenance = db.provenance().clone();
+    drop(db);
+
+    if let Err(e) = read_repo_db_file(&base_tmp) {
+        remove_tmp_sidecars(&names_tmp, &base_tmp);
+        return Err(format!(
+            "downloaded base-exports.json failed validation: {e}. {}",
+            manual_sidecar_guidance()
+        ));
+    }
+
+    replace_verified_sidecars(&names_tmp, &base_tmp, &names_final, &base_final)?;
+
+    Ok(InstalledSidecars {
+        names_db_path: names_final,
+        base_exports_path: base_final,
+        names_db_provenance,
+    })
+}
+
+fn write_unique_temp(dest_dir: &Path, prefix: &str, bytes: Vec<u8>) -> Result<PathBuf, String> {
+    for attempt in 0..100_u32 {
+        let path = unique_sidecar_path(dest_dir, prefix, attempt, "tmp");
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(&bytes) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(sidecar_write_error(&path, "write", e));
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(sidecar_write_error(&path, "create", e)),
+        }
+    }
+
+    Err(format!(
+        "could not create unique temporary sidecar in {}; rerun with --dest-dir pointing to a \
+         writable directory, or set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup",
+        dest_dir.display()
+    ))
+}
+
+fn replace_verified_sidecars(
+    names_tmp: &Path,
+    base_tmp: &Path,
+    names_final: &Path,
+    base_final: &Path,
+) -> Result<(), String> {
+    let mut names_backup = None;
+    let mut base_backup = None;
+    let mut names_installed = false;
+    let mut base_installed = false;
+
+    let result = (|| {
+        names_backup = backup_existing_final(names_final)?;
+        base_backup = backup_existing_final(base_final)?;
+
+        replace_with_tmp(names_tmp, names_final)?;
+        names_installed = true;
+
+        replace_with_tmp(base_tmp, base_final)?;
+        base_installed = true;
+
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        if names_installed {
+            let _ = std::fs::remove_file(names_final);
+        }
+        if base_installed {
+            let _ = std::fs::remove_file(base_final);
+        }
+        restore_backup(names_backup.as_deref(), names_final);
+        restore_backup(base_backup.as_deref(), base_final);
+        return Err(e);
+    }
+
+    remove_backup(names_backup.as_deref());
+    remove_backup(base_backup.as_deref());
+    Ok(())
+}
+
+fn backup_existing_final(final_path: &Path) -> Result<Option<PathBuf>, String> {
+    if !final_path.exists() {
+        return Ok(None);
+    }
+    let dir = final_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sidecar");
+    let prefix = format!("{file_name}.backup");
+
+    for attempt in 0..100_u32 {
+        let backup = unique_sidecar_path(dir, &prefix, attempt, "bak");
+        match std::fs::rename(final_path, &backup) {
+            Ok(()) => return Ok(Some(backup)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(sidecar_write_error(final_path, "backup", e)),
+        }
+    }
+
+    Err(format!(
+        "could not create unique backup sidecar for {}; rerun with --dest-dir pointing to a \
+         writable directory, or set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup",
+        final_path.display()
+    ))
+}
+
+fn unique_sidecar_path(dest_dir: &Path, prefix: &str, attempt: u32, suffix: &str) -> PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dest_dir.join(format!(".{prefix}.{pid}.{nanos}.{attempt}.{suffix}"))
+}
+
+fn restore_backup(backup: Option<&Path>, final_path: &Path) {
+    if let Some(backup) = backup {
+        let _ = std::fs::rename(backup, final_path);
+    }
+}
+
+fn remove_backup(backup: Option<&Path>) {
+    if let Some(backup) = backup {
+        let _ = std::fs::remove_file(backup);
+    }
+}
+
+fn replace_with_tmp(tmp: &Path, final_path: &Path) -> Result<(), String> {
+    replace_file(tmp, final_path).map_err(|e| sidecar_write_error(final_path, "replace", e))
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp: &Path, final_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, final_path)
+}
+
+#[cfg(windows)]
+fn replace_file(tmp: &Path, final_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let existing: Vec<u16> = tmp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let new: Vec<u16> = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            new.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_tmp_sidecars(names_tmp: &Path, base_tmp: &Path) {
+    let _ = std::fs::remove_file(names_tmp);
+    let _ = std::fs::remove_file(base_tmp);
+}
+
+fn sidecar_write_error(path: &Path, action: &str, error: std::io::Error) -> String {
+    format!(
+        "could not {action} {}: {error}; rerun with --dest-dir pointing to a writable \
+         directory, or set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup",
+        path.display()
+    )
+}
+
 /// Dispatch the `packages` subcommand group on its second token.
 pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
     match argv.next().as_deref() {
+        Some("update") => {
+            let args = parse_update_args(argv)?;
+            run_update(args).await
+        }
         Some("freeze") => {
             let args = parse_freeze_args(argv)?;
             run_freeze(args).await
@@ -440,7 +784,7 @@ pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
             run_build_shipped_db(args).await
         }
         Some(other) => Err(format!("unknown packages subcommand: {other}")),
-        None => Err("usage: raven packages <freeze|build-shipped-db> [OPTIONS]".into()),
+        None => Err("usage: raven packages <freeze|update|build-shipped-db> [OPTIONS]".into()),
     }
 }
 
@@ -449,6 +793,7 @@ pub fn print_help() {
         "raven packages — package-database commands\n\n\
          Usage:\n  \
          raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]\n  \
+         raven packages update [--base-url URL] [--dest-dir DIR]\n  \
          raven packages build-shipped-db [--reference-lib DIR] [--runiverse-cran DIR] \
 [--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
 [--base-exports-output base-exports.json] [--snapshot-date S] [--source S]\n"
@@ -457,6 +802,12 @@ pub fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    use crate::package_db::binary_db::{write_shipped_db, ShippedDb, ShippedDbProvenance};
+    use crate::package_db::json_db::{
+        read_repo_db_file, write_repo_db_file, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+    };
+    use crate::package_db::model::PackageRecord;
+
     #[test]
     fn parse_freeze_args_defaults_to_used() {
         let a = super::parse_freeze_args(std::iter::empty()).unwrap();
@@ -540,5 +891,247 @@ mod tests {
         assert_eq!(args.snapshot_date, "2026-05-30");
         assert_eq!(args.reference_lib, None);
         assert_eq!(args.seed, None);
+    }
+
+    #[test]
+    fn parse_update_args_defaults_to_names_db_release() {
+        let args = super::parse_update_args(std::iter::empty()).unwrap();
+        assert!(args.base_url.contains("github.com"));
+        assert_eq!(args.dest_dir, None);
+    }
+
+    #[test]
+    fn parse_update_args_accepts_base_url_and_dest_dir() {
+        let args = super::parse_update_args(
+            [
+                "--base-url".to_string(),
+                "http://127.0.0.1:9/assets".to_string(),
+                "--dest-dir".to_string(),
+                "/tmp/raven-db".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(args.base_url, "http://127.0.0.1:9/assets");
+        assert_eq!(
+            args.dest_dir.unwrap(),
+            std::path::PathBuf::from("/tmp/raven-db")
+        );
+    }
+
+    #[test]
+    fn atomic_install_rejects_invalid_names_db_and_leaves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("names.db");
+        std::fs::write(&existing, b"existing").unwrap();
+        let err = super::install_downloaded_sidecars(
+            dir.path(),
+            b"not a raven db".to_vec(),
+            b"{}".to_vec(),
+        )
+        .unwrap_err();
+        assert!(err.contains("names.db"));
+        assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
+        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn atomic_install_rejects_invalid_base_exports_and_suggests_manual_sidecars() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let records = vec![PackageRecord {
+            name: "base".into(),
+            version: "4.4.0".into(),
+            exports: vec!["mean".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }];
+        let provenance = ShippedDbProvenance {
+            source: "test".into(),
+            snapshot_date: "2026-05-31".into(),
+            package_count: records.len() as u32,
+            raven_version: "9.9.9".into(),
+        };
+        let names_src = source.path().join("names.db");
+        write_shipped_db(&names_src, &records, provenance).unwrap();
+
+        let err = super::install_downloaded_sidecars(
+            dest.path(),
+            std::fs::read(&names_src).unwrap(),
+            b"not json".to_vec(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("base-exports.json"), "got {err}");
+        assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
+        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
+    }
+
+    #[test]
+    fn atomic_install_accepts_valid_sidecars() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let records = vec![PackageRecord {
+            name: "base".into(),
+            version: "4.4.0".into(),
+            exports: vec!["mean".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }];
+        let provenance = ShippedDbProvenance {
+            source: "test".into(),
+            snapshot_date: "2026-05-31".into(),
+            package_count: records.len() as u32,
+            raven_version: "9.9.9".into(),
+        };
+        let names_src = source.path().join("names.db");
+        write_shipped_db(&names_src, &records, provenance).unwrap();
+        let repo_db = RepoDb {
+            schema_version: REPO_DB_SCHEMA_VERSION,
+            provenance: RepoDbProvenance {
+                raven_version: "9.9.9".into(),
+                r_version: "4.4.0".into(),
+                generated_unix: 1_800_000_000,
+            },
+            packages: records,
+        };
+        let base_src = source.path().join("base-exports.json");
+        write_repo_db_file(&base_src, &repo_db).unwrap();
+
+        let installed = super::install_downloaded_sidecars(
+            dest.path(),
+            std::fs::read(&names_src).unwrap(),
+            std::fs::read(&base_src).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(installed.names_db_path, dest.path().join("names.db"));
+        assert_eq!(
+            installed.base_exports_path,
+            dest.path().join("base-exports.json")
+        );
+        ShippedDb::open(&installed.names_db_path).unwrap();
+        read_repo_db_file(&installed.base_exports_path).unwrap();
+    }
+
+    #[test]
+    fn atomic_install_ignores_preexisting_fixed_temp_names() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let fixed_names_tmp = dest.path().join("names.db.tmp");
+        let fixed_base_tmp = dest.path().join("base-exports.json.tmp");
+        std::fs::write(&fixed_names_tmp, b"do not touch names").unwrap();
+        std::fs::write(&fixed_base_tmp, b"do not touch base").unwrap();
+
+        let records = vec![PackageRecord {
+            name: "base".into(),
+            version: "4.4.0".into(),
+            exports: vec!["mean".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }];
+        let provenance = ShippedDbProvenance {
+            source: "test".into(),
+            snapshot_date: "2026-05-31".into(),
+            package_count: records.len() as u32,
+            raven_version: "9.9.9".into(),
+        };
+        let names_src = source.path().join("names.db");
+        write_shipped_db(&names_src, &records, provenance).unwrap();
+        let repo_db = RepoDb {
+            schema_version: REPO_DB_SCHEMA_VERSION,
+            provenance: RepoDbProvenance {
+                raven_version: "9.9.9".into(),
+                r_version: "4.4.0".into(),
+                generated_unix: 1_800_000_000,
+            },
+            packages: records,
+        };
+        let base_src = source.path().join("base-exports.json");
+        write_repo_db_file(&base_src, &repo_db).unwrap();
+
+        super::install_downloaded_sidecars(
+            dest.path(),
+            std::fs::read(&names_src).unwrap(),
+            std::fs::read(&base_src).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&fixed_names_tmp).unwrap(),
+            b"do not touch names"
+        );
+        assert_eq!(
+            std::fs::read(&fixed_base_tmp).unwrap(),
+            b"do not touch base"
+        );
+    }
+
+    #[test]
+    fn install_verified_sidecars_rolls_back_when_second_replace_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let names_final = dir.path().join("names.db");
+        let base_final = dir.path().join("base-exports.json");
+        std::fs::write(&names_final, b"old names").unwrap();
+        std::fs::write(&base_final, b"old base").unwrap();
+
+        let names_tmp = dir.path().join("new-names.tmp");
+        let missing_base_tmp = dir.path().join("missing-base.tmp");
+        std::fs::write(&names_tmp, b"new names").unwrap();
+        let err = super::replace_verified_sidecars(
+            &names_tmp,
+            &missing_base_tmp,
+            &names_final,
+            &base_final,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("base-exports.json"), "got {err}");
+        assert_eq!(std::fs::read(&names_final).unwrap(), b"old names");
+        assert_eq!(std::fs::read(&base_final).unwrap(), b"old base");
+    }
+
+    #[test]
+    fn download_asset_blocking_rejects_non_http_urls() {
+        let err = super::download_asset_blocking("file:///tmp/names.db").unwrap_err();
+        assert!(err.contains("http://"), "got {err}");
+        assert!(err.contains("https://"), "got {err}");
+        assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
+        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
+    }
+
+    #[test]
+    fn curl_failure_errors_suggest_manual_sidecars() {
+        let err = super::curl_failure_error(
+            "https://example.invalid/names.db",
+            "exit status: 7",
+            "could not connect",
+        );
+        assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
+        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
+    }
+
+    #[test]
+    fn download_asset_blocking_rejects_ftp_without_network() {
+        let err = super::download_asset_blocking("ftp://example.invalid/file").unwrap_err();
+        assert!(err.contains("http://"), "got {err}");
+        assert!(err.contains("https://"), "got {err}");
+        assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
+        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn replace_with_tmp_preserves_existing_final_when_tmp_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_tmp = dir.path().join("missing.tmp");
+        let final_path = dir.path().join("names.db");
+        std::fs::write(&final_path, b"existing").unwrap();
+
+        let err = super::replace_with_tmp(&missing_tmp, &final_path).unwrap_err();
+
+        assert!(err.contains("replace"), "got {err}");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"existing");
     }
 }

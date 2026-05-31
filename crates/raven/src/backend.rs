@@ -1206,7 +1206,7 @@ impl Backend {
         if let crate::package_library::PackageLibraryStatus::InitFailed(e) = &outcome.status {
             log::warn!("Failed to initialize PackageLibrary: {}", e);
         }
-        let ready = outcome.status.is_ready();
+        let ready = outcome.consumer_ready();
         let load_notes = outcome.load_notes;
         let library = outcome.library;
         // Re-check under the write lock: `initialized()` may have raced ahead
@@ -2356,6 +2356,7 @@ impl LanguageServer for Backend {
 
             // Captured here before `outcome` is destructured; surfaced after the
             // commit below, and only if this path wins the race.
+            let package_library_ready = outcome.consumer_ready();
             let load_notes = outcome.load_notes;
 
             use crate::package_library::PackageLibraryStatus;
@@ -2378,8 +2379,7 @@ impl LanguageServer for Backend {
                     library.base_packages().len(),
                     library.base_exports().len()
                 );
-                let ready = status.is_ready();
-                (library, ready, load_notes)
+                (library, package_library_ready, load_notes)
             }
         };
 
@@ -6769,11 +6769,12 @@ pub(crate) async fn rebuild_package_library(
     if let crate::package_library::PackageLibraryStatus::InitFailed(e) = &outcome.status {
         log::warn!("rebuild_package_library: initialize failed: {e}");
     }
-    (outcome.library, outcome.status.is_ready())
+    let ready = outcome.consumer_ready();
+    (outcome.library, ready)
 }
 
 /// Tear down any running libpath watcher and, if watching is enabled and the
-/// package library is ready, spawn a fresh one over the current
+/// package library is ready with at least one library path, spawn a fresh one over the current
 /// `state.package_library.lib_paths()`. Returns whether a new watcher was
 /// attached.
 ///
@@ -6799,12 +6800,14 @@ pub(crate) fn restart_libpath_watcher<'a>(
 
         let (should_start, lib_paths, debounce) = {
             let state = state_arc.read().await;
+            let lib_paths = state.package_library.lib_paths().to_vec();
             let should = state.cross_file_config.packages_enabled
                 && state.cross_file_config.packages_watch_library_paths
-                && state.package_library_ready;
+                && state.package_library_ready
+                && !lib_paths.is_empty();
             (
                 should,
-                state.package_library.lib_paths().to_vec(),
+                lib_paths,
                 std::time::Duration::from_millis(
                     state.cross_file_config.packages_watch_debounce_ms,
                 ),

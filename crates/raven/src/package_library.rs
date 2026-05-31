@@ -478,6 +478,27 @@ impl PackageLibrary {
         cache.contains_key(name)
     }
 
+    /// Return true when an attached package has no known export metadata source.
+    ///
+    /// This is intentionally about export-metadata availability, not install
+    /// status. Installed packages, base packages, non-empty cached exports, and
+    /// Tier 2/3 provider hits all mean Raven has enough information to avoid the
+    /// targeted `raven check` metadata-missing warning. Empty cached exports can
+    /// be the result of a failed lookup for a non-installed package, so they only
+    /// suppress the warning when a provider also knows the package.
+    pub async fn export_metadata_missing(&self, package: &str) -> bool {
+        if self.package_exists(package) || self.is_base_package(package) {
+            return false;
+        }
+        if let Some(cached) = self.get_cached_package(package).await {
+            if !cached.exports.is_empty() {
+                return false;
+            }
+            return self.resolve_from_providers(package).is_none();
+        }
+        self.resolve_from_providers(package).is_none()
+    }
+
     /// Synchronous cache probe for use in hot diagnostic paths.
     ///
     /// Returns true when package metadata is currently cached, false otherwise.
@@ -1155,23 +1176,29 @@ impl PackageLibrary {
             }
         }
 
-        // CI fallback: if no base exports were found on disk, load the bundled
-        // base-exports file (built from a reference R) so base symbols and base
-        // datasets (mtcars/iris) still resolve without R. The guard is
-        // all-or-nothing: a non-empty disk merge (a real install) always wins and
-        // skips the file entirely. It does not recover a *partially* populated
-        // disk state (e.g. `base` present but `datasets` missing) — acceptable
-        // because base R ships these packages together.
+        // CI/runtime fallback: if no base exports were found on disk, load the
+        // first usable sidecar (built from a reference R), then fall back to the
+        // embedded floor. The guard is all-or-nothing: a non-empty disk merge (a
+        // real install) always wins and skips sidecars/embedded entirely. It does
+        // not recover a *partially* populated disk state (e.g. `base` present but
+        // `datasets` missing) — acceptable because base R ships these packages
+        // together.
         if all_base_exports.is_empty() {
-            if let Some(path) = crate::package_db::locate_base_exports() {
+            for path in crate::package_db::locate_base_exports_candidates() {
                 if let Some((file_exports, file_packages)) =
                     crate::package_db::base_exports::load_base_exports(&path)
                 {
                     log::info!("Loaded base exports from {:?}", path);
                     all_base_exports.extend(file_exports);
                     self.base_packages.extend(file_packages);
+                    break;
                 }
             }
+        }
+        if all_base_exports.is_empty() {
+            let (embedded_exports, embedded_packages) = crate::package_db::embedded_base::load();
+            all_base_exports.extend(embedded_exports);
+            self.base_packages.extend(embedded_packages);
         }
 
         // Step 5: Store per-package exports in the packages cache for completion attribution
@@ -1683,15 +1710,16 @@ impl PackageLibrary {
 }
 
 /// Outcome of [`build_package_library`]: the constructed library plus a single
-/// status that is the sole source of truth for readiness and the degradation
-/// reason. Encoding state as one enum (not a `(lib, bool)` pair + a separate
-/// reason) makes the illegal "ready, but with a degradation reason" state
-/// unrepresentable — the drift this helper exists to prevent.
+/// build status that records R/Tier-1 initialization and any degradation reason.
+/// Consumer readiness is derived by [`PackageLibraryOutcome::consumer_ready`],
+/// because non-`Ready` libraries can still contain useful offline data: Tier 2/3
+/// providers or embedded/offline base exports.
 pub struct PackageLibraryOutcome {
     /// Always present. `new_empty()` for `Disabled`. A non-`Ready` library may
     /// still carry useful offline data (base symbols, configured additional
-    /// paths), so "install it anyway" vs "discard it" is a *caller policy*, not
-    /// implied by the status.
+    /// paths, fallback providers), so callers should use
+    /// [`consumer_ready`](Self::consumer_ready) for normal diagnostic/completion
+    /// consumption instead of reading the build status directly.
     pub library: Arc<PackageLibrary>,
     pub status: PackageLibraryStatus,
     /// Non-fatal notes accumulated while opening Tier 2/3 fallback DBs
@@ -1699,6 +1727,21 @@ pub struct PackageLibraryOutcome {
     /// `Disabled` early-return and the Tier-1-only capture path, which wire no
     /// providers.
     pub load_notes: Vec<String>,
+}
+
+impl PackageLibraryOutcome {
+    /// True when the constructed library has enough data for normal consumers.
+    ///
+    /// Tier-1/R readiness (`Ready`) is sufficient, but not required: offline
+    /// Tier 2/3 providers can resolve package exports, and embedded/offline base
+    /// exports can satisfy base-symbol diagnostics even when R is unavailable.
+    /// `Disabled` naturally stays false because that path returns an empty
+    /// library with no providers or base exports.
+    pub fn consumer_ready(&self) -> bool {
+        self.status.is_ready()
+            || self.library.has_providers()
+            || !self.library.base_exports().is_empty()
+    }
 }
 
 /// The single source of truth for package-library **build status** and the
@@ -1711,11 +1754,11 @@ pub struct PackageLibraryOutcome {
 /// classification and degradation precedence live — not duplicated per site.
 ///
 /// Build status is distinct from the *consumer readiness gate*
-/// (`package_library_ready`), which is **not** uniform across sites: the editor
-/// gates on [`is_ready()`](PackageLibraryStatus::is_ready) (R-only), while
-/// `cli::check` deliberately widens its gate to also accept offline Tier 2/3
-/// providers (`|| library.has_providers()`) so `raven check` resolves packages
-/// in CI without R — see the comment in `cli::check::maybe_init_r`.
+/// (`package_library_ready`): runtime diagnostic/completion consumers use
+/// [`PackageLibraryOutcome::consumer_ready`] so offline Tier 2/3 providers and
+/// embedded/offline base exports are usable even when the Tier-1/R build status
+/// is degraded. Tier-1 capture paths such as `raven packages freeze` intentionally
+/// continue to inspect this status directly.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PackageLibraryStatus {
     /// `packages.enabled == false`; no R discovery attempted.
@@ -1792,7 +1835,7 @@ pub async fn build_package_library(
     let (mut lib, status) = build_library_inner(r_path, additional_paths, workspace_root).await;
 
     // Open the fallback DBs off the async runtime (mmap + ~10-20 ms blake3).
-    let shipped_db_path = crate::package_db::locate_shipped_db();
+    let shipped_db_candidates = crate::package_db::locate_shipped_db_candidates();
     let (providers, notes) = tokio::task::spawn_blocking(move || {
         let mut providers: Vec<Box<dyn crate::package_db::PackageMetadataProvider>> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
@@ -1804,11 +1847,14 @@ pub async fn build_package_library(
                 Err(e) => notes.push(e.to_string()), // explain-and-continue
             }
         }
-        if let Some(path) = shipped_db_path {
+        for path in shipped_db_candidates {
             match crate::package_db::binary_db::ShippedDbProvider::from_file(&path) {
-                Ok(Some(p)) => providers.push(Box::new(p)),
+                Ok(Some(p)) => {
+                    providers.push(Box::new(p));
+                    break;
+                }
                 Ok(None) => {}
-                Err(e) => notes.push(e.to_string()),
+                Err(e) => notes.push(format!("{}: {e}", path.display())),
             }
         }
         (providers, notes)
@@ -1952,6 +1998,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn build_library_falls_back_from_bad_user_db_to_lower_candidate() {
+        use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+        use crate::package_db::model::PackageRecord;
+
+        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let user_data = dir.path().join("data");
+        let bad_env_db = dir.path().join("bad.db");
+        let good_user_db = user_data.join("names.db");
+        std::fs::create_dir_all(&user_data).unwrap();
+        std::fs::write(&bad_env_db, b"not a raven db").unwrap();
+
+        let pkg = "ravenlowercandidatepkg";
+        write_shipped_db(
+            &good_user_db,
+            &[PackageRecord {
+                name: pkg.into(),
+                version: "1.0.0".into(),
+                exports: vec!["lower_export".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            }],
+            ShippedDbProvenance {
+                source: "test".into(),
+                snapshot_date: "2026-05-31".into(),
+                package_count: 1,
+                raven_version: "9.9.9".into(),
+            },
+        )
+        .unwrap();
+
+        let _user_data_guard = crate::package_db::test_user_data_dir_guard(user_data);
+        std::env::set_var("RAVEN_NAMES_DB", &bad_env_db);
+        let outcome = build_package_library(None, &[], None, true).await;
+        std::env::remove_var("RAVEN_NAMES_DB");
+
+        assert!(outcome.load_notes.iter().any(|n| n.contains("bad.db")));
+        assert!(outcome
+            .library
+            .get_package(pkg)
+            .await
+            .expect("lower candidate provider resolves")
+            .exports
+            .contains("lower_export"));
+    }
+
     /// Pins the readiness predicate and degradation precedence
     /// platform-independently. The `Some(_)` rows exercise classification
     /// *logic* only — `initialize()` never returns `Err` end-to-end, so those
@@ -2003,6 +2096,63 @@ mod tests {
         for s in [Disabled, RNotFound, InitFailed("x".into()), NoLibraryPaths] {
             assert!(!s.is_ready(), "{s:?} must not be ready");
         }
+    }
+
+    #[test]
+    fn consumer_ready_false_for_r_not_found_with_empty_library() {
+        let outcome = PackageLibraryOutcome {
+            library: Arc::new(PackageLibrary::new_empty()),
+            status: PackageLibraryStatus::RNotFound,
+            load_notes: Vec::new(),
+        };
+
+        assert!(!outcome.consumer_ready());
+    }
+
+    #[test]
+    fn consumer_ready_true_for_r_not_found_with_base_exports() {
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_base_exports(HashSet::from(["print".to_string()]));
+        let outcome = PackageLibraryOutcome {
+            library: Arc::new(lib),
+            status: PackageLibraryStatus::RNotFound,
+            load_notes: Vec::new(),
+        };
+
+        assert!(outcome.consumer_ready());
+    }
+
+    #[test]
+    fn consumer_ready_true_for_r_not_found_with_providers() {
+        use crate::package_db::PackageMetadataProvider;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, _: &str) -> Option<PackageInfo> {
+                None
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+        let outcome = PackageLibraryOutcome {
+            library: Arc::new(lib),
+            status: PackageLibraryStatus::RNotFound,
+            load_notes: Vec::new(),
+        };
+
+        assert!(outcome.consumer_ready());
+    }
+
+    #[test]
+    fn consumer_ready_true_for_ready() {
+        let outcome = PackageLibraryOutcome {
+            library: Arc::new(PackageLibrary::new_empty()),
+            status: PackageLibraryStatus::Ready,
+            load_notes: Vec::new(),
+        };
+
+        assert!(outcome.consumer_ready());
     }
 
     #[tokio::test]
@@ -2184,6 +2334,40 @@ mod tests {
             !lib.package_exists("__raven_not_installed__"),
             "package_exists must return false for cached-but-not-on-disk packages"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_export_metadata_reports_provider_miss() {
+        let lib = PackageLibrary::new_empty();
+        assert!(lib.export_metadata_missing("ravenmissingpkg").await);
+    }
+
+    #[tokio::test]
+    async fn missing_export_metadata_reports_empty_cached_provider_miss() {
+        let lib = PackageLibrary::new_empty();
+        let pkg = "ravenemptycachedpkg";
+        lib.insert_package(PackageInfo::new(pkg.into(), HashSet::new()))
+            .await;
+
+        assert!(lib.export_metadata_missing(pkg).await);
+    }
+
+    #[tokio::test]
+    async fn missing_export_metadata_ignores_provider_hit() {
+        use crate::package_db::PackageMetadataProvider;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "ravenproviderpkg")
+                    .then(|| PackageInfo::new("ravenproviderpkg".into(), HashSet::new()))
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        assert!(!lib.export_metadata_missing("ravenproviderpkg").await);
     }
 
     #[tokio::test]
@@ -4743,6 +4927,37 @@ mod tests {
             lib.is_base_export("mtcars"),
             "base dataset resolves from the base-exports file"
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_uses_embedded_base_exports_when_disk_and_sidecars_absent() {
+        let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let empty_lib = dir.path().join("empty-lib");
+        std::fs::create_dir_all(&empty_lib).unwrap();
+        let _user_data_guard =
+            crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
+        std::env::set_var("RAVEN_BASE_EXPORTS", dir.path().join("missing-base.json"));
+        let exe_base_exports = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("base-exports.json");
+        assert!(
+            !exe_base_exports.exists(),
+            "test requires no exe-relative base-exports.json at {}",
+            exe_base_exports.display()
+        );
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![empty_lib]);
+        lib.initialize().await.unwrap();
+        std::env::remove_var("RAVEN_BASE_EXPORTS");
+
+        assert!(lib.base_exports().contains("print"));
+        assert!(lib.base_exports().contains("mtcars"));
+        assert!(lib.is_base_package("base"));
+        assert!(lib.is_base_package("datasets"));
     }
 
     #[test]

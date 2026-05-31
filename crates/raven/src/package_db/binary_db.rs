@@ -280,6 +280,10 @@ impl ShippedDb {
             .filter_map(|(name, &(offset, len))| self.decode_at(name, offset, len))
             .collect()
     }
+
+    pub fn provenance(&self) -> &ShippedDbProvenance {
+        &self.provenance
+    }
 }
 
 /// Tier 3 provider over an opened `ShippedDb`.

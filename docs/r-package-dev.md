@@ -251,22 +251,26 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 ## Generating a package database for CI
 
-`raven check` already gives you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's bundled package database (Tier 3), so they don't show as undefined variables. You generate a committed `.raven/packages.json` (Tier 2) only to make those diagnostics *more accurate* in two cases:
+`raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's Tier 3 sidecars when they are present, so they don't show as undefined variables. Release archives, VSIX installs, and package-manager builds ship `names.db` and `base-exports.json` next to the Raven executable; source/Cargo installs need `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded base/recommended R platform coverage.
 
-1. you depend on packages whose exports **aren't shipped** in Raven's bundled database (GitHub-only, internal, or not-yet-indexed packages), or
+Generate and commit `.raven/packages.json` (Tier 2) when CI needs reproducible, project-specific package metadata pinned to what your project actually installed. That is distinct from `raven packages update`, which restores broad Tier 3 coverage from the moving `names-db` Release and is not version-pinned by the project.
+
+Tier 2 also improves diagnostic accuracy in two common cases:
+
+1. you depend on packages whose exports **aren't present** in Raven's Tier 3 sidecars (GitHub-only, internal, or not-yet-indexed packages), or
 2. you pin package versions whose exports **differ** from the versions Raven captured, in ways that could change your diagnostics (see the [drift caveat](package-database.md#fidelity-caveats)).
 
-If either applies, generate the file and check it in:
+To generate the file:
 
 ```bash
 raven packages freeze
 ```
 
-This writes `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets — which `raven check` then prefers over the bundled database when no R is present. Run it on a machine that has R and the project's dependencies installed; the file is generated, not hand-edited, and is meant to be reviewed in PRs (a `git diff` shows "package X gained export Y").
+This writes `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets — which `raven check` then prefers over Tier 3 when no R is present. Run it on a machine that has R and the project's dependencies installed; the file is generated, not hand-edited, committed for reproducible CI, and meant to be reviewed in PRs (a `git diff` shows "package X gained export Y").
 
 Generation uses a **renv-first** library order: the renv project library first, system libraries only for packages renv doesn't cover. If your project uses [`renv`](https://rstudio.github.io/renv/), run `freeze` after `renv::restore()` for the best coverage — `renv.lock` acts as a *set selector* (which packages to include), while the exports are read from whatever is actually installed locally. Regeneration is a no-op when nothing changed, so re-running it produces no diff unless your dependencies' exports actually moved.
 
-See [Package database](package-database.md) and [`raven packages freeze`](cli.md#raven-packages-freeze) for the full options and the three-tier resolution model.
+See [Package database](package-database.md), [`raven packages freeze`](cli.md#raven-packages-freeze), and [`raven packages update`](cli.md#raven-packages-update) for the full options and the three-tier resolution model.
 
 ## Configuration
 
@@ -320,7 +324,7 @@ If you need package-mode behavior in a workspace without `DESCRIPTION`, set
 Run `devtools::document()` to regenerate the NAMESPACE file, or save the file — Raven re-parses roxygen tags from source on each file change.
 
 **False positives persist after adding `@importFrom`:**
-Ensure the imported package is actually installed. Raven only suppresses diagnostics for symbols from installed packages (it verifies the package exists on disk).
+Ensure the imported package's export names are available to Raven: install the package locally, capture it in `.raven/packages.json` with `raven packages freeze`, or rely on Tier 3 `names.db` coverage (packaged installs ship it; source installs can run `raven packages update`). Export resolution is separate from install status. If `--report-uninstalled` or editor missing-package diagnostics are enabled, those still report local install status and require the package to exist on disk.
 
 **Package mode not activating:**
 Check that `DESCRIPTION` is at the workspace root (the first workspace folder) and contains a `Package:` field. You can also force it with `"raven.packages.packageMode": "enabled"`.

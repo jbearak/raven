@@ -23,7 +23,7 @@ Usage: raven [OPTIONS]
        raven check [PATHS...] [--workspace DIR]
        raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
-       raven packages <freeze|build-shipped-db> [OPTIONS]
+       raven packages <freeze|update|build-shipped-db> [OPTIONS]
 
 Available options:
 
@@ -43,6 +43,7 @@ analysis-stats <path>        Profile workspace analysis phases
                              (scan, parse, metadata, scope, packages)
 packages <subcommand>        Generate / maintain package databases
   freeze                     Write a repo's Tier 2 .raven/packages.json
+  update                     Download names.db and base-exports.json sidecars
   build-shipped-db           Maintainer-only Tier 3 names.db builder
 
 "#
