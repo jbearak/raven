@@ -381,13 +381,16 @@ capture of the build machine's **entire installed library**
 + Bioc r-universe (`cran.r-universe.dev` and `bioc.r-universe.dev` per-package
 `_exports`/`_dependencies`/`_datasets`). Each rebuild **seeds from the previous
 database by default** (append-only; `--fresh` rebuilds from scratch) and **never
-drops** a package. **Merge precedence is version-aware (decision #16):** among the
-sources carrying a package in the current build, the record with the **highest
-package version** wins — so a newer CRAN/Bioc release overrides an older
-reference-R install; equal versions prefer the reference-R capture; the prior
-database is the floor, retained only for packages absent from both current
-sources. The comparison reads a `version` field on `PackageRecord` (captured from
-`DESCRIPTION` / r-universe `Version`). The full
+drops** a package. **The merge is version-driven and monotonic (decision #16):**
+for each package it keeps the record with the **highest version across all three
+sources** (prior DB, reference-R, r-universe), so a package is never moved to an
+older export set — a newer CRAN/Bioc release beats an older reference-R install, a
+newer local/dev build beats an older CRAN release, and a still-newer prior capture
+is retained. Equal versions tiebreak reference-R → r-universe → prior. The
+comparison reads a `version` field on `PackageRecord` (captured from `DESCRIPTION`
+`Version` by the reference-R seed and `freeze`, or the r-universe JSON `Version`);
+the field rides in both encodings, so Tier 2 `.raven/packages.json` shows version
+changes in `git diff` too. The full
 installed library is the point — hard-to-install / GitHub-only / internal
 packages enter the floor only this way, and append-only keeps them. The
 maintainer **bootstraps** the floor once from a richly-provisioned machine; teams
