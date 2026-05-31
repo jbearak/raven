@@ -32,7 +32,7 @@ These were open in the spec; the plan locks them. The "locked" decisions from th
 2. **CI flag name → `raven check --report-uninstalled`.** Descriptive; matches spec §10.2. Plumbed by suppressing missing-package diagnostics by default (set `cross_file_config.packages_missing_package_severity = None` unless the flag is present), reusing the existing severity gate at `handlers.rs:5005`.
 3. **Tier 3 encoding → custom container + `postcard` payloads + `memmap2`, integrity via `blake3` (already a dep).** Layout: `MAGIC(8) | version(u32) | header_len(u32) | header(postcard) | payload region`. The header (decoded once at open — the "preload the index" of §12) carries provenance, a `blake3` hex of the payload region, and an index `Vec<{name, offset, len}>`. Per-package `PackageRecord`s live in the mmap'd payload region and are postcard-decoded **lazily** on lookup, off the LSP hot path (the hot path is `try_read`-only against the in-memory cache). No compression in v1 (would fight per-entry lazy mmap; export-name lists postcard-encode compactly; revisit only if size demands).
 4. **Resolution seam → a real `PackageMetadataProvider` trait, synchronous, covering the new fallback tiers only.** Tier 1 stays a bespoke first step in `get_package` (its subprocess/INDEX logic is intertwined with `lib_paths`/caches; wrapping it would not be "contained" and risks regressing the authoritative path, which the spec forbids). Tier 2/3 are pure pre-built reads → the trait is sync (no `async_trait` needed). `package_exists()` never consults providers, preserving the install-status invariant (§10).
-5. **Build-job hosting → a dedicated GitHub Actions workflow `build-names-db.yml`** (weekly `schedule` + `workflow_dispatch` + on release tag), storing `names.db` on a **GitHub Release** (see decision #14). The shipped binary stays **network-free**: the workflow uses `curl` to fetch r-universe JSON into a directory, then `raven packages build-shipped-db` transforms it. Provenance (source, snapshot date, package count, raven version) + a `blake3` checksum are written into the db header.
+5. **Build-job hosting → a dedicated GitHub Actions workflow `build-names-db.yml`** (`workflow_dispatch` + on release tag; a scheduled-`schedule` interval is **not yet committed** — see decision #16's cadence note), storing `names.db` on a **GitHub Release** (see decision #14). The shipped binary stays **network-free**: the workflow uses `curl` to fetch r-universe JSON into a directory, then `raven packages build-shipped-db` transforms it. Provenance (source, snapshot date, package count, raven version) + a `blake3` checksum are written into the db header.
 
 ---
 
@@ -42,7 +42,7 @@ The branches below were stress-tested after the first draft and changed the plan
 
 6. **`freeze` builds a provider-less (Tier-1-only) library.** The capture path must never fall through to Tier 2/3, or it would write latest-CRAN guesses (or a stale prior `.raven/packages.json`) into the "frozen Tier 1" file. Implemented by splitting construction: `build_library_inner` (no providers) feeds both `build_package_library_tier1_only` (capture: freeze + the Tier 3 build's reference-R seed) and `build_package_library` (runtime: inner + provider wiring). Existing 4-arg callers of `build_package_library` are unchanged.
 7. **Base/recommended exports ship as a separate bundled file** (built from the reference R), loaded in `initialize()` to populate `base_exports` when the base packages aren't on disk (CI). Base **datasets** (`mtcars`/`iris`) are merged into `base_exports` exactly as the disk path does today — so base datasets resolve in CI in v1 (independent of #350, which covers *non-base* package datasets). A real R install still wins (the file is only consulted when disk base packages are absent).
-8. **Tier 3 build = reference-R seed ∪ CRAN+Bioc r-universe append, append-only.** Each rebuild starts from the previous `names.db`, overlays an authoritative reference-R capture of the build machine's **entire installed library** (`enumerate_installed_packages` across all lib paths — base/recommended **and** every CRAN/Bioc/GitHub-only/internal package installed there, with datasets and `exportPattern` expanded), appends r-universe for packages not already present, and **never drops** a package. Precedence: **reference-R > r-universe > retained-from-prior**. r-universe is fetched from **both** `cran.r-universe.dev` and `bioc.r-universe.dev`.
+8. **Tier 3 build = reference-R seed ∪ CRAN+Bioc r-universe append, append-only, seeding from the prior DB by default.** Each rebuild **starts from the previous `names.db` by default** (append is the default, not an opt-in flag — `build-shipped-db` auto-seeds from the prior DB; an explicit `--fresh`/`--no-seed` is the only way to rebuild from scratch), overlays an authoritative reference-R capture of the build machine's **entire installed library** (`enumerate_installed_packages` across all lib paths — base/recommended **and** every CRAN/Bioc/GitHub-only/internal package installed there, with datasets and `exportPattern` expanded), merges in r-universe, and **never drops** a package. **Merge precedence is version-aware — see decision #16** (supersedes the old "reference-R > r-universe > prior" rule). r-universe is fetched from **both** `cran.r-universe.dev` and `bioc.r-universe.dev`.
 
    **Not a curated subset (corrected in review):** the reference-R seed is deliberately the *full* installed library, because packages that were hard to install or are absent from CRAN/Bioc (GitHub-only, internal, fallback-built) only ever enter the floor this way — and append-only guarantees they're never lost on later rebuilds. The build machine's library therefore determines authoritative coverage: the maintainer **bootstraps** the `names-db` Release once from a richly-provisioned machine (e.g. their own), after which automated runs seed from that Release, append CRAN+Bioc, and retain everything. Teams can likewise build a private `names.db`/`base-exports.json` from their own library for richer in-house coverage.
 9. **Unreadable databases are explained, not silently dropped.** Readers return typed errors — `Absent` (normal, silent) vs `UnsupportedSchema { found, supported }` vs `Corrupt`. On a present-but-unusable file (e.g. a `.raven/packages.json` written by a newer Raven), the surface **explains and continues** — `raven check` prints a specific stderr note, the language server raises `window/showMessage` — then degrades to the next tier. Never hard-fails the LSP or the build over a committed/seed file. Tier 2 gains a `schema_version`; Tier 3 keeps `FORMAT_VERSION`.
@@ -50,8 +50,22 @@ The branches below were stress-tested after the first draft and changed the plan
 11. **`freeze` is a no-op when content is unchanged.** After computing records, if an existing file is present, compare **package content only** (ignoring provenance); if identical, leave the file untouched and print "no changes" — so a no-op regeneration produces zero diff and the provenance timestamp only moves when content changed.
 12. **The seam is just one hook.** `prefetch_packages` needs **no** change: its Step 3 already funnels every loaded package (and transitive `Depends` / meta-package `attached_packages`) through `get_all_exports → collect_exports_recursive → get_package`, which carries the provider hook. So meta-packages (`library(tidyverse)`) and `Depends` chains resolve in CI for free. The original Task 2.3 (a separate prefetch fallback) is **removed** as redundant.
 13. **Verify the `names.db` checksum at open, in `spawn_blocking`** (Q5) — ~10–20 ms once during library init, off the async runtime; catches truncation/corruption.
-14. **`names.db` lives on a GitHub Release** (moving tag, e.g. `names-db`), holding `names.db`, the base-exports file, and their checksums. GH Actions artifacts are per-run and expire, which can't serve the append-only seed or release packaging; a Release gives a durable URL. The weekly job downloads the current asset (seed), rebuilds, re-uploads; `release-build` and `bundle-binary.js` download the same asset to place next to the binary / into the VSIX.
+14. **`names.db` lives on a GitHub Release** (moving tag, e.g. `names-db`), holding `names.db`, the base-exports file, and their checksums. GH Actions artifacts are per-run and expire, which can't serve the append-only seed or release packaging; a Release gives a durable URL. The refresh job downloads the current asset (seed), rebuilds, re-uploads; `release-build` and `bundle-binary.js` download the same asset to place next to the binary / into the VSIX.
 15. **Commit tiny `names.db` + `.raven/packages.json` fixtures** as a back-compat regression guard (a "old fixtures still load" test), alongside the runtime-built tempdir fixtures used for round-trip tests.
+
+---
+
+## Decisions revised after the Stage-1 documentation PR review (2026-05-30)
+
+The Stage-1 docs were authored against the ledger above, then reviewed across three competing PRs (#352/#353/#354). That review surfaced two corrections that change the design, not just the prose. They **supersede** anything contradictory above.
+
+16. **Tier 3 merge precedence is version-aware (corrects the old "reference-R > r-universe > prior" rule, which was a flaw).** The old rule made the reference-R capture unconditionally outrank r-universe — so if CRAN/Bioc had a *newer* release than the build machine's installed copy, the build would have frozen the **older** export set and Tier 3 could miss symbols the newer version added. Corrected rule: among the sources that carry a package **in the current build** (reference-R, r-universe), the record with the **highest package version** wins; equal versions prefer the reference-R capture (it is post-load truth and alone covers GitHub-only / internal packages). The prior `names.db` remains the **append-only floor** — its record is retained only when neither current source has the package, so nothing is ever dropped.
+
+    **Implementation consequence:** the merge must compare package **versions**, so the build pipeline has to carry a version per source. `PackageRecord` gains a `version: String` field (empty when unknown); `enumerate_installed_packages`/the reference-R capture fills it from `DESCRIPTION`'s `Version`, and the r-universe ingester fills it from the JSON `Version`. `PackageInfo` itself is **not** changed (it has no version today and Tier 1 resolution doesn't need one) — `version` is populated on the build-side record and ignored by `into_info()`. See the REVISED notes on Tasks 1.2, 4.1, and 4.2.
+
+    **Cadence (folds in the old decision #5/#14 wording):** the refresh **interval is not yet committed.** `build-names-db.yml` ships with `workflow_dispatch` + on-release triggers; the scheduled `schedule:` cron is left as a commented placeholder until an interval is chosen, so the plan commits to no specific frequency (the earlier "weekly" was dropped in review).
+
+17. **No `raven ci` alias — `raven check` keeps suppressing missing-package by default.** During review we considered having `raven check` *report* uninstalled packages by default and adding a separate `raven ci` alias for `raven check --suppress-package-warnings`. Rejected on reflection: `check` is the established CI verb, splitting it adds a second command for one default, and most CI that runs Raven never executes the R scripts (so the uninstalled-package nag is noise there). The original plan stands — `raven check` suppresses missing-package by default; `--report-uninstalled` is the single opt-in. **Document the nuance:** a CI workflow that *does* run the project's R scripts after `raven check` (e.g. R-package CI) genuinely wants the warning and should pass `--report-uninstalled` (spec §10.2).
 
 ---
 
@@ -230,6 +244,11 @@ git commit -m "feat(package_db): scaffold module + add memmap2/postcard deps"
 **Files:**
 - Modify: `crates/raven/src/package_db/model.rs`
 - Test: inline `#[cfg(test)]` in the same file
+
+> **REVISED (decision #16).** `PackageRecord` gains a **`pub version: String`** field (empty `""` when unknown), needed so the Tier 3 build's append merge can compare package versions and keep the newest. Apply throughout:
+> - Add `version` to the struct (after `name`), keep it in `Debug/Clone/PartialEq/Eq/Serialize/Deserialize`.
+> - `from_info` sets `version: String::new()` — `PackageInfo` carries no version, and Tier-1 resolution never needs one; the field is populated only on the build-side (reference-R capture from `DESCRIPTION` `Version`, Task 4.1's r-universe ingester from JSON `Version`). `into_info` simply drops it.
+> - **Every `PackageRecord { … }` struct literal in this plan's later code blocks (Tasks 1.3, 1.4, 4.1) must add a `version` field** (e.g. `version: "1.1.4".into()`), or those snippets won't compile. The round-trip test below should also assert `version` survives encode/decode in the Tier 2/3 paths.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1709,7 +1728,7 @@ git commit -m "feat: explain unreadable package DBs in check (stderr) and editor
 
 Goal: `raven packages build-shipped-db` merges a reference-R authoritative capture, CRAN+Bioc r-universe JSON, and the prior `names.db` (append-only) into a new `names.db` + base-exports file; the GH Actions job fetches both r-universe hosts and publishes to the `names-db` GitHub Release. The shipped binary stays network-free (the workflow's `curl` does the fetching).
 
-> **REVISED (decisions #8, #11, #14).** This milestone changed substantially from "ingest r-universe JSON only." The merge is now **prior ∪ reference-R ∪ r-universe** with precedence **reference-R > r-universe > prior** and **append-only** (never drop a package). r-universe is fetched from **both** `cran.r-universe.dev` and `bioc.r-universe.dev`. Output is published to a **GitHub Release**, not an artifact. Task 4.1 (ingestion) is unchanged except for accepting both hosts' directories; Task 4.2 becomes the merge + `build-shipped-db` command; Task 4.3 becomes the Release-publishing workflow.
+> **REVISED (decisions #8, #11, #14, #16).** This milestone changed substantially from "ingest r-universe JSON only." The merge is now **prior ∪ reference-R ∪ r-universe**, **append-only** (never drop a package), seeding from the prior DB **by default**, with **version-aware precedence** (decision #16 — the newest version's exports win among current sources; ties → reference-R; the prior DB is the floor). r-universe is fetched from **both** `cran.r-universe.dev` and `bioc.r-universe.dev`. Output is published to a **GitHub Release**, not an artifact. Task 4.1 (ingestion) adds version capture and accepts both hosts' directories; Task 4.2 becomes the merge + `build-shipped-db` command; Task 4.3 becomes the Release-publishing workflow.
 
 ### Task 4.1: r-universe JSON ingestion → `PackageRecord`
 
@@ -1718,6 +1737,8 @@ Goal: `raven packages build-shipped-db` merges a reference-R authoritative captu
 - Create: `crates/raven/tests/fixtures/package_db/runiverse/dplyr.json`
 - Create: `crates/raven/tests/fixtures/package_db/runiverse/ggplot2.json`
 - Test: inline `#[cfg(test)]`
+
+> **REVISED (decision #16).** Capture the package **version** so the append merge can prefer the newest. The fixtures already carry `"Version"`; wire it through: add `#[serde(rename = "Version", default)] version: String` to `RUniversePackage`, and set `version: pkg.version` on the `PackageRecord` built in `parse_runiverse_json`. Extend the ingester test to assert `dplyr`'s `version == "1.1.4"`.
 
 - [ ] **Step 1: Create fixture JSON**
 
@@ -1899,10 +1920,10 @@ git commit -m "feat(package_db): ingest r-universe per-package JSON into Package
 > **REVISED (decisions #6, #7, #8).** `build-shipped-db` is no longer a thin r-universe ingester. It now:
 > 1. **Captures the reference R** authoritatively via `build_package_library_tier1_only` (Task 3.1) + `enumerate_installed_packages` (Task 5.2) — the build machine's **entire installed library** (every package across all lib paths, not just base/recommended; datasets + `exportPattern` expanded; decision #8) — into `PackageRecord`s, and also writes the **base-exports file** (the base packages' records, a subset of the capture).
 > 2. **Ingests r-universe** from CRAN **and** Bioc directories (Task 4.1).
-> 3. **Seeds from the prior `names.db`** (if `--seed` given), read via `ShippedDb`.
-> 4. **Merges append-only** with precedence **reference-R > r-universe > prior** (a new `package_db::merge::merge_append_only(prior, runiverse, reference_r) -> Vec<PackageRecord>` that unions by name, taking the highest-precedence source per name, and never drops a name present in any source).
+> 3. **Seeds from the prior `names.db` by default** (append is the default — decision #8). The command auto-discovers/accepts the prior DB and seeds from it unless `--fresh` (a.k.a. `--no-seed`) is passed; `--seed <path>` overrides which prior DB to read (via `ShippedDb`).
+> 4. **Merges append-only, version-aware** (decision #16): a new `package_db::merge::merge_append_only(prior, runiverse, reference_r) -> Vec<PackageRecord>` unions by name; for a name carried by more than one **current** source (reference-R, r-universe) it keeps the record with the **highest package version** (ties → reference-R, the post-load capture); a name present only in `prior` is **retained** (append-only floor); nothing is ever dropped. Version comparison uses the `version` field added in Tasks 1.2/4.1 — parse with a small semver-ish compare (split on `.`/`-`, numeric-aware; fall back to string compare and prefer reference-R when a version is empty/unparseable).
 >
-> **Revised args:** `--reference-lib` (capture installed R; optional — omit in pure-ingest tests), `--runiverse-cran <dir>`, `--runiverse-bioc <dir>`, `--seed <prior names.db>` (optional), `--output <names.db>`, `--base-exports-output <base-exports.json>`, `--snapshot-date`, `--source`. The `parse_build_shipped_db_args` test below extends to cover the new flags; the merge precedence + append-only properties get dedicated `merge.rs` unit tests (e.g. a name only in `prior` is retained; a name in both `reference_r` and `runiverse` takes the reference-R record).
+> **Revised args:** `--reference-lib` (capture installed R; optional — omit in pure-ingest tests), `--runiverse-cran <dir>`, `--runiverse-bioc <dir>`, `--fresh`/`--no-seed` (skip the default prior-DB seed), `--seed <prior names.db>` (override the seed path), `--output <names.db>`, `--base-exports-output <base-exports.json>`, `--snapshot-date`, `--source`. The `parse_build_shipped_db_args` test below extends to cover the new flags; the version-aware merge + append-only properties get dedicated `merge.rs` unit tests: a name only in `prior` is retained; a name in both `reference_r` and `runiverse` takes the **higher-version** record (and the test must include the case where **r-universe is newer than reference-R**, proving the corrected precedence); equal versions take the reference-R record.
 >
 > The Step-3 code below is the **v1 skeleton** (single `--input` ingest); extend it to the merge flow above. The `parse_build_shipped_db_args`/dispatch/`print_help` wiring is otherwise reused as-is.
 
@@ -2093,8 +2114,10 @@ name: Build names.db (Tier 3 package-export DB)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1"   # weekly, Monday 06:00 UTC (latest-only; export names are stable)
+  # Refresh interval is NOT yet committed (decision #16). Run on demand for now.
+  # When an interval is chosen, uncomment a schedule, e.g.:
+  #   schedule:
+  #     - cron: "0 6 * * 1"   # example only — currently inactive
 
 permissions:
   contents: write   # to update the names-db Release
@@ -2165,7 +2188,7 @@ Expected: no error.
 
 ```bash
 git add .github/workflows/build-names-db.yml
-git commit -m "ci: weekly build-names-db (reference-R + CRAN+Bioc, append-only, publish to Release)"
+git commit -m "ci: build-names-db (reference-R + CRAN+Bioc, append-only, publish to Release)"
 ```
 
 ---
@@ -2868,9 +2891,9 @@ git commit -m "docs(development): package-export databases — architecture, sea
 - [ ] **Step 1: Document the new surfaces**
 
 Add sections to `docs/cli.md`:
-- `raven packages freeze` — purpose (generate `.raven/packages.json`), `--used` (default) / `--installed` / `--all`, `--output`, `--workspace`; the renv-first library order and the "renv.lock is a set selector" rule (§7.2); generate after `renv::restore()` for best coverage.
-- `raven packages build-shipped-db` — note it as maintainer/CI-only (the binary never fetches the network).
-- `raven check --report-uninstalled` — what it does and the precise wording from §10.2: it reports `library()` calls **not present in the local library paths**, *not* relative to Tier 2/Tier 3 metadata. State that missing-package is **off by default** in `raven check`.
+- `raven packages freeze` — purpose (generate `.raven/packages.json`), the **scope flags `--used` (default) / `--installed` / `--all`** (whether to capture only the packages the repo uses or every installed package — call these out wherever `freeze` is first introduced, including any top-of-file command summary, not just in the options block; PR-review comment), `--output`, `--workspace`; the renv-first library order and the "renv.lock is a set selector" rule (§7.2); generate after `renv::restore()` for best coverage.
+- `raven packages build-shipped-db` — **maintainer/CI-only; not a user command.** Do **not** list it as a peer of `raven check` / `raven lint` / `raven packages freeze` in the top-of-file command bullets (a reviewer rightly asked "why is a non-user command in cli.md?"). Mention it only inside the `raven packages` group, in a clearly-labeled "Maintainer / CI-only — most users never run this" subsection, and push the full build pipeline to `docs/development.md` (link to it). The binary never fetches the network.
+- `raven check --report-uninstalled` — what it does and the precise wording from §10.2: it reports `library()` calls **not present in the local library paths**, *not* relative to Tier 2/Tier 3 metadata. State that missing-package is **off by default** in `raven check`, and add the §10.2 nuance (decision #17): CI that actually **runs** the project's R scripts should pass `--report-uninstalled` so a genuinely-uninstalled package fails the run.
 
 - [ ] **Step 2: Verify and commit**
 
@@ -2894,6 +2917,7 @@ git commit -m "docs(cli): document packages freeze, build-shipped-db, --report-u
 Add to `docs/diagnostics.md`:
 - The missing-package diagnostic is **install-status only** (Tier 1), independent of the export database. Knowing a package's exports does **not** make it count as installed (§10).
 - Per-mode behavior table (§10.1): language server fires missing-package when install-state is known; `raven check` suppresses it by default, re-enabled with `--report-uninstalled`.
+- When to flip it on (decision #17 / §10.2): if your CI **actually runs the project's R scripts** after `raven check` (e.g. R-package CI), pass `--report-uninstalled` — an uninstalled package is then a real failure. Gate-only CI that never executes the scripts wants the default (suppressed). Do **not** describe a `raven ci` alias — it was considered and rejected.
 - The accepted gap (§10.3): a typo like `library(dpylr)` is silent in `raven check` by default.
 
 - [ ] **Step 2: Commit**
@@ -2914,7 +2938,7 @@ git commit -m "docs(diagnostics): CI missing-package default + names-vs-install-
 - [ ] **Step 1: Document three-tier resolution + renv-aware generation**
 
 - `docs/cross-file.md`: in/near the "When Raven calls R" section, describe the three-tier export resolution (Tier 1 installed → Tier 2 repo DB → Tier 3 shipped DB) and that Tiers 2/3 are export-names-only (no `:::`, no signatures).
-- `docs/r-package-dev.md`: describe generating `.raven/packages.json` for CI and the renv-first library order.
+- `docs/r-package-dev.md`: describe generating `.raven/packages.json` for CI and the renv-first library order. **Frame the rationale correctly (PR-review comment, spec §7):** do *not* say `freeze` is how you "get diagnostics in CI" — you get package-aware diagnostics regardless, via the bundled Tier 3 floor. State the two real reasons to run it: (1) the repo uses packages whose exports **aren't shipped** in Raven's Tier 3 database (GitHub-only / internal / not-yet-indexed); (2) the repo pins package versions whose exports **differ** from what Tier 3 captured, in ways that could change diagnostics (the §13 latest-only drift). Absent both, Tier 3 alone suffices.
 
 - [ ] **Step 2: Commit**
 
@@ -2933,7 +2957,7 @@ git commit -m "docs: three-tier export resolution + renv-aware generation"
 
 - [ ] **Step 1: Write the page**
 
-Create `docs/package-database.md` covering: the three tiers and their fidelity (table from §4); the committed `.raven/packages.json` (generated not hand-edited, reviewable in PRs, **regeneration is a no-op when unchanged**, **version-skew is explained and the bundled DB is used** — decisions #9/#11); the generation command and its maximally-inclusive `--used` set (decision #10); the bundled `names.db` (latest-only, export-only; built from a **reference R seed ∪ CRAN+Bioc r-universe, append-only**; shipped via a **GitHub Release**; provenance/integrity via `blake3`; refresh = weekly + release cadence — decisions #8/#14); the separate **base-exports file** that makes base symbols + base datasets resolve in CI (decision #7); package-dataset resolution arrives via [raven#350](https://github.com/jbearak/raven/issues/350); and the fidelity caveats (§13: `exportPattern` solved by r-universe; Tier 3 latest-only drift; no `:::`/signatures; Bioconductor cadence).
+Create `docs/package-database.md` covering: the three tiers and their fidelity (table from §4); **why a user would generate Tier 2 at all** given Tier 3 always ships a floor (the two reasons in spec §7 — unshipped packages, version-skew — *not* "this is how you get diagnostics"); the committed `.raven/packages.json` (generated not hand-edited, reviewable in PRs, **regeneration is a no-op when unchanged**, **version-skew is explained and the bundled DB is used** — decisions #9/#11); the generation command and its maximally-inclusive `--used` set (decision #10); the bundled `names.db` (export-only; built from a **reference R seed ∪ CRAN+Bioc r-universe, append-only**, with **version-aware merge precedence** — decision #16; shipped via a **GitHub Release**; provenance/integrity via `blake3`; refresh cadence = on-release + on-demand, **interval not yet committed** — decisions #8/#14/#16); the separate **base-exports file** that makes base symbols + base datasets resolve in CI (decision #7); package-dataset resolution arrives via [raven#350](https://github.com/jbearak/raven/issues/350); and the fidelity caveats (§13: `exportPattern` solved by r-universe; the Tier 3 drift caveat — **describe it concretely** as "tracks latest CRAN/Bioc as of Raven's last refresh; a newer local version can yield a false-positive undefined-variable," *avoid the bare jargon "latest-only"* per the PR-review comment; no `:::`/signatures; Bioconductor cadence).
 
 - [ ] **Step 2: Link it from CLAUDE.md**
 
@@ -3047,7 +3071,7 @@ git commit -m "chore: final verification sweep + drop planned-status banners for
 
 **2. Placeholder scan** — No "TBD"/"add error handling"/"similar to Task N". Code steps show complete code; the grilling REVISED callouts (Tasks 1.3, 1.4, 3.1, 4.2, 5.3) specify their deltas as concrete code, superseding the v1 skeleton beneath them. Verify-at-implementation notes: Task 5.5 (`getServerPath` scope, `extension.ts:100`); Task 4.x r-universe JSON shape & a possible bulk endpoint (pinned by fixtures, validated by the build-differential test). `scan_workspace` shape verified during planning (`state.rs:1140`).
 
-**3. Type consistency** — `PackageRecord` (`name/exports/depends/lazy_data`) consistent across Tasks 1.2–1.4, 3.5, 4.1–4.2, 5.3. `PackageMetadataProvider::lookup(&self,&str)->Option<PackageInfo>` consistent across 1.1/1.3/1.4 + test fakes. Construction split — `build_library_inner` / `build_package_library_tier1_only` / `build_package_library` (4-arg) — consistent across Tasks 3.1 (def), 5.3 (freeze uses tier1_only), 4.2 (build uses tier1_only); existing 4-arg callers untouched. Typed errors `RepoDbError`/`ShippedDbError` (Tasks 1.3/1.4) surfaced via `PackageLibraryOutcome.load_notes` (Tasks 3.1/3.6). `RepoDb` carries `schema_version` (Tasks 1.3, 3.5, 5.3). `FreezeScope::{Used,All}`, `ShippedDbProvenance`, `RepoDbProvenance` fields consistent across their tasks.
+**3. Type consistency** — `PackageRecord` (`name/version/exports/depends/lazy_data`; `version` added by decision #16) consistent across Tasks 1.2–1.4, 3.5, 4.1–4.2, 5.3. Remember to add `version` to every `PackageRecord { … }` literal in those tasks' code blocks (Task 1.2 REVISED note). `PackageMetadataProvider::lookup(&self,&str)->Option<PackageInfo>` consistent across 1.1/1.3/1.4 + test fakes. Construction split — `build_library_inner` / `build_package_library_tier1_only` / `build_package_library` (4-arg) — consistent across Tasks 3.1 (def), 5.3 (freeze uses tier1_only), 4.2 (build uses tier1_only); existing 4-arg callers untouched. Typed errors `RepoDbError`/`ShippedDbError` (Tasks 1.3/1.4) surfaced via `PackageLibraryOutcome.load_notes` (Tasks 3.1/3.6). `RepoDb` carries `schema_version` (Tasks 1.3, 3.5, 5.3). `FreezeScope::{Used,All}`, `ShippedDbProvenance`, `RepoDbProvenance` fields consistent across their tasks.
 
 **4. Internal consistency after grilling revisions** — Task 2.3 removed (decision #12); the prefetch warm test relocated into the Task 2.3 stub and passes via Task 2.2 alone. `prefetch_packages` is explicitly *unchanged*. All `build_package_library(…, true)` call sites in tests (Tasks 3.1, 3.2, 5.4, 5.6) intentionally use the runtime (provider-wiring) path; only freeze and `build-shipped-db` use `build_package_library_tier1_only`.
 
