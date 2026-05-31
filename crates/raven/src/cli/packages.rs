@@ -138,11 +138,9 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
         FreezeScope::Used => {
             wanted.extend(scan_workspace_referenced_packages(&root));
             wanted.extend(read_description_depends_imports(&root.join("DESCRIPTION")));
-            for pkg in read_renv_lock_package_names(&root.join("renv.lock"))
-                .map_err(|e| e.to_string())?
-            {
-                wanted.insert(pkg);
-            }
+            wanted.extend(
+                read_renv_lock_package_names(&root.join("renv.lock")).map_err(|e| e.to_string())?,
+            );
         }
     }
 
