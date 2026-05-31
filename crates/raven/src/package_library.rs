@@ -4392,4 +4392,24 @@ mod tests {
         assert!(lib.is_symbol_from_loaded_packages("mutate", &["dplyr".to_string()]));
         assert!(!lib.is_cached("ggplot2").await);
     }
+
+    #[tokio::test]
+    async fn package_exists_never_consults_providers() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        // The provider KNOWS dplyr's exports, but it is not installed on disk.
+        // package_exists answers "is it installed?", which stays Tier-1-only.
+        assert!(!lib.package_exists("dplyr"));
+    }
 }
