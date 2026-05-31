@@ -59,6 +59,28 @@ If the symbol is defined later in the same file at top level, the message also r
 |---|---|---|
 | Missing package | warning | `library()` references a package not installed on the system |
 
+### Package names vs. install status
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+Raven can resolve a package's **export names** from one of three tiers — installed packages, a committed `.raven/packages.json`, or Raven's bundled `names.db` — so symbols from `library(pkg)` resolve even when the package isn't installed (for example in CI with no R). See [Package database](package-database.md). Crucially, knowing a package's exports is kept **separate** from knowing whether it is installed:
+
+- **Export resolution** (suppresses undefined-variable noise) uses all three tiers, in every mode.
+- **Install status** (drives the *missing-package* diagnostic) is **Tier 1 only** — it reflects what is actually present in the local library paths, and never the export database. A database that knows `dplyr`'s exports does **not** make `dplyr` count as installed.
+
+#### Per-mode behavior
+
+| | Export resolution | Missing-package ("not installed") |
+|---|---|---|
+| **Language server (interactive)** | tiers 1→2→3 (no undefined-variable storm even when R is absent) | Fires when install state is known and the package is absent — regardless of the database. Unchanged from today; the database stops the symbol storm but never masks the "install this dependency" nudge. |
+| **`raven check` (CI)** | tiers 1→2→3 | **Suppressed by default** (CI deliberately omits installation). Re-enable with [`--report-uninstalled`](cli.md#missing-package-reporting-in-ci). |
+
+When enabled, `--report-uninstalled` reports `library()` calls **not present in the local library paths** — *not* relative to the Tier 2/Tier 3 export metadata.
+
+#### Accepted gap
+
+With missing-package off by default in `raven check`, a genuine typo such as `library(dpylr)` — unknown to every tier — is **silent** unless `--report-uninstalled` is passed. This is documented behavior: the default avoids nagging about known-but-uninstalled dependencies in CI. Pass the flag (e.g. in a pipeline that runs `renv::restore()`) to catch packages that failed to install. The language server still flags such a call interactively whenever install state is known.
+
 ### Cross-File Diagnostics
 
 | Diagnostic | Default Severity | Trigger |
