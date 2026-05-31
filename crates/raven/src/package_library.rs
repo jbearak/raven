@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 use crate::namespace_parser::{
     parse_data_symbols, parse_description_depends, parse_index_exports, parse_namespace_exports,
 };
+use crate::package_db::PackageMetadataProvider;
 use crate::r_subprocess::RSubprocess;
 
 /// Meta-packages that attach multiple other packages when loaded
@@ -228,6 +229,11 @@ pub struct PackageLibrary {
     /// R subprocess interface (None if R is unavailable)
     #[allow(dead_code)] // Will be used in task 3.3
     r_subprocess: Option<RSubprocess>,
+    /// Ordered fallback metadata providers (Tier 2 repo DB, then Tier 3 shipped
+    /// DB), consulted only when the installed (Tier 1) path does not resolve a
+    /// package. Empty by default; populated by `build_package_library`. These
+    /// feed export resolution only — never `package_exists()` (install status).
+    providers: Vec<Box<dyn PackageMetadataProvider>>,
 }
 
 impl PackageLibrary {
@@ -245,6 +251,7 @@ impl PackageLibrary {
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess: None,
+            providers: Vec::new(),
         }
     }
 
@@ -264,6 +271,7 @@ impl PackageLibrary {
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess,
+            providers: Vec::new(),
         }
     }
 
@@ -301,6 +309,28 @@ impl PackageLibrary {
     /// an R subprocess interface.
     pub fn r_subprocess(&self) -> Option<&RSubprocess> {
         self.r_subprocess.as_ref()
+    }
+
+    /// Replace the ordered fallback providers (tier order: index 0 first).
+    pub fn set_providers(&mut self, providers: Vec<Box<dyn PackageMetadataProvider>>) {
+        self.providers = providers;
+    }
+
+    /// True when no fallback providers are configured (the common Tier-1-only case).
+    pub fn has_no_providers(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Consult the fallback providers (Tier 2 → Tier 3) in order; return the
+    /// first source that knows `name`. Pure, synchronous reads.
+    fn resolve_from_providers(&self, name: &str) -> Option<PackageInfo> {
+        for provider in &self.providers {
+            if let Some(info) = provider.lookup(name) {
+                log::trace!("Package '{}' resolved from a fallback provider", name);
+                return Some(info);
+            }
+        }
+        None
     }
 
     /// Get all exports from loaded packages for completions (synchronous, cached-only)
@@ -4282,5 +4312,28 @@ mod tests {
             names,
             ["a".to_string(), "b".to_string()].into_iter().collect()
         );
+    }
+
+    #[tokio::test]
+    async fn providers_default_empty_and_settable() {
+        use crate::package_db::PackageMetadataProvider;
+        use crate::package_library::PackageInfo;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                if name == "fakepkg" {
+                    Some(PackageInfo::new("fakepkg".into(), HashSet::from(["zzz".into()])))
+                } else {
+                    None
+                }
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        assert!(lib.has_no_providers());
+        lib.set_providers(vec![Box::new(Fake)]);
+        assert!(!lib.has_no_providers());
     }
 }
