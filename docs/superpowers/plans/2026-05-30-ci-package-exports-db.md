@@ -12,9 +12,15 @@
 
 ## Prerequisites (build order)
 
-This plan **depends on [raven#350](https://github.com/jbearak/raven/issues/350) — "Resolve package datasets (lazy-data) as symbols"** — and must be implemented *after* it.
+**[raven#350](https://github.com/jbearak/raven/issues/350) — "Resolve package datasets (lazy-data) as symbols" — has LANDED** (merged to `main` via PR [#351](https://github.com/jbearak/raven/pull/351), commit `bda8ff30`; merged into this branch). The dependency is satisfied; this is no longer a blocking prerequisite.
 
-Rationale: the Tier 2/3 records here capture each package's `lazy_data` (dataset names), but the *consumer* only resolves a symbol if it's in the resolvable export set, which today excludes `lazy_data` for non-base packages. Wiring dataset resolution **only** in this CI feature would make CI resolve datasets that a local R install would not (an editor-vs-CI asymmetry). #350 fixes resolution at the Tier 1 level (populate `lazy_data` in `get_package`, fold it into `collect_exports_recursive`), so once it lands, this plan's captured `lazy_data` is consumed by the same resolution path automatically — package datasets then resolve in CI via the providers with no extra work here. Implement #350 first; this plan assumes that resolution mechanism exists.
+The lazy-data resolution mechanism this plan relies on is now in place:
+- `get_package` populates `lazy_data` via `parse_data_symbols` ([`package_library.rs:186`](../../../crates/raven/src/package_library.rs)),
+- `collect_exports_recursive` folds `lazy_data` into the resolvable set ([`package_library.rs:1540`](../../../crates/raven/src/package_library.rs)).
+
+So this plan's Tier 2/3 `PackageRecord` (which captures `lazy_data`) is consumed by that same resolution path automatically — once the providers land, package datasets resolve in CI with no extra work here.
+
+> **⚠ Anchor drift (post-#350).** #350 added ~361 lines to `crates/raven/src/package_library.rs`, so every `package_library.rs:NNN` line reference in this plan is now **stale** (shifted ~+30–40 lines) and the `get_package` body changed shape. Re-verify the seams **before** executing M1–M3. Current anchors (post-merge): `PackageInfo` `:110`; `find_package_for_symbol` `:795`; `prefetch_packages` `:630`; `initialize` `:981`; `get_package` `:1183`; `package_exists` `:1431`; `collect_exports_recursive` `:1506`; `build_package_library` `:1652`. Note that `get_package` **no longer** sets `lazy_data = Vec::new()` for regular packages (it now calls `parse_data_symbols`), so the plan's references to the old `:1236` empty-`lazy_data` line and the prereq rationale built on it are obsolete — `PackageRecord::from_info` already carries real `lazy_data`.
 
 ---
 
