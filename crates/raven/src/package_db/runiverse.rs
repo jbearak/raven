@@ -59,7 +59,16 @@ pub fn parse_runiverse_json(text: &str) -> anyhow::Result<PackageRecord> {
 pub fn ingest_runiverse_dir(dir: &Path) -> anyhow::Result<Vec<PackageRecord>> {
     let mut records = Vec::new();
     for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
+        // A single unreadable directory entry must not fail the whole build,
+        // same as the read/parse failures below — only an unopenable `dir`
+        // (the `?` above) is fatal.
+        let path = match entry {
+            Ok(e) => e.path(),
+            Err(e) => {
+                log::warn!("skipping unreadable entry in {:?}: {}", dir, e);
+                continue;
+            }
+        };
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }

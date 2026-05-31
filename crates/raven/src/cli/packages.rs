@@ -128,6 +128,27 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     let outcome =
         crate::package_library::build_package_library_tier1_only(None, &[], Some(root.clone()))
             .await;
+
+    // Freeze snapshots the INSTALLED library (Tier 1), so it needs R and at
+    // least one library path. Without a ready library, the `package_exists`
+    // gate below filters every candidate out and we'd overwrite a good
+    // `.raven/packages.json` with an empty/partial snapshot — refuse instead.
+    if !outcome.status.is_ready() {
+        use crate::package_library::PackageLibraryStatus::*;
+        let reason = match &outcome.status {
+            RNotFound => "no R interpreter was found".to_string(),
+            NoLibraryPaths => "R reported no library paths".to_string(),
+            InitFailed(e) => format!("R initialization failed: {e}"),
+            Disabled => "package support is disabled".to_string(),
+            Ready => unreachable!("guarded by is_ready()"),
+        };
+        return Err(format!(
+            "cannot freeze: {reason}. `raven packages freeze` needs R and an installed \
+             library to verify packages; refusing to overwrite {} with an unverified snapshot",
+            absolute_path(&root, &args.output).display()
+        ));
+    }
+
     let lib = &outcome.library;
 
     // BFS work-list seeded from the scope's sources. `seen` (below) is the sole
@@ -327,18 +348,19 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
         let seed_path = args.seed.clone().unwrap_or_else(|| args.output.clone());
         match ShippedDb::open(&seed_path) {
             Ok(db) => db.all_records(),
-            // A missing seed is normal (first build / no prior Release). Any
-            // OTHER failure (corrupt, or a newer Tier-3 format) means the prior
-            // DB's accumulated history would be silently dropped — warn loudly so
-            // a maintainer notices rather than shipping a regressed (shrunken) DB.
+            // A missing seed is the only case safe to treat as "start fresh"
+            // (first build / no prior Release). Any OTHER failure (corrupt, or a
+            // newer Tier-3 format) means the prior DB's accumulated history would
+            // be silently dropped, violating the append-only / version-monotonic
+            // contract — so abort rather than ship a regressed (shrunken) DB.
+            // `--fresh` is the explicit opt-in for intentionally discarding it.
             Err(crate::package_db::binary_db::ShippedDbError::Absent) => Vec::new(),
             Err(e) => {
-                eprintln!(
-                    "warning: could not read seed DB {}: {e} — building without the prior DB \
-                     (accumulated packages from earlier builds will be dropped unless this is fixed)",
+                return Err(format!(
+                    "could not read seed DB {}: {e}; rerun with --fresh only if dropping \
+                     prior history is intentional",
                     seed_path.display()
-                );
-                Vec::new()
+                ))
             }
         }
     };

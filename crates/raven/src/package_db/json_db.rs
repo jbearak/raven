@@ -1,6 +1,6 @@
 //! Tier 2 encoding: a committed, deterministic, diff-friendly `.raven/packages.json`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,18 @@ pub fn read_repo_db_str(text: &str) -> Result<RepoDb, RepoDbError> {
             found: db.schema_version,
             supported: REPO_DB_SCHEMA_VERSION,
         });
+    }
+    // `RepoDbProvider::from_db` collects into a `HashMap` by name, so duplicate
+    // records would be silently coalesced (last-wins) — turning a data error in
+    // a hand-merged file into wrong metadata with no signal. Reject it here.
+    let mut seen = HashSet::with_capacity(db.packages.len());
+    for pkg in &db.packages {
+        if !seen.insert(pkg.name.as_str()) {
+            return Err(RepoDbError::Corrupt(format!(
+                "duplicate package record '{}'",
+                pkg.name
+            )));
+        }
     }
     Ok(db)
 }
@@ -178,6 +190,25 @@ mod tests {
                 assert_eq!(supported, REPO_DB_SCHEMA_VERSION);
             }
             other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_package_names_are_rejected() {
+        // A hand-merged file with two records for one name must be flagged, not
+        // silently coalesced (last-wins) by the provider's by-name map.
+        let mut db = sample();
+        db.packages.push(PackageRecord {
+            name: "dplyr".into(),
+            version: "9.9.9".into(),
+            exports: vec!["other".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        });
+        let text = write_repo_db_string(&db);
+        match read_repo_db_str(&text) {
+            Err(RepoDbError::Corrupt(msg)) => assert!(msg.contains("dplyr"), "got {msg}"),
+            other => panic!("expected Corrupt(duplicate), got {other:?}"),
         }
     }
 }

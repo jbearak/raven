@@ -12,7 +12,11 @@
 //!
 //! The header is decoded **once at open**; per-package payloads stay in the mmap
 //! and are postcard-decoded **lazily** on lookup, off the LSP hot path. Integrity:
-//! a `blake3` hash of the payload region is stored in the header and verified at open.
+//! a `blake3` hash of the payload region is stored in the header and verified at
+//! open; the index→record mapping is additionally bound by checking that each
+//! decoded record's own `name` matches the index key it was reached through (see
+//! `decode_at`), so a tampered/corrupt index can't silently remap a name onto a
+//! different payload.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -219,14 +223,33 @@ impl ShippedDb {
         })
     }
 
-    /// Decode one package's record, lazily, from the mmap. Index bounds are
-    /// validated at `open`, so the checked arithmetic here is defense-in-depth.
-    fn decode_at(&self, offset: u64, len: u32) -> Option<PackageRecord> {
+    /// Decode one package's record, lazily, from the mmap, and verify the
+    /// decoded record's own `name` matches the index key it was reached through.
+    ///
+    /// The payload checksum authenticates the record BYTES; this binding
+    /// authenticates the index → record MAPPING. So a corrupt/tampered index
+    /// that remaps a name onto a different (valid, in-bounds, unchanged) payload
+    /// is rejected (fails closed) instead of silently returning the wrong
+    /// package. An unkeyed payload checksum can't catch that on its own — and,
+    /// unlike extending the checksum to cover the index, this binding still
+    /// holds if an attacker recomputes the hash, because each record carries its
+    /// own name. Index bounds are validated at `open`, so the checked arithmetic
+    /// here is defense-in-depth.
+    fn decode_at(&self, name: &str, offset: u64, len: u32) -> Option<PackageRecord> {
         let start = self.payload_start.checked_add(usize::try_from(offset).ok()?)?;
         let end = start.checked_add(len as usize)?;
         let slice = self.mmap.get(start..end)?;
         match postcard::from_bytes::<PackageRecord>(slice) {
-            Ok(rec) => Some(rec),
+            Ok(rec) if rec.name == name => Some(rec),
+            Ok(rec) => {
+                log::warn!(
+                    "names.db: index entry '{}' points at a record named '{}' \
+                     (corrupt or tampered index); ignoring",
+                    name,
+                    rec.name
+                );
+                None
+            }
             Err(e) => {
                 log::warn!("names.db: failed to decode a record: {}", e);
                 None
@@ -237,15 +260,15 @@ impl ShippedDb {
     /// Look up and decode one package's `PackageInfo`, lazily, from the mmap.
     pub fn lookup(&self, name: &str) -> Option<PackageInfo> {
         let (offset, len) = *self.index.get(name)?;
-        self.decode_at(offset, len).map(|rec| rec.into_info())
+        self.decode_at(name, offset, len).map(|rec| rec.into_info())
     }
 
     /// Decode and return EVERY record. Used by the Tier 3 build to seed the merge
     /// from the prior DB (Task 4.2). Not on any hot path.
     pub fn all_records(&self) -> Vec<PackageRecord> {
         self.index
-            .values()
-            .filter_map(|&(offset, len)| self.decode_at(offset, len))
+            .iter()
+            .filter_map(|(name, &(offset, len))| self.decode_at(name, offset, len))
             .collect()
     }
 }
@@ -395,6 +418,53 @@ mod tests {
             Err(ShippedDbError::Corrupt(msg)) => assert!(msg.contains("out of bounds"), "got {msg}"),
             other => panic!("expected Corrupt(out of bounds), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_index_remapping_to_wrong_record() {
+        // The payload checksum covers the record BYTES but not the index→record
+        // mapping. Swap the two entries' (offset,len) so each name points at the
+        // OTHER package's (valid, unchanged) payload: the payload — and thus its
+        // checksum — is untouched and offsets stay in-bounds, so open() succeeds.
+        // A lookup must then fail closed rather than return the wrong package.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        write_shipped_db(&path, &records(), provenance()).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let header_bytes = &bytes[16..16 + header_len];
+        let payload = bytes[16 + header_len..].to_vec(); // unchanged → checksum valid
+
+        let mut header: ShippedDbHeader = postcard::from_bytes(header_bytes).unwrap();
+        assert_eq!(header.index.len(), 2);
+        // Swap (offset,len) between the two entries, keeping their names — so
+        // "dplyr" now points at ggplot2's payload and vice versa.
+        let zero = (header.index[0].offset, header.index[0].len);
+        header.index[0].offset = header.index[1].offset;
+        header.index[0].len = header.index[1].len;
+        header.index[1].offset = zero.0;
+        header.index[1].len = zero.1;
+
+        let new_header = postcard::to_stdvec(&header).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(new_header.len() as u32).to_le_bytes());
+        out.extend_from_slice(&new_header);
+        out.extend_from_slice(&payload);
+        std::fs::write(&path, &out).unwrap();
+
+        let db = ShippedDb::open(&path).expect("payload checksum + bounds still pass");
+        assert!(
+            db.lookup("dplyr").is_none(),
+            "remapped name must not resolve to the wrong record"
+        );
+        assert!(db.lookup("ggplot2").is_none());
+        assert!(
+            db.all_records().is_empty(),
+            "every record fails the index→name binding check"
+        );
     }
 
     #[test]

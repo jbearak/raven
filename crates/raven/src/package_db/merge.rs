@@ -11,20 +11,31 @@ use crate::package_db::model::PackageRecord;
 /// `-` (the two separators are equivalent, as in R's own `numeric_version`, so
 /// `1.1-3` == `1.1.3`). Components are compared left-to-right as integers; if one
 /// is a prefix of the other the longer (more components) is greater (`1.1.0` >
-/// `1.1`). An empty or unparseable version sorts **lowest**, so any known version
-/// beats an unknown one. (Unlike SemVer, R has no pre-release ordering.)
+/// `1.1`). A version with **any** non-numeric component is treated as **fully
+/// unknown** and sorts lowest, so any well-formed version beats it and two
+/// unknowns compare equal. (Unlike SemVer, R has no pre-release ordering.)
 pub fn version_cmp(a: &str, b: &str) -> Ordering {
-    fn parts(v: &str) -> Vec<i64> {
+    // `None` ⇒ a non-numeric component ⇒ the whole version is unknown. Parsing
+    // each component into the vector (rather than mapping a bad one to a
+    // sentinel like -1) is what keeps `1.foo` from out-sorting `1`: a malformed
+    // suffix must sink the *whole* string, not just append a low component.
+    fn parts(v: &str) -> Option<Vec<u64>> {
         // Clippy suggests the `['.', '-']` array pattern, but `Pattern for
         // [char; N]` is stable only since Rust 1.80 and this crate's MSRV is
         // 1.75 — so the closure form is required.
         #[allow(clippy::manual_pattern_char_comparison)]
         v.split(|c| c == '.' || c == '-')
             .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<i64>().unwrap_or(-1)) // non-numeric component sorts low
-            .collect()
+            .map(|s| s.parse::<u64>())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
     }
-    parts(a).cmp(&parts(b))
+    match (parts(a), parts(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 /// Merge three sources into one append-only, version-monotonic set.
@@ -80,6 +91,18 @@ mod tests {
         assert_eq!(version_cmp("1.1-3", "1.1.3"), Ordering::Equal);
         assert_eq!(version_cmp("1.1.0", "1.1"), Ordering::Greater);
         assert_eq!(version_cmp("", "0.0.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_treats_malformed_as_fully_unknown() {
+        // Regression: a non-numeric component must sink the WHOLE version, not
+        // append a low component. The old `unwrap_or(-1)` made `1.foo` ⇒ [1,-1],
+        // which out-sorted `1` ⇒ [1] (longer-prefix-wins) — letting a corrupt
+        // version beat a valid one in `merge_append_only`.
+        assert_eq!(version_cmp("1.foo", "1"), Ordering::Less);
+        assert_eq!(version_cmp("1", "1.foo"), Ordering::Greater);
+        assert_eq!(version_cmp("1.foo", "2.bar"), Ordering::Equal); // both unknown
+        assert_eq!(version_cmp("abc", "1.0"), Ordering::Less);
     }
 
     #[test]

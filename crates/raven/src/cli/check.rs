@@ -43,8 +43,8 @@ pub struct CheckArgs {
     /// Resolved to on/off by [`resolve_color_from_env`] (TTY +
     /// `NO_COLOR`/`FORCE_COLOR`).
     pub color: ColorChoice,
-    /// Re-enable the missing-package ("not installed") diagnostic in CI. By
-    /// default `raven check` suppresses it because CI deliberately omits package
+    /// Enable the missing-package ("not installed") diagnostic. Disabled by
+    /// default because `raven check` often runs in environments without package
     /// installation. Reports `library()` calls absent from the local library
     /// paths — NOT relative to Tier 2/Tier 3 metadata (see docs/diagnostics.md).
     pub report_uninstalled: bool,
@@ -139,9 +139,10 @@ R / packages:
   limited and a note is printed to stderr; all other diagnostics still run.
 
   --report-uninstalled        Report packages from library() calls that are not
-                              present in the local library paths. Off by default
-                              in CI; useful when the pipeline DID install packages
-                              (e.g. renv::restore()) and you want to catch failures.
+                              present in the local library paths. Disabled by
+                              default; useful when the environment DID install
+                              packages (e.g. renv::restore()) and you want to
+                              catch failures.
 
 Exit codes:
   0   No diagnostic exceeded --max-severity

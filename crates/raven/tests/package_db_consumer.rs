@@ -14,6 +14,29 @@ use raven::package_library::build_package_library;
 /// the guard is held across `build_package_library(...).await`.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Save the current `RAVEN_NAMES_DB` and restore it on drop, so a test that
+/// points the var at a temp `names.db` doesn't clobber a pre-existing value for
+/// other tests sharing this process. `ENV_LOCK` serializes access; this keeps
+/// the var hermetic *across* tests, not just within one.
+struct NamesDbEnvGuard(Option<std::ffi::OsString>);
+
+impl NamesDbEnvGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let prior = std::env::var_os("RAVEN_NAMES_DB");
+        std::env::set_var("RAVEN_NAMES_DB", path);
+        Self(prior)
+    }
+}
+
+impl Drop for NamesDbEnvGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v) => std::env::set_var("RAVEN_NAMES_DB", v),
+            None => std::env::remove_var("RAVEN_NAMES_DB"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn tier3_resolves_export_with_no_r() {
     let _guard = ENV_LOCK.lock().await;
@@ -40,9 +63,8 @@ async fn tier3_resolves_export_with_no_r() {
     )
     .unwrap();
 
-    std::env::set_var("RAVEN_NAMES_DB", &db_path);
+    let _db_guard = NamesDbEnvGuard::set(&db_path);
     let outcome = build_package_library(None, &[], None, true).await;
-    std::env::remove_var("RAVEN_NAMES_DB");
 
     let lib = &outcome.library;
     // Warm the loaded package (mirrors the check-path prefetch).
@@ -166,10 +188,9 @@ async fn tier2_repo_db_from_workspace_outranks_tier3() {
     )
     .unwrap();
 
-    std::env::set_var("RAVEN_NAMES_DB", &db_path);
+    let _db_guard = NamesDbEnvGuard::set(&db_path);
     let outcome =
         build_package_library(None, &[], Some(workspace.path().to_path_buf()), true).await;
-    std::env::remove_var("RAVEN_NAMES_DB");
     let lib = &outcome.library;
 
     // Tier 2 wins for the shared package.

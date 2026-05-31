@@ -13,7 +13,7 @@ use crate::package_library::PackageInfo;
 /// export X"). `is_meta_package` / `attached_packages` are a pure function of
 /// the package name (see `meta_package_fields`), so they are re-derived on read
 /// via `PackageInfo::with_details` rather than stored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PackageRecord {
     pub name: String,
     /// Package version (`DESCRIPTION` `Version`); `""` when unknown. Drives the
@@ -31,12 +31,46 @@ pub struct PackageRecord {
 
 /// Normalize a string collection to the sorted, de-duplicated form every
 /// `PackageRecord` vector is documented to hold. The single enforcer of that
-/// invariant — used by `from_info` and the r-universe ingester alike.
+/// invariant — used by `from_info`, the r-universe ingester, and the
+/// `Deserialize` impl below alike.
 pub(crate) fn sorted_unique<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
     let mut v: Vec<String> = items.into_iter().collect();
     v.sort_unstable();
     v.dedup();
     v
+}
+
+/// Custom `Deserialize` so the sorted/de-duplicated invariant on `exports`,
+/// `depends`, and `lazy_data` holds for EVERY decoded record — a hand-edited
+/// Tier 2 JSON file or a Tier 3 (postcard) payload — not just records built via
+/// [`PackageRecord::from_info`]. Public fields + a *derived* `Deserialize` would
+/// otherwise let unsorted/duplicate vectors flow into runtime state and back out
+/// through `into_info`, silently breaking the documented invariant.
+impl<'de> Deserialize<'de> for PackageRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Shadow struct mirrors the on-disk field order exactly: postcard (Tier
+        // 3) is positional and non-self-describing, so the field order and
+        // presence here must match the derived `Serialize`. Normalize afterward.
+        #[derive(Deserialize)]
+        struct Raw {
+            name: String,
+            version: String,
+            exports: Vec<String>,
+            depends: Vec<String>,
+            lazy_data: Vec<String>,
+        }
+        let r = Raw::deserialize(deserializer)?;
+        Ok(PackageRecord {
+            name: r.name,
+            version: r.version,
+            exports: sorted_unique(r.exports),
+            depends: sorted_unique(r.depends),
+            lazy_data: sorted_unique(r.lazy_data),
+        })
+    }
 }
 
 impl PackageRecord {
@@ -92,6 +126,19 @@ mod tests {
         assert_eq!(back.exports, HashSet::from(["mutate".to_string(), "filter".to_string()]));
         assert_eq!(back.depends, vec!["R".to_string()]);
         assert_eq!(back.lazy_data, vec!["starwars".to_string()]);
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_duplicate_vectors() {
+        // A hand-edited Tier 2 record with unsorted + duplicate entries must
+        // come back sorted/de-duplicated, so the invariant holds even for
+        // records that never went through `from_info`.
+        let json = r#"{"name":"x","version":"1.0",
+            "exports":["b","a","b"],"depends":["z","a"],"lazy_data":["d","d","c"]}"#;
+        let rec: PackageRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.exports, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(rec.depends, vec!["a".to_string(), "z".to_string()]);
+        assert_eq!(rec.lazy_data, vec!["c".to_string(), "d".to_string()]);
     }
 
     #[test]

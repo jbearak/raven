@@ -85,8 +85,7 @@ jobs:
         run: |
           mkdir -p dist
           gh release download names-db --repo "$GITHUB_REPOSITORY" \
-            --pattern 'names.db' --pattern 'base-exports.json' --dir dist || \
-            echo "no names-db release yet; Tier 3/base-exports unavailable in this build"
+            --pattern 'names.db' --pattern 'base-exports.json' --dir dist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
