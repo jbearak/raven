@@ -5,46 +5,11 @@
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
-mod backend;
-mod builtins;
-mod chunks;
-mod cli;
-mod completion_context;
-mod config_file;
-mod content_provider;
-mod cross_file;
-mod document_store;
-mod extract_op;
-mod file_path_intellisense;
-mod file_type;
-mod handlers;
-mod help;
-mod indentation;
-mod jags_builtins;
-mod libpath_watcher;
-mod linting;
-mod namespace_parser;
-mod package_db;
-mod package_library;
-mod package_namespace;
-mod package_state;
-mod parameter_resolver;
-mod parser_pool;
-mod perf;
-mod qualified_resolve;
-mod r_env;
-mod r_subprocess;
-mod reserved_words;
-mod roxygen;
-mod stan_builtins;
-mod state;
-mod utf16;
-mod workspace_index;
-
-#[cfg(any(test, feature = "test-support"))]
-#[allow(dead_code)]
-mod test_utils;
-
+// The library crate (`src/lib.rs`) owns the entire module tree. This binary is
+// a thin shim over it: it parses argv and dispatches into `raven::cli` /
+// `raven::backend`, linking the already-compiled library rather than
+// recompiling every module a second time as a separate bin-crate module tree.
+use raven::{backend, cli};
 use std::env;
 
 fn print_usage() {
