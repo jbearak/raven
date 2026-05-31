@@ -171,12 +171,12 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     records.sort_by(|a, b| a.name.cmp(&b.name));
 
     let out = absolute_path(&root, &args.output);
-    if out.exists() {
-        if let Ok(existing) = read_repo_db_file(&out) {
-            if existing.packages == records {
-                eprintln!("no changes; left {} untouched", out.display());
-                return Ok(());
-            }
+    // `read_repo_db_file` maps a missing file to `Err(Absent)`, so no `exists()`
+    // pre-check is needed — an absent/unreadable file simply isn't a no-op match.
+    if let Ok(existing) = read_repo_db_file(&out) {
+        if existing.packages == records {
+            eprintln!("no changes; left {} untouched", out.display());
+            return Ok(());
         }
     }
 
