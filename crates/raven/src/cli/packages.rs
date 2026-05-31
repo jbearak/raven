@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use crate::cli::shared::absolute_path;
 use crate::package_db::binary_db::{write_shipped_db, ShippedDb, ShippedDbProvenance};
 use crate::package_db::json_db::{
     read_repo_db_file, write_repo_db_file, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
@@ -121,8 +122,7 @@ pub fn parse_freeze_args(mut argv: impl Iterator<Item = String>) -> Result<Freez
 pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = match &args.workspace {
-        Some(p) if p.is_absolute() => p.clone(),
-        Some(p) => cwd.join(p),
+        Some(p) => absolute_path(&cwd, p),
         None => cwd.clone(),
     };
     let outcome =
@@ -172,11 +172,7 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     }
     records.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let out = if args.output.is_absolute() {
-        args.output.clone()
-    } else {
-        root.join(&args.output)
-    };
+    let out = absolute_path(&root, &args.output);
     if out.exists() {
         if let Ok(existing) = read_repo_db_file(&out) {
             if existing.packages == records {
@@ -302,7 +298,8 @@ fn read_description_depends_imports(path: &std::path::Path) -> Vec<String> {
     out.extend(crate::namespace_parser::parse_description_field_pub(
         &text, "Imports",
     ));
-    out.remove("R");
+    // `parse_description_field_pub` already drops the "R" version requirement,
+    // so `out` never contains it.
     out.into_iter()
         .filter(|p| is_valid_package_name(p))
         .collect()
