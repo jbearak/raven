@@ -35,7 +35,7 @@ A repo-specific snapshot, generated on a machine that has R and the project's pa
 raven packages freeze
 ```
 
-See [`raven packages freeze`](cli.md#raven-packages-freeze) for all options. Generation resolves each package from a **renv-first** library order (the renv project library first, system libraries only for what renv doesn't cover), so "renv wins, system fills the gaps" happens automatically.
+In VS Code, the same generation runs from the command palette as **Raven: Generate Package Database for CI** — one implementation, two entry points. See [`raven packages freeze`](cli.md#raven-packages-freeze) for all options. Generation resolves each package from a **renv-first** library order (the renv project library first, system libraries only for what renv doesn't cover), so "renv wins, system fills the gaps" happens automatically.
 
 The default `--used` scope is **maximally inclusive** — over-inclusion is free, because the capture simply skips anything not actually installed. The "used" set is:
 
