@@ -55,9 +55,32 @@ If the symbol is defined later in the same file at top level, the message also r
 
 ### Package Diagnostics
 
+> **Status: planned — tracking [the CI package-exports DB work]. Not yet available in a released build.**
+
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
-| Missing package | warning | `library()` references a package not installed on the system |
+| Missing package | warning | `library()` / `require()` / `loadNamespace()` / `requireNamespace()` references a package not installed in the local library paths |
+
+This diagnostic determines the **install-status (Tier 1)** of a package on the system. It is strictly independent of the export name databases (Tier 2/3):
+- **Names ≠ Install Status:** Even if a package's exports are fully resolvable via a committed `.raven/packages.json` (Tier 2) or the bundled `names.db` (Tier 3), it does **not** count as installed. If the package is absent from local library paths, the missing-package diagnostic will still trigger when evaluated.
+- **Purpose of separation:** This guarantees that you are never misled into thinking a package is installed locally when it isn't. The database exists to suppress undefined-variable noise for symbols from packages you haven't installed, not to falsify the package's install state.
+
+#### Per-Mode Behavior (CI Gating Default)
+
+Because CI environments often deliberately skip package installations, the missing-package diagnostic has different default behavior in the Editor vs the CLI:
+
+| Mode | Behavior | Re-enable / Configure |
+|---|---|---|
+| **Editor (LSP)** | Enabled by default when R is found or library paths are known. | `raven.diagnostics.missingPackageSeverity` (default: `"warning"`) |
+| **CLI (`raven check`)** | **Disabled/Suppressed by default** (forces severity to `None` / `off`). | Pass `--report-uninstalled` to re-enable warnings. |
+
+#### The Accepted Typo Gap in CI
+
+Due to this separation, an accepted gap exists in CI when using `raven check`'s default settings:
+- If you call `library(dplyr)` but the package is not installed, no diagnostic is shown (suppressed by default).
+- If you then call `filter()`, the symbol is successfully resolved from Tier 3 metadata, so no undefined-variable diagnostic is shown.
+- However, if you make a typo like `library(dpylr)`, the missing-package diagnostic is still suppressed by default. Since no metadata exists for `dpylr`, symbols like `filter()` are not resolved from it. But if `dplyr` was also attached or in scope, you might get no errors, or you might get undefined-variable diagnostics for functions from `dpylr` that don't exist in base R.
+- **The Solution:** To catch typos and missing packages in pipelines that *do* install packages (e.g. after `renv::restore()`), always run `raven check --report-uninstalled` to fail the build if any declared package is missing from the local R library paths.
 
 ### Cross-File Diagnostics
 
