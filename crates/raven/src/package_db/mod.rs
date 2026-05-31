@@ -18,6 +18,7 @@
 pub mod base_exports;
 pub mod binary_db;
 pub mod json_db;
+pub mod merge;
 pub mod model;
 pub mod renv_lock;
 pub mod runiverse;

@@ -145,6 +145,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some("packages") => {
+            env_logger::init();
+            let rest = args.into_iter().skip(1);
+            match cli::packages::run(rest).await {
+                Ok(()) => return Ok(()),
+                Err(msg) if msg == "HELP" => {
+                    cli::packages::print_help();
+                    return Ok(());
+                }
+                Err(msg) => {
+                    return Err(anyhow::anyhow!("raven packages: {}", msg));
+                }
+            }
+        }
         _ => {}
     }
 
