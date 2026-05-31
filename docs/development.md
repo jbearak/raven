@@ -276,8 +276,6 @@ See `crates/raven/src/package_library.rs` and `crates/raven/src/r_subprocess.rs`
 
 ## Package-export databases (CI / R-free resolution)
 
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
-
 This subsystem lets Raven resolve package **export names** without an installed
 package or a running R — the case that makes `raven check` usable in CI. It is an
 **ordered fallback over three tiers**: Tier 1 (installed, authoritative — the

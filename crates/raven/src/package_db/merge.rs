@@ -15,6 +15,10 @@ use crate::package_db::model::PackageRecord;
 /// beats an unknown one. (Unlike SemVer, R has no pre-release ordering.)
 pub fn version_cmp(a: &str, b: &str) -> Ordering {
     fn parts(v: &str) -> Vec<i64> {
+        // Clippy suggests the `['.', '-']` array pattern, but `Pattern for
+        // [char; N]` is stable only since Rust 1.80 and this crate's MSRV is
+        // 1.75 — so the closure form is required.
+        #[allow(clippy::manual_pattern_char_comparison)]
         v.split(|c| c == '.' || c == '-')
             .filter(|s| !s.is_empty())
             .map(|s| s.parse::<i64>().unwrap_or(-1)) // non-numeric component sorts low

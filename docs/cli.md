@@ -52,8 +52,6 @@ Before reporting, `raven check` warms the export cache for the packages each rep
 
 ### Missing-package reporting in CI
 
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
-
 `raven check` resolves package **export names** through an ordered three-tier fallback — installed packages, then a committed `.raven/packages.json`, then Raven's bundled `names.db` — so symbols from attached packages resolve even when no R is installed. This stops the undefined-variable storm that otherwise makes Raven unusable in CI. See [Package database](package-database.md).
 
 Knowing a package's exports is **separate** from knowing whether it is installed. The **missing-package** diagnostic answers a different question — *"will `library(X)` succeed at runtime?"*, i.e. is `X` installed? — so it stays **Tier-1-only**: it is driven solely by what is present in the local library paths, never by the export database. Because CI deliberately omits package installation, `raven check` **suppresses missing-package warnings by default**.
@@ -135,8 +133,6 @@ raven lint [OPTIONS] [PATHS...]
 Only plain R files (`.R` / `.r`) are linted. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped with a one-line note on stderr — chunk extraction isn't supported on the command line — and other file types are ignored silently. Passing a directory walks it recursively for R files.
 
 ## `raven packages`
-
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
 
 A command group for the export databases Raven uses to resolve package symbols without installing packages. See [Package database](package-database.md) for the full three-tier model; the two subcommands below build the user-generated (Tier 2) and Raven-bundled (Tier 3) databases respectively.
 
