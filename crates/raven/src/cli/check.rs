@@ -461,7 +461,7 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
     // (no providers), so it stays not-ready, matching the prior behavior.
     use crate::package_library::PackageLibraryStatus::*;
     let has_providers = !outcome.library.has_no_providers();
-    let status = outcome.status.clone();
+    let status = outcome.status;
     state.package_library = outcome.library;
     state.package_library_ready = matches!(status, Ready) || has_providers;
     match status {

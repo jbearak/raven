@@ -48,27 +48,27 @@ pub trait PackageMetadataProvider: Send + Sync {
 /// if neither yields a path (existence is checked by the caller via the
 /// provider's `from_file`, which logs and returns `None` if the file is absent).
 pub fn locate_shipped_db() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RAVEN_NAMES_DB") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    Some(dir.join("names.db"))
+    locate_sidecar("RAVEN_NAMES_DB", "names.db")
 }
 
 /// Resolve the bundled `base-exports.json` path: the `RAVEN_BASE_EXPORTS` env
 /// var if set, else `base-exports.json` next to the current executable.
 pub fn locate_base_exports() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RAVEN_BASE_EXPORTS") {
+    locate_sidecar("RAVEN_BASE_EXPORTS", "base-exports.json")
+}
+
+/// Resolve a bundled sidecar file: the non-empty `env_var` override if set, else
+/// `file_name` next to the current executable. Shared by `locate_shipped_db` and
+/// `locate_base_exports` so the resolution rule lives in one place.
+fn locate_sidecar(env_var: &str, file_name: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(env_var) {
         if !p.is_empty() {
             return Some(PathBuf::from(p));
         }
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    Some(dir.join("base-exports.json"))
+    Some(dir.join(file_name))
 }
 
 /// Write the base/recommended subset of `records` to a base-exports file at

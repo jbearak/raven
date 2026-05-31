@@ -252,7 +252,7 @@ fn collect_referenced_packages(
             "namespace_operator" => {
                 if let Some(id) = node.child(0) {
                     let name = text[id.byte_range()].trim_matches(|c| c == '"' || c == '\'');
-                    if is_valid_pkg_name(name) {
+                    if is_valid_package_name(name) {
                         out.insert(name.to_string());
                     }
                 }
@@ -273,7 +273,7 @@ fn collect_referenced_packages(
                                 if let Some(value) = arg.child_by_field_name("value") {
                                     let name = text[value.byte_range()]
                                         .trim_matches(|c| c == '"' || c == '\'');
-                                    if is_valid_pkg_name(name) {
+                                    if is_valid_package_name(name) {
                                         out.insert(name.to_string());
                                     }
                                     break; // only the first arg names the package
@@ -305,12 +305,9 @@ fn read_description_depends_imports(path: &std::path::Path) -> Vec<String> {
         &text, "Imports",
     ));
     out.remove("R");
-    out.into_iter().filter(|p| is_valid_pkg_name(p)).collect()
-}
-
-#[inline]
-fn is_valid_pkg_name(s: &str) -> bool {
-    is_valid_package_name(s)
+    out.into_iter()
+        .filter(|p| is_valid_package_name(p))
+        .collect()
 }
 
 pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String> {
