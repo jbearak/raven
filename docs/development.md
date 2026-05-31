@@ -274,6 +274,194 @@ All R subprocess calls must:
 
 See `crates/raven/src/package_library.rs` and `crates/raven/src/r_subprocess.rs`.
 
+## Package-export databases (CI / R-free resolution)
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+This subsystem lets Raven resolve package **export names** without an installed
+package or a running R — the case that makes `raven check` usable in CI. It is an
+**ordered fallback over three tiers**: Tier 1 (installed, authoritative — the
+existing path above) → Tier 2 (a committed, repo-specific `.raven/packages.json`)
+→ Tier 3 (a Raven-bundled `names.db`). The user-facing contract lives in
+[`docs/package-database.md`](package-database.md); this section is the internals.
+
+**Critical invariant — names ≠ install status.** The databases feed *export
+resolution* only (they suppress the undefined-variable storm when R is absent).
+They **never** make a package count as installed. The missing-package diagnostic
+is Tier-1-only and is suppressed by default in `raven check` (re-enabled with
+`--report-uninstalled`). `package_exists()` is never wired to consult providers.
+See `docs/diagnostics.md` and `crates/raven/src/handlers.rs`.
+
+### The `package_db` module
+
+A new top-level module (`crates/raven/src/package_db/`) — declared in **both**
+`lib.rs` and `main.rs` per the module-declaration invariant — owns all
+encoding/decoding. `package_library.rs` is not moved or rewritten; it only gains
+the seam.
+
+- **One serializable record:** `model::PackageRecord` is the on-disk projection
+  of `PackageInfo` — `{ name, version, exports, depends, lazy_data }`, with all
+  vectors kept **sorted and de-duplicated** so the Tier 2 JSON is deterministic
+  and diff-friendly. `version` (the `DESCRIPTION` `Version`, `""` when unknown)
+  rides in both encodings and drives the Tier 3 monotonic merge (see below);
+  `PackageInfo` itself carries no version, so `from_info` defaults it to `""` and
+  `into_info` drops it — the field is populated only by the capture paths
+  (reference-R seed, `freeze`, r-universe ingest). `is_meta_package` /
+  `attached_packages` are a pure function of the package name, so they are
+  **re-derived on read** (via `PackageInfo::with_details`), never stored.
+- **Two encodings, one reader each:**
+  - **Tier 2 — `json_db.rs`** (`RepoDb`): deterministic, sorted, pretty JSON,
+    committed as `.raven/packages.json`. Carries minimal provenance (Raven
+    version, R version, generation epoch) and a `schema_version`
+    (`REPO_DB_SCHEMA_VERSION`).
+  - **Tier 3 — `binary_db.rs`** (`ShippedDb`): a compact, memory-mapped,
+    lazily-decoded container. Layout: `MAGIC(8) | version(u32) | header_len(u32)
+    | header(postcard) | payload`. The header (provenance + a `blake3` hex of the
+    payload region + an index of `{name, offset, len}`) is decoded **once at
+    open**; per-package `PackageRecord`s in the mmap'd payload are postcard-decoded
+    **lazily** on lookup. Versioned by `FORMAT_VERSION`. Dependencies: `memmap2`,
+    `postcard` (added in Milestone 1); `blake3` was already a dep.
+- **Typed reader errors, explained not dropped (decision #9):** each reader
+  returns `Absent` (normal, silent) vs `UnsupportedSchema { found, supported }` /
+  `UnsupportedFormat` vs `Corrupt`. A present-but-unusable file (e.g. a
+  `.raven/packages.json` written by a newer Raven) is **explained and the surface
+  continues**: `raven check` prints a specific stderr note, the language server
+  raises `window/showMessage`, then resolution degrades to the next tier. A
+  missing or unreadable database never hard-fails the LSP or the build.
+
+### The `PackageMetadataProvider` seam
+
+Tier 1 stays a bespoke first step inside `get_package` — its subprocess/INDEX
+logic is intertwined with `lib_paths` and the caches, and wrapping it would risk
+regressing the authoritative path. The new tiers are pure pre-built reads, so the
+seam is a small **synchronous** trait:
+
+```rust
+pub trait PackageMetadataProvider: Send + Sync {
+    fn lookup(&self, name: &str) -> Option<PackageInfo>;
+}
+```
+
+`PackageLibrary` gains an ordered `providers: Vec<Box<dyn PackageMetadataProvider>>`
+(Tier 2 repo DB at index 0, Tier 3 shipped DB next), empty by default. The **one**
+hook is in `get_package`: when `find_package_directory` misses (Tier 1 has no
+directory), it consults the providers in order; the first hit is cached like any
+other `PackageInfo`. A package no provider knows is left **uncached**, so
+`package_exists()` still reports it missing.
+
+`prefetch_packages` is **unchanged** (decision #12): its Step 3 already funnels
+every loaded package — and transitive `Depends` and meta-package
+`attached_packages` — through `get_all_exports → collect_exports_recursive →
+get_package`, which carries the hook. So `library(tidyverse)` and `Depends`
+chains resolve in CI for free.
+
+**Construction split (decision #6):** `freeze` (and the Tier 3 reference-R seed)
+must capture a *provider-less* library so a "frozen Tier 1" file can't be
+contaminated by Tier 2/3 guesses. Construction is split into
+`build_library_inner` (no providers) feeding both
+`build_package_library_tier1_only` (capture) and `build_package_library`
+(runtime: inner + provider wiring). Existing 4-arg callers of
+`build_package_library` are unchanged.
+
+### Performance discipline (§12)
+
+The LSP hot path (diagnostic collection) reads the in-memory cache `try_read`-only
+and must not take a disk/page-fault stall. So:
+
+- the Tier 3 index is **preloaded at open**; per-package payloads decode lazily
+  from the mmap on first lookup;
+- optionally, a one-shot `madvise(MADV_WILLNEED)` over the header/index region
+  (~500 KB) right after `mmap` faults the offset table in before the first
+  lookup — one syscall, eliminating even the first index page fault. A cheap
+  nicety, not required for correctness, and a no-op on platforms without
+  `madvise`;
+- the `blake3` payload checksum is verified **at open, in `spawn_blocking`**
+  (decision #13) — ~10–20 ms once during library init, off the async runtime —
+  catching truncation/corruption/tampering;
+- provider results feed the existing per-package cache, so steady-state lookups
+  are lock-free reads with no provider call.
+
+### Tier 3 build pipeline
+
+The shipped `names.db` is built **append-only** from an authoritative reference-R
+capture of the build machine's **entire installed library**
+(`enumerate_installed_packages` across all lib paths, via the Tier 1 path:
+`NAMESPACE` + subprocess `exportPattern` expansion + `data/` datasets) **∪** CRAN
++ Bioc r-universe (`cran.r-universe.dev` and `bioc.r-universe.dev` per-package
+`_exports`/`_dependencies`/`_datasets`). Each rebuild **seeds from the previous
+database by default** (append-only; `--fresh` rebuilds from scratch) and **never
+drops** a package. **The merge is version-driven and monotonic (decision #16):**
+for each package it keeps the record with the **highest version across all three
+sources** (prior DB, reference-R, r-universe), so a package is never moved to an
+older export set — a newer CRAN/Bioc release beats an older reference-R install, a
+newer local/dev build beats an older CRAN release, and a still-newer prior capture
+is retained. Equal versions tiebreak reference-R → r-universe → prior. The
+comparison reads a `version` field on `PackageRecord` (captured from `DESCRIPTION`
+`Version` by the reference-R seed and `freeze`, or the r-universe JSON `Version`);
+the field rides in both encodings, so Tier 2 `.raven/packages.json` shows version
+changes in `git diff` too. The full
+installed library is the point — hard-to-install / GitHub-only / internal
+packages enter the floor only this way, and append-only keeps them. The
+maintainer **bootstraps** the floor once from a richly-provisioned machine; teams
+can build a private `names.db` from their own library for richer in-house
+coverage.
+
+- **Entry point:** `raven packages build-shipped-db` (maintainer/CI-only — the
+  shipped binary itself is **network-free**; the workflow uses `curl` to fetch
+  r-universe JSON into a directory that the command then transforms). Code:
+  `cli/packages.rs`, `package_db/{merge,runiverse}.rs`.
+- **Companion base-exports file (decision #7):** base/recommended records (also
+  from the reference R) ship in a separate file, loaded in `initialize()` to
+  populate `base_exports` when the base packages aren't on disk (CI). Base
+  **datasets** (`mtcars`/`iris`) are merged exactly as the disk path does, so base
+  datasets resolve in CI in v1, independent of #350. A real R install still wins.
+- **Delivery (decision #14):** `names.db` + the base-exports file + checksums live
+  on a **GitHub Release** (moving `names-db` tag) — durable across runs, unlike a
+  per-run CI artifact. A `workflow_dispatch` + on-release job
+  (`.github/workflows/build-names-db.yml`; the scheduled refresh interval is **not
+  yet committed**) downloads the current asset (the seed),
+  rebuilds, and re-uploads. `release-build.yml` / `bundle-binary.js` download the
+  same asset to place `names.db` exe-relative next to the binary and into the
+  VSIX. Located via `locate_shipped_db()` — `RAVEN_NAMES_DB` override, else
+  exe-relative. **Not** `include_bytes!` (avoids binary bloat), **not** committed
+  to git (except tiny back-compat fixtures).
+- **Replacing the file (Windows mmap lock):** while `names.db` is mapped, Windows
+  holds the file open (`CreateFileMapping` keeps a handle), so it cannot be
+  overwritten in place. Writers (the bundle step, and any future in-process
+  refresh) must use **atomic rename** — write `names.db.tmp`, then rename over the
+  old file. On POSIX the rename succeeds even with the old inode still mapped
+  (readers keep the old mapping until they re-open); on Windows an in-process
+  refresh must **unmap → replace → remap**, tolerating a brief window with no
+  mapping. This is a solved pattern (SQLite, clangd) but is called out so the
+  implementation doesn't assume in-place overwrite works everywhere.
+- **Growth bound:** append-only means the file grows monotonically, but slowly —
+  at CRAN's ~2k-packages/year rate, ~1.7 MB/year, so a ~20–25 MB database stays
+  under ~40 MB a decade out. Names-only storage keeps the bound comfortable; no
+  pruning is planned.
+
+### Dependency on #350 (package-dataset resolution)
+
+`PackageRecord` captures `lazy_data`. [raven#350](https://github.com/jbearak/raven/issues/350)
+(landed) wired dataset resolution into `collect_exports_recursive`, so a Tier 2/3
+record's `lazy_data` is folded into the resolvable set automatically — *non-base*
+package datasets resolve in CI with no extra work in this subsystem. (Base
+datasets come via the base-exports file, above.)
+
+### Testing approach
+
+- **Runtime tempdir fixtures** for round-trip tests (write → open → lookup) of
+  both encodings, plus bad-magic / version-skew / payload-tamper rejection.
+- **Committed back-compat fixtures** (decision #15): tiny `names.db` +
+  `.raven/packages.json` under `crates/raven/tests/fixtures/package_db/` guard
+  format back-compat ("old fixtures still load").
+- **No-R consumer integration test** (`tests/package_db_consumer.rs`): empty
+  libpaths, `library(dplyr); mutate(...)` yields no undefined-variable;
+  `library(dpylr)` behaves per the names-vs-install-status split.
+- **Build-side differential** (deferred to the `build-names-db` job, where R + a
+  sample corpus are available): diff `names.db` against `getNamespaceExports()`.
+- **Generation round-trip** (on a machine with R): generate `.raven/packages.json`,
+  read it back, assert parity with the live Tier 1 result.
+
 ## Other subsystems
 
 Brief orientation for modules outside the cross-file and package-library subsystems.
