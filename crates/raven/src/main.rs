@@ -24,6 +24,7 @@ mod jags_builtins;
 mod libpath_watcher;
 mod linting;
 mod namespace_parser;
+mod package_db;
 mod package_library;
 mod package_namespace;
 mod package_state;
@@ -141,6 +142,20 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(msg) => {
                     return Err(anyhow::anyhow!("raven check: {}", msg));
+                }
+            }
+        }
+        Some("packages") => {
+            env_logger::init();
+            let rest = args.into_iter().skip(1);
+            match cli::packages::run(rest).await {
+                Ok(()) => return Ok(()),
+                Err(msg) if msg == "HELP" => {
+                    cli::packages::print_help();
+                    return Ok(());
+                }
+                Err(msg) => {
+                    return Err(anyhow::anyhow!("raven packages: {}", msg));
                 }
             }
         }

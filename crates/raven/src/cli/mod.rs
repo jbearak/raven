@@ -7,4 +7,5 @@
 pub mod analysis_stats;
 pub mod check;
 pub mod lint;
+pub mod packages;
 pub mod shared;

@@ -487,6 +487,65 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         })
     );
 
+    // Generate a CI package-exports database by running the bundled binary's
+    // `packages freeze` against the first workspace folder. Registered manually
+    // (not via executeCommandProvider.commands, which must stay vec![] — see
+    // CLAUDE.md) so vscode-languageclient doesn't double-register it.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.packages.freeze', async () => {
+            const folder = vscode.workspace.workspaceFolders?.[0];
+            if (!folder) {
+                vscode.window.showErrorMessage(
+                    'Raven: open a workspace folder to generate its package database.',
+                );
+                return;
+            }
+            const freezeServerPath = getServerPath(context);
+            const binaryCheck = validateServerBinary(freezeServerPath);
+            if (!binaryCheck.ok) {
+                vscode.window.showErrorMessage(
+                    `Raven: cannot generate package database — server binary is unusable (${binaryCheck.reason}).`,
+                );
+                return;
+            }
+            const cp = await import('node:child_process');
+            await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: 'Raven: generating package database…',
+                },
+                () =>
+                    new Promise<void>((resolve) => {
+                        const proc = cp.spawn(
+                            freezeServerPath,
+                            ['packages', 'freeze', '--workspace', folder.uri.fsPath],
+                            { cwd: folder.uri.fsPath },
+                        );
+                        let stderr = '';
+                        proc.stderr.on('data', (d) => (stderr += d.toString()));
+                        proc.on('error', (err) => {
+                            vscode.window.showErrorMessage(
+                                `Raven: package database generation failed: ${err.message}`,
+                            );
+                            resolve();
+                        });
+                        proc.on('close', (code) => {
+                            if (code === 0) {
+                                vscode.window.showInformationMessage(
+                                    'Raven: wrote .raven/packages.json',
+                                );
+                            } else {
+                                vscode.window.showErrorMessage(
+                                    `Raven: package database generation failed: ${stderr.trim()}`,
+                                );
+                            }
+                            resolve();
+                        });
+                    }),
+            );
+        }),
+    );
+
     // Register auto-close pair overtype fix
     context.subscriptions.push(registerAutoCloseFix());
 

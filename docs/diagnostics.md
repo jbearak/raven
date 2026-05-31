@@ -61,8 +61,6 @@ If the symbol is defined later in the same file at top level, the message also r
 
 ### Package names vs. install status
 
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
-
 Raven can resolve a package's **export names** from one of three tiers — installed packages, a committed `.raven/packages.json`, or Raven's bundled `names.db` — so symbols from `library(pkg)` resolve even when the package isn't installed (for example in CI with no R). See [Package database](package-database.md). Crucially, knowing a package's exports is kept **separate** from knowing whether it is installed:
 
 - **Export resolution** (suppresses undefined-variable noise) uses all three tiers, in every mode.

@@ -55,6 +55,11 @@
         "category": "Raven"
       },
       {
+        "command": "raven.packages.freeze",
+        "title": "Raven: Generate Package Database for CI",
+        "category": "Raven"
+      },
+      {
         "command": "raven.runLineOrSelection",
         "title": "Run Line or Selection",
         "category": "Raven"

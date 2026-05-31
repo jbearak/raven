@@ -1140,6 +1140,17 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Surface present-but-unusable package-DB load notes (e.g. a
+    /// `.raven/packages.json` from a newer Raven, or a corrupt/incompatible
+    /// `names.db`) to the editor as warnings. Single source for how these
+    /// build-time notes reach the user, called from both package-library
+    /// init paths.
+    async fn surface_load_notes(&self, notes: &[String]) {
+        for note in notes {
+            self.client.show_message(MessageType::WARNING, note).await;
+        }
+    }
+
     async fn ensure_package_library_initialized(&self) -> bool {
         let (enabled, already_ready) = {
             let state = self.state.read().await;
@@ -1195,6 +1206,8 @@ impl Backend {
         if let crate::package_library::PackageLibraryStatus::InitFailed(e) = &outcome.status {
             log::warn!("Failed to initialize PackageLibrary: {}", e);
         }
+        // Emit before `outcome.library` is moved into state below.
+        self.surface_load_notes(&outcome.load_notes).await;
         let ready = outcome.status.is_ready();
         let mut state = self.state.write().await;
         // Re-check under write lock: `initialized()` may have raced ahead
@@ -2330,6 +2343,9 @@ impl LanguageServer for Backend {
                 packages_enabled,
             )
             .await;
+
+            // Emit before `outcome` is destructured below.
+            self.surface_load_notes(&outcome.load_notes).await;
 
             use crate::package_library::PackageLibraryStatus;
             let status = outcome.status;
