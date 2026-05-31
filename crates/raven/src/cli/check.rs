@@ -242,7 +242,6 @@ pub async fn run(args: CheckArgs) -> i32 {
         // afterwards to bound memory across a large report set; the clone keeps
         // the index entry intact for other files' cross-file resolution.
         if let Some(doc) = state.workspace_index.get(&uri).cloned() {
-            reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
             state.documents.insert(uri.clone(), doc);
         } else {
             let text = match crate::state::read_source(path) {
@@ -262,9 +261,14 @@ pub async fn run(args: CheckArgs) -> i32 {
                 }
             };
             state.open_document_with_language_id(uri.clone(), &text, Some(1), Some("r"));
-            if let Some(doc) = state.documents.get(&uri) {
-                reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
-            }
+        }
+        // Both arms above leave the document in `state.documents`; collect its
+        // attached packages from the doc already in hand (free — the loop opens
+        // each target for diagnostics regardless). This intentionally also covers
+        // the disk-fallback arm, unlike the index-only up-front
+        // `prefetch_reported_packages` warm-up.
+        if let Some(doc) = state.documents.get(&uri) {
+            reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
         }
         let diags = compute_file_diagnostics(&state, &uri).await;
         state.close_document(&uri);
