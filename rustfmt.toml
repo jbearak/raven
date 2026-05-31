@@ -1,0 +1,5 @@
+# Formatting is enforced in CI (`cargo fmt --all --check`, pinned to the
+# toolchain in the Integration "Formatting" job). Keep this file to stable-only
+# options so `cargo fmt` behaves identically for every contributor; the edition
+# is stated explicitly so running `rustfmt` directly matches `cargo fmt`.
+edition = "2021"

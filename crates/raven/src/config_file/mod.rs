@@ -93,8 +93,7 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         }
     }
     state.symbol_config = crate::backend::parse_symbol_config(&merged).unwrap_or_default();
-    state.completion_config =
-        crate::backend::parse_completion_config(&merged).unwrap_or_default();
+    state.completion_config = crate::backend::parse_completion_config(&merged).unwrap_or_default();
     state.indentation_config =
         crate::backend::parse_indentation_config(&merged).unwrap_or_default();
     let lintr_discovered = state
@@ -118,7 +117,11 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     // them together here is the per-CLAUDE.md invariant: this function
     // is the only place that writes any parsed config field after a
     // settings change.
-    if let Some(root) = state.workspace_folders.first().and_then(|u| u.to_file_path().ok()) {
+    if let Some(root) = state
+        .workspace_folders
+        .first()
+        .and_then(|u| u.to_file_path().ok())
+    {
         state.lint_overrides = compile_lint_overrides(&merged, &root);
     } else {
         // No workspace root yet — clear any stale overrides so we don't

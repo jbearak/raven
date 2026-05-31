@@ -46,14 +46,32 @@ pub fn parse_build_shipped_db_args(
     let mut source = "reference-R ∪ r-universe".to_string();
     while let Some(arg) = argv.next() {
         match arg.as_str() {
-            "--reference-lib" => reference_lib = Some(PathBuf::from(argv.next().ok_or("--reference-lib needs a path")?)),
-            "--runiverse-cran" => runiverse_cran = Some(PathBuf::from(argv.next().ok_or("--runiverse-cran needs a path")?)),
-            "--runiverse-bioc" => runiverse_bioc = Some(PathBuf::from(argv.next().ok_or("--runiverse-bioc needs a path")?)),
+            "--reference-lib" => {
+                reference_lib = Some(PathBuf::from(
+                    argv.next().ok_or("--reference-lib needs a path")?,
+                ))
+            }
+            "--runiverse-cran" => {
+                runiverse_cran = Some(PathBuf::from(
+                    argv.next().ok_or("--runiverse-cran needs a path")?,
+                ))
+            }
+            "--runiverse-bioc" => {
+                runiverse_bioc = Some(PathBuf::from(
+                    argv.next().ok_or("--runiverse-bioc needs a path")?,
+                ))
+            }
             "--fresh" | "--no-seed" => fresh = true,
             "--seed" => seed = Some(PathBuf::from(argv.next().ok_or("--seed needs a path")?)),
             "--output" => output = Some(PathBuf::from(argv.next().ok_or("--output needs a path")?)),
-            "--base-exports-output" => base_exports_output = Some(PathBuf::from(argv.next().ok_or("--base-exports-output needs a path")?)),
-            "--snapshot-date" => snapshot_date = argv.next().ok_or("--snapshot-date needs a value")?,
+            "--base-exports-output" => {
+                base_exports_output = Some(PathBuf::from(
+                    argv.next().ok_or("--base-exports-output needs a path")?,
+                ))
+            }
+            "--snapshot-date" => {
+                snapshot_date = argv.next().ok_or("--snapshot-date needs a value")?
+            }
             "--source" => source = argv.next().ok_or("--source needs a value")?,
             "--help" => return Err("HELP".into()),
             s => return Err(format!("unknown flag: {s}")),
@@ -94,7 +112,9 @@ pub fn parse_freeze_args(mut argv: impl Iterator<Item = String>) -> Result<Freez
             "--installed" | "--all" => scope = FreezeScope::All,
             "--output" => output = PathBuf::from(argv.next().ok_or("--output needs a path")?),
             "--workspace" => {
-                workspace = Some(PathBuf::from(argv.next().ok_or("--workspace needs a path")?))
+                workspace = Some(PathBuf::from(
+                    argv.next().ok_or("--workspace needs a path")?,
+                ))
             }
             "--help" => return Err("HELP".into()),
             s => return Err(format!("unknown flag: {s}")),
@@ -366,14 +386,19 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
     };
 
     let mut runiverse: Vec<PackageRecord> = Vec::new();
-    for dir in [args.runiverse_cran.as_ref(), args.runiverse_bioc.as_ref()].into_iter().flatten() {
+    for dir in [args.runiverse_cran.as_ref(), args.runiverse_bioc.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         runiverse.extend(ingest_runiverse_dir(dir).map_err(|e| e.to_string())?);
     }
 
     let mut reference_r: Vec<PackageRecord> = Vec::new();
     if let Some(lib) = &args.reference_lib {
         let outcome = crate::package_library::build_package_library_tier1_only(
-            None, std::slice::from_ref(lib), None,
+            None,
+            std::slice::from_ref(lib),
+            None,
         )
         .await;
         for name in outcome.library.enumerate_installed_packages() {
@@ -395,7 +420,11 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
     if let Some(base_out) = &args.base_exports_output {
         crate::package_db::write_base_exports_file(base_out, &merged).map_err(|e| e.to_string())?;
     }
-    eprintln!("Wrote {} packages to {}", merged.len(), args.output.display());
+    eprintln!(
+        "Wrote {} packages to {}",
+        merged.len(),
+        args.output.display()
+    );
     Ok(())
 }
 
@@ -437,7 +466,15 @@ mod tests {
         let b = super::parse_freeze_args(["--all".to_string()].into_iter()).unwrap();
         assert_eq!(b.scope, super::FreezeScope::All);
 
-        let c = super::parse_freeze_args(["--installed".to_string(), "--output".to_string(), "x.json".to_string()].into_iter()).unwrap();
+        let c = super::parse_freeze_args(
+            [
+                "--installed".to_string(),
+                "--output".to_string(),
+                "x.json".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
         assert_eq!(c.scope, super::FreezeScope::All);
         assert_eq!(c.output, std::path::PathBuf::from("x.json"));
     }
@@ -476,19 +513,29 @@ mod tests {
     #[test]
     fn parse_build_shipped_db_args() {
         let args = super::parse_build_shipped_db_args(
-            ["--runiverse-cran".to_string(), "cran".to_string(),
-             "--runiverse-bioc".to_string(), "bioc".to_string(),
-             "--output".to_string(), "out.db".to_string(),
-             "--base-exports-output".to_string(), "base.json".to_string(),
-             "--fresh".to_string(),
-             "--snapshot-date".to_string(), "2026-05-30".to_string()]
-                .into_iter(),
+            [
+                "--runiverse-cran".to_string(),
+                "cran".to_string(),
+                "--runiverse-bioc".to_string(),
+                "bioc".to_string(),
+                "--output".to_string(),
+                "out.db".to_string(),
+                "--base-exports-output".to_string(),
+                "base.json".to_string(),
+                "--fresh".to_string(),
+                "--snapshot-date".to_string(),
+                "2026-05-30".to_string(),
+            ]
+            .into_iter(),
         )
         .unwrap();
         assert_eq!(args.runiverse_cran, Some(std::path::PathBuf::from("cran")));
         assert_eq!(args.runiverse_bioc, Some(std::path::PathBuf::from("bioc")));
         assert_eq!(args.output, std::path::PathBuf::from("out.db"));
-        assert_eq!(args.base_exports_output, Some(std::path::PathBuf::from("base.json")));
+        assert_eq!(
+            args.base_exports_output,
+            Some(std::path::PathBuf::from("base.json"))
+        );
         assert!(args.fresh, "--fresh skips the default prior-DB seed");
         assert_eq!(args.snapshot_date, "2026-05-30");
         assert_eq!(args.reference_lib, None);

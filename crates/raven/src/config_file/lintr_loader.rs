@@ -39,7 +39,12 @@ pub fn load_str(text: &str) -> LoadedLintr {
 
     for (key, value) in fields {
         match key.as_str() {
-            "linters" => apply_linters(&value, &mut linting, &mut warnings, &mut unrecognized_constructs),
+            "linters" => apply_linters(
+                &value,
+                &mut linting,
+                &mut warnings,
+                &mut unrecognized_constructs,
+            ),
             "exclusions" => apply_exclusions(&value, &mut overrides, &mut unrecognized_constructs),
             other => {
                 warnings.push(format!(".lintr: unknown field '{}'; ignoring", other));
@@ -64,7 +69,10 @@ pub fn load_str(text: &str) -> LoadedLintr {
         // in" working without overriding an explicit client `false`.
         settings.insert("linting".into(), Value::Object(linting));
     }
-    LoadedLintr { settings: Value::Object(settings), warnings }
+    LoadedLintr {
+        settings: Value::Object(settings),
+        warnings,
+    }
 }
 
 /// DCF-style line folding: a field starts with `Name:` at column zero; any
@@ -220,7 +228,11 @@ fn apply_linter_call(
     }
 }
 
-fn disable_rule(name: &str, linting: &mut serde_json::Map<String, Value>, warnings: &mut Vec<String>) {
+fn disable_rule(
+    name: &str,
+    linting: &mut serde_json::Map<String, Value>,
+    warnings: &mut Vec<String>,
+) {
     let severity_key = match name {
         "line_length_linter" => "lineLengthSeverity",
         "trailing_whitespace_linter" => "trailingWhitespaceSeverity",
@@ -354,9 +366,7 @@ fn parse_named_string_vec(args: &str, name: &str) -> Option<Vec<String>> {
         if let Some((lhs, rhs)) = part.split_once('=') {
             if lhs.trim() == name {
                 let rhs = rhs.trim();
-                let inner = rhs
-                    .strip_prefix("c(")
-                    .and_then(|r| r.strip_suffix(')'))?;
+                let inner = rhs.strip_prefix("c(").and_then(|r| r.strip_suffix(')'))?;
                 return Some(
                     split_top_level_commas(inner)
                         .into_iter()
@@ -383,7 +393,10 @@ mod tests {
     #[test]
     fn null_disables_rule() {
         let out = load_str("linters: linters_with_defaults(commented_code_linter = NULL)\n");
-        assert_eq!(out.settings["linting"]["commentedCodeSeverity"], json!("off"));
+        assert_eq!(
+            out.settings["linting"]["commentedCodeSeverity"],
+            json!("off")
+        );
     }
 
     #[test]
@@ -415,6 +428,9 @@ mod tests {
     #[test]
     fn out_of_grammar_yields_batch_warning() {
         let out = load_str("linters: linters_with_defaults(linters_with_tags(\"default\"))\n");
-        assert!(out.warnings.iter().any(|w| w.contains("unrecognized construct")));
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w.contains("unrecognized construct")));
     }
 }

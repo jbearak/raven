@@ -605,7 +605,12 @@ pub async fn parse_data_symbols(pkg_dir: &Path) -> Vec<String> {
                     continue;
                 }
 
-                let Some(stem) = data_file_stem(file_name, SERIALIZED_OR_SCRIPT_EXTS, TABULAR_EXTS, COMPRESSION_EXTENSIONS) else {
+                let Some(stem) = data_file_stem(
+                    file_name,
+                    SERIALIZED_OR_SCRIPT_EXTS,
+                    TABULAR_EXTS,
+                    COMPRESSION_EXTENSIONS,
+                ) else {
                     continue;
                 };
 
@@ -2069,9 +2074,8 @@ valid2                  Another valid one"#;
         let serialized = &["rda", "rdata", "r"][..];
         let tabular = &["csv", "tab", "txt"][..];
         let compression = &["gz", "bz2", "xz"][..];
-        let stem = |name: &str| {
-            data_file_stem(name, serialized, tabular, compression).map(str::to_owned)
-        };
+        let stem =
+            |name: &str| data_file_stem(name, serialized, tabular, compression).map(str::to_owned);
 
         // Bare names (no dot) are not data files.
         assert_eq!(stem("README"), None);

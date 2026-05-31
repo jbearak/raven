@@ -165,8 +165,7 @@ fn compute_test_attached_packages(description: Option<&DescriptionInput>) -> BTr
 /// `R` entry is handled by `parse_description_field_pub`.
 fn description_declares_dependency(description_text: &str, pkg: &str) -> bool {
     for field in ["Suggests", "Imports", "Depends"] {
-        let listed =
-            crate::namespace_parser::parse_description_field_pub(description_text, field);
+        let listed = crate::namespace_parser::parse_description_field_pub(description_text, field);
         if listed.iter().any(|p| p == pkg) {
             return true;
         }
@@ -947,10 +946,7 @@ foo <- function() 1
         );
         // Neither leaks into r_internal_symbols (R/ files remain isolated
         // from tests/testthat/ contributions).
-        assert!(!s
-            .scope_contribution
-            .r_internal_symbols
-            .contains("fixture"));
+        assert!(!s.scope_contribution.r_internal_symbols.contains("fixture"));
         assert!(!s
             .scope_contribution
             .r_internal_symbols

@@ -83,7 +83,9 @@ mod rules;
 use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 
-pub use self::config::{AssignmentOperatorStyle, LintConfig, LintEnabled, ObjectNameStyle, StringDelimiter};
+pub use self::config::{
+    AssignmentOperatorStyle, LintConfig, LintEnabled, ObjectNameStyle, StringDelimiter,
+};
 
 /// Source identifier set on every diagnostic produced by this module.
 ///
@@ -498,8 +500,15 @@ mod tests {
     #[test]
     fn object_name_accepts_snake_case() {
         let config = object_name_only_config();
-        let diags = lint("my_var <- 1\nmy_func <- function(x_arg, y_arg) x_arg + y_arg\n", &config);
-        assert!(diags.is_empty(), "snake_case names should pass: {:?}", diags);
+        let diags = lint(
+            "my_var <- 1\nmy_func <- function(x_arg, y_arg) x_arg + y_arg\n",
+            &config,
+        );
+        assert!(
+            diags.is_empty(),
+            "snake_case names should pass: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -532,7 +541,11 @@ mod tests {
             .iter()
             .filter(|d| d.message.contains("Function name"))
             .collect();
-        assert!(fn_diags.is_empty(), "S3 method should be exempt: {:?}", diags);
+        assert!(
+            fn_diags.is_empty(),
+            "S3 method should be exempt: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -557,7 +570,11 @@ mod tests {
             ".hidden_var <- 1\n.another_var <- 2\n.helper <- function(x_arg) x_arg\n",
             &config,
         );
-        assert!(diags.is_empty(), "leading-dot names should be allowed: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "leading-dot names should be allowed: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -586,14 +603,22 @@ mod tests {
         // `obj$badName <- 1` doesn't introduce a new symbol — just updates a
         // field. Should not flag.
         let diags = lint("obj$badName <- 1\n", &config);
-        assert!(diags.is_empty(), "compound LHS should be skipped: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "compound LHS should be skipped: {:?}",
+            diags
+        );
     }
 
     #[test]
     fn object_name_skips_backtick_quoted_names() {
         let config = object_name_only_config();
         let diags = lint("`with spaces` <- 1\n", &config);
-        assert!(diags.is_empty(), "backtick names should be skipped: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "backtick names should be skipped: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -651,9 +676,21 @@ mod tests {
             &config,
         );
         let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
-        assert!(!lines.contains(&0), "@lsp-ignore should suppress line 0: {:?}", diags);
-        assert!(!lines.contains(&2), "@lsp-ignore-next should suppress line 2: {:?}", diags);
-        assert!(lines.contains(&3), "unsuppressed line 3 should still flag: {:?}", diags);
+        assert!(
+            !lines.contains(&0),
+            "@lsp-ignore should suppress line 0: {:?}",
+            diags
+        );
+        assert!(
+            !lines.contains(&2),
+            "@lsp-ignore-next should suppress line 2: {:?}",
+            diags
+        );
+        assert!(
+            lines.contains(&3),
+            "unsuppressed line 3 should still flag: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -718,7 +755,12 @@ print.data.frame <- function(x, ...) NULL
     fn infix_spaces_flags_missing_spaces_around_plus() {
         let config = infix_spaces_only_config();
         let diags = lint("x <- 1+2\n", &config);
-        assert_eq!(diags.len(), 2, "expected 2 diagnostics (before+after), got {:?}", diags);
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected 2 diagnostics (before+after), got {:?}",
+            diags
+        );
         for d in &diags {
             assert!(d.message.contains("space"), "msg: {}", d.message);
             assert!(d.message.contains("`+`"), "msg: {}", d.message);
@@ -746,7 +788,11 @@ print.data.frame <- function(x, ...) NULL
         // common pattern and collapsing it would be more annoying than helpful.
         let config = infix_spaces_only_config();
         let diags = lint("x   <-   1\n", &config);
-        assert!(diags.is_empty(), "alignment spaces must not be flagged: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "alignment spaces must not be flagged: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -756,7 +802,11 @@ print.data.frame <- function(x, ...) NULL
         // only parses `pkg::fun` as `namespace_operator` when the operator is
         // tight — verify it's a no-op when written that way.
         let diags = lint("x <- pkg::fun()\n", &config);
-        assert!(diags.is_empty(), "tight `::` must not be flagged: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "tight `::` must not be flagged: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -803,7 +853,11 @@ print.data.frame <- function(x, ...) NULL
     fn infix_spaces_tight_sequence_is_ok() {
         let config = infix_spaces_only_config();
         let diags = lint("xs <- 1:10\n", &config);
-        assert!(diags.is_empty(), "tight `:` must not be flagged: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "tight `:` must not be flagged: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -822,7 +876,11 @@ print.data.frame <- function(x, ...) NULL
     fn infix_spaces_tight_unary_minus_is_ok() {
         let config = infix_spaces_only_config();
         let diags = lint("y <- -x\n", &config);
-        assert!(diags.is_empty(), "tight unary `-` must not be flagged: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "tight unary `-` must not be flagged: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -830,7 +888,11 @@ print.data.frame <- function(x, ...) NULL
         let config = infix_spaces_only_config();
         // `a - b` with binary minus and spaces — fine.
         let diags = lint("y <- a - b\n", &config);
-        assert!(diags.is_empty(), "binary `-` with spaces must pass: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "binary `-` with spaces must pass: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -840,7 +902,11 @@ print.data.frame <- function(x, ...) NULL
         // node, never a `binary_operator`. The infix-spaces rule must never
         // touch named arguments — they are an unrelated syntactic form.
         let diags = lint("f(name=value)\n", &config);
-        assert!(diags.is_empty(), "named arguments must not be flagged: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "named arguments must not be flagged: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -870,7 +936,11 @@ print.data.frame <- function(x, ...) NULL
         // Operator at end of line, RHS on the next line — the newline supplies
         // the separation, so neither side should be flagged.
         let diags = lint("x <- a +\n  b\n", &config);
-        assert!(diags.is_empty(), "line-continuation `+` must not be flagged: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "line-continuation `+` must not be flagged: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -927,10 +997,7 @@ print.data.frame <- function(x, ...) NULL
     fn infix_spaces_flags_formula_without_spaces() {
         let config = infix_spaces_only_config();
         let diags = lint("m <- lm(y~x)\n", &config);
-        let tilde_diags: Vec<_> = diags
-            .iter()
-            .filter(|d| d.message.contains("`~`"))
-            .collect();
+        let tilde_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("`~`")).collect();
         assert_eq!(tilde_diags.len(), 2, "got {:?}", diags);
     }
 
@@ -968,8 +1035,16 @@ print.data.frame <- function(x, ...) NULL
         let config = infix_spaces_only_config();
         let diags = lint("# @lsp-ignore-next\nx <- 1+2\ny <- 3+4\n", &config);
         let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
-        assert!(!lines.contains(&1), "@lsp-ignore-next must suppress line 1: {:?}", diags);
-        assert!(lines.contains(&2), "unsuppressed line 2 must still flag: {:?}", diags);
+        assert!(
+            !lines.contains(&1),
+            "@lsp-ignore-next must suppress line 1: {:?}",
+            diags
+        );
+        assert!(
+            lines.contains(&2),
+            "unsuppressed line 2 must still flag: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -977,7 +1052,11 @@ print.data.frame <- function(x, ...) NULL
         let mut config = infix_spaces_only_config();
         config.infix_spaces_severity = None;
         let diags = lint("x<-1\n", &config);
-        assert!(diags.is_empty(), "rule must be silent when severity is None: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "rule must be silent when severity is None: {:?}",
+            diags
+        );
     }
 
     fn commented_code_only_config() -> LintConfig {
@@ -1174,10 +1253,7 @@ print.data.frame <- function(x, ...) NULL
         // A `# @lsp-source` directive sandwiched between two real commented
         // code lines must NOT swallow them. The block should split into two
         // single-line sub-groups; each parses as code and is reported.
-        let diags = lint(
-            "# x <- 1\n# @lsp-source ../helpers.R\n# y <- 2\n",
-            &config,
-        );
+        let diags = lint("# x <- 1\n# @lsp-source ../helpers.R\n# y <- 2\n", &config);
         let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
         assert!(
             lines.contains(&0),
@@ -1219,10 +1295,7 @@ print.data.frame <- function(x, ...) NULL
     fn commented_code_splits_block_at_todo_line() {
         let config = commented_code_only_config();
         // Same idea with an annotation comment in the middle.
-        let diags = lint(
-            "# x <- 1\n# TODO: revisit\n# y <- 2\n",
-            &config,
-        );
+        let diags = lint("# x <- 1\n# TODO: revisit\n# y <- 2\n", &config);
         let lines: Vec<u32> = diags.iter().map(|d| d.range.start.line).collect();
         assert!(lines.contains(&0));
         assert!(lines.contains(&2));
@@ -1344,7 +1417,11 @@ print.data.frame <- function(x, ...) NULL
         let config = quotes_only_config();
         // Raw strings — both quote types are common because the body picks.
         let diags = lint("x <- r'(hi)'\n", &config);
-        assert!(diags.is_empty(), "raw strings must not be flagged: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "raw strings must not be flagged: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1404,7 +1481,11 @@ print.data.frame <- function(x, ...) NULL
         // A newline after the comma is fine — multi-line argument lists are
         // common and shouldn't be reformatted.
         let diags = lint("c(\n  1,\n  2\n)\n", &config);
-        assert!(diags.is_empty(), "newline-after-comma must pass: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "newline-after-comma must pass: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1537,10 +1618,7 @@ print.data.frame <- function(x, ...) NULL
     fn semicolon_ignores_strings_and_comments() {
         let config = semicolon_only_config();
         // `;` inside a string or comment is not a separator.
-        let diags = lint(
-            "x <- \"a;b\"\ny <- 1 # ;\n",
-            &config,
-        );
+        let diags = lint("x <- \"a;b\"\ny <- 1 # ;\n", &config);
         assert!(diags.is_empty(), "got {:?}", diags);
     }
 
@@ -1695,7 +1773,11 @@ print.data.frame <- function(x, ...) NULL
         // vector, not on the condition itself.
         let config = vector_logic_only_config();
         let diags = lint("if (any(x & y)) 1\n", &config);
-        assert!(diags.is_empty(), "call boundary must stop scan: {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "call boundary must stop scan: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1717,7 +1799,11 @@ print.data.frame <- function(x, ...) NULL
     fn mixed_logical_flags_and_inside_or() {
         let diags = lint_semantic("x <- a & b | c\n", ML_WARN, None);
         assert!(!diags.is_empty(), "expected diagnostic, got none");
-        assert!(diags[0].message.contains("parentheses"), "got: {:?}", diags[0].message);
+        assert!(
+            diags[0].message.contains("parentheses"),
+            "got: {:?}",
+            diags[0].message
+        );
     }
 
     #[test]
@@ -1731,7 +1817,11 @@ print.data.frame <- function(x, ...) NULL
     fn mixed_logical_flags_double_operators() {
         let diags = lint_semantic("x <- a && b || c\n", ML_WARN, None);
         assert!(!diags.is_empty(), "expected diagnostic, got none");
-        assert!(diags[0].message.contains("&&"), "got: {:?}", diags[0].message);
+        assert!(
+            diags[0].message.contains("&&"),
+            "got: {:?}",
+            diags[0].message
+        );
     }
 
     #[test]
@@ -1749,31 +1839,50 @@ print.data.frame <- function(x, ...) NULL
     #[test]
     fn mixed_logical_accepts_pure_and() {
         let diags = lint_semantic("x <- a & b & c\n", ML_WARN, None);
-        assert!(diags.is_empty(), "pure `&` should not be flagged, got {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "pure `&` should not be flagged, got {:?}",
+            diags
+        );
     }
 
     #[test]
     fn mixed_logical_accepts_pure_or() {
         let diags = lint_semantic("x <- a | b | c\n", ML_WARN, None);
-        assert!(diags.is_empty(), "pure `|` should not be flagged, got {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "pure `|` should not be flagged, got {:?}",
+            diags
+        );
     }
 
     #[test]
     fn mixed_logical_flags_in_if_condition() {
         let diags = lint_semantic("if (a & b | c) x\n", ML_WARN, None);
-        assert!(!diags.is_empty(), "should flag mixed operators in condition");
+        assert!(
+            !diags.is_empty(),
+            "should flag mixed operators in condition"
+        );
     }
 
     #[test]
     fn mixed_logical_flags_cross_family_or_then_double_and() {
         let diags = lint_semantic("x <- a | b && c\n", ML_WARN, None);
-        assert!(!diags.is_empty(), "a | b && c should be flagged, got {:?}", diags);
+        assert!(
+            !diags.is_empty(),
+            "a | b && c should be flagged, got {:?}",
+            diags
+        );
     }
 
     #[test]
     fn mixed_logical_flags_cross_family_double_or_then_and() {
         let diags = lint_semantic("x <- a || b & c\n", ML_WARN, None);
-        assert!(!diags.is_empty(), "a || b & c should be flagged, got {:?}", diags);
+        assert!(
+            !diags.is_empty(),
+            "a || b & c should be flagged, got {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1806,19 +1915,30 @@ print.data.frame <- function(x, ...) NULL
     fn condition_assignment_flags_equals_in_if() {
         let diags = lint_semantic("if (x = 1) x\n", None, CA_WARN);
         assert!(!diags.is_empty(), "expected diagnostic, got none");
-        assert!(diags[0].message.contains("=="), "got: {:?}", diags[0].message);
+        assert!(
+            diags[0].message.contains("=="),
+            "got: {:?}",
+            diags[0].message
+        );
     }
 
     #[test]
     fn condition_assignment_flags_equals_in_while() {
         let diags = lint_semantic("while (done = FALSE) x\n", None, CA_WARN);
-        assert!(!diags.is_empty(), "expected diagnostic for = in while condition");
+        assert!(
+            !diags.is_empty(),
+            "expected diagnostic for = in while condition"
+        );
     }
 
     #[test]
     fn condition_assignment_accepts_double_equals() {
         let diags = lint_semantic("if (x == 1) x\n", None, CA_WARN);
-        assert!(diags.is_empty(), "`==` should not be flagged, got {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "`==` should not be flagged, got {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1844,7 +1964,11 @@ print.data.frame <- function(x, ...) NULL
     #[test]
     fn condition_assignment_accepts_top_level_equals() {
         let diags = lint_semantic("x = 1\n", None, CA_WARN);
-        assert!(diags.is_empty(), "top-level `=` should not be flagged, got {:?}", diags);
+        assert!(
+            diags.is_empty(),
+            "top-level `=` should not be flagged, got {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -2202,10 +2326,10 @@ mod code_field_tests {
         );
         let ca = lint_semantic("if (x = 1) x\n", None, sev);
         assert!(
-            ca.iter().any(|d| rule_id_of(d) == Some(CONDITION_ASSIGNMENT)),
+            ca.iter()
+                .any(|d| rule_id_of(d) == Some(CONDITION_ASSIGNMENT)),
             "condition_assignment rule emitted unexpected ids: {:?}",
             ca
         );
     }
 }
-

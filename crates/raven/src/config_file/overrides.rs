@@ -26,17 +26,27 @@ pub struct CompiledLintOverride {
 /// `root` is the directory containing `raven.toml`. Returns an empty vec if
 /// no overrides are configured.
 pub fn compile_lint_overrides(merged: &Value, root: &Path) -> Vec<CompiledLintOverride> {
-    let Some(arr) = merged.get("linting").and_then(|v| v.get("overrides")).and_then(|v| v.as_array()) else {
+    let Some(arr) = merged
+        .get("linting")
+        .and_then(|v| v.get("overrides"))
+        .and_then(|v| v.as_array())
+    else {
         return Vec::new();
     };
     let mut out = Vec::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
         let Some(obj) = entry.as_object() else {
-            log::warn!("raven.toml: [[linting.overrides]] entry #{} is not a table; skipping", idx);
+            log::warn!(
+                "raven.toml: [[linting.overrides]] entry #{} is not a table; skipping",
+                idx
+            );
             continue;
         };
         let Some(files) = obj.get("files").and_then(|v| v.as_array()) else {
-            log::warn!("raven.toml: [[linting.overrides]] entry #{} missing `files`; skipping", idx);
+            log::warn!(
+                "raven.toml: [[linting.overrides]] entry #{} missing `files`; skipping",
+                idx
+            );
             continue;
         };
         let mut matchers = Vec::new();
@@ -46,7 +56,9 @@ pub fn compile_lint_overrides(merged: &Value, root: &Path) -> Vec<CompiledLintOv
                 Ok(g) => matchers.push(g.compile_matcher()),
                 Err(e) => log::warn!(
                     "raven.toml: [[linting.overrides]] entry #{} has invalid glob {:?}: {}",
-                    idx, s, e
+                    idx,
+                    s,
+                    e
                 ),
             }
         }
@@ -58,7 +70,11 @@ pub fn compile_lint_overrides(merged: &Value, root: &Path) -> Vec<CompiledLintOv
         if let Value::Object(map) = &mut patch {
             map.remove("files");
         }
-        out.push(CompiledLintOverride { root: root.to_path_buf(), matchers, patch });
+        out.push(CompiledLintOverride {
+            root: root.to_path_buf(),
+            matchers,
+            patch,
+        });
     }
     out
 }
@@ -169,10 +185,7 @@ mod tests {
         base.line_length = 80;
         let section = json!({ "lineLength": 80, "enabled": true });
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("tests/**/*.R", json!({ "lineLength": 120 }))],
-        );
+        let overrides = make_overrides(&root, vec![("tests/**/*.R", json!({ "lineLength": 120 }))]);
         let uri = Url::parse("file:///proj/tests/test-foo.R").unwrap();
         let out = resolve_lint_for_document(&base, &section, &overrides, &uri);
         assert_eq!(out.line_length, 120);
@@ -184,10 +197,7 @@ mod tests {
         base.line_length = 80;
         let section = json!({ "lineLength": 80 });
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("tests/**/*.R", json!({ "lineLength": 120 }))],
-        );
+        let overrides = make_overrides(&root, vec![("tests/**/*.R", json!({ "lineLength": 120 }))]);
         let uri = Url::parse("file:///proj/R/foo.R").unwrap();
         let out = resolve_lint_for_document(&base, &section, &overrides, &uri);
         assert_eq!(out.line_length, 80);
@@ -222,10 +232,7 @@ mod tests {
         base.line_length = 80;
         let section = json!({ "lineLength": 80 });
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("**/*.R", json!({ "lineLength": 200 }))],
-        );
+        let overrides = make_overrides(&root, vec![("**/*.R", json!({ "lineLength": 200 }))]);
         let uri = Url::parse("untitled:Untitled-1").unwrap();
         let out = resolve_lint_for_document(&base, &section, &overrides, &uri);
         assert_eq!(out.line_length, 80);
@@ -235,15 +242,16 @@ mod tests {
     fn enabled_false_in_override_is_detected() {
         let section = json!({ "enabled": true });
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("R/legacy_*.R", json!({ "enabled": false }))],
-        );
+        let overrides = make_overrides(&root, vec![("R/legacy_*.R", json!({ "enabled": false }))]);
         assert!(is_skipped_by_overrides(
-            &section, &overrides, Path::new("R/legacy_old.R")
+            &section,
+            &overrides,
+            Path::new("R/legacy_old.R")
         ));
         assert!(!is_skipped_by_overrides(
-            &section, &overrides, Path::new("R/main.R")
+            &section,
+            &overrides,
+            Path::new("R/main.R")
         ));
     }
 
@@ -254,10 +262,7 @@ mod tests {
         // master switch and per-glob overrides (#281).
         let section = json!({ "enabled": true });
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("vendor/**/*.R", json!({ "enabled": "off" }))],
-        );
+        let overrides = make_overrides(&root, vec![("vendor/**/*.R", json!({ "enabled": "off" }))]);
         assert!(is_skipped_by_overrides(
             &section,
             &overrides,
@@ -282,13 +287,13 @@ mod tests {
         let mut base = LintConfig::default();
         base.enabled = true;
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("**/*.R", json!({ "lineLength": 120 }))],
-        );
+        let overrides = make_overrides(&root, vec![("**/*.R", json!({ "lineLength": 120 }))]);
         let uri = Url::parse("file:///proj/R/foo.R").unwrap();
         let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
-        assert!(effective.enabled, "override without enabled should inherit base");
+        assert!(
+            effective.enabled,
+            "override without enabled should inherit base"
+        );
         assert_eq!(effective.line_length, 120);
     }
 
@@ -299,17 +304,17 @@ mod tests {
         let mut base = LintConfig::default();
         base.enabled = true;
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("**/*.R", json!({ "enabled": "auto" }))],
-        );
+        let overrides = make_overrides(&root, vec![("**/*.R", json!({ "enabled": "auto" }))]);
         let uri = Url::parse("file:///proj/x.R").unwrap();
         let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
         assert!(effective.enabled, "override 'auto' should inherit base on");
 
         base.enabled = false;
         let effective = resolve_lint_for_document(&base, &json!({}), &overrides, &uri);
-        assert!(!effective.enabled, "override 'auto' should inherit base off");
+        assert!(
+            !effective.enabled,
+            "override 'auto' should inherit base off"
+        );
     }
 
     #[test]
@@ -322,17 +327,17 @@ mod tests {
         base.indentation_unit = 4;
         let section = json!({ "indentationUnit": 2, "lineLength": 80, "enabled": true });
         let root = PathBuf::from("/proj");
-        let overrides = make_overrides(
-            &root,
-            vec![("R/**/*.R", json!({ "lineLength": 120 }))],
-        );
+        let overrides = make_overrides(&root, vec![("R/**/*.R", json!({ "lineLength": 120 }))]);
         let uri = Url::parse("file:///proj/R/foo.R").unwrap();
         let out = resolve_lint_for_document(&base, &section, &overrides, &uri);
         assert_eq!(
             out.indentation_unit, 4,
             "per-document indent unit must survive override re-parse"
         );
-        assert_eq!(out.line_length, 120, "override line length must still apply");
+        assert_eq!(
+            out.line_length, 120,
+            "override line length must still apply"
+        );
     }
 
     #[test]

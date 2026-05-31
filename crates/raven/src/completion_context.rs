@@ -204,9 +204,7 @@ fn find_enclosing_function_call(
                         // backticked or non-ASCII function names that the
                         // AST handles fine).
                         if args_node.has_error() {
-                            if let Some(fallback) =
-                                detect_via_bracket_heuristic(text, position)
-                            {
+                            if let Some(fallback) = detect_via_bracket_heuristic(text, position) {
                                 if ast_ctx.as_ref() != Some(&fallback) {
                                     return Some(fallback);
                                 }

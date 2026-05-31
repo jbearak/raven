@@ -72,7 +72,9 @@ fn check(
     if !gap.chars().all(|c| c.is_whitespace()) {
         return;
     }
-    let keyword = text.get(name.start_byte()..name.end_byte()).unwrap_or("function");
+    let keyword = text
+        .get(name.start_byte()..name.end_byte())
+        .unwrap_or("function");
     let line_no = name.end_position().row as u32;
     if suppressions.is_suppressed(line_no) {
         return;

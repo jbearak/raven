@@ -191,10 +191,7 @@ fn detect_r_cells(lines: &[&str]) -> Vec<Chunk> {
     // section divider, or EOF — whichever comes first.
     let mut chunks = Vec::with_capacity(markers.len());
     for (m, &header) in markers.iter().enumerate() {
-        let next_marker = markers
-            .get(m + 1)
-            .copied()
-            .unwrap_or(lines.len());
+        let next_marker = markers.get(m + 1).copied().unwrap_or(lines.len());
         let mut end_line = next_marker.saturating_sub(1);
         for i in (header + 1)..next_marker {
             if dividers.contains(&i) {

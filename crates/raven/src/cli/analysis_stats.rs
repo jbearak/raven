@@ -338,7 +338,11 @@ fn discover_r_files(root: &Path) -> Vec<(PathBuf, String)> {
     crate::cli::shared::collect_r_file_paths(root, &mut paths);
     let mut files: Vec<(PathBuf, String)> = paths
         .into_iter()
-        .filter_map(|p| crate::state::read_source(&p).ok().map(|content| (p, content)))
+        .filter_map(|p| {
+            crate::state::read_source(&p)
+                .ok()
+                .map(|content| (p, content))
+        })
         .collect();
     // Sort for deterministic ordering
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -596,7 +600,11 @@ mod tests {
         std::fs::write(dir.path().join("clean.R"), "y <- 2\n").unwrap();
 
         let files = discover_r_files(dir.path());
-        assert_eq!(files.len(), 1, "the undecodable file must be skipped; got {files:?}");
+        assert_eq!(
+            files.len(),
+            1,
+            "the undecodable file must be skipped; got {files:?}"
+        );
         assert!(files[0].0.ends_with("clean.R"));
     }
 

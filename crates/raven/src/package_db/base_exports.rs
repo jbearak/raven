@@ -74,7 +74,10 @@ mod tests {
 
         let (exports, packages) = load_base_exports(&path).expect("file loads");
         assert!(exports.contains("print"), "explicit export merged");
-        assert!(exports.contains("mtcars"), "lazy_data dataset merged as export");
+        assert!(
+            exports.contains("mtcars"),
+            "lazy_data dataset merged as export"
+        );
         assert!(packages.contains("base"));
         assert!(packages.contains("datasets"));
     }

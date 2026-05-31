@@ -109,21 +109,31 @@ mod tests {
     fn record_round_trips_through_package_info_and_sorts() {
         let info = PackageInfo::with_details(
             "dplyr".to_string(),
-            HashSet::from(["mutate".to_string(), "filter".to_string(), "filter".to_string()]),
+            HashSet::from([
+                "mutate".to_string(),
+                "filter".to_string(),
+                "filter".to_string(),
+            ]),
             vec!["R".to_string()],
             vec!["starwars".to_string()],
         );
 
         let rec = PackageRecord::from_info(&info);
         // Exports are sorted and de-duplicated for deterministic encoding.
-        assert_eq!(rec.exports, vec!["filter".to_string(), "mutate".to_string()]);
+        assert_eq!(
+            rec.exports,
+            vec!["filter".to_string(), "mutate".to_string()]
+        );
         assert_eq!(rec.name, "dplyr");
         // from_info has no version to read; capture paths fill it in later.
         assert_eq!(rec.version, "");
 
         let back = rec.clone().into_info();
         assert_eq!(back.name, "dplyr");
-        assert_eq!(back.exports, HashSet::from(["mutate".to_string(), "filter".to_string()]));
+        assert_eq!(
+            back.exports,
+            HashSet::from(["mutate".to_string(), "filter".to_string()])
+        );
         assert_eq!(back.depends, vec!["R".to_string()]);
         assert_eq!(back.lazy_data, vec!["starwars".to_string()]);
     }

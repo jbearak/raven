@@ -1789,8 +1789,7 @@ pub async fn build_package_library(
         .as_ref()
         .map(|r| r.join(".raven").join("packages.json"));
 
-    let (mut lib, status) =
-        build_library_inner(r_path, additional_paths, workspace_root).await;
+    let (mut lib, status) = build_library_inner(r_path, additional_paths, workspace_root).await;
 
     // Open the fallback DBs off the async runtime (mmap + ~10-20 ms blake3).
     let shipped_db_path = crate::package_db::locate_shipped_db();
@@ -1897,17 +1896,34 @@ mod tests {
         let db_path = dir.path().join("names.db");
         write_shipped_db(
             &db_path,
-            &[PackageRecord { name: pkg.into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] }],
-            ShippedDbProvenance { source: "test".into(), snapshot_date: "2026-05-30".into(), package_count: 1, raven_version: "9.9.9".into() },
+            &[PackageRecord {
+                name: pkg.into(),
+                version: "1.1.4".into(),
+                exports: vec!["mutate".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            }],
+            ShippedDbProvenance {
+                source: "test".into(),
+                snapshot_date: "2026-05-30".into(),
+                package_count: 1,
+                raven_version: "9.9.9".into(),
+            },
         )
         .unwrap();
 
         std::env::set_var("RAVEN_NAMES_DB", &db_path);
-        let outcome = build_package_library(None, &[], None, true).await;   // runtime path -> wires providers
+        let outcome = build_package_library(None, &[], None, true).await; // runtime path -> wires providers
         let outcome_t1 = build_package_library_tier1_only(None, &[], None).await; // capture path -> no providers
         std::env::remove_var("RAVEN_NAMES_DB");
 
-        assert!(outcome.library.get_package(pkg).await.expect("Tier 3 resolves synthetic pkg").exports.contains("mutate"));
+        assert!(outcome
+            .library
+            .get_package(pkg)
+            .await
+            .expect("Tier 3 resolves synthetic pkg")
+            .exports
+            .contains("mutate"));
         // Provider-less capture must NOT resolve the synthetic pkg from Tier 3.
         assert!(outcome_t1.library.get_package(pkg).await.is_none());
     }
@@ -1925,7 +1941,10 @@ mod tests {
         std::env::remove_var("RAVEN_NAMES_DB");
 
         // The build degrades (does not panic) AND explains the unreadable DB.
-        assert!(!outcome.load_notes.is_empty(), "a corrupt names.db must produce a load note");
+        assert!(
+            !outcome.load_notes.is_empty(),
+            "a corrupt names.db must produce a load note"
+        );
         assert!(
             outcome.load_notes.iter().any(|n| n.contains("names.db")),
             "the note should mention names.db; got {:?}",
@@ -4540,7 +4559,10 @@ mod tests {
         impl PackageMetadataProvider for Fake {
             fn lookup(&self, name: &str) -> Option<PackageInfo> {
                 if name == "fakepkg" {
-                    Some(PackageInfo::new("fakepkg".into(), HashSet::from(["zzz".into()])))
+                    Some(PackageInfo::new(
+                        "fakepkg".into(),
+                        HashSet::from(["zzz".into()]),
+                    ))
                 } else {
                     None
                 }
@@ -4561,7 +4583,8 @@ mod tests {
         struct Fake;
         impl PackageMetadataProvider for Fake {
             fn lookup(&self, name: &str) -> Option<PackageInfo> {
-                (name == "fakepkg").then(|| PackageInfo::new("fakepkg".into(), HashSet::from(["zzz".into()])))
+                (name == "fakepkg")
+                    .then(|| PackageInfo::new("fakepkg".into(), HashSet::from(["zzz".into()])))
             }
         }
 
@@ -4569,7 +4592,10 @@ mod tests {
         let mut lib = PackageLibrary::new_empty();
         lib.set_providers(vec![Box::new(Fake)]);
 
-        let info = lib.get_package("fakepkg").await.expect("resolved via provider");
+        let info = lib
+            .get_package("fakepkg")
+            .await
+            .expect("resolved via provider");
         assert!(info.exports.contains("zzz"));
         // Provider hits ARE cached.
         assert!(lib.is_cached("fakepkg").await);
@@ -4587,14 +4613,16 @@ mod tests {
         struct Fake;
         impl PackageMetadataProvider for Fake {
             fn lookup(&self, name: &str) -> Option<PackageInfo> {
-                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
+                (name == "dplyr")
+                    .then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
             }
         }
 
         let mut lib = PackageLibrary::new_empty();
         lib.set_providers(vec![Box::new(Fake)]);
 
-        lib.prefetch_packages(&["dplyr".to_string(), "ggplot2".to_string()]).await;
+        lib.prefetch_packages(&["dplyr".to_string(), "ggplot2".to_string()])
+            .await;
 
         assert!(lib.is_cached("dplyr").await);
         assert!(lib.is_symbol_from_loaded_packages("mutate", &["dplyr".to_string()]));
@@ -4609,7 +4637,8 @@ mod tests {
         struct Fake;
         impl PackageMetadataProvider for Fake {
             fn lookup(&self, name: &str) -> Option<PackageInfo> {
-                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
+                (name == "dplyr")
+                    .then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
             }
         }
 
@@ -4629,15 +4658,22 @@ mod tests {
         struct Tier2;
         impl PackageMetadataProvider for Tier2 {
             fn lookup(&self, name: &str) -> Option<PackageInfo> {
-                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["from_tier2".into()])))
+                (name == "dplyr")
+                    .then(|| PackageInfo::new("dplyr".into(), HashSet::from(["from_tier2".into()])))
             }
         }
         struct Tier3;
         impl PackageMetadataProvider for Tier3 {
             fn lookup(&self, name: &str) -> Option<PackageInfo> {
                 match name {
-                    "dplyr" => Some(PackageInfo::new("dplyr".into(), HashSet::from(["from_tier3".into()]))),
-                    "tidyr" => Some(PackageInfo::new("tidyr".into(), HashSet::from(["pivot_longer".into()]))),
+                    "dplyr" => Some(PackageInfo::new(
+                        "dplyr".into(),
+                        HashSet::from(["from_tier3".into()]),
+                    )),
+                    "tidyr" => Some(PackageInfo::new(
+                        "tidyr".into(),
+                        HashSet::from(["pivot_longer".into()]),
+                    )),
                     _ => None,
                 }
             }
@@ -4647,11 +4683,17 @@ mod tests {
         lib.set_providers(vec![Box::new(Tier2), Box::new(Tier3)]); // Tier 2 first
 
         let dplyr = lib.get_package("dplyr").await.unwrap();
-        assert!(dplyr.exports.contains("from_tier2"), "Tier 2 wins when both know dplyr");
+        assert!(
+            dplyr.exports.contains("from_tier2"),
+            "Tier 2 wins when both know dplyr"
+        );
         assert!(!dplyr.exports.contains("from_tier3"));
 
         let tidyr = lib.get_package("tidyr").await.unwrap();
-        assert!(tidyr.exports.contains("pivot_longer"), "Tier-3-only package still resolves");
+        assert!(
+            tidyr.exports.contains("pivot_longer"),
+            "Tier-3-only package still resolves"
+        );
     }
 
     // NOTE: this test only *discriminates* the fallback in a truly R-free
@@ -4711,7 +4753,11 @@ mod tests {
         std::fs::create_dir_all(lib.join("ggplot2")).unwrap();
         // A package directory is identified by a DESCRIPTION file.
         std::fs::write(lib.join("dplyr").join("DESCRIPTION"), "Package: dplyr\n").unwrap();
-        std::fs::write(lib.join("ggplot2").join("DESCRIPTION"), "Package: ggplot2\n").unwrap();
+        std::fs::write(
+            lib.join("ggplot2").join("DESCRIPTION"),
+            "Package: ggplot2\n",
+        )
+        .unwrap();
         // a non-package file should be ignored
         std::fs::write(lib.join("README"), "x").unwrap();
 

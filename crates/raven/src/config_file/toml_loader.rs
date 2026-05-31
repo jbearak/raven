@@ -44,9 +44,15 @@ pub fn load_str(text: &str, source_label: &str) -> Option<LoadedToml> {
         validate_top_level_keys(map, source_label, &mut warnings);
     } else {
         warnings.push(format!("{source_label}: top-level value must be a table"));
-        return Some(LoadedToml { settings: Value::Object(serde_json::Map::new()), warnings });
+        return Some(LoadedToml {
+            settings: Value::Object(serde_json::Map::new()),
+            warnings,
+        });
     }
-    Some(LoadedToml { settings: json, warnings })
+    Some(LoadedToml {
+        settings: json,
+        warnings,
+    })
 }
 
 /// Recursive TOML → JSON conversion. TOML's date/time types are stringified
@@ -55,15 +61,17 @@ fn toml_to_json(value: toml::Value) -> Value {
     match value {
         toml::Value::String(s) => Value::String(s),
         toml::Value::Integer(i) => Value::Number(i.into()),
-        toml::Value::Float(f) => {
-            serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
-        }
+        toml::Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         toml::Value::Boolean(b) => Value::Bool(b),
         toml::Value::Datetime(dt) => Value::String(dt.to_string()),
         toml::Value::Array(arr) => Value::Array(arr.into_iter().map(toml_to_json).collect()),
         toml::Value::Table(table) => {
-            let map: serde_json::Map<String, Value> =
-                table.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect();
+            let map: serde_json::Map<String, Value> = table
+                .into_iter()
+                .map(|(k, v)| (k, toml_to_json(v)))
+                .collect();
             Value::Object(map)
         }
     }
@@ -86,16 +94,34 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
 /// here causes a spurious "unknown key" warning at load time; forgetting
 /// the parser causes the new setting to be silently ignored.
 const KNOWN_LINTING_KEYS: &[&str] = &[
-    "enabled", "lineLength", "objectLength", "indentationUnit",
-    "assignmentOperator", "stringDelimiter",
-    "objectNameStyleFunction", "objectNameStyleVariable", "objectNameStyleArgument",
-    "lineLengthSeverity", "trailingWhitespaceSeverity", "noTabSeverity",
-    "trailingBlankLinesSeverity", "assignmentOperatorSeverity", "objectNameSeverity",
-    "infixSpacesSeverity", "commentedCodeSeverity", "quotesSeverity", "commasSeverity",
-    "tAndFSymbolSeverity", "semicolonSeverity", "equalsNaSeverity", "objectLengthSeverity",
+    "enabled",
+    "lineLength",
+    "objectLength",
+    "indentationUnit",
+    "assignmentOperator",
+    "stringDelimiter",
+    "objectNameStyleFunction",
+    "objectNameStyleVariable",
+    "objectNameStyleArgument",
+    "lineLengthSeverity",
+    "trailingWhitespaceSeverity",
+    "noTabSeverity",
+    "trailingBlankLinesSeverity",
+    "assignmentOperatorSeverity",
+    "objectNameSeverity",
+    "infixSpacesSeverity",
+    "commentedCodeSeverity",
+    "quotesSeverity",
+    "commasSeverity",
+    "tAndFSymbolSeverity",
+    "semicolonSeverity",
+    "equalsNaSeverity",
+    "objectLengthSeverity",
     "vectorLogicSeverity",
-    "functionLeftParenthesesSeverity", "spacesInsideSeverity",
-    "indentationSeverity", "overrides",
+    "functionLeftParenthesesSeverity",
+    "spacesInsideSeverity",
+    "indentationSeverity",
+    "overrides",
 ];
 
 /// For nested validation we accept the existence of any key in a known
@@ -110,7 +136,9 @@ fn validate_top_level_keys(
 ) {
     for (key, value) in map {
         if !KNOWN_TOP_LEVEL.contains(&key.as_str()) {
-            warnings.push(format!("{source_label}: unknown top-level key '{key}'; ignoring"));
+            warnings.push(format!(
+                "{source_label}: unknown top-level key '{key}'; ignoring"
+            ));
             continue;
         }
         if key == "linting" {

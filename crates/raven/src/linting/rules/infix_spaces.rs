@@ -113,18 +113,54 @@ fn check_binary(
     match style {
         BinaryStyle::RequireSpaces => {
             if left_gap.is_some_and(|g| g.is_empty()) {
-                report(text, op, "missing space before `", op_text, "`", severity, suppressions, out);
+                report(
+                    text,
+                    op,
+                    "missing space before `",
+                    op_text,
+                    "`",
+                    severity,
+                    suppressions,
+                    out,
+                );
             }
             if right_gap.is_some_and(|g| g.is_empty()) {
-                report(text, op, "missing space after `", op_text, "`", severity, suppressions, out);
+                report(
+                    text,
+                    op,
+                    "missing space after `",
+                    op_text,
+                    "`",
+                    severity,
+                    suppressions,
+                    out,
+                );
             }
         }
         BinaryStyle::NoSpaces => {
             if left_gap.is_some_and(|g| !g.is_empty()) {
-                report(text, op, "unexpected whitespace before `", op_text, "`", severity, suppressions, out);
+                report(
+                    text,
+                    op,
+                    "unexpected whitespace before `",
+                    op_text,
+                    "`",
+                    severity,
+                    suppressions,
+                    out,
+                );
             }
             if right_gap.is_some_and(|g| !g.is_empty()) {
-                report(text, op, "unexpected whitespace after `", op_text, "`", severity, suppressions, out);
+                report(
+                    text,
+                    op,
+                    "unexpected whitespace after `",
+                    op_text,
+                    "`",
+                    severity,
+                    suppressions,
+                    out,
+                );
             }
         }
         BinaryStyle::Skip => {}

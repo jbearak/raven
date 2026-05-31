@@ -51,10 +51,8 @@ fn visit(
                     let line_no = op_node.start_position().row as u32;
                     if !suppressions.is_suppressed(line_no) {
                         let line_text = text.lines().nth(line_no as usize).unwrap_or("");
-                        let start_col = byte_offset_to_utf16_column(
-                            line_text,
-                            op_node.start_position().column,
-                        );
+                        let start_col =
+                            byte_offset_to_utf16_column(line_text, op_node.start_position().column);
                         let end_col =
                             byte_offset_to_utf16_column(line_text, op_node.end_position().column);
                         let preferred = match style {
@@ -101,9 +99,7 @@ fn is_named_argument(binop: Node<'_>, op_text: &str) -> bool {
     if op_text != "=" {
         return false;
     }
-    binop
-        .parent()
-        .is_some_and(|p| p.kind() == "argument")
+    binop.parent().is_some_and(|p| p.kind() == "argument")
 }
 
 /// Returns `true` if `binop` is the direct `condition` field of an
