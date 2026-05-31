@@ -102,11 +102,12 @@ pub fn write_base_exports_file(
     crate::package_db::json_db::write_repo_db_file(path, &db)
 }
 
-/// Serializes tests that mutate the process-global `RAVEN_NAMES_DB` env var.
-/// Without this, parallel test threads race: one test's `set_var` / `remove_var`
-/// window can be observed by another's `build_package_library` call (or
-/// `locate_shipped_db`), producing spurious failures. Every test in the crate's
-/// lib test binary that touches `RAVEN_NAMES_DB` MUST hold this lock. An async
+/// Serializes tests that mutate the process-global package-DB env vars
+/// (`RAVEN_NAMES_DB`, `RAVEN_BASE_EXPORTS`). Without this, parallel test threads
+/// race: one test's `set_var` / `remove_var` window can be observed by another's
+/// `build_package_library` / `initialize` call (or `locate_shipped_db` /
+/// `locate_base_exports`), producing spurious failures. Every test in the crate's
+/// lib test binary that touches those vars MUST hold this lock. An async
 /// (`tokio`) mutex is required because some holders keep the guard across an
 /// `.await` on the build. Lives here (not in a test submodule) so both
 /// `package_db` and `package_library` tests can share the one instance.

@@ -4680,6 +4680,9 @@ mod tests {
         )
         .unwrap();
 
+        // Serialize against other tests that mutate/read package-DB env vars
+        // (the lock also guards `initialize()`, which reads RAVEN_BASE_EXPORTS).
+        let _env = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
         std::env::set_var("RAVEN_BASE_EXPORTS", &path);
         // new_empty + initialize with no lib paths simulates CI (no disk base packages).
         let mut lib = PackageLibrary::new_empty();

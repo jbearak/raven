@@ -5,12 +5,21 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::package_db::json_db::read_repo_db_file;
+use crate::package_db::json_db::{read_repo_db_file, RepoDbError};
 
 /// Merge base-package exports + dataset names from the file at `path` into a
 /// flat set, plus the set of base package names. Returns None if absent/unreadable.
+/// A present-but-unusable file (e.g. a newer schema, or corrupt) is a packaging
+/// bug, so it is logged before degrading — only a plain Absent file is silent.
 pub fn load_base_exports(path: &Path) -> Option<(HashSet<String>, HashSet<String>)> {
-    let db = read_repo_db_file(path).ok()?;
+    let db = match read_repo_db_file(path) {
+        Ok(db) => db,
+        Err(RepoDbError::Absent) => return None,
+        Err(e) => {
+            log::warn!("base-exports file unreadable, CI base-export fallback unavailable: {e}");
+            return None;
+        }
+    };
     let mut exports = HashSet::new();
     let mut packages = HashSet::new();
     for rec in db.packages {

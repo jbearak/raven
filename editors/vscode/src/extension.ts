@@ -501,6 +501,13 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
                 return;
             }
             const freezeServerPath = getServerPath(context);
+            const binaryCheck = validateServerBinary(freezeServerPath);
+            if (!binaryCheck.ok) {
+                vscode.window.showErrorMessage(
+                    `Raven: cannot generate package database — server binary is unusable (${binaryCheck.reason}).`,
+                );
+                return;
+            }
             const cp = await import('node:child_process');
             await vscode.window.withProgress(
                 {
