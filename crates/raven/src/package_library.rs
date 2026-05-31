@@ -753,12 +753,29 @@ impl PackageLibrary {
                                     )
                                     .await
                                 }
-                                None => PackageInfo::with_details(
-                                    pkg_name.clone(),
-                                    exports_set,
-                                    Vec::new(),
-                                    Vec::new(),
-                                ),
+                                None => {
+                                    // No on-disk directory for this package. When R
+                                    // also returned no exports (the tryCatch swallowed
+                                    // the asNamespace error and produced an empty
+                                    // list), caching an empty PackageInfo would shadow
+                                    // any Tier 2/3 provider result via the cache-first
+                                    // check in get_package. So on an empty set, consult
+                                    // the ordered fallback providers first; only fall
+                                    // back to the (empty) R-derived set if none knows it.
+                                    let from_provider = if exports_set.is_empty() {
+                                        self.resolve_from_providers(&pkg_name)
+                                    } else {
+                                        None
+                                    };
+                                    from_provider.unwrap_or_else(|| {
+                                        PackageInfo::with_details(
+                                            pkg_name.clone(),
+                                            exports_set,
+                                            Vec::new(),
+                                            Vec::new(),
+                                        )
+                                    })
+                                }
                             };
                             log::trace!(
                                 "Cached {} exports + {} datasets for pattern package '{}' from R",
