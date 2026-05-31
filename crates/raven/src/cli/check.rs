@@ -740,7 +740,8 @@ mod tests {
 
     #[test]
     fn missing_metadata_gate_ignores_defined_later_diagnostics() {
-        let state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new(vec![]);
+        state.cross_file_config.packages_enabled = true;
         let defined_later = vec![(
             PathBuf::from("main.R"),
             Diagnostic {
