@@ -5,7 +5,7 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 - `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes), for CI gating.
 - `raven lint` — run the native **style** linter only.
 - `raven analysis-stats <path> [--csv] [--only <phase>]` — profile workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help`.
-- `raven packages freeze` — generate a committed `.raven/packages.json` export database so `raven check` can resolve package symbols in CI when no R or packages are installed. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
+- `raven packages freeze` — generate a committed `.raven/packages.json` export database. `raven check` already resolves package symbols in CI without it, against Raven's bundled database (CRAN + Bioconductor + base R); `freeze` is for *accuracy* — it adds packages the bundled database doesn't cover (e.g. GitHub-only or internal packages) and symbols newer than the bundled snapshot, eliminating false positives in those cases. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
 
 The difference between `check` and `lint` is **scope**: `lint` parses each file in isolation and runs only the style rules, so it needs no R installation and no workspace index — but it can't see relationships between files. `check` builds the same workspace index the language server builds (and, unless packages are disabled, runs R to resolve installed-package exports and base R symbols), so it additionally reports cross-file, undefined-variable, and package diagnostics. `lint` is therefore the cheaper, R-free option for pure style gating; `check` does more work per run in exchange for the editor's full analysis in CI.
 
@@ -138,7 +138,7 @@ A command group for the export databases Raven uses to resolve package symbols w
 
 ### `raven packages freeze`
 
-Generate a committed, repo-specific `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets — so `raven check` and the editor can resolve those symbols in CI, where no R or packages are present. Run it on a machine that has R and the project's packages installed, then commit the result; it is generated, never hand-edited.
+Generate a committed, repo-specific `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets. `raven check` and the editor already resolve symbols in CI (where no R or packages are present) against Raven's bundled database; this committed snapshot **improves accuracy** for packages the bundled database doesn't cover (GitHub-only or internal packages) and for symbols newer than the bundled snapshot. Run it on a machine that has R and the project's packages installed, then commit the result; it is generated, never hand-edited.
 
 ```text
 raven packages freeze [OPTIONS]
