@@ -88,6 +88,14 @@ fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+/// The Raven per-user data directory: `%LOCALAPPDATA%\Raven` on Windows,
+/// `$XDG_DATA_HOME/raven` (or `$HOME/.local/share/raven`) elsewhere.
+///
+/// Hand-rolled rather than via the `xdg` crate on purpose: `xdg` is a
+/// unix-only dependency, so using it would cover only the non-Windows arm and
+/// split this one cfg-unified resolver into two mechanisms. The unix rule is
+/// factored into [`unix_user_data_dir`] so it can be unit-tested with injected
+/// env values without touching the process environment.
 fn user_data_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(dir) = TEST_USER_DATA_DIR.with(|cell| cell.borrow().clone()) {

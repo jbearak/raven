@@ -568,26 +568,23 @@ pub fn install_downloaded_sidecars(
     let names_tmp = write_unique_temp(dest_dir, "names.db", names_bytes)?;
     let base_tmp = write_unique_temp(dest_dir, "base-exports.json", base_bytes)?;
 
-    let db = match ShippedDb::open(&names_tmp) {
-        Ok(db) => db,
-        Err(e) => {
-            remove_tmp_sidecars(&names_tmp, &base_tmp);
-            return Err(format!(
-                "downloaded names.db failed validation: {e}. {}",
-                manual_sidecar_guidance()
-            ));
-        }
+    // Validate both temps before swapping either into place; on any failure,
+    // clean up both temps and surface a uniform "{label} failed validation" error.
+    let cleanup_and_fail = |label: &str, e: String| -> String {
+        remove_tmp_sidecars(&names_tmp, &base_tmp);
+        format!(
+            "downloaded {label} failed validation: {e}. {}",
+            manual_sidecar_guidance()
+        )
     };
+
+    let db =
+        ShippedDb::open(&names_tmp).map_err(|e| cleanup_and_fail("names.db", e.to_string()))?;
     let names_db_provenance = db.provenance().clone();
     drop(db);
 
-    if let Err(e) = read_repo_db_file(&base_tmp) {
-        remove_tmp_sidecars(&names_tmp, &base_tmp);
-        return Err(format!(
-            "downloaded base-exports.json failed validation: {e}. {}",
-            manual_sidecar_guidance()
-        ));
-    }
+    read_repo_db_file(&base_tmp)
+        .map_err(|e| cleanup_and_fail("base-exports.json", e.to_string()))?;
 
     replace_verified_sidecars(&names_tmp, &base_tmp, &names_final, &base_final)?;
 
@@ -710,6 +707,16 @@ fn remove_backup(backup: Option<&Path>) {
     }
 }
 
+/// Atomically replace `final_path` with the already-written, already-validated
+/// `tmp` file.
+///
+/// This deliberately hand-rolls the rename instead of using
+/// `tempfile::NamedTempFile::persist`: the install is a *two-file* transaction
+/// (`replace_verified_sidecars`) that needs explicit, separate rename control to
+/// back up and roll back each sidecar, and on Windows it uses
+/// `MOVEFILE_WRITE_THROUGH` so the replacement is flushed before returning —
+/// neither of which `persist` offers. `write_unique_temp` keeps the temp on the
+/// same directory/filesystem so the rename stays atomic.
 fn replace_with_tmp(tmp: &Path, final_path: &Path) -> Result<(), String> {
     replace_file(tmp, final_path).map_err(|e| sidecar_write_error(final_path, "replace", e))
 }
