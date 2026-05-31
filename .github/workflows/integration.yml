@@ -23,6 +23,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Formatting gate ────────────────────────────────────────────────────
+  # Cheap, dependency-free check that the tree is `cargo fmt`-clean. Pinned to
+  # an explicit toolchain (not `@stable`) so the gate is reproducible: the
+  # whole point is to stop formatting drift from re-accumulating PR after PR,
+  # which it did because nothing enforced `cargo fmt` and "stable" rustfmt
+  # shifts over time. `cargo fmt` does not invoke rustc, so the sccache/mold
+  # env above is inert here.
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Install pinned rustfmt
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo +1.95.0 fmt --all --check
+
   # Build only the release artifacts that genuinely need optimization: the LSP
   # binary (consumed by the vscode-mocha and binary-size jobs) and the
   # performance_budgets test binary (gated on `not(debug_assertions)`, asserts
