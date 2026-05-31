@@ -1,0 +1,74 @@
+name: Build names.db (Tier 3 package-export DB)
+
+on:
+  workflow_dispatch:
+  # Refresh interval is NOT yet committed (decision #16). Run on demand for now.
+  # When an interval is chosen, uncomment a schedule, e.g.:
+  #   schedule:
+  #     - cron: "0 6 * * 1"   # example only — currently inactive
+
+permissions:
+  contents: write   # to update the names-db Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2      # reference R; --reference-lib captures whatever is installed here
+
+      - name: Build raven (release)
+        run: cargo build --release -p raven
+
+      - name: Seed from the prior names.db (append-only)
+        run: |
+          mkdir -p dist
+          gh release download names-db --repo "$GITHUB_REPOSITORY" \
+            --pattern 'names.db' --dir seed || echo "no prior release; building fresh"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch CRAN + Bioc r-universe JSON
+        run: |
+          set -euo pipefail
+          for host in cran.r-universe.dev bioc.r-universe.dev; do
+            dest="runiverse/${host%%.*}"; mkdir -p "$dest"
+            curl -sf "https://${host}/api/ls" -o "pkglist-${host}.json"
+            jq -r '.[]' "pkglist-${host}.json" | while read -r pkg; do
+              curl -sf "https://${host}/api/packages/${pkg}" -o "${dest}/${pkg}.json" || echo "skip ${host}/${pkg}"
+            done
+          done
+
+      - name: Build names.db (reference-R seed ∪ CRAN+Bioc, append-only)
+        # FIX 1: --reference-lib requires a PATH argument. We capture R's .Library
+        # (the main library directory containing base + recommended packages) via
+        # Rscript and pass it as REF_LIB. Without this the next flag would be
+        # consumed as the path, silently dropping base/recommended exports.
+        run: |
+          SNAPSHOT_DATE="$(date -u +%Y-%m-%d)"
+          REF_LIB="$(Rscript -e 'cat(.Library)')"
+          ./target/release/raven packages build-shipped-db \
+            --reference-lib "$REF_LIB" \
+            --runiverse-cran runiverse/cran \
+            --runiverse-bioc runiverse/bioc \
+            ${{ hashFiles('seed/names.db') != '' && '--seed seed/names.db' || '' }} \
+            --output dist/names.db \
+            --base-exports-output dist/base-exports.json \
+            --snapshot-date "${SNAPSHOT_DATE}" \
+            --source r-universe+reference
+
+      - name: Record checksums
+        # FIX 2: b3sum is not preinstalled on ubuntu-latest. We use sha256sum
+        # (always available) instead of b3sum. names.db already self-verifies via
+        # its internal blake3 header; this file is a supplementary Release artifact
+        # for human spot-checks. The file is named checksums.sha256 to be explicit
+        # about the algorithm used.
+        run: |
+          ( cd dist && sha256sum names.db base-exports.json > checksums.sha256 )
+
+      - name: Publish to the names-db Release
+        run: |
+          gh release upload names-db dist/names.db dist/base-exports.json dist/checksums.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
