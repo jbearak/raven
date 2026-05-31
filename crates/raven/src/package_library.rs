@@ -4370,4 +4370,26 @@ mod tests {
         assert!(lib.get_package("unknownpkg").await.is_none());
         assert!(!lib.is_cached("unknownpkg").await);
     }
+
+    #[tokio::test]
+    async fn prefetch_warms_provider_packages_via_existing_step3() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        lib.prefetch_packages(&["dplyr".to_string(), "ggplot2".to_string()]).await;
+
+        assert!(lib.is_cached("dplyr").await);
+        assert!(lib.is_symbol_from_loaded_packages("mutate", &["dplyr".to_string()]));
+        assert!(!lib.is_cached("ggplot2").await);
+    }
 }
