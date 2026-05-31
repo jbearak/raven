@@ -64,6 +64,18 @@ Raven's analysis is static: it parses your code and your installed packages' `NA
 
 Run **Raven: Refresh package cache** after changing `.libPaths()` or running `renv::activate()` to re-run these queries.
 
+### Resolving exports without R
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+When a package isn't installed locally — or R can't launch, typically in CI — Raven still resolves its **export names** through an ordered three-tier fallback, consulted per package:
+
+1. **Tier 1 — installed.** The authoritative path above: parse the installed `NAMESPACE`, expanding `exportPattern` via R when needed. Version-exact to the install.
+2. **Tier 2 — repo database.** A committed, repo-specific `.raven/packages.json` you generate with [`raven packages freeze`](cli.md#raven-packages-freeze). It is "frozen Tier 1": full structure (exports, `Depends`, datasets) captured through the authoritative path, version-exact to when it was generated.
+3. **Tier 3 — shipped database.** Raven's bundled `names.db`, built from latest CRAN/Bioc. Export names only.
+
+Tier 2 outranks Tier 3 because it is project-specific and built through the authoritative path; a repo that never generates a Tier 2 file still works in CI via Tier 3 alone. Tiers 2 and 3 carry **export names, `Depends`, and datasets only** — no `:::` internal objects and no function signatures, which still require a local install (Tier 1). This fallback feeds **export resolution** only; it never changes a package's install status (see [Diagnostics](diagnostics.md#package-names-vs-install-status)). The full model, fidelity caveats, and how to generate the repo database are in [Package database](package-database.md).
+
 ### Base Packages
 
 Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. Raven uses this fixed list directly — it does not query R to discover the base packages. The R subprocess is queried for *installed user packages* (via the library paths), not to determine which base packages exist — though base-package *exports* are still expanded via R, since they use `exportPattern` (see [When Raven calls R](#when-raven-calls-r)).
