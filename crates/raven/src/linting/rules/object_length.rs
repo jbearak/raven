@@ -41,7 +41,9 @@ fn visit(
 ) {
     match node.kind() {
         "binary_operator" => check_assignment(node, text, max_length, severity, suppressions, out),
-        "function_definition" => check_parameters(node, text, max_length, severity, suppressions, out),
+        "function_definition" => {
+            check_parameters(node, text, max_length, severity, suppressions, out)
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -76,7 +78,9 @@ fn check_assignment(
     if target.kind() != "identifier" {
         return;
     }
-    let name = text.get(target.start_byte()..target.end_byte()).unwrap_or("");
+    let name = text
+        .get(target.start_byte()..target.end_byte())
+        .unwrap_or("");
     check_name(target, name, max_length, text, severity, suppressions, out);
 }
 
@@ -148,9 +152,7 @@ fn check_name(
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
         code: Some(NumberOrString::String(rule_ids::OBJECT_LENGTH.to_string())),
-        message: format!(
-            "Identifier `{name}` is {len} characters long; maximum is {max_length}."
-        ),
+        message: format!("Identifier `{name}` is {len} characters long; maximum is {max_length}."),
         ..Default::default()
     });
 }

@@ -132,13 +132,13 @@ use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
 
+use crate::chunks::{classify_chunk_document, classify_chunk_document_for, ChunkKind};
 use crate::content_provider::DefaultContentProvider;
 use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
 use crate::cross_file::{
     CrossFileActivityState, CrossFileConfig, CrossFileFileCache, CrossFileRevalidationState,
     CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
 };
-use crate::chunks::{classify_chunk_document, classify_chunk_document_for, ChunkKind};
 use crate::document_store::DocumentStore;
 use crate::file_type::{file_type_from_language_id_or_uri, file_type_from_uri, FileType};
 use crate::package_library::PackageLibrary;
@@ -1687,7 +1687,11 @@ mod tests {
 
         // UTF-16 LE BOM is decoded.
         let u16_path = tmp.path().join("u16.R");
-        std::fs::write(&u16_path, vec![0xFF, 0xFE, b'a', 0x00, b'b', 0x00, b'\n', 0x00]).unwrap();
+        std::fs::write(
+            &u16_path,
+            vec![0xFF, 0xFE, b'a', 0x00, b'b', 0x00, b'\n', 0x00],
+        )
+        .unwrap();
         assert_eq!(read_source_async(&u16_path).await.unwrap(), "ab\n");
 
         // A missing file is an Io error, not InvalidEncoding.

@@ -119,8 +119,7 @@ fn split_on_skip_lines<'a>(
     for (idx, c) in group.iter().enumerate() {
         let line_text = lines.get(c.line as usize).copied().unwrap_or("");
         let is_first_line = c.line == 0;
-        let skip = is_skip_line(line_text, is_first_line)
-            || suppressions.is_suppressed(c.line);
+        let skip = is_skip_line(line_text, is_first_line) || suppressions.is_suppressed(c.line);
         if skip {
             if idx > start {
                 out.push(&group[start..idx]);

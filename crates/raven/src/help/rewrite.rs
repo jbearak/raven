@@ -175,8 +175,7 @@ fn r_manual_cran_url(rest: &str) -> Option<String> {
     if !R_MANUAL_BASENAMES.contains(&basename) {
         return None;
     }
-    let mut url =
-        format!("https://cran.r-project.org/doc/manuals/r-release/{basename}.html");
+    let mut url = format!("https://cran.r-project.org/doc/manuals/r-release/{basename}.html");
     if let Some(a) = anchor {
         url.push('#');
         url.push_str(&canon_segment(a));
@@ -342,9 +341,8 @@ mod tests {
         let rewritten = rewrite_help_html(raw, "utils");
         let cleaned = sanitize_help_html(&rewritten);
         assert!(
-            cleaned.contains(
-                r#"href="https://cran.r-project.org/doc/manuals/r-release/R-exts.html""#
-            ),
+            cleaned
+                .contains(r#"href="https://cran.r-project.org/doc/manuals/r-release/R-exts.html""#),
             "href must survive sanitization; got: {cleaned}"
         );
     }
@@ -416,12 +414,12 @@ mod tests {
         // that isn't exactly `<basename>.html[#anchor]`. Path traversal,
         // extra segments, missing `.html`, and empty tails all Drop.
         for path in [
-            "/doc/manual/../R-exts.html",     // traversal
-            "/doc/manual/sub/R-exts.html",     // extra segment
-            "/doc/manual/R-exts.html/extra",   // trailing segment
-            "/doc/manual/R-exts",              // missing .html
-            "/doc/manual/.html",               // empty basename
-            "/doc/manual/",                    // empty rest
+            "/doc/manual/../R-exts.html",    // traversal
+            "/doc/manual/sub/R-exts.html",   // extra segment
+            "/doc/manual/R-exts.html/extra", // trailing segment
+            "/doc/manual/R-exts",            // missing .html
+            "/doc/manual/.html",             // empty basename
+            "/doc/manual/",                  // empty rest
         ] {
             let html = format!(r#"<a href="{path}">x</a>"#);
             let out = rewrite_help_html(&html, "base");

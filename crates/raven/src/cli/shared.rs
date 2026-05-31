@@ -147,7 +147,10 @@ pub fn resolve_color_from_env(choice: ColorChoice) -> bool {
 }
 
 pub fn is_r_file(p: &Path) -> bool {
-    matches!(p.extension().and_then(|s| s.to_str()), Some("R") | Some("r"))
+    matches!(
+        p.extension().and_then(|s| s.to_str()),
+        Some("R") | Some("r")
+    )
 }
 
 pub fn is_chunk_file(p: &Path) -> bool {
@@ -214,8 +217,14 @@ pub fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
     };
     Diagnostic {
         range: Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 0, character: 0 },
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 0,
+            },
         },
         severity: Some(DiagnosticSeverity::ERROR),
         message,
@@ -426,7 +435,11 @@ mod tests {
         // Malformed/odd-length UTF-16 (byte == 0): the file carried a BOM, so the
         // message must NOT claim "not valid UTF-8" and must mention UTF-16.
         let utf16 = encoding_diagnostic(0, 0);
-        assert!(!utf16.message.contains("not valid UTF-8"), "{}", utf16.message);
+        assert!(
+            !utf16.message.contains("not valid UTF-8"),
+            "{}",
+            utf16.message
+        );
         assert!(utf16.message.contains("UTF-16"), "{}", utf16.message);
     }
 

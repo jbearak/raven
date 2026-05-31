@@ -90,10 +90,7 @@ mod tests {
     #[test]
     fn strip_leading_bom_removes_only_the_first_bom() {
         // A second U+FEFF is a zero-width no-break space, not a BOM; keep it.
-        assert_eq!(
-            strip_leading_bom_for_scan("\u{FEFF}\u{FEFF}x"),
-            "\u{FEFF}x"
-        );
+        assert_eq!(strip_leading_bom_for_scan("\u{FEFF}\u{FEFF}x"), "\u{FEFF}x");
     }
 
     #[test]

@@ -31,7 +31,9 @@ pub(crate) fn collect(
             },
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
-            code: Some(NumberOrString::String(rule_ids::TRAILING_WHITESPACE.to_string())),
+            code: Some(NumberOrString::String(
+                rule_ids::TRAILING_WHITESPACE.to_string(),
+            )),
             message: "Trailing whitespace.".to_string(),
             ..Default::default()
         });

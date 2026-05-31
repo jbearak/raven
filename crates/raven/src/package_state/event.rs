@@ -167,8 +167,7 @@ fn translate_watched(
         // incremental path matches the bulk scan
         // (collect_package_r_file_inputs_from_disk); an undecodable file yields
         // no text and is treated as "no signal" (leaves the prior input).
-        let text = on_disk_text
-            .or_else(|| crate::state::read_source(&path).ok().map(Arc::from))?;
+        let text = on_disk_text.or_else(|| crate::state::read_source(&path).ok().map(Arc::from))?;
         let digest = ContentDigest::of(&text);
         inputs.r_files.insert(
             path.clone(),
@@ -665,7 +664,10 @@ mod tests {
             },
         );
 
-        assert!(matches!(delta, Some(PackageInputDelta::RFileChanged { .. })));
+        assert!(matches!(
+            delta,
+            Some(PackageInputDelta::RFileChanged { .. })
+        ));
         let entry = inputs.r_files.get(&path).expect("file input");
         assert_eq!(
             &*entry.text, "foo <- 2\n",

@@ -32,11 +32,26 @@ mod tests {
     #[test]
     fn rule_ids_are_non_empty_and_unique() {
         let ids = [
-            LINE_LENGTH, TRAILING_WHITESPACE, NO_TAB, TRAILING_BLANK_LINES,
-            ASSIGNMENT_OPERATOR, OBJECT_NAME, INFIX_SPACES, COMMENTED_CODE,
-            QUOTES, COMMAS, T_AND_F_SYMBOL, SEMICOLON, EQUALS_NA,
-            OBJECT_LENGTH, VECTOR_LOGIC, FUNCTION_LEFT_PARENTHESES,
-            SPACES_INSIDE, INDENTATION, MIXED_LOGICAL, CONDITION_ASSIGNMENT,
+            LINE_LENGTH,
+            TRAILING_WHITESPACE,
+            NO_TAB,
+            TRAILING_BLANK_LINES,
+            ASSIGNMENT_OPERATOR,
+            OBJECT_NAME,
+            INFIX_SPACES,
+            COMMENTED_CODE,
+            QUOTES,
+            COMMAS,
+            T_AND_F_SYMBOL,
+            SEMICOLON,
+            EQUALS_NA,
+            OBJECT_LENGTH,
+            VECTOR_LOGIC,
+            FUNCTION_LEFT_PARENTHESES,
+            SPACES_INSIDE,
+            INDENTATION,
+            MIXED_LOGICAL,
+            CONDITION_ASSIGNMENT,
         ];
         for id in ids {
             assert!(!id.is_empty(), "rule id must be non-empty");

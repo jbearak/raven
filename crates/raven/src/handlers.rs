@@ -265,7 +265,10 @@ impl DiagnosticsSnapshot {
                 &state.raw_client_settings,
                 state.raw_project_settings.as_ref(),
             );
-            let section = merged.get("linting").cloned().unwrap_or(serde_json::json!({}));
+            let section = merged
+                .get("linting")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
             crate::config_file::resolve_lint_for_document(
                 &base_lint_config,
                 &section,
@@ -375,11 +378,7 @@ pub(crate) fn diagnostics_from_snapshot(
     // Fast collectors (no scope resolution needed)
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
-    collect_invalid_assignment_targets(
-        snapshot.tree.root_node(),
-        &snapshot.text,
-        &mut diagnostics,
-    );
+    collect_invalid_assignment_targets(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
 
     // Semantic checks: always-on rules that flag likely-wrong code regardless
     // of the style-lint master switch.
@@ -5207,10 +5206,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     // collector handles this via `is_package_export` reading
     // `scope.inherited_packages`, but `is_visible` here only checks the
     // symbol set, so we need the explicit guard.
-    let test_attached_packages_for_uri: Vec<String> = test_attached_packages_for_uri(
-        snapshot,
-        uri,
-    );
+    let test_attached_packages_for_uri: Vec<String> = test_attached_packages_for_uri(snapshot, uri);
 
     // Pre-resolve scope at each forward-source's call site so the
     // defense-in-depth check (which needs `symbol.source_uri != *uri`)
@@ -6170,12 +6166,10 @@ fn find_opener_for_missing<'a>(missing: Node<'a>, text: &str) -> Option<(Node<'a
     }
 
     let mut cursor = parent.walk();
-    let opener = parent
-        .children(&mut cursor)
-        .find(|n| {
-            let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
-            matches!(t, "(" | "{" | "[" | "[[")
-        })?;
+    let opener = parent.children(&mut cursor).find(|n| {
+        let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
+        matches!(t, "(" | "{" | "[" | "[[")
+    })?;
 
     let opener_row = opener.start_position().row as u32;
     let opener_start_byte_col = opener.start_position().column;
@@ -6760,7 +6754,9 @@ struct CollectState {
 /// delimiter events. See bracket-diagnostics design spec.
 fn delimiter_events(error: Node, text: &str) -> Vec<DelimEvent> {
     let mut out = Vec::new();
-    walk_for_delimiters(error, text, &mut out, /*allow_recurse_into_error=*/ true);
+    walk_for_delimiters(
+        error, text, &mut out, /*allow_recurse_into_error=*/ true,
+    );
     out
 }
 
@@ -6780,7 +6776,12 @@ fn walk_for_delimiters(
     // itself has no children, treat the node as a leaf directly.
     if node.child_count() == 0 {
         let raw = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
-        extract_from_leaf(raw, node.start_byte(), node.start_position().row as u32, out);
+        extract_from_leaf(
+            raw,
+            node.start_byte(),
+            node.start_position().row as u32,
+            out,
+        );
         return;
     }
 
@@ -6951,7 +6952,10 @@ fn classify_error(node: Node, text: &str, state: &mut CollectState) -> ErrorClas
         });
     }
     if let Some(msg) = detect_consecutive_pipe(node, text) {
-        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic {
+            message: msg,
+            range,
+        });
     }
     if let Some(diag) = detect_mismatched_bracket(node, text) {
         return ErrorClassification::Whole(diag);
@@ -6960,7 +6964,10 @@ fn classify_error(node: Node, text: &str, state: &mut CollectState) -> ErrorClas
         return ErrorClassification::Whole(diag);
     }
     if let Some(msg) = detect_fat_arrow(node, text) {
-        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic { message: msg, range });
+        return ErrorClassification::Whole(ClassifiedSyntaxDiagnostic {
+            message: msg,
+            range,
+        });
     }
 
     // Delimiter scan: produces zero or more per-fault diagnostics. An
@@ -7002,11 +7009,7 @@ fn classify_via_delimiter_scan(
     // the error subtree, recursing up to two levels deep into nested
     // ERROR children (matches the two-level wrapping pattern tree-sitter
     // uses for closer-runs like `}}}` — see Task 5 probe finding).
-    fn find_node_by_byte<'a>(
-        root: Node<'a>,
-        target: usize,
-        depth: usize,
-    ) -> Option<Node<'a>> {
+    fn find_node_by_byte<'a>(root: Node<'a>, target: usize, depth: usize) -> Option<Node<'a>> {
         if depth > 2 {
             return None;
         }
@@ -7050,10 +7053,7 @@ fn classify_via_delimiter_scan(
                             ev.row,
                             byte_offset_to_utf16_column(line, start_col_byte),
                         ),
-                        end: Position::new(
-                            ev.row,
-                            byte_offset_to_utf16_column(line, end_col_byte),
-                        ),
+                        end: Position::new(ev.row, byte_offset_to_utf16_column(line, end_col_byte)),
                     },
                 });
             }
@@ -7079,10 +7079,7 @@ fn classify_via_delimiter_scan(
                             ev.row,
                             byte_offset_to_utf16_column(line, start_col_byte),
                         ),
-                        end: Position::new(
-                            ev.row,
-                            byte_offset_to_utf16_column(line, end_col_byte),
-                        ),
+                        end: Position::new(ev.row, byte_offset_to_utf16_column(line, end_col_byte)),
                     },
                 });
                 // Task 7 reads `covered_openers` from the MISSING-handling branch of
@@ -7105,8 +7102,7 @@ fn classify_via_delimiter_scan(
         for (i, item) in stack.iter().enumerate() {
             let line = text.lines().nth(item.row as usize).unwrap_or("");
             let line_start = line_start_byte(text, item.row as usize);
-            let start_col_utf16 =
-                byte_offset_to_utf16_column(line, item.start_byte - line_start);
+            let start_col_utf16 = byte_offset_to_utf16_column(line, item.start_byte - line_start);
 
             // Next opener at a later byte on the SAME row
             let next_on_row = (i + 1..stack.len())
@@ -7233,7 +7229,10 @@ fn detect_mismatched_bracket(node: Node, text: &str) -> Option<ClassifiedSyntaxD
         let leading_ws = child_raw.len() - child_raw.trim_start().len();
         let closer_start_byte = child.start_byte() + leading_ws;
         let closer_end_byte = closer_start_byte + child_text.len();
-        let row = text[..closer_start_byte].bytes().filter(|&b| b == b'\n').count() as u32;
+        let row = text[..closer_start_byte]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count() as u32;
         let line = text.lines().nth(row as usize).unwrap_or("");
         let line_start = line_start_byte(text, row as usize);
         let start_col = byte_offset_to_utf16_column(line, closer_start_byte - line_start);
@@ -7280,12 +7279,10 @@ fn detect_mismatched_via_structural_parent(
 
     // Parent's first delimiter child is the opener.
     let mut cursor = parent.walk();
-    let opener = parent
-        .children(&mut cursor)
-        .find(|n| {
-            let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
-            matches!(t, "(" | "{" | "[" | "[[")
-        })?;
+    let opener = parent.children(&mut cursor).find(|n| {
+        let t = text.get(n.start_byte()..n.end_byte()).unwrap_or("");
+        matches!(t, "(" | "{" | "[" | "[[")
+    })?;
     let opener_text = text.get(opener.start_byte()..opener.end_byte())?;
     let opener_kind = DelimiterKind::from_opener(opener_text)?;
 
@@ -7536,7 +7533,8 @@ mod syntax_error_range_tests {
                 )
             });
         assert_eq!(
-            missing_close.range.start.line, 0,
+            missing_close.range.start.line,
+            0,
             "Unclosed `(` diagnostic should anchor on line 0 (the line with the \
              unclosed `(`), got line {}. Full range: ({},{})..({},{})",
             missing_close.range.start.line,
@@ -8218,9 +8216,7 @@ mod syntax_error_range_tests {
         let code = "x |> |> y";
         let diags = collect(code);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("Consecutive pipe")),
+            diags.iter().any(|d| d.message.contains("Consecutive pipe")),
             "should emit 'Consecutive pipe' message, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -8284,7 +8280,9 @@ mod syntax_error_range_tests {
         let code = "1 > > 2";
         let diags = collect(code);
         assert!(
-            diags.iter().all(|d| !d.message.contains("no `=>` operator")),
+            diags
+                .iter()
+                .all(|d| !d.message.contains("no `=>` operator")),
             "non-`=>` errors must not be misclassified as fat-arrow, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -8310,7 +8308,9 @@ mod syntax_error_range_tests {
         let code = "x = > 1";
         let diags = collect(code);
         assert!(
-            diags.iter().all(|d| !d.message.contains("no `=>` operator")),
+            diags
+                .iter()
+                .all(|d| !d.message.contains("no `=>` operator")),
             "spaced `= >` must not be misclassified as fat-arrow, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -8322,7 +8322,9 @@ mod syntax_error_range_tests {
         let code = "x =\n> 1";
         let diags = collect(code);
         assert!(
-            diags.iter().all(|d| !d.message.contains("no `=>` operator")),
+            diags
+                .iter()
+                .all(|d| !d.message.contains("no `=>` operator")),
             "newline-separated `= ... >` must not be misclassified as fat-arrow, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -9377,7 +9379,9 @@ mod syntax_error_range_tests {
 
     fn first_missing(tree: &tree_sitter::Tree) -> Option<tree_sitter::Node<'_>> {
         fn walk<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
-            if n.is_missing() { return Some(n); }
+            if n.is_missing() {
+                return Some(n);
+            }
             let mut c = n.walk();
             for child in n.children(&mut c) {
                 if let Some(m) = walk(child) {
@@ -9563,7 +9567,11 @@ mod syntax_error_range_tests {
     fn scan_stray_close_brace() {
         let diags = run_scan("x <- 1\n}\n");
         assert_eq!(diags.len(), 1);
-        assert!(diags[0].0.contains("Missing opening `{`"), "got: {}", diags[0].0);
+        assert!(
+            diags[0].0.contains("Missing opening `{`"),
+            "got: {}",
+            diags[0].0
+        );
         assert_eq!(diags[0].1.start.line, 1);
         assert_eq!(diags[0].1.start.character, 0);
         assert_eq!(diags[0].1.end.character, 1);
@@ -9898,7 +9906,11 @@ mod syntax_error_range_tests {
             .iter()
             .filter(|d| d.message.contains("Unclosed `(`"))
             .collect();
-        assert_eq!(unclosed.len(), 3, "expected 3 Unclosed ( diagnostics, got: {diags:?}");
+        assert_eq!(
+            unclosed.len(),
+            3,
+            "expected 3 Unclosed ( diagnostics, got: {diags:?}"
+        );
         let mut sorted = unclosed.clone();
         sorted.sort_by_key(|d| d.range.start.character);
         // Non-overlapping per spec: cols 1..3, 3..5, 5..6
@@ -9919,13 +9931,16 @@ mod syntax_error_range_tests {
             .iter()
             .filter(|d| d.message.contains("Missing opening `{`"))
             .collect();
-        assert_eq!(stray.len(), 1, "expected exactly one Missing opening `{{` diagnostic, got: {diags:?}");
+        assert_eq!(
+            stray.len(),
+            1,
+            "expected exactly one Missing opening `{{` diagnostic, got: {diags:?}"
+        );
         // The `}` is on line 0 at col 4
         assert_eq!(stray[0].range.start.line, 0);
         assert_eq!(stray[0].range.start.character, 4);
         assert_eq!(stray[0].range.end.character, 5);
     }
-
 }
 
 #[cfg(test)]
@@ -9954,11 +9969,7 @@ mod invalid_assignment_target_tests {
     }
 
     #[track_caller]
-    fn assert_one_with_severity(
-        code: &str,
-        expected: DiagnosticSeverity,
-        expect_substr: &str,
-    ) {
+    fn assert_one_with_severity(code: &str, expected: DiagnosticSeverity, expect_substr: &str) {
         let diags = collect(code);
         assert_eq!(
             diags.len(),
@@ -9982,8 +9993,6 @@ mod invalid_assignment_target_tests {
             "expected no diagnostics for `{code}`, got {diags:?}"
         );
     }
-
-
 
     // ---- LHS literals on `<-` ------------------------------------------------
 
@@ -10049,11 +10058,7 @@ mod invalid_assignment_target_tests {
             DiagnosticSeverity::WARNING,
             "string literal",
         );
-        assert_one_with_severity(
-            "'foo' <- 1",
-            DiagnosticSeverity::WARNING,
-            "string literal",
-        );
+        assert_one_with_severity("'foo' <- 1", DiagnosticSeverity::WARNING, "string literal");
         assert_one_with_severity(
             "1 -> \"foo\"",
             DiagnosticSeverity::WARNING,
@@ -10136,21 +10141,9 @@ mod invalid_assignment_target_tests {
     fn dots_lhs_flagged_as_warning() {
         // R accepts these but the binding is unreachable through the usual
         // `...` / `..N` accessors — almost certainly unintended.
-        assert_one_with_severity(
-            "... <- 1",
-            DiagnosticSeverity::WARNING,
-            "can't be reached",
-        );
-        assert_one_with_severity(
-            "..1 <- 1",
-            DiagnosticSeverity::WARNING,
-            "can't be reached",
-        );
-        assert_one_with_severity(
-            "..10 <- 1",
-            DiagnosticSeverity::WARNING,
-            "can't be reached",
-        );
+        assert_one_with_severity("... <- 1", DiagnosticSeverity::WARNING, "can't be reached");
+        assert_one_with_severity("..1 <- 1", DiagnosticSeverity::WARNING, "can't be reached");
+        assert_one_with_severity("..10 <- 1", DiagnosticSeverity::WARNING, "can't be reached");
     }
 
     // ---- Other assignment operators -----------------------------------------
@@ -10356,7 +10349,6 @@ mod invalid_assignment_target_tests {
         assert_eq!(diags[0].range.start.character, 7);
         assert_eq!(diags[0].range.end.character, 11);
     }
-
 }
 
 /// Regression guard: semantic-warning rules must fire through `diagnostics_from_snapshot`
@@ -10381,7 +10373,9 @@ mod semantic_warning_pipeline_tests {
             enabled: false,
             ..LintConfig::default()
         };
-        state.documents.insert(uri.clone(), Document::new(code, None));
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
         (snapshot, uri)
     }
@@ -10666,20 +10660,13 @@ fn collect_invalid_assignment_targets_inner(
 /// `# nolint: line_length` for an unrelated style lint would be a
 /// surprise; restricting to `@lsp-ignore` keeps the suppression channel
 /// the same one the rest of `handlers.rs` uses.
-fn lsp_ignored_lines_from_tree(
-    root: Node<'_>,
-    text: &str,
-) -> std::collections::HashSet<u32> {
+fn lsp_ignored_lines_from_tree(root: Node<'_>, text: &str) -> std::collections::HashSet<u32> {
     let mut out = std::collections::HashSet::new();
     visit_comments_for_ignore(root, text, &mut out);
     out
 }
 
-fn visit_comments_for_ignore(
-    node: Node<'_>,
-    text: &str,
-    out: &mut std::collections::HashSet<u32>,
-) {
+fn visit_comments_for_ignore(node: Node<'_>, text: &str, out: &mut std::collections::HashSet<u32>) {
     if node.kind() == "comment" {
         classify_comment_for_ignore(node, text, out);
         // Comments have no AST children we care about.
@@ -10755,7 +10742,8 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
         None => Some(LspIgnoreKind::SameLine),
         Some(b) if b.is_ascii_alphanumeric() || *b == b'_' => None,
         Some(_) => {
-            let suffix = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
+            let suffix =
+                rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
             if suffix.starts_with("next") {
                 Some(LspIgnoreKind::NextLine)
             } else {
@@ -10764,7 +10752,6 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
         }
     }
 }
-
 
 fn check_invalid_assignment_target(
     binop: Node,
@@ -11229,7 +11216,11 @@ fn is_package_export(
 /// populates), but `ScopeStream::is_visible` only consults the symbol
 /// set, so the out-of-scope path needs this explicit guard.
 fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
-    if snapshot.scope_contribution.test_attached_packages.is_empty() {
+    if snapshot
+        .scope_contribution
+        .test_attached_packages
+        .is_empty()
+    {
         return Vec::new();
     }
     let Some(root) = snapshot.scope_contribution.workspace_root.as_ref() else {
@@ -15561,7 +15552,7 @@ mod tests {
         assert_eq!(
             decode_rmd_tokens(rmd),
             vec![
-                (1, 0, 7), // `library` in the first chunk
+                (1, 0, 7),  // `library` in the first chunk
                 (7, 10, 4), // `head` in the second chunk
             ],
         );
@@ -18779,7 +18770,10 @@ clean_data <- function(x) {
             "only the outer top-level orphan `else` should fire, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        assert_eq!(diagnostics[0].range.start.line, 2, "outer else is on line 2");
+        assert_eq!(
+            diagnostics[0].range.start.line, 2,
+            "outer else is on line 2"
+        );
     }
 
     // ========================================================================
@@ -21945,7 +21939,10 @@ result <- data %>% filter(x > 0)
 
         // Position 0, char 25 — inside the prose `library(` fragment.
         let result = super::completion(&state, &uri, Position::new(0, 25), None);
-        assert!(result.is_none(), "Rmd should yield no R completions on prose");
+        assert!(
+            result.is_none(),
+            "Rmd should yield no R completions on prose"
+        );
     }
 
     #[test]
@@ -21954,13 +21951,15 @@ result <- data %>% filter(x > 0)
         // every non-R line from surfacing as a syntax error.
         use crate::state::{Document, WorldState};
 
-        let prose_with_chunk = "# A heading\n\nSome prose with [a link](url).\n\n```{r}\nx <- 1\n```\n";
+        let prose_with_chunk =
+            "# A heading\n\nSome prose with [a link](url).\n\n```{r}\nx <- 1\n```\n";
         let uri = Url::parse("file:///doc.Rmd").unwrap();
         let mut state = WorldState::new(vec![]);
         state.cross_file_config.diagnostics_enabled = true;
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(prose_with_chunk, None, &uri));
+        state.documents.insert(
+            uri.clone(),
+            Document::new_with_uri(prose_with_chunk, None, &uri),
+        );
 
         let diags = super::diagnostics(&state, &uri, &DiagCancelToken::never());
         assert!(
@@ -40595,8 +40594,7 @@ x <- 1
         // x is defined on file line 3 (the trailing newline after `x` puts the
         // definition on row 2, 1-indexed = 3).
         assert_eq!(
-            diagnostics[0].message,
-            "Undefined variable: x (defined later on line 3)",
+            diagnostics[0].message, "Undefined variable: x (defined later on line 3)",
             "Forward reference should mention the definition line",
         );
     }
@@ -40642,8 +40640,7 @@ greet <- function() \"hi\"
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
         );
         assert_eq!(
-            greet_diags[0].message,
-            "Undefined variable: greet (defined later on line 3)",
+            greet_diags[0].message, "Undefined variable: greet (defined later on line 3)",
             "Forward reference to a function must mention the definition line",
         );
     }
@@ -40689,8 +40686,7 @@ g <- \\(x) x + 1
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
         );
         assert_eq!(
-            g_diags[0].message,
-            "Undefined variable: g (defined later on line 3)",
+            g_diags[0].message, "Undefined variable: g (defined later on line 3)",
             "Forward reference to a `\\()` lambda must mention the \
              definition line, same as `function() ...`",
         );
@@ -40786,8 +40782,7 @@ x <- 2
             .collect();
         assert_eq!(x_diags.len(), 1, "Should have one forward-ref diagnostic");
         assert_eq!(
-            x_diags[0].message,
-            "Undefined variable: x (defined later on line 3)",
+            x_diags[0].message, "Undefined variable: x (defined later on line 3)",
             "Must cite the earliest later definition (line 3, 1-indexed), \
              not the last reassignment (line 4)",
         );
@@ -47364,4 +47359,3 @@ mod issue_149_utf16_handlers {
         assert_eq!(parsed, vec!["`weird name`".to_string(), "pkg".to_string()]);
     }
 }
-

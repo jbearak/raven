@@ -76,9 +76,7 @@ fn visit(
 ) {
     match node.kind() {
         "binary_operator" => check_assignment(node, text, styles, severity, suppressions, out),
-        "function_definition" => {
-            check_parameters(node, text, styles, severity, suppressions, out)
-        }
+        "function_definition" => check_parameters(node, text, styles, severity, suppressions, out),
         _ => {}
     }
 
@@ -145,7 +143,16 @@ fn check_assignment(
         SymbolKind::Variable
     };
 
-    report_if_bad(target, name, kind, style_for(kind, styles), text, severity, suppressions, out);
+    report_if_bad(
+        target,
+        name,
+        kind,
+        style_for(kind, styles),
+        text,
+        severity,
+        suppressions,
+        out,
+    );
 }
 
 /// Check formal arguments of a `function_definition` node.
@@ -246,7 +253,9 @@ fn report_if_bad(
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
         code: Some(NumberOrString::String(rule_ids::OBJECT_NAME.to_string())),
-        message: format!("{kind_label} name `{name}` does not match the {scheme_label} naming style."),
+        message: format!(
+            "{kind_label} name `{name}` does not match the {scheme_label} naming style."
+        ),
         ..Default::default()
     });
 }
@@ -314,28 +323,84 @@ fn should_skip_name(name: &str, kind: SymbolKind) -> bool {
 fn is_known_s3_generic(name: &str) -> bool {
     // Sorted alphabetically so `binary_search` works.
     const GENERICS: &[&str] = &[
-        "AIC", "BIC", "Complex", "Math", "Ops", "Summary",
-        "all.equal", "anova", "as.Date", "as.POSIXct", "as.POSIXlt",
-        "as.character", "as.data.frame", "as.double", "as.environment",
-        "as.factor", "as.function", "as.integer", "as.list", "as.logical",
-        "as.matrix", "as.numeric", "as.vector",
-        "c", "cbind", "coef", "coefficients", "confint",
-        "deviance", "dim", "dimnames",
-        "fitted", "fitted.values", "format", "formula",
+        "AIC",
+        "BIC",
+        "Complex",
+        "Math",
+        "Ops",
+        "Summary",
+        "all.equal",
+        "anova",
+        "as.Date",
+        "as.POSIXct",
+        "as.POSIXlt",
+        "as.character",
+        "as.data.frame",
+        "as.double",
+        "as.environment",
+        "as.factor",
+        "as.function",
+        "as.integer",
+        "as.list",
+        "as.logical",
+        "as.matrix",
+        "as.numeric",
+        "as.vector",
+        "c",
+        "cbind",
+        "coef",
+        "coefficients",
+        "confint",
+        "deviance",
+        "dim",
+        "dimnames",
+        "fitted",
+        "fitted.values",
+        "format",
+        "formula",
         "head",
-        "is.character", "is.data.frame", "is.double", "is.environment",
-        "is.factor", "is.function", "is.integer", "is.list", "is.logical",
-        "is.matrix", "is.numeric", "is.vector",
-        "labels", "length", "levels", "logLik",
-        "mean", "merge",
-        "names", "nobs",
-        "plot", "predict", "print",
-        "range", "rbind", "residuals", "rev",
-        "simulate", "sort", "split", "str", "subset", "summary",
-        "t", "tail", "terms", "toString", "transform",
+        "is.character",
+        "is.data.frame",
+        "is.double",
+        "is.environment",
+        "is.factor",
+        "is.function",
+        "is.integer",
+        "is.list",
+        "is.logical",
+        "is.matrix",
+        "is.numeric",
+        "is.vector",
+        "labels",
+        "length",
+        "levels",
+        "logLik",
+        "mean",
+        "merge",
+        "names",
+        "nobs",
+        "plot",
+        "predict",
+        "print",
+        "range",
+        "rbind",
+        "residuals",
+        "rev",
+        "simulate",
+        "sort",
+        "split",
+        "str",
+        "subset",
+        "summary",
+        "t",
+        "tail",
+        "terms",
+        "toString",
+        "transform",
         "unique",
         "vcov",
-        "with", "within",
+        "with",
+        "within",
     ];
     GENERICS.binary_search(&name).is_ok()
 }
@@ -368,9 +433,7 @@ fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
 
 fn is_snake_case(body: &str) -> bool {
     let bytes = body.as_bytes();
-    bytes
-        .first()
-        .is_some_and(|b| b.is_ascii_lowercase())
+    bytes.first().is_some_and(|b| b.is_ascii_lowercase())
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
@@ -378,17 +441,13 @@ fn is_snake_case(body: &str) -> bool {
 
 fn is_camel_case(body: &str) -> bool {
     let bytes = body.as_bytes();
-    bytes
-        .first()
-        .is_some_and(|b| b.is_ascii_lowercase())
+    bytes.first().is_some_and(|b| b.is_ascii_lowercase())
         && bytes.iter().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn is_dotted_case(body: &str) -> bool {
     let bytes = body.as_bytes();
-    bytes
-        .first()
-        .is_some_and(|b| b.is_ascii_lowercase())
+    bytes.first().is_some_and(|b| b.is_ascii_lowercase())
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.')
@@ -396,9 +455,7 @@ fn is_dotted_case(body: &str) -> bool {
 
 fn is_upper_case(body: &str) -> bool {
     let bytes = body.as_bytes();
-    bytes
-        .first()
-        .is_some_and(|b| b.is_ascii_uppercase())
+    bytes.first().is_some_and(|b| b.is_ascii_uppercase())
         && bytes
             .iter()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
@@ -406,9 +463,7 @@ fn is_upper_case(body: &str) -> bool {
 
 fn is_lowercase(body: &str) -> bool {
     let bytes = body.as_bytes();
-    bytes
-        .first()
-        .is_some_and(|b| b.is_ascii_lowercase())
+    bytes.first().is_some_and(|b| b.is_ascii_lowercase())
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
@@ -533,9 +588,15 @@ mod tests {
         // and exempts on the second.
         assert!(should_skip_name("as.Date.character", SymbolKind::Function));
         assert!(should_skip_name("as.numeric.foo", SymbolKind::Function));
-        assert!(should_skip_name("is.character.MyClass", SymbolKind::Function));
+        assert!(should_skip_name(
+            "is.character.MyClass",
+            SymbolKind::Function
+        ));
         assert!(should_skip_name("all.equal.default", SymbolKind::Function));
-        assert!(should_skip_name("fitted.values.MyModel", SymbolKind::Function));
+        assert!(should_skip_name(
+            "fitted.values.MyModel",
+            SymbolKind::Function
+        ));
         // Class names containing dots also work because the leftmost matching
         // generic wins.
         assert!(should_skip_name("print.data.frame", SymbolKind::Function));

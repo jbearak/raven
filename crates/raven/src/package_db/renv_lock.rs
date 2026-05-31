@@ -35,16 +35,16 @@ mod tests {
 
     #[test]
     fn reads_locked_package_names() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/package_db/renv.lock");
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package_db/renv.lock");
         let names = read_renv_lock_package_names(&path).unwrap();
         assert_eq!(names, vec!["dplyr".to_string(), "ggplot2".to_string()]);
     }
 
     #[test]
     fn missing_file_is_empty_not_error() {
-        let names = read_renv_lock_package_names(std::path::Path::new("/nonexistent/renv.lock"))
-            .unwrap();
+        let names =
+            read_renv_lock_package_names(std::path::Path::new("/nonexistent/renv.lock")).unwrap();
         assert!(names.is_empty());
     }
 }

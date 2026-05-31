@@ -998,7 +998,10 @@ mod tests {
             state.package_library_ready,
             "a library carrying Tier 3 providers must be marked ready"
         );
-        state.package_library.prefetch_packages(&[pkg.to_string()]).await;
+        state
+            .package_library
+            .prefetch_packages(&[pkg.to_string()])
+            .await;
         assert!(
             state
                 .package_library

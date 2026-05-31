@@ -33,7 +33,9 @@ pub(crate) fn collect(
                 },
                 severity: Some(severity),
                 source: Some(LINT_SOURCE.to_string()),
-                code: Some(NumberOrString::String(rule_ids::TRAILING_BLANK_LINES.to_string())),
+                code: Some(NumberOrString::String(
+                    rule_ids::TRAILING_BLANK_LINES.to_string(),
+                )),
                 message: "File should end with a newline.".to_string(),
                 ..Default::default()
             });
@@ -66,7 +68,9 @@ pub(crate) fn collect(
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
-        code: Some(NumberOrString::String(rule_ids::TRAILING_BLANK_LINES.to_string())),
+        code: Some(NumberOrString::String(
+            rule_ids::TRAILING_BLANK_LINES.to_string(),
+        )),
         message: if trailing == 1 {
             "Trailing blank line at end of file.".to_string()
         } else {

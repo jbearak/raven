@@ -215,7 +215,8 @@ pub fn run(args: LintArgs) -> i32 {
         &serde_json::Value::Object(Default::default()),
         project_settings.as_ref(),
     );
-    let lint_config = crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
+    let lint_config =
+        crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
     let base_section = merged.get("linting").cloned().unwrap_or(json!({}));
     let overrides = crate::config_file::compile_lint_overrides(&merged, &root);
 
@@ -286,12 +287,8 @@ fn walk(
         let abs_path = absolute_path(root, path);
         let uri = tower_lsp::lsp_types::Url::from_file_path(&abs_path)
             .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///").unwrap());
-        let effective = crate::config_file::resolve_lint_for_document(
-            base_lint,
-            base_section,
-            overrides,
-            &uri,
-        );
+        let effective =
+            crate::config_file::resolve_lint_for_document(base_lint, base_section, overrides, &uri);
         // Decode through the shared BOM-aware seam so `raven lint` reads files
         // identically to the workspace scan and `raven check` (UTF-8 BOM
         // stripped, UTF-16 BOM decoded).
@@ -404,8 +401,7 @@ mod tests {
 
     #[test]
     fn parse_max_severity_warning() {
-        let args =
-            parse_args(["--max-severity", "warning"].iter().map(|s| s.to_string())).unwrap();
+        let args = parse_args(["--max-severity", "warning"].iter().map(|s| s.to_string())).unwrap();
         assert_eq!(args.max_severity, SeverityLevel::Warning);
     }
 
@@ -441,7 +437,10 @@ mod tests {
         let (root, settings, lintr_discovered) =
             resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
         assert_eq!(root, tmp.path().to_path_buf());
-        assert!(settings.is_some(), "a discovered .lintr yields project settings");
+        assert!(
+            settings.is_some(),
+            "a discovered .lintr yields project settings"
+        );
         assert!(
             lintr_discovered,
             "a discovered .lintr must set lintr_discovered so Auto resolution opts in"
@@ -457,7 +456,10 @@ mod tests {
         let (root, settings, lintr_discovered) =
             resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
         assert_eq!(root, tmp.path().to_path_buf());
-        assert!(settings.is_some(), "a discovered raven.toml yields project settings");
+        assert!(
+            settings.is_some(),
+            "a discovered raven.toml yields project settings"
+        );
         assert!(
             !lintr_discovered,
             "raven.toml is not a .lintr, so lintr_discovered must stay false"
@@ -494,18 +496,26 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("sub")).unwrap();
         fs::create_dir(tmp.path().join("pkg")).unwrap();
-        fs::write(tmp.path().join("pkg/raven.toml"), "[linting]\nenabled = true\n").unwrap();
+        fs::write(
+            tmp.path().join("pkg/raven.toml"),
+            "[linting]\nenabled = true\n",
+        )
+        .unwrap();
 
         // An absolute --config that routes through `sub/..`: the `..` must not
         // survive into `root`, or the purely lexical `strip_prefix(root)` in
         // `resolve_lint_for_document` would drop every override for a file given
         // by its (normalized) absolute path under the pkg root.
-        let dotted = tmp.path().join("sub").join("..").join("pkg").join("raven.toml");
+        let dotted = tmp
+            .path()
+            .join("sub")
+            .join("..")
+            .join("pkg")
+            .join("raven.toml");
         let mut args = discovery_args();
         args.config_path = Some(dotted);
 
-        let (root, _settings, lintr_discovered) =
-            resolve_lint_config(tmp.path(), &args).unwrap();
+        let (root, _settings, lintr_discovered) = resolve_lint_config(tmp.path(), &args).unwrap();
         assert!(!lintr_discovered);
         assert!(
             !root.components().any(|c| matches!(
@@ -514,7 +524,10 @@ mod tests {
             )),
             "root still carries . / .. components: {root:?}"
         );
-        assert!(root.ends_with("pkg"), "expected the pkg dir as root, got {root:?}");
+        assert!(
+            root.ends_with("pkg"),
+            "expected the pkg dir as root, got {root:?}"
+        );
     }
 
     #[test]
@@ -618,7 +631,11 @@ mod tests {
 
     /// Args that lint one file with `enabled` linting, sharing the boilerplate
     /// the encoding tests need (`walk` requires a parsed config + overrides).
-    fn lint_one(root: &Path, file: &Path, settings: &serde_json::Value) -> (Vec<(PathBuf, Diagnostic)>, bool) {
+    fn lint_one(
+        root: &Path,
+        file: &Path,
+        settings: &serde_json::Value,
+    ) -> (Vec<(PathBuf, Diagnostic)>, bool) {
         let base_lint = crate::backend::parse_lint_config(settings, false).unwrap();
         let base_section = settings.get("linting").cloned().unwrap();
         let overrides = crate::config_file::compile_lint_overrides(settings, root);
@@ -659,7 +676,11 @@ mod tests {
             !operator_error,
             "a mis-encoded file is a property of the code, not an operator error"
         );
-        assert_eq!(diags.len(), 1, "expected exactly one encoding finding, got {diags:?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one encoding finding, got {diags:?}"
+        );
         let d = &diags[0].1;
         assert_eq!(
             d.severity,
@@ -691,7 +712,9 @@ mod tests {
 
         assert!(!operator_error);
         assert!(
-            !diags.iter().any(|(_, d)| d.message.contains("characters long")),
+            !diags
+                .iter()
+                .any(|(_, d)| d.message.contains("characters long")),
             "BOM must be stripped before line-length measurement; got {diags:?}"
         );
     }

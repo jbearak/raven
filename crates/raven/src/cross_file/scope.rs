@@ -4213,28 +4213,34 @@ pub(crate) fn append_package_contribution(
     // `PackageScopeContribution` propagates kind metadata, use it here.
     for sym in contrib.r_internal_symbols.iter() {
         let name: Arc<str> = Arc::from(sym.as_str());
-        scope.symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
-            name,
-            kind: SymbolKind::Variable,
-            source_uri: pkg_uri.clone(),
-            defined_line: 0,
-            defined_column: 0,
-            signature: None,
-            is_declared: false,
-        });
+        scope
+            .symbols
+            .entry(name.clone())
+            .or_insert_with(|| ScopedSymbol {
+                name,
+                kind: SymbolKind::Variable,
+                source_uri: pkg_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+                is_declared: false,
+            });
     }
 
     for sym in contrib.imported_symbols.keys() {
         let name: Arc<str> = Arc::from(sym.as_str());
-        scope.symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
-            name,
-            kind: SymbolKind::Variable,
-            source_uri: pkg_uri.clone(),
-            defined_line: 0,
-            defined_column: 0,
-            signature: None,
-            is_declared: false,
-        });
+        scope
+            .symbols
+            .entry(name.clone())
+            .or_insert_with(|| ScopedSymbol {
+                name,
+                kind: SymbolKind::Variable,
+                source_uri: pkg_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+                is_declared: false,
+            });
     }
 
     // Test-only contributions: only inject when the queried file is under
@@ -4279,15 +4285,18 @@ pub(crate) fn append_package_contribution(
             }
             for sym in syms.iter() {
                 let name: Arc<str> = Arc::from(sym.as_str());
-                scope.symbols.entry(name.clone()).or_insert_with(|| ScopedSymbol {
-                    name,
-                    kind: SymbolKind::Variable,
-                    source_uri: pkg_uri.clone(),
-                    defined_line: 0,
-                    defined_column: 0,
-                    signature: None,
-                    is_declared: false,
-                });
+                scope
+                    .symbols
+                    .entry(name.clone())
+                    .or_insert_with(|| ScopedSymbol {
+                        name,
+                        kind: SymbolKind::Variable,
+                        source_uri: pkg_uri.clone(),
+                        defined_line: 0,
+                        defined_column: 0,
+                        signature: None,
+                        is_declared: false,
+                    });
             }
         }
         for pkg in contrib.test_attached_packages.iter() {

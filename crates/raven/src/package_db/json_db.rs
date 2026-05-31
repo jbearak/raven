@@ -116,7 +116,11 @@ pub struct RepoDbProvider {
 
 impl RepoDbProvider {
     pub fn from_db(db: RepoDb) -> Self {
-        let by_name = db.packages.into_iter().map(|r| (r.name.clone(), r)).collect();
+        let by_name = db
+            .packages
+            .into_iter()
+            .map(|r| (r.name.clone(), r))
+            .collect();
         Self { by_name }
     }
 
@@ -153,8 +157,20 @@ mod tests {
             },
             // intentionally out of order to prove the writer sorts.
             packages: vec![
-                PackageRecord { name: "dplyr".into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] },
-                PackageRecord { name: "cli".into(), version: "3.6.2".into(), exports: vec!["cli_alert".into()], depends: vec![], lazy_data: vec![] },
+                PackageRecord {
+                    name: "dplyr".into(),
+                    version: "1.1.4".into(),
+                    exports: vec!["mutate".into()],
+                    depends: vec![],
+                    lazy_data: vec![],
+                },
+                PackageRecord {
+                    name: "cli".into(),
+                    version: "3.6.2".into(),
+                    exports: vec!["cli_alert".into()],
+                    depends: vec![],
+                    lazy_data: vec![],
+                },
             ],
         }
     }

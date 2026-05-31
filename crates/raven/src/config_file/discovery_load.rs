@@ -70,7 +70,10 @@ mod tests {
     #[test]
     fn none_when_no_config() {
         let tmp = TempDir::new().unwrap();
-        assert!(matches!(discover_and_load(tmp.path()), DiscoveredLoad::None));
+        assert!(matches!(
+            discover_and_load(tmp.path()),
+            DiscoveredLoad::None
+        ));
     }
 
     #[test]

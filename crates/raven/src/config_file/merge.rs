@@ -46,7 +46,10 @@ mod tests {
     fn project_overrides_client_at_leaf() {
         let client = json!({ "linting": { "lineLength": 80 } });
         let project = json!({ "linting": { "lineLength": 120 } });
-        assert_eq!(merge(&client, Some(&project)), json!({ "linting": { "lineLength": 120 } }));
+        assert_eq!(
+            merge(&client, Some(&project)),
+            json!({ "linting": { "lineLength": 120 } })
+        );
     }
 
     #[test]
@@ -72,7 +75,10 @@ mod tests {
         let client = json!({ "packages": { "additionalLibraryPaths": ["/a"] } });
         let project = json!({ "packages": { "additionalLibraryPaths": ["/b", "/c"] } });
         let merged = merge(&client, Some(&project));
-        assert_eq!(merged["packages"]["additionalLibraryPaths"], json!(["/b", "/c"]));
+        assert_eq!(
+            merged["packages"]["additionalLibraryPaths"],
+            json!(["/b", "/c"])
+        );
     }
 
     #[test]

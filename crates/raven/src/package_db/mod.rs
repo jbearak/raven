@@ -112,7 +112,8 @@ pub fn write_base_exports_file(
 /// `.await` on the build. Lives here (not in a test submodule) so both
 /// `package_db` and `package_library` tests can share the one instance.
 #[cfg(test)]
-pub(crate) static RAVEN_NAMES_DB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static RAVEN_NAMES_DB_ENV_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -134,8 +135,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("base-exports.json");
         let records = vec![
-            PackageRecord { name: "datasets".into(), version: "4.4.0".into(), exports: vec![], depends: vec![], lazy_data: vec!["mtcars".into()] },
-            PackageRecord { name: "dplyr".into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] },
+            PackageRecord {
+                name: "datasets".into(),
+                version: "4.4.0".into(),
+                exports: vec![],
+                depends: vec![],
+                lazy_data: vec!["mtcars".into()],
+            },
+            PackageRecord {
+                name: "dplyr".into(),
+                version: "1.1.4".into(),
+                exports: vec!["mutate".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            },
         ];
         write_base_exports_file(&path, &records).unwrap();
         let db = crate::package_db::json_db::read_repo_db_file(&path).unwrap();

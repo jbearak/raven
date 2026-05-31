@@ -55,7 +55,13 @@ mod tests {
     fn widths(text: &str, max_len: u32) -> Vec<u32> {
         let suppressions = Suppressions::from_text(text);
         let mut out = Vec::new();
-        collect(text, max_len, DiagnosticSeverity::WARNING, &suppressions, &mut out);
+        collect(
+            text,
+            max_len,
+            DiagnosticSeverity::WARNING,
+            &suppressions,
+            &mut out,
+        );
         out.into_iter().map(|d| d.range.end.character).collect()
     }
 

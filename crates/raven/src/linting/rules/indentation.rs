@@ -202,12 +202,7 @@ fn set_expectations(
     }
 }
 
-fn set_braced(
-    node: Node<'_>,
-    lines: &[&str],
-    indent_unit: u32,
-    out: &mut HashMap<u32, Expected>,
-) {
+fn set_braced(node: Node<'_>, lines: &[&str], indent_unit: u32, out: &mut HashMap<u32, Expected>) {
     let Some(opener) = node.child_by_field_name("open") else {
         return;
     };
@@ -268,8 +263,7 @@ fn set_bracketed(
     // comments before making the same decision; do likewise here so we don't
     // silently accept aligned-style indent in code where the opener carries
     // no code argument.
-    let has_content_after_opener =
-        first_non_whitespace_is_code(after_opener);
+    let has_content_after_opener = first_non_whitespace_is_code(after_opener);
 
     let primary = opener_indent.saturating_add(indent_unit);
     let aligned = opener_end_col;
@@ -656,7 +650,10 @@ mod tests {
         let hanging = "x <- f() |>\n  g() + y +\n  z\n";
         let aligned = "x <- f() |>\n     g() + y +\n     z\n";
         assert!(lint(hanging, 2).is_empty(), "hanging style should pass");
-        assert!(lint(aligned, 2).is_empty(), "subchain-aligned style should pass");
+        assert!(
+            lint(aligned, 2).is_empty(),
+            "subchain-aligned style should pass"
+        );
     }
 
     #[test]

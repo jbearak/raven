@@ -100,11 +100,19 @@ pub fn write_shipped_db(
         let offset = payload.len() as u64;
         let len = bytes.len() as u32;
         payload.extend_from_slice(&bytes);
-        index.push(IndexEntry { name: rec.name.clone(), offset, len });
+        index.push(IndexEntry {
+            name: rec.name.clone(),
+            offset,
+            len,
+        });
     }
 
     let payload_checksum = blake3::hash(&payload).to_hex().to_string();
-    let header = ShippedDbHeader { provenance, payload_checksum, index };
+    let header = ShippedDbHeader {
+        provenance,
+        payload_checksum,
+        index,
+    };
     let header_bytes = postcard::to_stdvec(&header)?;
 
     let mut out: Vec<u8> = Vec::with_capacity(16 + header_bytes.len() + payload.len());
@@ -178,9 +186,8 @@ impl ShippedDb {
                 "header length exceeds file size".into(),
             ));
         }
-        let header: ShippedDbHeader =
-            postcard::from_bytes(&mmap[header_start..payload_start])
-                .map_err(|e| ShippedDbError::Corrupt(format!("header decode: {e}")))?;
+        let header: ShippedDbHeader = postcard::from_bytes(&mmap[header_start..payload_start])
+            .map_err(|e| ShippedDbError::Corrupt(format!("header decode: {e}")))?;
 
         let payload = &mmap[payload_start..];
         let actual = blake3::hash(payload).to_hex().to_string();
@@ -236,7 +243,9 @@ impl ShippedDb {
     /// own name. Index bounds are validated at `open`, so the checked arithmetic
     /// here is defense-in-depth.
     fn decode_at(&self, name: &str, offset: u64, len: u32) -> Option<PackageRecord> {
-        let start = self.payload_start.checked_add(usize::try_from(offset).ok()?)?;
+        let start = self
+            .payload_start
+            .checked_add(usize::try_from(offset).ok()?)?;
         let end = start.checked_add(len as usize)?;
         let slice = self.mmap.get(start..end)?;
         match postcard::from_bytes::<PackageRecord>(slice) {
@@ -415,7 +424,9 @@ mod tests {
         std::fs::write(&path, &out).unwrap();
 
         match ShippedDb::open(&path) {
-            Err(ShippedDbError::Corrupt(msg)) => assert!(msg.contains("out of bounds"), "got {msg}"),
+            Err(ShippedDbError::Corrupt(msg)) => {
+                assert!(msg.contains("out of bounds"), "got {msg}")
+            }
             other => panic!("expected Corrupt(out of bounds), got {other:?}"),
         }
     }
