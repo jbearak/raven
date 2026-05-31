@@ -1,6 +1,7 @@
 target/
 node_modules
 dist/
+runiverse/
 out/
 *.vsix
 .vscode-test/
@@ -14,4 +15,3 @@ bin/raven.exe
 .claude/worktrees
 
 scratch.R
-
