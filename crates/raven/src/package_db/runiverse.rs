@@ -12,17 +12,32 @@ use serde::Deserialize;
 
 use crate::package_db::model::{sorted_unique, PackageRecord};
 
+/// Deserialize a JSON array that may also be `null` (or absent) into a `Vec`.
+///
+/// r-universe's per-package endpoint emits an explicit `null` — not an omitted
+/// key or `[]` — for fields a package doesn't populate (e.g. `_datasets` on a
+/// package shipping no data). Plain `#[serde(default)]` only fills a *missing*
+/// key, so a `null` would fail with "invalid type: null, expected a sequence"
+/// and silently drop the whole package. Treat null/absent as empty.
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct RUniversePackage {
     #[serde(rename = "Package")]
     package: String,
     #[serde(rename = "Version", default)]
     version: String,
-    #[serde(rename = "_exports", default)]
+    #[serde(rename = "_exports", default, deserialize_with = "null_as_empty_vec")]
     exports: Vec<String>,
-    #[serde(rename = "_dependencies", default)]
+    #[serde(rename = "_dependencies", default, deserialize_with = "null_as_empty_vec")]
     dependencies: Vec<RUniverseDep>,
-    #[serde(rename = "_datasets", default)]
+    #[serde(rename = "_datasets", default, deserialize_with = "null_as_empty_vec")]
     datasets: Vec<RUniverseDataset>,
 }
 
@@ -101,5 +116,23 @@ mod tests {
         // Version is captured from the JSON "Version" field (drives the merge).
         assert_eq!(dplyr.version, "1.1.4");
         assert!(records.iter().any(|r| r.name == "ggplot2"));
+    }
+
+    #[test]
+    fn tolerates_explicit_null_array_fields() {
+        // r-universe's per-package endpoint returns `null` (not an omitted key
+        // or `[]`) for a package with no datasets/exports/dependencies. serde's
+        // `#[serde(default)]` only fills a *missing* key, not an explicit null,
+        // so a naive `Vec` field would fail to parse and silently drop the
+        // package. The shipped-DB build feeds this endpoint's raw JSON straight
+        // in, so null tolerance is load-bearing for coverage.
+        let rec = parse_runiverse_json(
+            r#"{"Package":"ympes","Version":"1.0","_exports":["foo"],"_dependencies":null,"_datasets":null}"#,
+        )
+        .unwrap();
+        assert_eq!(rec.name, "ympes");
+        assert_eq!(rec.exports, vec!["foo".to_string()]);
+        assert!(rec.depends.is_empty());
+        assert!(rec.lazy_data.is_empty());
     }
 }
