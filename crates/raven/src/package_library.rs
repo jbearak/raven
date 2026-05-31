@@ -494,7 +494,6 @@ impl PackageLibrary {
             if !cached.exports.is_empty() {
                 return false;
             }
-            return self.resolve_from_providers(package).is_none();
         }
         self.resolve_from_providers(package).is_none()
     }
