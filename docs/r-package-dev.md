@@ -245,6 +245,18 @@ visible to diagnostics and completions even before you run
 `devtools::document()` to regenerate `NAMESPACE`, and NAMESPACE-only
 imports remain visible if some `R/*.R` files don't carry roxygen tags.
 
+### Planned CI package database generation
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+For CI runs that should not compile or install R packages, the planned `raven packages freeze` command generates a repo-specific `.raven/packages.json` package-export database. Commit this file with your package so `raven check` can resolve imported package names in CI through the committed snapshot before falling back to Raven's bundled `names.db`.
+
+The default scope, `--used`, is intentionally inclusive for package projects. It includes packages referenced by `library()` / `require()` / `loadNamespace()` / `requireNamespace()`, namespace-qualified calls (`pkg::fun` and `pkg:::internal`, though internal object names are not resolved), packages listed in `renv.lock`, the package `DESCRIPTION` `Imports` and `Depends`, and transitive `Depends`. Use `--installed` or `--all` to capture every package available across the project and system libraries.
+
+Generation uses a renv-first library order. If the project has renv, Raven activates it and takes package records from the renv project library before falling back to system libraries. `renv.lock` is only a set selector: a package listed in the lockfile is included in the freeze set, but if it is not installed locally, Raven cannot freeze its exports and CI will fall through to Tier 3 for that package. Run `renv::restore()` before `raven packages freeze` for best coverage.
+
+Regenerating is safe in normal package-maintenance workflows: when the package content is unchanged, the command is a no-op and leaves `.raven/packages.json` untouched. Review diffs like any generated artifact; they should show package records or export names changing, not timestamp-only churn.
+
 ### Live Updates
 
 Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running `devtools::document()` or editing these files directly, diagnostics update automatically without restarting the editor.

@@ -64,6 +64,18 @@ Raven's analysis is static: it parses your code and your installed packages' `NA
 
 Run **Raven: Refresh package cache** after changing `.libPaths()` or running `renv::activate()` to re-run these queries.
 
+### Planned CI export-name tiers
+
+> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
+
+The planned CI package-export database adds two fallback tiers after installed packages:
+
+1. **Installed packages** — the current authoritative path. If a package is installed locally, Raven uses the installed version's `NAMESPACE`, `Depends`, datasets, and any R subprocess expansion needed for `exportPattern()`.
+2. **Committed repo DB** — `.raven/packages.json`, generated with `raven packages freeze` on a machine that has the project's packages installed. This is a frozen Tier 1 snapshot and outranks the bundled database.
+3. **Bundled DB** — Raven's shipped `names.db`, built from a reference R library plus CRAN and Bioconductor r-universe metadata.
+
+Tiers 2 and 3 provide export names and package structure only. They suppress undefined-variable noise for package exports when CI omits package installation, but they do not provide function signatures, do not resolve `:::` internal objects, and do not make a package count as installed for missing-package diagnostics. Package-dataset resolution is supplied by [raven#350](https://github.com/jbearak/raven/issues/350); the shipped database also has a separate base-exports file so base symbols and base datasets can resolve when base packages are not present on disk.
+
 ### Base Packages
 
 Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. Raven uses this fixed list directly — it does not query R to discover the base packages. The R subprocess is queried for *installed user packages* (via the library paths), not to determine which base packages exist — though base-package *exports* are still expanded via R, since they use `exportPattern` (see [When Raven calls R](#when-raven-calls-r)).
