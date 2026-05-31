@@ -1223,13 +1223,21 @@ impl PackageLibrary {
         let pkg_dir = match self.find_package_directory(name) {
             Some(dir) => dir,
             None => {
+                // Tier 1 (installed) has no directory for this package. Fall
+                // back through the ordered metadata providers (Tier 2 repo DB,
+                // then Tier 3 shipped DB). The first provider that knows the
+                // package wins and its PackageInfo IS cached. A package that no
+                // provider knows is left uncached so `package_exists()` still
+                // reports it missing (install status stays Tier-1-only).
+                if let Some(info) = self.resolve_from_providers(name) {
+                    self.insert_package(info).await;
+                    return self.get_cached_package(name).await;
+                }
                 log::trace!(
-                    "Package '{}' not found in any library path: {:?}",
+                    "Package '{}' not found in any tier (libpaths: {:?})",
                     name,
                     self.lib_paths
                 );
-                // Don't cache missing packages - return None directly so
-                // package_exists() can correctly report the package as missing
                 return None;
             }
         };
@@ -4335,5 +4343,31 @@ mod tests {
         assert!(lib.has_no_providers());
         lib.set_providers(vec![Box::new(Fake)]);
         assert!(!lib.has_no_providers());
+    }
+
+    #[tokio::test]
+    async fn get_package_falls_back_to_provider_when_not_installed() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "fakepkg").then(|| PackageInfo::new("fakepkg".into(), HashSet::from(["zzz".into()])))
+            }
+        }
+
+        // new_empty has no lib paths, so find_package_directory always misses.
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        let info = lib.get_package("fakepkg").await.expect("resolved via provider");
+        assert!(info.exports.contains("zzz"));
+        // Provider hits ARE cached.
+        assert!(lib.is_cached("fakepkg").await);
+
+        // A package no provider knows stays unresolved and uncached.
+        assert!(lib.get_package("unknownpkg").await.is_none());
+        assert!(!lib.is_cached("unknownpkg").await);
     }
 }
