@@ -1,7 +1,5 @@
 # Package database
 
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
-
 Raven resolves the symbols a package exports so it can offer completions, hover, and — most importantly — avoid flagging every package function as an undefined variable. Normally it reads that information from the package as installed on your machine. But in CI there is often **no R and no installed packages**: `.libPaths()` is empty, so every `library(pkg)` would fire a missing-package warning and every symbol from a package would show as undefined. That makes Raven effectively unusable in CI.
 
 The package database fixes this by giving Raven a pre-built source of export **names** that needs neither R nor installed packages at analysis time. Resolution becomes an **ordered fallback over three tiers**, consulted per package only when the package isn't already resolved.

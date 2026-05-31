@@ -15,3 +15,5 @@ scripts/**
 .vscode-test.mjs
 package-lock.json
 bun.lock
+# bin/ is intentionally NOT excluded so the raven binary and Tier 3 sidecars
+# (bin/names.db, bin/base-exports.json) are included in the VSIX.

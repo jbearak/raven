@@ -251,8 +251,6 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 ## Generating a package database for CI
 
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
-
 `raven check` already gives you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's bundled package database (Tier 3), so they don't show as undefined variables. You generate a committed `.raven/packages.json` (Tier 2) only to make those diagnostics *more accurate* in two cases:
 
 1. you depend on packages whose exports **aren't shipped** in Raven's bundled database (GitHub-only, internal, or not-yet-indexed packages), or

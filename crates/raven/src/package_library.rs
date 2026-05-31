@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 use crate::namespace_parser::{
     parse_data_symbols, parse_description_depends, parse_index_exports, parse_namespace_exports,
 };
+use crate::package_db::PackageMetadataProvider;
 use crate::r_subprocess::RSubprocess;
 
 /// Meta-packages that attach multiple other packages when loaded
@@ -228,6 +229,11 @@ pub struct PackageLibrary {
     /// R subprocess interface (None if R is unavailable)
     #[allow(dead_code)] // Will be used in task 3.3
     r_subprocess: Option<RSubprocess>,
+    /// Ordered fallback metadata providers (Tier 2 repo DB, then Tier 3 shipped
+    /// DB), consulted only when the installed (Tier 1) path does not resolve a
+    /// package. Empty by default; populated by `build_package_library`. These
+    /// feed export resolution only — never `package_exists()` (install status).
+    providers: Vec<Box<dyn PackageMetadataProvider>>,
 }
 
 impl PackageLibrary {
@@ -245,6 +251,7 @@ impl PackageLibrary {
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess: None,
+            providers: Vec::new(),
         }
     }
 
@@ -264,6 +271,7 @@ impl PackageLibrary {
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess,
+            providers: Vec::new(),
         }
     }
 
@@ -301,6 +309,29 @@ impl PackageLibrary {
     /// an R subprocess interface.
     pub fn r_subprocess(&self) -> Option<&RSubprocess> {
         self.r_subprocess.as_ref()
+    }
+
+    /// Replace the ordered fallback providers (tier order: index 0 first).
+    pub fn set_providers(&mut self, providers: Vec<Box<dyn PackageMetadataProvider>>) {
+        self.providers = providers;
+    }
+
+    /// True when fallback providers are configured (Tier 2/3 present beyond the
+    /// common Tier-1-only case).
+    pub fn has_providers(&self) -> bool {
+        !self.providers.is_empty()
+    }
+
+    /// Consult the fallback providers (Tier 2 → Tier 3) in order; return the
+    /// first source that knows `name`. Pure, synchronous reads.
+    fn resolve_from_providers(&self, name: &str) -> Option<PackageInfo> {
+        for provider in &self.providers {
+            if let Some(info) = provider.lookup(name) {
+                log::trace!("Package '{}' resolved from a fallback provider", name);
+                return Some(info);
+            }
+        }
+        None
     }
 
     /// Get all exports from loaded packages for completions (synchronous, cached-only)
@@ -723,12 +754,29 @@ impl PackageLibrary {
                                     )
                                     .await
                                 }
-                                None => PackageInfo::with_details(
-                                    pkg_name.clone(),
-                                    exports_set,
-                                    Vec::new(),
-                                    Vec::new(),
-                                ),
+                                None => {
+                                    // No on-disk directory for this package. When R
+                                    // also returned no exports (the tryCatch swallowed
+                                    // the asNamespace error and produced an empty
+                                    // list), caching an empty PackageInfo would shadow
+                                    // any Tier 2/3 provider result via the cache-first
+                                    // check in get_package. So on an empty set, consult
+                                    // the ordered fallback providers first; only fall
+                                    // back to the (empty) R-derived set if none knows it.
+                                    let from_provider = if exports_set.is_empty() {
+                                        self.resolve_from_providers(&pkg_name)
+                                    } else {
+                                        None
+                                    };
+                                    from_provider.unwrap_or_else(|| {
+                                        PackageInfo::with_details(
+                                            pkg_name.clone(),
+                                            exports_set,
+                                            Vec::new(),
+                                            Vec::new(),
+                                        )
+                                    })
+                                }
                             };
                             log::trace!(
                                 "Cached {} exports + {} datasets for pattern package '{}' from R",
@@ -1107,6 +1155,25 @@ impl PackageLibrary {
             }
         }
 
+        // CI fallback: if no base exports were found on disk, load the bundled
+        // base-exports file (built from a reference R) so base symbols and base
+        // datasets (mtcars/iris) still resolve without R. The guard is
+        // all-or-nothing: a non-empty disk merge (a real install) always wins and
+        // skips the file entirely. It does not recover a *partially* populated
+        // disk state (e.g. `base` present but `datasets` missing) — acceptable
+        // because base R ships these packages together.
+        if all_base_exports.is_empty() {
+            if let Some(path) = crate::package_db::locate_base_exports() {
+                if let Some((file_exports, file_packages)) =
+                    crate::package_db::base_exports::load_base_exports(&path)
+                {
+                    log::info!("Loaded base exports from {:?}", path);
+                    all_base_exports.extend(file_exports);
+                    self.base_packages.extend(file_packages);
+                }
+            }
+        }
+
         // Step 5: Store per-package exports in the packages cache for completion attribution
         // This allows get_exports_for_completions() to find base packages with correct
         // package names (e.g., {base}, {utils}, {stats}).
@@ -1193,13 +1260,21 @@ impl PackageLibrary {
         let pkg_dir = match self.find_package_directory(name) {
             Some(dir) => dir,
             None => {
+                // Tier 1 (installed) has no directory for this package. Fall
+                // back through the ordered metadata providers (Tier 2 repo DB,
+                // then Tier 3 shipped DB). The first provider that knows the
+                // package wins and its PackageInfo IS cached. A package that no
+                // provider knows is left uncached so `package_exists()` still
+                // reports it missing (install status stays Tier-1-only).
+                if let Some(info) = self.resolve_from_providers(name) {
+                    self.insert_package(info).await;
+                    return self.get_cached_package(name).await;
+                }
                 log::trace!(
-                    "Package '{}' not found in any library path: {:?}",
+                    "Package '{}' not found in any tier (libpaths: {:?})",
                     name,
                     self.lib_paths
                 );
-                // Don't cache missing packages - return None directly so
-                // package_exists() can correctly report the package as missing
                 return None;
             }
         };
@@ -1408,6 +1483,39 @@ impl PackageLibrary {
         None
     }
 
+    /// Enumerate the names of all packages present across the library paths.
+    /// A "package" is a subdirectory containing a `DESCRIPTION` file. Used by
+    /// `raven packages freeze --installed/--all` and the Tier 3 build's
+    /// reference-R capture.
+    pub fn enumerate_installed_packages(&self) -> Vec<String> {
+        let mut names = std::collections::HashSet::new();
+        for lib in &self.lib_paths {
+            let Ok(entries) = std::fs::read_dir(lib) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("DESCRIPTION").is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// Read a package's `DESCRIPTION` `Version` field from disk, if the package
+    /// is installed in a library path. Used by the Tier 3 build's reference-R
+    /// capture and `raven packages freeze` to stamp each record's version.
+    pub fn package_version(&self, name: &str) -> Option<String> {
+        let dir = self.find_package_directory(name)?;
+        let content = std::fs::read_to_string(dir.join("DESCRIPTION")).ok()?;
+        crate::namespace_parser::parse_description_field_pub(&content, "Version")
+            .into_iter()
+            .next()
+    }
+
     /// Check if a package exists (is installed)
     ///
     /// This is a synchronous method that checks installation by:
@@ -1586,16 +1694,28 @@ pub struct PackageLibraryOutcome {
     /// implied by the status.
     pub library: Arc<PackageLibrary>,
     pub status: PackageLibraryStatus,
+    /// Non-fatal notes accumulated while opening Tier 2/3 fallback DBs
+    /// (e.g. a present-but-unusable DB explained-and-continued). Empty on the
+    /// `Disabled` early-return and the Tier-1-only capture path, which wire no
+    /// providers.
+    pub load_notes: Vec<String>,
 }
 
-/// The single source of truth for package-library readiness and the reason a
-/// build degraded. All four package-library init sites route through
+/// The single source of truth for package-library **build status** and the
+/// reason a build degraded. All four package-library init sites route through
 /// [`build_package_library`]: `backend::rebuild_package_library`,
 /// `cli::check::maybe_init_r`, `backend::ensure_package_library_initialized`,
 /// and the Task B post-scan startup init. Routing them all through one
 /// builder is what stops the editor and `raven check` from drifting, and this
-/// enum's [`classify`](PackageLibraryStatus::classify) is where the readiness
-/// predicate and degradation precedence live — not duplicated per site.
+/// enum's [`classify`](PackageLibraryStatus::classify) is where the status
+/// classification and degradation precedence live — not duplicated per site.
+///
+/// Build status is distinct from the *consumer readiness gate*
+/// (`package_library_ready`), which is **not** uniform across sites: the editor
+/// gates on [`is_ready()`](PackageLibraryStatus::is_ready) (R-only), while
+/// `cli::check` deliberately widens its gate to also accept offline Tier 2/3
+/// providers (`|| library.has_providers()`) so `raven check` resolves packages
+/// in CI without R — see the comment in `cli::check::maybe_init_r`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PackageLibraryStatus {
     /// `packages.enabled == false`; no R discovery attempted.
@@ -1659,9 +1779,66 @@ pub async fn build_package_library(
         return PackageLibraryOutcome {
             library: Arc::new(PackageLibrary::new_empty()),
             status: PackageLibraryStatus::Disabled,
+            load_notes: Vec::new(),
         };
     }
 
+    // Tier 2 (repo DB) path is derived from the workspace root, so clone it
+    // before `workspace_root` is moved into the shared core below.
+    let repo_db_path = workspace_root
+        .as_ref()
+        .map(|r| r.join(".raven").join("packages.json"));
+
+    let (mut lib, status) =
+        build_library_inner(r_path, additional_paths, workspace_root).await;
+
+    // Open the fallback DBs off the async runtime (mmap + ~10-20 ms blake3).
+    let shipped_db_path = crate::package_db::locate_shipped_db();
+    let (providers, notes) = tokio::task::spawn_blocking(move || {
+        let mut providers: Vec<Box<dyn crate::package_db::PackageMetadataProvider>> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        // Tier 2 first (repo DB), then Tier 3 (shipped DB).
+        if let Some(path) = repo_db_path {
+            match crate::package_db::json_db::RepoDbProvider::from_file(&path) {
+                Ok(Some(p)) => providers.push(Box::new(p)),
+                Ok(None) => {}                       // Absent -> silent
+                Err(e) => notes.push(e.to_string()), // explain-and-continue
+            }
+        }
+        if let Some(path) = shipped_db_path {
+            match crate::package_db::binary_db::ShippedDbProvider::from_file(&path) {
+                Ok(Some(p)) => providers.push(Box::new(p)),
+                Ok(None) => {}
+                Err(e) => notes.push(e.to_string()),
+            }
+        }
+        (providers, notes)
+    })
+    .await
+    .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+
+    for note in &notes {
+        log::warn!("{note}");
+    }
+    lib.set_providers(providers);
+
+    PackageLibraryOutcome {
+        library: Arc::new(lib),
+        status,
+        load_notes: notes,
+    }
+}
+
+/// Shared construction core for both the runtime ([`build_package_library`]) and
+/// capture ([`build_package_library_tier1_only`]) paths: R discovery, Tier-1
+/// initialization, additional-path augmentation, and status classification. It
+/// wires **no** Tier 2/3 providers and does not `Arc`-wrap — callers add
+/// providers (or deliberately omit them) and own the wrapping.
+async fn build_library_inner(
+    r_path: Option<PathBuf>,
+    additional_paths: &[PathBuf],
+    workspace_root: Option<PathBuf>,
+) -> (PackageLibrary, PackageLibraryStatus) {
     let subprocess =
         tokio::task::spawn_blocking(move || match (RSubprocess::new(r_path), workspace_root) {
             (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
@@ -1677,15 +1854,84 @@ pub async fn build_package_library(
     let has_lib_paths = !lib.lib_paths().is_empty();
 
     let status = PackageLibraryStatus::classify(init_error, r_found, has_lib_paths);
+    (lib, status)
+}
+
+/// Build a Tier-1-only library with **no** fallback providers wired. This is the
+/// capture path used by `freeze` and `build-shipped-db`, which must observe only
+/// the live R installation and never resolve names from a Tier 2/3 DB (otherwise
+/// captured data would be contaminated by the very DBs it produces).
+pub async fn build_package_library_tier1_only(
+    r_path: Option<PathBuf>,
+    additional_paths: &[PathBuf],
+    workspace_root: Option<PathBuf>,
+) -> PackageLibraryOutcome {
+    let (lib, status) = build_library_inner(r_path, additional_paths, workspace_root).await;
     PackageLibraryOutcome {
         library: Arc::new(lib),
         status,
+        load_notes: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared `RAVEN_NAMES_DB` env-var serialization lock (defined in
+    /// `package_db` so every lib-test that touches the var shares one instance).
+    use crate::package_db::RAVEN_NAMES_DB_ENV_LOCK;
+
+    #[tokio::test]
+    async fn build_library_wires_shipped_db_provider_from_env() {
+        use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+        use crate::package_db::model::PackageRecord;
+
+        // Use a synthetic name that cannot exist in any real R install, so the
+        // ONLY way it can resolve is via the wired Tier 3 provider. (A real
+        // package like `dplyr` would resolve from Tier 1 on a developer machine
+        // that has it installed, masking whether providers were wired.)
+        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let pkg = "ravenfaketier3pkg";
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("names.db");
+        write_shipped_db(
+            &db_path,
+            &[PackageRecord { name: pkg.into(), version: "1.1.4".into(), exports: vec!["mutate".into()], depends: vec![], lazy_data: vec![] }],
+            ShippedDbProvenance { source: "test".into(), snapshot_date: "2026-05-30".into(), package_count: 1, raven_version: "9.9.9".into() },
+        )
+        .unwrap();
+
+        std::env::set_var("RAVEN_NAMES_DB", &db_path);
+        let outcome = build_package_library(None, &[], None, true).await;   // runtime path -> wires providers
+        let outcome_t1 = build_package_library_tier1_only(None, &[], None).await; // capture path -> no providers
+        std::env::remove_var("RAVEN_NAMES_DB");
+
+        assert!(outcome.library.get_package(pkg).await.expect("Tier 3 resolves synthetic pkg").exports.contains("mutate"));
+        // Provider-less capture must NOT resolve the synthetic pkg from Tier 3.
+        assert!(outcome_t1.library.get_package(pkg).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_library_reports_unreadable_shipped_db_in_load_notes() {
+        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("names.db");
+        // Too short / bad magic => ShippedDb::open returns Corrupt => a load note.
+        std::fs::write(&bad, b"NOT A RAVEN DB").unwrap();
+
+        std::env::set_var("RAVEN_NAMES_DB", &bad);
+        let outcome = build_package_library(None, &[], None, true).await;
+        std::env::remove_var("RAVEN_NAMES_DB");
+
+        // The build degrades (does not panic) AND explains the unreadable DB.
+        assert!(!outcome.load_notes.is_empty(), "a corrupt names.db must produce a load note");
+        assert!(
+            outcome.load_notes.iter().any(|n| n.contains("names.db")),
+            "the note should mention names.db; got {:?}",
+            outcome.load_notes
+        );
+    }
 
     /// Pins the readiness predicate and degradation precedence
     /// platform-independently. The `Some(_)` rows exercise classification
@@ -4282,5 +4528,213 @@ mod tests {
             names,
             ["a".to_string(), "b".to_string()].into_iter().collect()
         );
+    }
+
+    #[tokio::test]
+    async fn providers_default_empty_and_settable() {
+        use crate::package_db::PackageMetadataProvider;
+        use crate::package_library::PackageInfo;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                if name == "fakepkg" {
+                    Some(PackageInfo::new("fakepkg".into(), HashSet::from(["zzz".into()])))
+                } else {
+                    None
+                }
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        assert!(!lib.has_providers());
+        lib.set_providers(vec![Box::new(Fake)]);
+        assert!(lib.has_providers());
+    }
+
+    #[tokio::test]
+    async fn get_package_falls_back_to_provider_when_not_installed() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "fakepkg").then(|| PackageInfo::new("fakepkg".into(), HashSet::from(["zzz".into()])))
+            }
+        }
+
+        // new_empty has no lib paths, so find_package_directory always misses.
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        let info = lib.get_package("fakepkg").await.expect("resolved via provider");
+        assert!(info.exports.contains("zzz"));
+        // Provider hits ARE cached.
+        assert!(lib.is_cached("fakepkg").await);
+
+        // A package no provider knows stays unresolved and uncached.
+        assert!(lib.get_package("unknownpkg").await.is_none());
+        assert!(!lib.is_cached("unknownpkg").await);
+    }
+
+    #[tokio::test]
+    async fn prefetch_warms_provider_packages_via_existing_step3() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        lib.prefetch_packages(&["dplyr".to_string(), "ggplot2".to_string()]).await;
+
+        assert!(lib.is_cached("dplyr").await);
+        assert!(lib.is_symbol_from_loaded_packages("mutate", &["dplyr".to_string()]));
+        assert!(!lib.is_cached("ggplot2").await);
+    }
+
+    #[tokio::test]
+    async fn package_exists_never_consults_providers() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["mutate".into()])))
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        // The provider KNOWS dplyr's exports, but it is not installed on disk.
+        // package_exists answers "is it installed?", which stays Tier-1-only.
+        assert!(!lib.package_exists("dplyr"));
+    }
+
+    #[tokio::test]
+    async fn tier2_outranks_tier3() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Tier2;
+        impl PackageMetadataProvider for Tier2 {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["from_tier2".into()])))
+            }
+        }
+        struct Tier3;
+        impl PackageMetadataProvider for Tier3 {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                match name {
+                    "dplyr" => Some(PackageInfo::new("dplyr".into(), HashSet::from(["from_tier3".into()]))),
+                    "tidyr" => Some(PackageInfo::new("tidyr".into(), HashSet::from(["pivot_longer".into()]))),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Tier2), Box::new(Tier3)]); // Tier 2 first
+
+        let dplyr = lib.get_package("dplyr").await.unwrap();
+        assert!(dplyr.exports.contains("from_tier2"), "Tier 2 wins when both know dplyr");
+        assert!(!dplyr.exports.contains("from_tier3"));
+
+        let tidyr = lib.get_package("tidyr").await.unwrap();
+        assert!(tidyr.exports.contains("pivot_longer"), "Tier-3-only package still resolves");
+    }
+
+    // NOTE: this test only *discriminates* the fallback in a truly R-free
+    // environment (the intended CI target). On a machine with any R library on
+    // the hardcoded fallback paths, the disk loop populates `datasets`/`mtcars`
+    // and the `is_empty()` guard skips the file — the assertion then passes via
+    // disk, not the bundled file. The actual fallback logic is covered
+    // discriminatingly by the unit tests in `package_db::base_exports`.
+    #[tokio::test]
+    async fn initialize_loads_base_exports_file_when_disk_absent() {
+        use crate::package_db::json_db::{write_repo_db_file, RepoDb, RepoDbProvenance};
+        use crate::package_db::model::PackageRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base-exports.json");
+        // 'datasets' base package contributing the mtcars dataset name.
+        write_repo_db_file(
+            &path,
+            &RepoDb {
+                schema_version: crate::package_db::json_db::REPO_DB_SCHEMA_VERSION,
+                provenance: RepoDbProvenance {
+                    raven_version: "t".into(),
+                    r_version: "4.4.0".into(),
+                    generated_unix: 0,
+                },
+                packages: vec![PackageRecord {
+                    name: "datasets".into(),
+                    version: "4.4.0".into(),
+                    exports: vec![],
+                    depends: vec![],
+                    lazy_data: vec!["mtcars".into()],
+                }],
+            },
+        )
+        .unwrap();
+
+        // Serialize against other tests that mutate/read package-DB env vars
+        // (the lock also guards `initialize()`, which reads RAVEN_BASE_EXPORTS).
+        let _env = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        std::env::set_var("RAVEN_BASE_EXPORTS", &path);
+        // new_empty + initialize with no lib paths simulates CI (no disk base packages).
+        let mut lib = PackageLibrary::new_empty();
+        lib.initialize().await.unwrap();
+        std::env::remove_var("RAVEN_BASE_EXPORTS");
+
+        assert!(
+            lib.is_base_export("mtcars"),
+            "base dataset resolves from the base-exports file"
+        );
+    }
+
+    #[test]
+    fn enumerate_installed_lists_package_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("dplyr")).unwrap();
+        std::fs::create_dir_all(lib.join("ggplot2")).unwrap();
+        // A package directory is identified by a DESCRIPTION file.
+        std::fs::write(lib.join("dplyr").join("DESCRIPTION"), "Package: dplyr\n").unwrap();
+        std::fs::write(lib.join("ggplot2").join("DESCRIPTION"), "Package: ggplot2\n").unwrap();
+        // a non-package file should be ignored
+        std::fs::write(lib.join("README"), "x").unwrap();
+
+        let mut pl = PackageLibrary::new_empty();
+        pl.set_lib_paths(vec![lib]);
+        let mut found = pl.enumerate_installed_packages();
+        found.sort();
+        assert_eq!(found, vec!["dplyr".to_string(), "ggplot2".to_string()]);
+    }
+
+    #[test]
+    fn package_version_reads_description_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("dplyr")).unwrap();
+        std::fs::write(
+            lib.join("dplyr").join("DESCRIPTION"),
+            "Package: dplyr\nVersion: 1.2.3\n",
+        )
+        .unwrap();
+        let mut pl = PackageLibrary::new_empty();
+        pl.set_lib_paths(vec![lib]);
+        assert_eq!(pl.package_version("dplyr"), Some("1.2.3".to_string()));
+        assert_eq!(pl.package_version("nonexistent"), None);
     }
 }

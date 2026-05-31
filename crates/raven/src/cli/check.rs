@@ -43,6 +43,11 @@ pub struct CheckArgs {
     /// Resolved to on/off by [`resolve_color_from_env`] (TTY +
     /// `NO_COLOR`/`FORCE_COLOR`).
     pub color: ColorChoice,
+    /// Enable the missing-package ("not installed") diagnostic. Disabled by
+    /// default because `raven check` often runs in environments without package
+    /// installation. Reports `library()` calls absent from the local library
+    /// paths — NOT relative to Tier 2/Tier 3 metadata (see docs/diagnostics.md).
+    pub report_uninstalled: bool,
 }
 
 pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, String> {
@@ -56,6 +61,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
     // `--color` and `--no-color` write the same field; last-one-wins on conflict
     // (`--no-color --color always` ⇒ always), matching cargo/ripgrep.
     let mut color = ColorChoice::Auto;
+    let mut report_uninstalled = false;
 
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -82,6 +88,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
                 color = parse_color_choice(&v)?;
             }
             "--no-color" => color = ColorChoice::Never,
+            "--report-uninstalled" => report_uninstalled = true,
             "--help" => return Err("HELP".into()),
             s if s.starts_with("--") => return Err(format!("unknown flag: {s}")),
             p => paths.push(PathBuf::from(p)),
@@ -96,6 +103,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
         max_severity,
         quiet,
         color,
+        report_uninstalled,
     })
 }
 
@@ -129,6 +137,12 @@ R / packages:
   raven check auto-detects R on PATH to resolve installed-package exports and
   base R symbols. If R is not found, package and base-symbol diagnostics are
   limited and a note is printed to stderr; all other diagnostics still run.
+
+  --report-uninstalled        Report packages from library() calls that are not
+                              present in the local library paths. Disabled by
+                              default; useful when the environment DID install
+                              packages (e.g. renv::restore()) and you want to
+                              catch failures.
 
 Exit codes:
   0   No diagnostic exceeded --max-severity
@@ -173,6 +187,14 @@ pub async fn run(args: CheckArgs) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
+
+    // CI default: suppress the missing-package ("not installed") diagnostic,
+    // because CI deliberately omits installation (spec §10.1). The CLI owns
+    // `state` exclusively, so a direct field set here is safe.
+    // `--report-uninstalled` opts back in.
+    if !args.report_uninstalled {
+        state.cross_file_config.packages_missing_package_severity = None;
+    }
 
     // Auto-detect R for installed-package / base-symbol awareness. Any failure
     // (R absent, init error, no library paths) degrades gracefully and prints
@@ -422,20 +444,28 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
     )
     .await;
 
-    // Caller policy (see the doc comment): install only on `Ready`; otherwise
-    // keep the default empty library, printing a note for the R-related
-    // degradations and staying silent on `Disabled`.
+    // Surface present-but-unusable package-DB notes (e.g. a `.raven/packages.json`
+    // from a newer Raven, or a corrupt/incompatible `names.db`). These are
+    // build-time events carried on the outcome; print them before the status
+    // match below partially moves `outcome.library`.
+    for note in &outcome.load_notes {
+        eprintln!("raven check: {note}");
+    }
+
+    // Always install the returned library: on a non-`Ready` status it still
+    // carries the Tier 2/3 providers and bundled base exports, which are the
+    // whole point of CI resolution without R. Dropping it here would send
+    // `raven check` back to an empty library and lose the offline path.
+    // `package_library_ready` (which gates prefetch + diagnostics) is true when R
+    // initialized OR offline providers are present — so a names.db / repo DB makes
+    // the library usable even when R is absent. `Disabled` carries `new_empty()`
+    // (no providers), so it stays not-ready, matching the prior behavior.
     use crate::package_library::PackageLibraryStatus::*;
-    match outcome.status {
-        Ready => {
-            state.package_library = outcome.library;
-            state.package_library_ready = true;
-        }
-        // Packages disabled in `raven.toml`: keep the default empty library and
-        // `package_library_ready = false`, silently — a user who disabled
-        // package awareness in their editor doesn't get package diagnostics in
-        // CI.
-        Disabled => {}
+    let status = outcome.status;
+    state.package_library_ready = matches!(status, Ready) || outcome.library.has_providers();
+    state.package_library = outcome.library;
+    match status {
+        Ready | Disabled => {}
         RNotFound => eprintln!(
             "raven check: R not found on PATH; package and base-symbol diagnostics will be limited"
         ),
@@ -578,7 +608,17 @@ mod tests {
             max_severity: SeverityLevel::Info,
             quiet: true,
             color: ColorChoice::Never,
+            report_uninstalled: false,
         }
+    }
+
+    #[test]
+    fn parse_report_uninstalled_flag() {
+        let args = parse_args(["--report-uninstalled".to_string()].into_iter()).unwrap();
+        assert!(args.report_uninstalled);
+
+        let default = parse_args(std::iter::empty()).unwrap();
+        assert!(!default.report_uninstalled);
     }
 
     #[test]
@@ -782,6 +822,7 @@ mod tests {
             max_severity: SeverityLevel::Info,
             quiet: true,
             color: ColorChoice::Never,
+            report_uninstalled: false,
         };
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
     }
@@ -910,5 +951,61 @@ mod tests {
             "packages.enabled = false must not populate library paths; got {:?}",
             state.package_library.lib_paths()
         );
+    }
+
+    /// Regression: `raven check` must KEEP the Tier 2/3-carrying library even on a
+    /// degraded status (e.g. R absent in CI), and mark it ready so the offline
+    /// package-resolution path this PR adds actually runs. A synthetic Tier 3
+    /// package — installable nowhere — must resolve through `maybe_init_r`'s
+    /// installed library.
+    #[tokio::test]
+    async fn maybe_init_r_keeps_provider_library_when_r_absent() {
+        use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+        use crate::package_db::model::PackageRecord;
+
+        let _env = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let pkg = "ravenfakecheckpkg";
+        let sym = "ravenfakechecksym";
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("names.db");
+        write_shipped_db(
+            &db_path,
+            &[PackageRecord {
+                name: pkg.into(),
+                version: "1.0.0".into(),
+                exports: vec![sym.into()],
+                depends: vec![],
+                lazy_data: vec![],
+            }],
+            ShippedDbProvenance {
+                source: "test".into(),
+                snapshot_date: "2026-05-30".into(),
+                package_count: 1,
+                raven_version: "9.9.9".into(),
+            },
+        )
+        .unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        std::env::set_var("RAVEN_NAMES_DB", &db_path);
+        let mut state = crate::state::WorldState::new(vec![]);
+        maybe_init_r(&mut state, workspace.path()).await;
+        std::env::remove_var("RAVEN_NAMES_DB");
+
+        // The Tier 3 provider survived (library not dropped) and is marked ready,
+        // so prefetch + resolution can run even though R is irrelevant here.
+        assert!(
+            state.package_library_ready,
+            "a library carrying Tier 3 providers must be marked ready"
+        );
+        state.package_library.prefetch_packages(&[pkg.to_string()]).await;
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages(sym, &[pkg.to_string()]),
+            "Tier 3 export must resolve through the check-installed library"
+        );
+        // The synthetic package is still not "installed" (Tier-1-only).
+        assert!(!state.package_library.package_exists(pkg));
     }
 }

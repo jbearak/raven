@@ -12,9 +12,28 @@ if (!fs.existsSync(binDir)) {
     fs.mkdirSync(binDir, { recursive: true });
 }
 
-// In CI mode, the binary is pre-placed by the workflow.
-// Check for both names since cross-platform CI (e.g. packaging win32 on Linux)
-// means process.platform won't match the target platform.
+// Bundle the Tier 3 package-export database + base-exports file next to the
+// binary, if present. In dev builds they are usually absent (Tier 3/base-exports
+// unavailable, which is fine — the extension degrades to Tier 1/2). In VSIX CI
+// the release workflow places these directly in bin/; this block covers local
+// builds and the RAVEN_NAMES_DB_SRC override.
+const distDir = path.join(__dirname, '..', '..', '..', 'dist');
+for (const sidecar of ['names.db', 'base-exports.json']) {
+    const src = (sidecar === 'names.db' && process.env.RAVEN_NAMES_DB_SRC)
+        ? process.env.RAVEN_NAMES_DB_SRC
+        : path.join(distDir, sidecar);
+    const dest = path.join(binDir, sidecar);
+    if (fs.existsSync(src)) {
+        fs.copyFileSync(src, dest);
+        console.log(`Bundled ${sidecar} from ${src}`);
+    } else {
+        console.log(`${sidecar} not found at ${src}; that tier will be unavailable in this build`);
+    }
+}
+
+// In CI mode, the binary is pre-placed by the workflow. Check for both names
+// since cross-platform CI (e.g. packaging win32 on Linux) means
+// process.platform won't match the target platform.
 if (fs.existsSync(destBinary) || fs.existsSync(path.join(binDir, 'raven')) || fs.existsSync(path.join(binDir, 'raven.exe'))) {
     console.log('raven binary already present (CI mode)');
     process.exit(0);

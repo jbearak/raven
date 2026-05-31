@@ -1,0 +1,13 @@
+{
+  "Package": "dplyr",
+  "Version": "1.1.4",
+  "_exports": ["filter", "mutate", "select"],
+  "_dependencies": [
+    { "package": "R", "version": ">= 3.5.0", "role": "Depends" },
+    { "package": "cli", "version": "*", "role": "Imports" }
+  ],
+  "_datasets": [
+    { "name": "starwars", "title": "Starwars characters" },
+    { "name": "storms" }
+  ]
+}

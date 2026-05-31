@@ -1140,6 +1140,17 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Surface present-but-unusable package-DB load notes (e.g. a
+    /// `.raven/packages.json` from a newer Raven, or a corrupt/incompatible
+    /// `names.db`) to the editor as warnings. Single source for how these
+    /// build-time notes reach the user, called from both package-library
+    /// init paths.
+    async fn surface_load_notes(&self, notes: &[String]) {
+        for note in notes {
+            self.client.show_message(MessageType::WARNING, note).await;
+        }
+    }
+
     async fn ensure_package_library_initialized(&self) -> bool {
         let (enabled, already_ready) = {
             let state = self.state.read().await;
@@ -1196,16 +1207,28 @@ impl Backend {
             log::warn!("Failed to initialize PackageLibrary: {}", e);
         }
         let ready = outcome.status.is_ready();
-        let mut state = self.state.write().await;
-        // Re-check under write lock: `initialized()` may have raced ahead
+        let load_notes = outcome.load_notes;
+        let library = outcome.library;
+        // Re-check under the write lock: `initialized()` may have raced ahead
         // and already written a library with prefetched caches.
-        if !state.package_library_ready {
-            state.package_library = outcome.library;
-            state.package_library_ready = ready;
-        } else {
-            log::trace!("PackageLibrary already initialized (race), keeping existing");
+        let (committed, final_ready) = {
+            let mut state = self.state.write().await;
+            if !state.package_library_ready {
+                state.package_library = library;
+                state.package_library_ready = ready;
+                (true, ready)
+            } else {
+                log::trace!("PackageLibrary already initialized (race), keeping existing");
+                (false, state.package_library_ready)
+            }
+        };
+        // Surface Tier 2/3 load notes only on the path that actually committed
+        // the library, so a startup race doesn't toast the same notes twice.
+        // Done after dropping the write lock — `surface_load_notes` awaits.
+        if committed {
+            self.surface_load_notes(&load_notes).await;
         }
-        state.package_library_ready
+        final_ready
     }
     #[allow(dead_code)]
     pub fn new(client: Client) -> Self {
@@ -2310,7 +2333,7 @@ impl LanguageServer for Backend {
 
         // Task B: Initialize PackageLibrary (await this - diagnostics need it)
         // This is fast (~100ms) due to batched R subprocess calls.
-        let (new_package_library, package_library_ready) = {
+        let (new_package_library, package_library_ready, load_notes) = {
             let pkg_start = std::time::Instant::now();
             let r_calls_before = crate::perf::get_r_subprocess_calls();
 
@@ -2331,12 +2354,16 @@ impl LanguageServer for Backend {
             )
             .await;
 
+            // Captured here before `outcome` is destructured; surfaced after the
+            // commit below, and only if this path wins the race.
+            let load_notes = outcome.load_notes;
+
             use crate::package_library::PackageLibraryStatus;
             let status = outcome.status;
             let library = outcome.library;
             if status == PackageLibraryStatus::Disabled {
                 log::info!("Package function awareness disabled");
-                (library, false)
+                (library, false, load_notes)
             } else {
                 if let PackageLibraryStatus::InitFailed(e) = &status {
                     log::warn!("Failed to initialize PackageLibrary: {}", e);
@@ -2352,7 +2379,7 @@ impl LanguageServer for Backend {
                     library.base_exports().len()
                 );
                 let ready = status.is_ready();
-                (library, ready)
+                (library, ready, load_notes)
             }
         };
 
@@ -2361,16 +2388,24 @@ impl LanguageServer for Backend {
         // ahead and already written a library with prefetched package caches.
         // Overwriting it would discard those caches and cause false-positive
         // "Package is not installed" diagnostics until the next prefetch.
-        {
+        let committed = {
             let mut state = self.state.write().await;
             if !state.package_library_ready {
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
+                true
             } else {
                 log::info!(
                     "PackageLibrary already initialized (from did_open), skipping overwrite"
                 );
+                false
             }
+        };
+        // Surface Tier 2/3 load notes only if this path committed the library,
+        // so the did_open race (`ensure_package_library_initialized`) doesn't
+        // double-toast the same notes.
+        if committed {
+            self.surface_load_notes(&load_notes).await;
         }
 
         // Start the libpath watcher if enabled and we have a real package

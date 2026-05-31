@@ -5,7 +5,7 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 - `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes), for CI gating.
 - `raven lint` — run the native **style** linter only.
 - `raven analysis-stats <path> [--csv] [--only <phase>]` — profile workspace analysis phases (`scan`, `parse`, `metadata`, `scope`, `packages`); see `raven --help`.
-- `raven packages freeze` — **planned; not yet in a released build** ([status](#raven-packages)) — generate a committed `.raven/packages.json` export database so `raven check` can resolve package symbols in CI when no R or packages are installed. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
+- `raven packages freeze` — generate a committed `.raven/packages.json` export database. `raven check` already resolves package symbols in CI without it, against Raven's bundled database (CRAN + Bioconductor + base R); `freeze` is for *accuracy* — it adds packages the bundled database doesn't cover (e.g. GitHub-only or internal packages) and symbols newer than the bundled snapshot, eliminating false positives in those cases. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
 
 The difference between `check` and `lint` is **scope**: `lint` parses each file in isolation and runs only the style rules, so it needs no R installation and no workspace index — but it can't see relationships between files. `check` builds the same workspace index the language server builds (and, unless packages are disabled, runs R to resolve installed-package exports and base R symbols), so it additionally reports cross-file, undefined-variable, and package diagnostics. `lint` is therefore the cheaper, R-free option for pure style gating; `check` does more work per run in exchange for the editor's full analysis in CI.
 
@@ -22,7 +22,7 @@ Diagnostics reported (subject to configured severities — see [diagnostics.md](
 - Syntax errors and semantic checks (e.g. assignment-in-condition, mixed logical operators).
 - The native style lints (when enabled via `raven.toml` / `.lintr`).
 - Cross-file diagnostics: missing sourced files, circular dependencies, exceeded max source-chain depth, redundant directives, and out-of-scope usage.
-- Missing-package warnings (`library(notInstalled)`) — see [Missing-package reporting in CI](#missing-package-reporting-in-ci) for the planned change to suppress these by default.
+- Missing-package warnings (`library(notInstalled)`) — see [Missing-package reporting in CI](#missing-package-reporting-in-ci); `raven check` suppresses these by default.
 - Undefined-variable diagnostics, accounting for cross-file and package scope.
 
 ### Workspace and paths
@@ -39,7 +39,7 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 - `--no-config` — ignore `raven.toml` and `.lintr`; use Raven's built-in defaults.
 - `--format text|json|sarif` — default `text`.
 - `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold.
-- `--report-uninstalled` **(planned; not yet implemented — see [Missing-package reporting in CI](#missing-package-reporting-in-ci))** — re-enable missing-package warnings, which `raven check` will otherwise suppress by default once the package database lands.
+- `--report-uninstalled` (see [Missing-package reporting in CI](#missing-package-reporting-in-ci)) — re-enable missing-package warnings, which `raven check` otherwise suppresses by default.
 - `--quiet` — suppress the trailing summary line.
 - `--color auto|always|never` — when to colorize `text` output (default `auto`). See [Color output](#color-output).
 - `--no-color` — alias for `--color never`.
@@ -51,8 +51,6 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 Before reporting, `raven check` warms the export cache for the packages each reported file attaches with `library()` / `require()`, so a bare call into an attached package that isn't one of its exports is flagged the same way the editor flags it. One narrow gap remains: a package attached only *indirectly* — in a `source()`d file rather than in the reported file itself — is not pre-warmed, so calls that could resolve to such a package are left unflagged rather than risk a false positive. Attach the package directly in the file (or rely on the editor) if you need those calls checked.
 
 ### Missing-package reporting in CI
-
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
 
 `raven check` resolves package **export names** through an ordered three-tier fallback — installed packages, then a committed `.raven/packages.json`, then Raven's bundled `names.db` — so symbols from attached packages resolve even when no R is installed. This stops the undefined-variable storm that otherwise makes Raven unusable in CI. See [Package database](package-database.md).
 
@@ -136,13 +134,11 @@ Only plain R files (`.R` / `.r`) are linted. R Markdown / Quarto files (`.Rmd` /
 
 ## `raven packages`
 
-> **Status: planned.** Describes the CI package-exports database, in active development; not yet in a released build. Tracking: the package-database work (and prerequisite [raven#350](https://github.com/jbearak/raven/issues/350)).
-
 A command group for the export databases Raven uses to resolve package symbols without installing packages. See [Package database](package-database.md) for the full three-tier model; the two subcommands below build the user-generated (Tier 2) and Raven-bundled (Tier 3) databases respectively.
 
 ### `raven packages freeze`
 
-Generate a committed, repo-specific `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets — so `raven check` and the editor can resolve those symbols in CI, where no R or packages are present. Run it on a machine that has R and the project's packages installed, then commit the result; it is generated, never hand-edited.
+Generate a committed, repo-specific `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets. `raven check` and the editor already resolve symbols in CI (where no R or packages are present) against Raven's bundled database; this committed snapshot **improves accuracy** for packages the bundled database doesn't cover (GitHub-only or internal packages) and for symbols newer than the bundled snapshot. Run it on a machine that has R and the project's packages installed, then commit the result; it is generated, never hand-edited.
 
 ```text
 raven packages freeze [OPTIONS]

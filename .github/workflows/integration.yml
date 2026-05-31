@@ -23,10 +23,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Compile all Rust artifacts once in release profile and upload them.
-  # All downstream jobs download what they need — no second compile.
-  # Release profile is required so that performance_budgets tests
-  # (gated on `not(debug_assertions)`) are included and enforced.
+  # Build only the release artifacts that genuinely need optimization: the LSP
+  # binary (consumed by the vscode-mocha and binary-size jobs) and the
+  # performance_budgets test binary (gated on `not(debug_assertions)`, asserts
+  # wall-clock budgets — so it must be optimized). The functional Rust tests are
+  # NOT built here; they compile and run in debug in the `cargo` job, which is
+  # far cheaper and runs in parallel. This keeps slow release-profile codegen
+  # off the large functional test harness, which used to dominate build time.
   build:
     name: Build (release)
     runs-on: ubuntu-latest
@@ -35,7 +38,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
+        with:
+          toolchain: stable
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
@@ -67,17 +72,22 @@ jobs:
       - name: Reset sccache stats
         run: sccache --zero-stats
 
-      # `cargo test --release --no-run` compiles the test binary (all tests,
-      # including performance_budgets) without running it. The path to the
-      # compiled executable is printed to stderr; we copy it to a stable name.
-      # The same binary serves both the cargo and time-budgets jobs (filtered
-      # by passing a test name prefix to the executable).
-      - name: Compile release test + LSP binaries
+      # Build the production LSP binary, then compile (only) the
+      # performance_budgets test target in release. Both invocations share a
+      # single release compile of the lib (same `--features test-support`), so
+      # the second one just links the perf test crate. `--test
+      # performance_budgets` deliberately scopes the test build so the large
+      # functional integration tests and examples are NOT release-compiled here.
+      # cargo prints the compiled test executable's path to stderr; copy it to a
+      # stable name for the time-budgets job to download and run.
+      - name: Build release LSP binary + perf-budget test binary
         run: |
-          cargo test --release --no-run -p raven --features test-support 2>&1 | tee /tmp/cargo-test-build.txt
-          TEST_BIN=$(grep -oE 'target/release/deps/raven-[a-f0-9]+' /tmp/cargo-test-build.txt | head -1)
-          echo "TEST_BIN=$TEST_BIN"
-          cp "$TEST_BIN" target/raven-test
+          cargo build --release -p raven --features test-support
+          cargo test --release --no-run -p raven --features test-support \
+            --test performance_budgets 2>&1 | tee /tmp/perf-build.txt
+          PERF_BIN=$(grep -oE 'target/release/deps/performance_budgets-[a-f0-9]+' /tmp/perf-build.txt | head -1)
+          echo "PERF_BIN=$PERF_BIN"
+          cp "$PERF_BIN" target/raven-perf-test
 
       - name: Upload LSP binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -86,11 +96,11 @@ jobs:
           path: target/release/raven
           retention-days: 1
 
-      - name: Upload test binary
+      - name: Upload perf-budget test binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: raven-test
-          path: target/raven-test
+          name: raven-perf-test
+          path: target/raven-perf-test
           retention-days: 1
 
       - name: Report cache status
@@ -99,46 +109,81 @@ jobs:
           echo "::notice title=Cache status::cargo-hit=${{ steps.cargo-cache.outputs.cache-hit }} sccache-exact-hit=${{ steps.sccache-cache.outputs.cache-hit }}"
           sccache --show-stats
 
-  # Run the full Rust test suite using the pre-compiled release binary.
+  # Functional Rust tests run in DEBUG: opt-level-0 codegen is far cheaper than
+  # release and these tests don't depend on optimization for correctness. This
+  # job compiles AND runs them itself (no artifact handoff), so it runs in
+  # parallel with the release `build` job instead of waiting on it. `cargo test`
+  # here covers the lib unit tests plus every integration test — indentation,
+  # libpath_watching, package_db_consumer — which the old single-binary handoff
+  # silently dropped. performance_budgets compiles to an empty binary in debug
+  # (it is `#![cfg(not(debug_assertions))]`) and is enforced by the
+  # time-budgets job instead.
   cargo:
     name: Cargo Tests
-    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Download test binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
         with:
-          name: raven-test
-          path: target/
+          toolchain: stable
 
-      - name: Run cargo tests (release)
-        run: |
-          chmod +x target/raven-test
-          target/raven-test
+      # sccache + mold are referenced by the workflow-level RUSTC_WRAPPER /
+      # RUSTFLAGS env, so every Rust-compiling job must set them up or rustc
+      # fails. The debug dep cache is keyed separately from the release one
+      # (different opt level → different sccache objects).
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache sccache storage (debug)
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/sccache
+          key: sccache-debug-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sccache-debug-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            sccache-debug-${{ runner.os }}-
+
+      - name: Install mold linker
+        run: sudo apt-get install -y --no-install-recommends mold
+
+      - name: Run cargo tests (debug)
+        run: cargo test -p raven --features test-support
 
   # ── Time-budget regression tests (required check) ──────────────────────
-  # Re-uses the test binary from the build job, filtered to performance_budgets.
+  # Runs the release-compiled performance_budgets binary from the build job.
+  # The binary IS the performance_budgets test target, so running it with no
+  # filter runs all of its budget tests. Its fixtures are self-generated
+  # tempdirs, so no checkout is needed. GitHub Actions sets CI=true, which the
+  # tests read to apply their relaxation factor (3×) for slower CI hardware.
   time-budgets:
     name: Time-Budget Tests
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      - name: Download test binary
+      - name: Download perf-budget test binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
         with:
-          name: raven-test
+          name: raven-perf-test
           path: target/
 
       - name: Run time-budget tests
         run: |
-          chmod +x target/raven-test
-          target/raven-test performance_budgets
+          chmod +x target/raven-perf-test
+          target/raven-perf-test
 
   # ── Release binary size tracking ───────────────────────────────────────
   binary-size:
