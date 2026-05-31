@@ -4613,6 +4613,39 @@ mod tests {
         assert!(!lib.package_exists("dplyr"));
     }
 
+    #[tokio::test]
+    async fn tier2_outranks_tier3() {
+        use crate::package_db::PackageMetadataProvider;
+        use std::collections::HashSet;
+
+        struct Tier2;
+        impl PackageMetadataProvider for Tier2 {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "dplyr").then(|| PackageInfo::new("dplyr".into(), HashSet::from(["from_tier2".into()])))
+            }
+        }
+        struct Tier3;
+        impl PackageMetadataProvider for Tier3 {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                match name {
+                    "dplyr" => Some(PackageInfo::new("dplyr".into(), HashSet::from(["from_tier3".into()]))),
+                    "tidyr" => Some(PackageInfo::new("tidyr".into(), HashSet::from(["pivot_longer".into()]))),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Tier2), Box::new(Tier3)]); // Tier 2 first
+
+        let dplyr = lib.get_package("dplyr").await.unwrap();
+        assert!(dplyr.exports.contains("from_tier2"), "Tier 2 wins when both know dplyr");
+        assert!(!dplyr.exports.contains("from_tier3"));
+
+        let tidyr = lib.get_package("tidyr").await.unwrap();
+        assert!(tidyr.exports.contains("pivot_longer"), "Tier-3-only package still resolves");
+    }
+
     // NOTE: this test only *discriminates* the fallback in a truly R-free
     // environment (the intended CI target). On a machine with any R library on
     // the hardcoded fallback paths, the disk loop populates `datasets`/`mtcars`
