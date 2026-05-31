@@ -1482,6 +1482,28 @@ impl PackageLibrary {
         None
     }
 
+    /// Enumerate the names of all packages present across the library paths.
+    /// A "package" is a subdirectory containing a `DESCRIPTION` file. Used by
+    /// `raven packages freeze --installed/--all` and the Tier 3 build's
+    /// reference-R capture.
+    pub fn enumerate_installed_packages(&self) -> Vec<String> {
+        let mut names = std::collections::HashSet::new();
+        for lib in &self.lib_paths {
+            let Ok(entries) = std::fs::read_dir(lib) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("DESCRIPTION").is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
     /// Check if a package exists (is installed)
     ///
     /// This is a synchronous method that checks installation by:
@@ -4624,5 +4646,24 @@ mod tests {
             lib.is_base_export("mtcars"),
             "base dataset resolves from the base-exports file"
         );
+    }
+
+    #[test]
+    fn enumerate_installed_lists_package_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("dplyr")).unwrap();
+        std::fs::create_dir_all(lib.join("ggplot2")).unwrap();
+        // A package directory is identified by a DESCRIPTION file.
+        std::fs::write(lib.join("dplyr").join("DESCRIPTION"), "Package: dplyr\n").unwrap();
+        std::fs::write(lib.join("ggplot2").join("DESCRIPTION"), "Package: ggplot2\n").unwrap();
+        // a non-package file should be ignored
+        std::fs::write(lib.join("README"), "x").unwrap();
+
+        let mut pl = PackageLibrary::new_empty();
+        pl.set_lib_paths(vec![lib]);
+        let mut found = pl.enumerate_installed_packages();
+        found.sort();
+        assert_eq!(found, vec!["dplyr".to_string(), "ggplot2".to_string()]);
     }
 }
