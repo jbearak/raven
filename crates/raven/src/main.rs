@@ -24,6 +24,7 @@ mod jags_builtins;
 mod libpath_watcher;
 mod linting;
 mod namespace_parser;
+mod package_db;
 mod package_library;
 mod package_namespace;
 mod package_state;
