@@ -316,9 +316,10 @@ impl PackageLibrary {
         self.providers = providers;
     }
 
-    /// True when no fallback providers are configured (the common Tier-1-only case).
-    pub fn has_no_providers(&self) -> bool {
-        self.providers.is_empty()
+    /// True when fallback providers are configured (Tier 2/3 present beyond the
+    /// common Tier-1-only case).
+    pub fn has_providers(&self) -> bool {
+        !self.providers.is_empty()
     }
 
     /// Consult the fallback providers (Tier 2 → Tier 3) in order; return the
@@ -4540,9 +4541,9 @@ mod tests {
         }
 
         let mut lib = PackageLibrary::new_empty();
-        assert!(lib.has_no_providers());
+        assert!(!lib.has_providers());
         lib.set_providers(vec![Box::new(Fake)]);
-        assert!(!lib.has_no_providers());
+        assert!(lib.has_providers());
     }
 
     #[tokio::test]

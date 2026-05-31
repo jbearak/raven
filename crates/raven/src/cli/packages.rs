@@ -167,9 +167,7 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
                     }
                 }
             }
-            let mut rec = PackageRecord::from_info(&info);
-            rec.version = lib.package_version(&name).unwrap_or_default();
-            records.push(rec);
+            records.push(record_with_version(lib, &name, &info));
         }
     }
     records.sort_by(|a, b| a.name.cmp(&b.name));
@@ -310,6 +308,22 @@ fn read_description_depends_imports(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Build a Tier 2/3 record for an installed package, stamping the `Version` that
+/// `PackageRecord::from_info` deliberately leaves empty (`PackageInfo` carries no
+/// version). Both capture loops funnel through here so a record can never be
+/// pushed with an empty version — an empty version sorts lowest in the
+/// append-only monotonic merge, so a missed stamp would silently demote a real
+/// package.
+fn record_with_version(
+    lib: &crate::package_library::PackageLibrary,
+    name: &str,
+    info: &crate::package_library::PackageInfo,
+) -> PackageRecord {
+    let mut rec = PackageRecord::from_info(info);
+    rec.version = lib.package_version(name).unwrap_or_default();
+    rec
+}
+
 pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String> {
     let prior: Vec<PackageRecord> = if args.fresh {
         Vec::new()
@@ -346,9 +360,7 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
         .await;
         for name in outcome.library.enumerate_installed_packages() {
             if let Some(info) = outcome.library.get_package(&name).await {
-                let mut rec = PackageRecord::from_info(&info);
-                rec.version = outcome.library.package_version(&name).unwrap_or_default();
-                reference_r.push(rec);
+                reference_r.push(record_with_version(&outcome.library, &name, &info));
             }
         }
     }
