@@ -39,12 +39,19 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 - `--format text|json|sarif` — default `text`.
 - `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold.
 - `--quiet` — suppress the trailing summary line.
+- `--report-uninstalled` — report `library()` / `require()` calls for packages not present in local library paths. Off by default in CI (as CI environments often deliberately omit package installations). Note that this check only reports packages missing from the *local library paths* (Tier 1), not relative to the Tier 2 or Tier 3 metadata databases.
 - `--color auto|always|never` — when to colorize `text` output (default `auto`). See [Color output](#color-output).
 - `--no-color` — alias for `--color never`.
 
 ### R and packages
 
-`raven check` auto-detects R on `PATH` to resolve installed-package exports and base R symbols (it runs `.libPaths()` and parses package `NAMESPACE` files, the same as the language server). It honors the same `raven.toml` package settings the editor does: `packages.enabled = false` disables R detection entirely (no R subprocess, no package or base-symbol diagnostics — matching the editor), `packages.rPath` selects the R binary instead of `PATH` auto-detection, and `packages.additionalLibraryPaths` adds extra library directories to the search path. If R is not found, package and base-symbol diagnostics are limited — `library()` calls aren't checked against installed packages, and undefined-variable detection falls back to a built-in symbol list — and a one-line note is printed to stderr. All other diagnostics still run.
+> **Status: planned — tracking [the CI package-exports DB work]. Not yet available in a released build.**
+
+`raven check` auto-detects R on `PATH` to resolve installed-package exports and base R symbols (Tier 1: on-disk installed paths). If R or the package is not installed locally, Raven falls back to checking the repository-committed database `.raven/packages.json` (Tier 2), and then to the bundled CRAN/Bioconductor database `names.db` (Tier 3) to resolve package exports and prevent spurious undefined-variable diagnostics.
+
+The missing-package diagnostic ("not installed") is **off by default in `raven check`** to prevent build failures in CI where package installation is skipped. To re-enable missing-package warnings, pass the `--report-uninstalled` flag (which reports `library()` calls absent from local library paths, independent of the Tier 2/3 metadata databases).
+
+If R is not found and no package database is available, package and base-symbol diagnostics are limited, and undefined-variable detection falls back to a built-in symbol list, printing a one-line note on stderr. All other diagnostics still run.
 
 Before reporting, `raven check` warms the export cache for the packages each reported file attaches with `library()` / `require()`, so a bare call into an attached package that isn't one of its exports is flagged the same way the editor flags it. One narrow gap remains: a package attached only *indirectly* — in a `source()`d file rather than in the reported file itself — is not pre-warmed, so calls that could resolve to such a package are left unflagged rather than risk a false positive. Attach the package directly in the file (or rely on the editor) if you need those calls checked.
 
@@ -121,6 +128,44 @@ raven lint [OPTIONS] [PATHS...]
 `raven lint` runs the native style linter only. Cross-file, undefined-variable, and package diagnostics need a workspace scan; use [`raven check`](#raven-check) for those.
 
 Only plain R files (`.R` / `.r`) are linted. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped with a one-line note on stderr — chunk extraction isn't supported on the command line — and other file types are ignored silently. Passing a directory walks it recursively for R files.
+
+## `raven packages` subcommands
+
+> **Status: planned — tracking [the CI package-exports DB work]. Not yet available in a released build.**
+
+Raven provides a subcommand group `raven packages` to generate, build, and maintain offline package export databases.
+
+### `raven packages freeze`
+
+Generate a static, offline package export database for the current workspace. This captures the exported symbols, depends, and lazy-loaded datasets (Tier 2) from packages installed in the local environment and saves them to `.raven/packages.json`.
+
+```text
+raven packages freeze [OPTIONS]
+```
+
+This command should be run in an environment where your project's dependencies are fully installed (for example, on a developer machine or inside a provisioned container right after `renv::restore()`) to capture accurate exports.
+
+Options:
+- `--used` (default) — scan the workspace scripts for `library()`/`require()` calls, `::`/`:::` LHS references, `renv.lock` keys, and `DESCRIPTION` imports, then freeze only those packages (maximally-inclusive of all referenced dependencies).
+- `--installed` | `--all` — freeze *every* package currently found in the active R library paths.
+- `--output PATH` — path where the JSON file should be written (default: `.raven/packages.json`).
+- `--workspace DIR` — workspace root to scan and use as base (default: current directory).
+
+#### Key Invariants:
+- **No-op when unchanged:** If the frozen output file already exists, Raven compares the newly computed package records to the existing ones (ignoring metadata like timestamps). If they are identical, the file is left completely untouched to prevent unnecessary git churn.
+- **`renv.lock` as a Set Selector:** When `--used` is selected and `renv.lock` is present, the lockfile acts as a set selector (the list of packages to freeze), rather than a version oracle. Version information is omitted because Tier 2/3 metadata only tracks export names.
+
+### `raven packages build-shipped-db`
+
+Maintainer-only tool to compile the bundled Tier 3 binary database (`names.db`) and base-exports file (`base-exports.json`).
+
+```text
+raven packages build-shipped-db [OPTIONS]
+```
+
+This command merges a prior `names.db` seed (downloaded from the Release), a reference-R full-library capture of the build machine, and fetched API packages from CRAN and Bioconductor r-universe hosts.
+
+*Note: The shipped binary and extension are completely network-free. This command is executed only in automated weekly CI jobs to compile and upload Release assets.*
 
 ## Output formats
 
