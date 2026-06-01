@@ -1029,8 +1029,6 @@ fn write_unique_temp(dest_dir: &Path, prefix: &str, bytes: Vec<u8>) -> Result<Pa
     ))
 }
 
-
-
 fn backup_existing_final(final_path: &Path) -> Result<Option<PathBuf>, String> {
     if !final_path.exists() {
         return Ok(None);
@@ -1450,11 +1448,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let existing = dir.path().join("names.db");
         std::fs::write(&existing, b"existing").unwrap();
-        let err = super::install_downloaded_sidecars(
-            dir.path(),
-            b"not a raven db".to_vec(),
-        )
-        .unwrap_err();
+        let err =
+            super::install_downloaded_sidecars(dir.path(), b"not a raven db".to_vec()).unwrap_err();
         assert!(err.contains("names.db"));
         assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing");
@@ -1480,11 +1475,9 @@ mod tests {
         let names_src = source.path().join("names.db");
         write_shipped_db(&names_src, &recs, prov).unwrap();
 
-        let installed = super::install_downloaded_sidecars(
-            dest.path(),
-            std::fs::read(&names_src).unwrap(),
-        )
-        .unwrap();
+        let installed =
+            super::install_downloaded_sidecars(dest.path(), std::fs::read(&names_src).unwrap())
+                .unwrap();
         assert_eq!(installed.names_db_path, dest.path().join("names.db"));
         ShippedDb::open(&installed.names_db_path).unwrap();
     }

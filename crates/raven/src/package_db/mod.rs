@@ -236,5 +236,4 @@ mod tests {
             Some(PathBuf::from("/home/me/.local/share/raven"))
         );
     }
-
 }
