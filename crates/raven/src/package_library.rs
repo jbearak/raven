@@ -1184,13 +1184,9 @@ impl PackageLibrary {
         if all_base_exports.is_empty() {
             for p in crate::package_db::embedded_base::packages() {
                 self.base_packages.insert(p.name.to_string());
-                let exports: HashSet<String> = p
-                    .exports
-                    .iter()
-                    .chain(p.datasets.iter())
-                    .map(|s| s.to_string())
-                    .collect();
-                all_base_exports.extend(exports.iter().cloned());
+                for s in p.exports.iter().chain(p.datasets.iter()) {
+                    all_base_exports.insert(s.to_string());
+                }
                 let info = PackageInfo::with_details(
                     p.name.to_string(),
                     p.exports.iter().map(|s| s.to_string()).collect(),
@@ -5010,7 +5006,10 @@ mod tests {
         assert!(lib.base_exports().contains("print"));
         assert!(lib.base_exports().contains("mtcars"));
         // Per-package cache populated from the embedded table, datasets in lazy_data.
-        let datasets = lib.get_cached_package("datasets").await.expect("datasets cached");
+        let datasets = lib
+            .get_cached_package("datasets")
+            .await
+            .expect("datasets cached");
         assert!(datasets.lazy_data.contains(&"mtcars".to_string()));
     }
 }
