@@ -1,207 +1,39 @@
-//! Compact built-in base/recommended export floor used only when installed R
-//! packages and base-exports sidecars are unavailable.
+//! Built-in base-7 export/dataset floor, used when installed base packages are
+//! absent (CI without R). A `// @generated` per-package table embedded in the
+//! binary (see ADR 1 in the consolidation spec) — regenerate with
+//! `raven packages build-embedded-base`. The package set MUST equal
+//! `r_subprocess::get_fallback_base_packages()`.
 
 use std::collections::HashSet;
 
-const BASE_EXPORTS: &[&str] = &[
-    "::",
-    ":::",
-    "[",
-    "[[",
-    "$",
-    "<-",
-    "=",
-    "{",
-    "(",
-    "if",
-    "for",
-    "while",
-    "repeat",
-    "function",
-    "break",
-    "next",
-    "TRUE",
-    "FALSE",
-    "NULL",
-    "NA",
-    "NaN",
-    "Inf",
-    "print",
-    "cat",
-    "sum",
-    "mean",
-    "median",
-    "min",
-    "max",
-    "length",
-    "seq",
-    "seq_len",
-    "seq_along",
-    "c",
-    "list",
-    "data.frame",
-    "matrix",
-    "array",
-    "factor",
-    "as.character",
-    "as.numeric",
-    "as.integer",
-    "as.logical",
-    "is.na",
-    "is.null",
-    "isTRUE",
-    "stop",
-    "warning",
-    "message",
-    "library",
-    "require",
-    "source",
-    "get",
-    "exists",
-    "assign",
-    "ls",
-    "rm",
-    "paste",
-    "paste0",
-    "sprintf",
-    "format",
-    "names",
-    "colnames",
-    "rownames",
-    "nrow",
-    "ncol",
-    "dim",
-    "str",
-    "summary",
-    "head",
-    "tail",
-    "help",
-    "set.seed",
-    "sample",
-    "runif",
-    "rnorm",
-    "dnorm",
-    "pnorm",
-    "qnorm",
-    "lm",
-    "glm",
-    "predict",
-    "plot",
-    "hist",
-    "lines",
-    "points",
-    "title",
-];
+/// One base package's compile-time export floor. `datasets` map to
+/// `PackageInfo.lazy_data`; export *kind* is deliberately not tracked.
+pub struct EmbeddedBasePackage {
+    pub name: &'static str,
+    pub exports: &'static [&'static str],
+    pub datasets: &'static [&'static str],
+    pub depends: &'static [&'static str],
+}
 
-const BASE_DATASETS: &[&str] = &[
-    "AirPassengers",
-    "BOD",
-    "CO2",
-    "ChickWeight",
-    "DNase",
-    "EuStockMarkets",
-    "Formaldehyde",
-    "HairEyeColor",
-    "InsectSprays",
-    "JohnsonJohnson",
-    "LakeHuron",
-    "LifeCycleSavings",
-    "Loblolly",
-    "Nile",
-    "Orange",
-    "OrchardSprays",
-    "PlantGrowth",
-    "Puromycin",
-    "Theoph",
-    "Titanic",
-    "ToothGrowth",
-    "UCBAdmissions",
-    "UKDriverDeaths",
-    "UKgas",
-    "USAccDeaths",
-    "USArrests",
-    "USJudgeRatings",
-    "USPersonalExpenditure",
-    "UScitiesD",
-    "VADeaths",
-    "WWWusage",
-    "WorldPhones",
-    "airmiles",
-    "airquality",
-    "anscombe",
-    "attenu",
-    "attitude",
-    "austres",
-    "beaver1",
-    "beaver2",
-    "cars",
-    "chickwts",
-    "co2",
-    "crimtab",
-    "discoveries",
-    "esoph",
-    "euro",
-    "euro.cross",
-    "eurodist",
-    "faithful",
-    "fdeaths",
-    "freeny",
-    "infert",
-    "iris",
-    "iris3",
-    "islands",
-    "ldeaths",
-    "lh",
-    "longley",
-    "lynx",
-    "mdeaths",
-    "morley",
-    "mtcars",
-    "nhtemp",
-    "nottem",
-    "occupationalStatus",
-    "precip",
-    "presidents",
-    "pressure",
-    "quakes",
-    "randu",
-    "rivers",
-    "rock",
-    "sleep",
-    "stack.loss",
-    "stack.x",
-    "stackloss",
-    "state.abb",
-    "state.area",
-    "state.center",
-    "state.division",
-    "state.name",
-    "state.region",
-    "state.x77",
-    "sunspot.month",
-    "sunspot.year",
-    "sunspots",
-    "swiss",
-    "treering",
-    "trees",
-    "uspop",
-    "volcano",
-    "warpbreaks",
-    "women",
-];
+// Defines `static EMBEDDED_BASE_PACKAGES: &[EmbeddedBasePackage]`.
+include!("embedded_base_generated.rs");
 
+/// The per-package embedded records (for `initialize()` cache population).
+pub fn packages() -> &'static [EmbeddedBasePackage] {
+    EMBEDDED_BASE_PACKAGES
+}
+
+/// Flat always-in-scope set (exports ∪ datasets) + the base package-name set.
+/// Return shape is unchanged from the prior floor so callers are unaffected.
 pub fn load() -> (HashSet<String>, HashSet<String>) {
-    let exports = BASE_EXPORTS
-        .iter()
-        .chain(BASE_DATASETS.iter())
-        .map(|s| (*s).to_string())
-        .collect();
-    // The base/recommended package floor is owned by `get_fallback_base_packages`;
-    // derive it here rather than maintaining a second copy that can drift.
-    let packages = crate::r_subprocess::get_fallback_base_packages()
-        .into_iter()
-        .collect();
-    (exports, packages)
+    let mut exports = HashSet::new();
+    let mut pkgs = HashSet::new();
+    for p in EMBEDDED_BASE_PACKAGES {
+        pkgs.insert(p.name.to_string());
+        exports.extend(p.exports.iter().map(|s| s.to_string()));
+        exports.extend(p.datasets.iter().map(|s| s.to_string()));
+    }
+    (exports, pkgs)
 }
 
 #[cfg(test)]
@@ -209,16 +41,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_includes_common_platform_floor() {
-        let (exports, packages) = load();
-        let canonical_packages: HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
+    fn package_set_equals_fallback_base_packages() {
+        let canonical: HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
             .into_iter()
             .collect();
+        let derived: HashSet<String> = packages().iter().map(|p| p.name.to_string()).collect();
+        assert_eq!(derived, canonical);
+    }
 
-        assert!(exports.contains("print"));
-        assert!(exports.contains("mtcars"));
-        assert_eq!(packages, canonical_packages);
-        assert!(packages.contains("base"));
-        assert!(packages.contains("datasets"));
+    #[test]
+    fn load_unions_exports_and_datasets_into_flat_set() {
+        let (exports, pkgs) = load();
+        assert!(exports.contains("print"), "namespace export in flat set");
+        assert!(exports.contains("mtcars"), "dataset folded into flat set");
+        assert!(pkgs.contains("base") && pkgs.contains("datasets"));
+    }
+
+    #[test]
+    fn datasets_are_kept_distinct_from_exports() {
+        let datasets = packages().iter().find(|p| p.name == "datasets").unwrap();
+        assert!(datasets.datasets.contains(&"mtcars"));
+        assert!(!datasets.exports.contains(&"mtcars"));
     }
 }
