@@ -1202,7 +1202,7 @@ fn emit_embedded_base_source(pkgs: &[EmbeddedPkgCapture], r_version: &str) -> St
 /// `data()` Items are formatted `obj (topic)` for datasets documented under a
 /// shared topic, so the leading token is the resolvable object name (e.g.
 /// `state.abb`, `euro.cross`). Returns empty if R errors or the package ships
-/// no data. `pkg` is a fixed base-7 identifier, so the interpolation is safe.
+/// no data. `pkg` is a fixed base-priority identifier, so the interpolation is safe.
 async fn capture_base_datasets(r: &crate::r_subprocess::RSubprocess, pkg: &str) -> Vec<String> {
     let code = format!(
         "items <- suppressWarnings(data(package=\"{pkg}\")$results); \
@@ -1218,7 +1218,7 @@ async fn capture_base_datasets(r: &crate::r_subprocess::RSubprocess, pkg: &str) 
     }
 }
 
-/// Maintainer-only: captures the base-7 package table from a reference R
+/// Maintainer-only: captures the 14 base-priority packages from a reference R
 /// library and emits `embedded_base_generated.rs`. When R is present, exports
 /// come from `getNamespaceExports` and datasets from `data()` (both
 /// authoritative); a fresh, non-initialized `PackageLibrary` supplies `Depends`
@@ -1238,7 +1238,7 @@ pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), 
     let mut lib = PackageLibrary::with_subprocess(crate::r_subprocess::RSubprocess::new(None));
     lib.set_lib_paths(vec![args.reference_lib.clone()]);
     let mut pkgs = Vec::new();
-    for name in crate::r_subprocess::get_fallback_base_packages() {
+    for name in crate::r_subprocess::get_base_priority_packages() {
         let info = lib.get_package(&name).await.ok_or_else(|| {
             format!(
                 "base package {name} not found under {}",

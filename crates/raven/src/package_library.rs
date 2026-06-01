@@ -1176,16 +1176,23 @@ impl PackageLibrary {
         }
 
         // CI/runtime fallback: with no base exports found on disk, load the
-        // embedded base-7 table into both the flat always-in-scope set and the
-        // per-package cache (datasets → lazy_data). A non-empty disk merge (a
-        // real install) always wins and skips this entirely. No sidecar, so
-        // initialize() never depends on names.db and the startup ordering
-        // problem is gone (ADR 1).
+        // embedded base-priority table. All 14 packages populate the per-package
+        // cache (datasets → lazy_data) so `library(grid)` etc. resolve offline,
+        // but only the 7 default-attached packages seed the flat always-in-scope
+        // set + base_packages (the others require an explicit library() call).
+        // A non-empty disk merge (a real install) always wins and skips this
+        // entirely. No sidecar, so initialize() never depends on names.db and
+        // the startup ordering problem is gone (ADR 1).
         if all_base_exports.is_empty() {
+            let attached: HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
+                .into_iter()
+                .collect();
             for p in crate::package_db::embedded_base::packages() {
-                self.base_packages.insert(p.name.to_string());
-                for s in p.exports.iter().chain(p.datasets.iter()) {
-                    all_base_exports.insert(s.to_string());
+                if attached.contains(p.name) {
+                    self.base_packages.insert(p.name.to_string());
+                    for s in p.exports.iter().chain(p.datasets.iter()) {
+                        all_base_exports.insert(s.to_string());
+                    }
                 }
                 let info = PackageInfo::with_details(
                     p.name.to_string(),

@@ -1167,6 +1167,24 @@ pub fn get_fallback_base_packages() -> Vec<String> {
     ]
 }
 
+/// R's 14 base-priority packages (`installed.packages(priority="base")`): the
+/// 7 default-attached ones ([`get_fallback_base_packages`]) plus the 7 that
+/// ship with R but require an explicit `library()` to attach — `compiler`,
+/// `grid`, `parallel`, `splines`, `stats4`, `tcltk`, `tools`. All 14 are
+/// embedded so `library(grid)` etc. resolve offline (no R, no `names.db`); only
+/// the default-attached 7 are always in scope.
+pub fn get_base_priority_packages() -> Vec<String> {
+    let mut pkgs = get_fallback_base_packages();
+    pkgs.extend(
+        [
+            "compiler", "grid", "parallel", "splines", "stats4", "tcltk", "tools",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    pkgs
+}
+
 /// Platform-specific candidate R library directories used as a fallback when an R subprocess is unavailable.
 ///
 /// This returns a curated list of common system, user, and package-manager library locations for macOS, Linux, and Windows,
@@ -1465,6 +1483,22 @@ mod tests {
         assert_eq!(packages[4], "graphics");
         assert_eq!(packages[5], "stats");
         assert_eq!(packages[6], "datasets");
+    }
+
+    #[test]
+    fn test_get_base_priority_packages() {
+        let all = get_base_priority_packages();
+        assert_eq!(all.len(), 14);
+        let set: std::collections::HashSet<&str> = all.iter().map(String::as_str).collect();
+        // Superset of the default-attached 7 plus the 7 library()-only packages.
+        for p in get_fallback_base_packages() {
+            assert!(set.contains(p.as_str()), "missing attached pkg {p}");
+        }
+        for p in [
+            "compiler", "grid", "parallel", "splines", "stats4", "tcltk", "tools",
+        ] {
+            assert!(set.contains(p), "missing base-priority pkg {p}");
+        }
     }
 
     #[tokio::test]
