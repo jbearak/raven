@@ -280,7 +280,7 @@ This subsystem lets Raven resolve package **export names** without an installed
 package or a running R — the case that makes `raven check` usable in CI. It is an
 **ordered fallback over three tiers**: Tier 1 (installed, authoritative — the
 existing path above) → Tier 2 (a committed, repo-specific `.raven/packages.json`)
-→ Tier 3 (a `names.db` sidecar). Release archives, VSIX installs, and package-manager builds ship `names.db` and `base-exports.json` next to the executable; raw Cargo/source installs install only the executable and need `raven packages update` for broad CRAN/Bioconductor coverage. They still retain embedded base/recommended R platform coverage. The user-facing contract lives in
+→ Tier 3 (a `names.db` sidecar). Release archives, VSIX installs, and package-manager builds ship `names.db` next to the executable; raw Cargo/source installs install only the executable and need `raven packages update` for broad CRAN/Bioconductor coverage. Base-7 coverage is embedded in the binary. The user-facing contract lives in
 [`docs/package-database.md`](package-database.md); this section is the internals.
 
 **Critical invariant — names ≠ install status.** The databases feed *export
@@ -413,25 +413,30 @@ coverage.
   shipped binary itself is **network-free**; the workflow uses `curl` to fetch
   r-universe JSON into a directory that the command then transforms). Code:
   `cli/packages.rs`, `package_db/{merge,runiverse}.rs`.
-- **Companion base-exports file (decision #7):** base/recommended records (also
-  from the reference R) are delivered as a separate sidecar and also have an
-  embedded fallback in the binary. `initialize()` uses them to populate
-  `base_exports` when the base packages aren't on disk (CI). Base **datasets**
-  (`mtcars`/`iris`) are merged exactly as the disk path does, so base datasets
-  resolve in CI in v1, independent of #350. A real R install still wins.
-- **Delivery (decision #14):** `names.db` + the base-exports file + checksums live
-  on a **GitHub Release** (moving `names-db` tag) — durable across runs, unlike a
+- **Embedded base-7 (ADR 1):** the seven base packages (`base`, `methods`,
+  `utils`, `grDevices`, `graphics`, `stats`, `datasets`) are compiled into the
+  binary as a `// @generated` per-package table in
+  `embedded_base.rs` / `embedded_base_generated.rs`. Regenerate with
+  `raven packages build-embedded-base --reference-lib <DIR>`. `initialize()` loads
+  the table into both the flat `base_exports` set and the per-package cache
+  (datasets → `lazy_data`). `names.db` excludes base-7 post-merge (the
+  `build-shipped-db` filter uses `get_fallback_base_packages()`). A real R install
+  still wins.
+- **Delivery (decision #14):** one sidecar — `names.db` + checksums — lives on a
+  **GitHub Release** (moving `names-db` tag) — durable across runs, unlike a
   per-run CI artifact. `raven packages update` is the explicit network boundary for
   source/Cargo installs and should be part of CI image setup/cache warmup, not
   normal LSP startup, completion, hover, package lookup, or `raven check`. A
-  `workflow_dispatch` + on-release job
-  (`.github/workflows/build-names-db.yml`; the scheduled refresh interval is **not
-  yet committed**) downloads the current asset (the seed),
-  rebuilds, and re-uploads. `release-build.yml` / `bundle-binary.js` download the
-  same asset to place `names.db` exe-relative next to the binary and into the
-  VSIX. Located via the Tier 3 candidate locator — `RAVEN_NAMES_DB` override, then
-  user data, then exe-relative. **Not** `include_bytes!` (avoids binary bloat),
-  **not** committed to git (except tiny back-compat fixtures).
+  `workflow_dispatch` + scheduled job
+  (`.github/workflows/build-names-db.yml`; weekly schedule `0 6 * * 1`) downloads
+  the current asset (the seed), rebuilds via the shared
+  `scripts/build-names-db.sh`, and re-uploads. `release-build.yml` /
+  `bundle-binary.js` download the same asset to place `names.db` exe-relative next
+  to the binary and into the VSIX. A Git LFS seed is committed at
+  `crates/raven/data/names-db-seed.db` for bootstrap/disaster-recovery only (not a
+  build input). Located via the Tier 3 candidate locator — `RAVEN_NAMES_DB`
+  override, then user data, then exe-relative. **Not** `include_bytes!` (avoids
+  binary bloat), **not** committed to git (except tiny back-compat fixtures).
 - **Replacing the file (Windows mmap lock):** while `names.db` is mapped, Windows
   holds the file open (`CreateFileMapping` keeps a handle), so it cannot be
   overwritten in place. Writers (the bundle step, and any future in-process
@@ -452,7 +457,7 @@ coverage.
 (landed) wired dataset resolution into `collect_exports_recursive`, so a Tier 2/3
 record's `lazy_data` is folded into the resolvable set automatically — *non-base*
 package datasets resolve in CI with no extra work in this subsystem. (Base
-datasets come via the base-exports file, above.)
+datasets come via the embedded base-7 table, above.)
 
 ### Testing approach
 

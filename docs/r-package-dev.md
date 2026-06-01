@@ -251,7 +251,7 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 ## Generating a package database for CI
 
-`raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's Tier 3 sidecars when they are present, so they don't show as undefined variables. Release archives, VSIX installs, and package-manager builds ship `names.db` and `base-exports.json` next to the Raven executable; source/Cargo installs need `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded base/recommended R platform coverage.
+`raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's Tier 3 sidecar when it is present, so they don't show as undefined variables. Release archives, VSIX installs, and package-manager builds ship `names.db` next to the Raven executable; source/Cargo installs need `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded base-7 R platform coverage.
 
 Generate and commit `.raven/packages.json` (Tier 2) when CI needs reproducible, project-specific package metadata pinned to what your project actually installed. That is distinct from `raven packages update`, which restores broad Tier 3 coverage from the moving `names-db` Release and is not version-pinned by the project.
 
