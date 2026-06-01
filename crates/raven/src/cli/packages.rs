@@ -726,11 +726,10 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
 
     let merged = merge_append_only(prior, runiverse, reference_r);
 
-    // No FORMAT_VERSION bump needed — this post-merge filter simply removes
-    // base-7 packages from all sources before writing the shipped DB.
-    let base: std::collections::HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
-        .into_iter()
-        .collect();
+    // No FORMAT_VERSION bump needed — this post-merge filter removes every
+    // package embedded in the binary (all 14 base-priority packages) from all
+    // sources before writing the shipped DB, so names.db is strictly non-base.
+    let base = embedded_base_packages();
     let merged: Vec<PackageRecord> = merged
         .into_iter()
         .filter(|r| !base.contains(&r.name))
@@ -1447,11 +1446,18 @@ mod tests {
                 depends: vec![],
                 lazy_data: vec![],
             },
+            PackageRecord {
+                name: "grid".into(),
+                version: "4.4.0".into(),
+                exports: vec!["gpar".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            },
         ];
         let prov = ShippedDbProvenance {
             source: "t".into(),
             snapshot_date: "2026-06-01".into(),
-            package_count: 2,
+            package_count: 3,
             raven_version: "9.9.9".into(),
         };
         write_shipped_db(&seed, &recs, prov).unwrap();
@@ -1474,7 +1480,11 @@ mod tests {
         assert!(names.contains(&"dplyr".to_string()));
         assert!(
             !names.contains(&"base".to_string()),
-            "base-7 must be excluded"
+            "attached base package must be excluded"
+        );
+        assert!(
+            !names.contains(&"grid".to_string()),
+            "non-attached base-priority package must also be excluded"
         );
     }
 
