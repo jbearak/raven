@@ -44,6 +44,7 @@ Settled during design Q&A (the dialogue that produced this spec):
 5. **`--fail-on-missing` is opt-in.** By default, packages that resolve nowhere produce warnings and a success exit. `--fail-on-missing` turns the warning set into a non-zero exit so a pipeline can gate on unresolvable references.
 6. **Merge, never clobber — existing records always win.** `fetch` reads any existing file at the target path and **preserves every record in it untouched**, adding records only for used packages **not already present**. It does not even fetch a package that the existing file already covers. This makes `fetch` purely additive: run after `freeze`, it tops up coverage for whatever `freeze` missed (e.g. packages that weren't installed) without disturbing a single `freeze` row. When the merge produces content identical to the existing file, `fetch` leaves the file untouched and prints "no changes" (reusing `freeze`'s content-comparison no-op), so it never creates a spurious diff.
 7. **Version-skew warning (the achievable half of the renv.lock idea).** r-universe serves **latest only** — it does not archive old versions (it tracks the upstream git URL/commit for `renv` to restore, but exposes no per-version export JSON). So `fetch` cannot pull the exact version `renv.lock` pins. Instead, when `renv.lock` pins version *X* for a package and the fetched record is latest *Y* ≠ *X*, `fetch` prints a one-line warning naming both versions and pointing at `freeze` / `--missing-only` for a version-exact capture. Export names are usually stable across versions, so this is a soft heads-up, not an error.
+8. **Top-level aliases `raven freeze` / `raven fetch`.** As a convenience, `raven freeze [ARGS]` is exactly equivalent to `raven packages freeze [ARGS]`, and `raven fetch [ARGS]` to `raven packages fetch [ARGS]`. They are thin routing aliases in the top-level dispatcher — same parsing, same handler, same help/error text — not separate implementations. Only these two get aliases; `update` and `build-shipped-db` stay nested under `packages` (they're rarer / maintainer-only). The nested `raven packages freeze` / `raven packages fetch` forms keep working unchanged.
 
 ---
 
@@ -148,6 +149,8 @@ Reuse the temp-then-rename discipline from `update`'s `install_downloaded_sideca
 
 `run` (the subcommand router) gains a `Some("fetch") => run_fetch(parse_fetch_args(argv)?)` arm; `print_help` gains the `fetch` usage line.
 
+**Top-level aliases.** The flat dispatcher in `crates/raven/src/main.rs` (which routes `analysis-stats` / `lint` / `check` / `packages`) gains two arms: `Some("freeze")` and `Some("fetch")`. Each delegates to `cli::packages::run` with the subcommand token **prepended** to the remaining args — i.e. `raven freeze <rest>` calls `packages::run(["freeze", <rest>…])`, reusing the existing `HELP`/error handling exactly as the `packages` arm does. No collision risk: `freeze` / `fetch` are not existing top-level verbs. The top-level `--help` usage text adds the two aliases.
+
 ---
 
 ## 7. Error handling
@@ -174,6 +177,7 @@ Reuse the temp-then-rename discipline from `update`'s `install_downloaded_sideca
 - **No-op when unchanged:** a `fetch` whose used set is fully covered by the existing file leaves the file untouched and prints "no changes."
 - **Version-skew warning:** a `renv.lock` pinning `dplyr 1.1.2` with a fixture serving `1.1.4` emits the skew warning naming both versions; identical versions emit none; the warning never changes the exit code.
 - **Atomic write:** a simulated mid-write failure leaves a pre-existing target intact (reuse `update`'s rollback test shape).
+- **Top-level aliases:** `raven freeze <args>` routes to the same handler as `raven packages freeze <args>`, and `raven fetch <args>` to `raven packages fetch <args>` (assert the prepend-and-delegate produces identical parsed args / behavior, including `--help`).
 - **No consumption regression:** `read_repo_db_file` / `RepoDbProvider` load a fetched file identically to a frozen one (same schema, no new field), so the `raven check` path needs no new test beyond confirming a fetched file resolves a package's exports with empty libpaths.
 
 ---
@@ -202,7 +206,7 @@ Each row should briefly say what it does and its trade-offs. Indicative axes for
 
 ### 9.2 New: document `raven packages fetch`
 
-A `cli.md` subsection paralleling `raven packages freeze` / `raven packages update`: synopsis, the two modes, the no-R behavior, the additive merge (existing records always win), the inform/warn output, the renv.lock version-skew warning, `--fail-on-missing`, the gitignore guidance, and the honest scope limits (no whole-ecosystem floor; base still from R/embedded).
+A `cli.md` subsection paralleling `raven packages freeze` / `raven packages update`: synopsis, the two modes, the no-R behavior, the additive merge (existing records always win), the inform/warn output, the renv.lock version-skew warning, `--fail-on-missing`, the gitignore guidance, and the honest scope limits (no whole-ecosystem floor; base still from R/embedded). Document the top-level aliases `raven freeze` / `raven fetch` alongside the nested forms.
 
 ### 9.3 Cleanup pass on `docs/package-database.md` and the `raven packages` CLI docs
 
@@ -220,14 +224,14 @@ Docs must state two limits plainly so `fetch` is not oversold:
 ## 10. Code touchpoints
 
 - **New:** `run_fetch`, `parse_fetch_args`, `FetchArgs`, the per-package r-universe fetch helper, the "is base (embedded)" helper, the shared `collect_used_package_names` — all in `crates/raven/src/cli/packages.rs` (fetch helper may share a small module with `download_asset_blocking`).
-- **Modified:** the `renv.lock` reader gains a name→version accessor for the skew warning (sibling to `read_renv_lock_package_names`); `run_freeze` switches to the shared used-set helper (behavior-preserving); the `packages` `run` router + `print_help` gain the `fetch` arm. **No change to `RepoDbProvenance` / the Tier 2 schema.**
+- **Modified:** the `renv.lock` reader gains a name→version accessor for the skew warning (sibling to `read_renv_lock_package_names`); `run_freeze` switches to the shared used-set helper (behavior-preserving); the `packages` `run` router + `print_help` gain the `fetch` arm; **`main.rs` gains top-level `freeze` / `fetch` alias arms** that delegate into `cli::packages::run` with the subcommand prepended, plus the usage text. **No change to `RepoDbProvenance` / the Tier 2 schema.**
 - **Reused unchanged:** `parse_runiverse_json` (`package_db/runiverse.rs`), `collect_referenced_packages` / `read_description_depends_imports` / `read_renv_lock_package_names`, `build_package_library_tier1_only` + `package_exists` (Tier-1), `embedded_base::load`, `read_repo_db_file` (merge seed) + `write_repo_db_file` + the atomic-replace pattern from `update`.
 
 ---
 
 ## 11. Scope (v1) and explicit deferrals
 
-**In v1:** `raven packages fetch [--missing-only] [--fail-on-missing] [--output] [--workspace] [--base-urls]`; additive merge with the existing file (existing records always win); the inform/warn output; the renv.lock version-skew warning; bounded-concurrency curl fetch with CRAN→Bioc fallback; atomic write + no-op-when-unchanged; the docs (four-ways section, `fetch` reference, cleanup pass). **No Tier 2 schema change.**
+**In v1:** `raven packages fetch [--missing-only] [--fail-on-missing] [--output] [--workspace] [--base-urls]`; additive merge with the existing file (existing records always win); the inform/warn output; the renv.lock version-skew warning; bounded-concurrency curl fetch with CRAN→Bioc fallback; atomic write + no-op-when-unchanged; the top-level aliases `raven freeze` / `raven fetch`; the docs (four-ways section, `fetch` reference, cleanup pass). **No Tier 2 schema change.**
 
 **Deferred (noted, not built):**
 
