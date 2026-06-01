@@ -422,8 +422,9 @@ coverage.
   `library(grid)` etc. resolve offline, but only the 7 default-attached packages
   (`get_fallback_base_packages()`: `base`, `methods`, `utils`, `grDevices`,
   `graphics`, `stats`, `datasets`) seed the flat always-in-scope `base_exports`
-  set + `base_packages`. `names.db` excludes the base-7 post-merge (the
-  `build-shipped-db` filter uses `get_fallback_base_packages()`). A real R install
+  set + `base_packages`. `names.db` excludes all base-priority packages
+  post-merge (the `build-shipped-db` filter strips everything embedded, via
+  `embedded_base_packages()`). A real R install
   still wins.
 - **Delivery (decision #14):** one sidecar — `names.db` + checksums — lives on a
   **GitHub Release** (moving `names-db` tag) — durable across runs, unlike a

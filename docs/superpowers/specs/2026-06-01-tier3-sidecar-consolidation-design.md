@@ -47,10 +47,10 @@ Export kind) is defined in the repo-root `CONTEXT.md`.
    **not** track function-vs-variable `SymbolKind`. r-universe's `_exports` is a
    names-only list, so export kind cannot be known for the ecosystem floor; that
    is a separate future feature (see Non-goals).
-5. **`names.db` excludes the base-7** — a post-merge filter; **no
+5. **`names.db` excludes all base-priority packages** — a post-merge filter; **no
    `FORMAT_VERSION` bump** (same format, fewer records). It becomes strictly
-   non-base (CRAN/Bioc + recommended + reference capture minus
-   `get_fallback_base_packages()`). Recommended packages (MASS, Matrix, …) stay,
+   non-base (CRAN/Bioc + recommended + reference capture minus everything
+   embedded in the binary, via `embedded_base_packages()`). Recommended packages (MASS, Matrix, …) stay,
    because they attach via `library()` and resolve lazily like any package.
 6. **A comprehensive `names.db` seed is committed via Git LFS** as the bootstrap
    starting point and disaster-recovery backstop for the append-only release
@@ -98,7 +98,7 @@ the base-7 are always in scope.
 | Data | Source of truth | Consumption |
 |---|---|---|
 | Base-priority (14) exports + base datasets | **Embedded in the binary** (generated Rust) | Eager, in `initialize()`; base-7 seed the flat always-in-scope set, all 14 the per-package cache |
-| CRAN/Bioc + recommended + off-ecosystem capture (minus base-7) | **`names.db`** (one sidecar) | Lazy, per package, via `PackageMetadataProvider` |
+| CRAN/Bioc + recommended + off-ecosystem capture (minus all base-priority) | **`names.db`** (one sidecar) | Lazy, per package, via `PackageMetadataProvider` |
 | A real on-disk install | The install (Tier 1) | Unchanged; still wins, version-exact |
 
 A real on-disk base install still wins: the embedded base is consulted only when
@@ -119,7 +119,7 @@ pub struct EmbeddedBasePackage {
     pub depends: &'static [&'static str],
 }
 
-pub static EMBEDDED_BASE_PACKAGES: &[EmbeddedBasePackage] = &[ /* the base-7 */ ];
+pub static EMBEDDED_BASE_PACKAGES: &[EmbeddedBasePackage] = &[ /* all 14 base-priority packages */ ];
 ```
 
 `version` is dropped — `PackageInfo` has no version field and base resolution
@@ -167,8 +167,8 @@ depends on `names.db`, so the startup ordering problem disappears.
 
 ## `names.db` build changes (`build-shipped-db`)
 
-- **Exclude the base-7:** after the append-only merge, filter out
-  `get_fallback_base_packages()` before `write_shipped_db`. Filtering post-merge
+- **Exclude all base-priority packages:** after the append-only merge, filter out
+  everything embedded in the binary (`embedded_base_packages()`) before `write_shipped_db`. Filtering post-merge
   cleans base out of every source (prior seed/Release, reference capture,
   r-universe) uniformly. No `FORMAT_VERSION` bump.
 - **Drop base-exports emission:** remove `--base-exports-output`,
@@ -223,8 +223,8 @@ This spec includes generating and committing the two artifacts, not just the
 commands. Both runs need R + the maintainer's rich library (and `curl` for the
 seed), so the maintainer runs them and commits the outputs; the implementation
 otherwise builds the commands, the script, and all wiring. The partition is
-exact: **base-7 → embedded `.rs`; all other installed packages → `names.db`
-seed**, split at `get_fallback_base_packages()`.
+exact: **base-priority (14) → embedded `.rs`; all other installed packages → `names.db`
+seed**, split at `embedded_base_packages()`.
 
 1. `raven packages build-embedded-base --reference-lib <libs>` → commit
    `embedded_base.rs`.
@@ -263,8 +263,8 @@ seed**, split at `get_fallback_base_packages()`.
 
 - `docs/package-database.md` — Tier 3 section, "Base packages and datasets",
   "See also": base coverage is embedded in the binary; the floor is one sidecar,
-  `names.db`. Do not claim recommended packages are embedded — only the base-7
-  are.
+  `names.db`. Do not claim recommended packages are embedded — only the 14
+  base-priority packages are.
 - `README.md` — the two Installation passages naming "`names.db` and
   `base-exports.json`" drop the second file.
 - `docs/development.md` — internal architecture; add the `git lfs` / seed-refresh
@@ -307,7 +307,7 @@ Release (Release-first usage) — both surprising without this rationale.
   `get_fallback_base_packages()`.
 - `initialize()`: falls back to embedded base when disk base is absent; a real
   on-disk base install still wins when present.
-- `build-shipped-db`: the base-7 are excluded from the written `names.db`; no
+- `build-shipped-db`: all base-priority packages are excluded from the written `names.db`; no
   base-exports file is produced.
 - `update` / `install_downloaded_sidecars`: single-file install round-trips and
   rolls back on a bad `names.db`.
