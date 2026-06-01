@@ -304,7 +304,7 @@ Release (Release-first usage) — both surprising without this rationale.
 
 - Embedded base `load()`: flat set + per-package records, datasets kept distinct
   (`mtcars` in `datasets`/`lazy_data`), and the derived package set equals
-  `get_fallback_base_packages()`.
+  `get_base_priority_packages()`.
 - `initialize()`: falls back to embedded base when disk base is absent; a real
   on-disk base install still wins when present.
 - `build-shipped-db`: all base-priority packages are excluded from the written `names.db`; no
