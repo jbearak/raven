@@ -327,7 +327,6 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
     let mut found_names: HashSet<String> = HashSet::new();
     let mut fetched_records: Vec<PackageRecord> = Vec::new();
     let mut found_count: usize = 0;
-    let mut notfound_count: usize = 0;
     let mut transport_count: usize = 0;
     let mut sample_transport: Option<String> = None;
     let mut queue = to_fetch;
@@ -352,9 +351,7 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
                     }
                     fetched_records.push(rec);
                 }
-                PackageFetchOutcome::NotFound => {
-                    notfound_count += 1;
-                }
+                PackageFetchOutcome::NotFound => {}
                 PackageFetchOutcome::Transport(msg) => {
                     transport_count += 1;
                     if sample_transport.is_none() {
@@ -366,8 +363,8 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
         queue = next_queue;
     }
 
-    // Step 9: hard error on total infrastructure failure
-    if found_count == 0 && notfound_count == 0 && transport_count > 0 {
+    // Step 9: hard error when infrastructure failure prevented any successful fetch.
+    if found_count == 0 && transport_count > 0 {
         let sample = sample_transport.unwrap_or_default();
         return Err(format!(
             "could not reach any r-universe host (network down or curl missing): {sample}. \
@@ -383,11 +380,12 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
     }
 
     // Step 11: resolved-nowhere warnings
-    let resolved_nowhere: Vec<String> = used_nonbase
+    let mut resolved_nowhere: Vec<String> = seen
         .iter()
         .filter(|n| !existing_names.contains(*n) && !is_installed(n) && !found_names.contains(*n))
         .cloned()
         .collect();
+    resolved_nowhere.sort();
     for p in &resolved_nowhere {
         eprintln!(
             "warning: package '{p}' could not be resolved from r-universe; it may be \
@@ -1702,6 +1700,10 @@ mod tests {
         /// Always 500 (used to prove a 5xx outage is a hard Transport error,
         /// not a soft NotFound that silently drops a package).
         ServerError,
+        /// Return 500 for dplyr, but 404 for every other package.
+        DplyrServerErrorOtherwiseNotFound,
+        /// Serve a package whose Depends includes cli; every other package is 404.
+        RootDependsCli,
     }
 
     impl TestServer {
@@ -1759,6 +1761,39 @@ mod tests {
                         stream,
                         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     );
+                    return;
+                }
+                ServerMode::DplyrServerErrorOtherwiseNotFound => {
+                    if path == "/api/packages/dplyr" {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    } else {
+                        let _ = write!(stream, "{not_found}");
+                    }
+                    return;
+                }
+                ServerMode::RootDependsCli => {
+                    if path == "/api/packages/rootpkg" {
+                        let body = r#"{
+  "Package": "rootpkg",
+  "Version": "1.0.0",
+  "_exports": ["root_fn"],
+  "_dependencies": [
+    { "package": "cli", "version": "*", "role": "Depends" }
+  ],
+  "_datasets": []
+}"#;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                    } else {
+                        let _ = write!(stream, "{not_found}");
+                    }
                     return;
                 }
                 ServerMode::Fixtures => {}
@@ -2118,6 +2153,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_fetch_fail_on_missing_includes_transitive_depends() {
+        let server = TestServer::start_mode(ServerMode::RootDependsCli);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(rootpkg)\n").unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: true,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(
+            result.is_err(),
+            "expected --fail-on-missing to fail when rootpkg's cli dependency is unresolved"
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("could not be resolved"), "got: {err}");
+        assert!(err.contains("--fail-on-missing"), "got: {err}");
+    }
+
+    #[tokio::test]
     async fn run_fetch_missing_only_degrades_without_r() {
         // When --missing-only is set and R is NOT available, the tier1 lib
         // degrades (package_exists returns false for everything), so the fetch
@@ -2181,6 +2240,37 @@ mod tests {
 
         // No output file created
         assert!(!root.join(".raven/packages.json").exists());
+    }
+
+    #[tokio::test]
+    async fn run_fetch_mixed_notfound_and_transport_with_no_records_is_hard_error() {
+        let server = TestServer::start_mode(ServerMode::DplyrServerErrorOtherwiseNotFound);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("script.R"),
+            "library(boguspkgxyz)\nlibrary(dplyr)\n",
+        )
+        .unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(
+            result.is_err(),
+            "expected hard error when no records were fetched and any request hit transport failure"
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("could not reach"), "got: {err}");
+        assert!(
+            !root.join(".raven/packages.json").exists(),
+            "no file should be written when zero records were fetched during a mixed outage"
+        );
     }
 
     #[tokio::test]
