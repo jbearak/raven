@@ -15,7 +15,6 @@
 //! misses. Providers feed *export resolution* only; they never affect
 //! install-status (the missing-package diagnostic), which stays Tier-1-only.
 
-pub mod base_exports;
 pub mod binary_db;
 pub mod embedded_base;
 pub mod json_db;
@@ -51,11 +50,6 @@ pub trait PackageMetadataProvider: Send + Sync {
 /// Resolve ordered `names.db` sidecar candidates.
 pub fn locate_shipped_db_candidates() -> Vec<PathBuf> {
     locate_sidecar_candidates("RAVEN_NAMES_DB", "names.db")
-}
-
-/// Resolve ordered `base-exports.json` sidecar candidates.
-pub fn locate_base_exports_candidates() -> Vec<PathBuf> {
-    locate_sidecar_candidates("RAVEN_BASE_EXPORTS", "base-exports.json")
 }
 
 pub fn user_data_sidecar_path(file_name: &str) -> Option<PathBuf> {
@@ -168,46 +162,15 @@ impl Drop for TestUserDataDirGuard {
     }
 }
 
-/// Write the base/recommended subset of `records` to a base-exports file at
-/// `path`, reusing the Tier 2 JSON encoding. The Tier 3 build calls this with
-/// its merged record set so CI can resolve base symbols/datasets without R
-/// (loaded by `initialize()` when disk base packages are absent — decision #7).
-/// The base set is the canonical one used everywhere else
-/// (`r_subprocess::get_fallback_base_packages`).
-pub fn write_base_exports_file(
-    path: &std::path::Path,
-    records: &[crate::package_db::model::PackageRecord],
-) -> std::io::Result<()> {
-    use std::collections::HashSet;
-    let base: HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
-        .into_iter()
-        .collect();
-    let packages: Vec<crate::package_db::model::PackageRecord> = records
-        .iter()
-        .filter(|r| base.contains(&r.name))
-        .cloned()
-        .collect();
-    let db = crate::package_db::json_db::RepoDb {
-        schema_version: crate::package_db::json_db::REPO_DB_SCHEMA_VERSION,
-        provenance: crate::package_db::json_db::RepoDbProvenance {
-            raven_version: env!("CARGO_PKG_VERSION").to_string(),
-            r_version: String::new(),
-            generated_unix: 0,
-        },
-        packages,
-    };
-    crate::package_db::json_db::write_repo_db_file(path, &db)
-}
-
-/// Serializes tests that mutate the process-global package-DB env vars
-/// (`RAVEN_NAMES_DB`, `RAVEN_BASE_EXPORTS`). Without this, parallel test threads
-/// race: one test's `set_var` / `remove_var` window can be observed by another's
-/// `build_package_library` / `initialize` call (or `locate_shipped_db_candidates`
-/// / `locate_base_exports_candidates`), producing spurious failures. Every test in the crate's
-/// lib test binary that touches those vars MUST hold this lock. An async
-/// (`tokio`) mutex is required because some holders keep the guard across an
-/// `.await` on the build. Lives here (not in a test submodule) so both
-/// `package_db` and `package_library` tests can share the one instance.
+/// Serializes tests that mutate the process-global package-DB env var
+/// (`RAVEN_NAMES_DB`). Without this, parallel test threads race: one test's
+/// `set_var` / `remove_var` window can be observed by another's
+/// `build_package_library` / `initialize` call (or `locate_shipped_db_candidates`),
+/// producing spurious failures. Every test in the crate's lib test binary that
+/// touches that var MUST hold this lock. An async (`tokio`) mutex is required
+/// because some holders keep the guard across an `.await` on the build. Lives
+/// here (not in a test submodule) so both `package_db` and `package_library`
+/// tests can share the one instance.
 #[cfg(test)]
 pub(crate) static RAVEN_NAMES_DB_ENV_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
@@ -252,28 +215,6 @@ mod tests {
         assert_eq!(first, user_data.join("names.db"));
     }
 
-    #[tokio::test]
-    async fn base_exports_candidates_use_same_precedence() {
-        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
-        let user_data = dir.path().join("data");
-        let custom = dir.path().join("base.json");
-
-        std::env::set_var("RAVEN_BASE_EXPORTS", &custom);
-        let _user_data_guard = test_user_data_dir_guard(user_data.clone());
-        let candidates = locate_base_exports_candidates();
-        std::env::remove_var("RAVEN_BASE_EXPORTS");
-        let exe_relative = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("base-exports.json");
-
-        assert_eq!(candidates[0], custom);
-        assert_eq!(candidates[1], user_data.join("base-exports.json"));
-        assert!(candidates[2..].contains(&exe_relative));
-    }
-
     #[cfg(not(windows))]
     #[test]
     fn user_data_roots_ignore_empty_and_relative_values() {
@@ -296,31 +237,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn write_base_exports_filters_to_base_packages() {
-        use crate::package_db::model::PackageRecord;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("base-exports.json");
-        let records = vec![
-            PackageRecord {
-                name: "datasets".into(),
-                version: "4.4.0".into(),
-                exports: vec![],
-                depends: vec![],
-                lazy_data: vec!["mtcars".into()],
-            },
-            PackageRecord {
-                name: "dplyr".into(),
-                version: "1.1.4".into(),
-                exports: vec!["mutate".into()],
-                depends: vec![],
-                lazy_data: vec![],
-            },
-        ];
-        write_base_exports_file(&path, &records).unwrap();
-        let db = crate::package_db::json_db::read_repo_db_file(&path).unwrap();
-        let names: Vec<&str> = db.packages.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"datasets"), "base package datasets is kept");
-        assert!(!names.contains(&"dplyr"), "non-base dplyr is filtered out");
-    }
 }

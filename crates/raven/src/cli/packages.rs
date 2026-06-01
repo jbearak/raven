@@ -35,7 +35,6 @@ pub struct UpdateArgs {
 #[derive(Debug)]
 pub struct InstalledSidecars {
     pub names_db_path: PathBuf,
-    pub base_exports_path: PathBuf,
     pub names_db_provenance: ShippedDbProvenance,
 }
 
@@ -759,21 +758,16 @@ pub async fn run_update(args: UpdateArgs) -> Result<(), String> {
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .ok_or_else(|| {
                 "could not determine Raven user-data directory; rerun with --dest-dir, or set \
-                 RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup"
+                 RAVEN_NAMES_DB to override sidecar lookup"
                     .to_string()
             })?,
     };
 
     let names_bytes = download_asset(&args.base_url, "names.db").await?;
-    let base_bytes = download_asset(&args.base_url, "base-exports.json").await?;
-    let installed = install_downloaded_sidecars(&dest_dir, names_bytes, base_bytes)?;
+    let installed = install_downloaded_sidecars(&dest_dir, names_bytes)?;
     eprintln!(
         "Installed names.db to {}",
         installed.names_db_path.display()
-    );
-    eprintln!(
-        "Installed base-exports.json to {}",
-        installed.base_exports_path.display()
     );
     eprintln!(
         "names.db source: {}; snapshot: {}; packages: {}",
@@ -976,44 +970,38 @@ fn curl_failure_error(url: &str, status: &str, stderr: &str) -> String {
 }
 
 fn manual_sidecar_guidance() -> &'static str {
-    "Alternatively, set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to manually installed sidecars"
+    "Alternatively, set RAVEN_NAMES_DB to a manually installed names.db"
 }
 
 pub fn install_downloaded_sidecars(
     dest_dir: &Path,
     names_bytes: Vec<u8>,
-    base_bytes: Vec<u8>,
 ) -> Result<InstalledSidecars, String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| sidecar_write_error(dest_dir, "create", e))?;
     let names_final = dest_dir.join("names.db");
-    let base_final = dest_dir.join("base-exports.json");
 
     let names_tmp = write_unique_temp(dest_dir, "names.db", names_bytes)?;
-    let base_tmp = write_unique_temp(dest_dir, "base-exports.json", base_bytes)?;
 
-    // Validate both temps before swapping either into place; on any failure,
-    // clean up both temps and surface a uniform "{label} failed validation" error.
-    let cleanup_and_fail = |label: &str, e: String| -> String {
-        remove_tmp_sidecars(&names_tmp, &base_tmp);
+    let db = ShippedDb::open(&names_tmp).map_err(|e| {
+        let _ = std::fs::remove_file(&names_tmp);
         format!(
-            "downloaded {label} failed validation: {e}. {}",
+            "downloaded names.db failed validation: {e}. {}",
             manual_sidecar_guidance()
         )
-    };
-
-    let db =
-        ShippedDb::open(&names_tmp).map_err(|e| cleanup_and_fail("names.db", e.to_string()))?;
+    })?;
     let names_db_provenance = db.provenance().clone();
     drop(db);
 
-    read_repo_db_file(&base_tmp)
-        .map_err(|e| cleanup_and_fail("base-exports.json", e.to_string()))?;
-
-    replace_verified_sidecars(&names_tmp, &base_tmp, &names_final, &base_final)?;
+    // Backup existing, replace, restore on failure.
+    let backup = backup_existing_final(&names_final)?;
+    if let Err(e) = replace_with_tmp(&names_tmp, &names_final) {
+        restore_backup(backup.as_deref(), &names_final);
+        return Err(e);
+    }
+    remove_backup(backup.as_deref());
 
     Ok(InstalledSidecars {
         names_db_path: names_final,
-        base_exports_path: base_final,
         names_db_provenance,
     })
 }
@@ -1036,51 +1024,12 @@ fn write_unique_temp(dest_dir: &Path, prefix: &str, bytes: Vec<u8>) -> Result<Pa
 
     Err(format!(
         "could not create unique temporary sidecar in {}; rerun with --dest-dir pointing to a \
-         writable directory, or set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup",
+         writable directory, or set RAVEN_NAMES_DB to override sidecar lookup",
         dest_dir.display()
     ))
 }
 
-fn replace_verified_sidecars(
-    names_tmp: &Path,
-    base_tmp: &Path,
-    names_final: &Path,
-    base_final: &Path,
-) -> Result<(), String> {
-    let mut names_backup = None;
-    let mut base_backup = None;
-    let mut names_installed = false;
-    let mut base_installed = false;
 
-    let result = (|| {
-        names_backup = backup_existing_final(names_final)?;
-        base_backup = backup_existing_final(base_final)?;
-
-        replace_with_tmp(names_tmp, names_final)?;
-        names_installed = true;
-
-        replace_with_tmp(base_tmp, base_final)?;
-        base_installed = true;
-
-        Ok(())
-    })();
-
-    if let Err(e) = result {
-        if names_installed {
-            let _ = std::fs::remove_file(names_final);
-        }
-        if base_installed {
-            let _ = std::fs::remove_file(base_final);
-        }
-        restore_backup(names_backup.as_deref(), names_final);
-        restore_backup(base_backup.as_deref(), base_final);
-        return Err(e);
-    }
-
-    remove_backup(names_backup.as_deref());
-    remove_backup(base_backup.as_deref());
-    Ok(())
-}
 
 fn backup_existing_final(final_path: &Path) -> Result<Option<PathBuf>, String> {
     if !final_path.exists() {
@@ -1104,7 +1053,7 @@ fn backup_existing_final(final_path: &Path) -> Result<Option<PathBuf>, String> {
 
     Err(format!(
         "could not create unique backup sidecar for {}; rerun with --dest-dir pointing to a \
-         writable directory, or set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup",
+         writable directory, or set RAVEN_NAMES_DB to override sidecar lookup",
         final_path.display()
     ))
 }
@@ -1134,9 +1083,8 @@ fn remove_backup(backup: Option<&Path>) {
 /// `tmp` file.
 ///
 /// This deliberately hand-rolls the rename instead of using
-/// `tempfile::NamedTempFile::persist`: the install is a *two-file* transaction
-/// (`replace_verified_sidecars`) that needs explicit, separate rename control to
-/// back up and roll back each sidecar, and on Windows it uses
+/// `tempfile::NamedTempFile::persist`: the install needs explicit rename control
+/// to back up and roll back the sidecar, and on Windows it uses
 /// `MOVEFILE_WRITE_THROUGH` so the replacement is flushed before returning —
 /// neither of which `persist` offers. `write_unique_temp` keeps the temp on the
 /// same directory/filesystem so the rename stays atomic.
@@ -1185,15 +1133,10 @@ fn replace_file(tmp: &Path, final_path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn remove_tmp_sidecars(names_tmp: &Path, base_tmp: &Path) {
-    let _ = std::fs::remove_file(names_tmp);
-    let _ = std::fs::remove_file(base_tmp);
-}
-
 fn sidecar_write_error(path: &Path, action: &str, error: std::io::Error) -> String {
     format!(
         "could not {action} {}: {error}; rerun with --dest-dir pointing to a writable \
-         directory, or set RAVEN_NAMES_DB/RAVEN_BASE_EXPORTS to override sidecar lookup",
+         directory, or set RAVEN_NAMES_DB to override sidecar lookup",
         path.display()
     )
 }
@@ -1510,169 +1453,40 @@ mod tests {
         let err = super::install_downloaded_sidecars(
             dir.path(),
             b"not a raven db".to_vec(),
-            b"{}".to_vec(),
         )
         .unwrap_err();
         assert!(err.contains("names.db"));
         assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
-        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing");
     }
 
     #[test]
-    fn atomic_install_rejects_invalid_base_exports_and_suggests_manual_sidecars() {
+    fn atomic_install_round_trips_single_names_db() {
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
-        let records = vec![PackageRecord {
-            name: "base".into(),
-            version: "4.4.0".into(),
-            exports: vec!["mean".into()],
+        let recs = vec![PackageRecord {
+            name: "dplyr".into(),
+            version: "1.1.4".into(),
+            exports: vec!["mutate".into()],
             depends: vec![],
             lazy_data: vec![],
         }];
-        let provenance = ShippedDbProvenance {
-            source: "test".into(),
-            snapshot_date: "2026-05-31".into(),
-            package_count: records.len() as u32,
+        let prov = ShippedDbProvenance {
+            source: "t".into(),
+            snapshot_date: "2026-06-01".into(),
+            package_count: 1,
             raven_version: "9.9.9".into(),
         };
         let names_src = source.path().join("names.db");
-        write_shipped_db(&names_src, &records, provenance).unwrap();
-
-        let err = super::install_downloaded_sidecars(
-            dest.path(),
-            std::fs::read(&names_src).unwrap(),
-            b"not json".to_vec(),
-        )
-        .unwrap_err();
-
-        assert!(err.contains("base-exports.json"), "got {err}");
-        assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
-        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
-    }
-
-    #[test]
-    fn atomic_install_accepts_valid_sidecars() {
-        let source = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
-        let records = vec![PackageRecord {
-            name: "base".into(),
-            version: "4.4.0".into(),
-            exports: vec!["mean".into()],
-            depends: vec![],
-            lazy_data: vec![],
-        }];
-        let provenance = ShippedDbProvenance {
-            source: "test".into(),
-            snapshot_date: "2026-05-31".into(),
-            package_count: records.len() as u32,
-            raven_version: "9.9.9".into(),
-        };
-        let names_src = source.path().join("names.db");
-        write_shipped_db(&names_src, &records, provenance).unwrap();
-        let repo_db = RepoDb {
-            schema_version: REPO_DB_SCHEMA_VERSION,
-            provenance: RepoDbProvenance {
-                raven_version: "9.9.9".into(),
-                r_version: "4.4.0".into(),
-                generated_unix: 1_800_000_000,
-            },
-            packages: records,
-        };
-        let base_src = source.path().join("base-exports.json");
-        write_repo_db_file(&base_src, &repo_db).unwrap();
+        write_shipped_db(&names_src, &recs, prov).unwrap();
 
         let installed = super::install_downloaded_sidecars(
             dest.path(),
             std::fs::read(&names_src).unwrap(),
-            std::fs::read(&base_src).unwrap(),
         )
         .unwrap();
-
         assert_eq!(installed.names_db_path, dest.path().join("names.db"));
-        assert_eq!(
-            installed.base_exports_path,
-            dest.path().join("base-exports.json")
-        );
         ShippedDb::open(&installed.names_db_path).unwrap();
-        read_repo_db_file(&installed.base_exports_path).unwrap();
-    }
-
-    #[test]
-    fn atomic_install_ignores_preexisting_fixed_temp_names() {
-        let source = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
-        let fixed_names_tmp = dest.path().join("names.db.tmp");
-        let fixed_base_tmp = dest.path().join("base-exports.json.tmp");
-        std::fs::write(&fixed_names_tmp, b"do not touch names").unwrap();
-        std::fs::write(&fixed_base_tmp, b"do not touch base").unwrap();
-
-        let records = vec![PackageRecord {
-            name: "base".into(),
-            version: "4.4.0".into(),
-            exports: vec!["mean".into()],
-            depends: vec![],
-            lazy_data: vec![],
-        }];
-        let provenance = ShippedDbProvenance {
-            source: "test".into(),
-            snapshot_date: "2026-05-31".into(),
-            package_count: records.len() as u32,
-            raven_version: "9.9.9".into(),
-        };
-        let names_src = source.path().join("names.db");
-        write_shipped_db(&names_src, &records, provenance).unwrap();
-        let repo_db = RepoDb {
-            schema_version: REPO_DB_SCHEMA_VERSION,
-            provenance: RepoDbProvenance {
-                raven_version: "9.9.9".into(),
-                r_version: "4.4.0".into(),
-                generated_unix: 1_800_000_000,
-            },
-            packages: records,
-        };
-        let base_src = source.path().join("base-exports.json");
-        write_repo_db_file(&base_src, &repo_db).unwrap();
-
-        super::install_downloaded_sidecars(
-            dest.path(),
-            std::fs::read(&names_src).unwrap(),
-            std::fs::read(&base_src).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            std::fs::read(&fixed_names_tmp).unwrap(),
-            b"do not touch names"
-        );
-        assert_eq!(
-            std::fs::read(&fixed_base_tmp).unwrap(),
-            b"do not touch base"
-        );
-    }
-
-    #[test]
-    fn install_verified_sidecars_rolls_back_when_second_replace_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let names_final = dir.path().join("names.db");
-        let base_final = dir.path().join("base-exports.json");
-        std::fs::write(&names_final, b"old names").unwrap();
-        std::fs::write(&base_final, b"old base").unwrap();
-
-        let names_tmp = dir.path().join("new-names.tmp");
-        let missing_base_tmp = dir.path().join("missing-base.tmp");
-        std::fs::write(&names_tmp, b"new names").unwrap();
-        let err = super::replace_verified_sidecars(
-            &names_tmp,
-            &missing_base_tmp,
-            &names_final,
-            &base_final,
-        )
-        .unwrap_err();
-
-        assert!(err.contains("base-exports.json"), "got {err}");
-        assert_eq!(std::fs::read(&names_final).unwrap(), b"old names");
-        assert_eq!(std::fs::read(&base_final).unwrap(), b"old base");
     }
 
     #[test]
@@ -1681,7 +1495,6 @@ mod tests {
         assert!(err.contains("http://"), "got {err}");
         assert!(err.contains("https://"), "got {err}");
         assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
-        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
     }
 
     #[test]
@@ -1692,7 +1505,6 @@ mod tests {
             "could not connect",
         );
         assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
-        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
     }
 
     #[test]
@@ -1701,7 +1513,6 @@ mod tests {
         assert!(err.contains("http://"), "got {err}");
         assert!(err.contains("https://"), "got {err}");
         assert!(err.contains("RAVEN_NAMES_DB"), "got {err}");
-        assert!(err.contains("RAVEN_BASE_EXPORTS"), "got {err}");
     }
 
     #[cfg(not(windows))]

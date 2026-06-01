@@ -4876,55 +4876,6 @@ mod tests {
         );
     }
 
-    // NOTE: this test only *discriminates* the fallback in a truly R-free
-    // environment (the intended CI target). On a machine with any R library on
-    // the hardcoded fallback paths, the disk loop populates `datasets`/`mtcars`
-    // and the `is_empty()` guard skips the file — the assertion then passes via
-    // disk, not the bundled file. The actual fallback logic is covered
-    // discriminatingly by the unit tests in `package_db::base_exports`.
-    #[tokio::test]
-    async fn initialize_loads_base_exports_file_when_disk_absent() {
-        use crate::package_db::json_db::{write_repo_db_file, RepoDb, RepoDbProvenance};
-        use crate::package_db::model::PackageRecord;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("base-exports.json");
-        // 'datasets' base package contributing the mtcars dataset name.
-        write_repo_db_file(
-            &path,
-            &RepoDb {
-                schema_version: crate::package_db::json_db::REPO_DB_SCHEMA_VERSION,
-                provenance: RepoDbProvenance {
-                    raven_version: "t".into(),
-                    r_version: "4.4.0".into(),
-                    generated_unix: 0,
-                },
-                packages: vec![PackageRecord {
-                    name: "datasets".into(),
-                    version: "4.4.0".into(),
-                    exports: vec![],
-                    depends: vec![],
-                    lazy_data: vec!["mtcars".into()],
-                }],
-            },
-        )
-        .unwrap();
-
-        // Serialize against other tests that mutate/read package-DB env vars
-        // (the lock also guards `initialize()`, which reads RAVEN_BASE_EXPORTS).
-        let _env = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
-        std::env::set_var("RAVEN_BASE_EXPORTS", &path);
-        // new_empty + initialize with no lib paths simulates CI (no disk base packages).
-        let mut lib = PackageLibrary::new_empty();
-        lib.initialize().await.unwrap();
-        std::env::remove_var("RAVEN_BASE_EXPORTS");
-
-        assert!(
-            lib.is_base_export("mtcars"),
-            "base dataset resolves from the base-exports file"
-        );
-    }
-
     #[tokio::test]
     async fn initialize_uses_embedded_base_exports_when_disk_and_sidecars_absent() {
         let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
@@ -4933,22 +4884,10 @@ mod tests {
         std::fs::create_dir_all(&empty_lib).unwrap();
         let _user_data_guard =
             crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
-        std::env::set_var("RAVEN_BASE_EXPORTS", dir.path().join("missing-base.json"));
-        let exe_base_exports = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("base-exports.json");
-        assert!(
-            !exe_base_exports.exists(),
-            "test requires no exe-relative base-exports.json at {}",
-            exe_base_exports.display()
-        );
 
         let mut lib = PackageLibrary::new_empty();
         lib.set_lib_paths(vec![empty_lib]);
         lib.initialize().await.unwrap();
-        std::env::remove_var("RAVEN_BASE_EXPORTS");
 
         assert!(lib.base_exports().contains("print"));
         assert!(lib.base_exports().contains("mtcars"));

@@ -46,7 +46,7 @@ analysis-stats <path>        Profile workspace analysis phases
 packages <subcommand>        Generate / maintain package databases
   fetch                      Fetch a repo's Tier 2 .raven/packages.json from r-universe (R-free)
   freeze                     Write a repo's Tier 2 .raven/packages.json
-  update                     Download names.db and base-exports.json sidecars
+  update                     Download the names.db sidecar
   build-shipped-db           Maintainer-only Tier 3 names.db builder
 freeze, fetch                Top-level aliases for raven packages freeze/fetch
 
