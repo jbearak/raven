@@ -23,7 +23,7 @@ Usage: raven [OPTIONS]
        raven check [PATHS...] [--workspace DIR]
        raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
-       raven packages <fetch|freeze|update|build-shipped-db> [OPTIONS]
+       raven packages <fetch|freeze|update|build-shipped-db|build-embedded-base> [OPTIONS]
        raven freeze [ARGS]          (alias for: raven packages freeze)
        raven fetch  [ARGS]          (alias for: raven packages fetch)
 

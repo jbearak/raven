@@ -4,7 +4,7 @@
 # Usage: build-names-db.sh --raven PATH --output PATH [--seed PATH] [--reference-lib DIR] [--work DIR]
 set -euo pipefail
 
-RAVEN="" OUT="" SEED="" REF_LIB="" WORK="$(mktemp -d)"
+RAVEN="" OUT="" SEED="" REF_LIB="" WORK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --raven) RAVEN="$2"; shift 2;;
@@ -16,6 +16,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$RAVEN" ] && [ -n "$OUT" ] || { echo "--raven and --output are required" >&2; exit 2; }
+
+# Default to a temp work dir and clean it up on exit; a caller-supplied --work is left intact.
+if [ -z "$WORK" ]; then WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT; fi
 
 for host in cran.r-universe.dev bioc.r-universe.dev; do
   dest="$WORK/runiverse/${host%%.*}"; mkdir -p "$dest"
