@@ -303,18 +303,12 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
     };
 
     // Step 5: used packages (non-base, deduped)
-    let used = collect_used_package_names(&root)?;
-    let used_nonbase: Vec<String> = {
-        let mut set = HashSet::new();
-        let mut v = Vec::new();
-        for name in &used {
-            if !base.contains(name) && set.insert(name.clone()) {
-                v.push(name.clone());
-            }
-        }
-        v.sort();
-        v
-    };
+    let mut used_nonbase: Vec<String> = collect_used_package_names(&root)?
+        .into_iter()
+        .filter(|name| !base.contains(name))
+        .collect();
+    used_nonbase.sort();
+    used_nonbase.dedup();
 
     // Step 6: initial fetch set
     let to_fetch: Vec<String> = used_nonbase
