@@ -4900,6 +4900,25 @@ mod tests {
         assert!(lib.base_exports().contains("mtcars"));
         assert!(lib.is_base_package("base"));
         assert!(lib.is_base_package("datasets"));
+
+        // The non-attached base-priority 7 are cached for offline library()
+        // resolution but MUST NOT be always-in-scope.
+        assert!(
+            !lib.base_exports().contains("gpar"),
+            "grid::gpar must not be in the always-in-scope set"
+        );
+        assert!(
+            !lib.is_base_package("grid"),
+            "grid is base-priority but not default-attached"
+        );
+        let grid = lib
+            .get_package("grid")
+            .await
+            .expect("grid resolvable offline");
+        assert!(
+            grid.exports.contains("gpar"),
+            "library(grid) resolves gpar with no R and no names.db"
+        );
     }
 
     #[test]
