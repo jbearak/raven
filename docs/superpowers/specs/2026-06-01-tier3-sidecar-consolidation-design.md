@@ -63,7 +63,11 @@ Export kind) is defined in the repo-root `CONTEXT.md`.
 
 The base-7 are the seven always-attached packages from
 `get_fallback_base_packages()`: `base`, `methods`, `utils`, `grDevices`,
-`graphics`, `stats`, `datasets`.
+`graphics`, `stats`, `datasets`. They are 7 of R's 14 base-priority packages
+(`installed.packages(priority="base")`); the other 7 — compiler, grid, parallel,
+splines, stats4, tcltk, tools — ship with R but require `library()`. Raven
+embeds all 14 (`get_base_priority_packages()`) so they resolve offline, but only
+the base-7 are always in scope.
 
 ## Non-goals
 
@@ -93,7 +97,7 @@ The base-7 are the seven always-attached packages from
 
 | Data | Source of truth | Consumption |
 |---|---|---|
-| Base-7 exports + base datasets | **Embedded in the binary** (generated Rust) | Eager, in `initialize()`; flat always-in-scope set + per-package cache |
+| Base-priority (14) exports + base datasets | **Embedded in the binary** (generated Rust) | Eager, in `initialize()`; base-7 seed the flat always-in-scope set, all 14 the per-package cache |
 | CRAN/Bioc + recommended + off-ecosystem capture (minus base-7) | **`names.db`** (one sidecar) | Lazy, per package, via `PackageMetadataProvider` |
 | A real on-disk install | The install (Tier 1) | Unchanged; still wins, version-exact |
 

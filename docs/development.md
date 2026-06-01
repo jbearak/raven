@@ -280,7 +280,7 @@ This subsystem lets Raven resolve package **export names** without an installed
 package or a running R — the case that makes `raven check` usable in CI. It is an
 **ordered fallback over three tiers**: Tier 1 (installed, authoritative — the
 existing path above) → Tier 2 (a committed, repo-specific `.raven/packages.json`)
-→ Tier 3 (a `names.db` sidecar). Release archives, VSIX installs, and package-manager builds ship `names.db` next to the executable; raw Cargo/source installs install only the executable and need `raven packages update` for broad CRAN/Bioconductor coverage. Base-7 coverage is embedded in the binary. The user-facing contract lives in
+→ Tier 3 (a `names.db` sidecar). Release archives, VSIX installs, and package-manager builds ship `names.db` next to the executable; raw Cargo/source installs install only the executable and need `raven packages update` for broad CRAN/Bioconductor coverage. R's base-priority packages are embedded in the binary (all 14; only the default-attached base-7 are always in scope). The user-facing contract lives in
 [`docs/package-database.md`](package-database.md); this section is the internals.
 
 **Critical invariant — names ≠ install status.** The databases feed *export
@@ -413,13 +413,16 @@ coverage.
   shipped binary itself is **network-free**; the workflow uses `curl` to fetch
   r-universe JSON into a directory that the command then transforms). Code:
   `cli/packages.rs`, `package_db/{merge,runiverse}.rs`.
-- **Embedded base-7 (ADR 1):** the seven base packages (`base`, `methods`,
-  `utils`, `grDevices`, `graphics`, `stats`, `datasets`) are compiled into the
-  binary as a `// @generated` per-package table in
+- **Embedded base packages (ADR 1):** all 14 of R's base-priority packages
+  (`installed.packages(priority="base")`) are compiled into the binary as a
+  `// @generated` per-package table in
   `embedded_base.rs` / `embedded_base_generated.rs`. Regenerate with
-  `raven packages build-embedded-base --reference-lib <DIR>`. `initialize()` loads
-  the table into both the flat `base_exports` set and the per-package cache
-  (datasets → `lazy_data`). `names.db` excludes base-7 post-merge (the
+  `raven packages build-embedded-base --reference-lib <DIR>`. `initialize()`
+  loads every package into the per-package cache (datasets → `lazy_data`) so
+  `library(grid)` etc. resolve offline, but only the 7 default-attached packages
+  (`get_fallback_base_packages()`: `base`, `methods`, `utils`, `grDevices`,
+  `graphics`, `stats`, `datasets`) seed the flat always-in-scope `base_exports`
+  set + `base_packages`. `names.db` excludes the base-7 post-merge (the
   `build-shipped-db` filter uses `get_fallback_base_packages()`). A real R install
   still wins.
 - **Delivery (decision #14):** one sidecar — `names.db` + checksums — lives on a
@@ -457,7 +460,7 @@ coverage.
 (landed) wired dataset resolution into `collect_exports_recursive`, so a Tier 2/3
 record's `lazy_data` is folded into the resolvable set automatically — *non-base*
 package datasets resolve in CI with no extra work in this subsystem. (Base
-datasets come via the embedded base-7 table, above.)
+datasets come via the embedded base table, above.)
 
 ### Testing approach
 
