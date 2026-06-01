@@ -285,12 +285,8 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
     // Step 4: tier1 lib for --missing-only
     let lib_outcome = if args.missing_only {
         Some(
-            crate::package_library::build_package_library_tier1_only(
-                None,
-                &[],
-                Some(root.clone()),
-            )
-            .await,
+            crate::package_library::build_package_library_tier1_only(None, &[], Some(root.clone()))
+                .await,
         )
     } else {
         None
@@ -389,9 +385,7 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
     // Step 11: resolved-nowhere warnings
     let resolved_nowhere: Vec<String> = used_nonbase
         .iter()
-        .filter(|n| {
-            !existing_names.contains(*n) && !is_installed(n) && !found_names.contains(*n)
-        })
+        .filter(|n| !existing_names.contains(*n) && !is_installed(n) && !found_names.contains(*n))
         .cloned()
         .collect();
     for p in &resolved_nowhere {
@@ -416,13 +410,12 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let r_version = if args.missing_only
-            && lib_outcome.as_ref().is_some_and(|o| o.status.is_ready())
-        {
-            "present (--missing-only)".to_string()
-        } else {
-            "none (fetched)".to_string()
-        };
+        let r_version =
+            if args.missing_only && lib_outcome.as_ref().is_some_and(|o| o.status.is_ready()) {
+                "present (--missing-only)".to_string()
+            } else {
+                "none (fetched)".to_string()
+            };
         let db = RepoDb {
             schema_version: REPO_DB_SCHEMA_VERSION,
             provenance: RepoDbProvenance {
@@ -568,9 +561,7 @@ fn collect_used_package_names(root: &std::path::Path) -> Result<Vec<String>, Str
     let mut names = Vec::new();
     names.extend(scan_workspace_referenced_packages(root));
     names.extend(read_description_depends_imports(&root.join("DESCRIPTION")));
-    names.extend(
-        read_renv_lock_package_names(&root.join("renv.lock")).map_err(|e| e.to_string())?,
-    );
+    names.extend(read_renv_lock_package_names(&root.join("renv.lock")).map_err(|e| e.to_string())?);
     Ok(names)
 }
 
@@ -937,8 +928,7 @@ fn fetch_one_package_blocking(pkg: &str, base_urls: &[String]) -> PackageFetchOu
         PackageFetchOutcome::NotFound
     } else {
         PackageFetchOutcome::Transport(
-            last_error
-                .unwrap_or_else(|| format!("could not reach any r-universe base for {pkg}")),
+            last_error.unwrap_or_else(|| format!("could not reach any r-universe base for {pkg}")),
         )
     }
 }
@@ -967,10 +957,9 @@ async fn fetch_packages_wave(
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let n = name.clone();
-            let result =
-                tokio::task::spawn_blocking(move || fetch_one_package_blocking(&n, &urls))
-                    .await
-                    .unwrap();
+            let result = tokio::task::spawn_blocking(move || fetch_one_package_blocking(&n, &urls))
+                .await
+                .unwrap();
             (name, result)
         });
     }
@@ -1232,7 +1221,9 @@ pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
             run_build_shipped_db(args).await
         }
         Some(other) => Err(format!("unknown packages subcommand: {other}")),
-        None => Err("usage: raven packages <fetch|freeze|update|build-shipped-db> [OPTIONS]".into()),
+        None => {
+            Err("usage: raven packages <fetch|freeze|update|build-shipped-db> [OPTIONS]".into())
+        }
     }
 }
 
@@ -1620,7 +1611,10 @@ mod tests {
         let args = super::parse_fetch_args(std::iter::empty()).unwrap();
         assert!(!args.missing_only);
         assert!(!args.fail_on_missing);
-        assert_eq!(args.output, std::path::PathBuf::from(".raven/packages.json"));
+        assert_eq!(
+            args.output,
+            std::path::PathBuf::from(".raven/packages.json")
+        );
         assert_eq!(args.workspace, None);
         assert_eq!(
             args.base_urls,
@@ -1666,8 +1660,7 @@ mod tests {
 
     #[test]
     fn parse_fetch_args_unknown_flag() {
-        let err =
-            super::parse_fetch_args(["--bogus"].iter().map(|s| s.to_string())).unwrap_err();
+        let err = super::parse_fetch_args(["--bogus"].iter().map(|s| s.to_string())).unwrap_err();
         assert!(err.contains("unknown flag"), "got {err}");
         assert!(err.contains("--bogus"), "got {err}");
     }
@@ -1676,10 +1669,8 @@ mod tests {
     fn parse_fetch_args_rejects_empty_base_urls() {
         // `--base-urls ''` (or only commas/whitespace) parses to no URLs; reject
         // it with a clear message rather than later misreporting a network outage.
-        let err = super::parse_fetch_args(
-            ["--base-urls", " , "].iter().map(|s| s.to_string()),
-        )
-        .unwrap_err();
+        let err = super::parse_fetch_args(["--base-urls", " , "].iter().map(|s| s.to_string()))
+            .unwrap_err();
         assert!(err.contains("--base-urls"), "got {err}");
     }
 
@@ -1803,9 +1794,21 @@ mod tests {
             super::PackageFetchOutcome::Found(rec) => {
                 assert_eq!(rec.name, "dplyr");
                 assert_eq!(rec.version, "1.1.4");
-                assert!(rec.exports.contains(&"mutate".to_string()), "{:?}", rec.exports);
-                assert!(rec.exports.contains(&"filter".to_string()), "{:?}", rec.exports);
-                assert!(rec.exports.contains(&"select".to_string()), "{:?}", rec.exports);
+                assert!(
+                    rec.exports.contains(&"mutate".to_string()),
+                    "{:?}",
+                    rec.exports
+                );
+                assert!(
+                    rec.exports.contains(&"filter".to_string()),
+                    "{:?}",
+                    rec.exports
+                );
+                assert!(
+                    rec.exports.contains(&"select".to_string()),
+                    "{:?}",
+                    rec.exports
+                );
             }
             other => panic!("expected Found, got {other:?}"),
         }
@@ -1868,7 +1871,9 @@ mod tests {
             "curl: (22) The requested URL returned error: 503 Service Unavailable"
         ));
         // Unparseable stderr conservatively returns false (treated as Transport).
-        assert!(!super::curl_http_error_is_not_found("curl: (22) something odd"));
+        assert!(!super::curl_http_error_is_not_found(
+            "curl: (22) something odd"
+        ));
     }
 
     #[test]
@@ -1915,8 +1920,13 @@ mod tests {
             results.iter().map(|(n, o)| (n.as_str(), o)).collect();
 
         assert!(matches!(map["dplyr"], super::PackageFetchOutcome::Found(r) if r.name == "dplyr"));
-        assert!(matches!(map["ggplot2"], super::PackageFetchOutcome::Found(r) if r.name == "ggplot2"));
-        assert!(matches!(map["bogus_nonexistent"], super::PackageFetchOutcome::NotFound));
+        assert!(
+            matches!(map["ggplot2"], super::PackageFetchOutcome::Found(r) if r.name == "ggplot2")
+        );
+        assert!(matches!(
+            map["bogus_nonexistent"],
+            super::PackageFetchOutcome::NotFound
+        ));
     }
 
     // --- Task 3: run_fetch tests ---
@@ -2062,7 +2072,10 @@ mod tests {
         assert!(result.is_ok(), "run_fetch failed: {:?}", result);
 
         let bytes_after = std::fs::read(&out).unwrap();
-        assert_eq!(bytes_before, bytes_after, "file should be unchanged (no-op)");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "file should be unchanged (no-op)"
+        );
     }
 
     #[tokio::test]
@@ -2081,7 +2094,11 @@ mod tests {
             base_urls: vec![server.base_url()],
         };
         let result = super::run_fetch(args).await;
-        assert!(result.is_ok(), "expected Ok without --fail-on-missing, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "expected Ok without --fail-on-missing, got: {:?}",
+            result
+        );
 
         // With --fail-on-missing => Err
         // Remove the output so it starts fresh
@@ -2155,7 +2172,10 @@ mod tests {
             base_urls: vec![format!("http://127.0.0.1:{}", addr.port())],
         };
         let result = super::run_fetch(args).await;
-        assert!(result.is_err(), "expected hard error on total transport failure");
+        assert!(
+            result.is_err(),
+            "expected hard error on total transport failure"
+        );
         let err = result.unwrap_err();
         assert!(err.contains("could not reach"), "got: {err}");
 
