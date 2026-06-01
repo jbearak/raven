@@ -1219,9 +1219,10 @@ async fn capture_base_datasets(r: &crate::r_subprocess::RSubprocess, pkg: &str) 
 }
 
 /// Maintainer-only: captures the base-7 package table from a reference R
-/// library and emits `embedded_base_generated.rs`. Uses a fresh, non-initialized
-/// `PackageLibrary` so that `get_package` returns datasets in `lazy_data`
-/// rather than merging them into exports (which `initialize()` would do).
+/// library and emits `embedded_base_generated.rs`. When R is present, exports
+/// come from `getNamespaceExports` and datasets from `data()` (both
+/// authoritative); a fresh, non-initialized `PackageLibrary` supplies `Depends`
+/// and the R-absent fallbacks (static NAMESPACE exports, INDEX dataset topics).
 pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), String> {
     use crate::package_library::PackageLibrary;
     let query_r = crate::r_subprocess::RSubprocess::new(None);
@@ -1244,7 +1245,17 @@ pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), 
                 args.reference_lib.display()
             )
         })?;
-        let mut exports: Vec<String> = info.exports.iter().cloned().collect();
+        let mut exports: Vec<String> = match &query_r {
+            // Authoritative namespace exports (e.g. utils = 237). The static
+            // NAMESPACE parse used by `get_package` for non-exportPattern base
+            // packages is a bloated superset that even leaks `##`-commented
+            // lines, so prefer R's `getNamespaceExports` when R is present.
+            Some(sub) => match sub.get_package_exports(&name).await {
+                Ok(v) => v,
+                Err(_) => info.exports.iter().cloned().collect(),
+            },
+            None => info.exports.iter().cloned().collect(),
+        };
         // Datasets: `info.lazy_data` (parse_data_symbols) only sees individual
         // data files; base packages like `datasets` bundle their data in
         // `Rdata.r{db,dx,ds}`, so the object names are knowable only via R's
