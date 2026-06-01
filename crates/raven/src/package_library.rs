@@ -1175,29 +1175,30 @@ impl PackageLibrary {
             }
         }
 
-        // CI/runtime fallback: if no base exports were found on disk, load the
-        // first usable sidecar (built from a reference R), then fall back to the
-        // embedded floor. The guard is all-or-nothing: a non-empty disk merge (a
-        // real install) always wins and skips sidecars/embedded entirely. It does
-        // not recover a *partially* populated disk state (e.g. `base` present but
-        // `datasets` missing) — acceptable because base R ships these packages
-        // together.
+        // CI/runtime fallback: with no base exports found on disk, load the
+        // embedded base-7 table into both the flat always-in-scope set and the
+        // per-package cache (datasets → lazy_data). A non-empty disk merge (a
+        // real install) always wins and skips this entirely. No sidecar, so
+        // initialize() never depends on names.db and the startup ordering
+        // problem is gone (ADR 1).
         if all_base_exports.is_empty() {
-            for path in crate::package_db::locate_base_exports_candidates() {
-                if let Some((file_exports, file_packages)) =
-                    crate::package_db::base_exports::load_base_exports(&path)
-                {
-                    log::info!("Loaded base exports from {:?}", path);
-                    all_base_exports.extend(file_exports);
-                    self.base_packages.extend(file_packages);
-                    break;
-                }
+            for p in crate::package_db::embedded_base::packages() {
+                self.base_packages.insert(p.name.to_string());
+                let exports: HashSet<String> = p
+                    .exports
+                    .iter()
+                    .chain(p.datasets.iter())
+                    .map(|s| s.to_string())
+                    .collect();
+                all_base_exports.extend(exports.iter().cloned());
+                let info = PackageInfo::with_details(
+                    p.name.to_string(),
+                    p.exports.iter().map(|s| s.to_string()).collect(),
+                    p.depends.iter().map(|s| s.to_string()).collect(),
+                    p.datasets.iter().map(|s| s.to_string()).collect(),
+                );
+                self.insert_package(info).await;
             }
-        }
-        if all_base_exports.is_empty() {
-            let (embedded_exports, embedded_packages) = crate::package_db::embedded_base::load();
-            all_base_exports.extend(embedded_exports);
-            self.base_packages.extend(embedded_packages);
         }
 
         // Step 5: Store per-package exports in the packages cache for completion attribution
@@ -4996,5 +4997,20 @@ mod tests {
         pl.set_lib_paths(vec![lib]);
         assert_eq!(pl.package_version("dplyr"), Some("1.2.3".to_string()));
         assert_eq!(pl.package_version("nonexistent"), None);
+    }
+
+    #[tokio::test]
+    async fn initialize_without_disk_base_loads_embedded_records_into_cache() {
+        // No lib paths → no disk base → embedded fallback.
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![std::path::PathBuf::from("/nonexistent-xyz")]);
+        lib.initialize().await.unwrap();
+
+        // Flat always-in-scope set includes a base export and a base dataset.
+        assert!(lib.base_exports().contains("print"));
+        assert!(lib.base_exports().contains("mtcars"));
+        // Per-package cache populated from the embedded table, datasets in lazy_data.
+        let datasets = lib.get_cached_package("datasets").await.expect("datasets cached");
+        assert!(datasets.lazy_data.contains(&"mtcars".to_string()));
     }
 }
