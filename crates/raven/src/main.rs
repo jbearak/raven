@@ -23,7 +23,9 @@ Usage: raven [OPTIONS]
        raven check [PATHS...] [--workspace DIR]
        raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
-       raven packages <freeze|update|build-shipped-db> [OPTIONS]
+       raven packages <fetch|freeze|update|build-shipped-db> [OPTIONS]
+       raven freeze [ARGS]          (alias for: raven packages freeze)
+       raven fetch  [ARGS]          (alias for: raven packages fetch)
 
 Available options:
 
@@ -42,9 +44,11 @@ analysis-stats <path>        Profile workspace analysis phases
   --only <phase>             Run only the specified phase
                              (scan, parse, metadata, scope, packages)
 packages <subcommand>        Generate / maintain package databases
+  fetch                      Fetch a repo's Tier 2 .raven/packages.json from r-universe (R-free)
   freeze                     Write a repo's Tier 2 .raven/packages.json
   update                     Download names.db and base-exports.json sidecars
   build-shipped-db           Maintainer-only Tier 3 names.db builder
+freeze, fetch                Top-level aliases for raven packages freeze/fetch
 
 "#
     );
@@ -126,6 +130,21 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(msg) => {
                     return Err(anyhow::anyhow!("raven packages: {}", msg));
+                }
+            }
+        }
+        Some(tok) if cli::packages_top_level_alias(tok).is_some() => {
+            env_logger::init();
+            let alias = args[0].clone();
+            let rest = args.into_iter();
+            match cli::packages::run(rest).await {
+                Ok(()) => return Ok(()),
+                Err(msg) if msg == "HELP" => {
+                    cli::packages::print_help();
+                    return Ok(());
+                }
+                Err(msg) => {
+                    return Err(anyhow::anyhow!("raven {}: {}", alias, msg));
                 }
             }
         }

@@ -1,6 +1,8 @@
-//! `raven packages {freeze,update,build-shipped-db}` — package-database commands.
+//! `raven packages {fetch,freeze,update,build-shipped-db}` — package-database commands.
 //!
-//! `freeze` (Task 5.3) generates a repo's Tier 2 `.raven/packages.json`.
+//! `fetch` (this work) and `freeze` (Task 5.3) are the two producers of a repo's
+//! Tier 2 `.raven/packages.json`: `freeze` captures it from a local R install,
+//! `fetch` from CRAN/Bioc r-universe (R-free, additive merge — existing rows win).
 //! `build-shipped-db` is the maintainer-only Tier 3 builder. It merges, **append-only
 //! and version-monotonic**, three sources into `names.db`: the prior DB (the seed),
 //! an authoritative reference-R capture of the build machine's installed library,
@@ -160,6 +162,298 @@ pub fn parse_freeze_args(mut argv: impl Iterator<Item = String>) -> Result<Freez
     })
 }
 
+#[derive(Debug)]
+pub struct FetchArgs {
+    pub missing_only: bool,
+    pub fail_on_missing: bool,
+    pub output: PathBuf,
+    pub workspace: Option<PathBuf>,
+    pub base_urls: Vec<String>,
+}
+
+pub fn parse_fetch_args(mut argv: impl Iterator<Item = String>) -> Result<FetchArgs, String> {
+    let mut missing_only = false;
+    let mut fail_on_missing = false;
+    let mut output = PathBuf::from(".raven/packages.json");
+    let mut workspace = None;
+    let mut base_urls: Option<Vec<String>> = None;
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "--missing-only" => missing_only = true,
+            "--fail-on-missing" => fail_on_missing = true,
+            "--output" => output = PathBuf::from(argv.next().ok_or("--output needs a path")?),
+            "--workspace" => {
+                workspace = Some(PathBuf::from(
+                    argv.next().ok_or("--workspace needs a path")?,
+                ))
+            }
+            "--base-urls" => {
+                let raw = argv.next().ok_or("--base-urls needs a value")?;
+                let parsed: Vec<String> = raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parsed.is_empty() {
+                    return Err("--base-urls needs at least one non-empty URL".into());
+                }
+                base_urls = Some(parsed);
+            }
+            "--help" => return Err("HELP".into()),
+            s => return Err(format!("unknown flag: {s}")),
+        }
+    }
+    Ok(FetchArgs {
+        missing_only,
+        fail_on_missing,
+        output,
+        workspace,
+        base_urls: base_urls.unwrap_or_else(|| {
+            vec![
+                "https://cran.r-universe.dev".into(),
+                "https://bioc.r-universe.dev".into(),
+            ]
+        }),
+    })
+}
+
+/// One warning line per fetched record whose version differs from the renv.lock pin.
+fn renv_skew_warnings(
+    fetched: &[PackageRecord],
+    pinned: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for rec in fetched {
+        if let Some(want) = pinned.get(&rec.name) {
+            if !want.is_empty() && want != &rec.version {
+                out.push(format!(
+                    "{}: fetched {} (latest); renv.lock pins {}. Export names usually match \
+                     across versions; install it and use `freeze` / `--missing-only` for a \
+                     version-exact capture.",
+                    rec.name, rec.version, want
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn write_repo_db_file_atomic(path: &std::path::Path, db: &RepoDb) -> Result<(), String> {
+    use crate::package_db::json_db::write_repo_db_string;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("packages.json");
+    let mut text = write_repo_db_string(db);
+    text.push('\n');
+    let tmp = write_unique_temp(dir, file_name, text.into_bytes())?;
+    if let Err(e) = replace_with_tmp(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Fetch package metadata from r-universe, following transitive dependencies.
+pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
+    use crate::package_db::renv_lock::read_renv_lock_package_versions;
+    use std::collections::HashSet;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = match &args.workspace {
+        Some(p) => absolute_path(&cwd, p),
+        None => cwd,
+    };
+    let out = absolute_path(&root, &args.output);
+
+    // Step 2: read existing
+    let existing_records = match read_repo_db_file(&out) {
+        Ok(db) => db.packages,
+        Err(crate::package_db::json_db::RepoDbError::Absent) => Vec::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    let existing_names: HashSet<String> = existing_records.iter().map(|r| r.name.clone()).collect();
+
+    // Step 3: base packages
+    let base = embedded_base_packages();
+
+    // Step 4: tier1 lib for --missing-only
+    let lib_outcome = if args.missing_only {
+        Some(
+            crate::package_library::build_package_library_tier1_only(
+                None,
+                &[],
+                Some(root.clone()),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let is_installed = |name: &str| -> bool {
+        args.missing_only
+            && lib_outcome
+                .as_ref()
+                .is_some_and(|o| o.library.package_exists(name))
+    };
+
+    // Step 5: used packages (non-base, deduped)
+    let used = collect_used_package_names(&root)?;
+    let used_nonbase: Vec<String> = {
+        let mut set = HashSet::new();
+        let mut v = Vec::new();
+        for name in &used {
+            if !base.contains(name) && set.insert(name.clone()) {
+                v.push(name.clone());
+            }
+        }
+        v.sort();
+        v
+    };
+
+    // Step 6: initial fetch set
+    let to_fetch: Vec<String> = used_nonbase
+        .iter()
+        .filter(|n| !existing_names.contains(*n) && !is_installed(n))
+        .cloned()
+        .collect();
+
+    // Step 7: inform
+    if !to_fetch.is_empty() {
+        eprintln!(
+            "Fetching {} package(s) from r-universe: {}",
+            to_fetch.len(),
+            to_fetch.join(", ")
+        );
+    }
+
+    // Step 8: BFS waves
+    let mut seen: HashSet<String> = to_fetch.iter().cloned().collect();
+    let mut found_names: HashSet<String> = HashSet::new();
+    let mut fetched_records: Vec<PackageRecord> = Vec::new();
+    let mut found_count: usize = 0;
+    let mut notfound_count: usize = 0;
+    let mut transport_count: usize = 0;
+    let mut sample_transport: Option<String> = None;
+    let mut queue = to_fetch;
+
+    while !queue.is_empty() {
+        let results = fetch_packages_wave(std::mem::take(&mut queue), &args.base_urls).await;
+        let mut next_queue: Vec<String> = Vec::new();
+        for (name, outcome) in results {
+            match outcome {
+                PackageFetchOutcome::Found(rec) => {
+                    found_count += 1;
+                    found_names.insert(name);
+                    for dep in &rec.depends {
+                        if dep != "R"
+                            && !base.contains(dep)
+                            && !existing_names.contains(dep)
+                            && !is_installed(dep)
+                            && seen.insert(dep.clone())
+                        {
+                            next_queue.push(dep.clone());
+                        }
+                    }
+                    fetched_records.push(rec);
+                }
+                PackageFetchOutcome::NotFound => {
+                    notfound_count += 1;
+                }
+                PackageFetchOutcome::Transport(msg) => {
+                    transport_count += 1;
+                    if sample_transport.is_none() {
+                        sample_transport = Some(msg);
+                    }
+                }
+            }
+        }
+        queue = next_queue;
+    }
+
+    // Step 9: hard error on total infrastructure failure
+    if found_count == 0 && notfound_count == 0 && transport_count > 0 {
+        let sample = sample_transport.unwrap_or_default();
+        return Err(format!(
+            "could not reach any r-universe host (network down or curl missing): {sample}. \
+             Install the packages and use `raven packages freeze` for an offline, version-exact \
+             capture, or check connectivity."
+        ));
+    }
+
+    // Step 10: renv version-skew warnings
+    let pinned = read_renv_lock_package_versions(&root.join("renv.lock")).unwrap_or_default();
+    for w in renv_skew_warnings(&fetched_records, &pinned) {
+        eprintln!("{w}");
+    }
+
+    // Step 11: resolved-nowhere warnings
+    let resolved_nowhere: Vec<String> = used_nonbase
+        .iter()
+        .filter(|n| {
+            !existing_names.contains(*n) && !is_installed(n) && !found_names.contains(*n)
+        })
+        .cloned()
+        .collect();
+    for p in &resolved_nowhere {
+        eprintln!(
+            "warning: package '{p}' could not be resolved from r-universe; it may be \
+             GitHub-only, internal, not yet on r-universe, a typo, or the host was unreachable"
+        );
+    }
+
+    // Step 12: merge + write
+    let mut merged = existing_records.clone();
+    merged.extend(fetched_records);
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut existing_sorted = existing_records;
+    existing_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if merged == existing_sorted {
+        eprintln!("no changes; left {} untouched", out.display());
+    } else {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let r_version = if args.missing_only
+            && lib_outcome.as_ref().is_some_and(|o| o.status.is_ready())
+        {
+            "present (--missing-only)".to_string()
+        } else {
+            "none (fetched)".to_string()
+        };
+        let db = RepoDb {
+            schema_version: REPO_DB_SCHEMA_VERSION,
+            provenance: RepoDbProvenance {
+                raven_version: env!("CARGO_PKG_VERSION").to_string(),
+                r_version,
+                generated_unix: now_unix,
+            },
+            packages: merged,
+        };
+        write_repo_db_file_atomic(&out, &db)?;
+        eprintln!("Wrote {} packages to {}", db.packages.len(), out.display());
+    }
+
+    // Step 13: fail-on-missing exit
+    if args.fail_on_missing && !resolved_nowhere.is_empty() {
+        return Err(format!(
+            "{} package(s) could not be resolved from r-universe; failing because \
+             --fail-on-missing was set",
+            resolved_nowhere.len()
+        ));
+    }
+
+    Ok(())
+}
+
 /// Generate a repo's Tier 2 `.raven/packages.json` from installed packages.
 ///
 /// **Provider-less (decision #6):** built with
@@ -212,11 +506,7 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     match args.scope {
         FreezeScope::All => queue.extend(lib.enumerate_installed_packages()),
         FreezeScope::Used => {
-            queue.extend(scan_workspace_referenced_packages(&root));
-            queue.extend(read_description_depends_imports(&root.join("DESCRIPTION")));
-            queue.extend(
-                read_renv_lock_package_names(&root.join("renv.lock")).map_err(|e| e.to_string())?,
-            );
+            queue.extend(collect_used_package_names(&root)?);
         }
     }
 
@@ -275,6 +565,25 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     write_repo_db_file(&out, &db).map_err(|e| e.to_string())?;
     eprintln!("Wrote {} packages to {}", db.packages.len(), out.display());
     Ok(())
+}
+
+/// Compute the union of package names referenced in the workspace: scan R files
+/// for `library()`/`require()`/`loadNamespace()`/`requireNamespace()` calls and
+/// `::` / `:::` LHS, plus DESCRIPTION Depends+Imports, plus renv.lock names.
+fn collect_used_package_names(root: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    names.extend(scan_workspace_referenced_packages(root));
+    names.extend(read_description_depends_imports(&root.join("DESCRIPTION")));
+    names.extend(
+        read_renv_lock_package_names(&root.join("renv.lock")).map_err(|e| e.to_string())?,
+    );
+    Ok(names)
+}
+
+/// Return the set of base/recommended package names from the embedded database,
+/// without requiring an R subprocess.
+fn embedded_base_packages() -> std::collections::HashSet<String> {
+    crate::package_db::embedded_base::load().1
 }
 
 /// Scan every R file under `root` for the maximally-inclusive referenced set
@@ -500,15 +809,10 @@ async fn download_asset(base_url: &str, name: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("download task failed for {name}: {e}"))?
 }
 
-fn download_asset_blocking(url: &str) -> Result<Vec<u8>, String> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(format!(
-            "refusing to download {url}: only http:// and https:// URLs are supported. {}",
-            manual_sidecar_guidance()
-        ));
-    }
-
-    let output = Command::new("curl")
+/// Run curl with the shared arg list. Both `download_asset_blocking` and
+/// `fetch_one_package_blocking` use this to avoid arg-list drift.
+fn run_curl(url: &str) -> std::io::Result<std::process::Output> {
+    Command::new("curl")
         .args([
             "--fail",
             "--location",
@@ -527,13 +831,23 @@ fn download_asset_blocking(url: &str) -> Result<Vec<u8>, String> {
             url,
         ])
         .output()
-        .map_err(|e| {
-            format!(
-                "failed to run curl for {url}: {e}. `raven packages update` requires curl; \
-                 {}",
-                manual_sidecar_guidance()
-            )
-        })?;
+}
+
+fn download_asset_blocking(url: &str) -> Result<Vec<u8>, String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!(
+            "refusing to download {url}: only http:// and https:// URLs are supported. {}",
+            manual_sidecar_guidance()
+        ));
+    }
+
+    let output = run_curl(url).map_err(|e| {
+        format!(
+            "failed to run curl for {url}: {e}. `raven packages update` requires curl; \
+             {}",
+            manual_sidecar_guidance()
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(curl_failure_error(
@@ -543,6 +857,135 @@ fn download_asset_blocking(url: &str) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(output.stdout)
+}
+
+/// Outcome of fetching one package across the ordered base-url list.
+///
+/// The distinction between `NotFound` and `Transport` is critical for Task 3's
+/// error policy: a lone typo (NotFound) must never hard-error the command; only
+/// genuine infrastructure failures (Transport) can escalate to a hard error when
+/// nothing was fetched at all.
+#[derive(Debug)]
+enum PackageFetchOutcome {
+    /// Fetched and parsed from one of the bases.
+    Found(PackageRecord),
+    /// Every base served a genuine HTTP not-found (404/410): the package is
+    /// off-ecosystem or a typo. SOFT — becomes a resolved-nowhere warning in
+    /// Task 3. Only a true not-found qualifies; a 5xx is a transient outage and
+    /// is treated as `Transport` so it can't silently drop a real package.
+    NotFound,
+    /// curl could not run, could not reach any base (spawn failure / DNS /
+    /// connection refused / timeout), or every base returned a *server* error
+    /// (5xx) — i.e. an infrastructure failure, surfaced so the command can
+    /// report it rather than silently dropping the package. Carries a message.
+    Transport(String),
+}
+
+/// Whether a curl `--fail` HTTP error (exit 22) is a genuine "not found".
+///
+/// curl with `--show-error` emits `curl: (22) The requested URL returned error:
+/// NNN ...` on stderr. A 404/410 means the package is not served by this host
+/// (soft `NotFound`); any other status — notably a 5xx during an r-universe
+/// outage — must escalate to `Transport` so a transient failure can't silently
+/// write a database that drops a real package. When the status can't be parsed
+/// we conservatively return `false` (treat as `Transport`, the loud direction).
+fn curl_http_error_is_not_found(stderr: &str) -> bool {
+    stderr
+        .split("returned error:")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| code == 404 || code == 410)
+}
+
+/// Fetch one package's r-universe JSON, trying each `{base}/api/packages/{pkg}`
+/// in order (CRAN then Bioc). Returns Found on the first base that serves a
+/// parseable record; NotFound when every base returned a genuine HTTP not-found
+/// (404/410); Transport when curl could not reach any base, or a base failed
+/// with a non-not-found error (5xx, parse failure, spawn failure).
+fn fetch_one_package_blocking(pkg: &str, base_urls: &[String]) -> PackageFetchOutcome {
+    use crate::package_db::runiverse::parse_runiverse_json;
+
+    let mut saw_http_not_found = false;
+    let mut last_error: Option<String> = None;
+
+    for base in base_urls {
+        let url = format!("{}/api/packages/{}", base.trim_end_matches('/'), pkg);
+        match run_curl(&url) {
+            Err(e) => {
+                last_error = Some(format!("failed to run curl for {url}: {e}"));
+            }
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                match parse_runiverse_json(&text) {
+                    Ok(rec) => return PackageFetchOutcome::Found(rec),
+                    Err(e) => {
+                        last_error = Some(format!("parse error for {url}: {e}"));
+                    }
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if output.status.code() == Some(22) && curl_http_error_is_not_found(&stderr) {
+                    saw_http_not_found = true;
+                } else {
+                    last_error = Some(stderr.trim().to_string());
+                }
+            }
+        }
+    }
+
+    // Only a clean not-found across the bases is soft: if ANY base failed for a
+    // non-not-found reason (5xx outage, parse error, unreachable), that evidence
+    // wins, so a 404 on one host can't mask a transient outage on another and
+    // silently drop a package that the outaged host might actually serve.
+    if saw_http_not_found && last_error.is_none() {
+        PackageFetchOutcome::NotFound
+    } else {
+        PackageFetchOutcome::Transport(
+            last_error
+                .unwrap_or_else(|| format!("could not reach any r-universe base for {pkg}")),
+        )
+    }
+}
+
+const MAX_CONCURRENT_FETCHES: usize = 8;
+
+/// Fetch a batch (one BFS wave) of packages concurrently, bounded to
+/// MAX_CONCURRENT_FETCHES. curl is blocking, so each fetch runs on a blocking
+/// task; a semaphore caps in-flight work. Returns each name paired with its
+/// outcome (order not guaranteed).
+async fn fetch_packages_wave(
+    names: Vec<String>,
+    base_urls: &[String],
+) -> Vec<(String, PackageFetchOutcome)> {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+    let urls: Arc<Vec<String>> = Arc::new(base_urls.to_vec());
+    let mut set = JoinSet::new();
+
+    for name in names {
+        let sem = Arc::clone(&sem);
+        let urls = Arc::clone(&urls);
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let n = name.clone();
+            let result =
+                tokio::task::spawn_blocking(move || fetch_one_package_blocking(&n, &urls))
+                    .await
+                    .unwrap();
+            (name, result)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(res) = set.join_next().await {
+        results.push(res.unwrap());
+    }
+    results
 }
 
 fn curl_failure_error(url: &str, status: &str, stderr: &str) -> String {
@@ -786,12 +1229,16 @@ pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
             let args = parse_freeze_args(argv)?;
             run_freeze(args).await
         }
+        Some("fetch") => {
+            let args = parse_fetch_args(argv)?;
+            run_fetch(args).await
+        }
         Some("build-shipped-db") => {
             let args = parse_build_shipped_db_args(argv)?;
             run_build_shipped_db(args).await
         }
         Some(other) => Err(format!("unknown packages subcommand: {other}")),
-        None => Err("usage: raven packages <freeze|update|build-shipped-db> [OPTIONS]".into()),
+        None => Err("usage: raven packages <fetch|freeze|update|build-shipped-db> [OPTIONS]".into()),
     }
 }
 
@@ -799,6 +1246,8 @@ pub fn print_help() {
     println!(
         "raven packages — package-database commands\n\n\
          Usage:\n  \
+         raven packages fetch [--missing-only] [--fail-on-missing] [--output PATH] \
+[--workspace DIR] [--base-urls URL[,URL]]\n  \
          raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]\n  \
          raven packages update [--base-url URL] [--dest-dir DIR]\n  \
          raven packages build-shipped-db [--reference-lib DIR] [--runiverse-cran DIR] \
@@ -1140,5 +1589,635 @@ mod tests {
 
         assert!(err.contains("replace"), "got {err}");
         assert_eq!(std::fs::read(&final_path).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn collect_used_package_names_unions_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // R file referencing ggplot2 and dplyr
+        std::fs::write(
+            root.join("script.R"),
+            "library(ggplot2)\ndplyr::mutate(x)\n",
+        )
+        .unwrap();
+
+        // DESCRIPTION with Imports: cli
+        std::fs::write(root.join("DESCRIPTION"), "Package: mypkg\nImports: cli\n").unwrap();
+
+        // renv.lock pinning tibble
+        std::fs::write(
+            root.join("renv.lock"),
+            r#"{"Packages":{"tibble":{"Package":"tibble","Version":"3.2.1"}}}"#,
+        )
+        .unwrap();
+
+        let names = super::collect_used_package_names(root).unwrap();
+        let set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        assert!(set.contains("ggplot2"), "missing ggplot2, got {set:?}");
+        assert!(set.contains("dplyr"), "missing dplyr, got {set:?}");
+        assert!(set.contains("cli"), "missing cli, got {set:?}");
+        assert!(set.contains("tibble"), "missing tibble, got {set:?}");
+    }
+
+    #[test]
+    fn parse_fetch_args_defaults() {
+        let args = super::parse_fetch_args(std::iter::empty()).unwrap();
+        assert!(!args.missing_only);
+        assert!(!args.fail_on_missing);
+        assert_eq!(args.output, std::path::PathBuf::from(".raven/packages.json"));
+        assert_eq!(args.workspace, None);
+        assert_eq!(
+            args.base_urls,
+            vec![
+                "https://cran.r-universe.dev".to_string(),
+                "https://bioc.r-universe.dev".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_fetch_args_all_flags() {
+        let args = super::parse_fetch_args(
+            [
+                "--missing-only",
+                "--fail-on-missing",
+                "--output",
+                "x.json",
+                "--workspace",
+                "w",
+                "--base-urls",
+                "http://a,http://b",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert!(args.missing_only);
+        assert!(args.fail_on_missing);
+        assert_eq!(args.output, std::path::PathBuf::from("x.json"));
+        assert_eq!(args.workspace, Some(std::path::PathBuf::from("w")));
+        assert_eq!(
+            args.base_urls,
+            vec!["http://a".to_string(), "http://b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_fetch_args_help() {
+        let err = super::parse_fetch_args(["--help"].iter().map(|s| s.to_string())).unwrap_err();
+        assert_eq!(err, "HELP");
+    }
+
+    #[test]
+    fn parse_fetch_args_unknown_flag() {
+        let err =
+            super::parse_fetch_args(["--bogus"].iter().map(|s| s.to_string())).unwrap_err();
+        assert!(err.contains("unknown flag"), "got {err}");
+        assert!(err.contains("--bogus"), "got {err}");
+    }
+
+    #[test]
+    fn parse_fetch_args_rejects_empty_base_urls() {
+        // `--base-urls ''` (or only commas/whitespace) parses to no URLs; reject
+        // it with a clear message rather than later misreporting a network outage.
+        let err = super::parse_fetch_args(
+            ["--base-urls", " , "].iter().map(|s| s.to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("--base-urls"), "got {err}");
+    }
+
+    #[test]
+    fn embedded_base_packages_contains_expected() {
+        let set = super::embedded_base_packages();
+        for pkg in ["base", "stats", "utils", "methods", "datasets"] {
+            assert!(set.contains(pkg), "expected {pkg} in base set");
+        }
+        assert!(!set.contains("dplyr"), "dplyr must not be in base set");
+    }
+
+    // --- Test server for fetch tests ---
+
+    /// Minimal blocking HTTP server for fetch tests. Serves fixture JSON for
+    /// known packages, 404 for unknown ones.
+    struct TestServer {
+        addr: std::net::SocketAddr,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// How the test server responds to every request.
+    #[derive(Clone, Copy)]
+    enum ServerMode {
+        /// Serve the fixture for known packages, 404 for unknown ones.
+        Fixtures,
+        /// Always 404 (used to exercise the CRAN→Bioc fallback).
+        NotFound,
+        /// Always 500 (used to prove a 5xx outage is a hard Transport error,
+        /// not a soft NotFound that silently drops a package).
+        ServerError,
+    }
+
+    impl TestServer {
+        /// Start a test server. If `always_404` is true, every request gets 404.
+        fn start(always_404: bool) -> Self {
+            Self::start_mode(if always_404 {
+                ServerMode::NotFound
+            } else {
+                ServerMode::Fixtures
+            })
+        }
+
+        fn start_mode(mode: ServerMode) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    std::thread::spawn(move || Self::handle_conn(stream, mode));
+                }
+            });
+            TestServer {
+                addr,
+                _handle: handle,
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.addr.port())
+        }
+
+        fn handle_conn(mut stream: std::net::TcpStream, mode: ServerMode) {
+            use std::io::{BufRead, BufReader, Write};
+            let reader = BufReader::new(&stream);
+            let request_line = match reader.lines().next() {
+                Some(Ok(line)) => line,
+                _ => return,
+            };
+            // Parse: "GET /api/packages/dplyr HTTP/1.1"
+            let parts: Vec<&str> = request_line.split_whitespace().collect();
+            if parts.len() < 2 {
+                return;
+            }
+            let path = parts[1];
+
+            let not_found =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            match mode {
+                ServerMode::NotFound => {
+                    let _ = write!(stream, "{not_found}");
+                    return;
+                }
+                ServerMode::ServerError => {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                ServerMode::Fixtures => {}
+            }
+
+            let prefix = "/api/packages/";
+            if let Some(pkg) = path.strip_prefix(prefix) {
+                let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/package_db/runiverse");
+                let fixture_path = fixture_dir.join(format!("{pkg}.json"));
+                if let Ok(body) = std::fs::read(&fixture_path) {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(&body);
+                } else {
+                    let _ = write!(stream, "{not_found}");
+                }
+            } else {
+                let _ = write!(stream, "{not_found}");
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_one_package_found() {
+        let server = TestServer::start(false);
+        let bases = vec![server.base_url()];
+        let result = super::fetch_one_package_blocking("dplyr", &bases);
+        match result {
+            super::PackageFetchOutcome::Found(rec) => {
+                assert_eq!(rec.name, "dplyr");
+                assert_eq!(rec.version, "1.1.4");
+                assert!(rec.exports.contains(&"mutate".to_string()), "{:?}", rec.exports);
+                assert!(rec.exports.contains(&"filter".to_string()), "{:?}", rec.exports);
+                assert!(rec.exports.contains(&"select".to_string()), "{:?}", rec.exports);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_one_package_cran_miss_bioc_fallback() {
+        let server_404 = TestServer::start(true);
+        let server_ok = TestServer::start(false);
+        let bases = vec![server_404.base_url(), server_ok.base_url()];
+        let result = super::fetch_one_package_blocking("dplyr", &bases);
+        match result {
+            super::PackageFetchOutcome::Found(rec) => {
+                assert_eq!(rec.name, "dplyr");
+                assert_eq!(rec.version, "1.1.4");
+            }
+            other => panic!("expected Found from second base, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_one_package_not_found_on_all_bases() {
+        let server = TestServer::start(false);
+        let bases = vec![server.base_url()];
+        let result = super::fetch_one_package_blocking("nonexistent_pkg_xyz", &bases);
+        assert!(
+            matches!(result, super::PackageFetchOutcome::NotFound),
+            "expected NotFound, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_one_package_transport_when_unreachable() {
+        // Bind to get a free port, then drop the listener so nothing is listening.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let bases = vec![format!("http://127.0.0.1:{}", addr.port())];
+        let result = super::fetch_one_package_blocking("dplyr", &bases);
+        assert!(
+            matches!(result, super::PackageFetchOutcome::Transport(_)),
+            "expected Transport, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn curl_http_error_distinguishes_not_found_from_server_error() {
+        // curl --fail emits "curl: (22) The requested URL returned error: NNN".
+        // Only 404/410 are a genuine not-found (soft); a 5xx outage must NOT be.
+        assert!(super::curl_http_error_is_not_found(
+            "curl: (22) The requested URL returned error: 404"
+        ));
+        assert!(super::curl_http_error_is_not_found(
+            "curl: (22) The requested URL returned error: 410 Gone"
+        ));
+        assert!(!super::curl_http_error_is_not_found(
+            "curl: (22) The requested URL returned error: 500"
+        ));
+        assert!(!super::curl_http_error_is_not_found(
+            "curl: (22) The requested URL returned error: 503 Service Unavailable"
+        ));
+        // Unparseable stderr conservatively returns false (treated as Transport).
+        assert!(!super::curl_http_error_is_not_found("curl: (22) something odd"));
+    }
+
+    #[test]
+    fn fetch_one_package_server_error_is_transport_not_not_found() {
+        // A 5xx from every base is a transient outage, not a missing package:
+        // it must be Transport (hard) so run_fetch can refuse rather than write
+        // a database that silently drops the package.
+        let server = TestServer::start_mode(ServerMode::ServerError);
+        let bases = vec![server.base_url()];
+        let result = super::fetch_one_package_blocking("dplyr", &bases);
+        assert!(
+            matches!(result, super::PackageFetchOutcome::Transport(_)),
+            "expected Transport for a 5xx, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_one_package_5xx_on_one_base_not_masked_by_404_on_another() {
+        // A 5xx outage on the first base must NOT be masked by a genuine 404 on
+        // the second: the package might exist on the outaged host, so the result
+        // is Transport (hard), not NotFound (soft) — otherwise a partial outage
+        // could silently drop a real package.
+        let outage = TestServer::start_mode(ServerMode::ServerError);
+        let not_found = TestServer::start_mode(ServerMode::NotFound);
+        let bases = vec![outage.base_url(), not_found.base_url()];
+        let result = super::fetch_one_package_blocking("dplyr", &bases);
+        assert!(
+            matches!(result, super::PackageFetchOutcome::Transport(_)),
+            "expected Transport when one base 5xx'd, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_packages_wave_fetches_all() {
+        let server = TestServer::start(false);
+        let bases = vec![server.base_url()];
+        let names = vec![
+            "dplyr".to_string(),
+            "ggplot2".to_string(),
+            "bogus_nonexistent".to_string(),
+        ];
+        let results = super::fetch_packages_wave(names, &bases).await;
+        let map: std::collections::HashMap<&str, &super::PackageFetchOutcome> =
+            results.iter().map(|(n, o)| (n.as_str(), o)).collect();
+
+        assert!(matches!(map["dplyr"], super::PackageFetchOutcome::Found(r) if r.name == "dplyr"));
+        assert!(matches!(map["ggplot2"], super::PackageFetchOutcome::Found(r) if r.name == "ggplot2"));
+        assert!(matches!(map["bogus_nonexistent"], super::PackageFetchOutcome::NotFound));
+    }
+
+    // --- Task 3: run_fetch tests ---
+
+    #[test]
+    fn renv_skew_warnings_flags_only_mismatches() {
+        let fetched = vec![
+            PackageRecord {
+                name: "dplyr".into(),
+                version: "1.1.4".into(),
+                exports: vec![],
+                depends: vec![],
+                lazy_data: vec![],
+            },
+            PackageRecord {
+                name: "ggplot2".into(),
+                version: "3.5.0".into(),
+                exports: vec![],
+                depends: vec![],
+                lazy_data: vec![],
+            },
+        ];
+        let mut pinned = std::collections::HashMap::new();
+        pinned.insert("dplyr".to_string(), "1.1.2".to_string());
+        pinned.insert("ggplot2".to_string(), "3.5.0".to_string());
+
+        let warnings = super::renv_skew_warnings(&fetched, &pinned);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("dplyr"), "got: {}", warnings[0]);
+        assert!(warnings[0].contains("1.1.4"), "got: {}", warnings[0]);
+        assert!(warnings[0].contains("1.1.2"), "got: {}", warnings[0]);
+
+        // Empty pinned => no warnings
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let warnings2 = super::renv_skew_warnings(&fetched, &empty);
+        assert!(warnings2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_fetch_writes_used_packages() {
+        let server = TestServer::start(false);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(dplyr)\n").unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_ok(), "run_fetch failed: {:?}", result);
+
+        let out = root.join(".raven/packages.json");
+        let db = read_repo_db_file(&out).unwrap();
+        let dplyr = db.packages.iter().find(|r| r.name == "dplyr").unwrap();
+        assert!(dplyr.exports.contains(&"mutate".to_string()));
+        assert!(dplyr.exports.contains(&"filter".to_string()));
+        assert!(dplyr.exports.contains(&"select".to_string()));
+        assert_eq!(db.provenance.r_version, "none (fetched)");
+    }
+
+    #[tokio::test]
+    async fn run_fetch_merge_existing_wins() {
+        let server = TestServer::start(false);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(dplyr)\nlibrary(ggplot2)\n").unwrap();
+
+        // Pre-create with a sentinel dplyr record
+        let out = root.join(".raven/packages.json");
+        let sentinel_db = RepoDb {
+            schema_version: REPO_DB_SCHEMA_VERSION,
+            provenance: RepoDbProvenance {
+                raven_version: "0.0.0".into(),
+                r_version: "test".into(),
+                generated_unix: 0,
+            },
+            packages: vec![PackageRecord {
+                name: "dplyr".into(),
+                version: "0.0.0".into(),
+                exports: vec!["OLD_SENTINEL".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            }],
+        };
+        write_repo_db_file(&out, &sentinel_db).unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_ok(), "run_fetch failed: {:?}", result);
+
+        let db = read_repo_db_file(&out).unwrap();
+        let dplyr = db.packages.iter().find(|r| r.name == "dplyr").unwrap();
+        assert_eq!(dplyr.version, "0.0.0");
+        assert_eq!(dplyr.exports, vec!["OLD_SENTINEL".to_string()]);
+        let ggplot2 = db.packages.iter().find(|r| r.name == "ggplot2").unwrap();
+        assert_eq!(ggplot2.version, "3.5.0");
+    }
+
+    #[tokio::test]
+    async fn run_fetch_noop_when_fully_covered() {
+        let server = TestServer::start(false);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(dplyr)\n").unwrap();
+
+        let out = root.join(".raven/packages.json");
+        let existing_db = RepoDb {
+            schema_version: REPO_DB_SCHEMA_VERSION,
+            provenance: RepoDbProvenance {
+                raven_version: "0.0.0".into(),
+                r_version: "test".into(),
+                generated_unix: 0,
+            },
+            packages: vec![PackageRecord {
+                name: "dplyr".into(),
+                version: "1.1.4".into(),
+                exports: vec!["filter".into(), "mutate".into(), "select".into()],
+                depends: vec!["R".into(), "cli".into()],
+                lazy_data: vec![],
+            }],
+        };
+        write_repo_db_file(&out, &existing_db).unwrap();
+        let bytes_before = std::fs::read(&out).unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_ok(), "run_fetch failed: {:?}", result);
+
+        let bytes_after = std::fs::read(&out).unwrap();
+        assert_eq!(bytes_before, bytes_after, "file should be unchanged (no-op)");
+    }
+
+    #[tokio::test]
+    async fn run_fetch_resolved_nowhere_exit_codes() {
+        let server = TestServer::start(false);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(boguspkgxyz)\n").unwrap();
+
+        // Without --fail-on-missing => Ok
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_ok(), "expected Ok without --fail-on-missing, got: {:?}", result);
+
+        // With --fail-on-missing => Err
+        // Remove the output so it starts fresh
+        let _ = std::fs::remove_file(root.join(".raven/packages.json"));
+        let args2 = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: true,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result2 = super::run_fetch(args2).await;
+        assert!(result2.is_err(), "expected Err with --fail-on-missing");
+        let err = result2.unwrap_err();
+        assert!(err.contains("could not be resolved"), "got: {err}");
+        assert!(err.contains("--fail-on-missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_fetch_missing_only_degrades_without_r() {
+        // When --missing-only is set and R is NOT available, the tier1 lib
+        // degrades (package_exists returns false for everything), so the fetch
+        // proceeds as if --missing-only were not set. On machines WITH R where
+        // dplyr IS installed, the package is correctly subtracted. Either way
+        // run_fetch must succeed.
+        let server = TestServer::start(false);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(dplyr)\n").unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: true,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_ok(), "run_fetch failed: {:?}", result);
+
+        let out = root.join(".raven/packages.json");
+        // If R is available and dplyr is installed, it's subtracted (no file written).
+        // If R is unavailable, dplyr is fetched (file written with dplyr).
+        // Both are correct behavior.
+        if out.exists() {
+            let db = read_repo_db_file(&out).unwrap();
+            assert!(
+                db.packages.iter().any(|r| r.name == "dplyr"),
+                "if file written, dplyr should be present"
+            );
+        }
+        // The key assertion: no error regardless of R availability.
+    }
+
+    #[tokio::test]
+    async fn run_fetch_all_transport_is_hard_error() {
+        // Bind to get a free port, then drop so nothing listens
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(dplyr)\n").unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![format!("http://127.0.0.1:{}", addr.port())],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_err(), "expected hard error on total transport failure");
+        let err = result.unwrap_err();
+        assert!(err.contains("could not reach"), "got: {err}");
+
+        // No output file created
+        assert!(!root.join(".raven/packages.json").exists());
+    }
+
+    #[tokio::test]
+    async fn run_fetch_server_outage_5xx_is_hard_error_not_silent_write() {
+        // A 5xx from every host (transient r-universe outage) must hard-error
+        // and write nothing — NOT silently write a database that drops the
+        // package as if it were "resolved nowhere".
+        let server = TestServer::start_mode(ServerMode::ServerError);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(dplyr)\n").unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_err(), "expected hard error on a 5xx outage");
+        assert!(
+            !root.join(".raven/packages.json").exists(),
+            "no file should be written during a 5xx outage"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fetch_refuses_corrupt_existing() {
+        let server = TestServer::start(false);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("script.R"), "library(dplyr)\n").unwrap();
+
+        let out = root.join(".raven/packages.json");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(&out, "{ not valid json").unwrap();
+
+        let args = super::FetchArgs {
+            missing_only: false,
+            fail_on_missing: false,
+            output: std::path::PathBuf::from(".raven/packages.json"),
+            workspace: Some(root.to_path_buf()),
+            base_urls: vec![server.base_url()],
+        };
+        let result = super::run_fetch(args).await;
+        assert!(result.is_err(), "expected error on corrupt existing file");
+        let err = result.unwrap_err();
+        assert!(err.contains("unreadable"), "got: {err}");
+
+        // Corrupt file left intact
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "{ not valid json");
     }
 }
