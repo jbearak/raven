@@ -1172,13 +1172,13 @@ pub fn parse_build_embedded_base_args(
     })
 }
 
+/// One captured base package: `(name, exports, datasets, depends)`.
+type EmbeddedPkgCapture = (String, Vec<String>, Vec<String>, Vec<String>);
+
 /// Emit the `// @generated` `embedded_base_generated.rs` source from captured
 /// per-package `(name, exports, datasets, depends)` buckets. Each name is
 /// rendered with `{:?}` so exotic/operator identifiers escape correctly.
-fn emit_embedded_base_source(
-    pkgs: &[(String, Vec<String>, Vec<String>, Vec<String>)],
-    r_version: &str,
-) -> String {
+fn emit_embedded_base_source(pkgs: &[EmbeddedPkgCapture], r_version: &str) -> String {
     fn arr(items: &[String]) -> String {
         let parts: Vec<String> = items.iter().map(|s| format!("{s:?}")).collect();
         format!("&[{}]", parts.join(", "))
