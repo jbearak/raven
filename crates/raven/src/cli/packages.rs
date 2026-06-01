@@ -992,9 +992,14 @@ pub fn install_downloaded_sidecars(
     let names_db_provenance = db.provenance().clone();
     drop(db);
 
-    // Backup existing, replace, restore on failure.
-    let backup = backup_existing_final(&names_final)?;
+    // Backup existing, replace, restore on failure. Clean up the validated
+    // temp on any failure after validation so a rare error can't leak it.
+    let backup = backup_existing_final(&names_final).map_err(|e| {
+        let _ = std::fs::remove_file(&names_tmp);
+        e
+    })?;
     if let Err(e) = replace_with_tmp(&names_tmp, &names_final) {
+        let _ = std::fs::remove_file(&names_tmp);
         restore_backup(backup.as_deref(), &names_final);
         return Err(e);
     }
@@ -1226,6 +1231,8 @@ pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), 
         depends.sort();
         pkgs.push((name, exports, datasets, depends));
     }
+    // Deterministic output regardless of the source order of base-package names.
+    pkgs.sort_by(|a, b| a.0.cmp(&b.0));
     let src = emit_embedded_base_source(&pkgs, &r_version);
     std::fs::write(&args.output, src).map_err(|e| e.to_string())?;
     eprintln!("Wrote embedded base table to {}", args.output.display());
