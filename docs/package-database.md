@@ -53,6 +53,21 @@ The default `--used` scope is **maximally inclusive** — over-inclusion is free
 
 If a `.raven/packages.json` already exists, `freeze` compares **package content only** (ignoring provenance such as the timestamp). When the content is identical it leaves the file untouched and prints "no changes" — so a regeneration that found nothing new produces a **zero-line diff**, and the provenance timestamp moves only when the captured exports actually changed.
 
+### Two producers, one artifact
+
+The Tier 2 `.raven/packages.json` has two producers — the three resolution tiers are unchanged:
+
+- **`raven packages freeze`** — sources exports from a local R install. Version-exact, deterministic, meant to be committed and reviewed in PRs. The reproducible, project-pinned path.
+- **`raven packages fetch`** — sources exports from CRAN/Bioconductor r-universe (`cran.r-universe.dev`, `bioc.r-universe.dev`). Needs no R, no installed packages, and no dependency on the `names-db` Release. Fetches **latest** exports only (r-universe does not archive old versions), so it is not version-pinned. The file is an ephemeral CI artifact meant to be regenerated each run and gitignored rather than committed.
+
+Both write the same schema (v1) and are consumed through the same reader — `raven check` and the language server cannot distinguish them. `fetch` is strictly **additive**: it reads any existing file at the target, preserves every record untouched, and adds records only for used packages not already present. Run after `freeze`, it tops up coverage for whatever `freeze` missed (e.g. uninstalled packages) without disturbing a single `freeze` row.
+
+**renv.lock version-skew heads-up.** Because r-universe is latest-only, `fetch` cannot pull the exact version `renv.lock` pins. When the fetched version differs from the locked version, `fetch` prints a warning naming both. Export names are usually stable across versions, so this is informational — never an error.
+
+**Scope limits.** `fetch` covers only the project's used set — it does not replace Tier 3's zero-adoption, whole-ecosystem floor. And base/recommended packages are not on r-universe; they still come from local R or the embedded fallback at analysis time.
+
+See [`raven packages fetch`](cli.md#raven-packages-fetch) and [Four ways to run `raven check` in CI](cli.md#four-ways-to-run-raven-check-in-ci) for usage and the full strategy comparison.
+
 ### Version skew is explained, not silently dropped
 
 If a committed `.raven/packages.json` was written by a **newer** Raven than the one reading it (an incompatible schema), Raven does not silently ignore it. It **explains and continues**: `raven check` prints a specific note to stderr, the language server raises a notification, and resolution degrades to Tier 3 when a usable sidecar is available. The message tells you to upgrade Raven here or regenerate the file with `raven packages freeze`. An unreadable or corrupt file is reported the same way. A missing file is normal and silent.
@@ -95,7 +110,7 @@ In CI, `raven check` **suppresses missing-package warnings by default** (CI deli
 
 ## See also
 
-- [`raven packages`](cli.md#raven-packages) — the `freeze`, `update`, and `build-shipped-db` commands.
+- [`raven packages`](cli.md#raven-packages) — the `freeze`, `fetch`, `update`, and `build-shipped-db` commands.
 - [Diagnostics](diagnostics.md#package-names-vs-install-status) — names vs. install status, and the `raven check` default.
 - [Cross-File & Package Awareness](cross-file.md#resolving-exports-without-r) — where the three-tier fallback sits in package resolution.
 - [R Package Development](r-package-dev.md#generating-a-package-database-for-ci) — generating the repo database for a package project.
