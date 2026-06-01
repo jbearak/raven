@@ -1198,22 +1198,43 @@ fn emit_embedded_base_source(pkgs: &[EmbeddedPkgCapture], r_version: &str) -> St
     out
 }
 
+/// Authoritative dataset object names for one base package via R's `data()`.
+/// `data()` Items are formatted `obj (topic)` for datasets documented under a
+/// shared topic, so the leading token is the resolvable object name (e.g.
+/// `state.abb`, `euro.cross`). Returns empty if R errors or the package ships
+/// no data. `pkg` is a fixed base-7 identifier, so the interpolation is safe.
+async fn capture_base_datasets(r: &crate::r_subprocess::RSubprocess, pkg: &str) -> Vec<String> {
+    let code = format!(
+        "items <- suppressWarnings(data(package=\"{pkg}\")$results); \
+         if (length(items)) writeLines(sub(\" .*$\", \"\", items[, \"Item\"]))"
+    );
+    match r.execute_r_code(&code).await {
+        Ok(out) => out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Maintainer-only: captures the base-7 package table from a reference R
 /// library and emits `embedded_base_generated.rs`. Uses a fresh, non-initialized
 /// `PackageLibrary` so that `get_package` returns datasets in `lazy_data`
 /// rather than merging them into exports (which `initialize()` would do).
 pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), String> {
     use crate::package_library::PackageLibrary;
-    let r = crate::r_subprocess::RSubprocess::new(None);
-    let r_version = match &r {
+    let query_r = crate::r_subprocess::RSubprocess::new(None);
+    let r_version = match &query_r {
         Some(sub) => sub
             .execute_r_code("cat(as.character(getRversion()))")
             .await
             .unwrap_or_else(|_| "unknown".to_string()),
         None => "unknown".to_string(),
     };
-    // Fresh library (NOT initialize()d): get_package keeps datasets in lazy_data.
-    let mut lib = PackageLibrary::with_subprocess(r);
+    // Fresh library (NOT initialize()d) so `get_package` keeps datasets out of
+    // the exports set; its own R subprocess expands base exportPattern.
+    let mut lib = PackageLibrary::with_subprocess(crate::r_subprocess::RSubprocess::new(None));
     lib.set_lib_paths(vec![args.reference_lib.clone()]);
     let mut pkgs = Vec::new();
     for name in crate::r_subprocess::get_fallback_base_packages() {
@@ -1224,7 +1245,29 @@ pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), 
             )
         })?;
         let mut exports: Vec<String> = info.exports.iter().cloned().collect();
-        let mut datasets = info.lazy_data.clone();
+        // Datasets: `info.lazy_data` (parse_data_symbols) only sees individual
+        // data files; base packages like `datasets` bundle their data in
+        // `Rdata.r{db,dx,ds}`, so the object names are knowable only via R's
+        // `data()` (authoritative, e.g. `state.abb`/`euro.cross`). When R is
+        // unavailable, fall back to INDEX topics for any package with a `data/`
+        // dir (lower fidelity — topic names, not object names).
+        let mut dataset_set: std::collections::HashSet<String> =
+            info.lazy_data.iter().cloned().collect();
+        match &query_r {
+            Some(sub) => dataset_set.extend(capture_base_datasets(sub, &name).await),
+            None => {
+                let pkg_dir = args.reference_lib.join(&name);
+                if std::fs::symlink_metadata(pkg_dir.join("data"))
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                {
+                    if let Ok(idx) = crate::namespace_parser::parse_index_exports(&pkg_dir).await {
+                        dataset_set.extend(idx);
+                    }
+                }
+            }
+        }
+        let mut datasets: Vec<String> = dataset_set.into_iter().collect();
         let mut depends = info.depends.clone();
         exports.sort();
         datasets.sort();
