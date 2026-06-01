@@ -1684,7 +1684,9 @@ mod tests {
     #[test]
     fn embedded_base_packages_contains_expected() {
         let set = super::embedded_base_packages();
-        for pkg in ["base", "stats", "utils", "methods", "datasets"] {
+        // Attached-7 plus a non-attached base-priority package: all 14 are
+        // "base" for fetch/freeze skip purposes.
+        for pkg in ["base", "stats", "utils", "methods", "datasets", "grid"] {
             assert!(set.contains(pkg), "expected {pkg} in base set");
         }
         assert!(!set.contains("dplyr"), "dplyr must not be in base set");
