@@ -62,7 +62,6 @@ pub struct BuildShippedDbArgs {
     pub fresh: bool,
     pub seed: Option<PathBuf>,
     pub output: PathBuf,
-    pub base_exports_output: Option<PathBuf>,
     pub snapshot_date: String,
     pub source: String,
 }
@@ -76,7 +75,6 @@ pub fn parse_build_shipped_db_args(
     let mut fresh = false;
     let mut seed = None;
     let mut output = None;
-    let mut base_exports_output = None;
     let mut snapshot_date = String::new();
     let mut source = "reference-R ∪ r-universe".to_string();
     while let Some(arg) = argv.next() {
@@ -99,11 +97,6 @@ pub fn parse_build_shipped_db_args(
             "--fresh" | "--no-seed" => fresh = true,
             "--seed" => seed = Some(PathBuf::from(argv.next().ok_or("--seed needs a path")?)),
             "--output" => output = Some(PathBuf::from(argv.next().ok_or("--output needs a path")?)),
-            "--base-exports-output" => {
-                base_exports_output = Some(PathBuf::from(
-                    argv.next().ok_or("--base-exports-output needs a path")?,
-                ))
-            }
             "--snapshot-date" => {
                 snapshot_date = argv.next().ok_or("--snapshot-date needs a value")?
             }
@@ -119,7 +112,6 @@ pub fn parse_build_shipped_db_args(
         fresh,
         seed,
         output: output.ok_or("--output is required")?,
-        base_exports_output,
         snapshot_date,
         source,
     })
@@ -735,6 +727,16 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
 
     let merged = merge_append_only(prior, runiverse, reference_r);
 
+    // No FORMAT_VERSION bump needed — this post-merge filter simply removes
+    // base-7 packages from all sources before writing the shipped DB.
+    let base: std::collections::HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
+        .into_iter()
+        .collect();
+    let merged: Vec<PackageRecord> = merged
+        .into_iter()
+        .filter(|r| !base.contains(&r.name))
+        .collect();
+
     let provenance = ShippedDbProvenance {
         source: args.source,
         snapshot_date: args.snapshot_date,
@@ -742,9 +744,6 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
         raven_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     write_shipped_db(&args.output, &merged, provenance).map_err(|e| e.to_string())?;
-    if let Some(base_out) = &args.base_exports_output {
-        crate::package_db::write_base_exports_file(base_out, &merged).map_err(|e| e.to_string())?;
-    }
     eprintln!(
         "Wrote {} packages to {}",
         merged.len(),
@@ -1235,7 +1234,7 @@ pub fn print_help() {
          raven packages update [--base-url URL] [--dest-dir DIR]\n  \
          raven packages build-shipped-db [--reference-lib DIR] [--runiverse-cran DIR] \
 [--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
-[--base-exports-output base-exports.json] [--snapshot-date S] [--source S]\n"
+[--snapshot-date S] [--source S]\n"
     );
 }
 
@@ -1310,8 +1309,6 @@ mod tests {
                 "bioc".to_string(),
                 "--output".to_string(),
                 "out.db".to_string(),
-                "--base-exports-output".to_string(),
-                "base.json".to_string(),
                 "--fresh".to_string(),
                 "--snapshot-date".to_string(),
                 "2026-05-30".to_string(),
@@ -1322,14 +1319,63 @@ mod tests {
         assert_eq!(args.runiverse_cran, Some(std::path::PathBuf::from("cran")));
         assert_eq!(args.runiverse_bioc, Some(std::path::PathBuf::from("bioc")));
         assert_eq!(args.output, std::path::PathBuf::from("out.db"));
-        assert_eq!(
-            args.base_exports_output,
-            Some(std::path::PathBuf::from("base.json"))
-        );
         assert!(args.fresh, "--fresh skips the default prior-DB seed");
         assert_eq!(args.snapshot_date, "2026-05-30");
         assert_eq!(args.reference_lib, None);
         assert_eq!(args.seed, None);
+    }
+
+    #[tokio::test]
+    async fn build_shipped_db_excludes_base_seven() {
+        use crate::package_db::binary_db::ShippedDb;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("names.db");
+        // Seed a DB containing a base package + a non-base package.
+        let seed = dir.path().join("seed.db");
+        let recs = vec![
+            PackageRecord {
+                name: "base".into(),
+                version: "4.4.0".into(),
+                exports: vec!["c".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            },
+            PackageRecord {
+                name: "dplyr".into(),
+                version: "1.1.4".into(),
+                exports: vec!["mutate".into()],
+                depends: vec![],
+                lazy_data: vec![],
+            },
+        ];
+        let prov = ShippedDbProvenance {
+            source: "t".into(),
+            snapshot_date: "2026-06-01".into(),
+            package_count: 2,
+            raven_version: "9.9.9".into(),
+        };
+        write_shipped_db(&seed, &recs, prov).unwrap();
+
+        super::run_build_shipped_db(super::BuildShippedDbArgs {
+            reference_lib: None,
+            runiverse_cran: None,
+            runiverse_bioc: None,
+            fresh: false,
+            seed: Some(seed),
+            output: out.clone(),
+            snapshot_date: "2026-06-01".into(),
+            source: "t".into(),
+        })
+        .await
+        .unwrap();
+
+        let db = ShippedDb::open(&out).unwrap();
+        let names: Vec<String> = db.all_records().into_iter().map(|r| r.name).collect();
+        assert!(names.contains(&"dplyr".to_string()));
+        assert!(
+            !names.contains(&"base".to_string()),
+            "base-7 must be excluded"
+        );
     }
 
     #[test]
