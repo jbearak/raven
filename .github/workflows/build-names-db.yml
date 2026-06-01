@@ -2,10 +2,8 @@ name: Build names.db (Tier 3 package-export DB)
 
 on:
   workflow_dispatch:
-  # Refresh interval is NOT yet committed (decision #16). Run on demand for now.
-  # When an interval is chosen, uncomment a schedule, e.g.:
-  #   schedule:
-  #     - cron: "0 6 * * 1"   # example only — currently inactive
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
 
 permissions:
   contents: write   # to update the names-db Release
@@ -20,55 +18,37 @@ jobs:
       - name: Build raven (release)
         run: cargo build --release -p raven
 
-      - name: Seed from the prior names.db (append-only)
+      - name: Resolve seed (prefer Release, fall back to committed LFS seed)
         run: |
-          mkdir -p dist
-          gh release download names-db --repo "$GITHUB_REPOSITORY" \
-            --pattern 'names.db' --dir seed || echo "no prior release; building fresh"
+          mkdir -p seed
+          if gh release download names-db --repo "$GITHUB_REPOSITORY" \
+               --pattern 'names.db' --dir seed; then
+            echo "SEED=seed/names.db" >> "$GITHUB_ENV"
+          elif git lfs pull --include=crates/raven/data/names-db-seed.db; then
+            echo "SEED=crates/raven/data/names-db-seed.db" >> "$GITHUB_ENV"
+          else
+            echo "no prior Release and no committed seed; building fresh"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch CRAN + Bioc r-universe JSON
-        run: |
-          set -euo pipefail
-          for host in cran.r-universe.dev bioc.r-universe.dev; do
-            dest="runiverse/${host%%.*}"; mkdir -p "$dest"
-            curl -sf "https://${host}/api/ls" -o "pkglist-${host}.json"
-            jq -r '.[]' "pkglist-${host}.json" | while read -r pkg; do
-              curl -sf "https://${host}/api/packages/${pkg}" -o "${dest}/${pkg}.json" || echo "skip ${host}/${pkg}"
-            done
-          done
-
       - name: Build names.db (reference-R seed ∪ CRAN+Bioc, append-only)
-        # FIX 1: --reference-lib requires a PATH argument. We capture R's .Library
-        # (the main library directory containing base + recommended packages) via
-        # Rscript and pass it as REF_LIB. Without this the next flag would be
-        # consumed as the path, silently dropping base/recommended exports.
         run: |
-          SNAPSHOT_DATE="$(date -u +%Y-%m-%d)"
+          mkdir -p dist
           REF_LIB="$(Rscript -e 'cat(.Library)')"
-          ./target/release/raven packages build-shipped-db \
-            --reference-lib "$REF_LIB" \
-            --runiverse-cran runiverse/cran \
-            --runiverse-bioc runiverse/bioc \
-            ${{ hashFiles('seed/names.db') != '' && '--seed seed/names.db' || '' }} \
+          scripts/build-names-db.sh \
+            --raven ./target/release/raven \
             --output dist/names.db \
-            --base-exports-output dist/base-exports.json \
-            --snapshot-date "${SNAPSHOT_DATE}" \
-            --source r-universe+reference
+            --reference-lib "$REF_LIB" \
+            ${SEED:+--seed "$SEED"}
 
       - name: Record checksums
-        # FIX 2: b3sum is not preinstalled on ubuntu-latest. We use sha256sum
-        # (always available) instead of b3sum. names.db already self-verifies via
-        # its internal blake3 header; this file is a supplementary Release artifact
-        # for human spot-checks. The file is named checksums.sha256 to be explicit
-        # about the algorithm used.
         run: |
-          ( cd dist && sha256sum names.db base-exports.json > checksums.sha256 )
+          ( cd dist && sha256sum names.db > checksums.sha256 )
 
       - name: Publish to the names-db Release
         run: |
-          gh release upload names-db dist/names.db dist/base-exports.json dist/checksums.sha256 \
+          gh release upload names-db dist/names.db dist/checksums.sha256 \
             --repo "$GITHUB_REPOSITORY" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

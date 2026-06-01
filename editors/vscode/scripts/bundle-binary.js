@@ -12,23 +12,18 @@ if (!fs.existsSync(binDir)) {
     fs.mkdirSync(binDir, { recursive: true });
 }
 
-// Bundle the Tier 3 package-export database + base-exports file next to the
-// binary, if present. In dev builds they are usually absent (Tier 3/base-exports
-// unavailable, which is fine — the extension degrades to Tier 1/2). In VSIX CI
-// the release workflow places these directly in bin/; this block covers local
-// builds and the RAVEN_NAMES_DB_SRC override.
+// Bundle the Tier 3 package-export database (names.db) next to the binary, if
+// present. In dev builds it is usually absent (Tier 3 unavailable, which is
+// fine — the extension degrades to Tier 1/2; base-7 is embedded in the binary).
 const distDir = path.join(__dirname, '..', '..', '..', 'dist');
-for (const sidecar of ['names.db', 'base-exports.json']) {
-    const src = (sidecar === 'names.db' && process.env.RAVEN_NAMES_DB_SRC)
-        ? process.env.RAVEN_NAMES_DB_SRC
-        : path.join(distDir, sidecar);
-    const dest = path.join(binDir, sidecar);
-    if (fs.existsSync(src)) {
-        fs.copyFileSync(src, dest);
-        console.log(`Bundled ${sidecar} from ${src}`);
-    } else {
-        console.log(`${sidecar} not found at ${src}; that tier will be unavailable in this build`);
-    }
+const sidecar = 'names.db';
+const src = process.env.RAVEN_NAMES_DB_SRC || path.join(distDir, sidecar);
+const dest = path.join(binDir, sidecar);
+if (fs.existsSync(src)) {
+    fs.copyFileSync(src, dest);
+    console.log(`Bundled ${sidecar} from ${src}`);
+} else {
+    console.log(`${sidecar} not found at ${src}; Tier 3 will be unavailable in this build`);
 }
 
 // In CI mode, the binary is pre-placed by the workflow. Check for both names

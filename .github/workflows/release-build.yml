@@ -85,7 +85,7 @@ jobs:
         run: |
           mkdir -p dist
           gh release download names-db --repo "$GITHUB_REPOSITORY" \
-            --pattern 'names.db' --pattern 'base-exports.json' --dir dist
+            --pattern 'names.db' --dir dist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -172,8 +172,8 @@ jobs:
       - name: Download package DB from the names-db Release
         run: |
           gh release download names-db --repo "$GITHUB_REPOSITORY" \
-            --pattern 'names.db' --pattern 'base-exports.json' --dir editors/vscode/bin || \
-            echo "no names-db release yet; Tier 3/base-exports unavailable in this build"
+            --pattern 'names.db' --dir editors/vscode/bin || \
+            echo "no names-db release yet; Tier 3 unavailable in this build"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
