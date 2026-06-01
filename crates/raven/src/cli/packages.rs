@@ -1425,7 +1425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_shipped_db_excludes_base_seven() {
+    async fn build_shipped_db_excludes_base_priority_packages() {
         use crate::package_db::binary_db::ShippedDb;
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("names.db");
