@@ -27,6 +27,7 @@ use crate::r_subprocess::is_valid_package_name;
 const DEFAULT_NAMES_DB_RELEASE_BASE: &str =
     "https://github.com/jbearak/raven/releases/download/names-db";
 
+#[derive(Debug)]
 pub struct UpdateArgs {
     pub base_url: String,
     pub dest_dir: Option<PathBuf>,
@@ -38,19 +39,52 @@ pub struct InstalledSidecars {
     pub names_db_provenance: ShippedDbProvenance,
 }
 
+/// Whether `s` is exactly a `YYYY-MM-DD` calendar date (digits with dashes at
+/// positions 4 and 7). This is a shape check only — it gates the optional
+/// `update <date>` positional so a stray token can't be mistaken for a date; a
+/// well-formed but nonexistent date surfaces later as a 404 from the Release.
+fn is_yyyy_mm_dd(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+}
+
 pub fn parse_update_args(mut argv: impl Iterator<Item = String>) -> Result<UpdateArgs, String> {
-    let mut base_url = DEFAULT_NAMES_DB_RELEASE_BASE.to_string();
+    let mut base_url: Option<String> = None;
     let mut dest_dir = None;
+    let mut date: Option<String> = None;
     while let Some(arg) = argv.next() {
         match arg.as_str() {
-            "--base-url" => base_url = argv.next().ok_or("--base-url needs a URL")?,
+            "--base-url" => base_url = Some(argv.next().ok_or("--base-url needs a URL")?),
             "--dest-dir" => {
                 dest_dir = Some(PathBuf::from(argv.next().ok_or("--dest-dir needs a path")?))
             }
             "--help" => return Err("HELP".into()),
-            s => return Err(format!("unknown flag: {s}")),
+            s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
+            s if date.is_some() => return Err(format!("unexpected extra argument: {s}")),
+            s if !is_yyyy_mm_dd(s) => {
+                return Err(format!("expected a release date as YYYY-MM-DD, got: {s}"))
+            }
+            s => date = Some(s.to_string()),
         }
     }
+    // `--base-url` already encodes the full tag path, so combining it with a date
+    // (which also selects the tag) is ambiguous. The date only rewrites the tag
+    // suffix on the default GitHub base.
+    let base_url = match (base_url, date) {
+        (Some(_), Some(_)) => {
+            return Err("pass either a YYYY-MM-DD release date or --base-url, not both".into())
+        }
+        (Some(b), None) => b,
+        (None, Some(d)) => format!("{DEFAULT_NAMES_DB_RELEASE_BASE}-{d}"),
+        (None, None) => DEFAULT_NAMES_DB_RELEASE_BASE.to_string(),
+    };
     Ok(UpdateArgs { base_url, dest_dir })
 }
 
@@ -1403,7 +1437,7 @@ pub fn print_help() {
          raven packages fetch [--missing-only] [--fail-on-missing] [--output PATH] \
 [--workspace DIR] [--base-urls URL[,URL]]\n  \
          raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]\n  \
-         raven packages update [--base-url URL] [--dest-dir DIR]\n  \
+         raven packages update [YYYY-MM-DD] [--base-url URL] [--dest-dir DIR]\n  \
          raven packages build-shipped-db [--runiverse-cran DIR] \
 [--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
 [--snapshot-date S] [--source S]\n  \
@@ -1663,6 +1697,35 @@ mod tests {
             args.dest_dir.unwrap(),
             std::path::PathBuf::from("/tmp/raven-db")
         );
+    }
+
+    #[test]
+    fn parse_update_args_accepts_dated_release() {
+        let args =
+            super::parse_update_args(["2026-06-02"].into_iter().map(String::from)).unwrap();
+        assert!(
+            args.base_url.ends_with("names-db-2026-06-02"),
+            "got {}",
+            args.base_url
+        );
+    }
+
+    #[test]
+    fn parse_update_args_rejects_date_and_base_url_together() {
+        let err = super::parse_update_args(
+            ["2026-06-02", "--base-url", "http://x/y"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "got {err}");
+    }
+
+    #[test]
+    fn parse_update_args_rejects_malformed_date() {
+        let err =
+            super::parse_update_args(["2026-6-2"].into_iter().map(String::from)).unwrap_err();
+        assert!(err.contains("YYYY-MM-DD"), "got {err}");
     }
 
     #[test]

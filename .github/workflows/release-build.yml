@@ -16,7 +16,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate-names-db:
+  # Compatibility gate: confirm the raven we're about to release can open and
+  # validate the current `names-db` Release asset — the database users download
+  # with `raven packages update`. names.db is NOT bundled into the release; this
+  # only guards against shipping a raven whose names.db format support has drifted
+  # from the live database.
+  names-db-compat:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -24,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Download package DB from the names-db Release
+      - name: Download the current names-db Release asset
         run: |
           mkdir -p dist
           gh release download names-db --repo "$GITHUB_REPOSITORY" \
@@ -32,21 +37,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Raven validator
+      - name: Build raven (release)
         run: cargo build --release -p raven
 
-      - name: Validate package DB
+      - name: Validate names.db with the release raven
         run: ./target/release/raven packages validate-shipped-db dist/names.db
 
-      - name: Upload validated package DB
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: names-db
-          path: dist/names.db
-          retention-days: 30
-
   build-lsp:
-    needs: validate-names-db
+    needs: names-db-compat
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -114,12 +112,6 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }} --bin raven
           fi
-
-      - name: Download validated package DB
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: names-db
-          path: dist
 
       - name: Create archive
         run: |

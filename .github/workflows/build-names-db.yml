@@ -59,3 +59,18 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish immutable dated snapshot
+        run: |
+          DATE="$(date -u +%F)"
+          if gh release view "names-db-$DATE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "names-db-$DATE already exists; leaving the immutable snapshot untouched"
+          else
+            gh release create "names-db-$DATE" --repo "$GITHUB_REPOSITORY" \
+              --title "names.db ($DATE)" \
+              --notes "Immutable Tier 3 snapshot for reproducible \`raven packages update $DATE\`" \
+              --latest=false \
+              dist/names.db dist/checksums.sha256
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
