@@ -41,6 +41,54 @@ jobs:
       - name: Check formatting
         run: cargo +1.95.0 fmt --all --check
 
+  # ── Clippy lint gate (required check) ──────────────────────────────────
+  # Denies ALL clippy/rustc warnings (`-D warnings`) across every target so
+  # lint noise can't re-accumulate during development. Pinned to an explicit
+  # toolchain (not `@stable`) for the same reason as the fmt gate: new clippy
+  # releases add new lints, and an unpinned gate would start failing on
+  # unrelated PRs as the lint set shifts. `--all-targets --features
+  # test-support` matches the surface a developer sees in their editor
+  # (lib, tests, benches, examples). Unlike fmt, clippy DOES invoke rustc, so
+  # this job sets up sccache + mold like the other compiling jobs.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install pinned clippy
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache sccache storage (clippy)
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/sccache
+          key: sccache-clippy-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sccache-clippy-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            sccache-clippy-${{ runner.os }}-
+
+      - name: Install mold linker
+        run: sudo apt-get install -y --no-install-recommends mold
+
+      - name: Run clippy (deny warnings)
+        run: cargo +1.95.0 clippy --workspace --all-targets --features test-support -- -D warnings
+
+
   # Build only the release artifacts that genuinely need optimization: the LSP
   # binary (consumed by the vscode-mocha and binary-size jobs) and the
   # performance_budgets test binary (gated on `not(debug_assertions)`, asserts
