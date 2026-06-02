@@ -3572,6 +3572,30 @@ where
         None => return scope,
     };
 
+    // Snapshot the ancestor-path `visited` BEFORE STEP 1's parent walk runs.
+    //
+    // STEP 1 (`parent_prefix_at`) intentionally shares this `visited` map for
+    // its own pruning, and while walking backward edges it fully expands each
+    // parent — including that parent's *forward* source() calls, which get
+    // recorded at the EOF sentinel (u32::MAX, u32::MAX). Those forward-sourced
+    // files are cousins, not ancestors of the current file. If STEP 2 below
+    // cloned the post-STEP-1 `visited`, the revisit guard at the top of this
+    // function would treat this file's own genuine forward source() targets as
+    // "already visited at a wider-or-equal position" and return an empty scope
+    // for them — silently dropping every transitively-sourced symbol whenever
+    // the queried file participates in a source() cycle (e.g. a wrapper script
+    // `source()`s the queried file, and that wrapper also sources the queried
+    // file's children). Real forward execution must treat only true ancestors
+    // (this snapshot) as already-visited, mirroring `ScopeStream`'s fresh
+    // per-source `visited` in the diagnostic path. Only the isolated
+    // (real-execution) branch needs this; parent-prefix discovery keeps the
+    // shared map.
+    let forward_visited_base = if isolate_forward_source_visits {
+        Some(visited.clone())
+    } else {
+        None
+    };
+
     // Compute function scope context early — needed for STEP 1 hoisting.
     // When the query position is inside a function body, STEP 1 should query
     // parents at EOF to get their full global scope (R late-binding semantics).
@@ -3854,8 +3878,14 @@ where
                             // visits must still be visible to the child so
                             // cycles short-circuit, but recursive visits from
                             // one sourced sibling must not mark another later
-                            // sibling as already visited.
-                            let mut child_visited = visited.clone();
+                            // sibling as already visited. Clone the ancestor
+                            // snapshot taken before STEP 1 (not the live
+                            // `visited`), so cousin files that STEP 1's parent
+                            // walk expanded do not falsely short-circuit this
+                            // file's own forward source() targets.
+                            let mut child_visited = forward_visited_base
+                                .clone()
+                                .unwrap_or_else(|| visited.clone());
                             scope_at_position_with_graph_recursive(
                                 &child_uri,
                                 u32::MAX, // Include all symbols from sourced file
