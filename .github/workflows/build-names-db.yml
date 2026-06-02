@@ -53,7 +53,8 @@ jobs:
         run: |
           gh release create names-db --repo "$GITHUB_REPOSITORY" \
             --title "names.db (Tier 3 package-export DB)" \
-            --notes "Auto-updated by build-names-db.yml" 2>/dev/null || true
+            --notes "Auto-updated by build-names-db.yml" \
+            --latest=false 2>/dev/null || true
           gh release upload names-db dist/names.db dist/checksums.sha256 \
             --repo "$GITHUB_REPOSITORY" --clobber
         env:
