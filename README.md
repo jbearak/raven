@@ -69,9 +69,9 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 **VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r).
 
-**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
+**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. The binary ships only the executable — not the `names.db` sidecar — so run `raven packages update` after first launch (or copy a local `names.db` into place) for broad CRAN/Bioconductor metadata; base R coverage is embedded in the binary regardless. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
 
-**Build from source:** Install with `cargo install --git https://github.com/jbearak/raven raven`, or build from a local checkout. See [Development Notes](docs/development.md).
+**Build from source:** Install with `cargo install --git https://github.com/jbearak/raven raven`, or build from a local checkout. These builds also ship only the executable; run `raven packages update` after first launch (or copy a local `names.db` sidecar) for broad CRAN/Bioconductor coverage. See [Development Notes](docs/development.md).
 
 ## Documentation
 

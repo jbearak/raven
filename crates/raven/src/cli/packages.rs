@@ -39,20 +39,40 @@ pub struct InstalledSidecars {
     pub names_db_provenance: ShippedDbProvenance,
 }
 
-/// Whether `s` is exactly a `YYYY-MM-DD` calendar date (digits with dashes at
-/// positions 4 and 7). This is a shape check only — it gates the optional
-/// `update <date>` positional so a stray token can't be mistaken for a date; a
-/// well-formed but nonexistent date surfaces later as a 404 from the Release.
+/// Whether `s` is a real `YYYY-MM-DD` calendar date. Beyond the `dddd-dd-dd`
+/// shape this rejects impossible dates (e.g. `2026-02-31`) by validating the
+/// month and the day against that month's length, leap years included. It gates
+/// the optional `update <date>` positional so a stray token can't be mistaken
+/// for a date; a valid but unpublished date surfaces later as a 404 from the
+/// Release.
 fn is_yyyy_mm_dd(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() == 10
-        && b.iter().enumerate().all(|(i, c)| {
-            if i == 4 || i == 7 {
-                *c == b'-'
-            } else {
-                c.is_ascii_digit()
-            }
-        })
+    if b.len() != 10
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !b
+            .iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        s[0..4].parse::<u32>(),
+        s[5..7].parse::<u32>(),
+        s[8..10].parse::<u32>(),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 pub fn parse_update_args(mut argv: impl Iterator<Item = String>) -> Result<UpdateArgs, String> {
@@ -1437,7 +1457,7 @@ pub fn print_help() {
          raven packages fetch [--missing-only] [--fail-on-missing] [--output PATH] \
 [--workspace DIR] [--base-urls URL[,URL]]\n  \
          raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]\n  \
-         raven packages update [YYYY-MM-DD] [--base-url URL] [--dest-dir DIR]\n  \
+         raven packages update [YYYY-MM-DD | --base-url URL] [--dest-dir DIR]\n  \
          raven packages build-shipped-db [--runiverse-cran DIR] \
 [--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
 [--snapshot-date S] [--source S]\n  \
@@ -1701,8 +1721,7 @@ mod tests {
 
     #[test]
     fn parse_update_args_accepts_dated_release() {
-        let args =
-            super::parse_update_args(["2026-06-02"].into_iter().map(String::from)).unwrap();
+        let args = super::parse_update_args(["2026-06-02"].into_iter().map(String::from)).unwrap();
         assert!(
             args.base_url.ends_with("names-db-2026-06-02"),
             "got {}",
@@ -1723,8 +1742,14 @@ mod tests {
 
     #[test]
     fn parse_update_args_rejects_malformed_date() {
+        let err = super::parse_update_args(["2026-6-2"].into_iter().map(String::from)).unwrap_err();
+        assert!(err.contains("YYYY-MM-DD"), "got {err}");
+    }
+
+    #[test]
+    fn parse_update_args_rejects_impossible_date() {
         let err =
-            super::parse_update_args(["2026-6-2"].into_iter().map(String::from)).unwrap_err();
+            super::parse_update_args(["2026-02-31"].into_iter().map(String::from)).unwrap_err();
         assert!(err.contains("YYYY-MM-DD"), "got {err}");
     }
 

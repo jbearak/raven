@@ -63,14 +63,27 @@ jobs:
       - name: Publish immutable dated snapshot
         run: |
           DATE="$(date -u +%F)"
-          if gh release view "names-db-$DATE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "names-db-$DATE already exists; leaving the immutable snapshot untouched"
-          else
-            gh release create "names-db-$DATE" --repo "$GITHUB_REPOSITORY" \
+          TAG="names-db-$DATE"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "names.db ($DATE)" \
               --notes "Immutable Tier 3 snapshot for reproducible \`raven packages update $DATE\`" \
-              --latest=false \
-              dist/names.db dist/checksums.sha256
+              --latest=false
           fi
+          # Release existence is NOT proof its immutable assets are present: a prior
+          # run may have created the Release (or this run just did) but failed before
+          # finishing the upload. Upload only the assets that are missing — never
+          # --clobber — so an already-published asset stays untouched (immutability)
+          # while a partial/empty snapshot gets completed instead of retained broken.
+          present="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+          for f in names.db checksums.sha256; do
+            if grep -qxF "$f" <<<"$present"; then
+              echo "$TAG already has $f; leaving the immutable asset untouched"
+            else
+              echo "$TAG is missing $f; uploading it"
+              gh release upload "$TAG" "dist/$f" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
