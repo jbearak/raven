@@ -3105,7 +3105,7 @@ mod activity_signal_tests {
         );
 
         // Simulate files needing revalidation
-        let mut files_to_revalidate = vec![
+        let mut files_to_revalidate = [
             other.clone(),
             visible2.clone(),
             recent.clone(),
@@ -3132,7 +3132,7 @@ mod activity_signal_tests {
         println!("✓ Revalidation prioritization verified:");
         for (i, uri) in files_to_revalidate.iter().enumerate() {
             let priority = state.priority_score(uri);
-            let filename = uri.path().split('/').last().unwrap_or("unknown");
+            let filename = uri.path().split('/').next_back().unwrap_or("unknown");
             println!("  {}. {} (priority: {})", i + 1, filename, priority);
         }
     }

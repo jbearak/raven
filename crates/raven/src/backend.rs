@@ -4701,7 +4701,7 @@ impl LanguageServer for Backend {
                     // Capture old metadata before recomputing (for WD change detection)
                     let old_meta = {
                         let state = state_arc.read().await;
-                        state.get_enriched_metadata(&uri)
+                        state.get_enriched_metadata(uri)
                     };
 
                     // Compute metadata and artifacts
@@ -4713,7 +4713,7 @@ impl LanguageServer for Backend {
                                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
                                 crate::cross_file::scope::compute_artifacts_with_metadata(
-                                    &uri,
+                                    uri,
                                     &tree,
                                     &content,
                                     Some(&cross_file_meta),
@@ -4743,7 +4743,7 @@ impl LanguageServer for Backend {
                         let open_docs: std::collections::HashSet<_> =
                             state.documents.keys().cloned().collect();
                         state.cross_file_workspace_index.update_from_disk(
-                            &uri,
+                            uri,
                             &open_docs,
                             snapshot,
                             cross_file_meta.clone(),
@@ -4784,7 +4784,7 @@ impl LanguageServer for Backend {
                                 .collect();
 
                         let graph_result = state.cross_file_graph.update_file(
-                            &uri,
+                            uri,
                             &cross_file_meta,
                             workspace_root.as_ref(),
                             |parent_uri| parent_content.get(parent_uri).cloned(),
@@ -4792,7 +4792,7 @@ impl LanguageServer for Backend {
 
                         // Invalidate children affected by working directory change (Requirement 8)
                         let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                            &uri,
+                            uri,
                             old_meta.as_deref(),
                             &cross_file_meta,
                             &state.cross_file_graph,
@@ -4823,7 +4823,7 @@ impl LanguageServer for Backend {
                         if graph_result.edges_changed {
                             let post_neighbors =
                                 crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                                    &uri,
+                                    uri,
                                     true,
                                     true,
                                     &state.cross_file_graph,

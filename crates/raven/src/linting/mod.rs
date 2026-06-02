@@ -2199,7 +2199,8 @@ mod code_field_tests {
     fn every_rule_emits_its_id() {
         use super::rule_ids::*;
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut LintConfig)>, &str)> = vec![
+        type LintCase = (&'static str, Box<dyn Fn(&mut LintConfig)>, &'static str);
+        let cases: Vec<LintCase> = vec![
             (
                 LINE_LENGTH,
                 Box::new(|c| {

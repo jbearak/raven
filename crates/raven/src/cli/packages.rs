@@ -1117,9 +1117,8 @@ pub fn install_downloaded_sidecars(
 
     // Backup existing, replace, restore on failure. Clean up the validated
     // temp on any failure after validation so a rare error can't leak it.
-    let backup = backup_existing_final(&names_final).map_err(|e| {
+    let backup = backup_existing_final(&names_final).inspect_err(|_e| {
         let _ = std::fs::remove_file(&names_tmp);
-        e
     })?;
     if let Err(e) = replace_with_tmp(&names_tmp, &names_final) {
         let _ = std::fs::remove_file(&names_tmp);

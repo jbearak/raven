@@ -3534,8 +3534,8 @@ impl BlockDetector {
             } else {
                 // Scan forward from the line after the keyword for the opening brace
                 let mut found = None;
-                for scan_line in (keyword_line + 1)..total_lines {
-                    if let Some(col) = lines[scan_line].find('{') {
+                for (scan_line, &line) in lines.iter().enumerate().skip(keyword_line + 1) {
+                    if let Some(col) = line.find('{') {
                         found = Some((scan_line, col));
                         break;
                     }
@@ -5040,27 +5040,25 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
         .collect();
 
     for edge in &deps {
-        if edge.is_directive && !edge.is_backward_directive {
-            if ast_targets.contains(&edge.to) {
-                let line = edge.call_site_line.unwrap_or(0);
-                let target_name = edge
-                    .to
-                    .path_segments()
-                    .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(line, 0),
-                        end: Position::new(line, LSP_EOL_CHARACTER),
-                    },
-                    severity: Some(severity),
-                    message: format!(
-                        "Redundant @lsp-source directive: '{}' is already sourced by a source() call",
-                        target_name
-                    ),
-                    ..Default::default()
-                });
-            }
+        if edge.is_directive && !edge.is_backward_directive && ast_targets.contains(&edge.to) {
+            let line = edge.call_site_line.unwrap_or(0);
+            let target_name = edge
+                .to
+                .path_segments()
+                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
+                .unwrap_or_default();
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(line, 0),
+                    end: Position::new(line, LSP_EOL_CHARACTER),
+                },
+                severity: Some(severity),
+                message: format!(
+                    "Redundant @lsp-source directive: '{}' is already sourced by a source() call",
+                    target_name
+                ),
+                ..Default::default()
+            });
         }
     }
 }
@@ -5366,6 +5364,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -5463,10 +5462,9 @@ fn collect_undefined_variables_from_snapshot(
         .unwrap_or_default();
 
     let parent_symbol_names: HashSet<String> = {
-        if !scope_cache.contains_key(&(0, 0)) {
-            let computed = snapshot.get_scope(uri, 0, 0, cancel);
-            scope_cache.insert((0, 0), computed);
-        }
+        scope_cache
+            .entry((0, 0))
+            .or_insert_with(|| snapshot.get_scope(uri, 0, 0, cancel));
         let scope_0_0 = scope_cache.get(&(0, 0)).unwrap();
         // Only include symbols from OTHER files. When a parent sources this file,
         // the file's own exports flow into the parent's scope and back here via
@@ -5509,7 +5507,6 @@ fn collect_undefined_variables_from_snapshot(
     // monotonically. tree-sitter's `walk()` typically yields nodes in
     // document order already; the sort is a defensive guarantee for the
     // streaming `advance_to` invariant.
-    let mut used = used;
     used.sort_by_key(|(_, n)| (n.start_position().row, n.start_position().column));
 
     // Build a single ScopeStream for the queried URI. The closures
@@ -8827,7 +8824,7 @@ mod syntax_error_range_tests {
             // (b) a MISSING node exists inside the ERROR (Phase 1 took priority)
             for &(s_row, s_col, e_row, e_col) in &single_line_errors {
                 let error_node = find_error_at(root, s_row, s_col);
-                let has_missing = error_node.map_or(false, |n| has_missing_descendant(n));
+                let has_missing = error_node.is_some_and(|n| has_missing_descendant(n));
 
                 if has_missing {
                     // Phase 1 (MISSING priority) may override the range — that's OK
@@ -10523,7 +10520,7 @@ fn ts_start_to_lsp(node: Node, text: &str) -> Position {
     let line_text = text.lines().nth(row).unwrap_or("");
     Position::new(
         row as u32,
-        byte_offset_to_utf16_column(line_text, node.start_position().column) as u32,
+        byte_offset_to_utf16_column(line_text, node.start_position().column),
     )
 }
 
@@ -10535,7 +10532,7 @@ fn ts_end_to_lsp(node: Node, text: &str) -> Position {
     let line_text = text.lines().nth(row).unwrap_or("");
     Position::new(
         row as u32,
-        byte_offset_to_utf16_column(line_text, node.end_position().column) as u32,
+        byte_offset_to_utf16_column(line_text, node.end_position().column),
     )
 }
 
@@ -10696,6 +10693,9 @@ fn classify_comment_for_ignore(
     let prefix = line_text.get(..start_col).unwrap_or("");
     let standalone = prefix.trim().is_empty();
 
+    // Collapsing these inner `if`s into match guards would force a wildcard
+    // arm and lose exhaustiveness over `LspIgnoreKind` variants.
+    #[allow(clippy::collapsible_match)]
     match classify_lsp_ignore_marker(body) {
         Some(LspIgnoreKind::SameLine) => {
             // Inline `# @lsp-ignore` suppresses *this* line — but only
@@ -10862,7 +10862,7 @@ fn classify_target(node: Node, text: &str) -> Option<TargetClassification> {
             label,
         });
     }
-    if let Some(label) = suspicious_target_kind(node, text) {
+    if let Some(label) = suspicious_target_kind(node) {
         return Some(TargetClassification {
             severity: DiagnosticSeverity::WARNING,
             label,
@@ -10950,7 +10950,7 @@ fn unary_operator_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
 /// Classify an assignment-target node as suspicious (R accepts, but the
 /// binding is almost certainly unintended). Returns `Some(label)` for cases
 /// like `"foo" <- 1`, `... <- 1`, `..N <- 1`.
-fn suspicious_target_kind(node: Node, text: &str) -> Option<&'static str> {
+fn suspicious_target_kind(node: Node) -> Option<&'static str> {
     match node.kind() {
         "string" => Some("string literal"),
         "dots" => Some("dots"),
@@ -10959,7 +10959,7 @@ fn suspicious_target_kind(node: Node, text: &str) -> Option<&'static str> {
         // `("foo") <- 1` and `(... ) <- 1` keep getting the WARNING tier.
         "parenthesized_expression" => {
             let inner = node.child_by_field_name("body")?;
-            suspicious_target_kind(inner, text)
+            suspicious_target_kind(inner)
         }
         _ => None,
     }
@@ -11707,10 +11707,10 @@ fn collect_stan_identifier_occurrences(text: &str) -> Vec<StanIdentifierOccurren
     occurrences
 }
 
-fn stan_identifier_at_position<'a>(
-    occurrences: &'a [StanIdentifierOccurrence],
+fn stan_identifier_at_position(
+    occurrences: &[StanIdentifierOccurrence],
     position: Position,
-) -> Option<&'a StanIdentifierOccurrence> {
+) -> Option<&StanIdentifierOccurrence> {
     occurrences.iter().find(|occurrence| {
         occurrence.line == position.line
             && position.character >= occurrence.start_col
@@ -13020,10 +13020,8 @@ pub fn extract_definition_statement(
     // Get content provider for the symbol's source file
     let content = if let Some(doc) = state.documents.get(&symbol.source_uri) {
         doc.text()
-    } else if let Some(cached) = state.cross_file_file_cache.get(&symbol.source_uri) {
-        cached
     } else {
-        return None;
+        state.cross_file_file_cache.get(&symbol.source_uri)?
     };
 
     // Get tree for parsing
@@ -16481,7 +16479,7 @@ result <- "#;
                     helper_item
                         .detail
                         .as_ref()
-                        .map_or(false, |d| d.contains("{testpkg}")),
+                        .is_some_and(|d| d.contains("{testpkg}")),
                     "helper_func should have package attribution {{testpkg}}"
                 );
             } else {
@@ -16614,7 +16612,7 @@ result <- "#;
                     filter_items[0]
                         .detail
                         .as_ref()
-                        .map_or(false, |d| d.contains("{dplyr}")),
+                        .is_some_and(|d| d.contains("{dplyr}")),
                     "'filter' should have package attribution {{dplyr}}"
                 );
 
@@ -16626,7 +16624,7 @@ result <- "#;
                     select_items[0]
                         .detail
                         .as_ref()
-                        .map_or(false, |d| d.contains("{dplyr}")),
+                        .is_some_and(|d| d.contains("{dplyr}")),
                     "'select' should have package attribution {{dplyr}}"
                 );
 
@@ -16702,10 +16700,10 @@ x <- "#;
                 // Both packages should be represented
                 let has_pkg1 = common_items
                     .iter()
-                    .any(|item| item.detail.as_ref().map_or(false, |d| d.contains("{pkg1}")));
+                    .any(|item| item.detail.as_ref().is_some_and(|d| d.contains("{pkg1}")));
                 let has_pkg2 = common_items
                     .iter()
-                    .any(|item| item.detail.as_ref().map_or(false, |d| d.contains("{pkg2}")));
+                    .any(|item| item.detail.as_ref().is_some_and(|d| d.contains("{pkg2}")));
                 assert!(has_pkg1, "'common_func' should have entry from pkg1");
                 assert!(has_pkg2, "'common_func' should have entry from pkg2");
 
@@ -16784,7 +16782,7 @@ x <- "#;
                     assert!(
                         item.sort_text
                             .as_ref()
-                            .map_or(false, |s| s.starts_with("0-")),
+                            .is_some_and(|s| s.starts_with("0-")),
                         "Parameter item '{}' should have sort_text starting with '0-', got {:?}",
                         item.label,
                         item.sort_text
@@ -16830,7 +16828,7 @@ x <- "#;
                     x_item
                         .insert_text
                         .as_ref()
-                        .map_or(false, |t| t.contains("= ")),
+                        .is_some_and(|t| t.contains("= ")),
                     "Parameter 'x' insert_text should contain '= ', got {:?}",
                     x_item.insert_text
                 );
@@ -27604,7 +27602,7 @@ mod proptests {
 
             prop_assert!(defined.contains(&var_name));
             prop_assert!(defined.contains(&func_name));
-            prop_assert!(is_builtin(&builtin));
+            prop_assert!(is_builtin(builtin));
         }
 
         #[test]
@@ -27667,8 +27665,8 @@ mod proptests {
             let param_count = param_count.min(has_defaults.len());
             let mut params = Vec::new();
 
-            for i in 0..param_count {
-                if has_defaults[i] {
+            for (i, &has_default) in has_defaults.iter().enumerate().take(param_count) {
+                if has_default {
                     params.push(format!("p{} = {}", i, i + 1));
                 } else {
                     params.push(format!("p{}", i));
@@ -27908,12 +27906,12 @@ mod proptests {
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Should return user-defined signature, not built-in
-            let signature = find_user_function_signature(&state, &uri, &builtin);
+            let signature = find_user_function_signature(&state, &uri, builtin);
             prop_assert!(signature.is_some(), "Should find user-defined function");
 
             if let Some(sig) = signature {
                 prop_assert!(sig.contains("(x, y)"), "Should return user-defined signature: {}", sig);
-                prop_assert!(sig.contains(&builtin), "Should contain function name: {}", sig);
+                prop_assert!(sig.contains(builtin), "Should contain function name: {}", sig);
             }
         }
 
@@ -28254,7 +28252,7 @@ mod proptests {
             let info = def_info.unwrap();
             let statement = &info.statement;
             prop_assert_eq!(statement, &code, "Should include complete assignment statement");
-            prop_assert!(statement.contains(&op), "Should include assignment operator {}", op);
+            prop_assert!(statement.contains(op), "Should include assignment operator {}", op);
         }
 
         #[test]
@@ -32440,11 +32438,7 @@ setClass("{}", slots = c(value = "numeric"))
         ) {
             // Ensure the comment doesn't accidentally match the section pattern
             let clean_text = comment_text
-                .replace('-', " ")
-                .replace('#', " ")
-                .replace('=', " ")
-                .replace('*', " ")
-                .replace('+', " ");
+                .replace(['-', '#', '=', '*', '+'], " ");
             let code = format!("# {}\nx <- 1", clean_text.trim());
 
             let tree = parse_r_code(&code);
@@ -33953,8 +33947,7 @@ setClass("{}", slots = c(value = "numeric"))
             for i in 0..expected_sections.len() {
                 let (current_start, current_level) = expected_sections[i];
                 let mut end_line = line_count - 1; // default: EOF
-                for j in (i + 1)..expected_sections.len() {
-                    let (next_start, next_level) = expected_sections[j];
+                for &(next_start, next_level) in expected_sections.iter().skip(i + 1) {
                     if next_level <= current_level {
                         // Found sibling or ancestor
                         end_line = if next_start > 0 { next_start - 1 } else { 0 };
@@ -34142,8 +34135,7 @@ setClass("{}", slots = c(value = "numeric"))
             for i in 0..sections_info.len() {
                 let (start, level, ref name) = sections_info[i];
                 let mut end_line = line_count - 1; // default: EOF
-                for j in (i + 1)..sections_info.len() {
-                    let (next_start, next_level, _) = sections_info[j];
+                for &(next_start, next_level, _) in sections_info.iter().skip(i + 1) {
                     if next_level <= level {
                         end_line = if next_start > 0 { next_start - 1 } else { 0 };
                         break;
@@ -34340,7 +34332,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // Collect parameter completion items (those with sort_text starting with "0-")
                 let param_items: Vec<&CompletionItem> = items.iter()
                     .filter(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                        item.sort_text.as_ref().is_some_and(|st| st.starts_with("0-"))
                     })
                     .collect();
 
@@ -34521,7 +34513,7 @@ setClass("{}", slots = c(value = "numeric"))
             if let Some(CompletionResponse::Array(items)) = completions {
                 let param_items: Vec<&CompletionItem> = items.iter()
                     .filter(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                        item.sort_text.as_ref().is_some_and(|st| st.starts_with("0-"))
                     })
                     .collect();
 
@@ -34564,7 +34556,7 @@ setClass("{}", slots = c(value = "numeric"))
             if let Some(CompletionResponse::Array(items_nm)) = completions_nm {
                 let param_items_nm: Vec<&CompletionItem> = items_nm.iter()
                     .filter(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                        item.sort_text.as_ref().is_some_and(|st| st.starts_with("0-"))
                     })
                     .collect();
 
@@ -34656,7 +34648,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // Parameter items are identified by sort_text starting with "0-".
                 let param_items: Vec<&CompletionItem> = items.iter()
                     .filter(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                        item.sort_text.as_ref().is_some_and(|st| st.starts_with("0-"))
                     })
                     .collect();
 
@@ -34674,7 +34666,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // (belt-and-suspenders check)
                 let param_detail_items: Vec<&CompletionItem> = items.iter()
                     .filter(|item| {
-                        item.detail.as_ref().map_or(false, |d| d == "parameter")
+                        item.detail.as_ref().is_some_and(|d| d == "parameter")
                     })
                     .collect();
 
@@ -34775,7 +34767,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // --- Check 1: Parameter items are present (sort_text starts with "0-") ---
                 let param_items: Vec<&CompletionItem> = items.iter()
                     .filter(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                        item.sort_text.as_ref().is_some_and(|st| st.starts_with("0-"))
                     })
                     .collect();
 
@@ -34806,7 +34798,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // 2a: Keywords should be present (sort_text starts with "5-")
                 let keyword_items: Vec<&CompletionItem> = items.iter()
                     .filter(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("5-"))
+                        item.sort_text.as_ref().is_some_and(|st| st.starts_with("5-"))
                             && item.kind == Some(CompletionItemKind::KEYWORD)
                     })
                     .collect();
@@ -34822,7 +34814,7 @@ setClass("{}", slots = c(value = "numeric"))
                 // 2b: Local variable definitions should be present (sort_text starts with "1-")
                 let scope_items: Vec<&CompletionItem> = items.iter()
                     .filter(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| st.starts_with("1-"))
+                        item.sort_text.as_ref().is_some_and(|st| st.starts_with("1-"))
                     })
                     .collect();
 
@@ -34843,10 +34835,10 @@ setClass("{}", slots = c(value = "numeric"))
                 // All "0-" prefixed items should appear before any "1-", "4-", or "5-" items
                 // in the items list (since they are prepended)
                 if let Some(last_param_idx) = items.iter().rposition(|item| {
-                    item.sort_text.as_ref().map_or(false, |st| st.starts_with("0-"))
+                    item.sort_text.as_ref().is_some_and(|st| st.starts_with("0-"))
                 }) {
                     if let Some(first_standard_idx) = items.iter().position(|item| {
-                        item.sort_text.as_ref().map_or(false, |st| {
+                        item.sort_text.as_ref().is_some_and(|st| {
                             st.starts_with("1-") || st.starts_with("4-") || st.starts_with("5-")
                         })
                     }) {
@@ -34965,7 +34957,7 @@ setClass("{}", slots = c(value = "numeric"))
                     .filter(|item| {
                         item.sort_text
                             .as_ref()
-                            .map_or(false, |st| st.starts_with("0-"))
+                            .is_some_and(|st| st.starts_with("0-"))
                     })
                     .collect();
 
@@ -35112,15 +35104,16 @@ setClass("{}", slots = c(value = "numeric"))
     ///      The result.
     /// ```
     fn build_rd_help_text(params: &[(String, String)]) -> String {
-        let mut lines = Vec::new();
-        lines.push("Function Title".to_string());
-        lines.push(String::new());
-        lines.push("Description:".to_string());
-        lines.push(String::new());
-        lines.push("     Some description of the function.".to_string());
-        lines.push(String::new());
-        lines.push("Arguments:".to_string());
-        lines.push(String::new());
+        let mut lines = vec![
+            "Function Title".to_string(),
+            String::new(),
+            "Description:".to_string(),
+            String::new(),
+            "     Some description of the function.".to_string(),
+            String::new(),
+            "Arguments:".to_string(),
+            String::new(),
+        ];
 
         for (name, desc) in params {
             // Rd2txt format: indented name followed by ": " and description.
@@ -42161,10 +42154,12 @@ source(\"helpers.R\")
                 );
             }
 
-            let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect(&format!(
-                "Should build snapshot for data.R (scan_complete={})",
-                workspace_scan_complete
-            ));
+            let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).unwrap_or_else(|| {
+                panic!(
+                    "Should build snapshot for data.R (scan_complete={})",
+                    workspace_scan_complete
+                )
+            });
             let diagnostics =
                 diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
                     .expect("Should produce diagnostics");
@@ -44785,7 +44780,7 @@ result <- undefined_var
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```ignore
     /// #[test]
     /// fn explore_parser_behavior() {
     ///     inspect_ast("x <- 42", Some("numeric assignment"));

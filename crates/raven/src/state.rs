@@ -919,6 +919,7 @@ impl WorldState {
     /// 3. Legacy cross_file_workspace_index
     /// 4. Legacy documents HashMap (re-extract metadata)
     /// 5. File cache (re-extract metadata)
+    ///
     /// Find or parse `CrossFileMetadata` for `uri` for the working-directory
     /// inheritance closures used by snapshot builds and several diagnostic
     /// helpers. Walks the chain: open document → cross-file workspace index

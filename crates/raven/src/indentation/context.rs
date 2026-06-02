@@ -2290,10 +2290,12 @@ mod tests {
         // Should not panic, should return a valid context
         let ctx = detect_context(&tree, code, position, 2);
 
-        // The fallback should detect this as a complete expression
+        // The fallback should not panic; any resulting context is acceptable
+        // (malformed input does not guarantee a specific variant).
+        #[allow(clippy::single_match)]
         match ctx {
             IndentContext::AfterCompleteExpression { .. } => {}
-            _ => {} // Any context is fine, just shouldn't panic
+            _ => {}
         }
     }
 
@@ -4578,14 +4580,19 @@ mod tests {
 
     /// Verify that the detected context matches the expected innermost context type.
     fn verify_innermost_context(ctx: &IndentContext, expected_type: &str) -> bool {
-        match (ctx, expected_type) {
-            (IndentContext::AfterContinuationOperator { .. }, "AfterContinuationOperator") => true,
-            (IndentContext::InsideParens { .. }, "InsideParens") => true,
-            (IndentContext::InsideBraces { .. }, "InsideBraces") => true,
-            (IndentContext::ClosingDelimiter { .. }, "ClosingDelimiter") => true,
-            (IndentContext::AfterCompleteExpression { .. }, "AfterCompleteExpression") => true,
-            _ => false,
-        }
+        matches!(
+            (ctx, expected_type),
+            (
+                IndentContext::AfterContinuationOperator { .. },
+                "AfterContinuationOperator"
+            ) | (IndentContext::InsideParens { .. }, "InsideParens")
+                | (IndentContext::InsideBraces { .. }, "InsideBraces")
+                | (IndentContext::ClosingDelimiter { .. }, "ClosingDelimiter")
+                | (
+                    IndentContext::AfterCompleteExpression { .. },
+                    "AfterCompleteExpression"
+                )
+        )
     }
 
     proptest! {
@@ -4650,7 +4657,7 @@ mod tests {
             // Should detect pipe context, not parens context
             match ctx {
                 IndentContext::AfterContinuationOperator { operator_type, .. } => {
-                    match &*pipe_op {
+                    match pipe_op {
                         "|>" => prop_assert_eq!(operator_type, OperatorType::Pipe),
                         "%>%" => prop_assert_eq!(operator_type, OperatorType::MagrittrPipe),
                         _ => prop_assert!(false, "Unexpected pipe operator"),
@@ -6084,7 +6091,9 @@ mod tests {
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
 
-        // Should handle gracefully
+        // Should handle gracefully; any resulting context is acceptable as long
+        // as detect_context does not panic.
+        #[allow(clippy::single_match)]
         match ctx {
             IndentContext::AfterCompleteExpression { .. } => {}
             _ => {}

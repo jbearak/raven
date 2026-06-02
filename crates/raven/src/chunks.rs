@@ -138,8 +138,8 @@ fn detect_rmd_chunks(lines: &[&str]) -> Vec<Chunk> {
         let fence_char = fence.chars().next().unwrap_or('`');
         let min_len = fence.len();
         let mut closing_line: Option<u32> = None;
-        for j in (i + 1)..lines.len() {
-            if let Some(close_caps) = close_re.captures(lines[j]) {
+        for (j, &line) in lines.iter().enumerate().skip(i + 1) {
+            if let Some(close_caps) = close_re.captures(line) {
                 let close = close_caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if close.starts_with(fence_char) && close.len() >= min_len {
                     closing_line = Some(j as u32);

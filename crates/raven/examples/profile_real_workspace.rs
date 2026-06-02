@@ -47,7 +47,7 @@ fn main() {
     eprintln!("\n=== Phase 1: scan_workspace (cold) ===");
     let t0 = Instant::now();
     let (index, cross_file_entries, new_index_entries) =
-        scan_workspace(&[workspace_url.clone()], 20);
+        scan_workspace(std::slice::from_ref(&workspace_url), 20);
     let scan_time = t0.elapsed();
     eprintln!(
         "  {:?} ({} files, {} cross-file entries, {} new index)",
@@ -135,7 +135,7 @@ fn main() {
     // ── Phase 4: scan_workspace (warm filesystem) ──
     eprintln!("\n=== Phase 4: scan_workspace (warm) ===");
     let t4 = Instant::now();
-    let (index2, _, _) = scan_workspace(&[workspace_url.clone()], 20);
+    let (index2, _, _) = scan_workspace(std::slice::from_ref(&workspace_url), 20);
     let scan_warm_time = t4.elapsed();
     eprintln!("  {:?} ({} files)", scan_warm_time, index2.len());
 
@@ -170,7 +170,7 @@ fn main() {
         }
     }
     walk(&workspace, &mut file_sizes);
-    file_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    file_sizes.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     for (path, size) in file_sizes.iter().take(10) {
         let Ok(content) = std::fs::read_to_string(path) else {

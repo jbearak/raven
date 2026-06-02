@@ -47,7 +47,6 @@ pub fn derive_package_state(
         namespace_model,
         r_file_facts,
         scope_contribution,
-        ..PackageState::default()
     }
 }
 
@@ -196,7 +195,7 @@ fn merge_namespace_model(
     let mut seen_full: std::collections::HashSet<String> =
         model.full_imports.iter().cloned().collect();
 
-    for (_path, facts) in r_file_facts {
+    for facts in r_file_facts.values() {
         if facts.kind != RFileKind::Source {
             continue;
         }

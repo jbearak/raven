@@ -3967,7 +3967,7 @@ mod tests {
                 let mut packages: Vec<(String, HashSet<String>, Vec<String>)> = Vec::new();
 
                 // Create all packages first with empty dependencies
-                for (name, exp) in names.into_iter().zip(exports.into_iter()) {
+                for (name, exp) in names.into_iter().zip(exports) {
                     packages.push((name, exp, Vec::new()));
                 }
 
@@ -4568,7 +4568,7 @@ mod tests {
         );
         assert_eq!(result.get("mutate"), Some(&vec!["dplyr".to_string()]));
         assert!(
-            result.get("ggplot").is_none(),
+            !result.contains_key("ggplot"),
             "ggplot should not be in results"
         );
     }

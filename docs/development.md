@@ -39,7 +39,7 @@ Key code entry points:
 ## Build from source
 
 Prerequisites:
-- Rust toolchain (MSRV: 1.75)
+- Rust toolchain (MSRV: 1.80)
 
 Clone and build:
 ```bash

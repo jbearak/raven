@@ -634,6 +634,11 @@ pub struct NeighborhoodSubgraph {
 const CYCLE_CACHE_CAPACITY: usize = 4096;
 const SUBGRAPH_CACHE_CAPACITY: usize = 4096;
 
+/// LRU cache of extracted subgraphs keyed by `(root_uri, max_depth, max_visited)`.
+type SubgraphCache = std::sync::RwLock<
+    lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
+>;
+
 /// Dependency graph tracking source relationships between files
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
@@ -655,9 +660,7 @@ pub struct DependencyGraph {
     /// in the snapshot path do refcount bumps rather than re-walking the
     /// graph and cloning edges. Bounded LRU for the same reason as
     /// `cycle_cache`.
-    subgraph_cache: std::sync::RwLock<
-        lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
-    >,
+    subgraph_cache: SubgraphCache,
     /// Counter of subgraph cache hits — exposed for tests.
     subgraph_cache_hits: std::sync::atomic::AtomicU64,
 }
@@ -1047,7 +1050,7 @@ impl DependencyGraph {
 
         // Deduplicate and add all edges
         let mut seen_keys = HashSet::new();
-        for edge in directive_edges.into_iter().chain(ast_edges.into_iter()) {
+        for edge in directive_edges.into_iter().chain(ast_edges) {
             let key = edge.key();
             if !seen_keys.contains(&key) {
                 seen_keys.insert(key);
@@ -1530,13 +1533,6 @@ impl DependencyGraph {
         }
     }
 
-    /// Detect cycles involving a URI.
-    ///
-    /// Returns a `CycleDetection` containing:
-    /// - `outgoing_edge`: the first edge FROM `uri` that leads into the cycle
-    ///   (use this for diagnostic positioning in the queried file)
-    /// - `closing_edge`: the edge that points BACK to `uri` completing the cycle
-    ///   (use this for the diagnostic message details)
     /// Collect all URIs reachable from `uri` within `max_depth` hops,
     /// following both forward and backward edges.
     ///
@@ -1628,6 +1624,13 @@ impl DependencyGraph {
         visited
     }
 
+    /// Detect cycles involving a URI.
+    ///
+    /// Returns a `CycleDetection` containing:
+    /// - `outgoing_edge`: the first edge FROM `uri` that leads into the cycle
+    ///   (use this for diagnostic positioning in the queried file)
+    /// - `closing_edge`: the edge that points BACK to `uri` completing the cycle
+    ///   (use this for the diagnostic message details)
     pub fn detect_cycle(&self, uri: &Url) -> Option<CycleDetection> {
         use std::sync::atomic::Ordering;
         let revision = self.edge_revision.load(Ordering::Acquire);

@@ -856,7 +856,8 @@ mod tests {
         let rmd = tmp.path().join("report.Rmd");
         fs::write(&rmd, "prose\n").unwrap();
         let mut operator_error = false;
-        let targets = collect_report_targets(&[rmd.clone()], tmp.path(), &mut operator_error);
+        let targets =
+            collect_report_targets(std::slice::from_ref(&rmd), tmp.path(), &mut operator_error);
         // Targets are canonicalized so they match the canonical workspace root.
         assert_eq!(targets, vec![std::fs::canonicalize(&rmd).unwrap()]);
         assert!(!operator_error);

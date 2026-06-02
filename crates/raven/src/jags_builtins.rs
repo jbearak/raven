@@ -1,8 +1,7 @@
-/// Built-in distributions, functions, and keywords for the JAGS language.
-///
-/// These lists are used by the completion handler to provide JAGS-specific
-/// suggestions when editing `.jags` and `.bugs` files.
-
+//! Built-in distributions, functions, and keywords for the JAGS language.
+//!
+//! These lists are used by the completion handler to provide JAGS-specific
+//! suggestions when editing `.jags` and `.bugs` files.
 pub static JAGS_DISTRIBUTIONS: &[&str] = &[
     "dnorm",
     "dbern",

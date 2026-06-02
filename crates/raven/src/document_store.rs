@@ -1709,11 +1709,7 @@ mod tests {
                 }
 
                 // Calculate expected evictions
-                let expected_evictions = if num_unique_docs > max_documents {
-                    num_unique_docs - max_documents
-                } else {
-                    0
-                };
+                let expected_evictions = num_unique_docs.saturating_sub(max_documents);
 
                 assert_eq!(
                     store.metrics().evictions,
