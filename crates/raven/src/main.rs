@@ -48,6 +48,7 @@ packages <subcommand>        Generate / maintain package databases
   freeze                     Write a repo's Tier 2 .raven/packages.json
   update                     Download the names.db sidecar
   build-shipped-db           Maintainer-only Tier 3 names.db builder
+  build-embedded-base        Maintainer-only embedded base-package table builder
 freeze, fetch                Top-level aliases for raven packages freeze/fetch
 
 "#

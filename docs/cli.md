@@ -78,7 +78,7 @@ There are four strategies for giving `raven check` package-export coverage in CI
 | Strategy | Needs R in CI | Network in CI | Coverage | Version fidelity | Committed | Depends on `names-db` Release |
 |---|---|---|---|---|---|---|
 | 1. R + packages installed | yes | (install) | exact, full | version-exact | no | no |
-| 2. `packages update` | no | yes (2 files) | whole ecosystem | latest snapshot | no | **yes** |
+| 2. `packages update` | no | yes (1 file) | whole ecosystem | latest snapshot | no | **yes** |
 | 3. `packages fetch [--missing-only]` | no | yes (per-pkg) | project's used set | latest (installed rows exact under `--missing-only`) | no (ephemeral) | no |
 | 4. `freeze` + commit | no (in CI) | no | project's used set | version-exact | yes | no |
 

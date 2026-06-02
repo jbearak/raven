@@ -711,7 +711,30 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
         // `capture_reference = false` to stay deterministic / R-free.)
         let outcome =
             crate::package_library::build_package_library_tier1_only(None, &[], None).await;
-        for name in outcome.library.enumerate_installed_packages() {
+        // `--capture-reference` is an explicit opt-in to snapshot the build
+        // machine's installed library; a non-ready build or an empty library
+        // would silently ship a names.db with no reference capture, so refuse.
+        if !outcome.status.is_ready() {
+            use crate::package_library::PackageLibraryStatus::*;
+            let reason = match &outcome.status {
+                RNotFound => "no R interpreter was found".to_string(),
+                NoLibraryPaths => "R reported no library paths".to_string(),
+                InitFailed(e) => format!("R initialization failed: {e}"),
+                Disabled => "package support is disabled".to_string(),
+                Ready => unreachable!("guarded by is_ready()"),
+            };
+            return Err(format!(
+                "cannot capture reference R library: {reason}. --capture-reference needs R \
+                 and an installed library"
+            ));
+        }
+        let installed = outcome.library.enumerate_installed_packages();
+        if installed.is_empty() {
+            return Err(
+                "cannot capture reference R library: R reported no installed packages".to_string(),
+            );
+        }
+        for name in installed {
             if let Some(info) = outcome.library.get_package(&name).await {
                 reference_r.push(record_with_version(&outcome.library, &name, &info));
             }

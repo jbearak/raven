@@ -16,7 +16,7 @@
 
 ---
 
-### Task 1: Generated embedded-base table — struct, data file, `load()`, accessor
+## Task 1: Generated embedded-base table — struct, data file, `load()`, accessor
 
 Replace the hand-maintained const floor in `embedded_base.rs` with a per-package table. Split the file: hand-written logic + struct in `embedded_base.rs`, the `// @generated` data table `include!`d from `embedded_base_generated.rs`. The agent writes a compiling *placeholder* data file (existing flat floor reshaped: all current exports under `base`, all current datasets under `datasets`, the other five base packages empty) so the build and tests pass before the maintainer regenerates it.
 
@@ -432,7 +432,7 @@ Add the dispatch arm in `run()`:
 
 Update the `None =>` usage string to include `build-embedded-base`, and add a `build-embedded-base` line to `print_help`:
 
-```
+```text
          raven packages build-embedded-base --reference-lib DIR [--output PATH]\n
 ```
 
@@ -556,7 +556,7 @@ if (fs.existsSync(src)) {
 
 - [ ] **Step 2: `.vscodeignore`** — drop the base-exports mention in the trailing comment
 
-```
+```text
 # bin/ is intentionally NOT excluded so the raven binary and the Tier 3 sidecar
 # (bin/names.db) are included in the VSIX.
 ```
@@ -610,7 +610,7 @@ Make it executable: `chmod +x scripts/build-names-db.sh` (and `git update-index 
 
 - [ ] **Step 6: Create `.gitattributes`** — scoped to the exact seed path (NOT `*.db`)
 
-```
+```gitattributes
 crates/raven/data/names-db-seed.db filter=lfs diff=lfs merge=lfs -text
 ```
 
