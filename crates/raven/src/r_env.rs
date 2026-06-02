@@ -161,14 +161,14 @@ fn user_library_path() -> Option<PathBuf> {
             #[cfg(target_os = "linux")]
             {
                 let r_lib = home.join("R");
-                if r_lib.exists() {
-                    if let Ok(entries) = std::fs::read_dir(&r_lib) {
-                        for entry in entries.flatten() {
-                            if let Ok(versions) = std::fs::read_dir(entry.path()) {
-                                for ver_entry in versions.flatten() {
-                                    if ver_entry.path().is_dir() {
-                                        return Some(ver_entry.path());
-                                    }
+                if r_lib.exists()
+                    && let Ok(entries) = std::fs::read_dir(&r_lib)
+                {
+                    for entry in entries.flatten() {
+                        if let Ok(versions) = std::fs::read_dir(entry.path()) {
+                            for ver_entry in versions.flatten() {
+                                if ver_entry.path().is_dir() {
+                                    return Some(ver_entry.path());
                                 }
                             }
                         }
