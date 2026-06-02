@@ -330,7 +330,7 @@ the seam.
 - **Tier 3 locator order:** environment overrides still win, then the user-data
   sidecar installed by `raven packages update`, then an exe-relative sidecar
   (e.g. one placed next to the binary by hand). Installs normally have only the
-  user-data candidate, since `names.db` is no longer bundled next to the binary.
+  user-data candidate, since `names.db` is not bundled with the binary.
 
 ### The `PackageMetadataProvider` seam
 
@@ -434,8 +434,8 @@ coverage.
   `workflow_dispatch` + scheduled job
   (`.github/workflows/build-names-db.yml`; weekly schedule `0 6 * * 1`) downloads
   the current asset (the seed), rebuilds via the shared
-  `scripts/build-names-db.sh`, and re-uploads. `release-build.yml` no longer
-  bundles `names.db`: release archives ship only the `raven` binary, and the VSIX
+  `scripts/build-names-db.sh`, and re-uploads. `release-build.yml` does not
+  bundle `names.db`: release archives ship only the `raven` binary, and the VSIX
   omits it too (VS Code users resolve their locally installed packages via Tier 1).
   A Git LFS seed is committed at
   `crates/raven/data/names-db-seed.db` for bootstrap/disaster-recovery only (not a
