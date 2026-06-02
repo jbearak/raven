@@ -1539,8 +1539,9 @@ impl DependencyGraph {
     ///   (use this for diagnostic positioning in the queried file)
     /// - `closing_edge`: the edge that points BACK to `uri` completing the cycle
     ///   (use this for the diagnostic message details)
-    ///   Collect all URIs reachable from `uri` within `max_depth` hops,
-    ///   following both forward and backward edges.
+    ///
+    /// Collect all URIs reachable from `uri` within `max_depth` hops,
+    /// following both forward and backward edges.
     ///
     /// `max_visited` caps the total number of nodes collected to prevent
     /// unbounded expansion in dense bidirectional graphs.
