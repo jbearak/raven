@@ -24,6 +24,12 @@
 **Files:**
 - Modify: `.github/workflows/build-names-db.yml`
 
+> **Prerequisite (ordering matters):** Create the `names-db-builder` branch from
+> the current `main` tip **before** merging this task. Once `actions/checkout` is
+> pinned to `ref: names-db-builder`, the next scheduled run *or* any
+> `workflow_dispatch` fails at checkout if the branch does not yet exist. Create
+> and protect it first, then merge.
+
 - [ ] **Step 1: Patch workflow env + checkout ref**
 
 Change the top of `.github/workflows/build-names-db.yml` to define the protected source branch and use it in `actions/checkout`.
@@ -196,14 +202,31 @@ In `crates/raven/src/cli/packages.rs` tests module, add:
 
 - [ ] **Step 6: Add validator success/failure tests**
 
-In `crates/raven/src/cli/packages.rs` tests module, add:
+The test module has **no `records()` / `provenance()` helpers** — build the
+record and provenance inline, matching the existing
+`atomic_install_round_trips_single_names_db` test. `PackageRecord`,
+`write_shipped_db`, and `ShippedDbProvenance` are already imported at the top of
+the module. In `crates/raven/src/cli/packages.rs` tests module, add:
 
 ```rust
     #[test]
     fn validate_shipped_db_accepts_valid_db() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("names.db");
-        write_shipped_db(&path, &records(), provenance()).unwrap();
+        let recs = vec![PackageRecord {
+            name: "dplyr".into(),
+            version: "1.1.4".into(),
+            exports: vec!["mutate".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }];
+        let prov = ShippedDbProvenance {
+            source: "t".into(),
+            snapshot_date: "2026-06-01".into(),
+            package_count: 1,
+            raven_version: "9.9.9".into(),
+        };
+        write_shipped_db(&path, &recs, prov).unwrap();
 
         super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap();
     }
@@ -216,6 +239,32 @@ In `crates/raven/src/cli/packages.rs` tests module, add:
 
         let err = super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
         assert!(err.contains("bad magic"), "got {err}");
+    }
+
+    // Covers the ONLY logic the validator adds over `ShippedDb::open`: a
+    // structurally valid DB whose provenance package_count disagrees with the
+    // decoded record count must be rejected.
+    #[test]
+    fn validate_shipped_db_rejects_provenance_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        let recs = vec![PackageRecord {
+            name: "dplyr".into(),
+            version: "1.1.4".into(),
+            exports: vec!["mutate".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }];
+        let prov = ShippedDbProvenance {
+            source: "t".into(),
+            snapshot_date: "2026-06-01".into(),
+            package_count: 2, // lies: only one record is written
+            raven_version: "9.9.9".into(),
+        };
+        write_shipped_db(&path, &recs, prov).unwrap();
+
+        let err = super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
+        assert!(err.contains("provenance says"), "got {err}");
     }
 ```
 
@@ -428,4 +477,4 @@ Expected: no commit is needed if Task 5 only runs verification.
 - Spec coverage: The plan covers protected-branch source for DB refresh, release-time validation, exact-artifact bundling, CLI support, tests, and docs.
 - Placeholder scan: No task relies on an unspecified implementation. The protected branch name is fixed as `names-db-builder`.
 - Type consistency: The new Rust type is `ValidateShippedDbArgs`; parser, runner, dispatcher, and tests all use that name. The CLI subcommand spelling is consistently `validate-shipped-db`.
-- Risk note: GitHub branch protection itself is repository configuration, not a file change. After Task 1 lands, create/protect the `names-db-builder` branch in GitHub and only merge reviewed release-compatible DB-builder changes into it.
+- Risk note: GitHub branch protection itself is repository configuration, not a file change. **Create the `names-db-builder` branch (from the current `main` tip) and protect it _before_ merging Task 1** — once the checkout is pinned to that ref, a missing branch makes the next scheduled/dispatched run fail at checkout. Thereafter, only merge reviewed, release-compatible DB-builder changes into it.
