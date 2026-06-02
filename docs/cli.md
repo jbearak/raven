@@ -1,21 +1,32 @@
 # CLI
 
-Raven ships a single binary that serves the LSP via stdio *and* exposes subcommands for use outside an editor. The user-facing commands fall into two groups:
+Raven ships a single binary that serves the LSP via stdio *and* exposes subcommands for use outside an editor. To check your code, run either:
 
-**Check code**
-
-- `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes), for CI gating.
+- `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes).
 - `raven lint` — run the native **style** linter only.
 
-The difference between `check` and `lint` is **scope**: `lint` parses each file in isolation and runs only the style rules, so it never needs R or a workspace index — but it can't see relationships between files. `check` builds the same workspace index the language server builds, so it additionally reports cross-file, undefined-variable, and package diagnostics. It can run without R, using embedded R base-package coverage plus any package metadata files you provide; when R is available, it also reads the local R libraries for exact installed-package exports and base R symbols. `lint` is therefore the cheaper option for pure style gating; `check` does more work per run in exchange for the editor's full analysis in CI.
+If your codebase imports any R packages — and it almost certainly does — Raven needs to know the symbols those packages export. Run `raven check` on the same machine where you run your R scripts and it reads them straight from your R installation.
 
-**Manage package metadata**
-
-These commands make `raven check` easier to run in CI systems such as GitHub Actions or Bitbucket Pipelines when the job does not install R, or when R is present but some project packages are missing. They provide package export metadata outside the local R library, so automated pull-request checks can still recognize symbols from attached packages without paying the full package-install cost on every run.
+You may instead want to run Raven where R isn't installed — or where it is, but not all your packages are. The common case is an automated check on your pull requests: base images with R exist, but installing packages can take minutes or hours, expensive next to the moment `raven check` takes. So Raven can run without R: run `raven packages update && raven check`, where `raven packages update` downloads a database of known R packages. Or commit `raven packages freeze`, which writes your packages' exports — read from your local R install — into a `.raven/` file in your repository, so CI needs no download.
 
 - `raven packages freeze` — generate a committed `.raven/packages.json` export database. This is the reproducible, project-specific path for CI: it captures the exports your installed project dependencies expose and should be committed when you need version-pinned package metadata. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
 - `raven packages fetch` — produce the same `.raven/packages.json` from CRAN/Bioconductor r-universe instead of a local R install. Needs no R, no installed packages, and no dependency on the `names-db` Release. See [`raven packages fetch`](#raven-packages-fetch) and [Package database](package-database.md).
 - `raven packages update` — download the CRAN/Bioconductor metadata Raven uses to recognize symbols from packages that are not installed. Useful after `cargo install --git` or a local source build, which install only the executable. See [`raven packages update`](#raven-packages-update).
+
+## Why Raven analyzes R without running it
+
+Most language ecosystems have a CI checker that reads code without executing it — `cargo check`, `tsc`, `pyright`, `ruff`. R's tooling grew up around a different need: `R CMD check` and the CI ecosystem around it verify *packages*, which means installing every dependency and running code. There's little equivalent for *analysis repositories* — the scripts that make up most scientific and statistical work — and that gap is what these commands fill.
+
+Raven's core is static, semantic analysis with **position-aware scope**: it tracks what's defined at each point in a script — line by line, and inside each function — so it can flag an undefined variable, including one used before it's defined. Crucially for analysis repos, it follows `source()` chains, building a map of how your scripts depend on one another and resolving scope across them. No other R tool does this, and it's what makes `raven check` useful both for package development and for the analysis repositories the rest of the R tooling largely overlooks.
+
+If you aren't building a package, you usually don't want CI to *run* your scripts — and you certainly don't want to install every package they depend on just to check them. Raven finishes in about a second; compiling a dependency tree can take hours, which makes the check slow and expensive. At scale it would also push avoidable load onto CRAN mirrors and the wider ecosystem. So Raven runs **without R, and without your repo's packages installed**.
+
+It still needs each package's **export names** to tell a real symbol from a typo. There are two easy ways to supply them:
+
+- **`raven packages update` before `raven check`** (easiest) — downloads a package-export database from Raven's GitHub repository. It is seeded from the maintainer's system and refreshed every Monday with all of CRAN and Bioconductor, retrieved from [r-universe](https://r-universe.dev).
+- **Commit `raven packages freeze`** (simplest if you'd rather not depend on Raven's database) — records the exports of just the packages your repo uses, read from your installed packages (via renv and/or your machine), into `.raven/packages.json`. Commit that file and CI needs only `raven check`.
+
+And if R *is* installed in CI with all the packages available, none of this is needed: Raven reads everything it needs straight from that R installation. The [four CI strategies](#four-ways-to-run-raven-check-in-ci) below lay out the trade-offs in detail.
 
 ## `raven check`
 
@@ -54,17 +65,17 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 
 ### R and packages
 
-`raven check` auto-detects R on `PATH` to resolve installed-package exports and exact local metadata (it runs `.libPaths()` and parses package `NAMESPACE` files, the same as the language server). It honors the same `raven.toml` package settings the editor does: `packages.enabled = false` disables R detection entirely (no R subprocess and no installed/local package diagnostics — matching the editor), `packages.rPath` selects the R binary instead of `PATH` auto-detection, and `packages.additionalLibraryPaths` adds extra library directories to the search path. If R is not found, `library()` calls aren't checked against installed packages, but base R-platform symbols have embedded coverage in the binary. Broad CRAN/Bioconductor coverage without R comes from Raven's `names.db` sidecar: release archives and package-manager builds ship it; installs that produce only the `raven` executable, such as `cargo install --git` or local source builds, need `raven packages update`. A one-line note is printed to stderr when R is absent. All other diagnostics still run.
+`raven check` auto-detects R on `PATH` to resolve installed-package exports and exact local metadata (it runs `.libPaths()` and parses package `NAMESPACE` files, the same as the language server). It honors the same `raven.toml` package settings the editor does: `packages.enabled = false` disables R detection entirely (no R subprocess and no installed/local package diagnostics — matching the editor), `packages.rPath` selects the R binary instead of `PATH` auto-detection, and `packages.additionalLibraryPaths` adds extra library directories to the search path. If R is not found, `library()` calls aren't checked against installed packages, but base R-platform symbols have embedded coverage in the binary. Broad CRAN/Bioconductor coverage without R comes from Raven's `names.db` sidecar, installed with `raven packages update`. A one-line note is printed to stderr when R is absent. All other diagnostics still run.
 
 Before reporting, `raven check` warms the export cache for the packages each reported file attaches with `library()` / `require()`, so a bare call into an attached package that isn't one of its exports is flagged the same way the editor flags it. One narrow gap remains: a package attached only *indirectly* — in a `source()`d file rather than in the reported file itself — is not pre-warmed, so calls that could resolve to such a package are left unflagged rather than risk a false positive. Attach the package directly in the file (or rely on the editor) if you need those calls checked.
 
 ### Missing-package reporting in CI
 
-`raven check` resolves package **export names** through an ordered three-tier fallback — installed packages, then a committed `.raven/packages.json`, then Raven's broad CRAN/Bioconductor metadata when available — so symbols from attached packages can resolve even when no R is installed. Release archives and package-manager builds ship that metadata next to the Raven executable. Installs that produce only the `raven` executable, such as `cargo install --git` or local source builds, need an explicit `raven packages update` step for broad CRAN/Bioconductor coverage, though they still include embedded base R-platform coverage. This stops the undefined-variable storm that otherwise makes Raven unusable in CI. See [Package database](package-database.md).
+`raven check` resolves package **export names** through an ordered three-tier fallback — installed packages, then a committed `.raven/packages.json`, then Raven's broad CRAN/Bioconductor metadata when available — so symbols from attached packages can resolve even when no R is installed. That metadata is downloaded with `raven packages update` — it isn't bundled with the binary — so a CI image that installs Raven needs that step for broad CRAN/Bioconductor coverage; embedded base R-platform coverage is in the binary regardless. This stops the undefined-variable storm that otherwise makes Raven unusable in CI. See [Package database](package-database.md).
 
-Knowing a package's exports is **separate** from knowing whether it is installed. The **missing-package** diagnostic answers a different question — *"will `library(X)` succeed at runtime?"*, i.e. is `X` installed? — so it stays **Tier-1-only**: it is driven solely by what is present in the local library paths, never by the export database. Because CI deliberately omits package installation, `raven check` **suppresses missing-package warnings by default**.
+Knowing a package's exports is **separate** from knowing whether it is installed. The **missing-package** diagnostic answers a different question — *"will `library(X)` succeed at runtime?"*, i.e. is `X` installed? — so it is driven solely by what is present in the local library paths, never by the export database. Because CI deliberately omits package installation, `raven check` **suppresses missing-package warnings by default**.
 
-`--report-uninstalled` re-enables them. Reach for it whenever a `library(X)` call must really succeed at runtime: a pipeline that *does* install packages (e.g. `renv::restore()`) and wants to fail if any didn't, **or** any CI that **actually runs your R scripts** after `raven check` (e.g. R-package CI), where an uninstalled package is a genuine failure rather than CI noise. Gate-only CI that never executes the scripts wants the default (suppressed). It reports `library()` calls **not present in the local library paths** — **not** relative to the Tier 2/Tier 3 export metadata. One consequence: with the default off, a genuine typo such as `library(dpylr)` is silent (no tier knows it, but `raven check` isn't checking install status); it is reported only with `--report-uninstalled`. The language server is unchanged — it still fires missing-package whenever install state is known. See [Diagnostics](diagnostics.md#package-names-vs-install-status) for the full model.
+`--report-uninstalled` re-enables them. Reach for it whenever a `library(X)` call must really succeed at runtime: a pipeline that *does* install packages (e.g. `renv::restore()`) and wants to fail if any didn't, **or** any CI that **actually runs your R scripts** after `raven check` (e.g. R-package CI), where an uninstalled package is a genuine failure rather than CI noise. Gate-only CI that never executes the scripts wants the default (suppressed). It reports `library()` calls **not present in the local library paths** — **not** relative to the export databases (`.raven/packages.json` or the `names.db` database). One consequence: with the default off, a genuine typo such as `library(dpylr)` is silent (no database knows it, but `raven check` isn't checking install status); it is reported only with `--report-uninstalled`. The language server is unchanged — it still fires missing-package whenever install state is known. See [Diagnostics](diagnostics.md#package-names-vs-install-status) for the full model.
 
 ### Four ways to run `raven check` in CI
 
@@ -103,15 +114,12 @@ Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked U
   run: |
     cargo install --git https://github.com/jbearak/raven raven
     raven packages update
-    raven check --format sarif > raven.sarif
-- uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: raven.sarif
+    raven check
 ```
 
-For reproducible CI, commit `.raven/packages.json` generated by `raven packages freeze`. `raven packages update` restores broad CRAN/Bioconductor coverage for zero-adoption scans, but it follows the moving `names-db` Release and is not version-pinned by the project.
+For reproducible CI, commit `.raven/packages.json` generated by `raven packages freeze`. `raven packages update` restores broad CRAN/Bioconductor coverage, but it follows the moving `names-db` Release and is not version-pinned by the project.
 
-To get installed/local package awareness and exact local package metadata in CI, install R (e.g. `r-lib/actions/setup-r`) before running `raven check`. Base R-platform symbols are embedded in the binary even without R. Broad CRAN/Bioconductor coverage requires Raven's `names.db` sidecar, either shipped next to the executable or installed by `raven packages update`. If you installed Raven with `cargo install --git` or from a local source build, run that update during CI image setup or cache warmup so normal `raven check`, LSP startup, completion, hover, and package lookup stay network-free.
+To get installed/local package awareness and exact local package metadata in CI, install R (e.g. `r-lib/actions/setup-r`) before running `raven check`. Base R-platform symbols are embedded in the binary even without R. Broad CRAN/Bioconductor coverage requires Raven's `names.db` sidecar, downloaded with `raven packages update`. If you installed Raven with `cargo install --git` or from a local source build, run that update during CI image setup or cache warmup so normal `raven check`, LSP startup, completion, hover, and package lookup stay network-free.
 
 ### Scope
 
@@ -151,10 +159,7 @@ raven lint [OPTIONS] [PATHS...]
 - name: Lint R sources
   run: |
     cargo install --git https://github.com/jbearak/raven raven
-    raven lint --format sarif R/ tests/ > raven.sarif
-- uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: raven.sarif
+    raven lint R/ tests/
 ```
 
 ### Scope
@@ -165,13 +170,13 @@ Only plain R files (`.R` / `.r`) are linted. R Markdown / Quarto files (`.Rmd` /
 
 ## `raven packages`
 
-A command group for the export databases Raven uses to resolve package symbols without installing packages. See [Package database](package-database.md) for the full three-tier model. Both `freeze` and `fetch` are **producers** of the Tier 2 `.raven/packages.json` — `freeze` captures exports from a local R install (version-exact, committed), while `fetch` sources them from CRAN/Bioconductor r-universe (latest, ephemeral). `update` downloads broad CRAN/Bioconductor metadata for installs that did not bundle it, `build-shipped-db` is the maintainer-only command that produces the bundled `names.db`, and `build-embedded-base` regenerates the embedded base table.
+A command group for the export databases Raven uses to resolve package symbols without installing packages. See [Package database](package-database.md) for the full three-tier model. Both `freeze` and `fetch` are **producers** of the committed `.raven/packages.json` — `freeze` captures exports from a local R install (version-exact, committed), while `fetch` sources them from CRAN/Bioconductor r-universe (latest, ephemeral). `update` downloads broad CRAN/Bioconductor metadata (it isn't bundled with the binary). The maintainer-only commands that build the shipped databases (`build-shipped-db`, `validate-shipped-db`, `build-embedded-base`) are documented in the [appendix](#appendix-maintainer-and-advanced-topics).
 
 **Top-level aliases.** `raven freeze [ARGS]` is exactly equivalent to `raven packages freeze [ARGS]`, and `raven fetch [ARGS]` to `raven packages fetch [ARGS]`. They are thin routing aliases — same parsing, same handler, same help. Only `freeze` and `fetch` are aliased; `update` and `build-shipped-db` stay nested.
 
 ### `raven packages fetch`
 
-Produce a `.raven/packages.json` from CRAN/Bioconductor r-universe — the same Tier 2 artifact `freeze` produces, but sourced from community infrastructure instead of a local R install. It needs no R, no installed packages, and no dependency on the `names-db` GitHub Release. The file is an **ephemeral CI artifact** meant to be regenerated each run; gitignore it rather than committing it (contrast with `freeze`'s committed, version-pinned file).
+Produce a `.raven/packages.json` from CRAN/Bioconductor r-universe — the same artifact `freeze` produces, but sourced from community infrastructure instead of a local R install. It needs no R, no installed packages, and no dependency on the `names-db` GitHub Release. The file is an **ephemeral CI artifact** meant to be regenerated each run; gitignore it rather than committing it (contrast with `freeze`'s committed, version-pinned file).
 
 ```text
 raven packages fetch [OPTIONS]
@@ -179,8 +184,8 @@ raven packages fetch [OPTIONS]
 
 **Two modes:**
 
-- **Plain `raven packages fetch`** — computes the used set (R-free: tree-sitter scan ∪ `DESCRIPTION` `Depends`/`Imports` ∪ `renv.lock` names ∪ transitive `Depends` from r-universe), skips base/recommended packages (known offline via the embedded base set), and fetches the rest from r-universe. No R required.
-- **`raven packages fetch --missing-only`** — a pure optimization. When R is present with a populated library, it subtracts already-installed packages from the fetch set (they will resolve via Tier 1 in the same CI run). When R is absent or `.libPaths()` is empty, nothing is subtracted and `--missing-only` degrades to a full fetch. It is **never an error** to pass `--missing-only` without R.
+- **Plain `raven packages fetch`** — computes the used set without R (a tree-sitter scan of your sources, plus `DESCRIPTION` `Depends`/`Imports`, `renv.lock` names, and transitive `Depends` from r-universe), skips base/recommended packages (known offline via the embedded base set), and fetches the rest from r-universe. No R required.
+- **`raven packages fetch --missing-only`** — a pure optimization. When R is present with a populated library, it subtracts already-installed packages from the fetch set (they will resolve from your local R library in the same CI run). When R is absent or `.libPaths()` is empty, nothing is subtracted and `--missing-only` degrades to a full fetch. It is **never an error** to pass `--missing-only` without R.
 
 #### Options
 
@@ -219,12 +224,12 @@ Fetches via curl with bounded concurrency, trying CRAN then Bioconductor per pac
 
 Two honest limits:
 
-1. `fetch` does **not** replace Tier 3's zero-adoption, whole-ecosystem floor — it covers only packages the project references (the "used set").
+1. `fetch` does **not** replace Raven's broad, whole-ecosystem `names.db` metadata — it covers only packages the project references (the "used set").
 2. `fetch` is **not** fully self-contained — base/recommended packages are not on r-universe and still come from local R or the embedded fallback at analysis time.
 
 ### `raven packages freeze`
 
-Generate a committed, repo-specific `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets. This is Raven's reproducible CI path: run it on a machine that has R and the project's packages installed, then commit the result so CI uses project-pinned package metadata. Raven's bundled or updated CRAN/Bioconductor metadata provides broad ecosystem coverage when available, but this committed snapshot **improves accuracy** for packages the broad metadata doesn't cover (GitHub-only or internal packages) and for symbols newer than the metadata snapshot. The file is generated, never hand-edited.
+Generate a committed, repo-specific `.raven/packages.json` — a snapshot of your installed packages' export names, `Depends`, and datasets. This is Raven's reproducible CI path: run it on a machine that has R and the project's packages installed, then commit the result so CI uses project-pinned package metadata. Raven's bundled or updated CRAN/Bioconductor metadata provides broad ecosystem coverage when available, but this committed snapshot **improves accuracy** for packages the broad metadata doesn't cover (GitHub-only or internal packages) and for symbols newer than the metadata snapshot. The file is generated, never hand-edited.
 
 ```text
 raven packages freeze [OPTIONS]
@@ -232,18 +237,18 @@ raven packages freeze [OPTIONS]
 
 #### Options
 
-- `--used` (default) — capture only the packages the repo uses. The set is deliberately **maximally inclusive**: packages referenced via `library`/`require`/`loadNamespace`/`requireNamespace` ∪ the left-hand side of `::`/`:::` ∪ everything in `renv.lock` ∪ the repo's own `DESCRIPTION` `Depends`/`Imports` ∪ their transitive `Depends`. (`LinkingTo` is excluded — it is C-level and has no R exports.) Over-inclusion is free: the capture skips anything not actually installed.
+- `--used` (default) — capture only the packages the repo uses. The set is deliberately **maximally inclusive** — it combines packages referenced via `library`/`require`/`loadNamespace`/`requireNamespace`, the left-hand side of `::`/`:::`, everything in `renv.lock`, the repo's own `DESCRIPTION` `Depends`/`Imports`, and their transitive `Depends`. (`LinkingTo` is excluded — it is C-level and has no R exports.) Over-inclusion is free: the capture skips anything not actually installed.
 - `--installed` / `--all` — capture every package across the renv and system libraries, not just the used set.
 - `--output PATH` — where to write the file (default: `.raven/packages.json` at the workspace root).
 - `--workspace DIR` — workspace root to scan for usage and config (default: current directory).
 
-#### Base-priority packages
+#### Base packages
 
-`freeze` skips only the default-attached **Base-7** packages that Raven treats as always in scope with no `library()` call. It may still write records for non-attached base-priority packages such as `grid`, `tools`, and `compiler` when your code uses them or when you choose `--installed` / `--all`. That is intentional: `freeze` captures your local R install, which may differ from the reference R used to build Raven's embedded fallback, and the generated file should match packages you explicitly call in scripts.
+`freeze` skips only the seven packages R attaches by default — the ones Raven treats as always in scope with no `library()` call. It may still write records for other base packages such as `grid`, `tools`, and `compiler` when your code uses them or when you choose `--installed` / `--all`. That is intentional: `freeze` captures your local R install, which may differ from the reference R used to build Raven's embedded fallback, and the generated file should match packages you explicitly call in scripts.
 
 #### Library order and renv
 
-Generation resolves each package from a **renv-first** library order: the renv project library first, system-wide libraries only for packages renv doesn't cover (renv wins, system fills the gaps). A `renv.lock` acts purely as a **set selector** — it decides *which* packages to include (a locked package is included even if no script ever calls it), **not** which version to read; the exports always come from the package actually installed locally. A locked package that isn't installed simply can't be captured and falls through to Tier 3 in CI. Best coverage therefore comes from running `freeze` after `renv::restore()`, but nothing breaks otherwise.
+Generation resolves each package from a **renv-first** library order: the renv project library first, system-wide libraries only for packages renv doesn't cover (renv wins, system fills the gaps). A `renv.lock` acts purely as a **set selector** — it decides *which* packages to include (a locked package is included even if no script ever calls it), **not** which version to read; the exports always come from the package actually installed locally. A locked package that isn't installed simply can't be captured and falls through to Raven's bundled CRAN/Bioconductor metadata in CI. Best coverage therefore comes from running `freeze` after `renv::restore()`, but nothing breaks otherwise.
 
 #### No-op when content is unchanged
 
@@ -251,44 +256,27 @@ If a `.raven/packages.json` already exists, `freeze` compares **package content 
 
 ### `raven packages update`
 
-Downloads the `names.db` sidecar Raven uses to recognize package symbols when the packages are not installed, from the `names-db` GitHub Release into Raven's user data directory. Base R-package coverage is embedded in the binary and needs no download. Use this when your install only provided the `raven` executable, such as `cargo install --git` or a local source build. Release archives and package-manager builds normally ship `names.db` next to the executable. This command is the explicit network boundary for package metadata: `raven check`, LSP startup, completion, hover, and normal package lookup do not fetch it.
+Downloads the `names.db` sidecar Raven uses to recognize package symbols when the packages are not installed, from the `names-db` GitHub Release into Raven's user data directory. Base R-package coverage is embedded in the binary and needs no download. `names.db` is **not** bundled with the `raven` binary — use this whenever you want broad CRAN/Bioconductor coverage without a local R install. (The VS Code extension doesn't need it: VS Code users resolve their installed packages through R.) This command is the explicit network boundary for package metadata: `raven check`, LSP startup, completion, hover, and normal package lookup do not fetch it.
 
 Use it during CI image setup or cache warmup when installing Raven from source:
 
 ```sh
 cargo install --git https://github.com/jbearak/raven raven
 raven packages update
-raven check --format sarif > raven.sarif
+raven check
 ```
 
-For reproducible CI, commit `.raven/packages.json` generated by `raven packages freeze`. `raven packages update` restores broad CRAN/Bioconductor coverage for zero-adoption scans, but it follows the moving `names-db` Release and is not version-pinned by the project.
+For reproducible CI, commit `.raven/packages.json` generated by `raven packages freeze`. `raven packages update` restores broad CRAN/Bioconductor coverage, but it follows the moving `names-db` Release and is not version-pinned by the project.
 
-### `raven packages build-shipped-db`
+To pin a reproducible snapshot, pass an immutable dated release instead of tracking the moving one:
 
-**Maintainer / CI-only — most users never run this.** Builds Raven's Tier 3 `names.db` sidecar. All base-priority packages are excluded from `names.db` (they are embedded in the binary). The shipped binary is **network-free**: this command transforms r-universe JSON that the build workflow has already downloaded with `curl`, merging it **append-only** over an authoritative reference-R capture of the build machine's installed library. The reference capture **auto-discovers every R `.libPaths()` entry**. The result is published to the `names-db` GitHub Release and bundled next to the binary in release archives (the VSIX omits it; VS Code users resolve their locally installed packages via Tier 1). See [Package database](package-database.md#tier-3--sidecar-namesdb) and [development.md](development.md#tier-3-build-pipeline) for the build pipeline.
-
-### `raven packages validate-shipped-db`
-
-**Maintainer / CI-only — most users never run this.** Opens a `names.db` sidecar with the current Raven binary, verifies the container header, format version, payload checksum, index bounds, and decodes every package record. The command fails if the file is corrupt, uses a newer unsupported format, or if the fully decoded record count does not match the database provenance.
-
-```text
-raven packages validate-shipped-db names.db
+```sh
+raven packages update 2026-06-02
 ```
 
-Raven's release workflow runs this command against the exact `names.db` artifact it will bundle beside release binaries.
+Each build also publishes an immutable `names-db-YYYY-MM-DD` Release alongside the rolling `names-db` one, and these dated snapshots are retained indefinitely. With no date argument, `update` pulls the latest (`names-db`).
 
-### `raven packages build-embedded-base`
-
-**Maintainer-only — most users never run this.** Regenerates the embedded base export/dataset table (`crates/raven/src/package_db/embedded_base_generated.rs`) from a reference R installation — all 14 base-priority packages. The generated file is compiled into the binary so base symbols are available without any sidecar or R installation.
-
-```text
-raven packages build-embedded-base --reference-lib DIR [--output PATH]
-```
-
-- `--reference-lib DIR` — path to the R library containing the base packages (e.g. the output of `Rscript -e 'cat(.Library)'`).
-- `--output PATH` — where to write the generated file (default: `crates/raven/src/package_db/embedded_base_generated.rs`).
-
-After running, verify with `cargo test -p raven embedded_base` and commit the result.
+The maintainer-only `raven packages` commands (`build-shipped-db`, `validate-shipped-db`, `build-embedded-base`) are documented in the [appendix](#appendix-maintainer-and-advanced-topics).
 
 ## Output formats
 
@@ -311,3 +299,50 @@ Both `check` and `lint` colorize the **severity word** (`error`, `warning`, `inf
    - else **on** when stdout is a terminal, **off** when piped or redirected.
 
 So `--color always` forces color even through a pipe (e.g. into `less -R` or a CI log viewer), `--color never` / `--no-color` / `NO_COLOR` suppress it, and the default tracks whether you're looking at a terminal. Conflicting explicit flags are last-one-wins (`--no-color --color always` ⇒ color on).
+
+## Appendix: maintainer and advanced topics
+
+These topics are for maintainers and advanced / organizational setups; most users never need them.
+
+### Self-hosting `names.db` with `--base-url`
+
+`raven packages update --base-url URL` overrides where the sidecar is fetched from. The command downloads `{URL}/names.db` (any trailing slash on `URL` is trimmed), so an organization can host its own copy on an internal mirror:
+
+```sh
+raven packages update --base-url https://mirror.example.internal/raven
+# fetches https://mirror.example.internal/raven/names.db
+```
+
+Notes:
+
+- The URL must be `http://` or `https://` (other schemes are refused). Redirects are followed. The download is capped at 200 MB — purely defensive: that ceiling is an order of magnitude beyond any real `names.db`, so it should never be reached in normal use. It only guards against a misconfigured endpoint or a wrong URL serving something far larger than expected.
+- The downloaded file is validated structurally before it replaces the existing sidecar — `update` opens it as a Raven DB (container header, format version, payload checksum, index bounds, decodable records). This confirms the file is a well-formed `names.db`, **not** who produced it; there is no signature or provenance check, and the published `checksums.sha256` is not fetched. Trust rests on the transport (prefer HTTPS) plus that structural validation.
+- `--base-url` is a per-invocation flag, not a persisted setting (`RAVEN_NAMES_DB` is unrelated — it overrides sidecar *lookup*, not the download source). Wrap it in a script or CI step for repeated use.
+- `--base-url` is a full override and is therefore mutually exclusive with the `YYYY-MM-DD` dated-release argument; a self-hosted mirror defines its own URL layout.
+
+### `raven packages build-shipped-db`
+
+**Maintainer / CI-only — most users never run this.** Builds Raven's Tier 3 `names.db` sidecar. All base-priority packages are excluded from `names.db` (they are embedded in the binary). The shipped binary is **network-free**: this command transforms r-universe JSON that the build workflow has already downloaded with `curl`, merging it **append-only** over an authoritative reference-R capture of the build machine's installed library. The reference capture **auto-discovers every R `.libPaths()` entry**. The result is published to the `names-db` GitHub Release, where `raven packages update` downloads it on demand — it is **not** bundled with the binary, and the VSIX omits it too (VS Code users resolve their locally installed packages via Tier 1). See [Package database](package-database.md#tier-3--sidecar-namesdb) and [development.md](development.md#tier-3-build-pipeline) for the build pipeline.
+
+### `raven packages validate-shipped-db`
+
+**Maintainer / CI-only — most users never run this.** Opens a `names.db` sidecar with the current Raven binary, verifies the container header, format version, payload checksum, index bounds, and decodes every package record. The command fails if the file is corrupt, uses a newer unsupported format, or if the fully decoded record count does not match the database provenance.
+
+```text
+raven packages validate-shipped-db names.db
+```
+
+Raven's release workflow runs this against the current `names-db` Release asset before building the release binaries — a **compatibility gate** confirming the version of Raven being shipped can open and validate the database users will download. It is not a bundling step: `names.db` is not shipped with the binary.
+
+### `raven packages build-embedded-base`
+
+**Maintainer-only — most users never run this.** Regenerates the embedded base export/dataset table (`crates/raven/src/package_db/embedded_base_generated.rs`) from a reference R installation — all 14 base-priority packages. The generated file is compiled into the binary so base symbols are available without any sidecar or R installation.
+
+```text
+raven packages build-embedded-base --reference-lib DIR [--output PATH]
+```
+
+- `--reference-lib DIR` — path to the R library containing the base packages (e.g. the output of `Rscript -e 'cat(.Library)'`).
+- `--output PATH` — where to write the generated file (default: `crates/raven/src/package_db/embedded_base_generated.rs`).
+
+After running, verify with `cargo test -p raven embedded_base` and commit the result.
