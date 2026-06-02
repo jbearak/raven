@@ -3105,11 +3105,13 @@ mod activity_signal_tests {
         );
 
         // Simulate files needing revalidation
-        let mut files_to_revalidate = [other.clone(),
+        let mut files_to_revalidate = [
+            other.clone(),
             visible2.clone(),
             recent.clone(),
             active.clone(),
-            visible1.clone()];
+            visible1.clone(),
+        ];
 
         // Sort by priority (lower = higher priority)
         files_to_revalidate.sort_by_key(|uri| state.priority_score(uri));

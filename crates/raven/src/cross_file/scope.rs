@@ -1968,11 +1968,10 @@ where
                     }
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
-                    if should_apply_local_scoping(source)
-                        && function_scope.is_none() {
-                            // local=TRUE at top-level doesn't contribute to global scope
-                            continue;
-                        }
+                    if should_apply_local_scoping(source) && function_scope.is_none() {
+                        // local=TRUE at top-level doesn't contribute to global scope
+                        continue;
+                    }
 
                     // Resolve the path and get symbols from sourced file
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
@@ -3721,11 +3720,10 @@ where
                 if passes_position || is_global_source {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
-                    if should_apply_local_scoping(source)
-                        && function_scope.is_none() {
-                            // local=TRUE at top-level doesn't contribute to global scope
-                            continue;
-                        }
+                    if should_apply_local_scoping(source) && function_scope.is_none() {
+                        // local=TRUE at top-level doesn't contribute to global scope
+                        continue;
+                    }
 
                     // Resolve the child URI: prefer pre-computed dependency graph edges
                     // (which use workspace-root fallback) over re-resolving the path
@@ -5856,11 +5854,12 @@ mod tests {
         println!("Parent timeline:");
         for event in &parent_artifacts.timeline {
             if let ScopeEvent::Def {
-                    line,
-                    column,
-                    symbol,
-                    ..
-                } = event {
+                line,
+                column,
+                symbol,
+                ..
+            } = event
+            {
                 println!("  Def: {} at ({}, {})", symbol.name, line, column);
             }
         }
@@ -7885,7 +7884,8 @@ outside_var <- 2"#;
     #[test]
     fn test_removal_event_sorting_by_position() {
         // Test that Removal events are correctly sorted by (line, column) position
-        let mut events = [ScopeEvent::Removal {
+        let mut events = [
+            ScopeEvent::Removal {
                 line: 5,
                 column: 10,
                 symbols: vec!["c".to_string()],
@@ -7908,7 +7908,8 @@ outside_var <- 2"#;
                 column: 0,
                 symbols: vec!["d".to_string()],
                 function_scope: None,
-            }];
+            },
+        ];
 
         // Sort using the same key as compute_artifacts
         // Sort by each event's *effect* position so test ordering matches the
@@ -7931,7 +7932,8 @@ outside_var <- 2"#;
     #[test]
     fn test_removal_event_sorting_same_line_different_columns() {
         // Test that Removal events on the same line are sorted by column
-        let mut events = [ScopeEvent::Removal {
+        let mut events = [
+            ScopeEvent::Removal {
                 line: 3,
                 column: 20,
                 symbols: vec!["c".to_string()],
@@ -7948,7 +7950,8 @@ outside_var <- 2"#;
                 column: 10,
                 symbols: vec!["b".to_string()],
                 function_scope: None,
-            }];
+            },
+        ];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -7971,7 +7974,8 @@ outside_var <- 2"#;
     fn test_removal_event_mixed_with_def_events() {
         // Test that Removal events sort correctly when mixed with Def events
         let uri = test_uri();
-        let mut events = [ScopeEvent::Removal {
+        let mut events = [
+            ScopeEvent::Removal {
                 line: 3,
                 column: 0,
                 symbols: vec!["x".to_string()],
@@ -8008,7 +8012,8 @@ outside_var <- 2"#;
                     is_declared: false,
                 },
                 function_scope: None,
-            }];
+            },
+        ];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -8045,7 +8050,8 @@ outside_var <- 2"#;
         // Test that Removal events sort correctly when mixed with Source events
         use super::super::types::ForwardSource;
 
-        let mut events = [ScopeEvent::Removal {
+        let mut events = [
+            ScopeEvent::Removal {
                 line: 2,
                 column: 0,
                 symbols: vec!["x".to_string()],
@@ -8072,7 +8078,8 @@ outside_var <- 2"#;
                 column: 0,
                 symbols: vec!["y".to_string()],
                 function_scope: None,
-            }];
+            },
+        ];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -8098,7 +8105,8 @@ outside_var <- 2"#;
         use super::super::types::ForwardSource;
 
         let uri = test_uri();
-        let mut events = [ScopeEvent::Removal {
+        let mut events = [
+            ScopeEvent::Removal {
                 line: 5,
                 column: 0,
                 symbols: vec!["z".to_string()],
@@ -8148,7 +8156,8 @@ outside_var <- 2"#;
                 column: 0,
                 symbols: vec!["w".to_string()],
                 function_scope: None,
-            }];
+            },
+        ];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -12822,9 +12831,7 @@ x <- 1"#;
 
         // Parent should also have stringr (loaded in child, propagated via loaded_packages)
         assert!(
-            parent_scope
-                .loaded_packages
-                .contains("stringr"),
+            parent_scope.loaded_packages.contains("stringr"),
             "Parent should have stringr from child (package propagation via loaded_packages)"
         );
     }
@@ -12905,9 +12912,7 @@ x <- 1"#;
 
         // Child SHOULD have dplyr (propagated from parent)
         assert!(
-            child_scope
-                .inherited_packages
-                .contains("dplyr"),
+            child_scope.inherited_packages.contains("dplyr"),
             "Child should inherit dplyr from parent (forward propagation works)"
         );
 
@@ -12930,9 +12935,7 @@ x <- 1"#;
 
         // Parent should have ggplot2 (loaded in child, propagated via loaded_packages)
         assert!(
-            parent_scope
-                .loaded_packages
-                .contains("ggplot2"),
+            parent_scope.loaded_packages.contains("ggplot2"),
             "Parent should have ggplot2 from child (package propagation via loaded_packages)"
         );
     }
@@ -13088,9 +13091,7 @@ x <- 1"#;
         );
 
         assert!(
-            abortions_scope
-                .inherited_packages
-                .contains("plyr"),
+            abortions_scope.inherited_packages.contains("plyr"),
             "abortions.r should inherit plyr from sibling functions.r via main.r chain. \
              inherited_packages: {:?}",
             abortions_scope.inherited_packages

@@ -4575,7 +4575,19 @@ mod tests {
 
     /// Verify that the detected context matches the expected innermost context type.
     fn verify_innermost_context(ctx: &IndentContext, expected_type: &str) -> bool {
-        matches!((ctx, expected_type), (IndentContext::AfterContinuationOperator { .. }, "AfterContinuationOperator") | (IndentContext::InsideParens { .. }, "InsideParens") | (IndentContext::InsideBraces { .. }, "InsideBraces") | (IndentContext::ClosingDelimiter { .. }, "ClosingDelimiter") | (IndentContext::AfterCompleteExpression { .. }, "AfterCompleteExpression"))
+        matches!(
+            (ctx, expected_type),
+            (
+                IndentContext::AfterContinuationOperator { .. },
+                "AfterContinuationOperator"
+            ) | (IndentContext::InsideParens { .. }, "InsideParens")
+                | (IndentContext::InsideBraces { .. }, "InsideBraces")
+                | (IndentContext::ClosingDelimiter { .. }, "ClosingDelimiter")
+                | (
+                    IndentContext::AfterCompleteExpression { .. },
+                    "AfterCompleteExpression"
+                )
+        )
     }
 
     proptest! {

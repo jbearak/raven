@@ -5040,27 +5040,26 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
         .collect();
 
     for edge in &deps {
-        if edge.is_directive && !edge.is_backward_directive
-            && ast_targets.contains(&edge.to) {
-                let line = edge.call_site_line.unwrap_or(0);
-                let target_name = edge
-                    .to
-                    .path_segments()
-                    .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(line, 0),
-                        end: Position::new(line, LSP_EOL_CHARACTER),
-                    },
-                    severity: Some(severity),
-                    message: format!(
-                        "Redundant @lsp-source directive: '{}' is already sourced by a source() call",
-                        target_name
-                    ),
-                    ..Default::default()
-                });
-            }
+        if edge.is_directive && !edge.is_backward_directive && ast_targets.contains(&edge.to) {
+            let line = edge.call_site_line.unwrap_or(0);
+            let target_name = edge
+                .to
+                .path_segments()
+                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
+                .unwrap_or_default();
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(line, 0),
+                    end: Position::new(line, LSP_EOL_CHARACTER),
+                },
+                severity: Some(severity),
+                message: format!(
+                    "Redundant @lsp-source directive: '{}' is already sourced by a source() call",
+                    target_name
+                ),
+                ..Default::default()
+            });
+        }
     }
 }
 
@@ -5463,10 +5462,9 @@ fn collect_undefined_variables_from_snapshot(
         .unwrap_or_default();
 
     let parent_symbol_names: HashSet<String> = {
-        scope_cache.entry((0, 0)).or_insert_with(|| {
-            
-            snapshot.get_scope(uri, 0, 0, cancel)
-        });
+        scope_cache
+            .entry((0, 0))
+            .or_insert_with(|| snapshot.get_scope(uri, 0, 0, cancel));
         let scope_0_0 = scope_cache.get(&(0, 0)).unwrap();
         // Only include symbols from OTHER files. When a parent sources this file,
         // the file's own exports flow into the parent's scope and back here via
@@ -13022,7 +13020,9 @@ pub fn extract_definition_statement(
     // Get content provider for the symbol's source file
     let content = if let Some(doc) = state.documents.get(&symbol.source_uri) {
         doc.text()
-    } else { state.cross_file_file_cache.get(&symbol.source_uri)? };
+    } else {
+        state.cross_file_file_cache.get(&symbol.source_uri)?
+    };
 
     // Get tree for parsing
     let tree = if let Some(doc) = state.documents.get(&symbol.source_uri) {
@@ -42154,8 +42154,12 @@ source(\"helpers.R\")
                 );
             }
 
-            let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).unwrap_or_else(|| panic!("Should build snapshot for data.R (scan_complete={})",
-                workspace_scan_complete));
+            let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).unwrap_or_else(|| {
+                panic!(
+                    "Should build snapshot for data.R (scan_complete={})",
+                    workspace_scan_complete
+                )
+            });
             let diagnostics =
                 diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
                     .expect("Should produce diagnostics");
