@@ -92,20 +92,26 @@ mod tests {
     fn cacheable_classification() {
         assert!(HelpHtmlError::NotFound.is_cacheable());
         assert!(HelpHtmlError::PackageNotInstalled.is_cacheable());
-        assert!(HelpHtmlError::InvalidTopic {
-            message: "x".into()
-        }
-        .is_cacheable());
-        assert!(HelpHtmlError::RenderFailed {
-            message: "x".into()
-        }
-        .is_cacheable());
+        assert!(
+            HelpHtmlError::InvalidTopic {
+                message: "x".into()
+            }
+            .is_cacheable()
+        );
+        assert!(
+            HelpHtmlError::RenderFailed {
+                message: "x".into()
+            }
+            .is_cacheable()
+        );
         assert!(HelpHtmlError::TooLarge.is_cacheable());
         assert!(!HelpHtmlError::Timeout.is_cacheable());
-        assert!(!HelpHtmlError::RUnavailable {
-            message: "x".into()
-        }
-        .is_cacheable());
+        assert!(
+            !HelpHtmlError::RUnavailable {
+                message: "x".into()
+            }
+            .is_cacheable()
+        );
     }
 
     #[test]

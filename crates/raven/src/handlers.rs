@@ -18,8 +18,8 @@ use tree_sitter::QueryCursor;
 
 use crate::content_provider::ContentProvider;
 use crate::cross_file::dependency::compute_inherited_working_directory;
-use crate::cross_file::{scope, ScopedSymbol};
-use crate::file_type::{file_type_from_uri, FileType};
+use crate::cross_file::{ScopedSymbol, scope};
+use crate::file_type::{FileType, file_type_from_uri};
 use crate::state::WorldState;
 use crate::utf16::utf16_column_to_byte_offset;
 
@@ -398,49 +398,47 @@ pub(crate) fn diagnostics_from_snapshot(
     ));
 
     // Cycle detection (uses pre-computed result from full graph, not trimmed subgraph)
-    if let Some(severity) = snapshot.cross_file_config.circular_dependency_severity {
-        if let Some(cycle) = &snapshot.cycle_detection {
-            let out = &cycle.outgoing_edge;
-            let close = &cycle.closing_edge;
-            let line = out.call_site_line.unwrap_or(0);
-            let col = out.call_site_column.unwrap_or(0);
-            let max_line = snapshot.text.lines().count().saturating_sub(1) as u32;
-            let line = line.min(max_line);
+    if let Some(severity) = snapshot.cross_file_config.circular_dependency_severity
+        && let Some(cycle) = &snapshot.cycle_detection
+    {
+        let out = &cycle.outgoing_edge;
+        let close = &cycle.closing_edge;
+        let line = out.call_site_line.unwrap_or(0);
+        let col = out.call_site_column.unwrap_or(0);
+        let max_line = snapshot.text.lines().count().saturating_sub(1) as u32;
+        let line = line.min(max_line);
 
-            let closing_file = close
-                .from
-                .path_segments()
-                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
-                .unwrap_or_default();
-            let closing_line_1based = close.call_site_line.map(|l| l + 1);
+        let closing_file = close
+            .from
+            .path_segments()
+            .and_then(|mut s| s.next_back().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let closing_line_1based = close.call_site_line.map(|l| l + 1);
 
-            let message = match (
-                closing_line_1based,
-                snapshot.cycle_closing_snippet.as_deref(),
-            ) {
-                (Some(cl), Some(code)) => {
-                    format!(
-                        "Circular dependency: {closing_file} line {cl} sources this file: `{code}`"
-                    )
-                }
-                (Some(cl), None) => {
-                    format!("Circular dependency: {closing_file} line {cl} sources this file")
-                }
-                _ => {
-                    format!("Circular dependency: {closing_file} sources this file")
-                }
-            };
+        let message = match (
+            closing_line_1based,
+            snapshot.cycle_closing_snippet.as_deref(),
+        ) {
+            (Some(cl), Some(code)) => {
+                format!("Circular dependency: {closing_file} line {cl} sources this file: `{code}`")
+            }
+            (Some(cl), None) => {
+                format!("Circular dependency: {closing_file} line {cl} sources this file")
+            }
+            _ => {
+                format!("Circular dependency: {closing_file} sources this file")
+            }
+        };
 
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(line, col),
-                    end: Position::new(line, col.saturating_add(1)),
-                },
-                severity: Some(severity),
-                message,
-                ..Default::default()
-            });
-        }
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(line, col),
+                end: Position::new(line, col.saturating_add(1)),
+            },
+            severity: Some(severity),
+            message,
+            ..Default::default()
+        });
     }
 
     // Max depth diagnostics
@@ -828,8 +826,8 @@ fn value_is_function_definition(node: Node) -> bool {
     }
 
     let mut cursor = node.walk();
-    let contains_function_definition = node.children(&mut cursor).any(value_is_function_definition);
-    contains_function_definition
+
+    node.children(&mut cursor).any(value_is_function_definition)
 }
 fn push_function_token(node: Node, lines: &[&str], tokens: &mut Vec<AbsoluteSemanticToken>) {
     let start = node.start_position();
@@ -1703,15 +1701,15 @@ impl<'a> SymbolExtractor<'a> {
                 // The first child of a call node is the function identifier
                 let mut cursor = node.walk();
                 let children: Vec<_> = node.children(&mut cursor).collect();
-                if let Some(func_node) = children.first() {
-                    if func_node.kind() == "identifier" {
-                        let func_name = node_text(*func_node, self.text);
-                        return match func_name {
-                            "c" | "vector" | "matrix" | "array" => Some(DocumentSymbolKind::Array),
-                            "list" => Some(DocumentSymbolKind::List),
-                            _ => None,
-                        };
-                    }
+                if let Some(func_node) = children.first()
+                    && func_node.kind() == "identifier"
+                {
+                    let func_name = node_text(*func_node, self.text);
+                    return match func_name {
+                        "c" | "vector" | "matrix" | "array" => Some(DocumentSymbolKind::Array),
+                        "list" => Some(DocumentSymbolKind::List),
+                        _ => None,
+                    };
                 }
                 None
             }
@@ -2094,10 +2092,10 @@ impl<'a> SymbolExtractor<'a> {
                 // Only process positional arguments (no name field)
                 if child.child_by_field_name("name").is_none() {
                     // This is the first positional argument - it must be a string
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        if let Some(name) = self.extract_string_literal(value_node) {
-                            return Some((name, value_node));
-                        }
+                    if let Some(value_node) = child.child_by_field_name("value")
+                        && let Some(name) = self.extract_string_literal(value_node)
+                    {
+                        return Some((name, value_node));
                     }
                     // First positional argument is not a string, return None
                     return None;
@@ -4445,33 +4443,33 @@ async fn collect_missing_file_diagnostics_standalone(
             crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
         if let Some(path) = resolved {
-            if let Some(root) = &workspace_root {
-                if !path.starts_with(root) {
-                    let message = if source.is_directive {
-                        format!(
-                            "File '{}' referenced by @lsp-source directive is outside workspace",
-                            source.path
-                        )
-                    } else {
-                        format!("Path is outside workspace: '{}'", source.path)
-                    };
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position::new(source.line, source.column),
-                            end: Position::new(
-                                source.line,
-                                source
-                                    .column
-                                    .saturating_add(source.path.len() as u32)
-                                    .saturating_add(10),
-                            ),
-                        },
-                        severity: Some(missing_file_severity),
-                        message,
-                        ..Default::default()
-                    });
-                    continue;
-                }
+            if let Some(root) = &workspace_root
+                && !path.starts_with(root)
+            {
+                let message = if source.is_directive {
+                    format!(
+                        "File '{}' referenced by @lsp-source directive is outside workspace",
+                        source.path
+                    )
+                } else {
+                    format!("Path is outside workspace: '{}'", source.path)
+                };
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(source.line, source.column),
+                        end: Position::new(
+                            source.line,
+                            source
+                                .column
+                                .saturating_add(source.path.len() as u32)
+                                .saturating_add(10),
+                        ),
+                    },
+                    severity: Some(missing_file_severity),
+                    message,
+                    ..Default::default()
+                });
+                continue;
             }
             paths_to_check.push((
                 path,
@@ -4513,19 +4511,19 @@ async fn collect_missing_file_diagnostics_standalone(
             .as_ref()
             .and_then(|ctx| crate::cross_file::path_resolve::resolve_path(&directive.path, ctx));
         if let Some(path) = resolved {
-            if let Some(root) = &workspace_root {
-                if !path.starts_with(root) {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position::new(directive.directive_line, 0),
-                            end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
-                        },
-                        severity: Some(missing_file_severity),
-                        message: format!("Path is outside workspace: '{}'", directive.path),
-                        ..Default::default()
-                    });
-                    continue;
-                }
+            if let Some(root) = &workspace_root
+                && !path.starts_with(root)
+            {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(directive.directive_line, 0),
+                        end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
+                    },
+                    severity: Some(missing_file_severity),
+                    message: format!("Path is outside workspace: '{}'", directive.path),
+                    ..Default::default()
+                });
+                continue;
             }
             // Backward directives are always directives (is_directive=true for backward)
             paths_to_check.push((
@@ -4679,33 +4677,33 @@ pub async fn collect_missing_file_diagnostics_async(
         if let Some(path) = resolved_path {
             // Guard against paths outside workspace
             // Uses missing_file_severity since the file is effectively inaccessible
-            if let Some(root) = &workspace_root {
-                if !path.starts_with(root) {
-                    let message = if source.is_directive {
-                        format!(
-                            "File '{}' referenced by @lsp-source directive is outside workspace",
-                            source.path
-                        )
-                    } else {
-                        format!("Path is outside workspace: '{}'", source.path)
-                    };
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position::new(source.line, source.column),
-                            end: Position::new(
-                                source.line,
-                                source
-                                    .column
-                                    .saturating_add(source.path.len() as u32)
-                                    .saturating_add(10),
-                            ),
-                        },
-                        severity: Some(missing_file_severity),
-                        message,
-                        ..Default::default()
-                    });
-                    continue;
-                }
+            if let Some(root) = &workspace_root
+                && !path.starts_with(root)
+            {
+                let message = if source.is_directive {
+                    format!(
+                        "File '{}' referenced by @lsp-source directive is outside workspace",
+                        source.path
+                    )
+                } else {
+                    format!("Path is outside workspace: '{}'", source.path)
+                };
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(source.line, source.column),
+                        end: Position::new(
+                            source.line,
+                            source
+                                .column
+                                .saturating_add(source.path.len() as u32)
+                                .saturating_add(10),
+                        ),
+                    },
+                    severity: Some(missing_file_severity),
+                    message,
+                    ..Default::default()
+                });
+                continue;
             }
             if let Some(target_uri) = crate::cross_file::path_resolve::path_to_uri(&path) {
                 uris_to_check.push((
@@ -5565,16 +5563,15 @@ fn collect_undefined_variables_from_snapshot(
         let usage_col_utf16 =
             byte_offset_to_utf16_column(usage_line_text, usage_node.start_position().column);
 
-        if hoist_globals {
-            if let Some((ref exports, ref fn_tree)) = local_opt {
-                if exports.contains(name.as_str()) {
-                    let inside_function = !fn_tree
-                        .query_point(scope::Position::new(usage_line, usage_col_utf16))
-                        .is_empty();
-                    if inside_function {
-                        continue;
-                    }
-                }
+        if hoist_globals
+            && let Some((ref exports, ref fn_tree)) = local_opt
+            && exports.contains(name.as_str())
+        {
+            let inside_function = !fn_tree
+                .query_point(scope::Position::new(usage_line, usage_col_utf16))
+                .is_empty();
+            if inside_function {
+                continue;
             }
         }
 
@@ -5592,10 +5589,10 @@ fn collect_undefined_variables_from_snapshot(
             // `symbol_for` walk is cheaper than materializing a full
             // ScopeAtPosition because it short-circuits on the first
             // matching frame.
-            if let Some(sym) = stream.symbol_for(&name) {
-                if !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16) {
-                    continue;
-                }
+            if let Some(sym) = stream.symbol_for(&name)
+                && !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16)
+            {
+                continue;
             }
             // Slow path: name is undefined or forward-referenced. We
             // need the full ScopeAtPosition for the package checks
@@ -5617,12 +5614,11 @@ fn collect_undefined_variables_from_snapshot(
         // For the no-stream fall-back path we still need to apply the
         // forward-reference check (the stream path applied it above
         // before the snapshot materialization).
-        if stream_opt.is_none() {
-            if let Some(sym) = scope.symbols.get(name.as_str()) {
-                if !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16) {
-                    continue;
-                }
-            }
+        if stream_opt.is_none()
+            && let Some(sym) = scope.symbols.get(name.as_str())
+            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+        {
+            continue;
         }
 
         let defined_in_loaded_direct_source = direct_sources
@@ -5797,21 +5793,21 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
                 return true;
             }
             // Right-assignment target: `1 -> x`, `1 ->> x`.
-            if let Some(third) = third {
-                if third.id() == node.id() && matches!(op_text, "->" | "->>") {
-                    return true;
-                }
+            if let Some(third) = third
+                && third.id() == node.id()
+                && matches!(op_text, "->" | "->>")
+            {
+                return true;
             }
         }
     }
 
     // Named argument: `n = 1` in `f(..., n = 1)`.
-    if parent.kind() == "argument" {
-        if let Some(name_node) = parent.child_by_field_name("name") {
-            if name_node.id() == node.id() {
-                return true;
-            }
-        }
+    if parent.kind() == "argument"
+        && let Some(name_node) = parent.child_by_field_name("name")
+        && name_node.id() == node.id()
+    {
+        return true;
     }
 
     // Parameter NAME only. Default expressions are intentionally treated as
@@ -5819,12 +5815,11 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
     // source-order dependencies such as `function(a = b)` before a later
     // `source()` that defines `b`, because relying on that later side effect
     // is fragile.
-    if matches!(parent.kind(), "parameter" | "default_parameter") {
-        if let Some(name_node) = parent.child_by_field_name("name") {
-            if name_node.id() == node.id() {
-                return true;
-            }
-        }
+    if matches!(parent.kind(), "parameter" | "default_parameter")
+        && let Some(name_node) = parent.child_by_field_name("name")
+        && name_node.id() == node.id()
+    {
+        return true;
     }
 
     // Identifier directly inside a `parameters` list.
@@ -5899,13 +5894,13 @@ fn containing_default_parameter(node: Node) -> Option<Node> {
         if parent.kind() == "default_parameter" {
             return Some(parent);
         }
-        if parent.kind() == "parameter" {
-            if let Some(default_node) = parent.child_by_field_name("default") {
-                let node_range = node.byte_range();
-                let default_range = default_node.byte_range();
-                if default_range.start <= node_range.start && node_range.end <= default_range.end {
-                    return Some(parent);
-                }
+        if parent.kind() == "parameter"
+            && let Some(default_node) = parent.child_by_field_name("default")
+        {
+            let node_range = node.byte_range();
+            let default_range = default_node.byte_range();
+            if default_range.start <= node_range.start && node_range.end <= default_range.end {
+                return Some(parent);
             }
         }
         current = parent;
@@ -6576,36 +6571,36 @@ fn collect_syntax_errors_inner(
         // Bracket-kind MISSING routes through the opener-anchoring helper
         // unless the opener is already covered by a mismatched-bracket
         // diagnostic emitted earlier in this traversal.
-        if matches!(node.kind(), ")" | "}" | "]" | "]]") {
-            if let Some((opener, range)) = find_opener_for_missing(node, text) {
-                if !state.covered_openers.contains(&opener.id()) {
-                    let opener_text = text
-                        .get(opener.start_byte()..opener.end_byte())
-                        .unwrap_or("");
-                    if let Some(k) = DelimiterKind::from_opener(opener_text) {
-                        diagnostics.push(Diagnostic {
-                            range,
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!(
-                                "Unclosed `{}`: missing matching `{}`",
-                                k.opener_str(),
-                                k.closer_str(),
-                            ),
-                            ..Default::default()
-                        });
-                    } else {
-                        debug_assert!(
-                            false,
-                            "find_opener_for_missing returned opener text {:?} that DelimiterKind::from_opener does not recognize; this is a precondition violation",
-                            opener_text
-                        );
-                    }
+        if matches!(node.kind(), ")" | "}" | "]" | "]]")
+            && let Some((opener, range)) = find_opener_for_missing(node, text)
+        {
+            if !state.covered_openers.contains(&opener.id()) {
+                let opener_text = text
+                    .get(opener.start_byte()..opener.end_byte())
+                    .unwrap_or("");
+                if let Some(k) = DelimiterKind::from_opener(opener_text) {
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: format!(
+                            "Unclosed `{}`: missing matching `{}`",
+                            k.opener_str(),
+                            k.closer_str(),
+                        ),
+                        ..Default::default()
+                    });
+                } else {
+                    debug_assert!(
+                        false,
+                        "find_opener_for_missing returned opener text {:?} that DelimiterKind::from_opener does not recognize; this is a precondition violation",
+                        opener_text
+                    );
                 }
-                return;
             }
-            // Bracket-kind MISSING with no structural parent: fall through
-            // to the existing default branch.
+            return;
         }
+        // Bracket-kind MISSING with no structural parent: fall through
+        // to the existing default branch.
 
         // Existing default branch for non-bracket MISSING (e.g. identifier
         // missing after `x <-`). PRESERVE BYTE-FOR-BYTE from Task 3.
@@ -7015,10 +7010,10 @@ fn classify_via_delimiter_scan(
             if ch.start_byte() == target && ch.child_count() == 0 {
                 return Some(ch);
             }
-            if ch.is_error() {
-                if let Some(found) = find_node_by_byte(ch, target, depth + 1) {
-                    return Some(found);
-                }
+            if ch.is_error()
+                && let Some(found) = find_node_by_byte(ch, target, depth + 1)
+            {
+                return Some(found);
             }
         }
         None
@@ -7355,9 +7350,9 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 #[cfg(test)]
 mod syntax_error_range_tests {
     use super::{
-        anchor_missing_position, classify_via_delimiter_scan, collect_syntax_errors,
-        delimiter_events, end_of_meaningful_content, find_first_content_line, find_innermost_error,
-        find_opener_for_missing, CollectState, DelimiterKind,
+        CollectState, DelimiterKind, anchor_missing_position, classify_via_delimiter_scan,
+        collect_syntax_errors, delimiter_events, end_of_meaningful_content,
+        find_first_content_line, find_innermost_error, find_opener_for_missing,
     };
     use tower_lsp::lsp_types::Diagnostic;
 
@@ -10356,7 +10351,7 @@ mod invalid_assignment_target_tests {
 /// behind `run_lints` would silently suppress them for any user with linting disabled.
 #[cfg(test)]
 mod semantic_warning_pipeline_tests {
-    use super::{diagnostics_from_snapshot, DiagCancelToken, DiagnosticsSnapshot};
+    use super::{DiagCancelToken, DiagnosticsSnapshot, diagnostics_from_snapshot};
     use crate::linting::LintConfig;
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::Url;
@@ -10432,38 +10427,39 @@ mod semantic_warning_pipeline_tests {
 /// else {z} }")` succeeds; the function body `function() { if (x) {y}\nelse
 /// {z} }` runs). Flagging it would be a false positive.
 fn collect_else_newline_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
-    if node.kind() == "identifier" && node_text(node, text) == "else" && !node.is_error() {
-        if let Some(parent) = node.parent() {
-            if !parent.is_error() {
-                let mut used_same_line_message = false;
-                let mut prev = node.prev_named_sibling();
-                while let Some(sibling) = prev {
-                    if sibling.kind() == "comment" {
-                        prev = sibling.prev_named_sibling();
-                        continue;
-                    }
-                    if sibling.kind() == "if_statement"
-                        && !if_statement_has_else(sibling)
-                        && !has_separator_between(sibling, node, text)
-                    {
-                        // Only use the brace-specific "same-line as `}`" hint
-                        // when the `if`'s body actually has a closing `}`.
-                        // For braceless bodies (`if (x) y\nelse z`), fall
-                        // through to the orphan message — saying "same line as
-                        // `}`" would lie about a brace that isn't there.
-                        if let Some(brace_line) = find_closing_brace_line(&sibling, text) {
-                            if node.start_position().row > brace_line {
-                                emit_else_newline_diagnostic(node, text, diagnostics);
-                                used_same_line_message = true;
-                            }
-                        }
-                    }
-                    break;
-                }
-                if !used_same_line_message {
-                    emit_orphan_else_diagnostic(node, text, diagnostics);
+    if node.kind() == "identifier"
+        && node_text(node, text) == "else"
+        && !node.is_error()
+        && let Some(parent) = node.parent()
+        && !parent.is_error()
+    {
+        let mut used_same_line_message = false;
+        let mut prev = node.prev_named_sibling();
+        while let Some(sibling) = prev {
+            if sibling.kind() == "comment" {
+                prev = sibling.prev_named_sibling();
+                continue;
+            }
+            if sibling.kind() == "if_statement"
+                && !if_statement_has_else(sibling)
+                && !has_separator_between(sibling, node, text)
+            {
+                // Only use the brace-specific "same-line as `}`" hint
+                // when the `if`'s body actually has a closing `}`.
+                // For braceless bodies (`if (x) y\nelse z`), fall
+                // through to the orphan message — saying "same line as
+                // `}`" would lie about a brace that isn't there.
+                if let Some(brace_line) = find_closing_brace_line(&sibling, text)
+                    && node.start_position().row > brace_line
+                {
+                    emit_else_newline_diagnostic(node, text, diagnostics);
+                    used_same_line_message = true;
                 }
             }
+            break;
+        }
+        if !used_same_line_message {
+            emit_orphan_else_diagnostic(node, text, diagnostics);
         }
     }
 
@@ -10487,10 +10483,10 @@ fn has_separator_between(prev: Node, next: Node, text: &str) -> bool {
             Some(n) if n.id() != next.id() => n.start_byte(),
             _ => next.start_byte(),
         };
-        if let Some(gap) = text.get(last_end..stop_at) {
-            if gap.contains(';') {
-                return true;
-            }
+        if let Some(gap) = text.get(last_end..stop_at)
+            && gap.contains(';')
+        {
+            return true;
         }
         match cur {
             Some(n) if n.id() != next.id() => {
@@ -10508,8 +10504,8 @@ fn has_separator_between(prev: Node, next: Node, text: &str) -> bool {
 /// statement is a fully orphan token, not a misplaced `else` for this `if`.
 fn if_statement_has_else(if_stmt: Node) -> bool {
     let mut cursor = if_stmt.walk();
-    let has_else = if_stmt.children(&mut cursor).any(|c| c.kind() == "else");
-    has_else
+
+    if_stmt.children(&mut cursor).any(|c| c.kind() == "else")
 }
 
 /// LSP `Position` for a tree-sitter node's start, converting byte column to
@@ -11073,12 +11069,12 @@ fn collect_usages_with_context<'a>(
         // containing a right-assignment operator (e.g., `-> x` or `->> x` where
         // the parser couldn't find a LHS value). This handles broken-tree
         // recovery that the structural predicate can't see.
-        if let Some(prev) = node.prev_sibling() {
-            if prev.is_error() {
-                let prev_text = &text[prev.start_byte()..prev.end_byte()];
-                if prev_text.trim() == "->" || prev_text.trim() == "->>" {
-                    return;
-                }
+        if let Some(prev) = node.prev_sibling()
+            && prev.is_error()
+        {
+            let prev_text = &text[prev.start_byte()..prev.end_byte()];
+            if prev_text.trim() == "->" || prev_text.trim() == "->>" {
+                return;
             }
         }
 
@@ -11388,28 +11384,28 @@ fn collect_stan_declaration_matches(text: &str) -> Vec<StanDocumentSymbolMatch> 
 
     for (line_idx, line) in text.lines().enumerate() {
         for (offset, candidate) in stan_line_candidates(line) {
-            if let Some(captures) = var_re.captures(candidate) {
-                if let Some(symbol) = stan_match_from_captures(
+            if let Some(captures) = var_re.captures(candidate)
+                && let Some(symbol) = stan_match_from_captures(
                     captures,
                     offset,
                     line_idx,
                     StanDocumentSymbolKind::Variable,
-                ) {
-                    matches.push(symbol);
-                    break;
-                }
+                )
+            {
+                matches.push(symbol);
+                break;
             }
 
-            if let Some(captures) = fn_re.captures(candidate) {
-                if let Some(symbol) = stan_match_from_captures(
+            if let Some(captures) = fn_re.captures(candidate)
+                && let Some(symbol) = stan_match_from_captures(
                     captures,
                     offset,
                     line_idx,
                     StanDocumentSymbolKind::Function,
-                ) {
-                    matches.push(symbol);
-                    break;
-                }
+                )
+            {
+                matches.push(symbol);
+                break;
             }
         }
     }
@@ -11506,19 +11502,16 @@ fn collect_stan_definition_candidates(text: &str) -> Vec<StanDefinitionCandidate
             if let Some(captures) = var_re
                 .captures(candidate)
                 .or_else(|| fn_re.captures(candidate))
+                && let Some(name) = captures.get(1)
             {
-                if let Some(name) = captures.get(1) {
-                    let start = offset + name.start();
-                    let end = offset + name.end();
-                    candidates.push(StanDefinitionCandidate {
-                        name: name.as_str().to_string(),
-                        line: line_idx as u32,
-                        start_col: crate::cross_file::types::byte_offset_to_utf16_column(
-                            line, start,
-                        ),
-                        end_col: crate::cross_file::types::byte_offset_to_utf16_column(line, end),
-                    });
-                }
+                let start = offset + name.start();
+                let end = offset + name.end();
+                candidates.push(StanDefinitionCandidate {
+                    name: name.as_str().to_string(),
+                    line: line_idx as u32,
+                    start_col: crate::cross_file::types::byte_offset_to_utf16_column(line, start),
+                    end_col: crate::cross_file::types::byte_offset_to_utf16_column(line, end),
+                });
             }
         }
 
@@ -11749,21 +11742,21 @@ fn collect_jags_document_completions(
     for (line_idx, line) in text.lines().enumerate() {
         let code = line.split('#').next().unwrap_or(line);
         for candidate in std::iter::once(code).chain(code.rsplit_once('{').map(|(_, tail)| tail)) {
-            if let Some(captures) = symbol_re.captures(candidate) {
-                if let Some(name) = captures.get(1) {
-                    if is_r_only_jags_completion_name(name.as_str()) {
-                        break;
-                    }
-                    push_local_symbol_completion(
-                        items,
-                        seen_names,
-                        uri,
-                        name.as_str(),
-                        line_idx as u32,
-                        CompletionItemKind::FIELD,
-                    );
+            if let Some(captures) = symbol_re.captures(candidate)
+                && let Some(name) = captures.get(1)
+            {
+                if is_r_only_jags_completion_name(name.as_str()) {
                     break;
                 }
+                push_local_symbol_completion(
+                    items,
+                    seen_names,
+                    uri,
+                    name.as_str(),
+                    line_idx as u32,
+                    CompletionItemKind::FIELD,
+                );
+                break;
             }
         }
     }
@@ -11849,22 +11842,20 @@ fn collect_jags_definition_candidates(text: &str) -> Vec<StanDefinitionCandidate
             code.match_indices('{')
                 .map(|(i, _)| (i + 1, &code[i + 1..])),
         ) {
-            if let Some(captures) = def_re.captures(candidate) {
-                if let Some(name) = captures.get(1) {
-                    let byte_start = offset + name.start();
-                    let byte_end = offset + name.end();
-                    candidates.push(StanDefinitionCandidate {
-                        name: name.as_str().to_string(),
-                        line: line_idx as u32,
-                        start_col: crate::cross_file::types::byte_offset_to_utf16_column(
-                            line, byte_start,
-                        ),
-                        end_col: crate::cross_file::types::byte_offset_to_utf16_column(
-                            line, byte_end,
-                        ),
-                    });
-                    break;
-                }
+            if let Some(captures) = def_re.captures(candidate)
+                && let Some(name) = captures.get(1)
+            {
+                let byte_start = offset + name.start();
+                let byte_end = offset + name.end();
+                candidates.push(StanDefinitionCandidate {
+                    name: name.as_str().to_string(),
+                    line: line_idx as u32,
+                    start_col: crate::cross_file::types::byte_offset_to_utf16_column(
+                        line, byte_start,
+                    ),
+                    end_col: crate::cross_file::types::byte_offset_to_utf16_column(line, byte_end),
+                });
+                break;
             }
         }
 
@@ -13125,7 +13116,7 @@ fn find_assignment_statement<'a>(
                 return Some(StatementMatch {
                     node,
                     header_only: false,
-                })
+                });
             }
             "parameter" => {
                 // For parameters, find enclosing function_definition
@@ -13159,13 +13150,13 @@ fn find_function_statement<'a>(
         match node.kind() {
             "function_definition" => {
                 // Check if parent is assignment
-                if let Some(parent) = node.parent() {
-                    if parent.kind() == "binary_operator" {
-                        return Some(StatementMatch {
-                            node: parent,
-                            header_only: false,
-                        });
-                    }
+                if let Some(parent) = node.parent()
+                    && parent.kind() == "binary_operator"
+                {
+                    return Some(StatementMatch {
+                        node: parent,
+                        header_only: false,
+                    });
                 }
                 return Some(StatementMatch {
                     node,
@@ -13212,10 +13203,10 @@ fn find_enclosing_function(mut node: tree_sitter::Node) -> Option<tree_sitter::N
     loop {
         if node.kind() == "function_definition" {
             // Check if parent is assignment
-            if let Some(parent) = node.parent() {
-                if parent.kind() == "binary_operator" {
-                    return Some(parent);
-                }
+            if let Some(parent) = node.parent()
+                && parent.kind() == "binary_operator"
+            {
+                return Some(parent);
             }
             return Some(node);
         }
@@ -13356,13 +13347,13 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
                     }
                 }
                 // Add partial last line if body starts mid-line
-                if body_start.column > 0 {
-                    if let Some(line) = lines.get(body_start.row) {
-                        if !result.is_empty() {
-                            result.push('\n');
-                        }
-                        result.push_str(line[..body_start.column.min(line.len())].trim_end());
+                if body_start.column > 0
+                    && let Some(line) = lines.get(body_start.row)
+                {
+                    if !result.is_empty() {
+                        result.push('\n');
                     }
+                    result.push_str(line[..body_start.column.min(line.len())].trim_end());
                 }
                 return result;
             }
@@ -14684,17 +14675,17 @@ pub fn goto_definition_with_cancel(
         if &file_uri == uri {
             continue;
         }
-        if let Some(artifacts) = content_provider.get_artifacts(&file_uri) {
-            if let Some(symbol) = artifacts.exported_interface.get(name) {
-                // Skip package exports (they have pseudo-URIs that can't be navigated to)
-                if symbol.source_uri.as_str().starts_with("package:") {
-                    continue;
-                }
-                return Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: symbol.source_uri.clone(),
-                    range: scoped_symbol_range(symbol, name),
-                }));
+        if let Some(artifacts) = content_provider.get_artifacts(&file_uri)
+            && let Some(symbol) = artifacts.exported_interface.get(name)
+        {
+            // Skip package exports (they have pseudo-URIs that can't be navigated to)
+            if symbol.source_uri.as_str().starts_with("package:") {
+                continue;
             }
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: symbol.source_uri.clone(),
+                range: scoped_symbol_range(symbol, name),
+            }));
         }
     }
 
@@ -14706,17 +14697,17 @@ pub fn goto_definition_with_cancel(
         if &file_uri == uri {
             continue;
         }
-        if let Some(artifacts) = content_provider.get_artifacts(&file_uri) {
-            if let Some(symbol) = artifacts.exported_interface.get(name) {
-                // Skip package exports (they have pseudo-URIs that can't be navigated to)
-                if symbol.source_uri.as_str().starts_with("package:") {
-                    continue;
-                }
-                return Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: symbol.source_uri.clone(),
-                    range: scoped_symbol_range(symbol, name),
-                }));
+        if let Some(artifacts) = content_provider.get_artifacts(&file_uri)
+            && let Some(symbol) = artifacts.exported_interface.get(name)
+        {
+            // Skip package exports (they have pseudo-URIs that can't be navigated to)
+            if symbol.source_uri.as_str().starts_with("package:") {
+                continue;
             }
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: symbol.source_uri.clone(),
+                range: scoped_symbol_range(symbol, name),
+            }));
         }
     }
 
@@ -14985,16 +14976,16 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         }
         if let Some(content) = content_provider.get_content(&file_uri) {
             // Parse the content to search for references
-            if let Some(doc_state) = state.document_store.get_without_touch(&file_uri) {
-                if let Some(tree) = &doc_state.tree {
-                    find_references_in_tree(
-                        tree.root_node(),
-                        name,
-                        &content,
-                        &file_uri,
-                        &mut locations,
-                    );
-                }
+            if let Some(doc_state) = state.document_store.get_without_touch(&file_uri)
+                && let Some(tree) = &doc_state.tree
+            {
+                find_references_in_tree(
+                    tree.root_node(),
+                    name,
+                    &content,
+                    &file_uri,
+                    &mut locations,
+                );
             }
         }
     }
@@ -15235,12 +15226,12 @@ fn find_user_function_signature(
     name: &str,
 ) -> Option<String> {
     // 1. Search current document
-    if let Some(doc) = state.get_document(current_uri) {
-        if let Some(tree) = &doc.tree {
-            let text = doc.text();
-            if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
-                return Some(extract_function_signature(func_node, name, &text));
-            }
+    if let Some(doc) = state.get_document(current_uri)
+        && let Some(tree) = &doc.tree
+    {
+        let text = doc.text();
+        if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
+            return Some(extract_function_signature(func_node, name, &text));
         }
     }
 
@@ -34836,8 +34827,8 @@ setClass("{}", slots = c(value = "numeric"))
                 // in the items list (since they are prepended)
                 if let Some(last_param_idx) = items.iter().rposition(|item| {
                     item.sort_text.as_ref().is_some_and(|st| st.starts_with("0-"))
-                }) {
-                    if let Some(first_standard_idx) = items.iter().position(|item| {
+                })
+                    && let Some(first_standard_idx) = items.iter().position(|item| {
                         item.sort_text.as_ref().is_some_and(|st| {
                             st.starts_with("1-") || st.starts_with("4-") || st.starts_with("5-")
                         })
@@ -34851,7 +34842,6 @@ setClass("{}", slots = c(value = "numeric"))
                             code
                         );
                     }
-                }
 
                 // --- Check 4: Parameter completions are ADDITIVE (not replacing) ---
                 // The total number of items should be greater than just the parameter count
@@ -35013,8 +35003,8 @@ setClass("{}", slots = c(value = "numeric"))
                     // If the detail includes a default value (optional enhancement),
                     // verify it matches the actual default value.
                     // The design doc specifies the format: "parameter = <default>"
-                    if let Some(default_val) = default {
-                        if detail_str.contains('=') {
+                    if let Some(default_val) = default
+                        && detail_str.contains('=') {
                             // Detail includes a default — verify it contains the
                             // actual default value string
                             prop_assert!(
@@ -35030,7 +35020,6 @@ setClass("{}", slots = c(value = "numeric"))
                         // If detail is just "parameter" (no default shown), that's
                         // acceptable — defaults in detail are an optional enhancement
                         // per Requirements 2.3, 4.3, 5.2.
-                    }
                 }
             } else {
                 prop_assert!(false, "Expected CompletionResponse::Array");
@@ -37090,20 +37079,20 @@ process_data <- function(data, threshold = 0.5, ...) {
 
         for (position, symbol_name, expected_statement) in hover_tests {
             let hover_result = hover_blocking(&state, &uri, position);
-            if let Some(hover) = hover_result {
-                if let HoverContents::Markup(content) = hover.contents {
-                    assert!(
-                        content.value.contains(expected_statement),
-                        "Hover for '{}' should contain '{}', got: {}",
-                        symbol_name,
-                        expected_statement,
-                        content.value
-                    );
-                    assert!(
-                        content.value.contains("this file"),
-                        "Hover should show file location"
-                    );
-                }
+            if let Some(hover) = hover_result
+                && let HoverContents::Markup(content) = hover.contents
+            {
+                assert!(
+                    content.value.contains(expected_statement),
+                    "Hover for '{}' should contain '{}', got: {}",
+                    symbol_name,
+                    expected_statement,
+                    content.value
+                );
+                assert!(
+                    content.value.contains("this file"),
+                    "Hover should show file location"
+                );
             }
         }
     }
@@ -37275,13 +37264,13 @@ helper_transform <- function(data) {
         let multi_line_func_position = Position::new(13, 0); // analyze_data function name
         let hover_result = hover_blocking(&state, &main_uri, multi_line_func_position);
 
-        if let Some(hover) = hover_result {
-            if let HoverContents::Markup(content) = hover.contents {
-                assert!(content.value.contains("analyze_data <- function(dataset,"));
-                assert!(content.value.contains("this file"));
-                // Should handle markdown special characters properly
-                assert!(!content.value.contains("*asterisks*")); // Should be escaped
-            }
+        if let Some(hover) = hover_result
+            && let HoverContents::Markup(content) = hover.contents
+        {
+            assert!(content.value.contains("analyze_data <- function(dataset,"));
+            assert!(content.value.contains("this file"));
+            // Should handle markdown special characters properly
+            assert!(!content.value.contains("*asterisks*")); // Should be escaped
         }
 
         // Test no false positives for valid symbols
@@ -37396,14 +37385,14 @@ local_var <- 200"#;
         let hover_position = Position::new(5, 16); // "global_func" usage
         let hover_result = hover_blocking(&state, &main_uri, hover_position);
 
-        if let Some(hover) = hover_result {
-            if let HoverContents::Markup(content) = hover.contents {
-                assert!(content.value.contains("global_func"));
-                assert!(
-                    content.value.contains("global_source.R"),
-                    "Should show cross-file source"
-                );
-            }
+        if let Some(hover) = hover_result
+            && let HoverContents::Markup(content) = hover.contents
+        {
+            assert!(content.value.contains("global_func"));
+            assert!(
+                content.value.contains("global_source.R"),
+                "Should show cross-file source"
+            );
         }
     }
 
@@ -37450,15 +37439,17 @@ result <- helper_with_spaces(42)"#;
         let position = Position::new(1, 10); // "helper_with_spaces"
         let hover_result = hover_blocking(&state, &main_uri, position);
 
-        if let Some(hover) = hover_result {
-            if let HoverContents::Markup(content) = hover.contents {
-                // Should contain properly formatted hyperlink
-                assert!(content.value.contains("[utils/helpers with spaces.R]"));
-                assert!(content
+        if let Some(hover) = hover_result
+            && let HoverContents::Markup(content) = hover.contents
+        {
+            // Should contain properly formatted hyperlink
+            assert!(content.value.contains("[utils/helpers with spaces.R]"));
+            assert!(
+                content
                     .value
-                    .contains("file:///workspace/utils/helpers%20with%20spaces.R"));
-                assert!(content.value.contains("line 1"));
-            }
+                    .contains("file:///workspace/utils/helpers%20with%20spaces.R")
+            );
+            assert!(content.value.contains("line 1"));
         }
     }
 
@@ -37601,9 +37592,11 @@ result <- helper_with_spaces(42)"#;
             1,
             "Should emit one diagnostic for missing package"
         );
-        assert!(diagnostics[0]
-            .message
-            .contains("__nonexistent_package_xyz__"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("__nonexistent_package_xyz__")
+        );
         assert!(diagnostics[0].message.contains("not installed"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     }
@@ -39044,8 +39037,7 @@ result <- helper_with_spaces(42)"#;
             .documents
             .insert(utils_url.clone(), Document::new(utils_code, None));
 
-        let main_code =
-            "analyze <- function(method) { method }\nfor (j in 1:3) { print(j) }\nsource('utils.R')";
+        let main_code = "analyze <- function(method) { method }\nfor (j in 1:3) { print(j) }\nsource('utils.R')";
         state
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
@@ -40492,8 +40484,8 @@ y <- x"#;
 mod position_aware_tests {
     use crate::cross_file::directive::parse_directives;
     use crate::handlers::{
-        collect_undefined_variables_from_snapshot, diagnostics_from_snapshot, goto_definition,
-        DiagCancelToken, DiagnosticsSnapshot,
+        DiagCancelToken, DiagnosticsSnapshot, collect_undefined_variables_from_snapshot,
+        diagnostics_from_snapshot, goto_definition,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Url};
@@ -43179,7 +43171,7 @@ source(\"helpers.R\")
 #[cfg(test)]
 mod function_parameter_tests {
     use crate::handlers::{
-        collect_undefined_variables_from_snapshot, DiagCancelToken, DiagnosticsSnapshot,
+        DiagCancelToken, DiagnosticsSnapshot, collect_undefined_variables_from_snapshot,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{DiagnosticSeverity, Url};
@@ -44422,7 +44414,7 @@ my_func <- function(a = default_value) {
 
 #[cfg(test)]
 mod diagnostics_master_switch_tests {
-    use crate::handlers::{diagnostics, DiagCancelToken};
+    use crate::handlers::{DiagCancelToken, diagnostics};
     use crate::state::{Document, WorldState};
     use proptest::prelude::*;
     use tower_lsp::lsp_types::{DiagnosticSeverity, Url};
@@ -44941,9 +44933,11 @@ mod dollar_member_completion_tests {
         let items = completion_items("foo <- list(alpha = 1, beta = 2)\nfoo$|");
 
         assert_eq!(sorted_labels(&items), vec!["alpha", "beta"]);
-        assert!(items
-            .iter()
-            .all(|item| item.kind == Some(CompletionItemKind::FIELD)));
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind == Some(CompletionItemKind::FIELD))
+        );
     }
 
     #[test]
@@ -46509,9 +46503,11 @@ mod block_detector_integration_tests {
 
         assert_eq!(trend_section.range.end, outer_loop.range.end);
         let trend_children = trend_section.children.as_ref().unwrap();
-        assert!(trend_children
-            .iter()
-            .any(|s| s.name == "for (p_idx in 1:n_p1)"));
+        assert!(
+            trend_children
+                .iter()
+                .any(|s| s.name == "for (p_idx in 1:n_p1)")
+        );
     }
 
     #[test]

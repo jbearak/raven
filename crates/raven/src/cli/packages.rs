@@ -14,9 +14,9 @@ use std::process::Command;
 use std::{fs::OpenOptions, io::Write};
 
 use crate::cli::shared::absolute_path;
-use crate::package_db::binary_db::{write_shipped_db, ShippedDb, ShippedDbProvenance};
+use crate::package_db::binary_db::{ShippedDb, ShippedDbProvenance, write_shipped_db};
 use crate::package_db::json_db::{
-    read_repo_db_file, write_repo_db_file, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+    REPO_DB_SCHEMA_VERSION, RepoDb, RepoDbProvenance, read_repo_db_file, write_repo_db_file,
 };
 use crate::package_db::merge::merge_append_only;
 use crate::package_db::model::PackageRecord;
@@ -89,7 +89,7 @@ pub fn parse_update_args(mut argv: impl Iterator<Item = String>) -> Result<Updat
             s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
             s if date.is_some() => return Err(format!("unexpected extra argument: {s}")),
             s if !is_yyyy_mm_dd(s) => {
-                return Err(format!("expected a release date as YYYY-MM-DD, got: {s}"))
+                return Err(format!("expected a release date as YYYY-MM-DD, got: {s}"));
             }
             s => date = Some(s.to_string()),
         }
@@ -99,7 +99,7 @@ pub fn parse_update_args(mut argv: impl Iterator<Item = String>) -> Result<Updat
     // suffix on the default GitHub base.
     let base_url = match (base_url, date) {
         (Some(_), Some(_)) => {
-            return Err("pass either a YYYY-MM-DD release date or --base-url, not both".into())
+            return Err("pass either a YYYY-MM-DD release date or --base-url, not both".into());
         }
         (Some(b), None) => b,
         (None, Some(d)) => format!("{DEFAULT_NAMES_DB_RELEASE_BASE}-{d}"),
@@ -285,15 +285,16 @@ fn renv_skew_warnings(
 ) -> Vec<String> {
     let mut out = Vec::new();
     for rec in fetched {
-        if let Some(want) = pinned.get(&rec.name) {
-            if !want.is_empty() && want != &rec.version {
-                out.push(format!(
-                    "{}: fetched {} (latest); renv.lock pins {}. Export names usually match \
+        if let Some(want) = pinned.get(&rec.name)
+            && !want.is_empty()
+            && want != &rec.version
+        {
+            out.push(format!(
+                "{}: fetched {} (latest); renv.lock pins {}. Export names usually match \
                      across versions; install it and use `freeze` / `--missing-only` for a \
                      version-exact capture.",
-                    rec.name, rec.version, want
-                ));
-            }
+                rec.name, rec.version, want
+            ));
         }
     }
     out
@@ -591,11 +592,11 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
     let out = absolute_path(&root, &args.output);
     // `read_repo_db_file` maps a missing file to `Err(Absent)`, so no `exists()`
     // pre-check is needed — an absent/unreadable file simply isn't a no-op match.
-    if let Ok(existing) = read_repo_db_file(&out) {
-        if existing.packages == records {
-            eprintln!("no changes; left {} untouched", out.display());
-            return Ok(());
-        }
+    if let Ok(existing) = read_repo_db_file(&out)
+        && existing.packages == records
+    {
+        eprintln!("no changes; left {} untouched", out.display());
+        return Ok(());
     }
 
     let r_version = lib
@@ -690,21 +691,20 @@ fn collect_referenced_packages(
                     if matches!(
                         func_text,
                         "library" | "require" | "loadNamespace" | "requireNamespace"
-                    ) {
-                        if let Some(args) = node.child_by_field_name("arguments") {
-                            for i in 0..args.child_count() {
-                                let Some(arg) = args.child(i) else { continue };
-                                if arg.kind() != "argument" {
-                                    continue;
+                    ) && let Some(args) = node.child_by_field_name("arguments")
+                    {
+                        for i in 0..args.child_count() {
+                            let Some(arg) = args.child(i) else { continue };
+                            if arg.kind() != "argument" {
+                                continue;
+                            }
+                            if let Some(value) = arg.child_by_field_name("value") {
+                                let name = text[value.byte_range()]
+                                    .trim_matches(|c| c == '"' || c == '\'');
+                                if is_valid_package_name(name) {
+                                    out.insert(name.to_string());
                                 }
-                                if let Some(value) = arg.child_by_field_name("value") {
-                                    let name = text[value.byte_range()]
-                                        .trim_matches(|c| c == '"' || c == '\'');
-                                    if is_valid_package_name(name) {
-                                        out.insert(name.to_string());
-                                    }
-                                    break; // only the first arg names the package
-                                }
+                                break; // only the first arg names the package
                             }
                         }
                     }
@@ -773,7 +773,7 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
                     "could not read seed DB {}: {e}; rerun with --fresh only if dropping \
                      prior history is intentional",
                     seed_path.display()
-                ))
+                ));
             }
         }
     };
@@ -1393,10 +1393,9 @@ pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), 
                 if std::fs::symlink_metadata(pkg_dir.join("data"))
                     .map(|m| m.is_dir())
                     .unwrap_or(false)
+                    && let Ok(idx) = crate::namespace_parser::parse_index_exports(&pkg_dir).await
                 {
-                    if let Ok(idx) = crate::namespace_parser::parse_index_exports(&pkg_dir).await {
-                        dataset_set.extend(idx);
-                    }
+                    dataset_set.extend(idx);
                 }
             }
         }
@@ -1467,9 +1466,9 @@ pub fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use crate::package_db::binary_db::{write_shipped_db, ShippedDb, ShippedDbProvenance};
+    use crate::package_db::binary_db::{ShippedDb, ShippedDbProvenance, write_shipped_db};
     use crate::package_db::json_db::{
-        read_repo_db_file, write_repo_db_file, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+        REPO_DB_SCHEMA_VERSION, RepoDb, RepoDbProvenance, read_repo_db_file, write_repo_db_file,
     };
     use crate::package_db::model::PackageRecord;
 

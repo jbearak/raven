@@ -3,7 +3,7 @@
 // Run with: cargo bench --bench libpath_capture --features test-support
 // Real libpath: RAVEN_BENCH_LIBPATH=/usr/local/lib/R/site-library cargo bench --bench libpath_capture --features test-support
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use raven::libpath_watcher::LibpathSnapshot;
 use std::path::PathBuf;
 use tempfile::TempDir;

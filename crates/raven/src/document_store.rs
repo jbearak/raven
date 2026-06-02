@@ -8,8 +8,8 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use indexmap::IndexSet;
 use ropey::Rope;
@@ -828,33 +828,27 @@ impl DocumentStore {
     }
     /// Recursively visit nodes to find library/require calls
     fn visit_for_packages(node: tree_sitter::Node, text: &str, packages: &mut Vec<String>) {
-        if node.kind() == "call" {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                let func_text = &text[func_node.byte_range()];
+        if node.kind() == "call"
+            && let Some(func_node) = node.child_by_field_name("function")
+        {
+            let func_text = &text[func_node.byte_range()];
 
-                if func_text == "library" || func_text == "require" || func_text == "loadNamespace"
-                {
-                    if let Some(args_node) = node.child_by_field_name("arguments") {
-                        for i in 0..args_node.child_count() {
-                            if let Some(child) = args_node.child(i) {
-                                if child.kind() == "argument" {
-                                    if let Some(value_node) = child.child_by_field_name("value") {
-                                        let value_text = &text[value_node.byte_range()];
-                                        let pkg_name = value_text
-                                            .trim_matches(|c: char| c == '"' || c == '\'');
-                                        if crate::r_subprocess::is_valid_package_name(pkg_name) {
-                                            packages.push(pkg_name.to_string());
-                                        } else {
-                                            log::warn!(
-                                                "Skipping suspicious package name: {}",
-                                                pkg_name
-                                            );
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
+            if (func_text == "library" || func_text == "require" || func_text == "loadNamespace")
+                && let Some(args_node) = node.child_by_field_name("arguments")
+            {
+                for i in 0..args_node.child_count() {
+                    if let Some(child) = args_node.child(i)
+                        && child.kind() == "argument"
+                        && let Some(value_node) = child.child_by_field_name("value")
+                    {
+                        let value_text = &text[value_node.byte_range()];
+                        let pkg_name = value_text.trim_matches(|c: char| c == '"' || c == '\'');
+                        if crate::r_subprocess::is_valid_package_name(pkg_name) {
+                            packages.push(pkg_name.to_string());
+                        } else {
+                            log::warn!("Skipping suspicious package name: {}", pkg_name);
                         }
+                        break;
                     }
                 }
             }
@@ -1967,8 +1961,8 @@ mod tests {
 
                 // The last accessed document should still be present (if any eviction occurred)
                 // because it was most recently used
-                if let Some(ref last_uri) = last_accessed {
-                    if store.metrics().evictions > 0 && store.len() > 1 {
+                if let Some(ref last_uri) = last_accessed
+                    && store.metrics().evictions > 0 && store.len() > 1 {
                         // If evictions happened and we have multiple docs,
                         // the most recently accessed should likely still be there
                         // (unless the large doc alone exceeds the limit)
@@ -1984,7 +1978,6 @@ mod tests {
                             let _ = last_uri; // Acknowledge we checked
                         }
                     }
-                }
 
                 // Memory should be within limits
                 let final_memory = store.estimate_memory_usage();

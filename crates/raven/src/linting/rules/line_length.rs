@@ -5,9 +5,9 @@
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 
+use crate::linting::LINT_SOURCE;
 use crate::linting::nolint::Suppressions;
 use crate::linting::rule_ids;
-use crate::linting::LINT_SOURCE;
 
 pub(crate) fn collect(
     text: &str,

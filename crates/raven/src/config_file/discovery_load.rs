@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{find_config, load_lintr, load_toml, DiscoveredConfig};
+use super::{DiscoveredConfig, find_config, load_lintr, load_toml};
 
 /// Outcome of discovering and loading a project config from a directory.
 ///

@@ -113,10 +113,10 @@ fn detect_roxygen_usage(workspace_root: &Path) -> bool {
         } else {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if ROXYGEN_EXPORT_RE.is_match(&content) {
-                return true;
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && ROXYGEN_EXPORT_RE.is_match(&content)
+        {
+            return true;
         }
     }
     false

@@ -14,7 +14,7 @@ use super::config::{CallSiteDefault, CrossFileConfig};
 use super::dependency::DependencyGraph;
 #[cfg(test)]
 use super::types::BackwardDirective;
-use super::types::{byte_offset_to_utf16_column, CallSiteSpec, CrossFileMetadata};
+use super::types::{CallSiteSpec, CrossFileMetadata, byte_offset_to_utf16_column};
 
 /// Resolve the effective call site when a file is sourced multiple times.
 /// Returns the earliest call site position using lexicographic ordering.
@@ -208,12 +208,12 @@ where
                 .unwrap_or_default();
 
             // Try to get parent directory name for relative path matching
-            if let Some(parent) = full_path.parent() {
-                if let Some(parent_name) = parent.file_name() {
-                    let parent_str = parent_name.to_string_lossy();
-                    // Return "parent/filename" format for better matching
-                    return format!("{}/{}", parent_str, filename);
-                }
+            if let Some(parent) = full_path.parent()
+                && let Some(parent_name) = parent.file_name()
+            {
+                let parent_str = parent_name.to_string_lossy();
+                // Return "parent/filename" format for better matching
+                return format!("{}/{}", parent_str, filename);
             }
             filename
         })

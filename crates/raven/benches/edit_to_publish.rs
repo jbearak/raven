@@ -19,12 +19,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 use url::Url;
 
-use raven::handlers::{diagnostics_via_snapshot, DiagCancelToken};
-use raven::state::{scan_workspace, Document, WorldState};
+use raven::handlers::{DiagCancelToken, diagnostics_via_snapshot};
+use raven::state::{Document, WorldState, scan_workspace};
 
 // ---------------------------------------------------------------------------
 // Topology generators

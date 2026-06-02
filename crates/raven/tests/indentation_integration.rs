@@ -8,8 +8,8 @@
 //! **Validates: Requirements 3.2, 4.1, 6.1, 7.2, 7.3**
 
 use raven::indentation::{
-    calculate_indentation, detect_context, format_indentation, IndentContext, IndentationConfig,
-    IndentationStyle,
+    IndentContext, IndentationConfig, IndentationStyle, calculate_indentation, detect_context,
+    format_indentation,
 };
 use tower_lsp::lsp_types::Position;
 use tree_sitter::Parser;

@@ -15,8 +15,8 @@ use lru::LruCache;
 use tree_sitter::Node;
 use url::Url;
 
-use crate::cross_file::scope::ScopeAtPosition;
 use crate::cross_file::SymbolKind;
+use crate::cross_file::scope::ScopeAtPosition;
 use crate::state::WorldState;
 
 // ---------------------------------------------------------------------------
@@ -964,31 +964,43 @@ mod tests {
         cache.insert_user(format!("{}#func_c", other_uri.as_str()), sig3);
 
         // Verify all are present
-        assert!(cache
-            .get_user(&format!("{}#func_a", uri.as_str()))
-            .is_some());
-        assert!(cache
-            .get_user(&format!("{}#func_b", uri.as_str()))
-            .is_some());
-        assert!(cache
-            .get_user(&format!("{}#func_c", other_uri.as_str()))
-            .is_some());
+        assert!(
+            cache
+                .get_user(&format!("{}#func_a", uri.as_str()))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_user(&format!("{}#func_b", uri.as_str()))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_user(&format!("{}#func_c", other_uri.as_str()))
+                .is_some()
+        );
 
         // Invalidate the first file
         cache.invalidate_file(&uri);
 
         // Signatures from the invalidated file should be gone
-        assert!(cache
-            .get_user(&format!("{}#func_a", uri.as_str()))
-            .is_none());
-        assert!(cache
-            .get_user(&format!("{}#func_b", uri.as_str()))
-            .is_none());
+        assert!(
+            cache
+                .get_user(&format!("{}#func_a", uri.as_str()))
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_user(&format!("{}#func_b", uri.as_str()))
+                .is_none()
+        );
 
         // Signature from the other file should still be present
-        assert!(cache
-            .get_user(&format!("{}#func_c", other_uri.as_str()))
-            .is_some());
+        assert!(
+            cache
+                .get_user(&format!("{}#func_c", other_uri.as_str()))
+                .is_some()
+        );
     }
 
     #[test]

@@ -19,9 +19,9 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
+use crate::linting::LINT_SOURCE;
 use crate::linting::nolint::Suppressions;
 use crate::linting::rule_ids;
-use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
 pub(crate) fn collect(
@@ -46,22 +46,22 @@ fn visit(
     if matches!(node.kind(), "call" | "subset" | "subset2") {
         return;
     }
-    if node.kind() == "binary_operator" {
-        if let Some(op) = node.child_by_field_name("operator") {
-            let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
-            if matches!(op_text, "|" | "||") {
-                let lhs = node.child_by_field_name("lhs");
-                let rhs = node.child_by_field_name("rhs");
-                let lhs_bare = lhs.is_some_and(|n| is_bare_and(n, text));
-                let rhs_bare = rhs.is_some_and(|n| is_bare_and(n, text));
-                if lhs_bare || rhs_bare {
-                    let and_node = if lhs_bare { lhs.unwrap() } else { rhs.unwrap() };
-                    let and_op_text = and_node
-                        .child_by_field_name("operator")
-                        .and_then(|n| text.get(n.start_byte()..n.end_byte()))
-                        .unwrap_or("&");
-                    emit(op, op_text, and_op_text, text, severity, suppressions, out);
-                }
+    if node.kind() == "binary_operator"
+        && let Some(op) = node.child_by_field_name("operator")
+    {
+        let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
+        if matches!(op_text, "|" | "||") {
+            let lhs = node.child_by_field_name("lhs");
+            let rhs = node.child_by_field_name("rhs");
+            let lhs_bare = lhs.is_some_and(|n| is_bare_and(n, text));
+            let rhs_bare = rhs.is_some_and(|n| is_bare_and(n, text));
+            if lhs_bare || rhs_bare {
+                let and_node = if lhs_bare { lhs.unwrap() } else { rhs.unwrap() };
+                let and_op_text = and_node
+                    .child_by_field_name("operator")
+                    .and_then(|n| text.get(n.start_byte()..n.end_byte()))
+                    .unwrap_or("&");
+                emit(op, op_text, and_op_text, text, severity, suppressions, out);
             }
         }
     }

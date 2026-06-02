@@ -165,10 +165,10 @@ impl HelpCache {
 
         // Check argument cache under read lock (concurrent reads allowed)
         {
-            if let Ok(guard) = self.arguments.read() {
-                if let Some(cached) = guard.peek(&key) {
-                    return cached.clone();
-                }
+            if let Ok(guard) = self.arguments.read()
+                && let Some(cached) = guard.peek(&key)
+            {
+                return cached.clone();
             }
         }
 
@@ -177,11 +177,7 @@ impl HelpCache {
         let args = match help_text {
             Some(text) => {
                 let map = extract_arguments_from_help(&text);
-                if map.is_empty() {
-                    None
-                } else {
-                    Some(map)
-                }
+                if map.is_empty() { None } else { Some(map) }
             }
             // Transient R failure — don't cache so retries can succeed later
             None => return None,
@@ -309,11 +305,11 @@ fn get_help_inner(
         log::trace!("get_help: topic {:?} failed validation", topic);
         return None;
     }
-    if let Some(p) = package {
-        if !crate::r_subprocess::is_valid_package_name(p) {
-            log::trace!("get_help: package {:?} failed validation", p);
-            return None;
-        }
+    if let Some(p) = package
+        && !crate::r_subprocess::is_valid_package_name(p)
+    {
+        log::trace!("get_help: package {:?} failed validation", p);
+        return None;
     }
 
     let timeout = timeout_from_env();
@@ -360,19 +356,19 @@ fn get_help_inner(
 
     let stdout_thread = std::thread::spawn(move || -> Vec<u8> {
         let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            if let Err(e) = pipe.read_to_end(&mut buf) {
-                log::trace!("get_help: failed to read stdout pipe: {}", e);
-            }
+        if let Some(mut pipe) = stdout_pipe
+            && let Err(e) = pipe.read_to_end(&mut buf)
+        {
+            log::trace!("get_help: failed to read stdout pipe: {}", e);
         }
         buf
     });
     let stderr_thread = std::thread::spawn(move || -> Vec<u8> {
         let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            if let Err(e) = pipe.read_to_end(&mut buf) {
-                log::trace!("get_help: failed to read stderr pipe: {}", e);
-            }
+        if let Some(mut pipe) = stderr_pipe
+            && let Err(e) = pipe.read_to_end(&mut buf)
+        {
+            log::trace!("get_help: failed to read stderr pipe: {}", e);
         }
         buf
     });
@@ -870,12 +866,11 @@ fn is_r_param_name(s: &str) -> bool {
     if !(first.is_alphabetic() || first == '.') {
         return false;
     }
-    if first == '.' {
-        if let Some(&next) = s.as_bytes().get(1) {
-            if next.is_ascii_digit() {
-                return false;
-            }
-        }
+    if first == '.'
+        && let Some(&next) = s.as_bytes().get(1)
+        && next.is_ascii_digit()
+    {
+        return false;
     }
     chars.all(|c| c.is_alphanumeric() || c == '.' || c == '_')
 }

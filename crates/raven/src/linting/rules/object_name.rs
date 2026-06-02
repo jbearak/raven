@@ -34,10 +34,10 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
+use crate::linting::LINT_SOURCE;
 use crate::linting::config::ObjectNameStyle;
 use crate::linting::nolint::Suppressions;
 use crate::linting::rule_ids;
-use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
 /// Per-kind style configuration for the rule.
@@ -168,7 +168,8 @@ fn check_parameters(
         return;
     }
     let params_node = node.child_by_field_name("parameters").or_else(|| {
-        node.children(&mut node.walk())
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
             .find(|c| c.is_named() && c.kind() == "parameters")
     });
     let params_node = match params_node {

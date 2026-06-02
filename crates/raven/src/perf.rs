@@ -7,8 +7,8 @@
 //   RAVEN_PERF=1 raven --stdio      # Enable basic timing logs
 //   RAVEN_PERF=verbose raven --stdio # Enable detailed timing with thresholds
 
-use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Global flag indicating whether performance timing is enabled
@@ -105,15 +105,16 @@ impl Drop for TimingGuard {
         let elapsed = self.start.elapsed();
         log::info!("[PERF] {} completed in {:?}", self.name, elapsed);
 
-        if let Some(threshold) = self.threshold_warn_ms {
-            if elapsed.as_millis() > threshold as u128 && is_verbose() {
-                log::warn!(
-                    "[PERF] {} exceeded threshold ({}ms > {}ms)",
-                    self.name,
-                    elapsed.as_millis(),
-                    threshold
-                );
-            }
+        if let Some(threshold) = self.threshold_warn_ms
+            && elapsed.as_millis() > threshold as u128
+            && is_verbose()
+        {
+            log::warn!(
+                "[PERF] {} exceeded threshold ({}ms > {}ms)",
+                self.name,
+                elapsed.as_millis(),
+                threshold
+            );
         }
     }
 }
@@ -211,10 +212,10 @@ pub fn record_first_diagnostic(duration: Duration) {
     if !is_enabled() {
         return;
     }
-    if let Ok(mut metrics) = startup_metrics().lock() {
-        if metrics.first_diagnostic_duration.is_none() {
-            metrics.first_diagnostic_duration = Some(duration);
-        }
+    if let Ok(mut metrics) = startup_metrics().lock()
+        && metrics.first_diagnostic_duration.is_none()
+    {
+        metrics.first_diagnostic_duration = Some(duration);
     }
 }
 

@@ -5,13 +5,13 @@
 //
 // Allocation tracking: set RAVEN_BENCH_ALLOC=1 to report allocation counts.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tree_sitter::Parser;
 use url::Url;
 
-use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
+use raven::test_utils::fixture_workspace::{FixtureConfig, create_fixture_workspace};
 
 // Optional allocation counting (active when RAVEN_BENCH_ALLOC=1).
 #[path = "../src/test_utils/alloc_counter.rs"]

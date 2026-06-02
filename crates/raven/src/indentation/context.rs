@@ -314,10 +314,10 @@ pub fn find_matching_opener<'a>(node: Node<'a>, delimiter: char) -> Option<Node<
             // For call nodes, return the arguments child if it exists
             if current.kind() == "call" {
                 for i in 0..current.child_count() {
-                    if let Some(child) = current.child(i) {
-                        if child.kind() == "arguments" {
-                            return Some(child);
-                        }
+                    if let Some(child) = current.child(i)
+                        && child.kind() == "arguments"
+                    {
+                        return Some(child);
                     }
                 }
             }
@@ -659,16 +659,16 @@ fn should_use_fallback(root: Node, source: &str, position: Position) -> bool {
             return true;
         }
 
-        if let Some(prev_line_text) = source.lines().nth(prev_row) {
-            if !prev_line_text.is_empty() {
-                let end_col = prev_line_text.len().saturating_sub(1);
-                let prev_end = tree_sitter::Point {
-                    row: prev_row,
-                    column: end_col,
-                };
-                if has_error_at(prev_end) {
-                    return true;
-                }
+        if let Some(prev_line_text) = source.lines().nth(prev_row)
+            && !prev_line_text.is_empty()
+        {
+            let end_col = prev_line_text.len().saturating_sub(1);
+            let prev_end = tree_sitter::Point {
+                row: prev_row,
+                column: end_col,
+            };
+            if has_error_at(prev_end) {
+                return true;
             }
         }
     }
@@ -694,61 +694,61 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
     // 1. Check if current line starts with closing delimiter
     if let Some(line_text) = source.lines().nth(position.line as usize) {
         let trimmed = line_text.trim_start();
-        if let Some(first_char) = trimmed.chars().next() {
-            if matches!(first_char, ')' | ']' | '}') {
-                // Find matching opener using simple bracket counting
-                if let Some((opener_line, opener_col)) =
-                    find_matching_opener_heuristic(source, position.line, first_char)
-                {
-                    return IndentContext::ClosingDelimiter {
-                        opener_line,
-                        opener_col,
-                        delimiter: first_char,
-                    };
-                }
-                // No matching opener found - use previous line indent
-                let prev_indent = if position.line > 0 {
-                    get_line_indent(source, position.line - 1, tab_size)
-                } else {
-                    0
-                };
-                return IndentContext::AfterCompleteExpression {
-                    enclosing_block_indent: prev_indent,
+        if let Some(first_char) = trimmed.chars().next()
+            && matches!(first_char, ')' | ']' | '}')
+        {
+            // Find matching opener using simple bracket counting
+            if let Some((opener_line, opener_col)) =
+                find_matching_opener_heuristic(source, position.line, first_char)
+            {
+                return IndentContext::ClosingDelimiter {
+                    opener_line,
+                    opener_col,
+                    delimiter: first_char,
                 };
             }
+            // No matching opener found - use previous line indent
+            let prev_indent = if position.line > 0 {
+                get_line_indent(source, position.line - 1, tab_size)
+            } else {
+                0
+            };
+            return IndentContext::AfterCompleteExpression {
+                enclosing_block_indent: prev_indent,
+            };
         }
     }
 
     // 2. Check if previous line ends with continuation operator
-    if position.line > 0 {
-        if let Some(prev_line) = source.lines().nth((position.line - 1) as usize) {
-            let trimmed = strip_trailing_comment(prev_line).trim_end();
+    if position.line > 0
+        && let Some(prev_line) = source.lines().nth((position.line - 1) as usize)
+    {
+        let trimmed = strip_trailing_comment(prev_line).trim_end();
 
-            // Check for continuation operators
-            let operator_type = if trimmed.ends_with("|>") {
-                Some(OperatorType::Pipe)
-            } else if trimmed.ends_with("%>%") {
-                Some(OperatorType::MagrittrPipe)
-            } else if trimmed.ends_with('+') {
-                Some(OperatorType::Plus)
-            } else if trimmed.ends_with('~') {
-                Some(OperatorType::Tilde)
-            } else if trimmed.ends_with('%') && is_custom_infix_ending(trimmed) {
-                Some(OperatorType::CustomInfix)
-            } else {
-                None
+        // Check for continuation operators
+        let operator_type = if trimmed.ends_with("|>") {
+            Some(OperatorType::Pipe)
+        } else if trimmed.ends_with("%>%") {
+            Some(OperatorType::MagrittrPipe)
+        } else if trimmed.ends_with('+') {
+            Some(OperatorType::Plus)
+        } else if trimmed.ends_with('~') {
+            Some(OperatorType::Tilde)
+        } else if trimmed.ends_with('%') && is_custom_infix_ending(trimmed) {
+            Some(OperatorType::CustomInfix)
+        } else {
+            None
+        };
+
+        if let Some(op_type) = operator_type {
+            // Find chain start using simple backward walk
+            let (chain_start_line, chain_start_col) =
+                find_chain_start_heuristic(source, position.line - 1, tab_size);
+            return IndentContext::AfterContinuationOperator {
+                chain_start_line,
+                chain_start_col,
+                operator_type: op_type,
             };
-
-            if let Some(op_type) = operator_type {
-                // Find chain start using simple backward walk
-                let (chain_start_line, chain_start_col) =
-                    find_chain_start_heuristic(source, position.line - 1, tab_size);
-                return IndentContext::AfterContinuationOperator {
-                    chain_start_line,
-                    chain_start_col,
-                    operator_type: op_type,
-                };
-            }
         }
     }
 
@@ -1112,12 +1112,11 @@ fn is_inside_pipe_chain(node: Node, source: &str) -> bool {
                 if kind == "|>" {
                     return true;
                 }
-                if kind == "special" {
-                    if let Ok(text) = child.utf8_text(source_bytes) {
-                        if text == "%>%" {
-                            return true;
-                        }
-                    }
+                if kind == "special"
+                    && let Ok(text) = child.utf8_text(source_bytes)
+                    && text == "%>%"
+                {
+                    return true;
                 }
             }
         }
@@ -1158,11 +1157,11 @@ fn find_opener_position(node: Node, delimiter: char, _source: &str) -> Option<(u
             if current.kind() == "call" {
                 // Find the arguments child
                 for i in 0..current.child_count() {
-                    if let Some(child) = current.child(i) {
-                        if child.kind() == "arguments" {
-                            let start = child.start_position();
-                            return Some((start.row as u32, start.column as u32));
-                        }
+                    if let Some(child) = current.child(i)
+                        && child.kind() == "arguments"
+                    {
+                        let start = child.start_position();
+                        return Some((start.row as u32, start.column as u32));
                     }
                 }
             }
@@ -2027,7 +2026,7 @@ mod tests {
     fn test_is_position_valid_multibyte() {
         // CJK character: 3 bytes, 1 UTF-16 code unit
         let source = "\u{4E16}\u{754C}"; // 世界 — 2 chars, 2 UTF-16 code units, 6 bytes
-                                         // character=2 (UTF-16 count) should be valid (end of line)
+        // character=2 (UTF-16 count) should be valid (end of line)
         assert!(is_position_valid(
             source,
             Position {
@@ -5628,7 +5627,10 @@ mod tests {
             IndentContext::InsideParens { .. } => {
                 // Also acceptable if cursor is considered inside
             }
-            _ => panic!("Expected AfterCompleteExpression or InsideParens for empty function call, got {:?}", ctx),
+            _ => panic!(
+                "Expected AfterCompleteExpression or InsideParens for empty function call, got {:?}",
+                ctx
+            ),
         }
     }
 
@@ -6382,7 +6384,7 @@ mod tests {
 mod auto_close_tests {
     use super::*;
     use crate::indentation::calculator::{
-        calculate_indentation, IndentationConfig, IndentationStyle,
+        IndentationConfig, IndentationStyle, calculate_indentation,
     };
     use tower_lsp::lsp_types::Position;
 

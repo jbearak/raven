@@ -11,7 +11,7 @@
 //!
 //! See the help-viewer spec ("Cross-reference link rewriting") for full rules.
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::sync::OnceLock;
 
 /// Canonical basenames of R's bundled manuals that CRAN serves at
@@ -113,10 +113,10 @@ fn classify_href(href: &str) -> HrefKind {
     //
     // Unknown basenames (e.g. `rw-FAQ.html`, custom manuals) Drop rather
     // than synthesize a CRAN URL that would 404. See `R_MANUAL_BASENAMES`.
-    if let Some(rest) = href.strip_prefix("/doc/manual/") {
-        if let Some(url) = r_manual_cran_url(rest) {
-            return HrefKind::Replace(url);
-        }
+    if let Some(rest) = href.strip_prefix("/doc/manual/")
+        && let Some(url) = r_manual_cran_url(rest)
+    {
+        return HrefKind::Replace(url);
     }
     if let Some(rest) = href.strip_prefix("../../") {
         let mut parts = rest.splitn(3, '/');

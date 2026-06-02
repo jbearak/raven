@@ -95,20 +95,20 @@ impl PathContext {
         // Apply inherited working directory if no explicit one.
         // Inherited working directories are stored as absolute paths, so use directly
         // when absolute. Only resolve if relative (legacy/edge case).
-        if ctx.working_directory.is_none() {
-            if let Some(ref inherited_wd) = metadata.inherited_working_directory {
-                let inherited_path = PathBuf::from(inherited_wd);
-                if inherited_path.is_absolute() {
-                    ctx.inherited_working_directory = Some(inherited_path);
-                } else {
-                    // Relative inherited paths should not occur in normal operation
-                    log::trace!(
-                        "Inherited WD is relative '{}' for {}, resolving relative to file directory",
-                        inherited_wd,
-                        file_uri
-                    );
-                    ctx.inherited_working_directory = resolve_working_directory(inherited_wd, &ctx);
-                }
+        if ctx.working_directory.is_none()
+            && let Some(ref inherited_wd) = metadata.inherited_working_directory
+        {
+            let inherited_path = PathBuf::from(inherited_wd);
+            if inherited_path.is_absolute() {
+                ctx.inherited_working_directory = Some(inherited_path);
+            } else {
+                // Relative inherited paths should not occur in normal operation
+                log::trace!(
+                    "Inherited WD is relative '{}' for {}, resolving relative to file directory",
+                    inherited_wd,
+                    file_uri
+                );
+                ctx.inherited_working_directory = resolve_working_directory(inherited_wd, &ctx);
             }
         }
 
@@ -256,20 +256,22 @@ fn resolve_path_impl(
         let has_explicit_wd = context.working_directory.is_some();
         let has_inherited_wd = context.inherited_working_directory.is_some();
 
-        if try_workspace_fallback && !has_explicit_wd && !has_inherited_wd {
-            if let Some(ref workspace_root) = context.workspace_root {
-                let workspace_resolved = workspace_root.join(path);
-                if let Some(workspace_canonical) = normalize_path(&workspace_resolved) {
-                    if workspace_canonical.exists() {
-                        log::trace!(
-                            "Resolved path '{}' via workspace-root fallback: '{}' (file-relative '{}' did not exist)",
-                            path,
-                            workspace_canonical.display(),
-                            canonical.display()
-                        );
-                        return Some(workspace_canonical);
-                    }
-                }
+        if try_workspace_fallback
+            && !has_explicit_wd
+            && !has_inherited_wd
+            && let Some(ref workspace_root) = context.workspace_root
+        {
+            let workspace_resolved = workspace_root.join(path);
+            if let Some(workspace_canonical) = normalize_path(&workspace_resolved)
+                && workspace_canonical.exists()
+            {
+                log::trace!(
+                    "Resolved path '{}' via workspace-root fallback: '{}' (file-relative '{}' did not exist)",
+                    path,
+                    workspace_canonical.display(),
+                    canonical.display()
+                );
+                return Some(workspace_canonical);
             }
         }
 
@@ -363,10 +365,10 @@ fn normalize_path(path: &Path) -> Option<PathBuf> {
             std::path::Component::ParentDir => {
                 // Only pop if the last component is a Normal segment
                 // Preserve RootDir and Prefix components
-                if let Some(last) = components.last() {
-                    if matches!(last, std::path::Component::Normal(_)) {
-                        components.pop();
-                    }
+                if let Some(last) = components.last()
+                    && matches!(last, std::path::Component::Normal(_))
+                {
+                    components.pop();
                 }
             }
             std::path::Component::CurDir => {}

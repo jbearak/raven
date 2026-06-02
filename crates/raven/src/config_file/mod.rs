@@ -7,13 +7,13 @@ pub mod merge;
 pub mod overrides;
 pub mod toml_loader;
 
-pub use discovery::{find_config, DiscoveredConfig};
-pub use discovery_load::{discover_and_load, DiscoveredLoad};
+pub use discovery::{DiscoveredConfig, find_config};
+pub use discovery_load::{DiscoveredLoad, discover_and_load};
 pub use lintr_loader::load as load_lintr;
 pub use merge::merge as merge_settings;
 pub use overrides::{
-    compile_lint_overrides, is_skipped_by_overrides, resolve_lint_for_document,
-    CompiledLintOverride,
+    CompiledLintOverride, compile_lint_overrides, is_skipped_by_overrides,
+    resolve_lint_for_document,
 };
 pub use toml_loader::load as load_toml;
 
@@ -43,10 +43,10 @@ pub use toml_loader::load as load_toml;
 /// "auto"`. See #281.
 fn strip_project_auto_enabled(project: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     let mut cloned = project.cloned()?;
-    if let Some(linting) = cloned.get_mut("linting").and_then(|l| l.as_object_mut()) {
-        if linting.get("enabled") == Some(&serde_json::Value::String("auto".into())) {
-            linting.remove("enabled");
-        }
+    if let Some(linting) = cloned.get_mut("linting").and_then(|l| l.as_object_mut())
+        && linting.get("enabled") == Some(&serde_json::Value::String("auto".into()))
+    {
+        linting.remove("enabled");
     }
     Some(cloned)
 }

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use raven::libpath_watcher::{spawn_watcher, LibpathEvent};
+use raven::libpath_watcher::{LibpathEvent, spawn_watcher};
 use raven::package_library::{PackageInfo, PackageLibrary};
 use tempfile::tempdir;
 use tokio::sync::mpsc;

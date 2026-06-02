@@ -45,25 +45,25 @@ pub(crate) fn pin_aware_push<V>(
 ) {
     let already_present = guard.contains(&uri);
     let cap = guard.cap().get();
-    if !already_present && guard.len() >= cap {
-        if let Ok(p) = pinned.read() {
-            let lru_unpinned = guard
-                .iter()
-                .rev()
-                .find(|(k, _)| !p.contains(*k))
-                .map(|(k, _)| k.clone());
+    if !already_present
+        && guard.len() >= cap
+        && let Ok(p) = pinned.read()
+    {
+        let lru_unpinned = guard
+            .iter()
+            .rev()
+            .find(|(k, _)| !p.contains(*k))
+            .map(|(k, _)| k.clone());
 
-            if let Some(victim) = lru_unpinned {
-                guard.pop(&victim);
-            } else {
-                let new_cap =
-                    NonZeroUsize::new(guard.len() + 1).expect("len() + 1 is always non-zero");
-                guard.resize(new_cap);
-            }
+        if let Some(victim) = lru_unpinned {
+            guard.pop(&victim);
+        } else {
+            let new_cap = NonZeroUsize::new(guard.len() + 1).expect("len() + 1 is always non-zero");
+            guard.resize(new_cap);
         }
-        // pinned.read() poisoned: fall through to push() — may evict a
-        // pinned entry, but the lock is already in a bad state.
     }
+    // pinned.read() poisoned: fall through to push() — may evict a
+    // pinned entry, but the lock is already in a bad state.
     guard.push(uri, entry);
 }
 

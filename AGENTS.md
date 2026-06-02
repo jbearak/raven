@@ -2,10 +2,10 @@ This file is intentionally short: a map to the docs and a list of invariants tha
 
 ## CI gates (keep green before committing)
 
-Rust changes must pass two gates in `.github/workflows/integration.yml`, both pinned to toolchain `1.95.0` so results are reproducible:
+Rust changes must pass two gates in `.github/workflows/integration.yml`, both pinned to toolchain `1.96.0` so results are reproducible:
 
-- **Formatting** — `cargo +1.95.0 fmt --all --check`. Always run `cargo fmt --all` before committing; never hand-format around it.
-- **Clippy** — `cargo +1.95.0 clippy --workspace --all-targets --features test-support -- -D warnings`. Zero warnings: every clippy/rustc warning is an error, across lib, tests, benches, and examples.
+- **Formatting** — `cargo +1.96.0 fmt --all --check`. Always run `cargo fmt --all` before committing; never hand-format around it.
+- **Clippy** — `cargo +1.96.0 clippy --workspace --all-targets --features test-support -- -D warnings`. Zero warnings: every clippy/rustc warning is an error, across lib, tests, benches, and examples.
 
 Both block merge. Fix the underlying issue rather than suppressing it; when a lint is a genuine, deliberate exception, use a narrowly-scoped `#[allow(...)]` with a one-line reason. Project-wide exceptions live in `crates/raven/Cargo.toml` `[lints]` (currently only `field_reassign_with_default`).
 

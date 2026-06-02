@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Tree};
 
 use super::scope::FunctionScopeInterval;
-use super::types::{byte_offset_to_utf16_column, ForwardSource};
+use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
 /// Detected rm()/remove() call with extracted symbol names
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,10 +88,10 @@ pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
 }
 
 fn visit_node(node: Node, content: &str, sources: &mut Vec<ForwardSource>) {
-    if node.kind() == "call" {
-        if let Some(source) = try_parse_source_call(node, content) {
-            sources.push(source);
-        }
+    if node.kind() == "call"
+        && let Some(source) = try_parse_source_call(node, content)
+    {
+        sources.push(source);
     }
 
     for child in node.children(&mut node.walk()) {
@@ -161,16 +161,16 @@ fn has_function_definition_ancestor(node: Node) -> bool {
 fn find_envir_is_global(args_node: &Node, content: &str) -> bool {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
-        if child.kind() == "argument" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, content);
-                if name == "envir" {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        let value = node_text(value_node, content).trim();
-                        // Check for globalenv() or .GlobalEnv
-                        return value == "globalenv()" || value == ".GlobalEnv";
-                    }
-                }
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "envir"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                let value = node_text(value_node, content).trim();
+                // Check for globalenv() or .GlobalEnv
+                return value == "globalenv()" || value == ".GlobalEnv";
             }
         }
     }
@@ -185,24 +185,25 @@ fn find_file_argument(args_node: &Node, content: &str) -> Option<String> {
 
     // Look for named "file" argument
     for child in &children {
-        if child.kind() == "argument" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, content);
-                if name == "file" {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        return extract_string_literal(value_node, content);
-                    }
-                }
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "file"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                return extract_string_literal(value_node, content);
             }
         }
     }
 
     // Use first positional argument
     for child in &children {
-        if child.kind() == "argument" && child.child_by_field_name("name").is_none() {
-            if let Some(value_node) = child.child_by_field_name("value") {
-                return extract_string_literal(value_node, content);
-            }
+        if child.kind() == "argument"
+            && child.child_by_field_name("name").is_none()
+            && let Some(value_node) = child.child_by_field_name("value")
+        {
+            return extract_string_literal(value_node, content);
         }
     }
 
@@ -212,19 +213,19 @@ fn find_file_argument(args_node: &Node, content: &str) -> Option<String> {
 fn find_bool_argument(args_node: &Node, content: &str, param_name: &str) -> Option<bool> {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
-        if child.kind() == "argument" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, content);
-                if name == param_name {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        let value = node_text(value_node, content);
-                        return match value {
-                            "TRUE" | "T" => Some(true),
-                            "FALSE" | "F" => Some(false),
-                            _ => None,
-                        };
-                    }
-                }
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == param_name
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                let value = node_text(value_node, content);
+                return match value {
+                    "TRUE" | "T" => Some(true),
+                    "FALSE" | "F" => Some(false),
+                    _ => None,
+                };
             }
         }
     }
@@ -274,12 +275,12 @@ fn visit_node_for_rm(node: Node, content: &str, rm_calls: &mut Vec<RmCall>) {
     if node.kind() == "identifier" {
         return;
     }
-    if node.kind() == "call" {
-        if let Some(rm_call) = try_parse_rm_call(node, content) {
-            // Only add if there are symbols to remove
-            if !rm_call.symbols.is_empty() {
-                rm_calls.push(rm_call);
-            }
+    if node.kind() == "call"
+        && let Some(rm_call) = try_parse_rm_call(node, content)
+    {
+        // Only add if there are symbols to remove
+        if !rm_call.symbols.is_empty() {
+            rm_calls.push(rm_call);
         }
     }
 
@@ -334,20 +335,20 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
 fn has_non_default_envir_for_rm(args_node: &Node, content: &str) -> bool {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
-        if child.kind() == "argument" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, content);
-                if name == "envir" {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        let value = node_text(value_node, content).trim();
-                        // Default-equivalent values: globalenv() or .GlobalEnv
-                        if value == "globalenv()" || value == ".GlobalEnv" {
-                            return false;
-                        }
-                        // Any other value means non-default
-                        return true;
-                    }
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "envir"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                let value = node_text(value_node, content).trim();
+                // Default-equivalent values: globalenv() or .GlobalEnv
+                if value == "globalenv()" || value == ".GlobalEnv" {
+                    return false;
                 }
+                // Any other value means non-default
+                return true;
             }
         }
     }
@@ -364,13 +365,13 @@ fn extract_bare_symbols(args_node: &Node, content: &str) -> Vec<String> {
     for child in args_node.children(&mut cursor) {
         if child.kind() == "argument" {
             // Only process positional arguments (no name)
-            if child.child_by_field_name("name").is_none() {
-                if let Some(value_node) = child.child_by_field_name("value") {
-                    // Only extract if it's an identifier (bare symbol)
-                    if value_node.kind() == "identifier" {
-                        let symbol_name = node_text(value_node, content).to_string();
-                        symbols.push(symbol_name);
-                    }
+            if child.child_by_field_name("name").is_none()
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                // Only extract if it's an identifier (bare symbol)
+                if value_node.kind() == "identifier" {
+                    let symbol_name = node_text(value_node, content).to_string();
+                    symbols.push(symbol_name);
                 }
             }
         }
@@ -394,10 +395,10 @@ fn extract_list_symbols(args_node: &Node, content: &str) -> Vec<String> {
             // Look for named argument with name "list"
             if let Some(name_node) = child.child_by_field_name("name") {
                 let name = node_text(name_node, content);
-                if name == "list" {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        return extract_list_value_symbols(value_node, content);
-                    }
+                if name == "list"
+                    && let Some(value_node) = child.child_by_field_name("value")
+                {
+                    return extract_list_value_symbols(value_node, content);
                 }
             }
         }
@@ -464,14 +465,12 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
     if let Some(args_node) = node.child_by_field_name("arguments") {
         let mut cursor = args_node.walk();
         for child in args_node.children(&mut cursor) {
-            if child.kind() == "argument" {
-                if let Some(value_node) = child.child_by_field_name("value") {
-                    if value_node.kind() == "string" {
-                        if let Some(s) = extract_string_literal(value_node, content) {
-                            symbols.push(s);
-                        }
-                    }
-                }
+            if child.kind() == "argument"
+                && let Some(value_node) = child.child_by_field_name("value")
+                && value_node.kind() == "string"
+                && let Some(s) = extract_string_literal(value_node, content)
+            {
+                symbols.push(s);
             }
         }
     }
@@ -657,15 +656,15 @@ fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
 fn has_character_only_true(args_node: &Node, content: &str) -> bool {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
-        if child.kind() == "argument" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, content);
-                if name == "character.only" {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        let value = node_text(value_node, content);
-                        return value == "TRUE" || value == "T";
-                    }
-                }
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "character.only"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                let value = node_text(value_node, content);
+                return value == "TRUE" || value == "T";
             }
         }
     }
@@ -701,24 +700,25 @@ fn extract_package_name(args_node: &Node, content: &str) -> Option<String> {
 
     // Look for named "package" argument first
     for child in &children {
-        if child.kind() == "argument" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, content);
-                if name == "package" {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        return extract_package_value(value_node, content);
-                    }
-                }
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "package"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                return extract_package_value(value_node, content);
             }
         }
     }
 
     // Use first positional argument
     for child in &children {
-        if child.kind() == "argument" && child.child_by_field_name("name").is_none() {
-            if let Some(value_node) = child.child_by_field_name("value") {
-                return extract_package_value(value_node, content);
-            }
+        if child.kind() == "argument"
+            && child.child_by_field_name("name").is_none()
+            && let Some(value_node) = child.child_by_field_name("value")
+        {
+            return extract_package_value(value_node, content);
         }
     }
 
@@ -835,12 +835,11 @@ fn record_binary_assignment(node: Node, content: &str, map: &mut HashMap<String,
     let entry = map.entry(name).or_default();
     entry.assignment_count = entry.assignment_count.saturating_add(1);
 
-    if matches!(op.as_str(), "<-" | "=") {
-        if let Some(packages) = extract_c_strings_strict(value_node, content) {
-            if entry.static_packages.is_none() {
-                entry.static_packages = Some((packages, node.start_byte()));
-            }
-        }
+    if matches!(op.as_str(), "<-" | "=")
+        && let Some(packages) = extract_c_strings_strict(value_node, content)
+        && entry.static_packages.is_none()
+    {
+        entry.static_packages = Some((packages, node.start_byte()));
     }
 }
 
@@ -941,12 +940,11 @@ fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBi
 
     let entry = map.entry(name).or_default();
     entry.assignment_count = entry.assignment_count.saturating_add(1);
-    if let Some(value_node) = value_node {
-        if let Some(packages) = extract_c_strings_strict(value_node, content) {
-            if entry.static_packages.is_none() {
-                entry.static_packages = Some((packages, node.start_byte()));
-            }
-        }
+    if let Some(value_node) = value_node
+        && let Some(packages) = extract_c_strings_strict(value_node, content)
+        && entry.static_packages.is_none()
+    {
+        entry.static_packages = Some((packages, node.start_byte()));
     }
 }
 
@@ -3252,8 +3250,8 @@ mod property_tests {
     /// assert!(!code.is_empty());
     /// assert!(!specs.is_empty());
     /// ```
-    fn r_code_with_dynamic_library_calls(
-    ) -> impl Strategy<Value = (String, Vec<DynamicLibraryCallSpec>)> {
+    fn r_code_with_dynamic_library_calls()
+    -> impl Strategy<Value = (String, Vec<DynamicLibraryCallSpec>)> {
         // Generate 1-5 dynamic library calls
         prop::collection::vec(dynamic_library_call_spec(), 1..=5)
             .prop_flat_map(|specs| {
@@ -3307,8 +3305,8 @@ mod property_tests {
     /// // `strat` is a `Strategy` that generates `(String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)`.
     /// let _ = strat;
     /// ```
-    fn r_code_with_mixed_library_calls(
-    ) -> impl Strategy<Value = (String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)> {
+    fn r_code_with_mixed_library_calls()
+    -> impl Strategy<Value = (String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)> {
         (
             prop::collection::vec(library_call_spec(), 1..=3),
             prop::collection::vec(dynamic_library_call_spec(), 1..=3),

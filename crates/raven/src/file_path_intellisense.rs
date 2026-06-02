@@ -18,7 +18,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::cross_file::directive::{BACKWARD_DIRECTIVE_KEYWORDS, FORWARD_DIRECTIVE_KEYWORDS};
 use crate::cross_file::path_resolve::PathContext;
-use crate::cross_file::types::{byte_offset_to_utf16_column, CrossFileMetadata};
+use crate::cross_file::types::{CrossFileMetadata, byte_offset_to_utf16_column};
 use crate::utf16::utf16_column_to_byte_offset;
 
 // ============================================================================
@@ -295,16 +295,16 @@ fn is_file_argument(string_node: &Node, call_node: &Node, content: &str) -> bool
 
     // Check for named "file" argument
     for child in &children {
-        if child.kind() == "argument" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, content);
-                if name == "file" {
-                    if let Some(value_node) = child.child_by_field_name("value") {
-                        // Check if this value node contains our string node
-                        if nodes_overlap(&value_node, string_node) {
-                            return true;
-                        }
-                    }
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "file"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                // Check if this value node contains our string node
+                if nodes_overlap(&value_node, string_node) {
+                    return true;
                 }
             }
         }
@@ -972,22 +972,22 @@ pub fn file_path_definition(
     }
 
     // 5. Check workspace boundary if workspace_root is provided
-    if let Some(workspace_url) = workspace_root {
-        if let Ok(workspace_path) = workspace_url.to_file_path() {
-            // Canonicalize both paths for accurate comparison
-            let canonical_resolved = resolved_path.canonicalize().ok();
-            let canonical_workspace = workspace_path.canonicalize().ok();
+    if let Some(workspace_url) = workspace_root
+        && let Ok(workspace_path) = workspace_url.to_file_path()
+    {
+        // Canonicalize both paths for accurate comparison
+        let canonical_resolved = resolved_path.canonicalize().ok();
+        let canonical_workspace = workspace_path.canonicalize().ok();
 
-            if let (Some(resolved), Some(workspace)) = (canonical_resolved, canonical_workspace) {
-                if !resolved.starts_with(&workspace) {
-                    log::trace!(
-                        "file_path_definition: Path '{}' is outside workspace '{}'",
-                        resolved_path.display(),
-                        workspace_path.display()
-                    );
-                    return None;
-                }
-            }
+        if let (Some(resolved), Some(workspace)) = (canonical_resolved, canonical_workspace)
+            && !resolved.starts_with(&workspace)
+        {
+            log::trace!(
+                "file_path_definition: Path '{}' is outside workspace '{}'",
+                resolved_path.display(),
+                workspace_path.display()
+            );
+            return None;
         }
     }
 
@@ -1372,10 +1372,11 @@ pub fn resolve_base_directory(
                 // use workspace-root fallback to match resolve_path_with_workspace_fallback behavior
                 let has_explicit_wd = path_context.working_directory.is_some();
                 let has_inherited_wd = path_context.inherited_working_directory.is_some();
-                if !has_explicit_wd && !has_inherited_wd {
-                    if let Some(ref workspace_root) = path_context.workspace_root {
-                        return Some(workspace_root.clone());
-                    }
+                if !has_explicit_wd
+                    && !has_inherited_wd
+                    && let Some(ref workspace_root) = path_context.workspace_root
+                {
+                    return Some(workspace_root.clone());
                 }
                 Some(path_context.effective_working_directory())
             } else {
@@ -1402,10 +1403,11 @@ pub fn resolve_base_directory(
                 if partial_dir.is_empty() {
                     let has_explicit_wd = path_context.working_directory.is_some();
                     let has_inherited_wd = path_context.inherited_working_directory.is_some();
-                    if !has_explicit_wd && !has_inherited_wd {
-                        if let Some(ref workspace_root) = path_context.workspace_root {
-                            return Some(workspace_root.clone());
-                        }
+                    if !has_explicit_wd
+                        && !has_inherited_wd
+                        && let Some(ref workspace_root) = path_context.workspace_root
+                    {
+                        return Some(workspace_root.clone());
                     }
                     Some(path_context.effective_working_directory())
                 } else {
@@ -1457,10 +1459,10 @@ fn normalize_path_for_completion(path: &Path) -> Option<PathBuf> {
             std::path::Component::ParentDir => {
                 // Only pop if the last component is a Normal segment
                 // Preserve RootDir and Prefix components
-                if let Some(last) = components.last() {
-                    if matches!(last, std::path::Component::Normal(_)) {
-                        components.pop();
-                    }
+                if let Some(last) = components.last()
+                    && matches!(last, std::path::Component::Normal(_))
+                {
+                    components.pop();
                 }
             }
             std::path::Component::CurDir => {
@@ -5372,8 +5374,8 @@ mod tests {
                     if let Ok(normalized) = escape_path.canonicalize() {
                         // If the normalized path is outside workspace, listing it
                         // with workspace boundary should exclude entries
-                        if let Ok(canonical_workspace) = workspace_path.canonicalize() {
-                            if !normalized.starts_with(&canonical_workspace) {
+                        if let Ok(canonical_workspace) = workspace_path.canonicalize()
+                            && !normalized.starts_with(&canonical_workspace) {
                                 // This path is outside workspace
                                 // list_directory_entries should either fail or return
                                 // entries filtered by workspace boundary
@@ -5392,7 +5394,6 @@ mod tests {
                                     }
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -5444,8 +5445,8 @@ mod tests {
                             // canonicalize and check, it should be filtered
                             // if it points outside the workspace
                             for (name, path, _) in &entries {
-                                if let Ok(canonical_path) = path.canonicalize() {
-                                    if let Ok(canonical_workspace) = workspace.canonicalize() {
+                                if let Ok(canonical_path) = path.canonicalize()
+                                    && let Ok(canonical_workspace) = workspace.canonicalize() {
                                         // Entries should be within workspace
                                         // Note: The symlink entry itself is in workspace,
                                         // but its target is outside. The current implementation
@@ -5459,7 +5460,6 @@ mod tests {
                                             canonical_workspace
                                         );
                                     }
-                                }
                             }
                         }
                     }

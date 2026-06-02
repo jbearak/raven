@@ -375,27 +375,27 @@ impl PackageLibrary {
         // Requirement 9.3: Show all packages that export the same symbol
         for pkg_name in loaded_packages {
             // Try combined_exports first
-            if let Some(ref cache) = combined_cache {
-                if let Some(exports) = cache.get(pkg_name) {
-                    for export in exports.iter() {
-                        result
-                            .entry(export.clone())
-                            .or_default()
-                            .push(pkg_name.clone());
-                    }
-                    continue; // Found in combined cache, skip per-package lookup
+            if let Some(ref cache) = combined_cache
+                && let Some(exports) = cache.get(pkg_name)
+            {
+                for export in exports.iter() {
+                    result
+                        .entry(export.clone())
+                        .or_default()
+                        .push(pkg_name.clone());
                 }
+                continue; // Found in combined cache, skip per-package lookup
             }
 
             // Fall back to per-package exports
-            if let Some(ref cache) = packages_cache {
-                if let Some(info) = cache.get(pkg_name) {
-                    for export in &info.exports {
-                        result
-                            .entry(export.clone())
-                            .or_default()
-                            .push(pkg_name.clone());
-                    }
+            if let Some(ref cache) = packages_cache
+                && let Some(info) = cache.get(pkg_name)
+            {
+                for export in &info.exports {
+                    result
+                        .entry(export.clone())
+                        .or_default()
+                        .push(pkg_name.clone());
                 }
             }
         }
@@ -431,10 +431,10 @@ impl PackageLibrary {
         // Try combined_exports cache first (includes Depends/attached packages)
         if let Ok(combined_cache) = self.combined_exports.try_read() {
             for pkg_name in loaded_packages {
-                if let Some(exports) = combined_cache.get(pkg_name) {
-                    if exports.contains(symbol) {
-                        return true;
-                    }
+                if let Some(exports) = combined_cache.get(pkg_name)
+                    && exports.contains(symbol)
+                {
+                    return true;
                 }
             }
         }
@@ -453,10 +453,10 @@ impl PackageLibrary {
 
         // Check each loaded package
         for pkg_name in loaded_packages {
-            if let Some(info) = cache.get(pkg_name) {
-                if info.exports.contains(symbol) {
-                    return true;
-                }
+            if let Some(info) = cache.get(pkg_name)
+                && info.exports.contains(symbol)
+            {
+                return true;
             }
         }
 
@@ -490,10 +490,10 @@ impl PackageLibrary {
         if self.package_exists(package) || self.is_base_package(package) {
             return false;
         }
-        if let Some(cached) = self.get_cached_package(package).await {
-            if !cached.exports.is_empty() {
-                return false;
-            }
+        if let Some(cached) = self.get_cached_package(package).await
+            && !cached.exports.is_empty()
+        {
+            return false;
         }
         self.resolve_from_providers(package).is_none()
     }
@@ -646,18 +646,18 @@ impl PackageLibrary {
     /// otherwise do byte-identical per-package work.
     async fn prefetch_pattern_packages_via_index(&self, pattern_packages: &[String]) {
         for pkg_name in pattern_packages {
-            if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
-                if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
-                    let exports = self.load_with_index_fallback(&pkg_dir, &parse_result).await;
-                    let info = package_info_from_dir(
-                        pkg_name.clone(),
-                        &pkg_dir,
-                        exports,
-                        parse_result.depends,
-                    )
-                    .await;
-                    self.insert_package(info).await;
-                }
+            if let Some(pkg_dir) = self.find_package_directory(pkg_name)
+                && let Some(parse_result) = self.parse_package_static(&pkg_dir)
+            {
+                let exports = self.load_with_index_fallback(&pkg_dir, &parse_result).await;
+                let info = package_info_from_dir(
+                    pkg_name.clone(),
+                    &pkg_dir,
+                    exports,
+                    parse_result.depends,
+                )
+                .await;
+                self.insert_package(info).await;
             }
         }
     }
@@ -868,10 +868,10 @@ impl PackageLibrary {
         // Check combined_exports cache first
         if let Ok(cache) = self.combined_exports.try_read() {
             for pkg_name in loaded_packages {
-                if let Some(exports) = cache.get(pkg_name) {
-                    if exports.contains(symbol) {
-                        return Some(pkg_name.clone());
-                    }
+                if let Some(exports) = cache.get(pkg_name)
+                    && exports.contains(symbol)
+                {
+                    return Some(pkg_name.clone());
                 }
             }
         }
@@ -879,10 +879,10 @@ impl PackageLibrary {
         // Fall back to per-package cache
         if let Ok(cache) = self.packages.try_read() {
             for pkg_name in loaded_packages {
-                if let Some(info) = cache.get(pkg_name) {
-                    if info.exports.contains(symbol) {
-                        return Some(pkg_name.clone());
-                    }
+                if let Some(info) = cache.get(pkg_name)
+                    && info.exports.contains(symbol)
+                {
+                    return Some(pkg_name.clone());
                 }
             }
         }
@@ -1083,60 +1083,60 @@ impl PackageLibrary {
         let mut pattern_packages: Vec<String> = Vec::new();
 
         for package in &base_packages_list {
-            if let Some(pkg_dir) = self.find_package_directory(package) {
-                if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
-                    let pkg_exports = per_package_exports.entry(package.clone()).or_default();
-                    // Preserve depends from DESCRIPTION for transitive dependency resolution
-                    if !parse_result.depends.is_empty() {
-                        per_package_depends.insert(package.clone(), parse_result.depends.clone());
-                    }
-                    // Add explicit exports
-                    for export in &parse_result.explicit_exports {
+            if let Some(pkg_dir) = self.find_package_directory(package)
+                && let Some(parse_result) = self.parse_package_static(&pkg_dir)
+            {
+                let pkg_exports = per_package_exports.entry(package.clone()).or_default();
+                // Preserve depends from DESCRIPTION for transitive dependency resolution
+                if !parse_result.depends.is_empty() {
+                    per_package_depends.insert(package.clone(), parse_result.depends.clone());
+                }
+                // Add explicit exports
+                for export in &parse_result.explicit_exports {
+                    all_base_exports.insert(export.clone());
+                    pkg_exports.insert(export.clone());
+                }
+
+                if parse_result.has_export_pattern {
+                    // Base packages use exportPattern - add INDEX exports and track for R fallback
+                    let index_exports =
+                        self.load_with_index_fallback(&pkg_dir, &parse_result).await;
+                    for export in &index_exports {
                         all_base_exports.insert(export.clone());
                         pkg_exports.insert(export.clone());
                     }
+                    pattern_packages.push(package.clone());
+                }
 
-                    if parse_result.has_export_pattern {
-                        // Base packages use exportPattern - add INDEX exports and track for R fallback
-                        let index_exports =
-                            self.load_with_index_fallback(&pkg_dir, &parse_result).await;
+                // Step 3b: Pick up data objects auto-attached at startup
+                // (issue #276). Lazy-loaded base packages like `datasets`
+                // expose `mtcars`/`iris`/... without listing them in
+                // NAMESPACE export() or `getNamespaceExports()`. Walk
+                // `data/` for individual files and fall back to INDEX
+                // topics when the data is bundled into `Rdata.r{db,dx,ds}`.
+                //
+                // Use `symlink_metadata` (not `is_dir`, which traverses
+                // symlinks) for consistency with `parse_data_symbols`'s
+                // own rejection of symlinked `data/` trees.
+                let has_real_data_dir = std::fs::symlink_metadata(pkg_dir.join("data"))
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if has_real_data_dir {
+                    for sym in parse_data_symbols(&pkg_dir).await {
+                        all_base_exports.insert(sym.clone());
+                        pkg_exports.insert(sym);
+                    }
+                    // INDEX entries are documented topic names — for
+                    // lazy-loaded data packages these correspond to
+                    // top-level dataset names (mtcars, iris, ...). Only
+                    // applied here when has_export_pattern is false so we
+                    // don't double-merge with the existing fallback above.
+                    if !parse_result.has_export_pattern
+                        && let Ok(index_exports) = parse_index_exports(&pkg_dir).await
+                    {
                         for export in &index_exports {
                             all_base_exports.insert(export.clone());
                             pkg_exports.insert(export.clone());
-                        }
-                        pattern_packages.push(package.clone());
-                    }
-
-                    // Step 3b: Pick up data objects auto-attached at startup
-                    // (issue #276). Lazy-loaded base packages like `datasets`
-                    // expose `mtcars`/`iris`/... without listing them in
-                    // NAMESPACE export() or `getNamespaceExports()`. Walk
-                    // `data/` for individual files and fall back to INDEX
-                    // topics when the data is bundled into `Rdata.r{db,dx,ds}`.
-                    //
-                    // Use `symlink_metadata` (not `is_dir`, which traverses
-                    // symlinks) for consistency with `parse_data_symbols`'s
-                    // own rejection of symlinked `data/` trees.
-                    let has_real_data_dir = std::fs::symlink_metadata(pkg_dir.join("data"))
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false);
-                    if has_real_data_dir {
-                        for sym in parse_data_symbols(&pkg_dir).await {
-                            all_base_exports.insert(sym.clone());
-                            pkg_exports.insert(sym);
-                        }
-                        // INDEX entries are documented topic names — for
-                        // lazy-loaded data packages these correspond to
-                        // top-level dataset names (mtcars, iris, ...). Only
-                        // applied here when has_export_pattern is false so we
-                        // don't double-merge with the existing fallback above.
-                        if !parse_result.has_export_pattern {
-                            if let Ok(index_exports) = parse_index_exports(&pkg_dir).await {
-                                for export in &index_exports {
-                                    all_base_exports.insert(export.clone());
-                                    pkg_exports.insert(export.clone());
-                                }
-                            }
                         }
                     }
                 }
@@ -1145,32 +1145,32 @@ impl PackageLibrary {
 
         // Step 4: If R subprocess is available and we have pattern packages,
         // try to get accurate exports for them
-        if !pattern_packages.is_empty() {
-            if let Some(ref r_subprocess) = self.r_subprocess {
-                log::trace!(
-                    "Querying R for {} base packages with exportPattern",
-                    pattern_packages.len()
-                );
-                match r_subprocess
-                    .get_multiple_package_exports(&pattern_packages)
-                    .await
-                {
-                    Ok(exports_map) => {
-                        for (pkg_name, exports) in exports_map {
-                            let pkg_exports = per_package_exports.entry(pkg_name).or_default();
-                            for export in exports {
-                                all_base_exports.insert(export.clone());
-                                pkg_exports.insert(export);
-                            }
+        if !pattern_packages.is_empty()
+            && let Some(ref r_subprocess) = self.r_subprocess
+        {
+            log::trace!(
+                "Querying R for {} base packages with exportPattern",
+                pattern_packages.len()
+            );
+            match r_subprocess
+                .get_multiple_package_exports(&pattern_packages)
+                .await
+            {
+                Ok(exports_map) => {
+                    for (pkg_name, exports) in exports_map {
+                        let pkg_exports = per_package_exports.entry(pkg_name).or_default();
+                        for export in exports {
+                            all_base_exports.insert(export.clone());
+                            pkg_exports.insert(export);
                         }
                     }
-                    Err(e) => {
-                        log::trace!(
-                            "R batch query for base packages failed: {}, using INDEX fallback",
-                            e
-                        );
-                        // Continue with INDEX-based exports
-                    }
+                }
+                Err(e) => {
+                    log::trace!(
+                        "R batch query for base packages failed: {}, using INDEX fallback",
+                        e
+                    );
+                    // Continue with INDEX-based exports
                 }
             }
         }
@@ -1525,10 +1525,11 @@ impl PackageLibrary {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() && path.join("DESCRIPTION").is_file() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        names.insert(name.to_string());
-                    }
+                if path.is_dir()
+                    && path.join("DESCRIPTION").is_file()
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    names.insert(name.to_string());
                 }
             }
         }
@@ -1926,13 +1927,14 @@ pub async fn build_package_library_tier1_only(
 mod tests {
     use super::*;
 
-    /// The shared `RAVEN_NAMES_DB` env-var serialization lock (defined in
-    /// `package_db` so every lib-test that touches the var shares one instance).
-    use crate::package_db::RAVEN_NAMES_DB_ENV_LOCK;
+    /// The shared `RAVEN_NAMES_DB` env-var serialization lock and its RAII guard
+    /// (defined in `package_db` so every lib-test that touches the var shares one
+    /// instance / one audited `unsafe` mutation site).
+    use crate::package_db::{NamesDbEnvGuard, RAVEN_NAMES_DB_ENV_LOCK};
 
     #[tokio::test]
     async fn build_library_wires_shipped_db_provider_from_env() {
-        use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+        use crate::package_db::binary_db::{ShippedDbProvenance, write_shipped_db};
         use crate::package_db::model::PackageRecord;
 
         // Use a synthetic name that cannot exist in any real R install, so the
@@ -1961,18 +1963,19 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("RAVEN_NAMES_DB", &db_path);
+        let _db_env = NamesDbEnvGuard::set(&db_path);
         let outcome = build_package_library(None, &[], None, true).await; // runtime path -> wires providers
         let outcome_t1 = build_package_library_tier1_only(None, &[], None).await; // capture path -> no providers
-        std::env::remove_var("RAVEN_NAMES_DB");
 
-        assert!(outcome
-            .library
-            .get_package(pkg)
-            .await
-            .expect("Tier 3 resolves synthetic pkg")
-            .exports
-            .contains("mutate"));
+        assert!(
+            outcome
+                .library
+                .get_package(pkg)
+                .await
+                .expect("Tier 3 resolves synthetic pkg")
+                .exports
+                .contains("mutate")
+        );
         // Provider-less capture must NOT resolve the synthetic pkg from Tier 3.
         assert!(outcome_t1.library.get_package(pkg).await.is_none());
     }
@@ -1985,9 +1988,8 @@ mod tests {
         // Too short / bad magic => ShippedDb::open returns Corrupt => a load note.
         std::fs::write(&bad, b"NOT A RAVEN DB").unwrap();
 
-        std::env::set_var("RAVEN_NAMES_DB", &bad);
+        let _db_env = NamesDbEnvGuard::set(&bad);
         let outcome = build_package_library(None, &[], None, true).await;
-        std::env::remove_var("RAVEN_NAMES_DB");
 
         // The build degrades (does not panic) AND explains the unreadable DB.
         assert!(
@@ -2003,7 +2005,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_library_falls_back_from_bad_user_db_to_lower_candidate() {
-        use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+        use crate::package_db::binary_db::{ShippedDbProvenance, write_shipped_db};
         use crate::package_db::model::PackageRecord;
 
         let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
@@ -2034,18 +2036,19 @@ mod tests {
         .unwrap();
 
         let _user_data_guard = crate::package_db::test_user_data_dir_guard(user_data);
-        std::env::set_var("RAVEN_NAMES_DB", &bad_env_db);
+        let _db_env = NamesDbEnvGuard::set(&bad_env_db);
         let outcome = build_package_library(None, &[], None, true).await;
-        std::env::remove_var("RAVEN_NAMES_DB");
 
         assert!(outcome.load_notes.iter().any(|n| n.contains("bad.db")));
-        assert!(outcome
-            .library
-            .get_package(pkg)
-            .await
-            .expect("lower candidate provider resolves")
-            .exports
-            .contains("lower_export"));
+        assert!(
+            outcome
+                .library
+                .get_package(pkg)
+                .await
+                .expect("lower candidate provider resolves")
+                .exports
+                .contains("lower_export")
+        );
     }
 
     /// Pins the readiness predicate and degradation precedence

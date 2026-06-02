@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use crate::cli::shared::{
+    ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
     absolute_path, collect_r_file_paths, encoding_diagnostic, is_chunk_file, is_r_file,
     parse_color_choice, parse_output_format, parse_severity_level, render, resolve_color_from_env,
-    ColorChoice, OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -525,10 +525,10 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
     }
     let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
     for path in targets {
-        if let Ok(uri) = Url::from_file_path(path) {
-            if let Some(doc) = state.workspace_index.get(&uri) {
-                packages.extend(doc.loaded_packages.iter().cloned());
-            }
+        if let Ok(uri) = Url::from_file_path(path)
+            && let Some(doc) = state.workspace_index.get(&uri)
+        {
+            packages.extend(doc.loaded_packages.iter().cloned());
         }
     }
     let packages: Vec<String> = packages
@@ -1107,7 +1107,7 @@ mod tests {
     /// installed library.
     #[tokio::test]
     async fn maybe_init_r_keeps_provider_library_when_r_absent() {
-        use crate::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+        use crate::package_db::binary_db::{ShippedDbProvenance, write_shipped_db};
         use crate::package_db::model::PackageRecord;
 
         let _env = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
@@ -1134,10 +1134,9 @@ mod tests {
         .unwrap();
 
         let workspace = TempDir::new().unwrap();
-        std::env::set_var("RAVEN_NAMES_DB", &db_path);
+        let _db_env = crate::package_db::NamesDbEnvGuard::set(&db_path);
         let mut state = crate::state::WorldState::new(vec![]);
         maybe_init_r(&mut state, workspace.path()).await;
-        std::env::remove_var("RAVEN_NAMES_DB");
 
         // The Tier 3 provider survived (library not dropped) and is marked ready,
         // so prefetch + resolution can run even though R is irrelevant here.

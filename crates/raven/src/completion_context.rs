@@ -188,30 +188,30 @@ fn find_enclosing_function_call(
                 let args_end = args_node.end_position();
 
                 // cursor must be after the opening `(` and before or at the closing `)`
-                if cursor_point > args_start && cursor_point <= args_end {
-                    if let Some(func_node) = current.child_by_field_name("function") {
-                        let ast_ctx = extract_call_info(func_node, text);
+                if cursor_point > args_start
+                    && cursor_point <= args_end
+                    && let Some(func_node) = current.child_by_field_name("function")
+                {
+                    let ast_ctx = extract_call_info(func_node, text);
 
-                        // When the argument subtree has parse errors,
-                        // tree-sitter's bracket recovery can mis-group `(`
-                        // with `)` (e.g. `a(if(b, c))` — the outer `)` is
-                        // grouped with the outer `(` at the AST level even
-                        // though textually it pairs with the inner `(`).
-                        // Cross-check against the bracket heuristic and
-                        // prefer it on disagreement — but keep the AST
-                        // result when the heuristic returns `None` or
-                        // agrees with it (the heuristic can't extract
-                        // backticked or non-ASCII function names that the
-                        // AST handles fine).
-                        if args_node.has_error() {
-                            if let Some(fallback) = detect_via_bracket_heuristic(text, position) {
-                                if ast_ctx.as_ref() != Some(&fallback) {
-                                    return Some(fallback);
-                                }
-                            }
-                        }
-                        return ast_ctx;
+                    // When the argument subtree has parse errors,
+                    // tree-sitter's bracket recovery can mis-group `(`
+                    // with `)` (e.g. `a(if(b, c))` — the outer `)` is
+                    // grouped with the outer `(` at the AST level even
+                    // though textually it pairs with the inner `(`).
+                    // Cross-check against the bracket heuristic and
+                    // prefer it on disagreement — but keep the AST
+                    // result when the heuristic returns `None` or
+                    // agrees with it (the heuristic can't extract
+                    // backticked or non-ASCII function names that the
+                    // AST handles fine).
+                    if args_node.has_error()
+                        && let Some(fallback) = detect_via_bracket_heuristic(text, position)
+                        && ast_ctx.as_ref() != Some(&fallback)
+                    {
+                        return Some(fallback);
                     }
+                    return ast_ctx;
                 }
             }
         }
@@ -502,12 +502,12 @@ fn detect_via_bracket_heuristic(text: &str, position: Position) -> Option<Functi
         // Check if the top of the stack is an unmatched `(` from this line.
         // We want the rightmost unmatched `(` from this line.
         // Find the last `(` in line_opens.
-        if let Some(&top) = bracket_stack.last() {
-            if top == '(' {
-                // Find the rightmost `(` in line_opens
-                if let Some(&(_ch, paren_pos)) = line_opens.iter().rev().find(|(c, _)| *c == '(') {
-                    return extract_function_name_before_paren(lines[line_idx], paren_pos);
-                }
+        if let Some(&top) = bracket_stack.last()
+            && top == '('
+        {
+            // Find the rightmost `(` in line_opens
+            if let Some(&(_ch, paren_pos)) = line_opens.iter().rev().find(|(c, _)| *c == '(') {
+                return extract_function_name_before_paren(lines[line_idx], paren_pos);
             }
         }
     }

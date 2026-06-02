@@ -24,8 +24,8 @@ use std::path::Path;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
-use crate::package_db::model::PackageRecord;
 use crate::package_db::PackageMetadataProvider;
+use crate::package_db::model::PackageRecord;
 use crate::package_library::PackageInfo;
 
 const MAGIC: &[u8; 8] = b"RAVNDB\0\0";
@@ -157,7 +157,7 @@ impl ShippedDb {
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ShippedDbError::Absent)
+                return Err(ShippedDbError::Absent);
             }
             Err(e) => return Err(ShippedDbError::Corrupt(e.to_string())),
         };

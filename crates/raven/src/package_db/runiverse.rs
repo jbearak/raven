@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::package_db::model::{sorted_unique, PackageRecord};
+use crate::package_db::model::{PackageRecord, sorted_unique};
 
 /// Deserialize a JSON array that may also be `null` into a `Vec`.
 ///

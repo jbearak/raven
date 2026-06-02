@@ -201,12 +201,11 @@ fn first_direct_string_argument(args: Node) -> Option<Node> {
         if child.kind() == "string" {
             return Some(child);
         }
-        if child.kind() == "argument" {
-            if let Some(value) = child.child_by_field_name("value") {
-                if value.kind() == "string" {
-                    return Some(value);
-                }
-            }
+        if child.kind() == "argument"
+            && let Some(value) = child.child_by_field_name("value")
+            && value.kind() == "string"
+        {
+            return Some(value);
         }
     }
     None
@@ -1355,10 +1354,11 @@ fn ascend_to_assignment_for<'a>(start: Node<'a>, text: &str, lhs_name: &str) -> 
                 Some("->") | Some("->>") => current.child_by_field_name("rhs"),
                 _ => None,
             };
-            if let Some(t) = target {
-                if t.kind() == "identifier" && node_text(t, text) == lhs_name {
-                    return Some(current);
-                }
+            if let Some(t) = target
+                && t.kind() == "identifier"
+                && node_text(t, text) == lhs_name
+            {
+                return Some(current);
             }
         }
         current = current.parent()?;
@@ -1403,7 +1403,7 @@ fn nth_line(text: &str, n: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::handlers::{goto_definition, goto_definition_with_cancel, DiagCancelToken};
+    use crate::handlers::{DiagCancelToken, goto_definition, goto_definition_with_cancel};
     use crate::state::{Document, WorldState};
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -2546,8 +2546,8 @@ df$gamma <- 3
     /// reference a different `df` and must not be offered as completions
     /// for the cursor's `df`.
     #[test]
-    fn dollar_member_completion_excludes_post_nested_source_rebinding_in_non_redefining_contributor(
-    ) {
+    fn dollar_member_completion_excludes_post_nested_source_rebinding_in_non_redefining_contributor()
+     {
         let mut state = fresh_state();
         let main_code = "\
 df <- list(alpha = 1)

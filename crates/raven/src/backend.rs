@@ -15,20 +15,20 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tower::Service;
+use tower_lsp::Client;
+use tower_lsp::LanguageServer;
+use tower_lsp::LspService;
+use tower_lsp::Server;
 use tower_lsp::jsonrpc::{
     Error as JsonRpcError, Id as JsonRpcId, Request as JsonRpcRequest, Response as JsonRpcResponse,
     Result,
 };
 use tower_lsp::lsp_types::*;
-use tower_lsp::Client;
-use tower_lsp::LanguageServer;
-use tower_lsp::LspService;
-use tower_lsp::Server;
 
 use crate::handlers;
 use crate::indentation;
 use crate::r_env;
-use crate::state::{scan_workspace, IndentationSettings, SymbolConfig, WorldState};
+use crate::state::{IndentationSettings, SymbolConfig, WorldState, scan_workspace};
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
     static CURRENT_LSP_REQUEST_ID: JsonRpcId;
@@ -176,10 +176,10 @@ pub(crate) fn parse_cross_file_config(
         value: Option<&serde_json::Value>,
         name: &str,
     ) -> std::result::Result<(), String> {
-        if let Some(v) = value {
-            if !v.is_object() {
-                return Err(format!("{name} must be an object."));
-            }
+        if let Some(v) = value
+            && !v.is_object()
+        {
+            return Err(format!("{name} must be an object."));
         }
         Ok(())
     }
@@ -279,7 +279,9 @@ pub(crate) fn parse_cross_file_config(
                         crate::cross_file::BackwardDependencyMode::Explicit;
                 }
                 Some(other) => {
-                    log::warn!("Unrecognized crossFile.backwardDependencies value '{other}', defaulting to 'auto'.");
+                    log::warn!(
+                        "Unrecognized crossFile.backwardDependencies value '{other}', defaulting to 'auto'."
+                    );
                     config.backward_dependencies = crate::cross_file::BackwardDependencyMode::Auto;
                 }
                 None => {
@@ -366,10 +368,11 @@ pub(crate) fn parse_cross_file_config(
                 .map(std::path::PathBuf::from)
                 .collect();
         }
-        if let Some(v) = packages.get("rPath").and_then(|v| v.as_str()) {
-            if !v.is_empty() && !v.contains('\0') {
-                config.packages_r_path = Some(std::path::PathBuf::from(v));
-            }
+        if let Some(v) = packages.get("rPath").and_then(|v| v.as_str())
+            && !v.is_empty()
+            && !v.contains('\0')
+        {
+            config.packages_r_path = Some(std::path::PathBuf::from(v));
         }
         if let Some(sev) = packages
             .get("missingPackageSeverity")
@@ -1565,43 +1568,42 @@ fn hydrate_package_r_files_from_state(
         if open_uris.contains(&uri) {
             continue;
         }
-        if let Ok(path) = uri.to_file_path() {
-            if let Some(kind) = crate::package_state::is_r_source_path(&path, root) {
-                if let Some(entry) = state.workspace_index_new.get(&uri) {
-                    let text: std::sync::Arc<str> = entry.contents.to_string().into();
-                    let digest = crate::package_state::ContentDigest::of(&text);
-                    r_files.insert(
-                        path,
-                        crate::package_state::RFileInput {
-                            kind,
-                            text,
-                            content_digest: digest,
-                        },
-                    );
-                }
-            }
+        if let Ok(path) = uri.to_file_path()
+            && let Some(kind) = crate::package_state::is_r_source_path(&path, root)
+            && let Some(entry) = state.workspace_index_new.get(&uri)
+        {
+            let text: std::sync::Arc<str> = entry.contents.to_string().into();
+            let digest = crate::package_state::ContentDigest::of(&text);
+            r_files.insert(
+                path,
+                crate::package_state::RFileInput {
+                    kind,
+                    text,
+                    content_digest: digest,
+                },
+            );
         }
     }
 
     for uri in &open_uris {
-        if let Ok(path) = uri.to_file_path() {
-            if let Some(kind) = crate::package_state::is_r_source_path(&path, root) {
-                let text: std::sync::Arc<str> = state
-                    .documents
-                    .get(uri)
-                    .map(|d| d.text())
-                    .unwrap_or_default()
-                    .into();
-                let digest = crate::package_state::ContentDigest::of(&text);
-                r_files.insert(
-                    path,
-                    crate::package_state::RFileInput {
-                        kind,
-                        text,
-                        content_digest: digest,
-                    },
-                );
-            }
+        if let Ok(path) = uri.to_file_path()
+            && let Some(kind) = crate::package_state::is_r_source_path(&path, root)
+        {
+            let text: std::sync::Arc<str> = state
+                .documents
+                .get(uri)
+                .map(|d| d.text())
+                .unwrap_or_default()
+                .into();
+            let digest = crate::package_state::ContentDigest::of(&text);
+            r_files.insert(
+                path,
+                crate::package_state::RFileInput {
+                    kind,
+                    text,
+                    content_digest: digest,
+                },
+            );
         }
     }
 
@@ -1764,11 +1766,11 @@ async fn run_debounced_diagnostics(
             return;
         }
 
-        if let Some(ver) = current_version {
-            if !state.diagnostics_gate.can_publish(&affected_uri, ver) {
-                log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
-                return;
-            }
+        if let Some(ver) = current_version
+            && !state.diagnostics_gate.can_publish(&affected_uri, ver)
+        {
+            log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
+            return;
         }
 
         // Build the snapshot (captures all state needed for diagnostics)
@@ -2585,14 +2587,14 @@ impl LanguageServer for Backend {
                         "message": "topic failed validation",
                     })));
                 }
-                if let Some(p) = package {
-                    if !crate::r_subprocess::is_valid_package_name(p) {
-                        return Ok(Some(serde_json::json!({
-                            "ok": false,
-                            "reason": "invalid-topic",
-                            "message": "package failed validation",
-                        })));
-                    }
+                if let Some(p) = package
+                    && !crate::r_subprocess::is_valid_package_name(p)
+                {
+                    return Ok(Some(serde_json::json!({
+                        "ok": false,
+                        "reason": "invalid-topic",
+                        "message": "package failed validation",
+                    })));
                 }
 
                 let (cache, r_path) = {
@@ -2805,25 +2807,23 @@ impl LanguageServer for Backend {
                 );
 
                 for source in &meta.sources {
-                    if let Some(ctx) = path_ctx.as_ref() {
-                        if let Some(resolved) =
+                    if let Some(ctx) = path_ctx.as_ref()
+                        && let Some(resolved) =
                             crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
                                 &source.path,
                                 ctx,
                             )
+                        && let Ok(source_uri) = Url::from_file_path(resolved)
+                    {
+                        // Check if file needs indexing (not open, not in workspace index)
+                        if !state.documents.contains_key(&source_uri)
+                            && !state.cross_file_workspace_index.contains(&source_uri)
                         {
-                            if let Ok(source_uri) = Url::from_file_path(resolved) {
-                                // Check if file needs indexing (not open, not in workspace index)
-                                if !state.documents.contains_key(&source_uri)
-                                    && !state.cross_file_workspace_index.contains(&source_uri)
-                                {
-                                    log::trace!(
-                                        "Scheduling on-demand indexing for sourced file: {}",
-                                        source_uri
-                                    );
-                                    files_to_index.push((source_uri, IndexCategory::Sourced));
-                                }
-                            }
+                            log::trace!(
+                                "Scheduling on-demand indexing for sourced file: {}",
+                                source_uri
+                            );
+                            files_to_index.push((source_uri, IndexCategory::Sourced));
                         }
                     }
                 }
@@ -2835,23 +2835,18 @@ impl LanguageServer for Backend {
                 );
 
                 for directive in &meta.sourced_by {
-                    if let Some(ctx) = backward_ctx.as_ref() {
-                        if let Some(resolved) =
+                    if let Some(ctx) = backward_ctx.as_ref()
+                        && let Some(resolved) =
                             crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
-                        {
-                            if let Ok(parent_uri) = Url::from_file_path(resolved) {
-                                if !state.documents.contains_key(&parent_uri)
-                                    && !state.cross_file_workspace_index.contains(&parent_uri)
-                                {
-                                    log::trace!(
-                                        "Scheduling on-demand indexing for parent file: {}",
-                                        parent_uri
-                                    );
-                                    files_to_index
-                                        .push((parent_uri, IndexCategory::BackwardDirective));
-                                }
-                            }
-                        }
+                        && let Ok(parent_uri) = Url::from_file_path(resolved)
+                        && !state.documents.contains_key(&parent_uri)
+                        && !state.cross_file_workspace_index.contains(&parent_uri)
+                    {
+                        log::trace!(
+                            "Scheduling on-demand indexing for parent file: {}",
+                            parent_uri
+                        );
+                        files_to_index.push((parent_uri, IndexCategory::BackwardDirective));
                     }
                 }
             }
@@ -2946,20 +2941,17 @@ impl LanguageServer for Backend {
             // `append_package_contribution` injects package-internal symbols
             // into both kinds — so when an R/ interface changes, both kinds
             // of open files have potentially stale diagnostics.
-            if interface_changed || package_visibility_changed {
-                if let Some(pkg) = state.package_workspace() {
-                    if let Ok(fp) = uri.to_file_path() {
-                        let r_dir = pkg.root.join("R");
-                        if package_visibility_changed || fp.starts_with(&r_dir) {
-                            for open_uri in state.documents.keys() {
-                                if let Ok(p) = open_uri.to_file_path() {
-                                    if crate::package_state::is_r_source_path(&p, &pkg.root)
-                                        .is_some()
-                                    {
-                                        affected.insert(open_uri.clone());
-                                    }
-                                }
-                            }
+            if (interface_changed || package_visibility_changed)
+                && let Some(pkg) = state.package_workspace()
+                && let Ok(fp) = uri.to_file_path()
+            {
+                let r_dir = pkg.root.join("R");
+                if package_visibility_changed || fp.starts_with(&r_dir) {
+                    for open_uri in state.documents.keys() {
+                        if let Ok(p) = open_uri.to_file_path()
+                            && crate::package_state::is_r_source_path(&p, &pkg.root).is_some()
+                        {
+                            affected.insert(open_uri.clone());
                         }
                     }
                 }
@@ -3264,21 +3256,20 @@ impl LanguageServer for Backend {
                                 &source.path,
                                 &forward_ctx,
                             )
+                            && let Ok(child_uri) = Url::from_file_path(resolved)
                         {
-                            if let Ok(child_uri) = Url::from_file_path(resolved) {
-                                let needs_indexing = {
-                                    !state.documents.contains_key(&child_uri)
-                                        && !state.cross_file_workspace_index.contains(&child_uri)
-                                };
-                                if needs_indexing {
-                                    log::trace!(
-                                        "did_open re-enrich: indexing direct source {}",
-                                        child_uri
-                                    );
-                                    drop(state);
-                                    let _ = self.index_file_on_demand(&child_uri).await;
-                                    state = self.state.write().await;
-                                }
+                            let needs_indexing = {
+                                !state.documents.contains_key(&child_uri)
+                                    && !state.cross_file_workspace_index.contains(&child_uri)
+                            };
+                            if needs_indexing {
+                                log::trace!(
+                                    "did_open re-enrich: indexing direct source {}",
+                                    child_uri
+                                );
+                                drop(state);
+                                let _ = self.index_file_on_demand(&child_uri).await;
+                                state = self.state.write().await;
                             }
                         }
                     }
@@ -3752,14 +3743,12 @@ impl LanguageServer for Backend {
             // Both `R/` (two-way) and `tests/testthat/` (one-way) receive the
             // contribution via `append_package_contribution`, so both need
             // the affected-set.
-            if package_visibility_changed {
-                if let Some(pkg) = state.package_workspace() {
-                    for open_uri in state.documents.keys() {
-                        if let Ok(p) = open_uri.to_file_path() {
-                            if crate::package_state::is_r_source_path(&p, &pkg.root).is_some() {
-                                affected.insert(open_uri.clone());
-                            }
-                        }
+            if package_visibility_changed && let Some(pkg) = state.package_workspace() {
+                for open_uri in state.documents.keys() {
+                    if let Ok(p) = open_uri.to_file_path()
+                        && crate::package_state::is_r_source_path(&p, &pkg.root).is_some()
+                    {
+                        affected.insert(open_uri.clone());
                     }
                 }
             }
@@ -3769,20 +3758,18 @@ impl LanguageServer for Backend {
             // added/removed symbols propagate to undefined-variable
             // diagnostics. `tests/testthat/` sees R/ symbols (one-way), so
             // include test files in the affected set too.
-            if interface_changed && !package_visibility_changed {
-                if let Some(pkg) = state.package_workspace() {
-                    if let Ok(fp) = uri.to_file_path() {
-                        let r_dir = pkg.root.join("R");
-                        if fp.starts_with(&r_dir) {
-                            for open_uri in state.documents.keys() {
-                                if let Ok(p) = open_uri.to_file_path() {
-                                    if crate::package_state::is_r_source_path(&p, &pkg.root)
-                                        .is_some()
-                                    {
-                                        affected.insert(open_uri.clone());
-                                    }
-                                }
-                            }
+            if interface_changed
+                && !package_visibility_changed
+                && let Some(pkg) = state.package_workspace()
+                && let Ok(fp) = uri.to_file_path()
+            {
+                let r_dir = pkg.root.join("R");
+                if fp.starts_with(&r_dir) {
+                    for open_uri in state.documents.keys() {
+                        if let Ok(p) = open_uri.to_file_path()
+                            && crate::package_state::is_r_source_path(&p, &pkg.root).is_some()
+                        {
+                            affected.insert(open_uri.clone());
                         }
                     }
                 }
@@ -4089,14 +4076,13 @@ impl LanguageServer for Backend {
             }
 
             // Invalidate the workspace index entry so the next scan re-reads from disk.
-            if let Ok(p) = uri.to_file_path() {
-                if state
+            if let Ok(p) = uri.to_file_path()
+                && state
                     .package_workspace()
                     .is_some_and(|pkg| is_package_source_dir(&p, &pkg.root))
-                {
-                    state.cross_file_workspace_index.invalidate(uri);
-                    state.workspace_index_new.invalidate(uri);
-                }
+            {
+                state.cross_file_workspace_index.invalidate(uri);
+                state.workspace_index_new.invalidate(uri);
             }
 
             // Refresh the pin set now that the open set has shrunk; URIs reachable
@@ -4505,15 +4491,15 @@ impl LanguageServer for Backend {
                     let pkg_visibility_changed = state.package_state.namespace_model()
                         != old_ns_model.as_ref()
                         || state.package_state.scope_contribution() != &old_contribution;
-                    if pkg_visibility_changed {
-                        if let Some(root) = state.package_inputs.workspace_root.clone() {
-                            extend_with_open_package_docs(
-                                &mut affected,
-                                &mut affected_set,
-                                &state,
-                                &root,
-                            );
-                        }
+                    if pkg_visibility_changed
+                        && let Some(root) = state.package_inputs.workspace_root.clone()
+                    {
+                        extend_with_open_package_docs(
+                            &mut affected,
+                            &mut affected_set,
+                            &state,
+                            &root,
+                        );
                     }
                 }
 
@@ -4542,15 +4528,10 @@ impl LanguageServer for Backend {
                 let pkg_visibility_changed = state.package_state.namespace_model()
                     != old_ns_model.as_ref()
                     || state.package_state.scope_contribution() != &old_contribution;
-                if pkg_visibility_changed {
-                    if let Some(root) = state.package_inputs.workspace_root.clone() {
-                        extend_with_open_package_docs(
-                            &mut affected,
-                            &mut affected_set,
-                            &state,
-                            &root,
-                        );
-                    }
+                if pkg_visibility_changed
+                    && let Some(root) = state.package_inputs.workspace_root.clone()
+                {
+                    extend_with_open_package_docs(&mut affected, &mut affected_set, &state, &root);
                 }
             }
             // Watched-file deletions can drop edges that put a closed neighbor
@@ -4917,13 +4898,12 @@ impl LanguageServer for Backend {
                             // diagnostics are refreshed.
                             if let Some(ref root) = state.package_inputs.workspace_root.clone() {
                                 for open_uri in state.documents.keys() {
-                                    if let Ok(p) = open_uri.to_file_path() {
-                                        if crate::package_state::is_r_source_path(&p, root)
+                                    if let Ok(p) = open_uri.to_file_path()
+                                        && crate::package_state::is_r_source_path(&p, root)
                                             .is_some()
-                                            && affected_for_async_set.insert(open_uri.clone())
-                                        {
-                                            affected_for_async.push(open_uri.clone());
-                                        }
+                                        && affected_for_async_set.insert(open_uri.clone())
+                                    {
+                                        affected_for_async.push(open_uri.clone());
                                     }
                                 }
                             }
@@ -7123,8 +7103,8 @@ mod tests {
 
     mod request_cancellation {
         use super::super::{
-            Backend, CancellableRequestKind, RequestCancellationRegistry,
-            RequestCancellationService, CURRENT_LSP_REQUEST_ID,
+            Backend, CURRENT_LSP_REQUEST_ID, CancellableRequestKind, RequestCancellationRegistry,
+            RequestCancellationService,
         };
         use std::convert::Infallible;
         use std::future::Future;
@@ -7291,9 +7271,11 @@ mod tests {
             registry.register(id.clone(), CancellableRequestKind::GotoDefinition);
             registry.complete(&id);
 
-            assert!(registry
-                .token_for_id(&id, CancellableRequestKind::GotoDefinition)
-                .is_none());
+            assert!(
+                registry
+                    .token_for_id(&id, CancellableRequestKind::GotoDefinition)
+                    .is_none()
+            );
         }
 
         #[tokio::test]
@@ -7345,9 +7327,11 @@ mod tests {
             service.call(cancel).await.expect("cancel request handled");
 
             assert!(token.is_cancelled());
-            assert!(registry
-                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
-                .is_some_and(|token| token.is_cancelled()));
+            assert!(
+                registry
+                    .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                    .is_some_and(|token| token.is_cancelled())
+            );
 
             release_tx.send(()).expect("release observed request");
             let response = request_task
@@ -7356,9 +7340,11 @@ mod tests {
                 .expect("inner service succeeds")
                 .expect("request has a response");
             assert!(response.is_ok());
-            assert!(registry
-                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
-                .is_none());
+            assert!(
+                registry
+                    .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                    .is_none()
+            );
         }
 
         #[tokio::test]
@@ -7421,9 +7407,11 @@ mod tests {
                 response.error(),
                 Some(&tower_lsp::jsonrpc::Error::request_cancelled())
             );
-            assert!(registry
-                .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
-                .is_none());
+            assert!(
+                registry
+                    .token_for_id(&request_id, CancellableRequestKind::GotoDefinition)
+                    .is_none()
+            );
         }
     }
     /// Tests for saturating arithmetic used in priority scoring
@@ -9816,8 +9804,8 @@ mod refresh_packages_tests {
     // Unit tests for raven.getHelpHtml execute_command handler.
     // ============================================================================
     mod get_help_html_command {
-        use std::sync::mpsc;
         use std::sync::Arc;
+        use std::sync::mpsc;
         use tower_lsp::lsp_types::{ExecuteCommandParams, InitializeParams, InitializeResult};
         use tower_lsp::{LanguageServer, LspService};
 
@@ -10061,8 +10049,8 @@ mod refresh_packages_tests {
     // `rebuild_package_library` (design Decision 4).
     // ============================================================================
     mod package_enabled_gates {
-        use std::sync::mpsc;
         use std::sync::Arc;
+        use std::sync::mpsc;
         use tower_lsp::lsp_types::{
             DidChangeConfigurationParams, ExecuteCommandParams, InitializeParams, InitializeResult,
         };

@@ -17,9 +17,9 @@ mod calculator;
 mod context;
 mod formatter;
 
-pub use calculator::{calculate_indentation, IndentationConfig, IndentationStyle};
+pub use calculator::{IndentationConfig, IndentationStyle, calculate_indentation};
 #[allow(unused_imports)] // Used by integration tests
-pub use context::{detect_context, IndentContext, OperatorType};
+pub use context::{IndentContext, OperatorType, detect_context};
 pub use formatter::format_indentation;
 
 /// Returns the LSP capability options for on-type formatting.

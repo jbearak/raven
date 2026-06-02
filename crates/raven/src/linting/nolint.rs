@@ -77,12 +77,10 @@ impl Suppressions {
 
         // Unterminated `nolint start` — treat as suppressing to EOF, matching
         // lintr's behavior so a missing `end` doesn't silently lose coverage.
-        if in_block {
-            if let Some(start) = block_start {
-                let total_lines = text.lines().count() as u32;
-                for l in start..total_lines {
-                    suppressed.insert(l);
-                }
+        if in_block && let Some(start) = block_start {
+            let total_lines = text.lines().count() as u32;
+            for l in start..total_lines {
+                suppressed.insert(l);
             }
         }
 

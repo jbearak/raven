@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct LoadedLintr {
     pub settings: Value,
@@ -153,10 +153,10 @@ fn apply_linters(
 
 fn strip_linters_with_defaults(body: &str) -> &str {
     let trimmed = body.trim();
-    if let Some(rest) = trimmed.strip_prefix("linters_with_defaults(") {
-        if let Some(inner) = rest.strip_suffix(')') {
-            return inner.trim();
-        }
+    if let Some(rest) = trimmed.strip_prefix("linters_with_defaults(")
+        && let Some(inner) = rest.strip_suffix(')')
+    {
+        return inner.trim();
     }
     trimmed
 }
@@ -190,12 +190,12 @@ fn apply_linter_call(
             }
         }
         "object_name_linter" => {
-            if let Some(styles) = parse_named_string_vec(args, "styles") {
-                if let Some(first) = styles.first() {
-                    linting.insert("objectNameStyleFunction".into(), json!(first));
-                    linting.insert("objectNameStyleVariable".into(), json!(first));
-                    linting.insert("objectNameStyleArgument".into(), json!(first));
-                }
+            if let Some(styles) = parse_named_string_vec(args, "styles")
+                && let Some(first) = styles.first()
+            {
+                linting.insert("objectNameStyleFunction".into(), json!(first));
+                linting.insert("objectNameStyleVariable".into(), json!(first));
+                linting.insert("objectNameStyleArgument".into(), json!(first));
             }
         }
         "trailing_whitespace_linter"
@@ -340,10 +340,10 @@ fn parse_named_int(args: &str, name: &str) -> Option<u64> {
         // earlier in the list (e.g. `indentation_linter(2, indent = 4)`)
         // doesn't short-circuit the whole search — mirrors the
         // `parse_named_string` / `parse_named_string_vec` shape.
-        if let Some((lhs, rhs)) = part.split_once('=') {
-            if lhs.trim() == name {
-                return rhs.trim().parse::<u64>().ok();
-            }
+        if let Some((lhs, rhs)) = part.split_once('=')
+            && lhs.trim() == name
+        {
+            return rhs.trim().parse::<u64>().ok();
         }
     }
     None
@@ -351,11 +351,11 @@ fn parse_named_int(args: &str, name: &str) -> Option<u64> {
 
 fn parse_named_string(args: &str, name: &str) -> Option<String> {
     for part in split_top_level_commas(args) {
-        if let Some((lhs, rhs)) = part.split_once('=') {
-            if lhs.trim() == name {
-                let v = rhs.trim().trim_matches(|c| c == '"' || c == '\'');
-                return Some(v.to_string());
-            }
+        if let Some((lhs, rhs)) = part.split_once('=')
+            && lhs.trim() == name
+        {
+            let v = rhs.trim().trim_matches(|c| c == '"' || c == '\'');
+            return Some(v.to_string());
         }
     }
     None
@@ -363,18 +363,18 @@ fn parse_named_string(args: &str, name: &str) -> Option<String> {
 
 fn parse_named_string_vec(args: &str, name: &str) -> Option<Vec<String>> {
     for part in split_top_level_commas(args) {
-        if let Some((lhs, rhs)) = part.split_once('=') {
-            if lhs.trim() == name {
-                let rhs = rhs.trim();
-                let inner = rhs.strip_prefix("c(").and_then(|r| r.strip_suffix(')'))?;
-                return Some(
-                    split_top_level_commas(inner)
-                        .into_iter()
-                        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                );
-            }
+        if let Some((lhs, rhs)) = part.split_once('=')
+            && lhs.trim() == name
+        {
+            let rhs = rhs.trim();
+            let inner = rhs.strip_prefix("c(").and_then(|r| r.strip_suffix(')'))?;
+            return Some(
+                split_top_level_commas(inner)
+                    .into_iter()
+                    .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
         }
     }
     None
@@ -428,9 +428,10 @@ mod tests {
     #[test]
     fn out_of_grammar_yields_batch_warning() {
         let out = load_str("linters: linters_with_defaults(linters_with_tags(\"default\"))\n");
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w.contains("unrecognized construct")));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct"))
+        );
     }
 }

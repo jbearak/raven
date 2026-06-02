@@ -23,7 +23,7 @@
 // integrated into WorldState in task 7.1
 #![allow(dead_code)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use tokio::process::Command;
 
@@ -661,13 +661,13 @@ cat("__RAVEN_END__\n")
         }
 
         // Validate package name if provided
-        if let Some(pkg) = package {
-            if !is_valid_package_name(pkg) {
-                return Err(anyhow!(
-                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
-                    pkg
-                ));
-            }
+        if let Some(pkg) = package
+            && !is_valid_package_name(pkg)
+        {
+            return Err(anyhow!(
+                "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
+                pkg
+            ));
         }
 
         // Build R code to resolve the function and extract formals.

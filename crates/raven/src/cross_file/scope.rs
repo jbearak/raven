@@ -14,7 +14,7 @@ use tower_lsp::lsp_types::Url;
 use tree_sitter::{Node, Tree};
 
 use super::source_detect::{detect_library_calls, detect_rm_calls, detect_source_calls};
-use super::types::{byte_offset_to_utf16_column, ForwardSource};
+use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
 // ============================================================================
 // Line Index for Fast Lookups
@@ -409,15 +409,15 @@ impl FunctionScopeTree {
 
         // Compute max_end as max of: node's end, left subtree max_end, right subtree max_end
         let mut max_end = interval.end;
-        if let Some(ref left_node) = left {
-            if left_node.max_end > max_end {
-                max_end = left_node.max_end;
-            }
+        if let Some(ref left_node) = left
+            && left_node.max_end > max_end
+        {
+            max_end = left_node.max_end;
         }
-        if let Some(ref right_node) = right {
-            if right_node.max_end > max_end {
-                max_end = right_node.max_end;
-            }
+        if let Some(ref right_node) = right
+            && right_node.max_end > max_end
+        {
+            max_end = right_node.max_end;
         }
 
         Some(Box::new(IntervalNode {
@@ -475,10 +475,10 @@ impl FunctionScopeTree {
         // Prune left subtree if its max_end < pos
         // If the maximum end position in the left subtree is less than the query position,
         // no interval in the left subtree can contain the position.
-        if let Some(ref left) = node.left {
-            if left.max_end >= pos {
-                Self::query_point_recursive(left, pos, results);
-            }
+        if let Some(ref left) = node.left
+            && left.max_end >= pos
+        {
+            Self::query_point_recursive(left, pos, results);
         }
 
         // Prune right subtree if node's start > pos
@@ -487,10 +487,11 @@ impl FunctionScopeTree {
         // so none of them can contain the position.
         // We also skip the right subtree when its max_end is before the query position,
         // since no interval in it can contain pos.
-        if let Some(ref right) = node.right {
-            if node.interval.start <= pos && right.max_end >= pos {
-                Self::query_point_recursive(right, pos, results);
-            }
+        if let Some(ref right) = node.right
+            && node.interval.start <= pos
+            && right.max_end >= pos
+        {
+            Self::query_point_recursive(right, pos, results);
         }
     }
 
@@ -531,31 +532,30 @@ impl FunctionScopeTree {
     ) -> Option<FunctionScopeInterval> {
         // If the current node starts after the position, only the left subtree might contain pos.
         if node.interval.start > pos {
-            if let Some(ref left) = node.left {
-                if left.max_end >= pos {
-                    return Self::query_innermost_recursive(left, pos);
-                }
+            if let Some(ref left) = node.left
+                && left.max_end >= pos
+            {
+                return Self::query_innermost_recursive(left, pos);
             }
             return None;
         }
 
         // Prefer right subtree first (larger start positions).
-        if let Some(ref right) = node.right {
-            if right.max_end >= pos {
-                if let Some(right_result) = Self::query_innermost_recursive(right, pos) {
-                    return Some(right_result);
-                }
-            }
+        if let Some(ref right) = node.right
+            && right.max_end >= pos
+            && let Some(right_result) = Self::query_innermost_recursive(right, pos)
+        {
+            return Some(right_result);
         }
 
         if node.interval.contains(pos) {
             return Some(node.interval);
         }
 
-        if let Some(ref left) = node.left {
-            if left.max_end >= pos {
-                return Self::query_innermost_recursive(left, pos);
-            }
+        if let Some(ref left) = node.left
+            && left.max_end >= pos
+        {
+            return Self::query_innermost_recursive(left, pos);
         }
 
         None
@@ -1934,10 +1934,10 @@ where
                     // Local definitions take precedence (don't overwrite)
 
                     // Skip function-local definitions not in our scope
-                    if let Some(def_scope) = function_scope {
-                        if !active_function_scopes.contains(def_scope) {
-                            continue;
-                        }
+                    if let Some(def_scope) = function_scope
+                        && !active_function_scopes.contains(def_scope)
+                    {
+                        continue;
                     }
                     scope.symbols.entry(symbol.name.clone()).or_insert_with(|| {
                         log::trace!(
@@ -1961,10 +1961,10 @@ where
             } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
-                    if let Some(src_scope) = function_scope {
-                        if !active_function_scopes.contains(src_scope) {
-                            continue;
-                        }
+                    if let Some(src_scope) = function_scope
+                        && !active_function_scopes.contains(src_scope)
+                    {
+                        continue;
                     }
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
@@ -2132,45 +2132,45 @@ fn collect_definitions(
     // The symbol's own `defined_line/defined_column` (used for hover and
     // go-to-definition) remains at the LHS identifier, so navigation is
     // unaffected.
-    if node.kind() == "binary_operator" {
-        if let Some(symbol) = try_extract_assignment(node, line_index, uri) {
-            let (visible_line, visible_column) =
-                assignment_visible_from_position(node, line_index, &symbol);
-            let event = ScopeEvent::Def {
-                line: symbol.defined_line,
-                column: symbol.defined_column,
-                visible_from_line: visible_line,
-                visible_from_column: visible_column,
-                symbol: symbol.clone(),
-                function_scope: None,
-            };
-            artifacts.timeline.push(event);
-            artifacts
-                .exported_interface
-                .insert(symbol.name.clone(), symbol);
-        }
+    if node.kind() == "binary_operator"
+        && let Some(symbol) = try_extract_assignment(node, line_index, uri)
+    {
+        let (visible_line, visible_column) =
+            assignment_visible_from_position(node, line_index, &symbol);
+        let event = ScopeEvent::Def {
+            line: symbol.defined_line,
+            column: symbol.defined_column,
+            visible_from_line: visible_line,
+            visible_from_column: visible_column,
+            symbol: symbol.clone(),
+            function_scope: None,
+        };
+        artifacts.timeline.push(event);
+        artifacts
+            .exported_interface
+            .insert(symbol.name.clone(), symbol);
     }
 
     // Check for assign() calls (Requirement 17.4). The value argument is always
     // an immediately-evaluated expression (R does not introspect strings here),
     // so the RHS-before-binding rule always applies — the new binding becomes
     // visible at the end of the call.
-    if node.kind() == "call" {
-        if let Some(symbol) = try_extract_assign_call(node, line_index, uri) {
-            let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
-            let event = ScopeEvent::Def {
-                line: symbol.defined_line,
-                column: symbol.defined_column,
-                visible_from_line: visible_line,
-                visible_from_column: visible_column,
-                symbol: symbol.clone(),
-                function_scope: None,
-            };
-            artifacts.timeline.push(event);
-            artifacts
-                .exported_interface
-                .insert(symbol.name.clone(), symbol);
-        }
+    if node.kind() == "call"
+        && let Some(symbol) = try_extract_assign_call(node, line_index, uri)
+    {
+        let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+        let event = ScopeEvent::Def {
+            line: symbol.defined_line,
+            column: symbol.defined_column,
+            visible_from_line: visible_line,
+            visible_from_column: visible_column,
+            symbol: symbol.clone(),
+            function_scope: None,
+        };
+        artifacts.timeline.push(event);
+        artifacts
+            .exported_interface
+            .insert(symbol.name.clone(), symbol);
     }
 
     // Check for for loop iterators.
@@ -2182,28 +2182,28 @@ fn collect_definitions(
     // position. (Whether `for (i in expr_referencing_i)` should resolve to an
     // outer `i` is a separate question with the same answer R itself gives;
     // this fix targets `<-`/`=`/`<<-`/`assign()` only.)
-    if node.kind() == "for_statement" {
-        if let Some(symbol) = try_extract_for_loop_iterator(node, line_index, uri) {
-            let event = ScopeEvent::Def {
-                line: symbol.defined_line,
-                column: symbol.defined_column,
-                visible_from_line: symbol.defined_line,
-                visible_from_column: symbol.defined_column,
-                symbol: symbol.clone(),
-                function_scope: None,
-            };
-            artifacts.timeline.push(event);
-            artifacts
-                .exported_interface
-                .insert(symbol.name.clone(), symbol);
-        }
+    if node.kind() == "for_statement"
+        && let Some(symbol) = try_extract_for_loop_iterator(node, line_index, uri)
+    {
+        let event = ScopeEvent::Def {
+            line: symbol.defined_line,
+            column: symbol.defined_column,
+            visible_from_line: symbol.defined_line,
+            visible_from_column: symbol.defined_column,
+            symbol: symbol.clone(),
+            function_scope: None,
+        };
+        artifacts.timeline.push(event);
+        artifacts
+            .exported_interface
+            .insert(symbol.name.clone(), symbol);
     }
 
     // Check for function definitions to extract parameter scope
-    if node.kind() == "function_definition" {
-        if let Some(function_scope) = try_extract_function_scope(node, line_index, uri) {
-            artifacts.timeline.push(function_scope);
-        }
+    if node.kind() == "function_definition"
+        && let Some(function_scope) = try_extract_function_scope(node, line_index, uri)
+    {
+        artifacts.timeline.push(function_scope);
     }
 
     // Recurse into children
@@ -2226,7 +2226,8 @@ fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> 
         .child_by_field_name("body")
         .or_else(|| {
             // Most common body node for function definitions.
-            node.children(&mut node.walk())
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
                 .find(|c| c.is_named() && c.kind() == "braced_expression")
         })
         .or_else(|| {
@@ -2243,10 +2244,9 @@ fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> 
         if matches!(
             child.kind(),
             "parameter" | "default_parameter" | "identifier" | "dots"
-        ) {
-            if let Some(param_symbol) = extract_parameter_symbol(child, line_index, uri) {
-                parameters.push(param_symbol);
-            }
+        ) && let Some(param_symbol) = extract_parameter_symbol(child, line_index, uri)
+        {
+            parameters.push(param_symbol);
         }
     }
 
@@ -3711,10 +3711,10 @@ where
             } => {
                 // Include source() if before position, or if hoisting and it's a global source()
                 let passes_position = (*src_line, *src_col) < (line, column);
-                if let Some(src_scope) = function_scope {
-                    if !active_function_scopes.contains(src_scope) {
-                        continue;
-                    }
+                if let Some(src_scope) = function_scope
+                    && !active_function_scopes.contains(src_scope)
+                {
+                    continue;
                 }
                 let is_global_source = query_inside_function && function_scope.is_none();
                 if passes_position || is_global_source {
@@ -4072,10 +4072,10 @@ where
     // NAMESPACE-imported symbols that were not already resolved by the
     // standard scope engine above. This ensures existing local definitions
     // always take precedence (additive-only).
-    if current_depth == 0 {
-        if let Some(contrib) = package_contribution {
-            append_package_contribution(&mut scope, uri, contrib);
-        }
+    if current_depth == 0
+        && let Some(contrib) = package_contribution
+    {
+        append_package_contribution(&mut scope, uri, contrib);
     }
 
     scope
@@ -7734,12 +7734,13 @@ outside_var <- 2"#;
         inside_function: bool,
     ) -> Option<tree_sitter::Node<'a>> {
         let now_inside_function = inside_function || node.kind() == "function_definition";
-        if now_inside_function && node.kind() == "call" {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                if func_node.kind() == "identifier" && &content[func_node.byte_range()] == name {
-                    return Some(node);
-                }
-            }
+        if now_inside_function
+            && node.kind() == "call"
+            && let Some(func_node) = node.child_by_field_name("function")
+            && func_node.kind() == "identifier"
+            && &content[func_node.byte_range()] == name
+        {
+            return Some(node);
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -12806,9 +12807,7 @@ x <- 1"#;
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
         assert!(
-            grandparent_scope
-                .loaded_packages
-                .contains("stringr"),
+            grandparent_scope.loaded_packages.contains("stringr"),
             "Grandparent should have stringr from grandchild (package propagation via loaded_packages)"
         );
 
@@ -13343,7 +13342,7 @@ y <- filter(df)"#;
 
     mod reserved_word_property_tests {
         use super::*;
-        use crate::reserved_words::{is_reserved_word, RESERVED_WORDS};
+        use crate::reserved_words::{RESERVED_WORDS, is_reserved_word};
         use proptest::prelude::*;
 
         /// Strategy to generate a reserved word from the set.
@@ -13372,8 +13371,8 @@ y <- filter(df)"#;
 
         /// Generate R code with an assignment to a reserved word.
         /// Returns (code, reserved_word, operator).
-        fn reserved_word_assignment_strategy(
-        ) -> impl Strategy<Value = (String, &'static str, &'static str)> {
+        fn reserved_word_assignment_strategy()
+        -> impl Strategy<Value = (String, &'static str, &'static str)> {
             (
                 reserved_word_strategy(),
                 assignment_operator_strategy(),

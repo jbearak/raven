@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::directive::parse_directives;
-use super::path_resolve::{resolve_working_directory, PathContext};
+use super::path_resolve::{PathContext, resolve_working_directory};
 use super::types::{CallSiteSpec, CrossFileMetadata};
 
 // ============================================================================
@@ -1556,7 +1556,7 @@ proptest! {
 // Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3
 // ============================================================================
 
-use super::scope::{compute_artifacts, scope_at_position_with_deps, ScopeArtifacts};
+use super::scope::{ScopeArtifacts, compute_artifacts, scope_at_position_with_deps};
 
 fn parse_r_tree(code: &str) -> tree_sitter::Tree {
     let mut parser = Parser::new();
@@ -7604,7 +7604,7 @@ proptest! {
 // - The position ordering is correct
 // ============================================================================
 
-use super::scope::{event_effect_position, ScopeEvent};
+use super::scope::{ScopeEvent, event_effect_position};
 
 /// R reserved words that cannot be used as package names
 const R_RESERVED_PKG: &[&str] = &[
@@ -7750,16 +7750,10 @@ proptest! {
             prev_pos = pos;
         }
 
-        // 6. Verify position-aware property: PackageLoad should come AFTER definitions on earlier lines
-        //    and BEFORE definitions on later lines
-        for event in &artifacts.timeline {
-            if let ScopeEvent::Def { line, .. } = event {
-                if *line < library_line as u32 {
-                    // Definitions before library call should come before PackageLoad in timeline
-                    // (This is implicitly verified by the sorted check above)
-                }
-            }
-        }
+        // 6. Position-aware property: definitions before the library call come before
+        //    PackageLoad in the timeline, and definitions after it come after. This is
+        //    implicitly verified by the sorted-timeline check in step 5 above, so there
+        //    is no separate assertion here.
     }
 
     /// Property 3 extended: Multiple library calls should create multiple PackageLoad events in order

@@ -492,10 +492,10 @@ impl WorkspaceIndex {
         self.version.fetch_add(1, Ordering::SeqCst);
 
         // Update metrics
-        if count > 0 {
-            if let Ok(mut metrics) = self.metrics.write() {
-                metrics.invalidations += count as u64;
-            }
+        if count > 0
+            && let Ok(mut metrics) = self.metrics.write()
+        {
+            metrics.invalidations += count as u64;
         }
     }
 
