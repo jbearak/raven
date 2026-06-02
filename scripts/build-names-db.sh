@@ -7,10 +7,15 @@ set -euo pipefail
 RAVEN="" OUT="" SEED="" WORK=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --raven) RAVEN="$2"; shift 2;;
-    --output) OUT="$2"; shift 2;;
-    --seed) SEED="$2"; shift 2;;
-    --work) WORK="$2"; shift 2;;
+    --raven|--output|--seed|--work)
+      [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
+      case "$1" in
+        --raven) RAVEN="$2";;
+        --output) OUT="$2";;
+        --seed) SEED="$2";;
+        --work) WORK="$2";;
+      esac
+      shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -23,6 +28,8 @@ SKIP_COUNT=0 TOTAL_COUNT=0 FAIL_THRESHOLD="${FAIL_THRESHOLD:-0.05}"
 for host in cran.r-universe.dev bioc.r-universe.dev; do
   dest="$WORK/runiverse/${host%%.*}"; mkdir -p "$dest"
   curl -sf "https://${host}/api/ls" -o "$WORK/pkglist-${host}.json"
+  [ "$(jq 'length' "$WORK/pkglist-${host}.json")" -gt 0 ] \
+    || { echo "error: empty package list from ${host}; aborting" >&2; exit 1; }
   # Process substitution (not a pipe) keeps SKIP_COUNT/TOTAL_COUNT in this shell.
   while read -r pkg; do
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
