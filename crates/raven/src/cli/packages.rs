@@ -797,8 +797,7 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
 }
 
 pub fn run_validate_shipped_db(args: ValidateShippedDbArgs) -> Result<(), String> {
-    let db = ShippedDb::open(&args.path)
-        .map_err(|e| format!("{}: {e}", args.path.display()))?;
+    let db = ShippedDb::open(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
     let records = db.all_records();
     let provenance = db.provenance();
     let expected = provenance.package_count as usize;
@@ -1505,16 +1504,14 @@ mod tests {
         let err = super::parse_validate_shipped_db_args(std::iter::empty()).unwrap_err();
         assert!(err.contains("needs a names.db path"));
 
-        let args = super::parse_validate_shipped_db_args(
-            ["dist/names.db"].into_iter().map(String::from),
-        )
-        .unwrap();
+        let args =
+            super::parse_validate_shipped_db_args(["dist/names.db"].into_iter().map(String::from))
+                .unwrap();
         assert_eq!(args.path, std::path::PathBuf::from("dist/names.db"));
 
-        let err = super::parse_validate_shipped_db_args(
-            ["a.db", "b.db"].into_iter().map(String::from),
-        )
-        .unwrap_err();
+        let err =
+            super::parse_validate_shipped_db_args(["a.db", "b.db"].into_iter().map(String::from))
+                .unwrap_err();
         assert!(err.contains("unexpected extra argument"));
     }
 
@@ -1546,7 +1543,8 @@ mod tests {
         let path = dir.path().join("names.db");
         std::fs::write(&path, b"NOT A RAVEN DB").unwrap();
 
-        let err = super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
+        let err =
+            super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
         assert!(err.contains("bad magic"), "got {err}");
     }
 
@@ -1572,7 +1570,8 @@ mod tests {
         };
         write_shipped_db(&path, &recs, prov).unwrap();
 
-        let err = super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
+        let err =
+            super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
         assert!(err.contains("provenance says"), "got {err}");
     }
 
