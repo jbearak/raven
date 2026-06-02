@@ -48,6 +48,10 @@ jobs:
   build-lsp:
     needs: validate-names-db
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     defaults:
       run:
         shell: bash
@@ -130,6 +134,11 @@ jobs:
             cd dist && zip -r ../raven-${{ matrix.platform }}.zip .
           fi
 
+      - name: Attest build provenance (LSP archive)
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: raven-${{ matrix.platform }}.zip
+
       - name: Upload LSP artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -140,6 +149,10 @@ jobs:
   build-vscode:
     needs: build-lsp
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         target: [darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64, win32-arm64]
@@ -176,7 +189,7 @@ jobs:
       - name: Install dependencies
         run: |
           cd editors/vscode
-          npm install
+          npm ci
 
       - name: Compile extension
         run: |
@@ -201,6 +214,11 @@ jobs:
         run: |
           cd editors/vscode
           vsce package --target ${{ matrix.target }}
+
+      - name: Attest build provenance (VSIX)
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: editors/vscode/*.vsix
 
       - name: Upload extension artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

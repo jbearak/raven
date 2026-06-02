@@ -129,6 +129,7 @@ This updates `Cargo.toml` (workspace version) and `editors/vscode/package.json`,
 Pushing the tag triggers `release-build.yml`, which:
 1. Cross-compiles the `raven` binary for 6 platforms (linux-x64, linux-arm64, macos-arm64, macos-x64, windows-x64, windows-arm64)
 2. Packages a platform-specific `.vsix` for each target (the binary is embedded in `bin/`)
+3. Generates a Sigstore-backed build-provenance attestation (`actions/attest-build-provenance`) for each `raven-<platform>.zip` and `.vsix`, so a published artifact can be verified with `gh attestation verify <file> --repo jbearak/raven`
 
 ### Publishing
 
