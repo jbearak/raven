@@ -41,6 +41,9 @@ impl Suppressions {
             let line_no = idx as u32;
             let marker = find_marker(line);
 
+            // Collapsing these inner `if`s into match guards would force a
+            // wildcard arm and lose exhaustiveness over `NolintMarker` variants.
+            #[allow(clippy::collapsible_match)]
             match marker {
                 Some(NolintMarker::Start) => {
                     if !in_block {

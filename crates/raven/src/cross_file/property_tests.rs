@@ -8749,8 +8749,10 @@ proptest! {
     ) {
         // Create some nested intervals by shrinking existing ones
         let mut all_scopes = base_intervals.clone();
-        for i in 0..nested_count.min(base_intervals.len()) {
-            let (sl, sc, el, ec) = base_intervals[i];
+        for &(sl, sc, el, ec) in base_intervals
+            .iter()
+            .take(nested_count.min(base_intervals.len()))
+        {
             // Create a nested interval if possible
             if sl + 1 < el || (sl + 1 == el && sc + 1 < ec) {
                 let nested = (
@@ -11729,14 +11731,7 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // Create a package exports callback that returns EMPTY exports
-        let pkg_clone = package.clone();
-        let get_exports = move |p: &str| -> HashSet<String> {
-            if p == pkg_clone {
-                HashSet::new() // Empty exports!
-            } else {
-                HashSet::new()
-            }
-        };
+        let get_exports = move |_p: &str| -> HashSet<String> { HashSet::new() };
 
         let base_exports = HashSet::new();
 

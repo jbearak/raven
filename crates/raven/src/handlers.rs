@@ -3534,8 +3534,8 @@ impl BlockDetector {
             } else {
                 // Scan forward from the line after the keyword for the opening brace
                 let mut found = None;
-                for scan_line in (keyword_line + 1)..total_lines {
-                    if let Some(col) = lines[scan_line].find('{') {
+                for (scan_line, &line) in lines.iter().enumerate().skip(keyword_line + 1) {
+                    if let Some(col) = line.find('{') {
                         found = Some((scan_line, col));
                         break;
                     }
@@ -10695,6 +10695,9 @@ fn classify_comment_for_ignore(
     let prefix = line_text.get(..start_col).unwrap_or("");
     let standalone = prefix.trim().is_empty();
 
+    // Collapsing these inner `if`s into match guards would force a wildcard
+    // arm and lose exhaustiveness over `LspIgnoreKind` variants.
+    #[allow(clippy::collapsible_match)]
     match classify_lsp_ignore_marker(body) {
         Some(LspIgnoreKind::SameLine) => {
             // Inline `# @lsp-ignore` suppresses *this* line — but only
@@ -27662,8 +27665,8 @@ mod proptests {
             let param_count = param_count.min(has_defaults.len());
             let mut params = Vec::new();
 
-            for i in 0..param_count {
-                if has_defaults[i] {
+            for (i, &has_default) in has_defaults.iter().enumerate().take(param_count) {
+                if has_default {
                     params.push(format!("p{} = {}", i, i + 1));
                 } else {
                     params.push(format!("p{}", i));
@@ -33944,8 +33947,7 @@ setClass("{}", slots = c(value = "numeric"))
             for i in 0..expected_sections.len() {
                 let (current_start, current_level) = expected_sections[i];
                 let mut end_line = line_count - 1; // default: EOF
-                for j in (i + 1)..expected_sections.len() {
-                    let (next_start, next_level) = expected_sections[j];
+                for &(next_start, next_level) in expected_sections.iter().skip(i + 1) {
                     if next_level <= current_level {
                         // Found sibling or ancestor
                         end_line = if next_start > 0 { next_start - 1 } else { 0 };
@@ -34133,8 +34135,7 @@ setClass("{}", slots = c(value = "numeric"))
             for i in 0..sections_info.len() {
                 let (start, level, ref name) = sections_info[i];
                 let mut end_line = line_count - 1; // default: EOF
-                for j in (i + 1)..sections_info.len() {
-                    let (next_start, next_level, _) = sections_info[j];
+                for &(next_start, next_level, _) in sections_info.iter().skip(i + 1) {
                     if next_level <= level {
                         end_line = if next_start > 0 { next_start - 1 } else { 0 };
                         break;
@@ -35103,15 +35104,16 @@ setClass("{}", slots = c(value = "numeric"))
     ///      The result.
     /// ```
     fn build_rd_help_text(params: &[(String, String)]) -> String {
-        let mut lines = Vec::new();
-        lines.push("Function Title".to_string());
-        lines.push(String::new());
-        lines.push("Description:".to_string());
-        lines.push(String::new());
-        lines.push("     Some description of the function.".to_string());
-        lines.push(String::new());
-        lines.push("Arguments:".to_string());
-        lines.push(String::new());
+        let mut lines = vec![
+            "Function Title".to_string(),
+            String::new(),
+            "Description:".to_string(),
+            String::new(),
+            "     Some description of the function.".to_string(),
+            String::new(),
+            "Arguments:".to_string(),
+            String::new(),
+        ];
 
         for (name, desc) in params {
             // Rd2txt format: indented name followed by ": " and description.

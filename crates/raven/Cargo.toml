@@ -8,6 +8,14 @@ license.workspace = true
 rust-version.workspace = true
 repository = "https://github.com/jbearak/Raven"
 
+# clippy is gated in CI with `-D warnings` (see .github/workflows/integration.yml).
+# `field_reassign_with_default` is the one lint allowed: the
+# `let mut x = T::default(); x.field = ..;` idiom is used pervasively and
+# deliberately in test/builder setup, where it reads more clearly than a
+# struct-literal with `..Default::default()`.
+[lints.clippy]
+field_reassign_with_default = "allow"
+
 [[bin]]
 name = "raven"
 path = "src/main.rs"

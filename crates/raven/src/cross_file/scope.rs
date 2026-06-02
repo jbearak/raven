@@ -1013,6 +1013,7 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
                 // Non-local source() (the default) evaluates in .GlobalEnv,
                 // so its symbols should be globally visible regardless of
                 // where the call site is.
+                #[allow(clippy::collapsible_match)] // guard would break match exhaustiveness
                 if should_apply_local_scoping(source) {
                     *function_scope = find_containing_function_scope(
                         &artifacts.function_scope_tree,
