@@ -302,7 +302,7 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
                     // Extract the first argument
                     if let Some(args_node) = node.child_by_field_name("arguments") {
                         for i in 0..args_node.child_count() {
-                            if let Some(child) = args_node.child(i)
+                            if let Some(child) = args_node.child(i as u32)
                                 && child.kind() == "argument"
                                 && let Some(value_node) = child.child_by_field_name("value")
                             {
@@ -320,7 +320,7 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
 
         let child_count = node.child_count();
         for i in (0..child_count).rev() {
-            if let Some(child) = node.child(i) {
+            if let Some(child) = node.child(i as u32) {
                 stack.push(child);
             }
         }

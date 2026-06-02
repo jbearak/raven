@@ -35,8 +35,8 @@ tokio = { version = "1.26.0", features = ["full"] }
 tokio-util = "0.7"
 tower = "0.4"
 tower-lsp.workspace = true
-tree-sitter = "0.24.7"
-tree-sitter-r = { git = "https://github.com/r-lib/tree-sitter-r", rev = "95aff097aa927a66bb357f715b58cde821be8867" }
+tree-sitter = "=0.26.9"
+tree-sitter-r = { git = "https://github.com/r-lib/tree-sitter-r", rev = "8ac99ed1e7ad319737fc11dde20c07d1e1942383" }
 url = "2.4.1"
 walkdir = "2"
 dashmap = "5.4.0"

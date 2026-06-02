@@ -17849,6 +17849,70 @@ clean_data <- function(x) {
         );
     }
 
+    /// Regression: tree-sitter-r parses `return` as a plain identifier (not a
+    /// keyword node), so `return(x)` is an ordinary `call`. The
+    /// undefined-variable collector must not flag `return`, because it is a
+    /// registered builtin (`is_builtin("return")`) — note `return` is NOT in
+    /// the `reserved_words` list, so the builtin guard is what suppresses it.
+    #[tokio::test]
+    async fn test_diagnostic_does_not_flag_return_call() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "f <- function(x) { return(x) }\ng <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        // Sanity: the baseline undefined symbol MUST be flagged — otherwise the
+        // collector isn't running and the test is vacuous.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: return"),
+            "`return(...)` must not be flagged as undefined (return is a builtin). messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
     /// Package-internal symbols from `r_internal_symbols` must also suppress
     /// the undefined-variable diagnostic in the hot ScopeStream path.
     #[tokio::test]
