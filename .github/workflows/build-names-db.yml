@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-      - uses: r-lib/actions/setup-r@a51a8012b0aab7c32ef9d19bf54da93f3254335e # v2 — reference R; --reference-lib captures whatever is installed here
+      - uses: r-lib/actions/setup-r@a51a8012b0aab7c32ef9d19bf54da93f3254335e # v2 — reference R; build-shipped-db auto-discovers its .libPaths()
 
       - name: Build raven (release)
         run: cargo build --release -p raven
@@ -35,11 +35,9 @@ jobs:
       - name: Build names.db (reference-R seed ∪ CRAN+Bioc, append-only)
         run: |
           mkdir -p dist
-          REF_LIB="$(Rscript -e 'cat(.Library)')"
           scripts/build-names-db.sh \
             --raven ./target/release/raven \
             --output dist/names.db \
-            --reference-lib "$REF_LIB" \
             ${SEED:+--seed "$SEED"}
 
       - name: Record checksums

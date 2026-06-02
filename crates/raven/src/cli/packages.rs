@@ -55,7 +55,7 @@ pub fn parse_update_args(mut argv: impl Iterator<Item = String>) -> Result<Updat
 }
 
 pub struct BuildShippedDbArgs {
-    pub reference_libs: Vec<PathBuf>,
+    pub capture_reference: bool,
     pub runiverse_cran: Option<PathBuf>,
     pub runiverse_bioc: Option<PathBuf>,
     pub fresh: bool,
@@ -68,7 +68,6 @@ pub struct BuildShippedDbArgs {
 pub fn parse_build_shipped_db_args(
     mut argv: impl Iterator<Item = String>,
 ) -> Result<BuildShippedDbArgs, String> {
-    let mut reference_libs: Vec<PathBuf> = Vec::new();
     let mut runiverse_cran = None;
     let mut runiverse_bioc = None;
     let mut fresh = false;
@@ -78,9 +77,6 @@ pub fn parse_build_shipped_db_args(
     let mut source = "reference-R ∪ r-universe".to_string();
     while let Some(arg) = argv.next() {
         match arg.as_str() {
-            "--reference-lib" => reference_libs.push(PathBuf::from(
-                argv.next().ok_or("--reference-lib needs a path")?,
-            )),
             "--runiverse-cran" => {
                 runiverse_cran = Some(PathBuf::from(
                     argv.next().ok_or("--runiverse-cran needs a path")?,
@@ -103,7 +99,7 @@ pub fn parse_build_shipped_db_args(
         }
     }
     Ok(BuildShippedDbArgs {
-        reference_libs,
+        capture_reference: true,
         runiverse_cran,
         runiverse_bioc,
         fresh,
@@ -708,13 +704,13 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
     }
 
     let mut reference_r: Vec<PackageRecord> = Vec::new();
-    if !args.reference_libs.is_empty() {
-        let outcome = crate::package_library::build_package_library_tier1_only(
-            None,
-            &args.reference_libs,
-            None,
-        )
-        .await;
+    if args.capture_reference {
+        // Capture the build machine's entire installed library: the Tier-1-only
+        // build auto-detects R and `initialize()` discovers every `.libPaths()`
+        // entry, so no library paths need to be passed in. (Tests set
+        // `capture_reference = false` to stay deterministic / R-free.)
+        let outcome =
+            crate::package_library::build_package_library_tier1_only(None, &[], None).await;
         for name in outcome.library.enumerate_installed_packages() {
             if let Some(info) = outcome.library.get_package(&name).await {
                 reference_r.push(record_with_version(&outcome.library, &name, &info));
@@ -1306,14 +1302,7 @@ pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
             run_fetch(args).await
         }
         Some("build-shipped-db") => {
-            let mut args = parse_build_shipped_db_args(argv)?;
-            // Default to the maintainer's entire installed library: auto-discover
-            // every R `.libPaths()` entry when no explicit --reference-lib was given.
-            if args.reference_libs.is_empty() {
-                if let Some(r) = crate::r_subprocess::RSubprocess::new(None) {
-                    args.reference_libs = r.get_lib_paths().await.unwrap_or_default();
-                }
-            }
+            let args = parse_build_shipped_db_args(argv)?;
             run_build_shipped_db(args).await
         }
         Some("build-embedded-base") => {
@@ -1335,7 +1324,7 @@ pub fn print_help() {
 [--workspace DIR] [--base-urls URL[,URL]]\n  \
          raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]\n  \
          raven packages update [--base-url URL] [--dest-dir DIR]\n  \
-         raven packages build-shipped-db [--reference-lib DIR] [--runiverse-cran DIR] \
+         raven packages build-shipped-db [--runiverse-cran DIR] \
 [--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
 [--snapshot-date S] [--source S]\n  \
          raven packages build-embedded-base --reference-lib DIR [--output PATH]\n"
@@ -1425,32 +1414,8 @@ mod tests {
         assert_eq!(args.output, std::path::PathBuf::from("out.db"));
         assert!(args.fresh, "--fresh skips the default prior-DB seed");
         assert_eq!(args.snapshot_date, "2026-05-30");
-        assert!(args.reference_libs.is_empty());
+        assert!(args.capture_reference);
         assert_eq!(args.seed, None);
-    }
-
-    #[test]
-    fn parse_build_shipped_db_args_reference_lib_is_repeatable() {
-        let args = super::parse_build_shipped_db_args(
-            [
-                "--reference-lib",
-                "/a",
-                "--reference-lib",
-                "/b",
-                "--output",
-                "out.db",
-            ]
-            .into_iter()
-            .map(String::from),
-        )
-        .unwrap();
-        assert_eq!(
-            args.reference_libs,
-            vec![
-                std::path::PathBuf::from("/a"),
-                std::path::PathBuf::from("/b")
-            ]
-        );
     }
 
     #[tokio::test]
@@ -1492,7 +1457,7 @@ mod tests {
         write_shipped_db(&seed, &recs, prov).unwrap();
 
         super::run_build_shipped_db(super::BuildShippedDbArgs {
-            reference_libs: vec![],
+            capture_reference: false,
             runiverse_cran: None,
             runiverse_bioc: None,
             fresh: false,
