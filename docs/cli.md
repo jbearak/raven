@@ -237,6 +237,10 @@ raven packages freeze [OPTIONS]
 - `--output PATH` — where to write the file (default: `.raven/packages.json` at the workspace root).
 - `--workspace DIR` — workspace root to scan for usage and config (default: current directory).
 
+#### Base-priority packages
+
+`freeze` skips only the default-attached **Base-7** packages that Raven treats as always in scope with no `library()` call. It may still write records for non-attached base-priority packages such as `grid`, `tools`, and `compiler` when your code uses them or when you choose `--installed` / `--all`. That is intentional: `freeze` captures your local R install, which may differ from the reference R used to build Raven's embedded fallback, and the generated file should match packages you explicitly call in scripts.
+
 #### Library order and renv
 
 Generation resolves each package from a **renv-first** library order: the renv project library first, system-wide libraries only for packages renv doesn't cover (renv wins, system fills the gaps). A `renv.lock` acts purely as a **set selector** — it decides *which* packages to include (a locked package is included even if no script ever calls it), **not** which version to read; the exports always come from the package actually installed locally. A locked package that isn't installed simply can't be captured and falls through to Tier 3 in CI. Best coverage therefore comes from running `freeze` after `renv::restore()`, but nothing breaks otherwise.

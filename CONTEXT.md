@@ -20,3 +20,17 @@ _Avoid_: folding datasets into "exports".
 
 **Export kind**:
 Whether an ordinary (non-dataset) export is a function or a plain value. Deliberately *not* tracked for package exports, because the ecosystem source (r-universe) supplies export names without kind. Distinct from dataset-vs-non-dataset, which is tracked.
+
+## ADRs
+
+### ADR: `freeze` records explicit base-priority packages
+
+Status: accepted.
+
+`raven packages freeze` is the local-R, version-exact producer for Tier 2. It skips only the packages Raven treats as always in scope without a `library()` call: the default-attached **Base-7**. It intentionally does **not** skip the whole embedded **Base-priority (14)** set. If a repo calls `library(grid)` or `library(tools)`, or a user runs `raven packages freeze --installed` / `--all`, the generated `.raven/packages.json` may contain `grid`, `tools`, `compiler`, etc.
+
+Rationale:
+
+- Raven's embedded base-priority table is built from Raven's reference R, while `freeze` is explicitly a snapshot of the user's local R install. Keeping non-attached base-priority records preserves local-version fidelity when the user's R differs from the build/reference R.
+- A frozen file should line up with packages users see in their scripts. Dropping `library(grid)` from the generated file just because Raven has an embedded fallback is surprising and looks like a missed capture.
+- R-free and maintainer producers have different contracts. `fetch` and `names.db` generation filter the full embedded base-priority set because they are not documenting a user's local R install, and base-priority coverage is already embedded in the binary.

@@ -47,6 +47,8 @@ The default `--used` scope is **maximally inclusive** — over-inclusion is free
 
 (`LinkingTo` is excluded — it is C-level and has no R exports. For a `:::` reference, the *package's exports* are still frozen; only the internal-object names are out of scope.) Use `--installed` / `--all` to capture every package across the renv + system libraries instead.
 
+`freeze` skips only the default-attached **Base-7** packages that Raven treats as always in scope with no `library()` call. It may still write records for non-attached base-priority packages such as `grid`, `tools`, and `compiler` when your code uses them or when you choose `--installed` / `--all`. That is intentional: `freeze` captures your local R install, which may differ from the reference R used to build Raven's embedded fallback, and the generated file should match packages you explicitly call in scripts.
+
 `renv.lock` is a **set selector** — it decides *which* packages to include (a locked package is included even if no script calls it), **not** which version to read; exports always come from whatever is installed locally. A locked package that isn't installed can't be captured and falls through to Tier 3 in CI. Best coverage therefore comes from generating after `renv::restore()`, but nothing breaks otherwise.
 
 ### Regeneration is a no-op when unchanged

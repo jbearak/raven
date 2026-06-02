@@ -429,8 +429,8 @@ pub async fn run_fetch(args: FetchArgs) -> Result<(), String> {
 /// **Provider-less (decision #6):** built with
 /// [`build_package_library_tier1_only`](crate::package_library::build_package_library_tier1_only)
 /// so a not-installed package can never leak a Tier 2/3 guess into the frozen
-/// file — every candidate is gated by `package_exists` (Tier-1) and base
-/// packages are skipped.
+/// file — every candidate is gated by `package_exists` (Tier-1) and the
+/// default-attached Base-7 packages are skipped.
 ///
 /// For `--used` the candidate set is **maximally inclusive (decision #10):**
 /// `library`/`require`/`loadNamespace` call args ∪ `::`/`:::` LHS ∪ the repo's
@@ -486,6 +486,13 @@ pub async fn run_freeze(args: FreezeArgs) -> Result<(), String> {
         if !seen.insert(name.clone()) {
             continue;
         }
+        // Freeze is a local-R, version-exact capture. Skip only the packages
+        // Raven treats as always in scope with no `library()` call (the
+        // default-attached Base-7), not the full embedded base-priority set.
+        // If a user explicitly calls `library(grid)` or runs `--all`, keeping
+        // that local-R record is intentional: their R version may differ from
+        // the reference R that produced Raven's embedded fallback, and a frozen
+        // file that omits explicitly used packages looks like a missed capture.
         if lib.is_base_package(&name) {
             continue;
         }
@@ -1711,8 +1718,10 @@ mod tests {
     #[test]
     fn embedded_base_packages_contains_expected() {
         let set = super::embedded_base_packages();
-        // Attached-7 plus a non-attached base-priority package: all 14 are
-        // "base" for fetch/freeze skip purposes.
+        // Attached-7 plus a non-attached base-priority package: all 14 are the
+        // embedded/R-free base set used by fetch and names.db generation.
+        // `freeze` intentionally uses PackageLibrary::is_base_package instead,
+        // so explicit local-R packages like grid can still be recorded.
         for pkg in ["base", "stats", "utils", "methods", "datasets", "grid"] {
             assert!(set.contains(pkg), "expected {pkg} in base set");
         }
