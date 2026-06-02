@@ -1,0 +1,18 @@
+# Single source of truth for the Rust toolchain. Local `cargo build/test/fmt/
+# clippy` and the CI jobs in .github/workflows/{integration,perf}.yml all run on
+# this version — rustup auto-installs it on first use, so a bare `cargo fmt` /
+# `cargo clippy` is the same rustfmt/clippy every contributor and gate uses.
+# 1.96.0 is also the project MSRV (`rust-version` in Cargo.toml), so CI actually
+# exercises the minimum supported compiler.
+#
+# Pinning makes upgrades intentional: it stops fmt/clippy drift and unrelated PR
+# failures as the floating `stable` toolchain shifts under contributors. Bump in
+# a dedicated PR — and update the matching `toolchain:` in release-build.yml,
+# which needs an explicit version to install cross-compilation targets.
+#
+# `profile = minimal` + the rustfmt/clippy components are what the fmt and clippy
+# gates rely on.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

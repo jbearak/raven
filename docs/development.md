@@ -43,8 +43,8 @@ Prerequisites:
 
 Clone and build:
 ```bash
-git clone https://github.com/jbearak/Raven.git
-cd Raven
+git clone https://github.com/jbearak/raven.git
+cd raven
 cargo build --release -p raven
 # Binary will be at target/release/raven
 ```

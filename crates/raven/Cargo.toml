@@ -6,7 +6,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-repository = "https://github.com/jbearak/Raven"
+repository = "https://github.com/jbearak/raven"
 
 # clippy is gated in CI with `-D warnings` (see .github/workflows/integration.yml).
 # `field_reassign_with_default` is the one lint allowed: the
