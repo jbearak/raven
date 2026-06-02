@@ -11153,8 +11153,8 @@ outside_var <- 2"#;
 
         // Equal positions
         assert!(Position::new(5, 10) == Position::new(5, 10));
-        assert!((Position::new(5, 10) >= Position::new(5, 10)));
-        assert!((Position::new(5, 10) <= Position::new(5, 10)));
+        assert!(Position::new(5, 10) >= Position::new(5, 10));
+        assert!(Position::new(5, 10) <= Position::new(5, 10));
 
         // Test with large values
         assert!(Position::new(1000000, 50000) < Position::new(1000001, 0));

@@ -1533,14 +1533,6 @@ impl DependencyGraph {
         }
     }
 
-    /// Detect cycles involving a URI.
-    ///
-    /// Returns a `CycleDetection` containing:
-    /// - `outgoing_edge`: the first edge FROM `uri` that leads into the cycle
-    ///   (use this for diagnostic positioning in the queried file)
-    /// - `closing_edge`: the edge that points BACK to `uri` completing the cycle
-    ///   (use this for the diagnostic message details)
-    ///
     /// Collect all URIs reachable from `uri` within `max_depth` hops,
     /// following both forward and backward edges.
     ///
@@ -1632,6 +1624,13 @@ impl DependencyGraph {
         visited
     }
 
+    /// Detect cycles involving a URI.
+    ///
+    /// Returns a `CycleDetection` containing:
+    /// - `outgoing_edge`: the first edge FROM `uri` that leads into the cycle
+    ///   (use this for diagnostic positioning in the queried file)
+    /// - `closing_edge`: the edge that points BACK to `uri` completing the cycle
+    ///   (use this for the diagnostic message details)
     pub fn detect_cycle(&self, uri: &Url) -> Option<CycleDetection> {
         use std::sync::atomic::Ordering;
         let revision = self.edge_revision.load(Ordering::Acquire);

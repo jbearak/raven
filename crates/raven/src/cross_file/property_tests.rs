@@ -9054,6 +9054,7 @@ proptest! {
     /// For any two positions a, b: if a < b, then NOT (b < a).
     /// Also: if a <= b and b <= a, then a == b.
     #[test]
+    #[allow(clippy::nonminimal_bool)] // assert on the negated operator directly to exercise it
     fn prop_position_ordering_antisymmetry(
         line1 in 0..u32::MAX,
         col1 in 0..u32::MAX,
@@ -9065,7 +9066,7 @@ proptest! {
 
         // If pos1 < pos2, then NOT (pos2 < pos1)
         if pos1 < pos2 {
-            prop_assert!((pos2 >= pos1),
+            prop_assert!(!(pos2 < pos1),
                 "Antisymmetry violated: ({}, {}) < ({}, {}) but also ({}, {}) < ({}, {})",
                 line1, col1, line2, col2, line2, col2, line1, col1);
         }
@@ -9083,6 +9084,7 @@ proptest! {
     ///
     /// For any position a: a == a and a <= a and NOT (a < a).
     #[test]
+    #[allow(clippy::nonminimal_bool)] // assert on the negated operator directly to exercise it
     fn prop_position_ordering_reflexivity(
         line in 0..u32::MAX,
         col in 0..u32::MAX,
@@ -9100,7 +9102,7 @@ proptest! {
             line, col, line, col);
 
         // NOT (a < a)
-        prop_assert!((pos >= pos),
+        prop_assert!(!(pos < pos),
             "Irreflexivity violated: ({}, {}) < ({}, {})",
             line, col, line, col);
     }
@@ -9111,6 +9113,7 @@ proptest! {
     /// Specifically: (a == b) implies (a.cmp(&b) == Ordering::Equal)
     /// and (a < b) implies (a.cmp(&b) == Ordering::Less)
     #[test]
+    #[allow(clippy::nonminimal_bool)] // assert on the negated operator directly to exercise it
     fn prop_position_ordering_consistency(
         line1 in 0..u32::MAX,
         col1 in 0..u32::MAX,
@@ -9130,10 +9133,10 @@ proptest! {
                 prop_assert!(pos1 < pos2,
                     "Consistency violated: cmp returned Less but ({}, {}) not < ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!((pos1 != pos2),
+                prop_assert!(!(pos1 == pos2),
                     "Consistency violated: cmp returned Less but ({}, {}) == ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!((pos1 <= pos2),
+                prop_assert!(!(pos1 > pos2),
                     "Consistency violated: cmp returned Less but ({}, {}) > ({}, {})",
                     line1, col1, line2, col2);
             }
@@ -9141,10 +9144,10 @@ proptest! {
                 prop_assert!(pos1 == pos2,
                     "Consistency violated: cmp returned Equal but ({}, {}) != ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!((pos1 >= pos2),
+                prop_assert!(!(pos1 < pos2),
                     "Consistency violated: cmp returned Equal but ({}, {}) < ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!((pos1 <= pos2),
+                prop_assert!(!(pos1 > pos2),
                     "Consistency violated: cmp returned Equal but ({}, {}) > ({}, {})",
                     line1, col1, line2, col2);
             }
@@ -9152,10 +9155,10 @@ proptest! {
                 prop_assert!(pos1 > pos2,
                     "Consistency violated: cmp returned Greater but ({}, {}) not > ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!((pos1 != pos2),
+                prop_assert!(!(pos1 == pos2),
                     "Consistency violated: cmp returned Greater but ({}, {}) == ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!((pos1 >= pos2),
+                prop_assert!(!(pos1 < pos2),
                     "Consistency violated: cmp returned Greater but ({}, {}) < ({}, {})",
                     line1, col1, line2, col2);
             }

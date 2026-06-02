@@ -2290,8 +2290,13 @@ mod tests {
         // Should not panic, should return a valid context
         let ctx = detect_context(&tree, code, position, 2);
 
-        // The fallback should detect this as a complete expression
-        if let IndentContext::AfterCompleteExpression { .. } = ctx {}
+        // The fallback should not panic; any resulting context is acceptable
+        // (malformed input does not guarantee a specific variant).
+        #[allow(clippy::single_match)]
+        match ctx {
+            IndentContext::AfterCompleteExpression { .. } => {}
+            _ => {}
+        }
     }
 
     // ========================================================================
@@ -6086,8 +6091,13 @@ mod tests {
         // Should not panic
         let ctx = detect_context(&tree, code, position, 2);
 
-        // Should handle gracefully
-        if let IndentContext::AfterCompleteExpression { .. } = ctx {}
+        // Should handle gracefully; any resulting context is acceptable as long
+        // as detect_context does not panic.
+        #[allow(clippy::single_match)]
+        match ctx {
+            IndentContext::AfterCompleteExpression { .. } => {}
+            _ => {}
+        }
     }
 
     #[test]
