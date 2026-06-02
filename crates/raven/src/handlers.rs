@@ -5365,6 +5365,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -5508,7 +5509,6 @@ fn collect_undefined_variables_from_snapshot(
     // monotonically. tree-sitter's `walk()` typically yields nodes in
     // document order already; the sort is a defensive guarantee for the
     // streaming `advance_to` invariant.
-    let mut used = used;
     used.sort_by_key(|(_, n)| (n.start_position().row, n.start_position().column));
 
     // Build a single ScopeStream for the queried URI. The closures
@@ -44774,7 +44774,7 @@ result <- undefined_var
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```ignore
     /// #[test]
     /// fn explore_parser_behavior() {
     ///     inspect_ast("x <- 42", Some("numeric assignment"));

@@ -11150,7 +11150,7 @@ outside_var <- 2"#;
         assert!(Position::new(1000000, 50000) < Position::new(1000001, 0));
 
         // Test ordering is consistent with Ord trait
-        let mut positions = vec![
+        let mut positions = [
             Position::new(10, 5),
             Position::new(5, 20),
             Position::new(5, 10),
@@ -13641,9 +13641,7 @@ y <- filter(df)"#;
         /// dependency edge derived from `main.R`'s `source()` call (if
         /// any). Returns the components needed for both `ScopeStream::new`
         /// and `scope_at_position_with_graph_cached`.
-        fn build_two_file_fixture(
-            main_code: &str,
-        ) -> (
+        type TwoFileFixture = (
             Url,
             Url,
             Url,
@@ -13652,7 +13650,8 @@ y <- filter(df)"#;
             std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
             std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
             crate::cross_file::dependency::DependencyGraph,
-        ) {
+        );
+        fn build_two_file_fixture(main_code: &str) -> TwoFileFixture {
             use crate::cross_file::dependency::DependencyGraph;
             use crate::cross_file::types::CrossFileMetadata;
 

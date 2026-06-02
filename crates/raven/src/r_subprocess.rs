@@ -1288,8 +1288,7 @@ mod tests {
     fn test_new_with_none_discovers_r() {
         // This test will pass if R is installed, skip otherwise
         let subprocess = RSubprocess::new(None);
-        if subprocess.is_some() {
-            let subprocess = subprocess.unwrap();
+        if let Some(subprocess) = subprocess {
             assert!(subprocess.r_path().exists());
         }
     }

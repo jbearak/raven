@@ -634,6 +634,10 @@ pub struct NeighborhoodSubgraph {
 const CYCLE_CACHE_CAPACITY: usize = 4096;
 const SUBGRAPH_CACHE_CAPACITY: usize = 4096;
 
+/// LRU cache of extracted subgraphs keyed by `(root_uri, max_depth, max_visited)`.
+type SubgraphCache =
+    std::sync::RwLock<lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>>;
+
 /// Dependency graph tracking source relationships between files
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
@@ -655,9 +659,7 @@ pub struct DependencyGraph {
     /// in the snapshot path do refcount bumps rather than re-walking the
     /// graph and cloning edges. Bounded LRU for the same reason as
     /// `cycle_cache`.
-    subgraph_cache: std::sync::RwLock<
-        lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
-    >,
+    subgraph_cache: SubgraphCache,
     /// Counter of subgraph cache hits — exposed for tests.
     subgraph_cache_hits: std::sync::atomic::AtomicU64,
 }

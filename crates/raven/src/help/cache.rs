@@ -411,6 +411,10 @@ mod tests {
         assert!(c.get("filter", Some("dplyr")).is_some());
     }
 
+    // Deliberately holds the LRU write guard while orchestrating the Owner
+    // task to reproduce the `drain()` ordering; the guard is explicitly dropped
+    // before the only `.await`, so this is safe despite the lint.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread")]
     async fn drain_generation_check_is_atomic_with_lru_insert() {
         // Regression: checking `generation` before acquiring the LRU write

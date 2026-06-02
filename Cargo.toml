@@ -7,7 +7,7 @@ version = "0.7.1"
 authors = ["Jonathan Marc Bearak <jbearak@gmail.com>"]
 edition = "2021"
 license = "GPL-3.0"
-rust-version = "1.75"
+rust-version = "1.80"
 
 [workspace.dependencies]
 tower-lsp = "0.20"

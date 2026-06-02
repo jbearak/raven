@@ -315,6 +315,7 @@ pub fn resolve_qualified_member(
 /// `cancel` is polled cooperatively at scope-lookup and loop boundaries.
 /// Returns `None` on cancellation; passing [`DiagCancelToken::never`] yields
 /// the same behavior as [`resolve_qualified_member`].
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_qualified_member_with_cancel(
     state: &WorldState,
     uri: &Url,
@@ -452,6 +453,7 @@ pub fn complete_qualified_members_with_cancel(
     completions
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_qualified_member_candidates_with_cancel(
     state: &WorldState,
     uri: &Url,

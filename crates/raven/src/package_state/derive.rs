@@ -47,7 +47,6 @@ pub fn derive_package_state(
         namespace_model,
         r_file_facts,
         scope_contribution,
-        ..PackageState::default()
     }
 }
 

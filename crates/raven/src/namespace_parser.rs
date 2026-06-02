@@ -1451,7 +1451,7 @@ importFrom(magrittr, "%>%")
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use proptest::prelude::*;
     ///
     /// proptest! {
