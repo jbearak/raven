@@ -314,7 +314,7 @@ pub fn find_matching_opener<'a>(node: Node<'a>, delimiter: char) -> Option<Node<
             // For call nodes, return the arguments child if it exists
             if current.kind() == "call" {
                 for i in 0..current.child_count() {
-                    if let Some(child) = current.child(i)
+                    if let Some(child) = current.child(i as u32)
                         && child.kind() == "arguments"
                     {
                         return Some(child);
@@ -1157,7 +1157,7 @@ fn find_opener_position(node: Node, delimiter: char, _source: &str) -> Option<(u
             if current.kind() == "call" {
                 // Find the arguments child
                 for i in 0..current.child_count() {
-                    if let Some(child) = current.child(i)
+                    if let Some(child) = current.child(i as u32)
                         && child.kind() == "arguments"
                     {
                         let start = child.start_position();
@@ -1184,7 +1184,7 @@ fn find_opener_position(node: Node, delimiter: char, _source: &str) -> Option<(u
 /// - None: no continuation operator found (e.g., `*`, `/`, `>`)
 fn continuation_class_of_binop(binop: &tree_sitter::Node, source: &str) -> Option<u8> {
     for i in 0..binop.child_count() {
-        if let Some(child) = binop.child(i) {
+        if let Some(child) = binop.child(i as u32) {
             match child.kind() {
                 "|>" => return Some(0),
                 "+" => return Some(1),

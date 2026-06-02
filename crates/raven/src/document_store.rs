@@ -837,7 +837,7 @@ impl DocumentStore {
                 && let Some(args_node) = node.child_by_field_name("arguments")
             {
                 for i in 0..args_node.child_count() {
-                    if let Some(child) = args_node.child(i)
+                    if let Some(child) = args_node.child(i as u32)
                         && child.kind() == "argument"
                         && let Some(value_node) = child.child_by_field_name("value")
                     {
@@ -855,7 +855,7 @@ impl DocumentStore {
         }
 
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+            if let Some(child) = node.child(i as u32) {
                 Self::visit_for_packages(child, text, packages);
             }
         }

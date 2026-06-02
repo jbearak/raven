@@ -694,7 +694,9 @@ fn collect_referenced_packages(
                     ) && let Some(args) = node.child_by_field_name("arguments")
                     {
                         for i in 0..args.child_count() {
-                            let Some(arg) = args.child(i) else { continue };
+                            let Some(arg) = args.child(i as u32) else {
+                                continue;
+                            };
                             if arg.kind() != "argument" {
                                 continue;
                             }
@@ -713,7 +715,7 @@ fn collect_referenced_packages(
             _ => {}
         }
         for i in (0..node.child_count()).rev() {
-            if let Some(c) = node.child(i) {
+            if let Some(c) = node.child(i as u32) {
                 stack.push(c);
             }
         }
