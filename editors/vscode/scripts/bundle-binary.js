@@ -12,19 +12,10 @@ if (!fs.existsSync(binDir)) {
     fs.mkdirSync(binDir, { recursive: true });
 }
 
-// Bundle the Tier 3 package-export database (names.db) next to the binary, if
-// present. In dev builds it is usually absent (Tier 3 unavailable, which is
-// fine — the extension degrades to Tier 1/2; base-7 is embedded in the binary).
-const distDir = path.join(__dirname, '..', '..', '..', 'dist');
-const sidecar = 'names.db';
-const src = process.env.RAVEN_NAMES_DB_SRC || path.join(distDir, sidecar);
-const dest = path.join(binDir, sidecar);
-if (fs.existsSync(src)) {
-    fs.copyFileSync(src, dest);
-    console.log(`Bundled ${sidecar} from ${src}`);
-} else {
-    console.log(`${sidecar} not found at ${src}; Tier 3 will be unavailable in this build`);
-}
+// The Tier 3 sidecar (names.db) is deliberately NOT bundled into the VSIX (it
+// is also excluded in .vscodeignore). VS Code users run alongside their local R
+// install, so Tier 1 resolves their installed packages directly — they don't
+// need the broad CRAN/Bioconductor floor, and it would only bloat the VSIX.
 
 // In CI mode, the binary is pre-placed by the workflow. Check for both names
 // since cross-platform CI (e.g. packaging win32 on Linux) means

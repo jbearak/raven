@@ -280,7 +280,7 @@ This subsystem lets Raven resolve package **export names** without an installed
 package or a running R — the case that makes `raven check` usable in CI. It is an
 **ordered fallback over three tiers**: Tier 1 (installed, authoritative — the
 existing path above) → Tier 2 (a committed, repo-specific `.raven/packages.json`)
-→ Tier 3 (a `names.db` sidecar). Release archives, VSIX installs, and package-manager builds ship `names.db` next to the executable; raw Cargo/source installs install only the executable and need `raven packages update` for broad CRAN/Bioconductor coverage. R's base-priority packages are embedded in the binary (all 14; only the default-attached base-7 are always in scope). The user-facing contract lives in
+→ Tier 3 (a `names.db` sidecar). Release archives and package-manager builds ship `names.db` next to the executable; raw Cargo/source installs ship only the executable and need `raven packages update` for broad CRAN/Bioconductor coverage. R's base-priority packages are embedded in the binary (all 14; only the default-attached base-7 are always in scope). The user-facing contract lives in
 [`docs/package-database.md`](package-database.md); this section is the internals.
 
 **Critical invariant — names ≠ install status.** The databases feed *export
@@ -328,7 +328,7 @@ the seam.
   missing or unreadable database never hard-fails the LSP or the build.
 - **Tier 3 locator order:** environment overrides still win, then the user-data
   sidecars installed by `raven packages update`, then exe-relative sidecars shipped
-  by release archives, VSIX installs, and package-manager builds. Source/Cargo
+  by release archives and package-manager builds. Source/Cargo
   installs normally have only the user-data candidate unless the sidecars were
   placed manually next to the executable.
 
@@ -434,9 +434,10 @@ coverage.
   `workflow_dispatch` + scheduled job
   (`.github/workflows/build-names-db.yml`; weekly schedule `0 6 * * 1`) downloads
   the current asset (the seed), rebuilds via the shared
-  `scripts/build-names-db.sh`, and re-uploads. `release-build.yml` /
-  `bundle-binary.js` download the same asset to place `names.db` exe-relative next
-  to the binary and into the VSIX. A Git LFS seed is committed at
+  `scripts/build-names-db.sh`, and re-uploads. `release-build.yml` downloads the
+  same asset to place `names.db` exe-relative next to the binary in the release
+  archives; the VSIX omits it (VS Code users resolve their locally installed
+  packages via Tier 1). A Git LFS seed is committed at
   `crates/raven/data/names-db-seed.db` for bootstrap/disaster-recovery only (not a
   build input). Located via the Tier 3 candidate locator — `RAVEN_NAMES_DB`
   override, then user data, then exe-relative. **Not** `include_bytes!` (avoids

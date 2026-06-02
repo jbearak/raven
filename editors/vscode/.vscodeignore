@@ -15,5 +15,8 @@ scripts/**
 .vscode-test.mjs
 package-lock.json
 bun.lock
-# bin/ is intentionally NOT excluded so the raven binary and the Tier 3 sidecar
-# (bin/names.db) are included in the VSIX.
+# bin/ is intentionally NOT excluded so the raven binary ships in the VSIX. The
+# Tier 3 sidecar is excluded, though: VS Code users run alongside their local R
+# install, so Tier 1 already resolves their installed packages — the broad
+# CRAN/Bioconductor floor isn't needed and would only bloat the VSIX.
+bin/names.db

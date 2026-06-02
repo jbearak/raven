@@ -169,14 +169,6 @@ jobs:
             *) echo "ERROR: Unknown target '${{ matrix.target }}'" && exit 1 ;;
           esac
 
-      - name: Download package DB from the names-db Release
-        run: |
-          gh release download names-db --repo "$GITHUB_REPOSITORY" \
-            --pattern 'names.db' --dir editors/vscode/bin || \
-            echo "no names-db release yet; Tier 3 unavailable in this build"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Package extension
         run: |
           cd editors/vscode

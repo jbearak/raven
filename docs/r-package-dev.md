@@ -251,7 +251,7 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 ## Generating a package database for CI
 
-`raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's Tier 3 sidecar when it is present, so they don't show as undefined variables. Release archives, VSIX installs, and package-manager builds ship `names.db` next to the Raven executable; source/Cargo installs need `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded R base-package coverage.
+`raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's Tier 3 sidecar when it is present, so they don't show as undefined variables. Release archives and package-manager builds ship `names.db` next to the Raven executable; source/Cargo installs need `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded R base-package coverage.
 
 Generate and commit `.raven/packages.json` (Tier 2) when CI needs reproducible, project-specific package metadata pinned to what your project actually installed. That is distinct from `raven packages update`, which restores broad Tier 3 coverage from the moving `names-db` Release and is not version-pinned by the project.
 
@@ -324,7 +324,7 @@ If you need package-mode behavior in a workspace without `DESCRIPTION`, set
 Run `devtools::document()` to regenerate the NAMESPACE file, or save the file — Raven re-parses roxygen tags from source on each file change.
 
 **False positives persist after adding `@importFrom`:**
-Ensure the imported package's export names are available to Raven: install the package locally, capture it in `.raven/packages.json` with `raven packages freeze`, or rely on Tier 3 `names.db` coverage (packaged installs ship it; source installs can run `raven packages update`). Export resolution is separate from install status. If `--report-uninstalled` or editor missing-package diagnostics are enabled, those still report local install status and require the package to exist on disk.
+Ensure the imported package's export names are available to Raven: install the package locally, capture it in `.raven/packages.json` with `raven packages freeze`, or rely on Tier 3 `names.db` coverage (release archives and package-manager builds ship it; source installs can run `raven packages update`). Export resolution is separate from install status. If `--report-uninstalled` or editor missing-package diagnostics are enabled, those still report local install status and require the package to exist on disk.
 
 **Package mode not activating:**
 Check that `DESCRIPTION` is at the workspace root (the first workspace folder) and contains a `Package:` field. You can also force it with `"raven.packages.packageMode": "enabled"`.
