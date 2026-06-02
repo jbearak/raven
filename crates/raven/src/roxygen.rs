@@ -1172,7 +1172,7 @@ fn process_roxygen_tag(
         && tag_line
             .as_bytes()
             .get(7)
-            .map_or(false, |b| b.is_ascii_whitespace())
+            .is_some_and(|b| b.is_ascii_whitespace())
     {
         *has_export = true;
         for name in tag_line[7..].split_whitespace() {
@@ -1184,7 +1184,7 @@ fn process_roxygen_tag(
         && tag_line
             .as_bytes()
             .get(11)
-            .map_or(false, |b| b.is_ascii_whitespace())
+            .is_some_and(|b| b.is_ascii_whitespace())
     {
         let mut parts = tag_line[11..].split_whitespace();
         if let Some(pkg) = parts.next() {
@@ -1199,7 +1199,7 @@ fn process_roxygen_tag(
         && tag_line
             .as_bytes()
             .get(7)
-            .map_or(false, |b| b.is_ascii_whitespace())
+            .is_some_and(|b| b.is_ascii_whitespace())
     {
         for pkg in tag_line[7..].split_whitespace() {
             if !pkg.is_empty() {
@@ -1478,7 +1478,7 @@ fn find_toplevel_equals(s: &str) -> Option<usize> {
 fn extract_first_identifier(line: &str) -> Option<String> {
     let mut chars = line.chars().peekable();
     // Skip whitespace
-    while chars.peek().map_or(false, |c| c.is_whitespace()) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
         chars.next();
     }
     // Collect identifier chars

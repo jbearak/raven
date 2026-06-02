@@ -1,8 +1,7 @@
-/// Built-in types, block keywords, control flow, and functions for the Stan language.
-///
-/// These lists are used by the completion handler to provide Stan-specific
-/// suggestions when editing `.stan` files.
-
+//! Built-in types, block keywords, control flow, and functions for the Stan language.
+//!
+//! These lists are used by the completion handler to provide Stan-specific
+//! suggestions when editing `.stan` files.
 pub static STAN_TYPES: &[&str] = &[
     "int",
     "real",

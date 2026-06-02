@@ -3105,13 +3105,11 @@ mod activity_signal_tests {
         );
 
         // Simulate files needing revalidation
-        let mut files_to_revalidate = vec![
-            other.clone(),
+        let mut files_to_revalidate = [other.clone(),
             visible2.clone(),
             recent.clone(),
             active.clone(),
-            visible1.clone(),
-        ];
+            visible1.clone()];
 
         // Sort by priority (lower = higher priority)
         files_to_revalidate.sort_by_key(|uri| state.priority_score(uri));
@@ -3132,7 +3130,7 @@ mod activity_signal_tests {
         println!("✓ Revalidation prioritization verified:");
         for (i, uri) in files_to_revalidate.iter().enumerate() {
             let priority = state.priority_score(uri);
-            let filename = uri.path().split('/').last().unwrap_or("unknown");
+            let filename = uri.path().split('/').next_back().unwrap_or("unknown");
             println!("  {}. {} (priority: {})", i + 1, filename, priority);
         }
     }

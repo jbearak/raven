@@ -400,7 +400,7 @@ mod tests {
                 }
             })
             .await;
-        assert!(matches!(res2, Ok(_)));
+        assert!(res2.is_ok());
         assert_eq!(
             calls.load(StdOrdering::SeqCst),
             2,
@@ -517,7 +517,7 @@ mod tests {
                 }
             })
             .await;
-        assert!(matches!(res2, Ok(_)));
+        assert!(res2.is_ok());
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,

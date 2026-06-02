@@ -2291,10 +2291,7 @@ mod tests {
         let ctx = detect_context(&tree, code, position, 2);
 
         // The fallback should detect this as a complete expression
-        match ctx {
-            IndentContext::AfterCompleteExpression { .. } => {}
-            _ => {} // Any context is fine, just shouldn't panic
-        }
+        if let IndentContext::AfterCompleteExpression { .. } = ctx {}
     }
 
     // ========================================================================
@@ -4578,14 +4575,7 @@ mod tests {
 
     /// Verify that the detected context matches the expected innermost context type.
     fn verify_innermost_context(ctx: &IndentContext, expected_type: &str) -> bool {
-        match (ctx, expected_type) {
-            (IndentContext::AfterContinuationOperator { .. }, "AfterContinuationOperator") => true,
-            (IndentContext::InsideParens { .. }, "InsideParens") => true,
-            (IndentContext::InsideBraces { .. }, "InsideBraces") => true,
-            (IndentContext::ClosingDelimiter { .. }, "ClosingDelimiter") => true,
-            (IndentContext::AfterCompleteExpression { .. }, "AfterCompleteExpression") => true,
-            _ => false,
-        }
+        matches!((ctx, expected_type), (IndentContext::AfterContinuationOperator { .. }, "AfterContinuationOperator") | (IndentContext::InsideParens { .. }, "InsideParens") | (IndentContext::InsideBraces { .. }, "InsideBraces") | (IndentContext::ClosingDelimiter { .. }, "ClosingDelimiter") | (IndentContext::AfterCompleteExpression { .. }, "AfterCompleteExpression"))
     }
 
     proptest! {
@@ -4650,7 +4640,7 @@ mod tests {
             // Should detect pipe context, not parens context
             match ctx {
                 IndentContext::AfterContinuationOperator { operator_type, .. } => {
-                    match &*pipe_op {
+                    match pipe_op {
                         "|>" => prop_assert_eq!(operator_type, OperatorType::Pipe),
                         "%>%" => prop_assert_eq!(operator_type, OperatorType::MagrittrPipe),
                         _ => prop_assert!(false, "Unexpected pipe operator"),
@@ -6085,10 +6075,7 @@ mod tests {
         let ctx = detect_context(&tree, code, position, 2);
 
         // Should handle gracefully
-        match ctx {
-            IndentContext::AfterCompleteExpression { .. } => {}
-            _ => {}
-        }
+        if let IndentContext::AfterCompleteExpression { .. } = ctx {}
     }
 
     #[test]

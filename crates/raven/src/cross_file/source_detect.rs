@@ -2618,38 +2618,22 @@ mod property_tests {
         use_named_arg: bool,
     }
 
-    /// Generates an arbitrary `LibraryCallSpec` strategy for property-based tests.
-
-    ///
-
-    /// The strategy produces tuples describing a library-like call: the function name (`library`, `require`, or `loadNamespace`),
-
-    /// a package name, the string quote style to use (none, single, or double), and a boolean indicating whether the package
-
-    /// is supplied with a named `package=` argument.
-
-    ///
-
-    /// # Examples
-
-    ///
-
-    /// ```
-
-    /// use proptest::prelude::*;
-
-    ///
-
-    /// let mut runner = proptest::test_runner::TestRunner::default();
-
-    /// let tree = library_call_spec().new_tree(&mut runner).unwrap();
-
-    /// let spec = tree.current();
-
-    /// // `spec` contains generated fields: `func`, `package`, `quote_style`, and `use_named_arg`.
-
-    /// assert!(!spec.package.is_empty());
-
+    /// Generates an arbitrary `LibraryCallSpec` strategy for property-based tests.    ///
+    ///    ///
+    /// The strategy produces tuples describing a library-like call: the function name (`library`, `require`, or `loadNamespace`),    ///
+    /// a package name, the string quote style to use (none, single, or double), and a boolean indicating whether the package    ///
+    /// is supplied with a named `package=` argument.    ///
+    ///    ///
+    /// # Examples    ///
+    ///    ///
+    /// ```    ///
+    /// use proptest::prelude::*;    ///
+    ///    ///
+    /// let mut runner = proptest::test_runner::TestRunner::default();    ///
+    /// let tree = library_call_spec().new_tree(&mut runner).unwrap();    ///
+    /// let spec = tree.current();    ///
+    /// // `spec` contains generated fields: `func`, `package`, `quote_style`, and `use_named_arg`.    ///
+    /// assert!(!spec.package.is_empty());    ///
     /// ```
     fn library_call_spec() -> impl Strategy<Value = LibraryCallSpec> {
         (

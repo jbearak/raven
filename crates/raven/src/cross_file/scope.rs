@@ -1967,12 +1967,11 @@ where
                     }
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
-                    if should_apply_local_scoping(source) {
-                        if function_scope.is_none() {
+                    if should_apply_local_scoping(source)
+                        && function_scope.is_none() {
                             // local=TRUE at top-level doesn't contribute to global scope
                             continue;
                         }
-                    }
 
                     // Resolve the path and get symbols from sourced file
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
@@ -3214,7 +3213,7 @@ where
         }
         super::config::BackwardDependencyMode::Auto => {
             let file_has_backward_directives =
-                get_metadata(uri).map_or(false, |m| !m.sourced_by.is_empty());
+                get_metadata(uri).is_some_and(|m| !m.sourced_by.is_empty());
             if file_has_backward_directives {
                 parent_edges.retain(|e| e.is_backward_directive);
             }
@@ -3721,12 +3720,11 @@ where
                 if passes_position || is_global_source {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
-                    if should_apply_local_scoping(source) {
-                        if function_scope.is_none() {
+                    if should_apply_local_scoping(source)
+                        && function_scope.is_none() {
                             // local=TRUE at top-level doesn't contribute to global scope
                             continue;
                         }
-                    }
 
                     // Resolve the child URI: prefer pre-computed dependency graph edges
                     // (which use workspace-root fallback) over re-resolving the path
@@ -5856,16 +5854,13 @@ mod tests {
         // Verify parent artifacts
         println!("Parent timeline:");
         for event in &parent_artifacts.timeline {
-            match event {
-                ScopeEvent::Def {
+            if let ScopeEvent::Def {
                     line,
                     column,
                     symbol,
                     ..
-                } => {
-                    println!("  Def: {} at ({}, {})", symbol.name, line, column);
-                }
-                _ => {}
+                } = event {
+                println!("  Def: {} at ({}, {})", symbol.name, line, column);
             }
         }
 
@@ -7291,7 +7286,7 @@ outside_var <- 2"#;
         // with function_scope (not just Removal events), otherwise function-local symbols
         // leak into global scope.
         let code = "my_func <- function() { local_var <- 42; local_var }\nglobal_var <- 100";
-        let tree = parse_r(&code);
+        let tree = parse_r(code);
         let metadata = CrossFileMetadata::default();
         let artifacts = compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&metadata));
 
@@ -7889,8 +7884,7 @@ outside_var <- 2"#;
     #[test]
     fn test_removal_event_sorting_by_position() {
         // Test that Removal events are correctly sorted by (line, column) position
-        let mut events = vec![
-            ScopeEvent::Removal {
+        let mut events = [ScopeEvent::Removal {
                 line: 5,
                 column: 10,
                 symbols: vec!["c".to_string()],
@@ -7913,8 +7907,7 @@ outside_var <- 2"#;
                 column: 0,
                 symbols: vec!["d".to_string()],
                 function_scope: None,
-            },
-        ];
+            }];
 
         // Sort using the same key as compute_artifacts
         // Sort by each event's *effect* position so test ordering matches the
@@ -7937,8 +7930,7 @@ outside_var <- 2"#;
     #[test]
     fn test_removal_event_sorting_same_line_different_columns() {
         // Test that Removal events on the same line are sorted by column
-        let mut events = vec![
-            ScopeEvent::Removal {
+        let mut events = [ScopeEvent::Removal {
                 line: 3,
                 column: 20,
                 symbols: vec!["c".to_string()],
@@ -7955,8 +7947,7 @@ outside_var <- 2"#;
                 column: 10,
                 symbols: vec!["b".to_string()],
                 function_scope: None,
-            },
-        ];
+            }];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -7979,8 +7970,7 @@ outside_var <- 2"#;
     fn test_removal_event_mixed_with_def_events() {
         // Test that Removal events sort correctly when mixed with Def events
         let uri = test_uri();
-        let mut events = vec![
-            ScopeEvent::Removal {
+        let mut events = [ScopeEvent::Removal {
                 line: 3,
                 column: 0,
                 symbols: vec!["x".to_string()],
@@ -8017,8 +8007,7 @@ outside_var <- 2"#;
                     is_declared: false,
                 },
                 function_scope: None,
-            },
-        ];
+            }];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -8055,8 +8044,7 @@ outside_var <- 2"#;
         // Test that Removal events sort correctly when mixed with Source events
         use super::super::types::ForwardSource;
 
-        let mut events = vec![
-            ScopeEvent::Removal {
+        let mut events = [ScopeEvent::Removal {
                 line: 2,
                 column: 0,
                 symbols: vec!["x".to_string()],
@@ -8083,8 +8071,7 @@ outside_var <- 2"#;
                 column: 0,
                 symbols: vec!["y".to_string()],
                 function_scope: None,
-            },
-        ];
+            }];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -8110,8 +8097,7 @@ outside_var <- 2"#;
         use super::super::types::ForwardSource;
 
         let uri = test_uri();
-        let mut events = vec![
-            ScopeEvent::Removal {
+        let mut events = [ScopeEvent::Removal {
                 line: 5,
                 column: 0,
                 symbols: vec!["z".to_string()],
@@ -8161,8 +8147,7 @@ outside_var <- 2"#;
                 column: 0,
                 symbols: vec!["w".to_string()],
                 function_scope: None,
-            },
-        ];
+            }];
 
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
@@ -11158,8 +11143,8 @@ outside_var <- 2"#;
 
         // Equal positions
         assert!(Position::new(5, 10) == Position::new(5, 10));
-        assert!(!(Position::new(5, 10) < Position::new(5, 10)));
-        assert!(!(Position::new(5, 10) > Position::new(5, 10)));
+        assert!((Position::new(5, 10) >= Position::new(5, 10)));
+        assert!((Position::new(5, 10) <= Position::new(5, 10)));
 
         // Test with large values
         assert!(Position::new(1000000, 50000) < Position::new(1000001, 0));
@@ -11278,7 +11263,7 @@ outside_var <- 2"#;
                     function_scope,
                 } = e
                 {
-                    Some((*line, *column, package.clone(), function_scope.clone()))
+                    Some((*line, *column, package.clone(), *function_scope))
                 } else {
                     None
                 }
@@ -11450,7 +11435,7 @@ outside_var <- 2"#;
             .iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { function_scope, .. } = e {
-                    Some(function_scope.clone())
+                    Some(*function_scope)
                 } else {
                     None
                 }
@@ -11497,7 +11482,7 @@ outside_var <- 2"#;
                     ..
                 } = e
                 {
-                    Some((package.clone(), function_scope.clone()))
+                    Some((package.clone(), *function_scope))
                 } else {
                     None
                 }
@@ -12204,7 +12189,7 @@ x <- 1"#;
 
         // Child should have inherited dplyr from parent
         assert!(
-            scope.inherited_packages.contains(&"dplyr".to_string()),
+            scope.inherited_packages.contains("dplyr"),
             "Child should inherit dplyr package from parent"
         );
     }
@@ -12284,7 +12269,7 @@ x <- 1"#;
 
         // Child should NOT have dplyr (it was loaded after source() call)
         assert!(
-            !scope.inherited_packages.contains(&"dplyr".to_string()),
+            !scope.inherited_packages.contains("dplyr"),
             "Child should NOT inherit dplyr (loaded after source() call)"
         );
     }
@@ -12364,11 +12349,11 @@ x <- 1"#;
 
         // Child should have both packages
         assert!(
-            scope.inherited_packages.contains(&"dplyr".to_string()),
+            scope.inherited_packages.contains("dplyr"),
             "Child should inherit dplyr from parent"
         );
         assert!(
-            scope.inherited_packages.contains(&"ggplot2".to_string()),
+            scope.inherited_packages.contains("ggplot2"),
             "Child should inherit ggplot2 from parent"
         );
     }
@@ -12449,7 +12434,7 @@ x <- 1"#;
 
         // Child should NOT have dplyr (it's function-scoped in parent)
         assert!(
-            !scope.inherited_packages.contains(&"dplyr".to_string()),
+            !scope.inherited_packages.contains("dplyr"),
             "Child should NOT inherit function-scoped dplyr from parent"
         );
     }
@@ -12523,7 +12508,7 @@ x <- 1"#;
         );
 
         assert!(
-            scope.inherited_packages.contains(&"dplyr".to_string()),
+            scope.inherited_packages.contains("dplyr"),
             "Child should inherit dplyr when a nested local source() call runs inside an outer function that loaded it"
         );
     }
@@ -12610,7 +12595,7 @@ x <- 1"#;
         // Parent should have dplyr (loaded in child, available after source())
         // Packages from sourced files go into loaded_packages, not inherited_packages
         assert!(
-            scope.loaded_packages.contains(&"dplyr".to_string()),
+            scope.loaded_packages.contains("dplyr"),
             "Parent should have dplyr from child (package propagation via loaded_packages)"
         );
     }
@@ -12697,7 +12682,7 @@ x <- 1"#;
 
         // Packages from child should be in parent's loaded_packages (not inherited_packages)
         assert!(
-            scope.loaded_packages.contains(&"ggplot2".to_string()),
+            scope.loaded_packages.contains("ggplot2"),
             "Parent should have ggplot2 from child (package propagation via loaded_packages)"
         );
     }
@@ -12813,7 +12798,7 @@ x <- 1"#;
         assert!(
             grandparent_scope
                 .loaded_packages
-                .contains(&"stringr".to_string()),
+                .contains("stringr"),
             "Grandparent should have stringr from grandchild (package propagation via loaded_packages)"
         );
 
@@ -12838,7 +12823,7 @@ x <- 1"#;
         assert!(
             parent_scope
                 .loaded_packages
-                .contains(&"stringr".to_string()),
+                .contains("stringr"),
             "Parent should have stringr from child (package propagation via loaded_packages)"
         );
     }
@@ -12921,7 +12906,7 @@ x <- 1"#;
         assert!(
             child_scope
                 .inherited_packages
-                .contains(&"dplyr".to_string()),
+                .contains("dplyr"),
             "Child should inherit dplyr from parent (forward propagation works)"
         );
 
@@ -12946,7 +12931,7 @@ x <- 1"#;
         assert!(
             parent_scope
                 .loaded_packages
-                .contains(&"ggplot2".to_string()),
+                .contains("ggplot2"),
             "Parent should have ggplot2 from child (package propagation via loaded_packages)"
         );
     }
@@ -13104,7 +13089,7 @@ x <- 1"#;
         assert!(
             abortions_scope
                 .inherited_packages
-                .contains(&"plyr".to_string()),
+                .contains("plyr"),
             "abortions.r should inherit plyr from sibling functions.r via main.r chain. \
              inherited_packages: {:?}",
             abortions_scope.inherited_packages
@@ -13207,7 +13192,7 @@ x <- 1"#;
         );
 
         assert!(
-            b_scope.inherited_packages.contains(&"dplyr".to_string()),
+            b_scope.inherited_packages.contains("dplyr"),
             "b.r should inherit dplyr from sibling a.r via parent's forward path. \
              inherited_packages: {:?}",
             b_scope.inherited_packages
@@ -13231,7 +13216,7 @@ x <- 1"#;
         );
 
         assert!(
-            parent_scope.loaded_packages.contains(&"dplyr".to_string()),
+            parent_scope.loaded_packages.contains("dplyr"),
             "Parent should have dplyr in loaded_packages after processing source(\"a.r\"). \
              loaded_packages: {:?}",
             parent_scope.loaded_packages
@@ -13254,14 +13239,14 @@ x <- 1"#;
         // Query at line 0 (before library call) - should NOT have dplyr in loaded_packages
         let scope_before = scope_at_position(&artifacts, 0, 10, false);
         assert!(
-            !scope_before.loaded_packages.contains(&"dplyr".to_string()),
+            !scope_before.loaded_packages.contains("dplyr"),
             "dplyr should NOT be in loaded_packages before library() call"
         );
 
         // Query at line 2 (after library call) - should have dplyr in loaded_packages
         let scope_after = scope_at_position(&artifacts, 2, 10, false);
         assert!(
-            scope_after.loaded_packages.contains(&"dplyr".to_string()),
+            scope_after.loaded_packages.contains("dplyr"),
             "dplyr should be in loaded_packages after library() call"
         );
     }
@@ -13276,22 +13261,22 @@ x <- 1"#;
         // Query at line 0 (after first library, before second)
         let scope_mid = scope_at_position(&artifacts, 0, 20, false);
         assert!(
-            scope_mid.loaded_packages.contains(&"dplyr".to_string()),
+            scope_mid.loaded_packages.contains("dplyr"),
             "dplyr should be in loaded_packages after first library() call"
         );
         assert!(
-            !scope_mid.loaded_packages.contains(&"ggplot2".to_string()),
+            !scope_mid.loaded_packages.contains("ggplot2"),
             "ggplot2 should NOT be in loaded_packages before second library() call"
         );
 
         // Query at line 2 (after both library calls)
         let scope_end = scope_at_position(&artifacts, 2, 10, false);
         assert!(
-            scope_end.loaded_packages.contains(&"dplyr".to_string()),
+            scope_end.loaded_packages.contains("dplyr"),
             "dplyr should be in loaded_packages"
         );
         assert!(
-            scope_end.loaded_packages.contains(&"ggplot2".to_string()),
+            scope_end.loaded_packages.contains("ggplot2"),
             "ggplot2 should be in loaded_packages"
         );
     }
@@ -13310,14 +13295,14 @@ y <- filter(df)"#;
         // Query inside the function (line 2) - should have dplyr
         let scope_inside = scope_at_position(&artifacts, 2, 10, false);
         assert!(
-            scope_inside.loaded_packages.contains(&"dplyr".to_string()),
+            scope_inside.loaded_packages.contains("dplyr"),
             "dplyr should be in loaded_packages inside function"
         );
 
         // Query outside the function (line 4) - should NOT have dplyr
         let scope_outside = scope_at_position(&artifacts, 4, 10, false);
         assert!(
-            !scope_outside.loaded_packages.contains(&"dplyr".to_string()),
+            !scope_outside.loaded_packages.contains("dplyr"),
             "dplyr should NOT be in loaded_packages outside function (function-scoped)"
         );
     }
@@ -13331,7 +13316,7 @@ y <- filter(df)"#;
 
         let scope = scope_at_position(&artifacts, 1, 10, false);
         assert!(
-            scope.loaded_packages.contains(&"dplyr".to_string()),
+            scope.loaded_packages.contains("dplyr"),
             "dplyr should be in loaded_packages after require() call"
         );
     }
@@ -13345,7 +13330,7 @@ y <- filter(df)"#;
 
         let scope = scope_at_position(&artifacts, 1, 10, false);
         assert!(
-            scope.loaded_packages.contains(&"dplyr".to_string()),
+            scope.loaded_packages.contains("dplyr"),
             "dplyr should be in loaded_packages after loadNamespace() call"
         );
     }

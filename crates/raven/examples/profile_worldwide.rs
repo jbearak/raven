@@ -306,7 +306,7 @@ fn main() {
     let mut last: Option<(usize, usize, usize)> = None;
     for _ in 0..3 {
         let t = Instant::now();
-        let (index, cf, new_idx) = scan_workspace(&[folder.clone()], 20);
+        let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
         let elapsed = t.elapsed();
         runs.push(elapsed);
         last = Some((index.len(), cf.len(), new_idx.len()));
@@ -333,7 +333,7 @@ fn main() {
     let mut apply_runs = Vec::new();
     for _ in 0..3 {
         // Fresh scan each time so the inputs aren't moved
-        let (index, cf, new_idx) = scan_workspace(&[folder.clone()], 20);
+        let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
         let mut state = make_state(&workspace);
         let t = Instant::now();
         state.apply_workspace_index(index, cf, new_idx);
@@ -442,7 +442,7 @@ fn main() {
     // Phase 6: scripts/data.r diagnostics — POST-scan (workspace index applied)
     // ------------------------------------------------------------------
     println!("[6] scripts/data.r diagnostics — POST-scan (workspace_scan_complete=true):");
-    let (index, cf, new_idx) = scan_workspace(&[folder.clone()], 20);
+    let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
     state.apply_workspace_index(index, cf, new_idx);
     // Warmup
     for _ in 0..3 {

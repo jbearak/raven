@@ -50,9 +50,7 @@ pub fn translate(inputs: &mut PackageInputs, event: HandlerEvent) -> Option<Pack
         return Some(PackageInputDelta::SettingChanged);
     }
 
-    let Some(root) = inputs.workspace_root.clone() else {
-        return None;
-    };
+    let root = inputs.workspace_root.clone()?;
     match event {
         HandlerEvent::DidOpen { uri, text } | HandlerEvent::DidChange { uri, text } => {
             let path = uri.to_file_path().ok()?;

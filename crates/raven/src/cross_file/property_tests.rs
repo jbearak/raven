@@ -3178,9 +3178,9 @@ proptest! {
         };
 
         // Resolve parent multiple times
-        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
-        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
-        let result3 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
+        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
+        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
+        let result3 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
 
         // All results should be identical (deterministic)
         match (&result1, &result2, &result3) {
@@ -3244,8 +3244,8 @@ proptest! {
             }
         };
 
-        let result_with_line = resolve_parent(&metadata_with_line, &graph, &child_uri, &config, &resolve_path);
-        let result_with_default = resolve_parent(&metadata_with_default, &graph, &child_uri, &config, &resolve_path);
+        let result_with_line = resolve_parent(&metadata_with_line, &graph, &child_uri, &config, resolve_path);
+        let result_with_default = resolve_parent(&metadata_with_default, &graph, &child_uri, &config, resolve_path);
 
         // Both should resolve to the same parent
         match (&result_with_line, &result_with_default) {
@@ -3313,8 +3313,8 @@ proptest! {
             }
         };
 
-        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
-        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, &resolve_path);
+        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
+        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
 
         match (&result1, &result2) {
             (
@@ -5015,7 +5015,7 @@ proptest! {
     /// symbols are specified or whether they are currently defined in scope.
     #[test]
     fn prop_rm_bare_symbol_extraction_single(symbol in r_identifier()) {
-        let code = rm_bare_symbols(&[symbol.clone()]);
+        let code = rm_bare_symbols(std::slice::from_ref(&symbol));
         let tree = parse_r(&code);
         let rm_calls = detect_rm_calls(&tree, &code);
 
@@ -5066,7 +5066,7 @@ proptest! {
     /// Removal event SHALL contain exactly those symbol names.
     #[test]
     fn prop_remove_bare_symbol_extraction_single(symbol in r_identifier()) {
-        let code = remove_bare_symbols(&[symbol.clone()]);
+        let code = remove_bare_symbols(std::slice::from_ref(&symbol));
         let tree = parse_r(&code);
         let rm_calls = detect_rm_calls(&tree, &code);
 
@@ -5118,7 +5118,7 @@ proptest! {
     #[test]
     fn prop_rm_bare_symbol_extraction_undefined(symbol in r_identifier()) {
         // Symbol is not defined anywhere, just used in rm()
-        let code = rm_bare_symbols(&[symbol.clone()]);
+        let code = rm_bare_symbols(std::slice::from_ref(&symbol));
         let tree = parse_r(&code);
         let rm_calls = detect_rm_calls(&tree, &code);
 
@@ -5194,8 +5194,8 @@ proptest! {
     /// Test case: Single bare symbol
     #[test]
     fn prop_remove_equivalence_bare_single(symbol in r_identifier()) {
-        let rm_code = rm_bare_symbols(&[symbol.clone()]);
-        let remove_code = remove_bare_symbols(&[symbol.clone()]);
+        let rm_code = rm_bare_symbols(std::slice::from_ref(&symbol));
+        let remove_code = remove_bare_symbols(std::slice::from_ref(&symbol));
 
         let rm_tree = parse_r(&rm_code);
         let remove_tree = parse_r(&remove_code);
@@ -5378,8 +5378,8 @@ proptest! {
     /// Test case: Verify column positions are relative to the call (both start at column 0)
     #[test]
     fn prop_remove_equivalence_column_position(symbol in r_identifier()) {
-        let rm_code = rm_bare_symbols(&[symbol.clone()]);
-        let remove_code = remove_bare_symbols(&[symbol.clone()]);
+        let rm_code = rm_bare_symbols(std::slice::from_ref(&symbol));
+        let remove_code = remove_bare_symbols(std::slice::from_ref(&symbol));
 
         let rm_tree = parse_r(&rm_code);
         let remove_tree = parse_r(&remove_code);
@@ -7698,7 +7698,7 @@ proptest! {
         let package_load_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope } = e {
-                    Some((*line, *column, pkg.clone(), function_scope.clone()))
+                    Some((*line, *column, pkg.clone(), *function_scope))
                 } else {
                     None
                 }
@@ -7928,7 +7928,7 @@ proptest! {
         let package_load_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope } = e {
-                    Some((*line, *column, pkg.clone(), function_scope.clone()))
+                    Some((*line, *column, pkg.clone(), *function_scope))
                 } else {
                     None
                 }
@@ -8006,7 +8006,7 @@ proptest! {
         let package_load_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { function_scope, package: pkg, .. } = e {
-                    Some((pkg.clone(), function_scope.clone()))
+                    Some((pkg.clone(), *function_scope))
                 } else {
                     None
                 }
@@ -8050,7 +8050,7 @@ proptest! {
         let package_load_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { line, function_scope, package: pkg, .. } = e {
-                    Some((*line, pkg.clone(), function_scope.clone()))
+                    Some((*line, pkg.clone(), *function_scope))
                 } else {
                     None
                 }
@@ -8130,7 +8130,7 @@ proptest! {
         let package_load_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { line, package, function_scope, .. } = e {
-                    Some((*line, package.clone(), function_scope.clone()))
+                    Some((*line, package.clone(), *function_scope))
                 } else {
                     None
                 }
@@ -8335,7 +8335,7 @@ proptest! {
             // Query at start position
             let start_results = tree.query_point(interval.start);
             prop_assert!(
-                start_results.iter().any(|i| *i == interval),
+                start_results.contains(&interval),
                 "Interval ({}, {}) - ({}, {}) should contain its start position ({}, {})",
                 sl, sc, el, ec, sl, sc
             );
@@ -8343,7 +8343,7 @@ proptest! {
             // Query at end position
             let end_results = tree.query_point(interval.end);
             prop_assert!(
-                end_results.iter().any(|i| *i == interval),
+                end_results.contains(&interval),
                 "Interval ({}, {}) - ({}, {}) should contain its end position ({}, {})",
                 sl, sc, el, ec, el, ec
             );
@@ -8757,7 +8757,7 @@ proptest! {
                     sl + 1,
                     sc.saturating_add(1).min(99),
                     el.saturating_sub(1).max(sl + 1),
-                    ec.saturating_sub(1).max(0),
+                    ec.saturating_sub(1),
                 );
                 // Only add if valid
                 if (nested.0, nested.1) <= (nested.2, nested.3) {
@@ -9063,7 +9063,7 @@ proptest! {
 
         // If pos1 < pos2, then NOT (pos2 < pos1)
         if pos1 < pos2 {
-            prop_assert!(!(pos2 < pos1),
+            prop_assert!((pos2 >= pos1),
                 "Antisymmetry violated: ({}, {}) < ({}, {}) but also ({}, {}) < ({}, {})",
                 line1, col1, line2, col2, line2, col2, line1, col1);
         }
@@ -9098,7 +9098,7 @@ proptest! {
             line, col, line, col);
 
         // NOT (a < a)
-        prop_assert!(!(pos < pos),
+        prop_assert!((pos >= pos),
             "Irreflexivity violated: ({}, {}) < ({}, {})",
             line, col, line, col);
     }
@@ -9128,10 +9128,10 @@ proptest! {
                 prop_assert!(pos1 < pos2,
                     "Consistency violated: cmp returned Less but ({}, {}) not < ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!(!(pos1 == pos2),
+                prop_assert!((pos1 != pos2),
                     "Consistency violated: cmp returned Less but ({}, {}) == ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!(!(pos1 > pos2),
+                prop_assert!((pos1 <= pos2),
                     "Consistency violated: cmp returned Less but ({}, {}) > ({}, {})",
                     line1, col1, line2, col2);
             }
@@ -9139,10 +9139,10 @@ proptest! {
                 prop_assert!(pos1 == pos2,
                     "Consistency violated: cmp returned Equal but ({}, {}) != ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!(!(pos1 < pos2),
+                prop_assert!((pos1 >= pos2),
                     "Consistency violated: cmp returned Equal but ({}, {}) < ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!(!(pos1 > pos2),
+                prop_assert!((pos1 <= pos2),
                     "Consistency violated: cmp returned Equal but ({}, {}) > ({}, {})",
                     line1, col1, line2, col2);
             }
@@ -9150,10 +9150,10 @@ proptest! {
                 prop_assert!(pos1 > pos2,
                     "Consistency violated: cmp returned Greater but ({}, {}) not > ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!(!(pos1 == pos2),
+                prop_assert!((pos1 != pos2),
                     "Consistency violated: cmp returned Greater but ({}, {}) == ({}, {})",
                     line1, col1, line2, col2);
-                prop_assert!(!(pos1 < pos2),
+                prop_assert!((pos1 >= pos2),
                     "Consistency violated: cmp returned Greater but ({}, {}) < ({}, {})",
                     line1, col1, line2, col2);
             }
@@ -15693,7 +15693,7 @@ proptest! {
 
         // Test with max_depth = 0: should return None (depth limit reached immediately)
         let result_depth_0 = compute_inherited_working_directory_with_depth(
-            &child_uri, &child_meta, Some(&workspace_uri), &get_metadata, 0,
+            &child_uri, &child_meta, Some(&workspace_uri), get_metadata, 0,
         );
         prop_assert!(
             result_depth_0.is_none(),
@@ -15702,7 +15702,7 @@ proptest! {
 
         // Test with max_depth = 1: should resolve parent's effective WD
         let result_depth_1 = compute_inherited_working_directory_with_depth(
-            &child_uri, &child_meta, Some(&workspace_uri), &get_metadata, 1,
+            &child_uri, &child_meta, Some(&workspace_uri), get_metadata, 1,
         );
         prop_assert!(
             result_depth_1.is_some(),
@@ -15718,7 +15718,7 @@ proptest! {
 
         // Test with sufficient depth (2+): should get parent's explicit WD
         let result_sufficient = compute_inherited_working_directory_with_depth(
-            &child_uri, &child_meta, Some(&workspace_uri), &get_metadata, 2,
+            &child_uri, &child_meta, Some(&workspace_uri), get_metadata, 2,
         );
         prop_assert!(
             result_sufficient.is_some(),
@@ -15845,7 +15845,7 @@ proptest! {
             &uris[last_idx],
             &metadatas[last_idx],
             Some(&workspace_uri),
-            &get_metadata,
+            get_metadata,
             0,
         );
         prop_assert!(
@@ -15858,7 +15858,7 @@ proptest! {
             &uris[last_idx],
             &metadatas[last_idx],
             Some(&workspace_uri),
-            &get_metadata,
+            get_metadata,
             1,
         );
         prop_assert!(
@@ -15886,7 +15886,7 @@ proptest! {
             &uris[last_idx],
             &metadatas[last_idx],
             Some(&workspace_uri),
-            &get_metadata,
+            get_metadata,
             100, // Large enough for any chain
         );
         prop_assert!(
@@ -15957,7 +15957,7 @@ proptest! {
 
         // With max_depth=0, should always return None
         let result = compute_inherited_working_directory_with_depth(
-            &child_uri, &child_meta, Some(&workspace_uri), &get_metadata, 0,
+            &child_uri, &child_meta, Some(&workspace_uri), get_metadata, 0,
         );
 
         prop_assert!(
@@ -16056,7 +16056,7 @@ proptest! {
             &uris[last_idx],
             &metadatas[last_idx],
             Some(&workspace_uri),
-            &get_metadata,
+            get_metadata,
         );
 
         // For chains shorter than DEFAULT_MAX_INHERITANCE_DEPTH, should succeed
@@ -16302,7 +16302,7 @@ proptest! {
             &a_uri,
             &meta_a,
             Some(&workspace_uri),
-            &get_metadata,
+            get_metadata,
         );
 
         // When cycle is detected, the system falls back to the file's directory
@@ -16320,7 +16320,7 @@ proptest! {
         // The result should be some directory in the workspace (either A's, B's, or C's directory
         // depending on where the cycle detection kicks in)
         prop_assert!(
-            a_inherited_path.starts_with(&format!("/{}", workspace)),
+            a_inherited_path.starts_with(format!("/{}", workspace)),
             "Cycle fallback should be within workspace"
         );
     }
@@ -16703,7 +16703,7 @@ proptest! {
             &a_uri,
             &meta_a,
             Some(&workspace_uri),
-            &get_metadata,
+            get_metadata,
         );
 
         // Should get some result (fallback to directory when cycle detected)
@@ -16715,7 +16715,7 @@ proptest! {
         // The result should be within the workspace
         let a_inherited_path = PathBuf::from(a_inherited_wd.as_ref().unwrap());
         prop_assert!(
-            a_inherited_path.starts_with(&format!("/{}", workspace)),
+            a_inherited_path.starts_with(format!("/{}", workspace)),
             "Fallback directory should be within workspace"
         );
     }
@@ -21854,13 +21854,13 @@ proptest! {
         let mut expected_vars = Vec::new();
         let mut expected_funcs = Vec::new();
 
-        for (_i, name) in var_names.iter().enumerate() {
+        for name in var_names.iter() {
             let line_num = lines.len() as u32;
             lines.push(format!("# @lsp-var {}", name));
             expected_vars.push((name.clone(), line_num));
         }
 
-        for (_i, name) in func_names.iter().enumerate() {
+        for name in func_names.iter() {
             let line_num = lines.len() as u32;
             lines.push(format!("# @lsp-func {}", name));
             expected_funcs.push((name.clone(), line_num));

@@ -663,7 +663,7 @@ x <- undefined"#;
             let caps = patterns
                 .forward
                 .captures(&line)
-                .expect(&format!("Should match for {}", directive));
+                .unwrap_or_else(|| panic!("Should match for {}", directive));
 
             // Path should be in group 3 (unquoted)
             assert_eq!(

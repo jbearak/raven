@@ -1525,38 +1525,22 @@ importFrom(magrittr, "%>%")
         })
     }
 
-    /// Generates a proptest strategy that produces a tuple containing:
-
-    /// - an `S3method(...)` directive string, and
-
-    /// - the corresponding expected export name `generic.class` as a single-item `Vec<String>`.
-
-    ///
-
-    /// # Examples
-
-    ///
-
-    /// ```
-
-    /// use proptest::test_runner::TestRunner;
-
-    ///
-
-    /// let mut runner = TestRunner::default();
-
-    /// let strategy = s3method_directive_strategy();
-
-    /// let tree = strategy.new_tree(&mut runner).unwrap();
-
-    /// let (directive, expected) = tree.current();
-
-    /// assert!(directive.starts_with("S3method("));
-
-    /// assert_eq!(expected.len(), 1);
-
-    /// assert!(expected[0].contains('.'));
-
+    /// Generates a proptest strategy that produces a tuple containing:    ///
+    /// - an `S3method(...)` directive string, and    ///
+    /// - the corresponding expected export name `generic.class` as a single-item `Vec<String>`.    ///
+    ///    ///
+    /// # Examples    ///
+    ///    ///
+    /// ```    ///
+    /// use proptest::test_runner::TestRunner;    ///
+    ///    ///
+    /// let mut runner = TestRunner::default();    ///
+    /// let strategy = s3method_directive_strategy();    ///
+    /// let tree = strategy.new_tree(&mut runner).unwrap();    ///
+    /// let (directive, expected) = tree.current();    ///
+    /// assert!(directive.starts_with("S3method("));    ///
+    /// assert_eq!(expected.len(), 1);    ///
+    /// assert!(expected[0].contains('.'));    ///
     /// ```
     fn s3method_directive_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
         (r_identifier_strategy(), r_identifier_with_dots_strategy()).prop_map(|(generic, class)| {
