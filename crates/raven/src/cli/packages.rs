@@ -110,6 +110,28 @@ pub fn parse_build_shipped_db_args(
     })
 }
 
+#[derive(Debug)]
+pub struct ValidateShippedDbArgs {
+    pub path: PathBuf,
+}
+
+pub fn parse_validate_shipped_db_args(
+    mut argv: impl Iterator<Item = String>,
+) -> Result<ValidateShippedDbArgs, String> {
+    let Some(path) = argv.next() else {
+        return Err("validate-shipped-db needs a names.db path".into());
+    };
+    if path == "--help" {
+        return Err("HELP".into());
+    }
+    if let Some(extra) = argv.next() {
+        return Err(format!("unexpected extra argument: {extra}"));
+    }
+    Ok(ValidateShippedDbArgs {
+        path: PathBuf::from(path),
+    })
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum FreezeScope {
     Used,
@@ -774,6 +796,30 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
     Ok(())
 }
 
+pub fn run_validate_shipped_db(args: ValidateShippedDbArgs) -> Result<(), String> {
+    let db = ShippedDb::open(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
+    let records = db.all_records();
+    let provenance = db.provenance();
+    let expected = provenance.package_count as usize;
+    if records.len() != expected {
+        return Err(format!(
+            "{}: decoded {} package records, but provenance says {}",
+            args.path.display(),
+            records.len(),
+            expected
+        ));
+    }
+    eprintln!(
+        "Validated {}: {} packages; source: {}; snapshot: {}; built by Raven {}",
+        args.path.display(),
+        records.len(),
+        provenance.source,
+        provenance.snapshot_date,
+        provenance.raven_version
+    );
+    Ok(())
+}
+
 pub async fn run_update(args: UpdateArgs) -> Result<(), String> {
     let dest_dir = match args.dest_dir {
         Some(dir) => dir,
@@ -1339,9 +1385,13 @@ pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
             let args = parse_build_embedded_base_args(argv)?;
             run_build_embedded_base(args).await
         }
+        Some("validate-shipped-db") => {
+            let args = parse_validate_shipped_db_args(argv)?;
+            run_validate_shipped_db(args)
+        }
         Some(other) => Err(format!("unknown packages subcommand: {other}")),
         None => {
-            Err("usage: raven packages <fetch|freeze|update|build-shipped-db|build-embedded-base> [OPTIONS]".into())
+            Err("usage: raven packages <fetch|freeze|update|build-shipped-db|build-embedded-base|validate-shipped-db> [OPTIONS]".into())
         }
     }
 }
@@ -1357,7 +1407,8 @@ pub fn print_help() {
          raven packages build-shipped-db [--runiverse-cran DIR] \
 [--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
 [--snapshot-date S] [--source S]\n  \
-         raven packages build-embedded-base --reference-lib DIR [--output PATH]\n"
+         raven packages build-embedded-base --reference-lib DIR [--output PATH]\n  \
+         raven packages validate-shipped-db names.db\n"
     );
 }
 
@@ -1446,6 +1497,82 @@ mod tests {
         assert_eq!(args.snapshot_date, "2026-05-30");
         assert!(args.capture_reference);
         assert_eq!(args.seed, None);
+    }
+
+    #[test]
+    fn parse_validate_shipped_db_requires_one_path() {
+        let err = super::parse_validate_shipped_db_args(std::iter::empty()).unwrap_err();
+        assert!(err.contains("needs a names.db path"));
+
+        let args =
+            super::parse_validate_shipped_db_args(["dist/names.db"].into_iter().map(String::from))
+                .unwrap();
+        assert_eq!(args.path, std::path::PathBuf::from("dist/names.db"));
+
+        let err =
+            super::parse_validate_shipped_db_args(["a.db", "b.db"].into_iter().map(String::from))
+                .unwrap_err();
+        assert!(err.contains("unexpected extra argument"));
+    }
+
+    #[test]
+    fn validate_shipped_db_accepts_valid_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        let recs = vec![PackageRecord {
+            name: "dplyr".into(),
+            version: "1.1.4".into(),
+            exports: vec!["mutate".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }];
+        let prov = ShippedDbProvenance {
+            source: "t".into(),
+            snapshot_date: "2026-06-01".into(),
+            package_count: 1,
+            raven_version: "9.9.9".into(),
+        };
+        write_shipped_db(&path, &recs, prov).unwrap();
+
+        super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap();
+    }
+
+    #[test]
+    fn validate_shipped_db_rejects_corrupt_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        std::fs::write(&path, b"NOT A RAVEN DB").unwrap();
+
+        let err =
+            super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
+        assert!(err.contains("bad magic"), "got {err}");
+    }
+
+    // Covers the ONLY logic the validator adds over `ShippedDb::open`: a
+    // structurally valid DB whose provenance package_count disagrees with the
+    // decoded record count must be rejected.
+    #[test]
+    fn validate_shipped_db_rejects_provenance_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        let recs = vec![PackageRecord {
+            name: "dplyr".into(),
+            version: "1.1.4".into(),
+            exports: vec!["mutate".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        }];
+        let prov = ShippedDbProvenance {
+            source: "t".into(),
+            snapshot_date: "2026-06-01".into(),
+            package_count: 2, // lies: only one record is written
+            raven_version: "9.9.9".into(),
+        };
+        write_shipped_db(&path, &recs, prov).unwrap();
+
+        let err =
+            super::run_validate_shipped_db(super::ValidateShippedDbArgs { path }).unwrap_err();
+        assert!(err.contains("provenance says"), "got {err}");
     }
 
     #[tokio::test]

@@ -16,7 +16,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-names-db:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Download package DB from the names-db Release
+        run: |
+          mkdir -p dist
+          gh release download names-db --repo "$GITHUB_REPOSITORY" \
+            --pattern 'names.db' --dir dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Raven validator
+        run: cargo build --release -p raven
+
+      - name: Validate package DB
+        run: ./target/release/raven packages validate-shipped-db dist/names.db
+
+      - name: Upload validated package DB
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: names-db
+          path: dist/names.db
+          retention-days: 30
+
   build-lsp:
+    needs: validate-names-db
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -81,13 +111,11 @@ jobs:
             cargo build --release --target ${{ matrix.target }} --bin raven
           fi
 
-      - name: Download package DB from the names-db Release
-        run: |
-          mkdir -p dist
-          gh release download names-db --repo "$GITHUB_REPOSITORY" \
-            --pattern 'names.db' --dir dist
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download validated package DB
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: names-db
+          path: dist
 
       - name: Create archive
         run: |

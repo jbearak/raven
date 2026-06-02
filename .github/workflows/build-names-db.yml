@@ -8,11 +8,16 @@ on:
 permissions:
   contents: write   # to update the names-db Release
 
+env:
+  NAMES_DB_BUILDER_REF: names-db-builder
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ env.NAMES_DB_BUILDER_REF }}
       - uses: r-lib/actions/setup-r@a51a8012b0aab7c32ef9d19bf54da93f3254335e # v2 — reference R; build-shipped-db auto-discovers its .libPaths()
 
       - name: Build raven (release)
@@ -48,7 +53,8 @@ jobs:
         run: |
           gh release create names-db --repo "$GITHUB_REPOSITORY" \
             --title "names.db (Tier 3 package-export DB)" \
-            --notes "Auto-updated by build-names-db.yml" 2>/dev/null || true
+            --notes "Auto-updated by build-names-db.yml" \
+            --latest=false 2>/dev/null || true
           gh release upload names-db dist/names.db dist/checksums.sha256 \
             --repo "$GITHUB_REPOSITORY" --clobber
         env:

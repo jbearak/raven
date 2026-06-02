@@ -23,7 +23,7 @@ Usage: raven [OPTIONS]
        raven check [PATHS...] [--workspace DIR]
        raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
-       raven packages <fetch|freeze|update|build-shipped-db|build-embedded-base> [OPTIONS]
+       raven packages <fetch|freeze|update|build-shipped-db|build-embedded-base|validate-shipped-db> [OPTIONS]
        raven freeze [ARGS]          (alias for: raven packages freeze)
        raven fetch  [ARGS]          (alias for: raven packages fetch)
 
@@ -49,6 +49,7 @@ packages <subcommand>        Generate / maintain package databases
   update                     Download the names.db sidecar
   build-shipped-db           Maintainer-only Tier 3 names.db builder
   build-embedded-base        Maintainer-only embedded base-package table builder
+  validate-shipped-db       Maintainer-only names.db compatibility/integrity validator
 freeze, fetch                Top-level aliases for raven packages freeze/fetch
 
 "#

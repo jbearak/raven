@@ -442,6 +442,8 @@ coverage.
   build input). Located via the Tier 3 candidate locator — `RAVEN_NAMES_DB`
   override, then user data, then exe-relative. **Not** `include_bytes!` (avoids
   binary bloat), **not** committed to git (except tiny back-compat fixtures).
+- The scheduled `build-names-db.yml` workflow stays on the default branch so GitHub Actions can run its cron, but its `actions/checkout` step is pinned to the protected `names-db-builder` branch. That branch is the production source line for the DB builder; merge only reviewed, release-compatible DB-builder changes into it.
+- `release-build.yml` downloads the current `names-db` Release asset once, validates it with the just-tagged Raven source via `raven packages validate-shipped-db`, uploads that validated file as a workflow artifact, and every platform package bundles that artifact. This prevents a mutable Release asset from changing between validation and packaging.
 - **Replacing the file (Windows mmap lock):** while `names.db` is mapped, Windows
   holds the file open (`CreateFileMapping` keeps a handle), so it cannot be
   overwritten in place. Writers (the bundle step, and any future in-process
