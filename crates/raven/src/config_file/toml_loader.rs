@@ -141,14 +141,14 @@ fn validate_top_level_keys(
             ));
             continue;
         }
-        if key == "linting" {
-            if let Value::Object(linting_map) = value {
-                for nested in linting_map.keys() {
-                    if !KNOWN_LINTING_KEYS.contains(&nested.as_str()) {
-                        warnings.push(format!(
-                            "{source_label}: unknown key 'linting.{nested}'; ignoring"
-                        ));
-                    }
+        if key == "linting"
+            && let Value::Object(linting_map) = value
+        {
+            for nested in linting_map.keys() {
+                if !KNOWN_LINTING_KEYS.contains(&nested.as_str()) {
+                    warnings.push(format!(
+                        "{source_label}: unknown key 'linting.{nested}'; ignoring"
+                    ));
                 }
             }
         }

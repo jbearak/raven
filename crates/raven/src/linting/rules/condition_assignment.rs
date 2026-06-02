@@ -22,9 +22,9 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
+use crate::linting::LINT_SOURCE;
 use crate::linting::nolint::Suppressions;
 use crate::linting::rule_ids;
-use crate::linting::LINT_SOURCE;
 use crate::utf16::byte_offset_to_utf16_column;
 
 pub(crate) fn collect(
@@ -44,10 +44,10 @@ fn visit(
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    if matches!(node.kind(), "if_statement" | "while_statement") {
-        if let Some(cond) = node.child_by_field_name("condition") {
-            scan_condition(cond, text, severity, suppressions, out);
-        }
+    if matches!(node.kind(), "if_statement" | "while_statement")
+        && let Some(cond) = node.child_by_field_name("condition")
+    {
+        scan_condition(cond, text, severity, suppressions, out);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -73,12 +73,12 @@ fn scan_condition(
     ) {
         return;
     }
-    if node.kind() == "binary_operator" {
-        if let Some(op) = node.child_by_field_name("operator") {
-            let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
-            if op_text == "=" {
-                emit(op, text, severity, suppressions, out);
-            }
+    if node.kind() == "binary_operator"
+        && let Some(op) = node.child_by_field_name("operator")
+    {
+        let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
+        if op_text == "=" {
+            emit(op, text, severity, suppressions, out);
         }
     }
     let mut cursor = node.walk();

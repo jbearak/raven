@@ -416,7 +416,9 @@ process <- function(data, verbose = FALSE) {}
         let block = extract_roxygen_block(code, 5).unwrap();
         assert_eq!(
             block.params.get("data").map(|s| s.as_str()),
-            Some("A data frame containing the input data. Must have columns 'x' and 'y'. Additional columns are ignored.")
+            Some(
+                "A data frame containing the input data. Must have columns 'x' and 'y'. Additional columns are ignored."
+            )
         );
         assert_eq!(
             block.params.get("verbose").map(|s| s.as_str()),
@@ -748,7 +750,9 @@ filter_and_summarize <- function(df, threshold = 0, cols = NULL, na.rm = TRUE, .
         assert_eq!(block.title.as_deref(), Some("Filter and summarize data"));
         assert_eq!(
             block.description.as_deref(),
-            Some("Takes a data frame and applies filtering based on the specified threshold, then computes summary statistics.")
+            Some(
+                "Takes a data frame and applies filtering based on the specified threshold, then computes summary statistics."
+            )
         );
         assert_eq!(block.params.len(), 5);
         assert_eq!(
@@ -921,20 +925,20 @@ mod prop_tests {
         lines.push("# preamble".to_string());
 
         // Add title line if present
-        if let Some(ref t) = title {
+        if let Some(t) = title {
             lines.push(format!("#' {}", t));
         }
 
         // Add description
         match desc_style {
             DescriptionStyle::Implicit => {
-                if let Some(ref d) = description {
+                if let Some(d) = description {
                     // Implicit description: lines after title, before first tag
                     lines.push(format!("#' {}", d));
                 }
             }
             DescriptionStyle::Explicit => {
-                if let Some(ref d) = description {
+                if let Some(d) = description {
                     // Explicit @description tag
                     lines.push(format!("#' @description {}", d));
                 }
@@ -1291,10 +1295,10 @@ pub fn extract_roxygen_namespace_tags(content: &str) -> RoxygenNamespace {
                         break;
                     }
                 }
-                if i < lines.len() {
-                    if let Some(name) = extract_definition_name(lines[i]) {
-                        ns.exports.push(name);
-                    }
+                if i < lines.len()
+                    && let Some(name) = extract_definition_name(lines[i])
+                {
+                    ns.exports.push(name);
                 }
             }
         }
@@ -1491,11 +1495,7 @@ fn extract_first_identifier(line: &str) -> Option<String> {
             break;
         }
     }
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Extract top-level definition names from R source text.

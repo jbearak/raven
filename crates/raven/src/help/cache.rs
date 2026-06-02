@@ -114,11 +114,11 @@ impl HtmlHelpCache {
         result: Result_,
         expected_generation: u64,
     ) -> bool {
-        if let Ok(mut guard) = self.inner.write() {
-            if self.generation.load(Ordering::SeqCst) == expected_generation {
-                Self::insert_locked(&mut guard, topic, package, result);
-                return true;
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && self.generation.load(Ordering::SeqCst) == expected_generation
+        {
+            Self::insert_locked(&mut guard, topic, package, result);
+            return true;
         }
         false
     }
@@ -213,10 +213,10 @@ impl HtmlHelpCache {
                 // single-flight guarantee until the new Owner finishes.
                 {
                     let mut map = self.in_flight.lock().expect("in_flight lock");
-                    if let Some(current) = map.get(&key) {
-                        if current.same_channel(&sender) {
-                            map.remove(&key);
-                        }
+                    if let Some(current) = map.get(&key)
+                        && current.same_channel(&sender)
+                    {
+                        map.remove(&key);
                     }
                 }
                 let shared = Arc::new(result.clone());

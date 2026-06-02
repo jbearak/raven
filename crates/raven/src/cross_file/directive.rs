@@ -25,22 +25,22 @@ struct DirectivePatterns {
 /// Extract path from capture groups (double-quoted, single-quoted, or unquoted)
 fn capture_path(caps: &regex::Captures, base_group: usize) -> Option<String> {
     // Try double-quoted (base_group)
-    if let Some(m) = caps.get(base_group) {
-        if !m.as_str().is_empty() {
-            return Some(m.as_str().to_string());
-        }
+    if let Some(m) = caps.get(base_group)
+        && !m.as_str().is_empty()
+    {
+        return Some(m.as_str().to_string());
     }
     // Try single-quoted (base_group + 1)
-    if let Some(m) = caps.get(base_group + 1) {
-        if !m.as_str().is_empty() {
-            return Some(m.as_str().to_string());
-        }
+    if let Some(m) = caps.get(base_group + 1)
+        && !m.as_str().is_empty()
+    {
+        return Some(m.as_str().to_string());
     }
     // Try unquoted (base_group + 2)
-    if let Some(m) = caps.get(base_group + 2) {
-        if !m.as_str().is_empty() {
-            return Some(m.as_str().to_string());
-        }
+    if let Some(m) = caps.get(base_group + 2)
+        && !m.as_str().is_empty()
+    {
+        return Some(m.as_str().to_string());
     }
     None
 }
@@ -174,51 +174,47 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         }
 
         // Header-only: backward directives
-        if in_header {
-            if let Some(caps) = patterns.backward.captures(line) {
-                let path = capture_path(&caps, 1).unwrap_or_default();
-                let call_site = if let Some(line_match) = caps.get(4) {
-                    let line_str = line_match.as_str();
-                    if line_str == "eof" || line_str == "end" {
-                        // Use u32::MAX as EOF sentinel
-                        CallSiteSpec::Line(u32::MAX)
-                    } else {
-                        // Convert 1-based user input to 0-based internal
-                        let user_line: u32 = line_str.parse().unwrap_or(1);
-                        CallSiteSpec::Line(user_line.saturating_sub(1))
-                    }
-                } else if let Some(match_pattern) = caps.get(5) {
-                    CallSiteSpec::Match(match_pattern.as_str().to_string())
+        if in_header && let Some(caps) = patterns.backward.captures(line) {
+            let path = capture_path(&caps, 1).unwrap_or_default();
+            let call_site = if let Some(line_match) = caps.get(4) {
+                let line_str = line_match.as_str();
+                if line_str == "eof" || line_str == "end" {
+                    // Use u32::MAX as EOF sentinel
+                    CallSiteSpec::Line(u32::MAX)
                 } else {
-                    CallSiteSpec::Default
-                };
-                log::trace!(
-                    "  Parsed backward directive at line {}: path='{}' call_site={:?}",
-                    line_num,
-                    path,
-                    call_site
-                );
-                meta.sourced_by.push(BackwardDirective {
-                    path,
-                    call_site,
-                    directive_line: line_num,
-                });
-                continue;
-            }
+                    // Convert 1-based user input to 0-based internal
+                    let user_line: u32 = line_str.parse().unwrap_or(1);
+                    CallSiteSpec::Line(user_line.saturating_sub(1))
+                }
+            } else if let Some(match_pattern) = caps.get(5) {
+                CallSiteSpec::Match(match_pattern.as_str().to_string())
+            } else {
+                CallSiteSpec::Default
+            };
+            log::trace!(
+                "  Parsed backward directive at line {}: path='{}' call_site={:?}",
+                line_num,
+                path,
+                call_site
+            );
+            meta.sourced_by.push(BackwardDirective {
+                path,
+                call_site,
+                directive_line: line_num,
+            });
+            continue;
         }
 
         // Header-only: working directory directive
-        if in_header {
-            if let Some(caps) = patterns.working_dir.captures(line) {
-                let path = capture_path(&caps, 1).unwrap_or_default();
-                log::trace!(
-                    "  Parsed working directory directive at line {}: path='{}'",
-                    line_num,
-                    path
-                );
-                meta.working_directory = Some(path);
-                continue;
-            }
+        if in_header && let Some(caps) = patterns.working_dir.captures(line) {
+            let path = capture_path(&caps, 1).unwrap_or_default();
+            log::trace!(
+                "  Parsed working directory directive at line {}: path='{}'",
+                line_num,
+                path
+            );
+            meta.working_directory = Some(path);
+            continue;
         }
 
         // Full-file: forward directive

@@ -113,8 +113,7 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
     };
     let mut results = Vec::new();
 
-    let should_run =
-        |phase: &str| -> bool { args.only.as_ref().map_or(true, |only| only == phase) };
+    let should_run = |phase: &str| -> bool { args.only.as_ref().is_none_or(|only| only == phase) };
 
     // Phase 1: Scan — discover R files
     let mut r_files: Vec<(PathBuf, String)> = Vec::new();
@@ -261,10 +260,10 @@ pub fn run_analysis_stats(args: &AnalysisStatsArgs) -> Vec<PhaseResult> {
         let pkg_lib = crate::package_library::PackageLibrary::new_empty();
         let mut resolved = 0usize;
         for pkg_name in &unique_packages {
-            if let Some(pkg_dir) = pkg_lib.find_package_directory(pkg_name) {
-                if pkg_lib.parse_package_static(&pkg_dir).is_some() {
-                    resolved += 1;
-                }
+            if let Some(pkg_dir) = pkg_lib.find_package_directory(pkg_name)
+                && pkg_lib.parse_package_static(&pkg_dir).is_some()
+            {
+                resolved += 1;
             }
         }
 

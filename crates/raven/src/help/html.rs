@@ -74,12 +74,12 @@ fn get_help_html_inner(
             message: format!("invalid topic: {}", topic.escape_debug()),
         });
     }
-    if let Some(p) = package {
-        if !crate::r_subprocess::is_valid_package_name(p) {
-            return Err(HelpHtmlError::InvalidTopic {
-                message: format!("invalid package: {}", p.escape_debug()),
-            });
-        }
+    if let Some(p) = package
+        && !crate::r_subprocess::is_valid_package_name(p)
+    {
+        return Err(HelpHtmlError::InvalidTopic {
+            message: format!("invalid package: {}", p.escape_debug()),
+        });
     }
 
     let timeout = timeout_from_env();

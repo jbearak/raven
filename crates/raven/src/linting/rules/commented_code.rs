@@ -32,10 +32,10 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
 
+use crate::linting::LINT_SOURCE;
 use crate::linting::nolint::Suppressions;
 use crate::linting::parse_gate::looks_like_code;
 use crate::linting::rule_ids;
-use crate::linting::LINT_SOURCE;
 use crate::utf16::{byte_offset_to_utf16_column, strip_leading_bom_for_scan};
 
 /// Annotation prefixes (case-insensitive). `TODO`, `FIXME`, etc. — these are
@@ -269,10 +269,10 @@ fn is_annotation_comment(trimmed_line: &str) -> bool {
         if tail.is_empty() {
             return true;
         }
-        if let Some(c) = tail.chars().next() {
-            if c.is_whitespace() || c == ':' || c == '(' || c == '-' {
-                return true;
-            }
+        if let Some(c) = tail.chars().next()
+            && (c.is_whitespace() || c == ':' || c == '(' || c == '-')
+        {
+            return true;
         }
     }
     false

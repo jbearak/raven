@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use raven::handlers::{diagnostics_via_snapshot_profile, DiagCancelToken};
-use raven::state::{scan_workspace, Document, WorldState};
+use raven::handlers::{DiagCancelToken, diagnostics_via_snapshot_profile};
+use raven::state::{Document, WorldState, scan_workspace};
 use tempfile::TempDir;
 use url::Url;
 

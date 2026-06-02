@@ -5,8 +5,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::package_db::model::PackageRecord;
 use crate::package_db::PackageMetadataProvider;
+use crate::package_db::model::PackageRecord;
 use crate::package_library::PackageInfo;
 
 /// Tier 2 schema version. Bump when the on-disk shape changes incompatibly.

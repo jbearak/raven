@@ -7,17 +7,17 @@
 //
 // Requirements: 1.4, 1.3
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use url::Url;
 
 use raven::cross_file::types::CrossFileMetadata;
 use raven::cross_file::{
-    compute_artifacts, extract_metadata, scope_at_position, DependencyGraph, FunctionScopeTree,
-    Position, ScopeArtifacts,
+    DependencyGraph, FunctionScopeTree, Position, ScopeArtifacts, compute_artifacts,
+    extract_metadata, scope_at_position,
 };
-use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
+use raven::test_utils::fixture_workspace::{FixtureConfig, create_fixture_workspace};
 
 /// Pre-compute scope artifacts and metadata for all files in a workspace.
 ///

@@ -29,11 +29,11 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 use raven::cross_file::file_cache::FileSnapshot;
-use raven::cross_file::{extract_metadata, extract_metadata_with_tree, scope, CrossFileMetadata};
-use raven::handlers::{diagnostics_via_snapshot_profile, DiagCancelToken};
+use raven::cross_file::{CrossFileMetadata, extract_metadata, extract_metadata_with_tree, scope};
+use raven::handlers::{DiagCancelToken, diagnostics_via_snapshot_profile};
 use raven::package_library::PackageLibrary;
 use raven::r_subprocess::RSubprocess;
-use raven::state::{scan_workspace, Document, WorldState};
+use raven::state::{Document, WorldState, scan_workspace};
 use raven::workspace_index as new_workspace_index;
 
 const SKIP_DIRECTORIES: &[&str] = &[
@@ -71,10 +71,10 @@ fn discover(dir: &Path, out: &mut Vec<PathBuf>) {
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
-            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
-                if should_skip(n) {
-                    continue;
-                }
+            if let Some(n) = p.file_name().and_then(|n| n.to_str())
+                && should_skip(n)
+            {
+                continue;
             }
             discover(&p, out);
         } else if is_r_file(&p) {

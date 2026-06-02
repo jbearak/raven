@@ -482,10 +482,11 @@ mod tests {
             &inputs,
             &PackageInputDelta::Initial,
         );
-        assert!(!s
-            .scope_contribution
-            .r_internal_symbols
-            .contains("test_helper"));
+        assert!(
+            !s.scope_contribution
+                .r_internal_symbols
+                .contains("test_helper")
+        );
     }
 
     #[test]
@@ -836,20 +837,24 @@ foo <- function() 1
             &with_description(PackageMode::Auto, "Package: foo\nImports: testthat\n"),
             &PackageInputDelta::Initial,
         );
-        assert!(s_imp
-            .scope_contribution
-            .test_attached_packages
-            .contains("testthat"));
+        assert!(
+            s_imp
+                .scope_contribution
+                .test_attached_packages
+                .contains("testthat")
+        );
 
         let s_dep = derive_package_state(
             &PackageState::default(),
             &with_description(PackageMode::Auto, "Package: foo\nDepends: testthat\n"),
             &PackageInputDelta::Initial,
         );
-        assert!(s_dep
-            .scope_contribution
-            .test_attached_packages
-            .contains("testthat"));
+        assert!(
+            s_dep
+                .scope_contribution
+                .test_attached_packages
+                .contains("testthat")
+        );
     }
 
     /// Without testthat declared anywhere, do not implicitly attach it.
@@ -946,10 +951,11 @@ foo <- function() 1
         // Neither leaks into r_internal_symbols (R/ files remain isolated
         // from tests/testthat/ contributions).
         assert!(!s.scope_contribution.r_internal_symbols.contains("fixture"));
-        assert!(!s
-            .scope_contribution
-            .r_internal_symbols
-            .contains("test_local"));
+        assert!(
+            !s.scope_contribution
+                .r_internal_symbols
+                .contains("test_local")
+        );
     }
 
     /// Multiple helper files contribute their union — peer helpers see each
@@ -984,16 +990,18 @@ foo <- function() 1
             &inputs,
             &PackageInputDelta::Initial,
         );
-        assert!(s
-            .scope_contribution
-            .test_helper_symbols
-            .values()
-            .any(|syms| syms.contains("helper_a_fn")));
-        assert!(s
-            .scope_contribution
-            .test_helper_symbols
-            .values()
-            .any(|syms| syms.contains("helper_b_fn")));
+        assert!(
+            s.scope_contribution
+                .test_helper_symbols
+                .values()
+                .any(|syms| syms.contains("helper_a_fn"))
+        );
+        assert!(
+            s.scope_contribution
+                .test_helper_symbols
+                .values()
+                .any(|syms| syms.contains("helper_b_fn"))
+        );
     }
 
     /// Codex follow-up: `tests/testthat/sub/helper-x.R` must NOT be

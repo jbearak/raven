@@ -11,7 +11,7 @@
 // integrated into PackageLibrary in task 3.3
 #![allow(dead_code)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -100,10 +100,10 @@ fn parse_namespace_content(content: &str) -> Vec<String> {
         // Handle S3method(generic, class) and S3method(generic, class, method)
         // Requirement 3.5: WHEN a NAMESPACE file contains `S3method(generic, class)`,
         // THE Package_Resolver SHALL include the S3 method in exports
-        else if let Some(args) = extract_directive_args(line, "S3method") {
-            if let Some(method_name) = parse_s3method_args(&args) {
-                exports.push(method_name);
-            }
+        else if let Some(args) = extract_directive_args(line, "S3method")
+            && let Some(method_name) = parse_s3method_args(&args)
+        {
+            exports.push(method_name);
         }
     }
 
@@ -546,26 +546,24 @@ pub async fn parse_data_symbols(pkg_dir: &Path) -> Vec<String> {
             let datalist_ok = fs::symlink_metadata(&datalist_path)
                 .map(|m| m.is_file())
                 .unwrap_or(false);
-            if datalist_ok {
-                if let Ok(content) = fs::read_to_string(&datalist_path) {
-                    for line in content.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') {
-                            continue;
+            if datalist_ok && let Ok(content) = fs::read_to_string(&datalist_path) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((primary, rest)) = line.split_once(':') {
+                        let primary = primary.trim();
+                        if is_valid_r_identifier(primary) {
+                            found.push(primary.to_string());
                         }
-                        if let Some((primary, rest)) = line.split_once(':') {
-                            let primary = primary.trim();
-                            if is_valid_r_identifier(primary) {
-                                found.push(primary.to_string());
+                        for sub in rest.split_whitespace() {
+                            if is_valid_r_identifier(sub) {
+                                found.push(sub.to_string());
                             }
-                            for sub in rest.split_whitespace() {
-                                if is_valid_r_identifier(sub) {
-                                    found.push(sub.to_string());
-                                }
-                            }
-                        } else if is_valid_r_identifier(line) {
-                            found.push(line.to_string());
                         }
+                    } else if is_valid_r_identifier(line) {
+                        found.push(line.to_string());
                     }
                 }
             }
@@ -692,12 +690,11 @@ fn is_valid_r_identifier(s: &str) -> bool {
     }
 
     // If starts with dot, second char must be letter (not digit)
-    if first == '.' {
-        if let Some(second) = chars.next() {
-            if second.is_ascii_digit() {
-                return false;
-            }
-        }
+    if first == '.'
+        && let Some(second) = chars.next()
+        && second.is_ascii_digit()
+    {
+        return false;
     }
 
     // Rest must be alphanumeric, dot, or underscore
@@ -962,8 +959,7 @@ exportPattern("^helper_")
 
     #[test]
     fn test_parse_description_depends_with_version_constraints() {
-        let content =
-            "Package: mypackage\nDepends: R (>= 4.0), dplyr (>= 1.0.0), ggplot2 (>= 3.0)\nVersion: 1.0.0";
+        let content = "Package: mypackage\nDepends: R (>= 4.0), dplyr (>= 1.0.0), ggplot2 (>= 3.0)\nVersion: 1.0.0";
         let depends = parse_description_field(content, "Depends");
         assert_eq!(depends, vec!["dplyr", "ggplot2"]);
     }

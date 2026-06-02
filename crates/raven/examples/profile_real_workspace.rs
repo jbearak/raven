@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use raven::handlers::{diagnostics_via_snapshot_profile, DiagCancelToken};
-use raven::state::{scan_workspace, Document, WorldState};
+use raven::handlers::{DiagCancelToken, diagnostics_via_snapshot_profile};
+use raven::state::{Document, WorldState, scan_workspace};
 use url::Url;
 
 fn main() {
@@ -148,23 +148,21 @@ fn main() {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with('.')
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && (name.starts_with('.')
                             || name == "node_modules"
                             || name == "output"
                             || name == "abortion_data"
-                            || name == "fertility_surveys"
-                        {
-                            continue;
-                        }
+                            || name == "fertility_surveys")
+                    {
+                        continue;
                     }
                     walk(&path, out);
-                } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if matches!(ext, "r" | "R") {
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            out.push((path, meta.len() as usize));
-                        }
-                    }
+                } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    && matches!(ext, "r" | "R")
+                    && let Ok(meta) = std::fs::metadata(&path)
+                {
+                    out.push((path, meta.len() as usize));
                 }
             }
         }

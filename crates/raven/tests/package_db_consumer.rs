@@ -3,7 +3,7 @@
 //! (spec §14, §10). Uses a synthetic package name so the test proves Tier 3
 //! resolution regardless of what is installed on the build machine.
 
-use raven::package_db::binary_db::{write_shipped_db, ShippedDbProvenance};
+use raven::package_db::binary_db::{ShippedDbProvenance, write_shipped_db};
 use raven::package_db::model::PackageRecord;
 use raven::package_library::build_package_library;
 
@@ -23,16 +23,23 @@ struct NamesDbEnvGuard(Option<std::ffi::OsString>);
 impl NamesDbEnvGuard {
     fn set(path: &std::path::Path) -> Self {
         let prior = std::env::var_os("RAVEN_NAMES_DB");
-        std::env::set_var("RAVEN_NAMES_DB", path);
+        // SAFETY: test-only; callers hold `ENV_LOCK` for the whole test, which
+        // serializes every test in this binary that reads or writes the var, so
+        // no other thread touches the environment concurrently.
+        unsafe { std::env::set_var("RAVEN_NAMES_DB", path) };
         Self(prior)
     }
 }
 
 impl Drop for NamesDbEnvGuard {
     fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("RAVEN_NAMES_DB", v),
-            None => std::env::remove_var("RAVEN_NAMES_DB"),
+        // SAFETY: this guard is dropped before the test's `ENV_LOCK` guard, so
+        // the restore still runs serialized — see `set` above.
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("RAVEN_NAMES_DB", v),
+                None => std::env::remove_var("RAVEN_NAMES_DB"),
+            }
         }
     }
 }
@@ -86,7 +93,7 @@ async fn tier3_resolves_export_with_no_r() {
 #[tokio::test]
 async fn freeze_round_trip_matches_tier1_when_r_present() {
     use raven::package_db::json_db::{
-        read_repo_db_str, write_repo_db_string, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+        REPO_DB_SCHEMA_VERSION, RepoDb, RepoDbProvenance, read_repo_db_str, write_repo_db_string,
     };
     use raven::package_db::model::PackageRecord;
 
@@ -128,7 +135,7 @@ async fn freeze_round_trip_matches_tier1_when_r_present() {
 #[tokio::test]
 async fn tier2_repo_db_from_workspace_outranks_tier3() {
     use raven::package_db::json_db::{
-        write_repo_db_file, RepoDb, RepoDbProvenance, REPO_DB_SCHEMA_VERSION,
+        REPO_DB_SCHEMA_VERSION, RepoDb, RepoDbProvenance, write_repo_db_file,
     };
 
     let _guard = ENV_LOCK.lock().await;

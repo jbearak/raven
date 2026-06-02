@@ -197,10 +197,10 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         }
 
         // 2. Check legacy documents HashMap (for migration compatibility)
-        if let Some(legacy_docs) = self.legacy_documents {
-            if let Some(doc) = legacy_docs.get(uri) {
-                return Some(doc.text());
-            }
+        if let Some(legacy_docs) = self.legacy_documents
+            && let Some(doc) = legacy_docs.get(uri)
+        {
+            return Some(doc.text());
         }
 
         // 3. Check WorkspaceIndex
@@ -209,10 +209,10 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         }
 
         // 4. Check legacy workspace_index (for migration compatibility)
-        if let Some(legacy_ws) = self.legacy_workspace_index {
-            if let Some(doc) = legacy_ws.get(uri) {
-                return Some(doc.text());
-            }
+        if let Some(legacy_ws) = self.legacy_workspace_index
+            && let Some(doc) = legacy_ws.get(uri)
+        {
+            return Some(doc.text());
         }
 
         // 5. Check file cache (no synchronous disk I/O)
@@ -236,11 +236,11 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         }
 
         // 2. Check legacy documents HashMap (for migration compatibility)
-        if let Some(legacy_docs) = self.legacy_documents {
-            if let Some(doc) = legacy_docs.get(uri) {
-                let text = doc.text();
-                return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
-            }
+        if let Some(legacy_docs) = self.legacy_documents
+            && let Some(doc) = legacy_docs.get(uri)
+        {
+            let text = doc.text();
+            return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
         }
 
         // 3. Check WorkspaceIndex
@@ -249,18 +249,18 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         }
 
         // 4. Check legacy cross_file_workspace_index (for migration compatibility)
-        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index {
-            if let Some(metadata) = legacy_cf_ws.get_metadata(uri) {
-                return Some(metadata);
-            }
+        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
+            && let Some(metadata) = legacy_cf_ws.get_metadata(uri)
+        {
+            return Some(metadata);
         }
 
         // 5. Check legacy workspace_index (for migration compatibility)
-        if let Some(legacy_ws) = self.legacy_workspace_index {
-            if let Some(doc) = legacy_ws.get(uri) {
-                let text = doc.text();
-                return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
-            }
+        if let Some(legacy_ws) = self.legacy_workspace_index
+            && let Some(doc) = legacy_ws.get(uri)
+        {
+            let text = doc.text();
+            return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
         }
 
         None
@@ -283,21 +283,20 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         }
 
         // 2. Check legacy documents HashMap (for migration compatibility)
-        if let Some(legacy_docs) = self.legacy_documents {
-            if let Some(doc) = legacy_docs.get(uri) {
-                if let Some(tree) = &doc.tree {
-                    let text = doc.text();
-                    // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
-                    // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                    let metadata = crate::cross_file::extract_metadata(&text);
-                    return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                        uri,
-                        tree,
-                        &text,
-                        Some(&metadata),
-                    )));
-                }
-            }
+        if let Some(legacy_docs) = self.legacy_documents
+            && let Some(doc) = legacy_docs.get(uri)
+            && let Some(tree) = &doc.tree
+        {
+            let text = doc.text();
+            // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
+            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+            let metadata = crate::cross_file::extract_metadata(&text);
+            return Some(Arc::new(scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                &text,
+                Some(&metadata),
+            )));
         }
 
         // 3. Check WorkspaceIndex
@@ -306,28 +305,27 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         }
 
         // 4. Check legacy cross_file_workspace_index (for migration compatibility)
-        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index {
-            if let Some(artifacts) = legacy_cf_ws.get_artifacts(uri) {
-                return Some(artifacts);
-            }
+        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
+            && let Some(artifacts) = legacy_cf_ws.get_artifacts(uri)
+        {
+            return Some(artifacts);
         }
 
         // 5. Check legacy workspace_index (for migration compatibility)
-        if let Some(legacy_ws) = self.legacy_workspace_index {
-            if let Some(doc) = legacy_ws.get(uri) {
-                if let Some(tree) = &doc.tree {
-                    let text = doc.text();
-                    // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
-                    // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                    let metadata = crate::cross_file::extract_metadata(&text);
-                    return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                        uri,
-                        tree,
-                        &text,
-                        Some(&metadata),
-                    )));
-                }
-            }
+        if let Some(legacy_ws) = self.legacy_workspace_index
+            && let Some(doc) = legacy_ws.get(uri)
+            && let Some(tree) = &doc.tree
+        {
+            let text = doc.text();
+            // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
+            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+            let metadata = crate::cross_file::extract_metadata(&text);
+            return Some(Arc::new(scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                &text,
+                Some(&metadata),
+            )));
         }
 
         None
@@ -1801,10 +1799,12 @@ mod integration_tests {
         // Verify we can get artifacts from utils.R via ContentProvider
         let utils_artifacts_from_provider = provider.get_artifacts(&utils_uri);
         assert!(utils_artifacts_from_provider.is_some());
-        assert!(utils_artifacts_from_provider
-            .unwrap()
-            .exported_interface
-            .contains_key("helper_func"));
+        assert!(
+            utils_artifacts_from_provider
+                .unwrap()
+                .exported_interface
+                .contains_key("helper_func")
+        );
     }
 
     /// Integration test for async diagnostics
@@ -2160,7 +2160,7 @@ mod integration_tests {
     async fn test_scope_resolution_uses_indexed_file_declarations() {
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::scope::{
-            scope_at_position_with_graph, ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind,
+            ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind, scope_at_position_with_graph,
         };
         use crate::cross_file::types::{CrossFileMetadata, DeclaredSymbol, ForwardSource};
         use std::collections::HashSet;

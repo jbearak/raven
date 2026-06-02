@@ -118,10 +118,11 @@ impl CrossFileWorkspaceIndex {
         }
 
         let user_cap = self.user_cap.load(Ordering::Relaxed);
-        if let Some(user_cap_nz) = NonZeroUsize::new(user_cap) {
-            if guard.cap().get() > user_cap && guard.len() <= user_cap {
-                guard.resize(user_cap_nz);
-            }
+        if let Some(user_cap_nz) = NonZeroUsize::new(user_cap)
+            && guard.cap().get() > user_cap
+            && guard.len() <= user_cap
+        {
+            guard.resize(user_cap_nz);
         }
     }
 
@@ -267,11 +268,11 @@ impl CrossFileWorkspaceIndex {
             if exclude.contains(uri) {
                 continue;
             }
-            if let Ok(p) = uri.to_file_path() {
-                if p.starts_with(prefix) {
-                    for name in entry.artifacts.exported_interface.keys() {
-                        symbols.insert(name.to_string());
-                    }
+            if let Ok(p) = uri.to_file_path()
+                && p.starts_with(prefix)
+            {
+                for name in entry.artifacts.exported_interface.keys() {
+                    symbols.insert(name.to_string());
                 }
             }
         }

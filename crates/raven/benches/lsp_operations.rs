@@ -7,13 +7,13 @@
 //
 // Requirements: 1.2, 1.3, 1.5
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tower_lsp::lsp_types::Position;
 use url::Url;
 
-use raven::state::{scan_workspace, Document, WorldState};
+use raven::state::{Document, WorldState, scan_workspace};
 use raven::test_utils::fixture_workspace::{
-    create_fanout_fixture_workspace, create_fixture_workspace, fanout_parent_uris, FixtureConfig,
+    FixtureConfig, create_fanout_fixture_workspace, create_fixture_workspace, fanout_parent_uris,
 };
 
 // ---------------------------------------------------------------------------

@@ -20,9 +20,9 @@ use tower_lsp::lsp_types::Url;
 
 use crate::cross_file::file_cache::FileSnapshot;
 use crate::cross_file::path_resolve::{
-    resolve_path, resolve_path_with_workspace_fallback, PathContext,
+    PathContext, resolve_path, resolve_path_with_workspace_fallback,
 };
-use crate::cross_file::{extract_metadata_with_tree, CrossFileMetadata};
+use crate::cross_file::{CrossFileMetadata, extract_metadata_with_tree};
 use crate::state::WorldState;
 
 /// Task for background indexing
@@ -412,51 +412,50 @@ impl BackgroundIndexer {
 
         // Uses workspace-root fallback for files without @lsp-cd directives
         for source in &metadata.sources {
-            if let Some(ctx) = path_ctx.as_ref() {
-                if let Some(resolved) = resolve_path_with_workspace_fallback(&source.path, ctx) {
-                    if let Ok(source_uri) = Url::from_file_path(resolved) {
-                        // Check if file needs indexing
-                        let needs_indexing = {
-                            let state_guard = state.read().await;
-                            !state_guard.documents.contains_key(&source_uri)
-                                && !state_guard.cross_file_workspace_index.contains(&source_uri)
-                        };
+            if let Some(ctx) = path_ctx.as_ref()
+                && let Some(resolved) = resolve_path_with_workspace_fallback(&source.path, ctx)
+                && let Ok(source_uri) = Url::from_file_path(resolved)
+            {
+                // Check if file needs indexing
+                let needs_indexing = {
+                    let state_guard = state.read().await;
+                    !state_guard.documents.contains_key(&source_uri)
+                        && !state_guard.cross_file_workspace_index.contains(&source_uri)
+                };
 
-                        if needs_indexing {
-                            // O(1) duplicate check via pending set
-                            let already_pending = pending.lock().unwrap().contains(&source_uri);
-                            if already_pending {
-                                continue;
-                            }
-
-                            let mut q = queue.lock().unwrap();
-
-                            // Check queue size limit
-                            if q.len() >= max_queue_size {
-                                log::warn!(
-                                    "Background indexing queue full, dropping transitive task for {} ({}/{})",
-                                    source_uri,
-                                    q.len(),
-                                    max_queue_size
-                                );
-                                continue;
-                            }
-
-                            // Use saturating_add to prevent integer overflow at max depth
-                            let next_depth = current_depth.saturating_add(1);
-                            q.push_back(IndexTask {
-                                uri: source_uri.clone(),
-                                depth: next_depth,
-                                submitted_at: Instant::now(),
-                            });
-                            pending.lock().unwrap().insert(source_uri.clone());
-                            log::trace!(
-                                "Queued transitive dependency: {} (depth {})",
-                                source_uri,
-                                next_depth
-                            );
-                        }
+                if needs_indexing {
+                    // O(1) duplicate check via pending set
+                    let already_pending = pending.lock().unwrap().contains(&source_uri);
+                    if already_pending {
+                        continue;
                     }
+
+                    let mut q = queue.lock().unwrap();
+
+                    // Check queue size limit
+                    if q.len() >= max_queue_size {
+                        log::warn!(
+                            "Background indexing queue full, dropping transitive task for {} ({}/{})",
+                            source_uri,
+                            q.len(),
+                            max_queue_size
+                        );
+                        continue;
+                    }
+
+                    // Use saturating_add to prevent integer overflow at max depth
+                    let next_depth = current_depth.saturating_add(1);
+                    q.push_back(IndexTask {
+                        uri: source_uri.clone(),
+                        depth: next_depth,
+                        submitted_at: Instant::now(),
+                    });
+                    pending.lock().unwrap().insert(source_uri.clone());
+                    log::trace!(
+                        "Queued transitive dependency: {} (depth {})",
+                        source_uri,
+                        next_depth
+                    );
                 }
             }
         }

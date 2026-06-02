@@ -1295,7 +1295,9 @@ result <- get_colnames(my_data)
         assert!(
             children.contains(&get_colnames_uri),
             "collate.r should have get_colnames.r as a dependency. Expected: {}, Found {} children: {:?}",
-            get_colnames_uri, children.len(), children
+            get_colnames_uri,
+            children.len(),
+            children
         );
 
         // Verify get_colnames.r has collate.r as a parent
@@ -1430,7 +1432,9 @@ my_function <- function() {
             children.contains(&child_uri),
             "oos.r should have subdir/child.r as a dependency (forward edge created by backward directive). \
              Expected: {}, Found {} children: {:?}",
-            child_uri, children.len(), children
+            child_uri,
+            children.len(),
+            children
         );
 
         // Verify child.r has oos.r as a parent
@@ -1887,7 +1891,9 @@ child_function <- function() {
             children.contains(&child_uri),
             "parent.r should have subdir/child.r as a dependency (forward edge created by backward directive). \
              Expected: {}, Found {} children: {:?}",
-            child_uri, children.len(), children
+            child_uri,
+            children.len(),
+            children
         );
         println!("  ✓ Forward edge exists: parent.r -> subdir/child.r");
 
@@ -2240,7 +2246,9 @@ child_function <- function() {
             "parent.r should have child.r as a dependency (forward edge created by backward directive). \
              Bug would cause this to fail because file_exists would not check filesystem. \
              Expected: {}, Found {} children: {:?}",
-            child_uri, children.len(), children
+            child_uri,
+            children.len(),
+            children
         );
         println!("  ✓ Forward edge exists: parent.r -> child.r");
 
@@ -4347,7 +4355,9 @@ wrong_func <- function() { "wrong" }
             resolved.display()
         );
         println!("\nRequirements Validated:");
-        println!("  - 2.1: Child with backward directive inherits parent's directory when parent has no @lsp-cd");
+        println!(
+            "  - 2.1: Child with backward directive inherits parent's directory when parent has no @lsp-cd"
+        );
         println!("  - 2.2: Path resolution correctly uses parent's directory path for inheritance");
     }
 
@@ -4674,8 +4684,8 @@ mod lsp_source_scope_tests {
     use super::*;
     use crate::cross_file::dependency::DependencyGraph;
     use crate::cross_file::scope::{
-        compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph,
-        ScopeArtifacts,
+        ScopeArtifacts, compute_artifacts, compute_artifacts_with_metadata,
+        scope_at_position_with_graph,
     };
     use crate::cross_file::types::CrossFileMetadata;
     use std::collections::HashSet;
@@ -5942,7 +5952,7 @@ mod cross_directory_hoisting_tests {
     use super::*;
     use crate::cross_file::dependency::DependencyGraph;
     use crate::cross_file::scope::{
-        compute_artifacts, scope_at_position_with_graph, ScopeArtifacts,
+        ScopeArtifacts, compute_artifacts, scope_at_position_with_graph,
     };
     use crate::cross_file::types::{
         BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,

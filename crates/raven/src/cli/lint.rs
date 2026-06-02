@@ -6,9 +6,9 @@ use serde_json::json;
 use tower_lsp::lsp_types::Diagnostic;
 
 use crate::cli::shared::{
+    ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
     absolute_path, encoding_diagnostic, is_chunk_file, is_r_file, parse_color_choice,
-    parse_output_format, parse_severity_level, render, resolve_color_from_env, ColorChoice,
-    OutputFormat, SeverityLevel, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR,
+    parse_output_format, parse_severity_level, render, resolve_color_from_env,
 };
 
 #[derive(Debug, PartialEq, Clone)]

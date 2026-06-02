@@ -20,13 +20,13 @@ pub fn find_r_home() -> Option<PathBuf> {
     }
 
     // Try R CMD config
-    if let Ok(output) = Command::new("R").args(["CMD", "config", "R_HOME"]).output() {
-        if output.status.success() {
-            let r_home = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let path = PathBuf::from(&r_home);
-            if path.exists() {
-                return Some(path);
-            }
+    if let Ok(output) = Command::new("R").args(["CMD", "config", "R_HOME"]).output()
+        && output.status.success()
+    {
+        let r_home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let path = PathBuf::from(&r_home);
+        if path.exists() {
+            return Some(path);
         }
     }
 
@@ -98,14 +98,13 @@ pub fn find_library_paths() -> Vec<PathBuf> {
     if let Ok(output) = Command::new("R")
         .args(["--vanilla", "--slave", "-e", "cat(.libPaths(), sep='\\n')"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let path = PathBuf::from(line.trim());
-                if path.exists() && !paths.contains(&path) {
-                    paths.push(path);
-                }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let path = PathBuf::from(line.trim());
+            if path.exists() && !paths.contains(&path) {
+                paths.push(path);
             }
         }
     }
@@ -120,10 +119,10 @@ pub fn find_library_paths() -> Vec<PathBuf> {
         }
 
         // User library
-        if let Some(user_lib) = user_library_path() {
-            if user_lib.exists() {
-                paths.push(user_lib);
-            }
+        if let Some(user_lib) = user_library_path()
+            && user_lib.exists()
+        {
+            paths.push(user_lib);
         }
     }
 

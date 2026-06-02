@@ -208,7 +208,7 @@ use std::fmt::Write;
 use tree_sitter::Parser;
 use url::Url;
 
-use raven::test_utils::fixture_workspace::{create_fixture_workspace, FixtureConfig};
+use raven::test_utils::fixture_workspace::{FixtureConfig, create_fixture_workspace};
 
 /// Create a tree-sitter parser configured for R.
 fn make_r_parser() -> Parser {
@@ -490,7 +490,7 @@ fn budget_scope_resolution_50_file_workspace_auto() {
 
 #[test]
 fn budget_single_file_completion() {
-    use raven::state::{scan_workspace, Document, WorldState};
+    use raven::state::{Document, WorldState, scan_workspace};
     use tower_lsp::lsp_types::Position;
 
     // Create a small fixture workspace for realistic completion context

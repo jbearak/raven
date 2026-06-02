@@ -60,18 +60,18 @@ pub fn user_data_sidecar_path(file_name: &str) -> Option<PathBuf> {
 /// data sidecar, then executable-relative bundled sidecar.
 fn locate_sidecar_candidates(env_var: &str, file_name: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(p) = std::env::var(env_var) {
-        if !p.is_empty() {
-            out.push(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var(env_var)
+        && !p.is_empty()
+    {
+        out.push(PathBuf::from(p));
     }
     if let Some(p) = user_data_sidecar_path(file_name) {
         push_unique(&mut out, p);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            push_unique(&mut out, dir.join(file_name));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        push_unique(&mut out, dir.join(file_name));
     }
     out
 }
@@ -175,6 +175,43 @@ impl Drop for TestUserDataDirGuard {
 pub(crate) static RAVEN_NAMES_DB_ENV_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// RAII guard for the process-global `RAVEN_NAMES_DB` var in tests: sets it on
+/// construction and restores the prior value (or unsets it) on drop, so a
+/// panicking assertion can't leak the var to a sibling test. Callers MUST hold
+/// [`RAVEN_NAMES_DB_ENV_LOCK`] for the guard's whole lifetime — that lock is
+/// what makes the `set_var`/`remove_var` sound, by serializing every test in
+/// this binary that reads or writes the var. This concentrates the one
+/// `unsafe` env mutation (edition 2024 made `set_var`/`remove_var` unsafe) in a
+/// single audited place instead of repeating it at each call site.
+#[cfg(test)]
+pub(crate) struct NamesDbEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl NamesDbEnvGuard {
+    pub(crate) fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os("RAVEN_NAMES_DB");
+        // SAFETY: the caller holds `RAVEN_NAMES_DB_ENV_LOCK` (see type doc), so
+        // no other thread reads or writes the environment concurrently.
+        unsafe { std::env::set_var("RAVEN_NAMES_DB", value) };
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for NamesDbEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: mirrors `set`; the lock is still held for the guard's lifetime.
+        unsafe {
+            match self.previous.take() {
+                Some(prev) => std::env::set_var("RAVEN_NAMES_DB", prev),
+                None => std::env::remove_var("RAVEN_NAMES_DB"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,10 +223,9 @@ mod tests {
         let user_data = dir.path().join("data");
         let custom = dir.path().join("custom.db");
 
-        std::env::set_var("RAVEN_NAMES_DB", &custom);
+        let _db_env = NamesDbEnvGuard::set(&custom);
         let _user_data_guard = test_user_data_dir_guard(user_data.clone());
         let candidates = locate_shipped_db_candidates();
-        std::env::remove_var("RAVEN_NAMES_DB");
         let exe_relative = std::env::current_exe()
             .unwrap()
             .parent()
@@ -207,10 +243,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let user_data = dir.path().join("data");
 
-        std::env::set_var("RAVEN_NAMES_DB", "");
+        let _db_env = NamesDbEnvGuard::set("");
         let _user_data_guard = test_user_data_dir_guard(user_data.clone());
         let first = locate_shipped_db_candidates().remove(0);
-        std::env::remove_var("RAVEN_NAMES_DB");
 
         assert_eq!(first, user_data.join("names.db"));
     }

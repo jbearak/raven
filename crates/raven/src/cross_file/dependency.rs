@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
 use super::path_resolve::{
-    path_to_uri, resolve_path, resolve_path_with_workspace_fallback, PathContext,
+    PathContext, path_to_uri, resolve_path, resolve_path_with_workspace_fallback,
 };
 use super::types::{CallSiteSpec, CrossFileMetadata};
 
@@ -438,49 +438,49 @@ where
     );
 
     // If multiple backward directives resolve to different working directories, log which one we used.
-    if meta.sourced_by.len() > 1 {
-        if let Some(ref first_wd) = inherited_wd {
-            let mut differing_parent: Option<(String, String)> = None;
-            let backward_ctx = PathContext::new(uri, workspace_root);
-            for directive in meta.sourced_by.iter().skip(1) {
-                let ctx = match backward_ctx.as_ref() {
-                    Some(ctx) => ctx,
-                    None => break,
-                };
-                let other_parent_path = match resolve_path(&directive.path, ctx) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                let other_parent_uri = match path_to_uri(&other_parent_path) {
-                    Some(uri) => uri,
-                    None => continue,
-                };
-                let mut other_visited = HashSet::new();
-                let other_wd = resolve_parent_working_directory_with_visited(
-                    &other_parent_uri,
-                    get_metadata,
-                    workspace_root,
-                    max_depth,
-                    &mut other_visited,
-                );
-                if let Some(other_wd) = other_wd {
-                    if &other_wd != first_wd {
-                        differing_parent = Some((directive.path.clone(), other_wd));
-                        break;
-                    }
-                }
+    if meta.sourced_by.len() > 1
+        && let Some(ref first_wd) = inherited_wd
+    {
+        let mut differing_parent: Option<(String, String)> = None;
+        let backward_ctx = PathContext::new(uri, workspace_root);
+        for directive in meta.sourced_by.iter().skip(1) {
+            let ctx = match backward_ctx.as_ref() {
+                Some(ctx) => ctx,
+                None => break,
+            };
+            let other_parent_path = match resolve_path(&directive.path, ctx) {
+                Some(path) => path,
+                None => continue,
+            };
+            let other_parent_uri = match path_to_uri(&other_parent_path) {
+                Some(uri) => uri,
+                None => continue,
+            };
+            let mut other_visited = HashSet::new();
+            let other_wd = resolve_parent_working_directory_with_visited(
+                &other_parent_uri,
+                get_metadata,
+                workspace_root,
+                max_depth,
+                &mut other_visited,
+            );
+            if let Some(other_wd) = other_wd
+                && &other_wd != first_wd
+            {
+                differing_parent = Some((directive.path.clone(), other_wd));
+                break;
             }
+        }
 
-            if let Some((other_parent, other_wd)) = differing_parent {
-                log::trace!(
-                    "Multiple backward directives for {} resolve to different working directories; using first parent '{}' with WD '{}', ignoring '{}' (WD '{}')",
-                    uri,
-                    first_directive.path,
-                    first_wd,
-                    other_parent,
-                    other_wd
-                );
-            }
+        if let Some((other_parent, other_wd)) = differing_parent {
+            log::trace!(
+                "Multiple backward directives for {} resolve to different working directories; using first parent '{}' with WD '{}', ignoring '{}' (WD '{}')",
+                uri,
+                first_directive.path,
+                first_wd,
+                other_parent,
+                other_wd
+            );
         }
     }
 
@@ -950,101 +950,99 @@ impl DependencyGraph {
         // Requirements 4.1, 4.2, 4.3, 4.4, 4.5
         let mut ast_edges: Vec<DependencyEdge> = Vec::new();
         for source in &meta.sources {
-            if !source.is_directive {
-                if let Some(to_uri) = do_resolve(&source.path) {
-                    let edge = DependencyEdge {
-                        from: uri.clone(),
-                        to: to_uri.clone(),
-                        call_site_line: Some(source.line),
-                        call_site_column: Some(source.column),
-                        local: source.local,
-                        chdir: source.chdir,
-                        is_sys_source: source.is_sys_source,
-                        is_directive: false,
-                        is_backward_directive: false,
-                    };
-                    let pair = edge.as_from_to_pair();
+            if !source.is_directive
+                && let Some(to_uri) = do_resolve(&source.path)
+            {
+                let edge = DependencyEdge {
+                    from: uri.clone(),
+                    to: to_uri.clone(),
+                    call_site_line: Some(source.line),
+                    call_site_column: Some(source.column),
+                    local: source.local,
+                    chdir: source.chdir,
+                    is_sys_source: source.is_sys_source,
+                    is_directive: false,
+                    is_backward_directive: false,
+                };
+                let pair = edge.as_from_to_pair();
 
-                    // Check for directive-vs-AST conflict
-                    if directive_from_to.contains(&pair) {
-                        // Find the directive edge for this (from, to) pair
-                        let directive_edge =
-                            directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
+                // Check for directive-vs-AST conflict
+                if directive_from_to.contains(&pair) {
+                    // Find the directive edge for this (from, to) pair
+                    let directive_edge =
+                        directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
 
-                        if let Some(dir_edge) = directive_edge {
-                            // Check if directive has a known call site
-                            let directive_has_call_site = dir_edge.call_site_line.is_some()
-                                && dir_edge.call_site_line != Some(u32::MAX);
+                    if let Some(dir_edge) = directive_edge {
+                        // Check if directive has a known call site
+                        let directive_has_call_site = dir_edge.call_site_line.is_some()
+                            && dir_edge.call_site_line != Some(u32::MAX);
 
-                            if directive_has_call_site {
-                                // Directive has known call site: only override AST edge at same call site
+                        if directive_has_call_site {
+                            // Directive has known call site: only override AST edge at same call site
+                            // (Requirement 4.3)
+                            let call_sites_match = dir_edge.call_site_line == edge.call_site_line
+                                && dir_edge.call_site_column == edge.call_site_column;
+
+                            if call_sites_match {
+                                // Case 1: Same call site - directive wins, skip AST edge
                                 // (Requirement 4.3)
-                                let call_sites_match = dir_edge.call_site_line
-                                    == edge.call_site_line
-                                    && dir_edge.call_site_column == edge.call_site_column;
-
-                                if call_sites_match {
-                                    // Case 1: Same call site - directive wins, skip AST edge
-                                    // (Requirement 4.3)
-                                    continue;
-                                } else {
-                                    // Case 2: Different call sites - keep both edges
-                                    // (Requirement 4.4)
-                                    ast_edges.push(edge);
-                                    continue;
-                                }
+                                continue;
                             } else {
-                                // Directive has no explicit call site
-                                // (Requirement 4.5)
+                                // Case 2: Different call sites - keep both edges
+                                // (Requirement 4.4)
+                                ast_edges.push(edge);
+                                continue;
+                            }
+                        } else {
+                            // Directive has no explicit call site
+                            // (Requirement 4.5)
 
-                                // Get the directive's line (where it appears in the file)
-                                let directive_line = meta
-                                    .sources
-                                    .iter()
-                                    .find(|s| {
-                                        s.is_directive
-                                            && do_resolve(&s.path) == Some(to_uri.clone())
-                                    })
-                                    .map(|s| s.line);
+                            // Get the directive's line (where it appears in the file)
+                            let directive_line = meta
+                                .sources
+                                .iter()
+                                .find(|s| {
+                                    s.is_directive && do_resolve(&s.path) == Some(to_uri.clone())
+                                })
+                                .map(|s| s.line);
 
-                                // Check if AST edge is at an earlier line than the directive
-                                let ast_is_earlier = match directive_line {
-                                    Some(dir_line) => source.line < dir_line,
-                                    None => false, // If we can't determine directive line, don't treat AST as earlier
-                                };
+                            // Check if AST edge is at an earlier line than the directive
+                            let ast_is_earlier = match directive_line {
+                                Some(dir_line) => source.line < dir_line,
+                                None => false, // If we can't determine directive line, don't treat AST as earlier
+                            };
 
-                                if ast_is_earlier {
-                                    // Case 3: Directive without line=, AST at earlier line
-                                    // Keep AST edge (earliest call site wins), store redundancy info
-                                    // for optional diagnostic emission with configurable severity
-                                    // (Requirement 4.5, 6.2)
-                                    let diag_line = directive_line.unwrap_or(0);
-                                    let target_filename = to_uri
-                                        .path_segments()
-                                        .and_then(|mut s| s.next_back())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    result.redundant_directives.push(RedundantDirective {
-                                        directive_line: diag_line,
-                                        target_filename,
-                                        source_call_line: source.line,
-                                    });
-                                    ast_edges.push(edge);
-                                    continue;
-                                } else {
-                                    // AST is at same or later line than directive
-                                    // Directive wins (it's earlier or at same position)
-                                    // Skip AST edge
-                                    continue;
-                                }
+                            if ast_is_earlier {
+                                // Case 3: Directive without line=, AST at earlier line
+                                // Keep AST edge (earliest call site wins), store redundancy info
+                                // for optional diagnostic emission with configurable severity
+                                // (Requirement 4.5, 6.2)
+                                let diag_line = directive_line.unwrap_or(0);
+                                let target_filename = to_uri
+                                    .path_segments()
+                                    .and_then(|mut s| s.next_back())
+                                    .unwrap_or("")
+                                    .to_string();
+                                result.redundant_directives.push(RedundantDirective {
+                                    directive_line: diag_line,
+                                    target_filename,
+                                    source_call_line: source.line,
+                                });
+                                ast_edges.push(edge);
+                                continue;
+                            } else {
+                                // AST is at same or later line than directive
+                                // Directive wins (it's earlier or at same position)
+                                // Skip AST edge
+                                continue;
                             }
                         }
-                        // No matching directive edge found (shouldn't happen), skip
-                        continue;
                     }
-
-                    ast_edges.push(edge);
+                    // No matching directive edge found (shouldn't happen), skip
+                    continue;
                 }
+
+                ast_edges.push(edge);
             }
         }
 
@@ -1637,13 +1635,12 @@ impl DependencyGraph {
 
         // Fast path: cache hit at the current edge revision. `peek` to keep
         // the read lock concurrent (no LRU promotion under shared access).
-        if let Ok(guard) = self.cycle_cache.read() {
-            if let Some((cached_rev, cached_result)) = guard.peek(uri) {
-                if *cached_rev == revision {
-                    self.cycle_cache_hits.fetch_add(1, Ordering::Relaxed);
-                    return cached_result.clone();
-                }
-            }
+        if let Ok(guard) = self.cycle_cache.read()
+            && let Some((cached_rev, cached_result)) = guard.peek(uri)
+            && *cached_rev == revision
+        {
+            self.cycle_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return cached_result.clone();
         }
 
         let mut visited = HashSet::new();
@@ -1680,13 +1677,12 @@ impl DependencyGraph {
         use std::sync::atomic::Ordering;
         let revision = self.edge_revision.load(Ordering::Acquire);
 
-        if let Ok(guard) = self.subgraph_cache.read() {
-            if let Some((cached_rev, cached)) = guard.peek(&(uri.clone(), max_depth, max_visited)) {
-                if *cached_rev == revision {
-                    self.subgraph_cache_hits.fetch_add(1, Ordering::Relaxed);
-                    return std::sync::Arc::clone(cached);
-                }
-            }
+        if let Ok(guard) = self.subgraph_cache.read()
+            && let Some((cached_rev, cached)) = guard.peek(&(uri.clone(), max_depth, max_visited))
+            && *cached_rev == revision
+        {
+            self.subgraph_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return std::sync::Arc::clone(cached);
         }
 
         let neighborhood = self.collect_neighborhood(uri, max_depth, max_visited);

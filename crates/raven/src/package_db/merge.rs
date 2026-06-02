@@ -20,11 +20,7 @@ pub fn version_cmp(a: &str, b: &str) -> Ordering {
     // sentinel like -1) is what keeps `1.foo` from out-sorting `1`: a malformed
     // suffix must sink the *whole* string, not just append a low component.
     fn parts(v: &str) -> Option<Vec<u64>> {
-        // Clippy suggests the `['.', '-']` array pattern, but `Pattern for
-        // [char; N]` is stable only since Rust 1.80 and this crate's MSRV is
-        // 1.75 — so the closure form is required.
-        #[allow(clippy::manual_pattern_char_comparison)]
-        v.split(|c| c == '.' || c == '-')
+        v.split(['.', '-'])
             .filter(|s| !s.is_empty())
             .map(|s| s.parse::<u64>())
             .collect::<Result<Vec<_>, _>>()

@@ -132,7 +132,7 @@ use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
 
-use crate::chunks::{classify_chunk_document, classify_chunk_document_for, ChunkKind};
+use crate::chunks::{ChunkKind, classify_chunk_document, classify_chunk_document_for};
 use crate::content_provider::DefaultContentProvider;
 use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
 use crate::cross_file::{
@@ -140,7 +140,7 @@ use crate::cross_file::{
     CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
 };
 use crate::document_store::DocumentStore;
-use crate::file_type::{file_type_from_language_id_or_uri, file_type_from_uri, FileType};
+use crate::file_type::{FileType, file_type_from_language_id_or_uri, file_type_from_uri};
 use crate::package_library::PackageLibrary;
 use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::WorkspaceIndex;
@@ -302,16 +302,15 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
                     // Extract the first argument
                     if let Some(args_node) = node.child_by_field_name("arguments") {
                         for i in 0..args_node.child_count() {
-                            if let Some(child) = args_node.child(i) {
-                                if child.kind() == "argument" {
-                                    if let Some(value_node) = child.child_by_field_name("value") {
-                                        let value_text = &text[value_node.byte_range()];
-                                        let pkg_name = value_text
-                                            .trim_matches(|c: char| c == '"' || c == '\'');
-                                        packages.push(pkg_name.to_string());
-                                        break;
-                                    }
-                                }
+                            if let Some(child) = args_node.child(i)
+                                && child.kind() == "argument"
+                                && let Some(value_node) = child.child_by_field_name("value")
+                            {
+                                let value_text = &text[value_node.byte_range()];
+                                let pkg_name =
+                                    value_text.trim_matches(|c: char| c == '"' || c == '\'');
+                                packages.push(pkg_name.to_string());
+                                break;
                             }
                         }
                     }
@@ -437,16 +436,15 @@ fn parse_index(path: &PathBuf) -> Option<Vec<String>> {
 
     for line in text.lines() {
         // INDEX format: symbol_name<whitespace>description
-        if let Some(sym) = line.split_whitespace().next() {
-            if !sym.is_empty()
-                && sym
-                    .chars()
-                    .next()
-                    .map(|c| c.is_alphabetic())
-                    .unwrap_or(false)
-            {
-                symbols.push(sym.to_string());
-            }
+        if let Some(sym) = line.split_whitespace().next()
+            && !sym.is_empty()
+            && sym
+                .chars()
+                .next()
+                .map(|c| c.is_alphabetic())
+                .unwrap_or(false)
+        {
+            symbols.push(sym.to_string());
         }
     }
 
@@ -470,10 +468,10 @@ impl Library {
 
     #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<Arc<Package>> {
-        if let Ok(packages) = self.packages.read() {
-            if let Some(pkg) = packages.get(name) {
-                return Some(pkg.clone());
-            }
+        if let Ok(packages) = self.packages.read()
+            && let Some(pkg) = packages.get(name)
+        {
+            return Some(pkg.clone());
         }
 
         // Try to load from library paths
@@ -499,12 +497,12 @@ impl Library {
         for lib_path in &self.paths {
             if let Ok(entries) = fs::read_dir(lib_path) {
                 for entry in entries.flatten() {
-                    if entry.path().join("DESCRIPTION").exists() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            let s = name.to_string();
-                            if names_set.insert(s.clone()) {
-                                names.push(s);
-                            }
+                    if entry.path().join("DESCRIPTION").exists()
+                        && let Some(name) = entry.file_name().to_str()
+                    {
+                        let s = name.to_string();
+                        if names_set.insert(s.clone()) {
+                            names.push(s);
                         }
                     }
                 }
@@ -1041,7 +1039,9 @@ impl WorldState {
         // forward-created backward edges are available for auto-detect mode.
         self.build_dependency_graph_from_workspace();
         self.workspace_scan_complete = true;
-        log::info!("[Background] Dependency graph built from workspace entries, workspace_scan_complete = true");
+        log::info!(
+            "[Background] Dependency graph built from workspace entries, workspace_scan_complete = true"
+        );
 
         // Now that the graph reflects the workspace, refresh the document_store
         // pin set so any file opened before the scan completes picks up its
@@ -1104,21 +1104,21 @@ impl WorldState {
             let path = entry.path();
 
             if path.is_dir() {
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if should_skip_directory(dir_name) {
-                        continue;
-                    }
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
+                    && should_skip_directory(dir_name)
+                {
+                    continue;
                 }
                 self.index_directory(&path);
             } else if is_stat_model_extension(&path) {
                 // Route through the shared BOM-aware seam; an undecodable file
                 // is left unindexed. See `read_source` for the decode policy.
-                if let Ok(text) = read_source(&path) {
-                    if let Ok(uri) = Url::from_file_path(&path) {
-                        log::trace!("Indexing file: {}", uri);
-                        self.workspace_index
-                            .insert(uri.clone(), Document::new_with_uri(&text, None, &uri));
-                    }
+                if let Ok(text) = read_source(&path)
+                    && let Ok(uri) = Url::from_file_path(&path)
+                {
+                    log::trace!("Indexing file: {}", uri);
+                    self.workspace_index
+                        .insert(uri.clone(), Document::new_with_uri(&text, None, &uri));
                 }
             }
         }
@@ -1351,7 +1351,7 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, SourceReadE
     // accept corrupted input. UTF-16 source is vanishingly rare, so we don't
     // pinpoint a byte offset here (`byte == 0` selects the encoding-agnostic
     // diagnostic message in `encoding_diagnostic`).
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(SourceReadError::InvalidEncoding { offset: 0, byte: 0 });
     }
     let units = bytes.chunks_exact(2).map(|c| {
