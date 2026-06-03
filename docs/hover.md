@@ -81,7 +81,7 @@ This isn't a Raven bug. Both extensions are answering the hover request independ
 
 - **No navigation to installed package sources.** Hover attributes a symbol to its package and links to the help viewer, but cmd-click on a package export does not jump into the package's source. See [Go-to-Definition: Package Exports](go-to-definition.md#package-exports).
 - **R-help fallback is async.** The first hover for a topic spawns an R subprocess to render help; re-hovering the same topic uses the cached result.
-- **Not available in R Markdown / Quarto.** Hover (and its help-panel link) is disabled in `.Rmd` and `.qmd` documents.
+- **R Markdown / Quarto: chunk bodies only.** Hover (and its help-panel link) works on identifiers inside R code chunks of `.Rmd` and `.qmd` documents. Hovering prose, YAML front matter, or a non-R chunk produces nothing.
 
 ## Related
 

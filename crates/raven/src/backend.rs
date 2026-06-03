@@ -5405,10 +5405,21 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Skip Rmd/Quarto: indentation rules designed for R syntax would
-        // produce surprising edits on prose, YAML, or non-R chunk content.
-        if doc.is_rmd_document() {
-            log::trace!("on_type_formatting: skipping Rmd/Quarto document {}", uri);
+        let position = params.text_document_position.position;
+
+        // Rmd/Quarto: indentation is first-class inside R chunk bodies, but a
+        // prose/YAML line maps to a blank masked line that the R indentation
+        // engine would treat as top-level R — applying R rules to markdown.
+        // Short-circuit unless the position is inside an R chunk body. The
+        // chunk-position check uses the RAW text (fences are blanked in the
+        // masked analysis text).
+        if doc.is_rmd_document()
+            && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+        {
+            log::trace!(
+                "on_type_formatting: skipping prose position in Rmd/Quarto document {}",
+                uri
+            );
             return Ok(None);
         }
 
@@ -5421,8 +5432,10 @@ impl LanguageServer for Backend {
             }
         };
 
-        let source = doc.text();
-        let position = params.text_document_position.position;
+        // The tree is parsed from the analysis text (masked for Rmd); the
+        // indentation engine must receive the same text so its byte offsets
+        // and tree-sitter points line up. Behavior-neutral for plain R.
+        let source = doc.analysis_text();
 
         // Get indentation style from server configuration
         let style = state.indentation_config.style;
@@ -11212,6 +11225,117 @@ lineLength = 200
                 .iter()
                 .map(|d| (d.range.start.line, d.message.clone()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Open an Rmd document through the real `did_open` path. Returns the owned
+    /// `LspService` (keep it alive for the test's duration), the backend's URI,
+    /// and the `TempDir` backing the file. Shared by the on-type-formatting
+    /// chunk/prose tests.
+    async fn open_rmd(content: &str) -> (tower_lsp::LspService<Backend>, Url, TempDir) {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let tmp = TempDir::new().unwrap();
+        let rmd_path = tmp.path().join("report.Rmd");
+        fs::write(&rmd_path, content).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&rmd_path).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "rmd".into(),
+                    version: 1,
+                    text: content.into(),
+                },
+            })
+            .await;
+        (svc, uri, tmp)
+    }
+
+    fn on_type_params(
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> tower_lsp::lsp_types::DocumentOnTypeFormattingParams {
+        use tower_lsp::lsp_types::{
+            DocumentOnTypeFormattingParams, FormattingOptions, Position, TextDocumentPositionParams,
+        };
+        DocumentOnTypeFormattingParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            ch: "\n".into(),
+            options: FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Issue #343 Task 4: on-type-formatting indents inside an R chunk body.
+    /// The indentation engine receives the masked analysis text, so a newline
+    /// inside a function body produces a body-indent edit at document
+    /// coordinates exactly as a plain-R file would.
+    #[tokio::test]
+    async fn on_type_formatting_indents_inside_rmd_chunk() {
+        // Cursor lands on the blank line 3, inside the brace block opened on
+        // line 2; the engine should indent it under the block.
+        //   0  ```{r}
+        //   1  prose-free chunk
+        //   2  f <- function() {
+        //   3  (cursor here, empty)
+        //   4  }
+        //   5  ```
+        let content = "```{r}\nx <- 1\nf <- function() {\n\n}\n```\n";
+        let (svc, uri, _tmp) = open_rmd(content).await;
+
+        let edits = svc
+            .inner()
+            .on_type_formatting(on_type_params(&uri, 3, 0))
+            .await
+            .expect("on_type_formatting must not error");
+        let edits = edits.expect("on_type_formatting must return edits inside a chunk body");
+        assert!(
+            !edits.is_empty() && edits.iter().any(|e| e.new_text.contains(' ')),
+            "indentation edit must add leading spaces inside the chunk function body, got {:?}",
+            edits
+        );
+    }
+
+    /// The complement: a newline on a prose line must be inert. Without the
+    /// prose guard the engine would treat the blank masked line as top-level R
+    /// and apply R indentation rules to markdown.
+    #[tokio::test]
+    async fn on_type_formatting_inert_on_rmd_prose() {
+        // Line 2 is prose; an Enter there must yield no edits.
+        let content = "```{r}\nx <- 1\n```\n\nSome prose line.\n";
+        let (svc, uri, _tmp) = open_rmd(content).await;
+
+        let edits = svc
+            .inner()
+            .on_type_formatting(on_type_params(&uri, 4, 5))
+            .await
+            .expect("on_type_formatting must not error");
+        assert!(
+            edits.is_none() || edits.as_ref().is_some_and(|e| e.is_empty()),
+            "on_type_formatting must be inert on a prose line, got {:?}",
+            edits
         );
     }
 }

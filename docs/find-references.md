@@ -37,7 +37,7 @@ Unlike completions and diagnostics, Find References does **not** consult the `so
 
 If you need a result scoped to one symbol's definition, use [Go-to-Definition](go-to-definition.md), which *is* scope- and dependency-aware.
 
-> Find References returns no results when invoked from an R Markdown / Quarto (`.Rmd` / `.qmd`) document.
+> Find References works inside R code chunks of R Markdown / Quarto (`.Rmd` / `.qmd`) documents — all R chunk bodies are pooled as one R program, so references span chunks. Invoking it on prose, YAML, or a non-R chunk returns no results.
 
 ## Workspace Symbols (Cmd/Ctrl+T)
 

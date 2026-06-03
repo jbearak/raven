@@ -3349,11 +3349,9 @@ fn cross_file_base_exports(state: &WorldState) -> Arc<HashSet<String>> {
 
 pub fn folding_range(state: &WorldState, uri: &Url) -> Option<Vec<FoldingRange>> {
     let doc = state.get_document(uri)?;
-    // Folding on prose/YAML would surface garbage AST regions; chunk-aware
-    // folding for Rmd/Quarto is a future feature.
-    if doc.is_rmd_document() {
-        return Some(Vec::new());
-    }
+    // For Rmd/Quarto the tree is parsed from the masked analysis text, so its
+    // nodes already cover only real R code inside chunk bodies — folding
+    // naturally yields chunk-body R folds and nothing on prose/YAML.
     let tree = doc.tree.as_ref()?;
     let mut ranges = Vec::new();
 
@@ -3399,14 +3397,21 @@ pub fn selection_range(
     positions: Vec<Position>,
 ) -> Option<Vec<SelectionRange>> {
     let doc = state.get_document(uri)?;
-    if doc.is_rmd_document() {
-        return Some(Vec::new());
-    }
     let tree = doc.tree.as_ref()?;
 
-    let text = doc.text();
+    // Byte offsets from `tree` index into the analysis text (masked for Rmd).
+    let text = doc.analysis_text();
+    // For Rmd, a prose position maps to a blank masked line, where
+    // `descendant_for_point_range` would return the document root and surface a
+    // nonsensical whole-document selection. Restrict to chunk-body positions
+    // (checked against the RAW text, where fences/prose are still present).
+    let raw_text = doc.text();
+    let is_rmd = doc.chunk_kind == crate::chunks::ChunkKind::Rmd;
     let mut results = Vec::new();
     for pos in positions {
+        if is_rmd && !crate::chunks::position_in_r_chunk_body(&raw_text, pos.line) {
+            continue;
+        }
         let point = lsp_position_to_ts_point(&text, pos);
         if let Some(range) = build_selection_range(tree.root_node(), point, &text) {
             results.push(range);
@@ -12371,12 +12376,20 @@ pub fn completion(
     context: Option<CompletionContext>,
 ) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
-    // Suppress R-style completions on prose/YAML lines in Rmd/Quarto.
-    // Chunk-aware completion inside fenced R blocks is a follow-up to #230.
-    if doc.is_rmd_document() {
+    // Rmd/Quarto: completions are first-class inside R chunk bodies, but a
+    // prose/YAML line maps to a blank masked line that the R logic below would
+    // treat as top-level R (offering R symbols while the user types prose).
+    // Short-circuit unless the position is inside an R chunk body. The
+    // chunk-position check uses the RAW text (fences are blanked in the masked
+    // analysis text).
+    if doc.chunk_kind == crate::chunks::ChunkKind::Rmd
+        && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+    {
         return None;
     }
-    let text = doc.text();
+    // Byte offsets paired with `tree` index into the analysis text (masked for
+    // Rmd). Behavior-neutral for plain R, where this equals the raw text.
+    let text = doc.analysis_text();
 
     // JAGS/Stan completion filtering
     match doc.file_type {
@@ -13489,11 +13502,15 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
-    if doc.file_type != FileType::R || doc.is_rmd_document() {
+    if doc.file_type != FileType::R {
         return None;
     }
     let tree = doc.tree.as_ref()?;
-    let text = doc.text();
+    // For Rmd the tree is parsed from the masked analysis text; pair byte
+    // offsets with it. A prose position maps to a blank masked line, so the
+    // identifier lookup below finds no `identifier`/`string` node and returns
+    // None — hover is naturally inert on prose without an explicit guard.
+    let text = doc.analysis_text();
 
     // Resolve the R executable path once for all help lookups in this hover call.
     // Falls back to "R" (PATH lookup) when no explicit path is configured.
@@ -14251,11 +14268,20 @@ pub fn prepare_signature_help(
     position: Position,
 ) -> Option<SignatureHelpContext> {
     let doc = state.get_document(uri)?;
-    if doc.is_rmd_document() {
+    // Rmd/Quarto: signature help is first-class inside R chunk bodies, but a
+    // prose position maps to a blank masked line. The call-node search below
+    // would already find nothing there, but an explicit guard makes the intent
+    // clear and avoids any reliance on masking incidentally yielding no `call`
+    // node. Checked against the RAW text (fences are blanked in the mask).
+    if doc.chunk_kind == crate::chunks::ChunkKind::Rmd
+        && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+    {
         return None;
     }
     let tree = doc.tree.as_ref()?;
-    let text = doc.text();
+    // Byte offsets paired with `tree` index into the analysis text (masked for
+    // Rmd); behavior-neutral for plain R.
+    let text = doc.analysis_text();
 
     let point = lsp_position_to_ts_point(&text, position);
 
@@ -14489,11 +14515,13 @@ pub fn goto_definition_with_cancel(
     let doc = state
         .get_document(uri)
         .or_else(|| state.workspace_index.get(uri))?;
-    if doc.is_rmd_document() {
-        return None;
-    }
     let tree = doc.tree.as_ref()?;
-    let text = doc.text();
+    // For Rmd the tree is parsed from the masked analysis text; pair byte
+    // offsets with it. A prose position maps to a blank masked line, so the
+    // identifier lookup below finds no `identifier` node and returns None —
+    // go-to-definition is naturally inert on prose. Behavior-neutral for plain
+    // R / JAGS / Stan, where this equals the raw text.
+    let text = doc.analysis_text();
 
     // Check for file path context first (source() calls and LSP directives)
     // Requirements 5.1-5.5, 6.1-6.5: Go-to-definition for file paths
@@ -14838,10 +14866,13 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let doc = state
         .get_document(uri)
         .or_else(|| state.workspace_index.get(uri))?;
-    if doc.is_rmd_document() {
-        return Some(Vec::new());
-    }
-    let text = doc.text();
+    // For Rmd the current-document tree is parsed from the masked analysis
+    // text; pair byte offsets with it (the cross-file/workspace arms below
+    // already use each document's analysis text or the content provider). A
+    // prose position maps to a blank masked line, so the identifier lookup
+    // returns None — references is naturally inert on prose. Behavior-neutral
+    // for plain R / JAGS / Stan.
+    let text = doc.analysis_text();
 
     if doc.file_type == FileType::Stan {
         let occurrences = collect_stan_identifier_occurrences(&text);
@@ -22011,70 +22042,205 @@ result <- data %>% filter(x > 0)
         );
     }
 
-    #[test]
-    fn test_r_handlers_suppressed_for_rmd_documents() {
-        // Every R-only handler that was gated in the Rmd routing change
-        // (issue #227) should return an empty/no-op response for Rmd
-        // documents. Diagnostics and completion have their own tests; this
-        // covers the remaining sync handlers in one place.
+    /// Multi-chunk Rmd fixture shared by the chunk-body language-feature tests.
+    /// `my_func` is defined in the first chunk and called in the last; lines:
+    ///
+    /// ```text
+    /// 0  ```{r}
+    /// 1  my_func <- function(x) {
+    /// 2    x + 1
+    /// 3  }
+    /// 4  ```
+    /// 5  (blank)
+    /// 6  Some prose paragraph.
+    /// 7  (blank)
+    /// 8  ```{r}
+    /// 9  my_func(2)
+    /// 10 ```
+    /// ```
+    fn rmd_handler_fixture() -> (crate::state::WorldState, Url) {
         use crate::state::{Document, WorldState};
-
-        let code = "Some prose.\n\n```{r}\nfn <- function(x) x\n```\n";
+        let code = "```{r}\nmy_func <- function(x) {\n  x + 1\n}\n```\n\nSome prose paragraph.\n\n```{r}\nmy_func(2)\n```\n";
         let uri = Url::parse("file:///doc.Rmd").unwrap();
         let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
         state
             .documents
             .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+        (state, uri)
+    }
 
-        let pos = Position::new(3, 0);
+    #[test]
+    fn test_r_handlers_active_in_rmd_chunk_body() {
+        // Issue #343 Task 4: the per-feature Rmd gates are gone; language
+        // features are first-class inside R chunk bodies. Every handler below
+        // operates on the masked analysis text, so byte offsets from `tree`
+        // line up with the document coordinates the request carries.
+        let (state, uri) = rmd_handler_fixture();
 
-        assert_eq!(
-            super::folding_range(&state, &uri),
-            Some(Vec::new()),
-            "folding_range"
-        );
-        assert_eq!(
-            super::selection_range(&state, &uri, vec![pos]),
-            Some(Vec::new()),
-            "selection_range"
-        );
+        // `my_func` is called on document line 9 (a chunk body); its
+        // definition is on line 1 of the same document.
+        let use_pos = Position::new(9, 0); // on `my_func` in `my_func(2)`
+
+        // folding_range: the multi-line function definition (lines 1-3) folds.
+        let folds = super::folding_range(&state, &uri).expect("folding_range Some");
         assert!(
-            super::prepare_signature_help(&state, &uri, pos).is_none(),
-            "prepare_signature_help"
+            folds.iter().any(|f| f.start_line == 1 && f.end_line == 3),
+            "the multi-line function in the chunk must yield a fold, got {:?}",
+            folds
+        );
+
+        // selection_range: expands within the chunk code (yields a non-empty,
+        // range hierarchy rooted at the cursor token). The hierarchy nests from
+        // outermost (`.range`) down through `.parent`; the innermost range —
+        // the deepest `.parent` — must hug the chunk-body token on line 9.
+        let sel =
+            super::selection_range(&state, &uri, vec![use_pos]).expect("selection_range Some");
+        assert_eq!(sel.len(), 1, "one selection range per requested position");
+        let mut innermost = &sel[0];
+        while let Some(parent) = &innermost.parent {
+            innermost = parent;
+        }
+        assert_eq!(
+            innermost.range.start.line, 9,
+            "innermost selection range must hug the chunk-body token on line 9"
+        );
+
+        // prepare_signature_help: cursor just inside `my_func(` resolves the
+        // chunk-defined function.
+        assert!(
+            super::prepare_signature_help(&state, &uri, Position::new(9, 8)).is_some(),
+            "signature help must resolve a chunk-defined function"
+        );
+
+        // goto_definition: from the use on line 9 to the def on line 1.
+        let goto = super::goto_definition_with_cancel(
+            &state,
+            &uri,
+            use_pos,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .expect("goto_definition Some");
+        match goto {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri, uri, "definition is in the same document");
+                assert_eq!(
+                    loc.range.start.line, 1,
+                    "go-to-definition must land on the chunk-1 definition line"
+                );
+            }
+            other => panic!("expected a scalar location, got {:?}", other),
+        }
+
+        // references: both the definition (line 1) and the use (line 9).
+        let refs = super::references(&state, &uri, use_pos).expect("references Some");
+        let ref_lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert!(
+            ref_lines.contains(&1) && ref_lines.contains(&9),
+            "references must find both the definition (line 1) and use (line 9), got {:?}",
+            ref_lines
+        );
+    }
+
+    #[test]
+    fn test_r_handlers_inert_at_rmd_prose_position() {
+        // The complement of `test_r_handlers_active_in_rmd_chunk_body`: at a
+        // prose position the masked analysis line is blank, so tree-driven
+        // handlers find no node/identifier and return empty/None. completion
+        // and signature help additionally carry an explicit prose guard.
+        let (state, uri) = rmd_handler_fixture();
+        let prose_pos = Position::new(6, 4); // inside "Some prose paragraph."
+
+        // selection_range must NOT surface the whole-document root range for a
+        // blank masked (prose) line — it yields no range for that position.
+        let sel =
+            super::selection_range(&state, &uri, vec![prose_pos]).expect("selection_range Some");
+        assert!(
+            sel.is_empty(),
+            "selection_range must be empty at a prose position, got {:?}",
+            sel
+        );
+
+        assert!(
+            super::prepare_signature_help(&state, &uri, prose_pos).is_none(),
+            "signature help must be None at a prose position"
         );
         assert!(
             super::goto_definition_with_cancel(
                 &state,
                 &uri,
-                pos,
+                prose_pos,
                 &crate::handlers::DiagCancelToken::never(),
             )
             .is_none(),
-            "goto_definition"
+            "goto_definition must be None at a prose position"
         );
-        assert_eq!(
-            super::references(&state, &uri, pos),
-            Some(Vec::new()),
-            "references"
+        // references finds no `identifier` node on the blank masked line, so it
+        // returns None (no results) — naturally inert.
+        let refs = super::references(&state, &uri, prose_pos);
+        assert!(
+            refs.as_ref().is_none_or(|r| r.is_empty()),
+            "references must yield no results at a prose position, got {:?}",
+            refs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hover_active_in_rmd_chunk_and_inert_in_prose() {
+        let (state, uri) = rmd_handler_fixture();
+
+        // Hovering the use of `my_func` on line 9 surfaces the definition
+        // extracted from chunk 1.
+        let hover = super::hover(&state, &uri, Position::new(9, 0)).await;
+        let hover = hover.expect("hover must return content for a chunk-defined function");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected markdown hover contents");
+        };
+        assert!(
+            markup.value.contains("my_func"),
+            "hover content must mention the function name, got {:?}",
+            markup.value
+        );
+
+        // Prose position: blank masked line → no identifier node → None.
+        assert!(
+            super::hover(&state, &uri, Position::new(6, 4))
+                .await
+                .is_none(),
+            "hover must be None at a prose position"
         );
     }
 
     #[test]
-    fn test_completion_suppressed_for_rmd_documents() {
+    fn test_completion_active_in_rmd_chunk_and_inert_in_prose() {
         use crate::state::{Document, WorldState};
 
-        let code = "Some prose with `library(`\n\n```{r}\nx <-\n```\n";
+        // `x` defined in chunk 1; completion partway through chunk 2 offers it.
+        let code = "```{r}\nx <- 1\n```\n\nSome prose with `library(`\n\n```{r}\nx\n```\n";
         let uri = Url::parse("file:///doc.Rmd").unwrap();
         let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
         state
             .documents
             .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
 
-        // Position 0, char 25 — inside the prose `library(` fragment.
-        let result = super::completion(&state, &uri, Position::new(0, 25), None);
+        // Document line 7 holds `x` inside the second chunk body. Completion at
+        // its end must offer the chunk-1 symbol `x`.
+        let result = super::completion(&state, &uri, Position::new(7, 1), None)
+            .expect("completion must return items inside a chunk body");
+        let CompletionResponse::Array(items) = result else {
+            panic!("expected a completion array");
+        };
         assert!(
-            result.is_none(),
-            "Rmd should yield no R completions on prose"
+            items.iter().any(|i| i.label == "x"),
+            "completion inside a chunk must offer the chunk-defined symbol `x`"
+        );
+
+        // Prose position (inside the `library(` fragment on line 4): the prose
+        // guard short-circuits before any R completion logic runs.
+        assert!(
+            super::completion(&state, &uri, Position::new(4, 25), None).is_none(),
+            "Rmd should yield no R completions on a prose line"
         );
     }
 

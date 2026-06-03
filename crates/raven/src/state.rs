@@ -342,13 +342,22 @@ impl Document {
         }
     }
 
-    /// True when the document is an R Markdown / Quarto document. The R
-    /// tree-sitter parser sees the prose/YAML/non-R portions as syntax
-    /// errors, so handlers that don't understand chunks should treat the
-    /// document as off-limits and return empty results.
+    /// True when the document is an R Markdown / Quarto document.
     ///
-    /// The document outline (`document_symbol`) is the exception — it
-    /// intentionally processes chunk markers via the text-based detector.
+    /// For Rmd documents the analysis view (`tree` + `analysis_text()`) is the
+    /// geometry-preserving [`chunks::mask_to_r`] mask, so R-language features
+    /// (diagnostics, completion, hover, signature help, go-to-definition,
+    /// references, folding, selection, on-type formatting, semantic tokens) are
+    /// first-class **inside R chunk bodies** and operate on document
+    /// coordinates directly.
+    ///
+    /// Callers still use this flag for two reasons: (1) a few handlers must add
+    /// a prose guard — at a prose/YAML position the masked line is blank, which
+    /// would otherwise let completion / signature help / on-type formatting
+    /// behave like top-level R; guard such positions with
+    /// [`chunks::position_in_r_chunk_body`] on the *raw* text. (2) Whole-text
+    /// paths that can't consume the R AST (e.g. chunk-aware semantic tokens,
+    /// the text-based document outline) branch on it.
     pub fn is_rmd_document(&self) -> bool {
         self.chunk_kind == ChunkKind::Rmd
     }
