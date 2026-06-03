@@ -3406,9 +3406,12 @@ pub fn selection_range(
     // nonsensical whole-document selection. Restrict to chunk-body positions
     // (checked against the RAW text, where fences/prose are still present).
     let raw_text = doc.text();
-    let is_rmd = doc.chunk_kind == crate::chunks::ChunkKind::Rmd;
+    let is_rmd = doc.is_rmd_document();
     let mut results = Vec::new();
     for pos in positions {
+        // `position_in_r_chunk_body` re-scans the document per call (O(doc));
+        // acceptable here because selection-range requests carry only the
+        // active cursors (typically one or two positions).
         if is_rmd && !crate::chunks::position_in_r_chunk_body(&raw_text, pos.line) {
             continue;
         }
@@ -12382,8 +12385,7 @@ pub fn completion(
     // Short-circuit unless the position is inside an R chunk body. The
     // chunk-position check uses the RAW text (fences are blanked in the masked
     // analysis text).
-    if doc.chunk_kind == crate::chunks::ChunkKind::Rmd
-        && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+    if doc.is_rmd_document() && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
     {
         return None;
     }
@@ -14273,8 +14275,7 @@ pub fn prepare_signature_help(
     // would already find nothing there, but an explicit guard makes the intent
     // clear and avoids any reliance on masking incidentally yielding no `call`
     // node. Checked against the RAW text (fences are blanked in the mask).
-    if doc.chunk_kind == crate::chunks::ChunkKind::Rmd
-        && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+    if doc.is_rmd_document() && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
     {
         return None;
     }
