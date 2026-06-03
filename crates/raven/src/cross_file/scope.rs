@@ -15296,13 +15296,13 @@ y <- filter(df)"#;
                 None,
             );
 
-            // Identical symbol name sets.
-            let mut stream_names: Vec<String> =
+            // Identical symbol name sets (asserted separately from the full
+            // identity set below so a pure name-set divergence fails with a
+            // clear message).
+            let stream_names: std::collections::BTreeSet<String> =
                 streamed.symbols.keys().map(|n| n.to_string()).collect();
-            stream_names.sort();
-            let mut cached_names: Vec<String> =
+            let cached_names: std::collections::BTreeSet<String> =
                 cached.symbols.keys().map(|n| n.to_string()).collect();
-            cached_names.sort();
             assert_eq!(
                 stream_names, cached_names,
                 "ScopeStream::snapshot and scope_at_position_with_graph_cached \
@@ -15310,16 +15310,12 @@ y <- filter(df)"#;
             );
 
             // Identical provenance tuple for every symbol.
-            for name in &stream_names {
-                let s = &streamed.symbols[name.as_str()];
-                let c = &cached.symbols[name.as_str()];
-                assert_eq!(
-                    symbol_provenance(s),
-                    symbol_provenance(c),
-                    "ScopeStream and cached resolver must agree on the \
-                     provenance tuple for `{name}` at main.R (2, 0)"
-                );
-            }
+            assert_eq!(
+                symbol_identity_set(&streamed),
+                symbol_identity_set(&cached),
+                "ScopeStream and cached resolver must agree on every symbol's \
+                 provenance tuple at main.R (2, 0)"
+            );
 
             // Identical package surface (the core anti-drift guarantee for
             // package origins through the cycle).
