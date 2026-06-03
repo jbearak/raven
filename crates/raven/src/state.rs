@@ -1029,8 +1029,11 @@ impl WorldState {
         uri: &Url,
     ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
         if let Some(doc) = self.documents.get(uri) {
+            // Parse from `analysis_text()`: masked for Rmd/Quarto (so a
+            // `# @lsp-cd` in prose is ignored while one inside a chunk is a
+            // real directive), raw for everything else (behavior-neutral).
             return Some(Arc::new(crate::cross_file::directive::parse_directives(
-                &doc.text(),
+                &doc.analysis_text(),
             )));
         }
         if let Some(meta) = self.cross_file_workspace_index.get_metadata(uri) {
@@ -1053,9 +1056,12 @@ impl WorldState {
             .or_else(|| self.workspace_index_new.get_metadata(uri))
             .or_else(|| self.cross_file_workspace_index.get_metadata(uri))
             .or_else(|| {
+                // `analysis_text()`: masked for Rmd/Quarto (directives/source()/
+                // library() come from chunk bodies, not prose), raw otherwise
+                // (behavior-neutral for plain R / JAGS / Stan).
                 self.documents
                     .get(uri)
-                    .map(|doc| Arc::new(crate::cross_file::extract_metadata(&doc.text())))
+                    .map(|doc| Arc::new(crate::cross_file::extract_metadata(&doc.analysis_text())))
             })
             .or_else(|| {
                 self.cross_file_file_cache

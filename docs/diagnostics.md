@@ -221,4 +221,14 @@ When a parent file changes (e.g., a `library()` call is added or removed), Raven
 
 Diagnostics are suppressed for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files because Raven cannot statically determine what is in scope in these languages.
 
-R Markdown (`.Rmd`) and Quarto (`.qmd`) documents also produce no diagnostics: the tree-sitter R parser sees prose, YAML, and non-R fenced blocks as parse errors, so every non-R line would become spurious noise. Code intelligence for individual R chunks is covered in [chunks.md](chunks.md).
+## R Markdown and Quarto
+
+R Markdown (`.Rmd`) and Quarto (`.qmd`) documents are diagnosed chunk-by-chunk. Raven analyzes a masked view of the document in which every non-R line — prose, YAML front matter, and non-R fenced blocks (Python, Bash, etc.) — is blanked while R chunk bodies are preserved at their original line and column positions. As a result:
+
+- Syntax errors, undefined variables, and lint findings inside `{r}` (and `{rscript}`) chunks are reported at the document's own coordinates, exactly as they would be in a `.R` file.
+- Prose, YAML, markdown links, and non-R chunks never produce diagnostics.
+- Symbols defined in one R chunk are in scope in later R chunks (the chunks share a single analysis), so a variable assigned in an early chunk and used in a later one is not flagged as undefined.
+- Chunk options that only affect knitr execution (such as `eval=FALSE`) do not suppress static analysis — a syntax error in an `eval=FALSE` chunk is still flagged.
+- `# nolint` markers and `# @lsp-ignore` directives work inside chunks just as in plain R.
+
+Code intelligence for individual R chunks is covered in [chunks.md](chunks.md).

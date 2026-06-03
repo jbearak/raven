@@ -86,10 +86,13 @@ pub(crate) fn empty_base_exports() -> &'static Arc<HashSet<String>> {
 pub(crate) struct DiagnosticsSnapshot {
     // Document data
     pub tree: tree_sitter::Tree,
-    /// Raw source text — `doc.text()`, not `doc.analysis_text()`.
-    /// Paired with `tree` only after the Rmd early-return at the top of
-    /// `diagnostics_from_snapshot` ensures they are never mixed; if Rmd
-    /// diagnostics are ever enabled, this field must switch to `analysis_text()`.
+    /// Analysis text — `doc.analysis_text()`, the masked text for Rmd/Quarto
+    /// documents and the raw text for everything else. Paired with `tree`,
+    /// whose byte offsets reference this exact text (never `doc.text()`); the
+    /// two MUST stay consistent so every diagnostic range is a valid document
+    /// coordinate. For plain R / JAGS / Stan this equals the raw text, so the
+    /// choice is behavior-neutral there. See the [`crate::state::Document`]
+    /// type docs for the full raw-vs-analysis invariant.
     pub text: String,
     // Cross-file state (pre-collected)
     pub directive_meta: crate::cross_file::CrossFileMetadata,
@@ -122,10 +125,6 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
-    /// Chunk-detection kind for the document, captured from the document so
-    /// that untitled Rmd/Quarto buffers (no file extension) still classify
-    /// correctly. Used to gate diagnostics for prose-bearing documents.
-    pub chunk_kind: crate::chunks::ChunkKind,
 
     /// STEP 1 (parent walk) cache shared across all `get_scope` calls in this
     /// snapshot's diagnostic pass. STEP 1 is position-invariant within one
@@ -150,14 +149,36 @@ impl DiagnosticsSnapshot {
         let build_start = std::time::Instant::now();
         let doc = state.get_document(uri)?;
         let tree = doc.tree.as_ref()?.clone();
-        let text = doc.text();
+        // Analysis text (masked for Rmd/Quarto, raw otherwise). `tree` was
+        // parsed from this exact text, so the two stay consistent and every
+        // diagnostic range is a valid document coordinate.
+        let text = doc.analysis_text();
+        let is_rmd = doc.chunk_kind == crate::chunks::ChunkKind::Rmd;
         // Get enriched metadata. The snapshot owns its `directive_meta` so it
         // can mutate `inherited_working_directory` in place; we deep-clone
         // only this single entry, while neighbors stay Arc-wrapped.
-        let mut directive_meta = state
-            .get_enriched_metadata(uri)
-            .map(std::sync::Arc::unwrap_or_clone)
-            .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
+        //
+        // For Rmd/Quarto documents, derive metadata directly from the MASKED
+        // analysis text rather than `get_enriched_metadata`. The DocumentStore
+        // entry for an open Rmd doc is populated at did_open time from the RAW
+        // text (backend.rs), so `get_enriched_metadata` would otherwise return
+        // raw-derived metadata: a `# @lsp-cd` in prose would be (wrongly)
+        // honored as a directive, and `source()`/`library()` calls inside
+        // chunks would be missed. Re-extracting from `(text, tree)` — both
+        // masked — keeps directives prose-aware and chunk-call-aware.
+        // (Rewiring the DocumentStore did_open/did_change path to store
+        // masked-derived metadata is Task 5's territory; this snapshot-local
+        // re-derivation makes the diagnostics path correct in the meantime.)
+        let mut directive_meta = if is_rmd {
+            crate::cross_file::extract_metadata_with_tree(&text, Some(&tree))
+        } else {
+            state
+                .get_enriched_metadata(uri)
+                .map(std::sync::Arc::unwrap_or_clone)
+                .unwrap_or_else(|| {
+                    crate::cross_file::extract_metadata_with_tree(&text, Some(&tree))
+                })
+        };
         let metadata_elapsed = build_start.elapsed();
 
         // Compute inherited working directory if needed
@@ -298,7 +319,6 @@ impl DiagnosticsSnapshot {
             cycle_closing_snippet,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
-            chunk_kind: doc.chunk_kind,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             scope_contribution: state.package_state.scope_contribution().clone(),
         })
@@ -369,13 +389,10 @@ pub(crate) fn diagnostics_from_snapshot(
         return Some(Vec::new());
     }
 
-    // Suppress diagnostics for R Markdown / Quarto documents. The tree-sitter
-    // R parser sees prose, YAML, and non-R fenced blocks as garbage, so every
-    // non-R line becomes a syntax error. The outline still works (see
-    // `document_symbol`); only the diagnostic noise is gated.
-    if snapshot.chunk_kind == crate::chunks::ChunkKind::Rmd {
-        return Some(Vec::new());
-    }
+    // Rmd/Quarto documents are diagnosed against their MASKED analysis text
+    // (`snapshot.text` / `snapshot.tree`): prose, YAML, and non-R fenced blocks
+    // are blanked, so only real R chunk-body content is analyzed and every
+    // diagnostic lands at the correct document coordinate (issue #343).
 
     let mut diagnostics = Vec::new();
 
@@ -4323,12 +4340,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
         return Vec::new();
     }
 
-    // Suppress diagnostics for R Markdown / Quarto documents — prose lines
-    // would otherwise surface as spurious syntax errors. See the matching
-    // guard in `diagnostics_from_snapshot`.
-    if doc.chunk_kind == crate::chunks::ChunkKind::Rmd {
-        return Vec::new();
-    }
+    // Rmd/Quarto documents ARE diagnosed (issue #343): the snapshot pipeline
+    // analyzes the masked analysis text, so only real R chunk-body content is
+    // checked. See `diagnostics_from_snapshot`.
 
     // Delegate to the snapshot-based pipeline (the same path used by the
     // debounced production pipeline in `run_debounced_diagnostics`). Issue
@@ -22065,27 +22079,249 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
-    fn test_diagnostics_suppressed_for_rmd_documents() {
-        // The R tree-sitter parser sees prose as garbage. Gating prevents
-        // every non-R line from surfacing as a syntax error.
+    fn test_diagnostics_enabled_for_rmd_documents() {
+        // Chunk-aware diagnostics (issue #343): the masked analysis text means
+        // the R parser only sees real R code inside chunk bodies, so prose,
+        // YAML, and markdown links no longer surface as spurious syntax errors,
+        // while real errors inside chunks ARE flagged at document coordinates.
         use crate::state::{Document, WorldState};
 
-        let prose_with_chunk =
+        // Prose-only-plus-valid-chunk Rmd: no diagnostics. The link `[a](url)`
+        // and the heading would each be a syntax error if parsed as raw text.
+        let prose_with_valid_chunk =
             "# A heading\n\nSome prose with [a link](url).\n\n```{r}\nx <- 1\n```\n";
         let uri = Url::parse("file:///doc.Rmd").unwrap();
         let mut state = WorldState::new(vec![]);
         state.cross_file_config.diagnostics_enabled = true;
         state.documents.insert(
             uri.clone(),
-            Document::new_with_uri(prose_with_chunk, None, &uri),
+            Document::new_with_uri(prose_with_valid_chunk, None, &uri),
         );
-
         let diags = super::diagnostics(&state, &uri, &DiagCancelToken::never());
         assert!(
             diags.is_empty(),
-            "Rmd documents should produce zero diagnostics, got {} ({:?})",
+            "prose + a valid chunk should produce zero diagnostics, got {} ({:?})",
             diags.len(),
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // An R syntax error inside a chunk body IS now flagged.
+        let prose_with_broken_chunk =
+            "# A heading\n\nSome prose with [a link](url).\n\n```{r}\nx <- (\n```\n";
+        let uri2 = Url::parse("file:///broken.Rmd").unwrap();
+        state.documents.insert(
+            uri2.clone(),
+            Document::new_with_uri(prose_with_broken_chunk, None, &uri2),
+        );
+        let diags2 = super::diagnostics(&state, &uri2, &DiagCancelToken::never());
+        assert!(
+            !diags2.is_empty(),
+            "a syntax error inside a chunk must be flagged for Rmd documents"
+        );
+        // The error must be on the chunk body line (line 5), not on a prose line.
+        assert!(
+            diags2
+                .iter()
+                .all(|d| d.range.start.line == 5 && d.range.end.line == 5),
+            "all diagnostics must land on the chunk body line 5, got {:?}",
+            diags2
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // =====================================================================
+    // Chunk-aware diagnostics for Rmd/Quarto documents (issue #343).
+    //
+    // These exercise `DiagnosticsSnapshot::build` + `diagnostics_from_snapshot`
+    // end-to-end on Rmd documents. Geometry-preserving masking (Task 1/2) means
+    // every diagnostic lands at the same document coordinates a plain-R file
+    // would yield for the equivalent chunk-body content.
+    // =====================================================================
+
+    /// Build a snapshot for an Rmd document inserted directly into
+    /// `state.documents` (so `get_enriched_metadata` resolves the masked
+    /// `documents` arm rather than the raw DocumentStore entry).
+    fn build_rmd_snapshot(
+        code: &str,
+        uri_str: &str,
+        configure: impl FnOnce(&mut crate::state::WorldState),
+    ) -> (DiagnosticsSnapshot, Url) {
+        use crate::state::{Document, WorldState};
+        let uri = Url::parse(uri_str).unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.cross_file_config.diagnostics_enabled = true;
+        state.workspace_scan_complete = true;
+        configure(&mut state);
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        (snapshot, uri)
+    }
+
+    fn rmd_diagnostics(
+        code: &str,
+        uri_str: &str,
+        configure: impl FnOnce(&mut crate::state::WorldState),
+    ) -> Vec<Diagnostic> {
+        let (snapshot, uri) = build_rmd_snapshot(code, uri_str, configure);
+        diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned")
+    }
+
+    #[test]
+    fn rmd_snapshot_flags_syntax_error_in_chunk_at_document_coords() {
+        // Header on line 4, body `x <- (` on line 5 (a syntax error).
+        let code = "# Title\n\nprose here\n\n```{r}\nx <- (\n```\n";
+        let diags = rmd_diagnostics(code, "file:///syntax.Rmd", |_| {});
+        assert!(
+            !diags.is_empty(),
+            "the chunk's syntax error must be flagged"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "a syntax-error (ERROR) diagnostic is expected, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.severity, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            diags.iter().all(|d| d.range.start.line == 5),
+            "every diagnostic must land on document line 5 (the chunk body), got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_snapshot_does_not_flag_prose() {
+        // YAML front matter, markdown headings, links, and prose around one
+        // valid chunk must all be silent.
+        let code = "---\ntitle: \"Report\"\nauthor: Me\n---\n\n# Heading\n\nSee [the docs](https://example.com) for [more](url).\n\nSome *emphasis* and `inline code`.\n\n```{r}\nx <- 1\nprint(x)\n```\n\nClosing prose.\n";
+        let diags = rmd_diagnostics(code, "file:///prose.Rmd", |_| {});
+        assert!(
+            diags.is_empty(),
+            "prose / YAML / markdown must not produce diagnostics, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_snapshot_ignores_non_r_chunk() {
+        // A `{python}` chunk whose contents are invalid R must be ignored:
+        // the masked text blanks the python body entirely.
+        let code = "# Title\n\n```{python}\nx = (\ndef broken(:\n```\n\nMore prose.\n";
+        let diags = rmd_diagnostics(code, "file:///python.Rmd", |_| {});
+        assert!(
+            diags.is_empty(),
+            "non-R chunk contents must not be diagnosed, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_cross_chunk_variable_resolves() {
+        // `x` is defined in chunk 1 and used in chunk 3; the masked analysis
+        // text concatenates all R chunk bodies into one tree, so `x` resolves
+        // across chunks and is NOT flagged as undefined.
+        let code = "```{r}\nx <- 1\n```\n\nProse paragraph.\n\n```{r}\ny <- 2\n```\n\nMore prose.\n\n```{r}\nprint(x)\n```\n";
+        let diags = rmd_diagnostics(code, "file:///cross.Rmd", |_| {});
+        assert!(
+            !diags.iter().any(|d| d.message == "Undefined variable: x"),
+            "x defined in an earlier chunk must resolve in a later chunk, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_undefined_var_in_chunk_flagged() {
+        // A bare undefined symbol used inside a chunk is flagged at document
+        // coordinates. Undefined-variable diagnostics require
+        // `workspace_scan_complete` (set by the helper).
+        let code = "# Title\n\nprose\n\n```{r}\ntotally_undefined_symbol\n```\n";
+        let diags = rmd_diagnostics(code, "file:///undef.Rmd", |_| {});
+        let undef = diags
+            .iter()
+            .find(|d| d.message == "Undefined variable: totally_undefined_symbol")
+            .unwrap_or_else(|| {
+                panic!(
+                    "undefined symbol must be flagged, got {:?}",
+                    diags
+                        .iter()
+                        .map(|d| (d.range.start.line, d.message.clone()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            undef.range.start.line, 5,
+            "the diagnostic must be on document line 5 (the chunk body)"
+        );
+    }
+
+    #[test]
+    fn rmd_nolint_inside_chunk_respected() {
+        // A lint-triggering line inside a chunk carrying `# nolint` must be
+        // suppressed; the same rule must still fire on a sibling line without
+        // the marker (proving the lint pipeline is actually running).
+        let code = "# Title\n\n```{r}\nx<-1 # nolint\ny<-2\n```\n";
+        let diags = rmd_diagnostics(code, "file:///nolint.Rmd", |state| {
+            state.lint_config = crate::linting::LintConfig {
+                enabled: true,
+                infix_spaces_severity: Some(DiagnosticSeverity::WARNING),
+                ..crate::linting::LintConfig::default()
+            };
+        });
+        // Line 3 (`x<-1 # nolint`) must be suppressed.
+        assert!(
+            !diags.iter().any(|d| d.range.start.line == 3),
+            "`# nolint` on line 3 must suppress lint diagnostics there, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        // Line 4 (`y<-2`, no marker) must still be flagged.
+        assert!(
+            diags.iter().any(|d| d.range.start.line == 4),
+            "the infix-spaces lint must still fire on the un-suppressed line 4, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_eval_false_chunk_still_diagnosed() {
+        // `eval=FALSE` only affects knitr execution, not static analysis: a
+        // syntax error inside such a chunk is still flagged.
+        let code = "# Title\n\n```{r, eval=FALSE}\nx <- (\n```\n";
+        let diags = rmd_diagnostics(code, "file:///eval.Rmd", |_| {});
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR) && d.range.start.line == 3),
+            "a syntax error inside an eval=FALSE chunk must still be flagged on line 3, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
         );
     }
 

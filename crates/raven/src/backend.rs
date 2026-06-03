@@ -6701,10 +6701,11 @@ pub(crate) async fn publish_diagnostics_inner(
     // snapshot fields, which already mirror `doc.file_type` and
     // `doc.chunk_kind` from build time.
     let sync_diagnostics = match snapshot {
-        Some(snap)
-            if snap.file_type == crate::file_type::FileType::R
-                && snap.chunk_kind != crate::chunks::ChunkKind::Rmd =>
-        {
+        // Rmd/Quarto documents flow through too (issue #343): the snapshot
+        // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
+        // sees only real R chunk-body content. JAGS/Stan stay suppressed via the
+        // `file_type == R` condition.
+        Some(snap) if snap.file_type == crate::file_type::FileType::R => {
             handlers::diagnostics_from_snapshot(&snap, uri, &handlers::DiagCancelToken::never())
                 .unwrap_or_default()
         }
@@ -11132,5 +11133,86 @@ lineLength = 200
             .expect("snapshot built for tests/test-a.R");
         assert_eq!(r_snap.lint_config.line_length, 30);
         assert_eq!(test_snap.lint_config.line_length, 200);
+    }
+
+    /// Issue #343: an open Rmd document must flow through the publish-path
+    /// dispatch (`publish_diagnostics_inner` Phase 1 build + Phase 2 match
+    /// guard) and produce chunk diagnostics. The document is opened via the
+    /// real `did_open` path, so its DocumentStore entry holds raw-derived
+    /// metadata/tree; the snapshot must still be masked-correct (metadata and
+    /// `text`/`tree` re-derived from the masked analysis text in
+    /// `DiagnosticsSnapshot::build`). This mirrors the exact match arm in
+    /// `publish_diagnostics_inner`: build the snapshot, then run
+    /// `diagnostics_from_snapshot` iff `file_type == R`.
+    #[tokio::test]
+    async fn rmd_document_flows_through_publish_path_and_flags_chunk_error() {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let tmp = TempDir::new().unwrap();
+        let rmd_path = tmp.path().join("report.Rmd");
+        // Prose + a chunk with a syntax error (`x <- (`) on document line 5.
+        let content = "# Title\n\nSome [prose](url) here.\n\n```{r}\nx <- (\n```\n";
+        fs::write(&rmd_path, content).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&rmd_path).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "rmd".into(),
+                    version: 1,
+                    text: content.into(),
+                },
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri)
+            .expect("snapshot built for report.Rmd");
+
+        // Reproduce the publish-path match guard exactly.
+        let diagnostics = if snapshot.file_type == crate::file_type::FileType::R {
+            crate::handlers::diagnostics_from_snapshot(
+                &snapshot,
+                &uri,
+                &crate::handlers::DiagCancelToken::never(),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR) && d.range.start.line == 5),
+            "the chunk syntax error must surface on document line 5 through the publish path, got {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        // Prose lines (heading, markdown link) must not produce diagnostics.
+        assert!(
+            diagnostics.iter().all(|d| d.range.start.line == 5),
+            "no diagnostics may land on prose lines, got {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
     }
 }
