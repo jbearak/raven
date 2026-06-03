@@ -123,7 +123,7 @@ To get installed/local package awareness and exact local package metadata in CI,
 
 ### Scope
 
-Only plain R files (`.R` / `.r`) are reported. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped — chunk extraction isn't supported on the command line — with a one-line note on stderr when one is named explicitly.
+`.R` / `.r` files and R Markdown / Quarto files (`.Rmd` / `.qmd`) are all reported. When a workspace walk or a directory argument includes `.Rmd` / `.qmd` files they are analyzed the same way the editor analyzes them: every R chunk body is treated as R code at its document coordinates, while prose, YAML front matter, and non-R chunks (Python, Bash, …) are ignored. Diagnostics are reported at the coordinates of the chunk body line where they occur, so the line and column in `text` / `json` / `sarif` output map directly to the document. Cross-file resolution from chunks works: a `source()` inside a chunk creates a real dependency edge, and missing-file and cross-file scope diagnostics are reported the same as from a `.R` file.
 
 ## `raven lint`
 
@@ -166,7 +166,7 @@ raven lint [OPTIONS] [PATHS...]
 
 `raven lint` runs the native style linter only. Cross-file, undefined-variable, and package diagnostics need a workspace scan; use [`raven check`](#raven-check) for those.
 
-Only plain R files (`.R` / `.r`) are linted. R Markdown / Quarto files (`.Rmd` / `.qmd`) are skipped with a one-line note on stderr — chunk extraction isn't supported on the command line — and other file types are ignored silently. Passing a directory walks it recursively for R files.
+`.R` / `.r` files and R Markdown / Quarto files (`.Rmd` / `.qmd`) are linted. Inside `.Rmd` / `.qmd` files, lint rules apply to R chunk bodies; prose, YAML front matter, and non-R chunks are ignored. `# nolint` / `# nolint start` / `# nolint end` and `# @lsp-ignore` markers inside chunk bodies work as in plain R files. Other file types are ignored silently. Passing a directory walks it recursively for `.R` / `.r`, `.Rmd`, and `.qmd` files.
 
 ## `raven packages`
 

@@ -8,6 +8,15 @@ Raven is under active development. The gaps below reflect features that exist in
 - **Session-aware completions** — Raven's completions are purely static. REditorSupport can complete symbols from the live R session's `globalenv()`, including column names from data frames that only exist at runtime. See [Comparison: Language intelligence](./comparison.md#language-intelligence).
 - **Nested member completions** — Raven resolves one level of `$` member access: after `foo$` it offers `foo`'s known members (discovered statically from assignments and constructor literals), but it does not resolve deeper chains — after `foo$bar$` it can't offer the members of `foo$bar`. See [Completion: `$` member completions](./completion.md#-member-completions).
 
+## R Markdown / Quarto
+
+R chunk bodies in `.Rmd` / `.qmd` documents are fully analyzed as first-class R code. The following gaps are accepted limitations of the current implementation:
+
+- **Inline R expressions** (`\`r expr\`` in prose) are not analyzed. Only fenced chunk bodies (```` ```{r} ... ``` ```` ) are treated as R.
+- **Cross-chunk delimiter leak** — chunk bodies are analyzed as a single concatenated R program. An unclosed delimiter (`"`, `(`, `{`) in one chunk body can swallow the opening of the next chunk, causing the next chunk's parse to fail. The unclosed delimiter in the offending chunk is itself flagged as a parse error. This is a consequence of the single-parse model knitr uses.
+- **Non-R chunks not analyzed** — `{python}`, `{bash}`, `{julia}`, and other non-R fenced blocks are never analyzed or linted.
+- **knitr chunk-reuse lines** (`<<label>>`) are blanked (treated as empty lines) and not resolved.
+
 ## R-session features
 
 - **Workspace viewer** — REditorSupport has a sidebar panel that introspects the live R session, showing objects in `globalenv()` with their types and dimensions, plus attached and loaded namespaces; objects can be viewed or removed from the panel. Raven has no equivalent. See [Comparison: What REditorSupport's VS Code extension offers that Raven doesn't](./comparison.md#what-reditorsupports-vs-code-extension-offers-that-raven-doesnt).

@@ -231,4 +231,8 @@ R Markdown (`.Rmd`) and Quarto (`.qmd`) documents are diagnosed chunk-by-chunk. 
 - Chunk options that only affect knitr execution (such as `eval=FALSE`) do not suppress static analysis — a syntax error in an `eval=FALSE` chunk is still flagged.
 - `# nolint` markers and `# @lsp-ignore` directives work inside chunks just as in plain R.
 
+### Parameterized reports (`params`)
+
+When the YAML front matter declares a top-level `params:` key, Raven treats `params` as a defined symbol for that document — undefined-variable and out-of-scope diagnostics will not flag uses of `params` inside R chunks. Without a `params:` key in the front matter, `params` is treated as any other undefined symbol and is flagged normally.
+
 Code intelligence for individual R chunks is covered in [chunks.md](chunks.md).
