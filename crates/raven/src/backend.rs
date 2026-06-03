@@ -6698,8 +6698,7 @@ pub(crate) async fn publish_diagnostics_inner(
     // the heavy phase the snapshot pattern was designed to keep
     // lock-free (see DiagnosticsSnapshot doc comment in handlers.rs).
     // Replicate the remaining `handlers::diagnostics` early-exits via
-    // snapshot fields, which already mirror `doc.file_type` and
-    // `doc.chunk_kind` from build time.
+    // snapshot fields, which already mirror `doc.file_type` from build time.
     let sync_diagnostics = match snapshot {
         // Rmd/Quarto documents flow through too (issue #343): the snapshot
         // carries the masked analysis text + tree, so `diagnostics_from_snapshot`

@@ -1010,15 +1010,6 @@ impl WorldState {
         self.documents.get(uri)
     }
 
-    /// Get enriched metadata for a URI, preferring already-enriched sources.
-    ///
-    /// Priority order:
-    /// 1. DocumentStore (open documents with enriched metadata)
-    /// 2. WorkspaceIndex (new unified index)
-    /// 3. Legacy cross_file_workspace_index
-    /// 4. Legacy documents HashMap (re-extract metadata)
-    /// 5. File cache (re-extract metadata)
-    ///
     /// Find or parse `CrossFileMetadata` for `uri` for the working-directory
     /// inheritance closures used by snapshot builds and several diagnostic
     /// helpers. Walks the chain: open document → cross-file workspace index
@@ -1046,6 +1037,21 @@ impl WorldState {
         None
     }
 
+    /// Get enriched metadata for a URI, preferring already-enriched sources.
+    ///
+    /// Priority order:
+    /// 1. DocumentStore (open documents with enriched metadata)
+    /// 2. WorkspaceIndex (new unified index)
+    /// 3. Legacy cross_file_workspace_index
+    /// 4. Legacy documents HashMap (re-extract metadata)
+    /// 5. File cache (re-extract metadata)
+    ///
+    /// CAVEAT (until Task 5 of issue #343 lands): the DocumentStore arm
+    /// (tier 1) stores metadata extracted from RAW text at `did_open` time,
+    /// so for open Rmd/Quarto documents it can return prose-derived metadata.
+    /// Callers needing masked-correct metadata for open Rmd docs must
+    /// re-derive from `analysis_text()` — see the bypass in
+    /// `DiagnosticsSnapshot::build`.
     pub fn get_enriched_metadata(
         &self,
         uri: &Url,
