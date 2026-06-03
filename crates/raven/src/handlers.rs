@@ -13015,9 +13015,12 @@ pub fn extract_definition_statement(
     symbol: &ScopedSymbol,
     state: &WorldState,
 ) -> Option<DefinitionInfo> {
-    // Get content provider for the symbol's source file
+    // Get content provider for the symbol's source file.
+    // Use analysis_text() so that byte offsets from doc.tree (which was parsed
+    // from the masked text for Rmd/Quarto) agree with the string we slice.
+    // For plain R documents analysis_text() == text(), so this is neutral there.
     let content = if let Some(doc) = state.documents.get(&symbol.source_uri) {
-        doc.text()
+        doc.analysis_text()
     } else {
         state.cross_file_file_cache.get(&symbol.source_uri)?
     };
@@ -36333,6 +36336,59 @@ mod integration_tests {
         assert!(def_info.is_some());
         let def_info = def_info.unwrap();
         assert_eq!(def_info.statement, "my_var <- 42");
+    }
+
+    #[test]
+    fn test_extract_definition_statement_rmd_source_uri() {
+        // Regression: extract_definition_statement must use analysis_text() (the
+        // masked text) not text() when the source_uri is an Rmd document.  The
+        // tree's byte offsets reference the masked text; slicing the raw text
+        // with those offsets returns garbage (or panics on a char boundary).
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        // Build an Rmd document whose masked byte length differs from its raw
+        // length: a YAML front matter block (non-R, blanked by masking) followed
+        // by a chunk containing `my_var <- 42`.  The front-matter lines are each
+        // 3–14 bytes in the raw text but 0 bytes in the masked text, so any
+        // byte-slice against the wrong string will land in the wrong position.
+        let rmd_uri = Url::parse("file:///test/report.Rmd").unwrap();
+        let rmd_content = "---\ntitle: Demo\n---\n\n```{r}\nmy_var <- 42\n```\n";
+        // Confirm the invariant we rely on: masked and raw lengths differ.
+        let masked = crate::chunks::mask_to_r(rmd_content);
+        assert_ne!(
+            masked.len(),
+            rmd_content.len(),
+            "test precondition: masked byte length must differ from raw"
+        );
+
+        let doc = Document::new_with_uri(rmd_content, None, &rmd_uri);
+        state.documents.insert(rmd_uri.clone(), doc);
+
+        // `my_var <- 42` is on line 5 (0-based) in both the raw and masked text
+        // because masking preserves newlines.
+        let symbol = ScopedSymbol {
+            name: Arc::from("my_var"),
+            kind: SymbolKind::Variable,
+            source_uri: rmd_uri.clone(),
+            defined_line: 5,
+            defined_column: 0,
+            signature: None,
+            is_declared: false,
+        };
+
+        let def_info = extract_definition_statement(&symbol, &state);
+        assert!(
+            def_info.is_some(),
+            "extract_definition_statement must find the symbol in an Rmd document"
+        );
+        assert_eq!(
+            def_info.unwrap().statement,
+            "my_var <- 42",
+            "extracted statement must match the assignment inside the chunk"
+        );
     }
 
     #[test]
