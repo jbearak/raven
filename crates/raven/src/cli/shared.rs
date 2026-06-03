@@ -187,6 +187,21 @@ pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     crate::state::collect_files_matching(dir, out, is_r_file);
 }
 
+/// Recursively collect both R sources (`.R` / `.r`) and chunk-bearing documents
+/// (`.Rmd` / `.qmd`, case-insensitive) under `dir`. Same directory walk as
+/// [`collect_r_file_paths`] — symlinked directories are followed with
+/// canonical-path cycle detection and non-source directories pruned — but the
+/// predicate also matches chunk files so their R chunks are diagnosed
+/// (issue #343).
+///
+/// Used by `raven check`'s report walk (empty `PATHS` or an explicit directory)
+/// and reused by `raven lint`'s walk so the two commands agree on which files a
+/// directory contributes. Results are unsorted; callers that need deterministic
+/// order sort afterwards.
+pub fn collect_check_target_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    crate::state::collect_files_matching(dir, out, |p| is_r_file(p) || is_chunk_file(p));
+}
+
 /// Build the reported finding for a target that isn't valid UTF-8. A
 /// mis-encoded source file (typically Latin-1 / Windows-1252 saved without a
 /// BOM) can't be parsed, but it's a property of the user's code — so it's an
@@ -578,6 +593,30 @@ mod tests {
         // a.R + sub/b.r; .Rmd is not an R source; .git is pruned.
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|p| is_r_file(p)));
+    }
+
+    #[test]
+    fn collect_check_target_paths_includes_r_and_chunk_files() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.R"), "1\n").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/b.r"), "2\n").unwrap();
+        fs::write(tmp.path().join("c.Rmd"), "prose\n").unwrap();
+        fs::write(tmp.path().join("d.qmd"), "prose\n").unwrap();
+        // Mixed-case chunk extensions are matched (is_chunk_file is
+        // case-insensitive).
+        fs::write(tmp.path().join("e.QMD"), "prose\n").unwrap();
+        fs::write(tmp.path().join("f.txt"), "not source\n").unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".git/g.R"), "3\n").unwrap();
+
+        let mut out = Vec::new();
+        collect_check_target_paths(tmp.path(), &mut out);
+        // a.R + sub/b.r + c.Rmd + d.qmd + e.QMD; .txt skipped; .git pruned.
+        assert_eq!(out.len(), 5, "got {out:?}");
+        assert!(out.iter().all(|p| is_r_file(p) || is_chunk_file(p)));
+        assert!(out.iter().any(|p| is_chunk_file(p)));
     }
 
     #[cfg(unix)]
