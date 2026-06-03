@@ -849,6 +849,60 @@ fn propagate_package_origins(
     }
 }
 
+/// Single source of truth for the forward-`source()` symbol leak rule, shared
+/// by the recursive resolver (STEP 2 of `scope_at_position_with_graph_recursive`)
+/// and `ScopeStream::resolve_source_contribution`. Returns `true` when a child
+/// symbol must NOT flow back out through the forward edge into the querying
+/// scope.
+///
+/// Two leak conditions, checked in order:
+///
+/// 1. **Same-file leak** (`symbol.source_uri == *queried_uri`): a forward
+///    `source()` may transitively revisit the queried file at `(MAX, MAX)`,
+///    and that revisit would otherwise leak the file's own *future*
+///    definitions back into the narrower original query scope. Self-file
+///    symbols are always re-entered by STEP 2 with proper `visible_from`
+///    filtering, so dropping them here loses nothing.
+///
+/// 2. **Parent-prefix-only leak** (`child_parent_prefix_names.contains(name)`):
+///    symbols the child only *inherited* from ITS callers are context, not
+///    bindings produced by executing the child. They must not leak back out
+///    through this forward edge or replace the caller's own parent-prefix
+///    binding.
+fn child_source_symbol_is_leak(
+    symbol: &ScopedSymbol,
+    name: &Arc<str>,
+    queried_uri: &Url,
+    child_parent_prefix_names: &HashSet<Arc<str>>,
+) -> bool {
+    symbol.source_uri == *queried_uri || child_parent_prefix_names.contains(name)
+}
+
+/// Same-file leak filter for packages, shared by the recursive resolver and
+/// `ScopeStream::resolve_source_contribution`. Iterates the child's loaded and
+/// inherited packages, skipping any whose only known origin is the queried file
+/// (`queried_uri`) — a child whose own cross-file recursion brought packages
+/// back from a path through the queried file would otherwise re-import them.
+/// Surviving packages are inserted into `dst_packages` and their origins
+/// propagated into `dst_origins` so downstream merge sites can run the same
+/// filter.
+fn merge_child_source_packages(
+    child_loaded: &HashSet<String>,
+    child_inherited: &HashSet<String>,
+    child_origins: &HashMap<String, HashSet<Arc<Url>>>,
+    queried_uri: &Url,
+    dst_packages: &mut HashSet<String>,
+    dst_origins: &mut HashMap<String, HashSet<Arc<Url>>>,
+) {
+    for pkg in child_loaded.iter().chain(child_inherited.iter()) {
+        if package_only_origin_is_uri(child_origins, pkg, queried_uri) {
+            continue;
+        }
+        dst_packages.insert(pkg.clone());
+        propagate_package_origins(child_origins, pkg, dst_origins);
+    }
+}
+
 /// Determine whether a `source()` call should use local scoping rules.
 ///
 /// The function returns `true` when the `ForwardSource` explicitly requests local
@@ -3934,31 +3988,29 @@ where
                             &mut scope.visible_positions,
                             &child_scope.visible_positions,
                         );
-                        // Merge child symbols (local definitions take precedence)
-                        //
-                        // Filter out symbols whose `source_uri` is the current
-                        // file: same rationale as the backward-edge merge
-                        // above. A forward source() may transitively revisit
-                        // this file at (MAX, MAX), and that revisit would
-                        // otherwise leak our own future definitions back into
-                        // our scope at the narrower original query position.
-                        // Self-file symbols are always re-entered by STEP 2
-                        // with proper `visible_from` filtering.
+                        // Merge child symbols (local definitions take
+                        // precedence). The forward-source leak rule (same-file
+                        // + parent-prefix-only) lives in
+                        // `child_source_symbol_is_leak`.
                         let child_parent_prefix_symbol_names =
                             child_scope.parent_prefix_symbol_names.clone();
                         for (name, symbol) in child_scope.symbols {
-                            if symbol.source_uri == *uri {
+                            if child_source_symbol_is_leak(
+                                &symbol,
+                                &name,
+                                uri,
+                                &child_parent_prefix_symbol_names,
+                            ) {
                                 continue;
                             }
-                            // Parent-prefix-only child symbols are context
-                            // the child inherited from one of its callers,
-                            // not bindings produced by executing the child.
-                            // They must not leak back out through this
-                            // forward source() edge or replace the caller's
-                            // own parent-prefix binding.
-                            if child_parent_prefix_symbol_names.contains(&name) {
-                                continue;
-                            }
+                            // The identical-binding no-op and marker-override
+                            // merge below stay recursive-only: they preserve
+                            // this frame's `parent_prefix_symbol_names` marker,
+                            // which streaming has no equivalent of (its prefix
+                            // is held separately and combined at snapshot).
+                            // Pinned by
+                            // `test_scope_stream_parent_prefix_override_matches_recursive`.
+                            //
                             // A sourced file's resolved scope includes symbols
                             // it inherited from its own parents. Re-exporting
                             // an identical already-visible binding is a no-op
@@ -3982,27 +4034,17 @@ where
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
 
-                        // Packages loaded in the sourced file become available after the source() call.
-                        //
-                        // Same-file leak filter: skip packages whose only known
-                        // origin is the queried file (`*uri`). A child whose
-                        // own cross-file recursion brought packages back from a
-                        // path through `*uri` would otherwise re-import them.
-                        for pkg in child_scope
-                            .loaded_packages
-                            .iter()
-                            .chain(child_scope.inherited_packages.iter())
-                        {
-                            if package_only_origin_is_uri(&child_scope.package_origins, pkg, uri) {
-                                continue;
-                            }
-                            scope.loaded_packages.insert(pkg.clone());
-                            propagate_package_origins(
-                                &child_scope.package_origins,
-                                pkg,
-                                &mut scope.package_origins,
-                            );
-                        }
+                        // Packages loaded in the sourced file become available
+                        // after the source() call. The same-file leak filter
+                        // lives in `merge_child_source_packages`.
+                        merge_child_source_packages(
+                            &child_scope.loaded_packages,
+                            &child_scope.inherited_packages,
+                            &child_scope.package_origins,
+                            uri,
+                            &mut scope.loaded_packages,
+                            &mut scope.package_origins,
+                        );
                     }
                 }
             }
@@ -5408,17 +5450,16 @@ where
             None,
         );
 
-        // Same-file leak filter: drop child symbols whose `source_uri` is
-        // the queried URI. A forward source() may transitively revisit
-        // the queried URI at (MAX, MAX); without this filter, our own
-        // future definitions would leak back into our scope at the
-        // narrower original query position. (Mirrors `scope.rs:3617-3622`.)
+        // Forward-source leak rule (same-file + parent-prefix-only) lives in
+        // `child_source_symbol_is_leak`.
         let child_parent_prefix_symbol_names = child_scope.parent_prefix_symbol_names.clone();
         for (name, symbol) in child_scope.symbols {
-            if symbol.source_uri == *self.queried_uri {
-                continue;
-            }
-            if child_parent_prefix_symbol_names.contains(&name) {
+            if child_source_symbol_is_leak(
+                &symbol,
+                &name,
+                self.queried_uri,
+                &child_parent_prefix_symbol_names,
+            ) {
                 continue;
             }
             contrib.symbols.entry(name).or_insert(symbol);
@@ -5430,22 +5471,16 @@ where
         );
         contrib.depth_exceeded.extend(child_scope.depth_exceeded);
 
-        // Same-file leak filter for packages (mirrors `scope.rs:3632-3650`).
-        for pkg in child_scope
-            .loaded_packages
-            .iter()
-            .chain(child_scope.inherited_packages.iter())
-        {
-            if package_only_origin_is_uri(&child_scope.package_origins, pkg, self.queried_uri) {
-                continue;
-            }
-            contrib.packages.insert(pkg.clone());
-            propagate_package_origins(
-                &child_scope.package_origins,
-                pkg,
-                &mut contrib.package_origins,
-            );
-        }
+        // Same-file leak filter for packages lives in
+        // `merge_child_source_packages`.
+        merge_child_source_packages(
+            &child_scope.loaded_packages,
+            &child_scope.inherited_packages,
+            &child_scope.package_origins,
+            self.queried_uri,
+            &mut contrib.packages,
+            &mut contrib.package_origins,
+        );
 
         contrib
     }
