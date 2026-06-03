@@ -5451,6 +5451,74 @@ where
     }
 }
 
+/// Benchmark-only streaming sweep over `positions`, performing an `is_visible`
+/// check at each for every name in `names`. Returns an accumulated count of
+/// `(position, name)` pairs that were visible, so `criterion`'s `black_box`
+/// can defeat dead-code elimination.
+///
+/// This exists **solely** for the criterion benches in
+/// `crates/raven/benches/cross_file.rs` (gated on the `test-support` feature so
+/// it never enters a production build). It mirrors what the diagnostics path in
+/// `handlers.rs` does per usage — `advance_to` followed by `is_visible(name)` —
+/// without requiring external benches to construct the `pub(crate)`
+/// [`ScopeStream`] directly. It is **NOT** a public API: do not call it from
+/// production code, and do not widen [`ScopeStream`]'s visibility for it.
+///
+/// `positions` must be in document order (the cursor advances monotonically;
+/// out-of-order targets are no-ops). Returns `0` if the stream can't be
+/// constructed (no artifacts for `uri`).
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_arguments)]
+pub fn bench_scope_stream_sweep<F, G>(
+    uri: &Url,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    prefix_cache: &std::cell::RefCell<ParentPrefixCache>,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    positions: &[(u32, u32)],
+    names: &[&str],
+) -> usize
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    let mut stream = match ScopeStream::new(
+        uri,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        prefix_cache,
+        package_contribution,
+    ) {
+        Some(stream) => stream,
+        None => return 0,
+    };
+
+    let mut visible_count = 0usize;
+    for &(line, column) in positions {
+        stream.advance_to(line, column);
+        for name in names {
+            if stream.is_visible(name) {
+                visible_count += 1;
+            }
+        }
+    }
+    visible_count
+}
+
 /// `package:base` URL — parsed once and reused for every `seed_base_exports`
 /// call. Each `ScopeStream` construction (and every recursive resolver
 /// invocation that injects base exports) would otherwise re-parse the same
