@@ -75,6 +75,43 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     extract_metadata_with_tree(content, tree.as_ref())
 }
 
+/// The R-analysis view of `content` for the file identified by `path_or_uri`:
+/// the geometry-preserving [`crate::chunks::mask_to_r`] mask for R Markdown /
+/// Quarto documents (`.Rmd` / `.qmd`), and the raw `content` borrowed
+/// unchanged for everything else.
+///
+/// This is the single place that pairs path-based classification with masking
+/// for closed-file / on-demand-indexing call sites that only have a path and a
+/// byte string (no constructed `Document`). Open documents should prefer the
+/// already-masked [`crate::state::Document::analysis_text`] instead of
+/// re-masking here.
+///
+/// Returns a `Cow` so the plain-R case (the overwhelming majority) borrows
+/// without allocating.
+pub fn analysis_text_for_path<'a>(
+    path_or_uri: &str,
+    content: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    match crate::chunks::classify_chunk_document(path_or_uri) {
+        crate::chunks::ChunkKind::Rmd => std::borrow::Cow::Owned(crate::chunks::mask_to_r(content)),
+        crate::chunks::ChunkKind::R => std::borrow::Cow::Borrowed(content),
+    }
+}
+
+/// Extract cross-file metadata from `content`, masking R Markdown / Quarto
+/// prose first so directives, `source()` calls, and `library()` calls are
+/// taken from R chunk bodies only (never from prose or YAML front matter).
+///
+/// For non-Rmd files this is identical to [`extract_metadata`]. Use this at any
+/// site that extracts metadata from a path-identified file's *raw* content
+/// (file-cache fallbacks, on-demand indexing, legacy-document arms) so that
+/// `.Rmd` / `.qmd` files contribute outgoing edges from their chunks rather
+/// than spurious prose-derived ones (issue #343).
+pub fn extract_metadata_for_path(path_or_uri: &str, content: &str) -> CrossFileMetadata {
+    let analysis = analysis_text_for_path(path_or_uri, content);
+    extract_metadata(&analysis)
+}
+
 /// Extract cross-file metadata using a pre-parsed tree when available.
 ///
 /// This avoids redundant parsing when the caller already has a tree-sitter `Tree`.

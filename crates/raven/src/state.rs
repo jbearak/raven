@@ -1041,7 +1041,12 @@ impl WorldState {
         }
         let content_provider = self.content_provider();
         if let Some(content) = content_provider.get_content(uri) {
-            return Some(Arc::new(crate::cross_file::extract_metadata(&content)));
+            // Cached content is RAW; mask Rmd/Quarto before extracting so
+            // directives come from chunk bodies, not prose (#343).
+            return Some(Arc::new(crate::cross_file::extract_metadata_for_path(
+                uri.path(),
+                &content,
+            )));
         }
         None
     }
@@ -1055,12 +1060,15 @@ impl WorldState {
     /// 4. Legacy documents HashMap (re-extract metadata)
     /// 5. File cache (re-extract metadata)
     ///
-    /// CAVEAT (until Task 5 of issue #343 lands): the DocumentStore arm
-    /// (tier 1) stores metadata extracted from RAW text at `did_open` time,
-    /// so for open Rmd/Quarto documents it can return prose-derived metadata.
-    /// Callers needing masked-correct metadata for open Rmd docs must
-    /// re-derive from `analysis_text()` — see the bypass in
-    /// `DiagnosticsSnapshot::build`.
+    /// Rmd/Quarto note (issue #343): every tier here is masked-correct for
+    /// open R Markdown / Quarto documents. The DocumentStore arm (tier 1)
+    /// stores metadata extracted from the masked analysis text at
+    /// `did_open`/`did_change` time (`backend.rs` passes
+    /// `extract_metadata_for_path`, and `DocumentStore::compute_derived`
+    /// re-derives artifacts from the masked text); the legacy-documents arm
+    /// (tier 4) and the file-cache arm (tier 5) likewise mask via
+    /// `analysis_text()` / `extract_metadata_for_path`. So directives,
+    /// `source()`, and `library()` always reflect chunk bodies, never prose.
     pub fn get_enriched_metadata(
         &self,
         uri: &Url,
@@ -1079,9 +1087,15 @@ impl WorldState {
                     .map(|doc| Arc::new(crate::cross_file::extract_metadata(&doc.analysis_text())))
             })
             .or_else(|| {
-                self.cross_file_file_cache
-                    .get(uri)
-                    .map(|content| Arc::new(crate::cross_file::extract_metadata(&content)))
+                // Cached content is RAW; mask Rmd/Quarto before extracting so
+                // directives/source()/library() come from chunk bodies, not
+                // prose (#343).
+                self.cross_file_file_cache.get(uri).map(|content| {
+                    Arc::new(crate::cross_file::extract_metadata_for_path(
+                        uri.path(),
+                        &content,
+                    ))
+                })
             })
     }
 

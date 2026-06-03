@@ -153,32 +153,21 @@ impl DiagnosticsSnapshot {
         // parsed from this exact text, so the two stay consistent and every
         // diagnostic range is a valid document coordinate.
         let text = doc.analysis_text();
-        let is_rmd = doc.chunk_kind == crate::chunks::ChunkKind::Rmd;
         // Get enriched metadata. The snapshot owns its `directive_meta` so it
         // can mutate `inherited_working_directory` in place; we deep-clone
         // only this single entry, while neighbors stay Arc-wrapped.
         //
-        // For Rmd/Quarto documents, derive metadata directly from the MASKED
-        // analysis text rather than `get_enriched_metadata`. The DocumentStore
-        // entry for an open Rmd doc is populated at did_open time from the RAW
-        // text (backend.rs), so `get_enriched_metadata` would otherwise return
-        // raw-derived metadata: a `# @lsp-cd` in prose would be (wrongly)
-        // honored as a directive, and `source()`/`library()` calls inside
-        // chunks would be missed. Re-extracting from `(text, tree)` — both
-        // masked — keeps directives prose-aware and chunk-call-aware.
-        // (Rewiring the DocumentStore did_open/did_change path to store
-        // masked-derived metadata is Task 5's territory; this snapshot-local
-        // re-derivation makes the diagnostics path correct in the meantime.)
-        let mut directive_meta = if is_rmd {
-            crate::cross_file::extract_metadata_with_tree(&text, Some(&tree))
-        } else {
-            state
-                .get_enriched_metadata(uri)
-                .map(std::sync::Arc::unwrap_or_clone)
-                .unwrap_or_else(|| {
-                    crate::cross_file::extract_metadata_with_tree(&text, Some(&tree))
-                })
-        };
+        // `get_enriched_metadata` is masked-correct for open Rmd/Quarto docs:
+        // the DocumentStore arm now stores metadata derived from the masked
+        // analysis text at did_open/did_change time (#343 Task 5), and the
+        // remaining tiers mask too. So a `# @lsp-cd` in prose is ignored while
+        // chunk `source()`/`library()` calls are captured — no Rmd special case
+        // needed here. The fallback re-extracts from the masked `(text, tree)`
+        // for the rare case where no enriched entry exists yet.
+        let mut directive_meta = state
+            .get_enriched_metadata(uri)
+            .map(std::sync::Arc::unwrap_or_clone)
+            .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
         let metadata_elapsed = build_start.elapsed();
 
         // Compute inherited working directory if needed
@@ -15036,34 +15025,40 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // Search current document
     find_references_in_tree(tree.root_node(), name, &text, uri, &mut locations);
 
-    // Search all open documents using new DocumentStore
+    // Search all open documents using new DocumentStore.
+    // Pair the DocumentStore tree with its analysis text (masked for Rmd/Quarto,
+    // raw otherwise) — never `get_content` (which is RAW): the tree's byte
+    // offsets index into the masked text, so slicing raw content mis-slices
+    // (and can panic on a non-UTF-8 boundary) for `.Rmd`/`.qmd` files (#343).
     for file_uri in state.document_store.uris() {
         if &file_uri == uri {
             continue; // Already searched
         }
-        if let Some(content) = content_provider.get_content(&file_uri) {
-            // Parse the content to search for references
-            if let Some(doc_state) = state.document_store.get_without_touch(&file_uri)
-                && let Some(tree) = &doc_state.tree
-            {
-                find_references_in_tree(
-                    tree.root_node(),
-                    name,
-                    &content,
-                    &file_uri,
-                    &mut locations,
-                );
-            }
+        if let Some(doc_state) = state.document_store.get_without_touch(&file_uri)
+            && let Some(tree) = &doc_state.tree
+        {
+            let file_text = doc_state.analysis_text();
+            find_references_in_tree(
+                tree.root_node(),
+                name,
+                &file_text,
+                &file_uri,
+                &mut locations,
+            );
         }
     }
 
-    // Search workspace index using new WorkspaceIndex
+    // Search workspace index using new WorkspaceIndex. The entry's `tree` is
+    // parsed from the masked analysis text for Rmd/Quarto (on-demand indexing),
+    // while `contents` is RAW — pair the tree with the masked analysis view so
+    // byte offsets align (#343).
     for (file_uri, entry) in state.workspace_index_new.iter() {
         if &file_uri == uri || state.document_store.contains(&file_uri) {
             continue; // Already searched
         }
         if let Some(tree) = &entry.tree {
-            let file_text = entry.contents.to_string();
+            let raw = entry.contents.to_string();
+            let file_text = crate::cross_file::analysis_text_for_path(file_uri.path(), &raw);
             find_references_in_tree(
                 tree.root_node(),
                 name,

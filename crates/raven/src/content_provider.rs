@@ -235,11 +235,14 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             return Some(doc.metadata.clone());
         }
 
-        // 2. Check legacy documents HashMap (for migration compatibility)
+        // 2. Check legacy documents HashMap (for migration compatibility).
+        //    Use the analysis text (masked for Rmd/Quarto, raw otherwise) so
+        //    directives/source()/library() come from chunk bodies, not prose
+        //    (#343), and so byte offsets stay consistent with downstream uses.
         if let Some(legacy_docs) = self.legacy_documents
             && let Some(doc) = legacy_docs.get(uri)
         {
-            let text = doc.text();
+            let text = doc.analysis_text();
             return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
         }
 
@@ -255,11 +258,12 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             return Some(metadata);
         }
 
-        // 5. Check legacy workspace_index (for migration compatibility)
+        // 5. Check legacy workspace_index (for migration compatibility).
+        //    Analysis text (masked for Rmd/Quarto, raw otherwise) — see step 2.
         if let Some(legacy_ws) = self.legacy_workspace_index
             && let Some(doc) = legacy_ws.get(uri)
         {
-            let text = doc.text();
+            let text = doc.analysis_text();
             return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
         }
 
