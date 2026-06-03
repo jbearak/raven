@@ -708,7 +708,7 @@ pub fn semantic_tokens_for_rmd_document(text: &str) -> SemanticTokens {
     }
 
     for chunk in &chunks {
-        if !is_r_chunk_language(&chunk.language) {
+        if !crate::chunks::is_r_chunk_language(&chunk.language) {
             continue;
         }
         // Body lines: lines after the header fence, up to but not including the
@@ -751,14 +751,6 @@ pub fn semantic_tokens_for_rmd_document(text: &str) -> SemanticTokens {
         result_id: None,
         data: encode_semantic_tokens(absolute_tokens),
     }
-}
-
-/// True for chunk language tags that should be tokenized as R. Pandoc/knitr
-/// permit a few aliases (`r`, `R`, plus the rare `Rscript`). The chunk
-/// detector lower-cases the tag before storing it, so a simple ASCII compare
-/// is sufficient here.
-fn is_r_chunk_language(language: &str) -> bool {
-    matches!(language, "r" | "rscript")
 }
 
 fn semantic_tokens_for_r_tree(root: Node, text: &str) -> SemanticTokens {
