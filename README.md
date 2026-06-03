@@ -66,7 +66,9 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 ## Installation
 
-**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r).
+**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) 
+
+**Cursor, Positron, and other VS Code-based editors:** Install from [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r) or download the .vsix file from the [releases page](https://github.com/jbearak/raven/releases) and install manually.
 
 **Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
 
