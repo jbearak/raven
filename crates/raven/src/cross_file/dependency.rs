@@ -1591,65 +1591,22 @@ impl DependencyGraph {
     ///
     /// `max_visited` caps the total number of nodes collected to prevent
     /// unbounded expansion in dense bidirectional graphs.
+    ///
+    /// Single-seed convenience wrapper around
+    /// [`Self::collect_neighborhood_multi`].
     pub fn collect_neighborhood(
         &self,
         uri: &Url,
         max_depth: usize,
         max_visited: usize,
     ) -> HashSet<Url> {
-        let mut visited = HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back((uri.clone(), 0usize));
-        visited.insert(uri.clone());
-
-        while let Some((current, depth)) = queue.pop_front() {
-            if depth >= max_depth {
-                if self.has_unvisited_neighbors(&current, &visited) {
-                    self.record_depth_truncation();
-                }
-                continue;
-            }
-            if visited.len() >= max_visited {
-                if self.has_unvisited_neighbors(&current, &visited) {
-                    self.record_visited_budget_truncation();
-                }
-                continue;
-            }
-            // Follow forward edges (children)
-            if let Some(edges) = self.forward.get(&current) {
-                for edge in edges {
-                    if visited.len() >= max_visited {
-                        if !visited.contains(&edge.to) {
-                            self.record_visited_budget_truncation();
-                        }
-                        break;
-                    }
-                    if visited.insert(edge.to.clone()) {
-                        queue.push_back((edge.to.clone(), depth + 1));
-                    }
-                }
-            }
-            // Follow backward edges (parents)
-            if let Some(edges) = self.backward.get(&current) {
-                for edge in edges {
-                    if visited.len() >= max_visited {
-                        if !visited.contains(&edge.from) {
-                            self.record_visited_budget_truncation();
-                        }
-                        break;
-                    }
-                    if visited.insert(edge.from.clone()) {
-                        queue.push_back((edge.from.clone(), depth + 1));
-                    }
-                }
-            }
-        }
-        visited
+        self.collect_neighborhood_multi(std::iter::once(uri.clone()), max_depth, max_visited)
     }
 
-    /// Multi-seed variant of `collect_neighborhood`. Performs a single BFS
-    /// from all seeds sharing one visited set and one global `max_visited`
-    /// budget, avoiding redundant traversal of shared ancestors.
+    /// Multi-seed neighborhood walk: a single BFS from all seeds sharing one
+    /// visited set and one global `max_visited` budget, avoiding redundant
+    /// traversal of shared ancestors. [`Self::collect_neighborhood`] is the
+    /// single-seed wrapper.
     pub fn collect_neighborhood_multi(
         &self,
         seeds: impl IntoIterator<Item = Url>,
