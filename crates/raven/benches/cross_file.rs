@@ -129,6 +129,20 @@ fn build_nested_interval_tree(depth: usize) -> FunctionScopeTree {
 // file_0.R (the root of the source chain) for chain depths 1, 5, and 15.
 // ---------------------------------------------------------------------------
 
+/// Per-depth fixture shared by `bench_scope_resolution` and
+/// `bench_diagnostic_sweep` — the two groups deliberately use the same
+/// workspace shape so their numbers are comparable. Enough files to cover
+/// the chain, plus a few extra.
+fn config_for_depth(depth: usize) -> FixtureConfig {
+    FixtureConfig {
+        file_count: (depth + 5).max(10),
+        functions_per_file: 5,
+        source_chain_depth: depth,
+        library_calls_per_file: 1,
+        extra_lines_per_file: 3,
+    }
+}
+
 fn bench_scope_resolution(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_file_scope_resolution");
     group.sample_size(20);
@@ -136,16 +150,7 @@ fn bench_scope_resolution(c: &mut Criterion) {
     let chain_depths: &[usize] = &[1, 5, 15];
 
     for &depth in chain_depths {
-        // Create a workspace with the specified chain depth.
-        // Use enough files to cover the chain, plus a few extra.
-        let file_count = (depth + 5).max(10);
-        let config = FixtureConfig {
-            file_count,
-            functions_per_file: 5,
-            source_chain_depth: depth,
-            library_calls_per_file: 1,
-            extra_lines_per_file: 3,
-        };
+        let config = config_for_depth(depth);
 
         let workspace = create_fixture_workspace(&config);
         let workspace_path = workspace.path();
@@ -175,6 +180,178 @@ fn bench_scope_resolution(c: &mut Criterion) {
                 ))
             })
         });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: Diagnostic-style sweep — streaming vs per-position resolution
+//
+// Quantifies *why* `ScopeStream` exists: the production out-of-scope
+// diagnostic collector (handlers.rs) sweeps every identifier usage in a file
+// in document order, doing an `advance_to` + `is_visible` per usage against a
+// single streaming cursor. This group compares that streaming sweep against
+// the two per-position alternatives it replaced:
+//
+//   1. streaming           — one ScopeStream advanced through K positions.
+//   2. per-position cached  — K `scope_at_position_with_graph_cached` calls
+//                             sharing ONE ParentPrefixCache (fresh per
+//                             iteration, shared within the K calls).
+//   3. per-position uncached — K `scope_at_position_with_graph` calls.
+//
+// Parameterized by source_chain_depth (1, 5, 15) like the scope-resolution
+// group. K is fixed within a depth so the three arms are directly comparable.
+//
+// Expected: streaming << per-position cached << per-position uncached.
+// ---------------------------------------------------------------------------
+
+/// Number of document-order positions to sweep per arm, fixed across depths.
+const SWEEP_POSITIONS: usize = 100;
+
+/// Build `SWEEP_POSITIONS` document-order (line, column) positions for a file
+/// with `line_count` lines. Line and column indices wrap independently, so
+/// positions repeat after a few sweeps of the file; repeats are fine — they
+/// exercise `advance_to` no-op/re-query paths. Positions are sorted ascending
+/// so the streaming cursor advances monotonically.
+fn sweep_positions(line_count: usize) -> Vec<(u32, u32)> {
+    let line_count = line_count.max(1) as u32;
+    let columns: &[u32] = &[0, 4, 8];
+    let mut positions = Vec::with_capacity(SWEEP_POSITIONS);
+    for i in 0..SWEEP_POSITIONS {
+        let line = (i as u32) % line_count;
+        let column = columns[i % columns.len()];
+        positions.push((line, column));
+    }
+    positions.sort_unstable();
+    positions
+}
+
+fn bench_diagnostic_sweep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cross_file_diagnostic_sweep");
+    group.sample_size(20);
+
+    let chain_depths: &[usize] = &[1, 5, 15];
+
+    // Identifier names that actually exist in the fixture so `is_visible`
+    // does real work: `func_0_0` (local def in file_0.R), `var_0_0` (local
+    // extra-line def), `func_1_0` (inherited via `source("file_1.R")`), and
+    // `missing_sym` (genuinely absent — exercises the not-found path).
+    let names: &[&str] = &["func_0_0", "var_0_0", "func_1_0", "missing_sym"];
+
+    for &depth in chain_depths {
+        let config = config_for_depth(depth);
+
+        let workspace = create_fixture_workspace(&config);
+        let workspace_path = workspace.path();
+        let folder_url = Url::from_file_path(workspace_path).unwrap();
+
+        let (artifacts_map, metadata_map) = precompute_artifacts(workspace_path);
+        let graph = build_dependency_graph(&metadata_map, Some(&folder_url));
+        let uri = file_0_uri(workspace_path);
+        let base_exports: HashSet<String> = HashSet::new();
+
+        let content = std::fs::read_to_string(workspace_path.join("file_0.R")).unwrap();
+        let positions = sweep_positions(content.lines().count());
+
+        let get_artifacts = |u: &Url| artifacts_map.get(u).cloned();
+        let get_metadata = |u: &Url| metadata_map.get(u).cloned();
+        let is_cancelled = || false;
+
+        // Arm 1: streaming sweep.
+        group.bench_with_input(BenchmarkId::new("streaming", depth), &depth, |b, _| {
+            b.iter(|| {
+                let prefix_cache =
+                    std::cell::RefCell::new(raven::cross_file::ParentPrefixCache::new());
+                black_box(raven::cross_file::bench_scope_stream_sweep(
+                    black_box(&uri),
+                    &get_artifacts,
+                    &get_metadata,
+                    &graph,
+                    Some(&folder_url),
+                    black_box(20),
+                    &base_exports,
+                    true,
+                    raven::cross_file::config::BackwardDependencyMode::Explicit,
+                    &is_cancelled,
+                    &prefix_cache,
+                    None,
+                    black_box(&positions),
+                    black_box(names),
+                ))
+            })
+        });
+
+        // Arm 2: per-position, cached — one ParentPrefixCache shared across
+        // the K calls (fresh per iteration, shared within).
+        group.bench_with_input(
+            BenchmarkId::new("per_position_cached", depth),
+            &depth,
+            |b, _| {
+                b.iter(|| {
+                    let mut prefix_cache = raven::cross_file::ParentPrefixCache::new();
+                    let mut acc = 0usize;
+                    for &(line, column) in &positions {
+                        let scope = raven::cross_file::scope_at_position_with_graph_cached(
+                            black_box(&uri),
+                            line,
+                            column,
+                            &get_artifacts,
+                            &get_metadata,
+                            &graph,
+                            Some(&folder_url),
+                            black_box(20),
+                            &base_exports,
+                            true,
+                            raven::cross_file::config::BackwardDependencyMode::Explicit,
+                            &is_cancelled,
+                            &mut prefix_cache,
+                            None,
+                        );
+                        for name in names {
+                            if scope.symbols.contains_key(*name) {
+                                acc += 1;
+                            }
+                        }
+                    }
+                    black_box(acc)
+                })
+            },
+        );
+
+        // Arm 3: per-position, uncached.
+        group.bench_with_input(
+            BenchmarkId::new("per_position_uncached", depth),
+            &depth,
+            |b, _| {
+                b.iter(|| {
+                    let mut acc = 0usize;
+                    for &(line, column) in &positions {
+                        let scope = raven::cross_file::scope_at_position_with_graph(
+                            black_box(&uri),
+                            line,
+                            column,
+                            &get_artifacts,
+                            &get_metadata,
+                            &graph,
+                            Some(&folder_url),
+                            black_box(20),
+                            &base_exports,
+                            true,
+                            raven::cross_file::config::BackwardDependencyMode::Explicit,
+                            &is_cancelled,
+                            None,
+                        );
+                        for name in names {
+                            if scope.symbols.contains_key(*name) {
+                                acc += 1;
+                            }
+                        }
+                    }
+                    black_box(acc)
+                })
+            },
+        );
     }
 
     group.finish();
@@ -389,6 +566,7 @@ fn bench_dependency_graph(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_scope_resolution,
+    bench_diagnostic_sweep,
     bench_dependency_graph,
     bench_scope_hotspots,
     bench_interval_tree_queries,

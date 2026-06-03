@@ -849,6 +849,60 @@ fn propagate_package_origins(
     }
 }
 
+/// Single source of truth for the forward-`source()` symbol leak rule, shared
+/// by the recursive resolver (STEP 2 of `scope_at_position_with_graph_recursive`)
+/// and `ScopeStream::resolve_source_contribution`. Returns `true` when a child
+/// symbol must NOT flow back out through the forward edge into the querying
+/// scope.
+///
+/// Two leak conditions, checked in order:
+///
+/// 1. **Same-file leak** (`symbol.source_uri == *queried_uri`): a forward
+///    `source()` may transitively revisit the queried file at `(MAX, MAX)`,
+///    and that revisit would otherwise leak the file's own *future*
+///    definitions back into the narrower original query scope. Self-file
+///    symbols are always re-entered by STEP 2 with proper `visible_from`
+///    filtering, so dropping them here loses nothing.
+///
+/// 2. **Parent-prefix-only leak** (`child_parent_prefix_names.contains(name)`):
+///    symbols the child only *inherited* from ITS callers are context, not
+///    bindings produced by executing the child. They must not leak back out
+///    through this forward edge or replace the caller's own parent-prefix
+///    binding.
+fn child_source_symbol_is_leak(
+    symbol: &ScopedSymbol,
+    name: &Arc<str>,
+    queried_uri: &Url,
+    child_parent_prefix_names: &HashSet<Arc<str>>,
+) -> bool {
+    symbol.source_uri == *queried_uri || child_parent_prefix_names.contains(name)
+}
+
+/// Same-file leak filter for packages, shared by the recursive resolver and
+/// `ScopeStream::resolve_source_contribution`. Iterates the child's loaded and
+/// inherited packages, skipping any whose only known origin is the queried file
+/// (`queried_uri`) — a child whose own cross-file recursion brought packages
+/// back from a path through the queried file would otherwise re-import them.
+/// Surviving packages are inserted into `dst_packages` and their origins
+/// propagated into `dst_origins` so downstream merge sites can run the same
+/// filter.
+fn merge_child_source_packages(
+    child_loaded: &HashSet<String>,
+    child_inherited: &HashSet<String>,
+    child_origins: &HashMap<String, HashSet<Arc<Url>>>,
+    queried_uri: &Url,
+    dst_packages: &mut HashSet<String>,
+    dst_origins: &mut HashMap<String, HashSet<Arc<Url>>>,
+) {
+    for pkg in child_loaded.iter().chain(child_inherited.iter()) {
+        if package_only_origin_is_uri(child_origins, pkg, queried_uri) {
+            continue;
+        }
+        dst_packages.insert(pkg.clone());
+        propagate_package_origins(child_origins, pkg, dst_origins);
+    }
+}
+
 /// Determine whether a `source()` call should use local scoping rules.
 ///
 /// The function returns `true` when the `ForwardSource` explicitly requests local
@@ -3934,31 +3988,29 @@ where
                             &mut scope.visible_positions,
                             &child_scope.visible_positions,
                         );
-                        // Merge child symbols (local definitions take precedence)
-                        //
-                        // Filter out symbols whose `source_uri` is the current
-                        // file: same rationale as the backward-edge merge
-                        // above. A forward source() may transitively revisit
-                        // this file at (MAX, MAX), and that revisit would
-                        // otherwise leak our own future definitions back into
-                        // our scope at the narrower original query position.
-                        // Self-file symbols are always re-entered by STEP 2
-                        // with proper `visible_from` filtering.
+                        // Merge child symbols (local definitions take
+                        // precedence). The forward-source leak rule (same-file
+                        // + parent-prefix-only) lives in
+                        // `child_source_symbol_is_leak`.
                         let child_parent_prefix_symbol_names =
                             child_scope.parent_prefix_symbol_names.clone();
                         for (name, symbol) in child_scope.symbols {
-                            if symbol.source_uri == *uri {
+                            if child_source_symbol_is_leak(
+                                &symbol,
+                                &name,
+                                uri,
+                                &child_parent_prefix_symbol_names,
+                            ) {
                                 continue;
                             }
-                            // Parent-prefix-only child symbols are context
-                            // the child inherited from one of its callers,
-                            // not bindings produced by executing the child.
-                            // They must not leak back out through this
-                            // forward source() edge or replace the caller's
-                            // own parent-prefix binding.
-                            if child_parent_prefix_symbol_names.contains(&name) {
-                                continue;
-                            }
+                            // The identical-binding no-op and marker-override
+                            // merge below stay recursive-only: they preserve
+                            // this frame's `parent_prefix_symbol_names` marker,
+                            // which streaming has no equivalent of (its prefix
+                            // is held separately and combined at snapshot).
+                            // Pinned by
+                            // `test_scope_stream_parent_prefix_override_matches_recursive`.
+                            //
                             // A sourced file's resolved scope includes symbols
                             // it inherited from its own parents. Re-exporting
                             // an identical already-visible binding is a no-op
@@ -3982,27 +4034,17 @@ where
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
 
-                        // Packages loaded in the sourced file become available after the source() call.
-                        //
-                        // Same-file leak filter: skip packages whose only known
-                        // origin is the queried file (`*uri`). A child whose
-                        // own cross-file recursion brought packages back from a
-                        // path through `*uri` would otherwise re-import them.
-                        for pkg in child_scope
-                            .loaded_packages
-                            .iter()
-                            .chain(child_scope.inherited_packages.iter())
-                        {
-                            if package_only_origin_is_uri(&child_scope.package_origins, pkg, uri) {
-                                continue;
-                            }
-                            scope.loaded_packages.insert(pkg.clone());
-                            propagate_package_origins(
-                                &child_scope.package_origins,
-                                pkg,
-                                &mut scope.package_origins,
-                            );
-                        }
+                        // Packages loaded in the sourced file become available
+                        // after the source() call. The same-file leak filter
+                        // lives in `merge_child_source_packages`.
+                        merge_child_source_packages(
+                            &child_scope.loaded_packages,
+                            &child_scope.inherited_packages,
+                            &child_scope.package_origins,
+                            uri,
+                            &mut scope.loaded_packages,
+                            &mut scope.package_origins,
+                        );
                     }
                 }
             }
@@ -5408,17 +5450,16 @@ where
             None,
         );
 
-        // Same-file leak filter: drop child symbols whose `source_uri` is
-        // the queried URI. A forward source() may transitively revisit
-        // the queried URI at (MAX, MAX); without this filter, our own
-        // future definitions would leak back into our scope at the
-        // narrower original query position. (Mirrors `scope.rs:3617-3622`.)
+        // Forward-source leak rule (same-file + parent-prefix-only) lives in
+        // `child_source_symbol_is_leak`.
         let child_parent_prefix_symbol_names = child_scope.parent_prefix_symbol_names.clone();
         for (name, symbol) in child_scope.symbols {
-            if symbol.source_uri == *self.queried_uri {
-                continue;
-            }
-            if child_parent_prefix_symbol_names.contains(&name) {
+            if child_source_symbol_is_leak(
+                &symbol,
+                &name,
+                self.queried_uri,
+                &child_parent_prefix_symbol_names,
+            ) {
                 continue;
             }
             contrib.symbols.entry(name).or_insert(symbol);
@@ -5430,25 +5471,89 @@ where
         );
         contrib.depth_exceeded.extend(child_scope.depth_exceeded);
 
-        // Same-file leak filter for packages (mirrors `scope.rs:3632-3650`).
-        for pkg in child_scope
-            .loaded_packages
-            .iter()
-            .chain(child_scope.inherited_packages.iter())
-        {
-            if package_only_origin_is_uri(&child_scope.package_origins, pkg, self.queried_uri) {
-                continue;
-            }
-            contrib.packages.insert(pkg.clone());
-            propagate_package_origins(
-                &child_scope.package_origins,
-                pkg,
-                &mut contrib.package_origins,
-            );
-        }
+        // Same-file leak filter for packages lives in
+        // `merge_child_source_packages`.
+        merge_child_source_packages(
+            &child_scope.loaded_packages,
+            &child_scope.inherited_packages,
+            &child_scope.package_origins,
+            self.queried_uri,
+            &mut contrib.packages,
+            &mut contrib.package_origins,
+        );
 
         contrib
     }
+}
+
+/// Benchmark-only streaming sweep over `positions`, performing an `is_visible`
+/// check at each for every name in `names`. Returns an accumulated count of
+/// `(position, name)` pairs that were visible, so `criterion`'s `black_box`
+/// can defeat dead-code elimination.
+///
+/// This exists **solely** for the criterion benches in
+/// `crates/raven/benches/cross_file.rs` (gated on the `test-support` feature so
+/// it never enters a production build). It mirrors what the diagnostics path in
+/// `handlers.rs` does per usage — `advance_to` followed by `is_visible(name)` —
+/// without requiring external benches to construct the `pub(crate)`
+/// [`ScopeStream`] directly. It is **NOT** a public API: do not call it from
+/// production code, and do not widen [`ScopeStream`]'s visibility for it.
+///
+/// `positions` must be in document order (the cursor advances monotonically;
+/// out-of-order targets are no-ops). Returns `0` if the stream can't be
+/// constructed (no artifacts for `uri`).
+#[cfg(feature = "test-support")]
+// Reason: mirrors `ScopeStream::new`'s parameter surface 1:1; bundling into a
+// struct for a bench-only wrapper with a single caller isn't worth the churn.
+#[allow(clippy::too_many_arguments)]
+pub fn bench_scope_stream_sweep<F, G>(
+    uri: &Url,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    prefix_cache: &std::cell::RefCell<ParentPrefixCache>,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    positions: &[(u32, u32)],
+    names: &[&str],
+) -> usize
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    let mut stream = match ScopeStream::new(
+        uri,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        prefix_cache,
+        package_contribution,
+    ) {
+        Some(stream) => stream,
+        None => return 0,
+    };
+
+    let mut visible_count = 0usize;
+    for &(line, column) in positions {
+        stream.advance_to(line, column);
+        for name in names {
+            if stream.is_visible(name) {
+                visible_count += 1;
+            }
+        }
+    }
+    visible_count
 }
 
 /// `package:base` URL — parsed once and reused for every `seed_base_exports`
@@ -13668,6 +13773,40 @@ y <- filter(df)"#;
             })
         }
 
+        /// Project a resolver result's symbols into a sorted set of
+        /// `(name, source_uri, defined_line, defined_column, kind)` tuples
+        /// for identity comparison. A bare-name comparison would silently
+        /// miss provenance regressions (e.g. a first- vs last-source-wins
+        /// flip that keeps the name but changes the definition site).
+        /// `SymbolKind` is not `Ord`, so the kind is rendered via `Debug`
+        /// for a stable sort key; the string form still distinguishes every
+        /// variant.
+        fn symbol_identity_set(
+            scope: &ScopeAtPosition,
+        ) -> std::collections::BTreeSet<(String, String, u32, u32, String)> {
+            scope
+                .symbols
+                .iter()
+                .map(|(n, s)| {
+                    (
+                        n.to_string(),
+                        s.source_uri.to_string(),
+                        s.defined_line,
+                        s.defined_column,
+                        format!("{:?}", s.kind),
+                    )
+                })
+                .collect()
+        }
+
+        /// Per-symbol sibling of [`symbol_identity_set`]: project one symbol's
+        /// provenance into a comparable tuple. Keeps the observable-field list in
+        /// one place — adding a provenance field updates every assertion at once
+        /// instead of ~19 hand-spelled tuples.
+        fn symbol_provenance(s: &ScopedSymbol) -> (&Url, u32, u32, SymbolKind) {
+            (&s.source_uri, s.defined_line, s.defined_column, s.kind)
+        }
+
         /// Build a 2-file fixture (`main.R` + `helper.R`) with a
         /// dependency edge derived from `main.R`'s `source()` call (if
         /// any). Returns the components needed for both `ScopeStream::new`
@@ -13843,36 +13982,8 @@ y <- filter(df)"#;
                     // (different `ScopedSymbol` for the same name, affecting
                     // hover and find-references — see AGENTS.md learning on
                     // `entry().or_insert()` for Source events).
-                    let streamed_identity: std::collections::BTreeSet<(
-                        String, String, u32, u32, String,
-                    )> = streamed
-                        .symbols
-                        .iter()
-                        .map(|(n, s)| {
-                            (
-                                n.to_string(),
-                                s.source_uri.to_string(),
-                                s.defined_line,
-                                s.defined_column,
-                                format!("{:?}", s.kind),
-                            )
-                        })
-                        .collect();
-                    let direct_identity: std::collections::BTreeSet<(
-                        String, String, u32, u32, String,
-                    )> = direct
-                        .symbols
-                        .iter()
-                        .map(|(n, s)| {
-                            (
-                                n.to_string(),
-                                s.source_uri.to_string(),
-                                s.defined_line,
-                                s.defined_column,
-                                format!("{:?}", s.kind),
-                            )
-                        })
-                        .collect();
+                    let streamed_identity = symbol_identity_set(&streamed);
+                    let direct_identity = symbol_identity_set(&direct);
                     prop_assert_eq!(
                         &streamed_identity,
                         &direct_identity,
@@ -14383,6 +14494,1021 @@ y <- filter(df)"#;
                 direct_chain.contains(&helper_uri.to_string()),
                 "sanity: recursive resolver must include helper_uri in chain \
                  after source(\"helper.R\") fires"
+            );
+        }
+
+        /// Provenance parity for a "diamond" merge where two forward
+        /// `source()` calls both define the same name at *different*
+        /// definition positions. The name-set property test cannot
+        /// distinguish first-source-wins from last-source-wins here
+        /// because both paths still record the name `f`; only the full
+        /// `(source_uri, defined_line, defined_column, kind)` tuple
+        /// reveals which definition wins. This is the canonical "names
+        /// match, provenance could diverge" case from issue #374.
+        ///
+        /// Setup:
+        ///   main.R  sources a.R then b.R; then uses f.
+        ///   a.R     defines `f` at line 0, col 0  (function).
+        ///   b.R     has a comment on line 0, defines `f` at line 1, col 0.
+        ///
+        /// First-source-wins (the recursive resolver's first-source-wins
+        /// `entry().or_insert()` in its forward-source merge;
+        /// `ScopeStream::resolve_source_contribution`'s `or_insert`) means
+        /// `f` must resolve to a.R's line-0 definition in *both* paths.
+        #[test]
+        fn test_scope_stream_diamond_source_provenance_matches_recursive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::CrossFileMetadata;
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let a_uri = Url::parse("file:///project/a.R").unwrap();
+            let b_uri = Url::parse("file:///project/b.R").unwrap();
+
+            let main_code = "source(\"a.R\")\nsource(\"b.R\")\nuse_f <- f\n";
+            // a.R: `f` defined at line 0, col 0 (a function).
+            let a_code = "f <- function() 1\n";
+            // b.R: comment on line 0 pushes `f` to line 1, col 0 (a
+            // function with a different body). Different defined_line from
+            // a.R, so a last-source-wins regression would change the
+            // provenance tuple.
+            let b_code = "# comment line\nf <- function() 2\n";
+
+            let main_tree = parse_r(main_code);
+            let a_tree = parse_r(a_code);
+            let b_tree = parse_r(b_code);
+
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let a_artifacts = Arc::new(compute_artifacts(&a_uri, &a_tree, a_code));
+            let b_artifacts = Arc::new(compute_artifacts(&b_uri, &b_tree, b_code));
+
+            let main_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                main_code,
+                Some(&main_tree),
+            ));
+            let a_meta = std::sync::Arc::new(CrossFileMetadata::default());
+            let b_meta = std::sync::Arc::new(CrossFileMetadata::default());
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
+
+            let main_uri_a = main_uri.clone();
+            let a_uri_a = a_uri.clone();
+            let b_uri_a = b_uri.clone();
+            let main_arts_c = main_artifacts.clone();
+            let a_arts_c = a_artifacts.clone();
+            let b_arts_c = b_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &main_uri_a {
+                    Some(main_arts_c.clone())
+                } else if uri == &a_uri_a {
+                    Some(a_arts_c.clone())
+                } else if uri == &b_uri_a {
+                    Some(b_arts_c.clone())
+                } else {
+                    None
+                }
+            };
+            let main_uri_m = main_uri.clone();
+            let a_uri_m = a_uri.clone();
+            let b_uri_m = b_uri.clone();
+            let main_meta_c = main_meta.clone();
+            let a_meta_c = a_meta.clone();
+            let b_meta_c = b_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &main_uri_m {
+                    Some(main_meta_c.clone())
+                } else if uri == &a_uri_m {
+                    Some(a_meta_c.clone())
+                } else if uri == &b_uri_m {
+                    Some(b_meta_c.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Query at line 2 col 0: both source() calls have fired.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(2, 0);
+            let streamed = stream.snapshot();
+
+            let mut throwaway = ParentPrefixCache::new();
+            let direct = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+                None,
+            );
+
+            let stream_f = streamed
+                .symbols
+                .get("f")
+                .expect("stream must have f in scope after both source() calls");
+            let direct_f = direct
+                .symbols
+                .get("f")
+                .expect("recursive must have f in scope after both source() calls");
+
+            // Full-tuple parity between the two paths.
+            assert_eq!(
+                symbol_provenance(stream_f),
+                symbol_provenance(direct_f),
+                "ScopeStream and recursive resolver must agree on the full \
+                 provenance tuple (source_uri, defined_line, defined_column, \
+                 kind) for f when two sources define it at different positions."
+            );
+
+            // Concrete intent: a.R is sourced first, so its line-0 / col-0
+            // function definition wins (first-source-wins).
+            assert_eq!(
+                symbol_provenance(direct_f),
+                (&a_uri, 0u32, 0u32, SymbolKind::Function),
+                "sanity: f must resolve to a.R's line-0 function definition \
+                 (first-source-wins), not b.R's line-1 definition"
+            );
+        }
+
+        /// Provenance parity for a forward+backward cycle that round-trips
+        /// a local symbol back through a child's parent-prefix.
+        ///
+        /// Setup (cycle):
+        ///   main.R    g <- 1            (line 0)
+        ///             source("helper.R") (line 1)  -- forward main -> helper
+        ///   helper.R  # @lsp-sourced-by main.R (line 0) -- backward helper -> main
+        ///             h <- 1            (line 1)
+        ///
+        /// When main.R resolves its forward source() of helper.R, helper's
+        /// recursive resolution inherits `g` from main.R (its parent via the
+        /// backward directive) as a *parent-prefix* binding. The same-file
+        /// leak filter (`symbol.source_uri == queried_uri`) plus the
+        /// parent-prefix-only filter must drop that round-tripped copy of
+        /// `g`, leaving main.R's own line-0 definition intact, while `h`
+        /// (genuinely defined in helper.R) flows through with helper.R
+        /// provenance. Both paths must agree.
+        #[test]
+        fn test_scope_stream_self_roundtrip_provenance_matches_recursive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+
+            // main.R: defines g at line 0, sources helper.R at line 1.
+            let main_code = "g <- 1\nsource(\"helper.R\")\n";
+            // helper.R: backward directive to main.R on line 0, defines h
+            // at line 1.
+            let helper_code = "# @lsp-sourced-by main.R\nh <- 1\n";
+
+            let main_tree = parse_r(main_code);
+            let helper_tree = parse_r(helper_code);
+
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let helper_artifacts =
+                Arc::new(compute_artifacts(&helper_uri, &helper_tree, helper_code));
+
+            // main.R sources helper.R (forward edge from line 1).
+            let main_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helper.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            // helper.R is sourced-by main.R (backward edge).
+            let helper_meta = std::sync::Arc::new(CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "main.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            });
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            // get_content closure lets the graph resolve helper's backward
+            // directive's call site against main.R.
+            let main_code_owned = main_code.to_string();
+            graph.update_file(&helper_uri, &helper_meta, Some(&workspace_root), |uri| {
+                if uri == &main_uri {
+                    Some(main_code_owned.clone())
+                } else {
+                    None
+                }
+            });
+
+            let main_uri_a = main_uri.clone();
+            let helper_uri_a = helper_uri.clone();
+            let main_arts_c = main_artifacts.clone();
+            let helper_arts_c = helper_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &main_uri_a {
+                    Some(main_arts_c.clone())
+                } else if uri == &helper_uri_a {
+                    Some(helper_arts_c.clone())
+                } else {
+                    None
+                }
+            };
+            let main_uri_m = main_uri.clone();
+            let helper_uri_m = helper_uri.clone();
+            let main_meta_c = main_meta.clone();
+            let helper_meta_c = helper_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &main_uri_m {
+                    Some(main_meta_c.clone())
+                } else if uri == &helper_uri_m {
+                    Some(helper_meta_c.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Query at line 2 col 0: g is defined and the source() of
+            // helper.R has fired.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(2, 0);
+            let streamed = stream.snapshot();
+
+            let mut throwaway = ParentPrefixCache::new();
+            let direct = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+                None,
+            );
+
+            let stream_g = streamed
+                .symbols
+                .get("g")
+                .expect("stream must keep g (local main.R definition) in scope");
+            let direct_g = direct
+                .symbols
+                .get("g")
+                .expect("recursive must keep g (local main.R definition) in scope");
+
+            // g's provenance must stay the local main.R line-0 definition in
+            // both paths: the same-file leak filter must drop the copy of g
+            // that round-trips back through helper's parent-prefix.
+            assert_eq!(
+                symbol_provenance(stream_g),
+                symbol_provenance(direct_g),
+                "ScopeStream and recursive resolver must agree on g's \
+                 provenance tuple across the forward+backward cycle."
+            );
+            assert_eq!(
+                symbol_provenance(direct_g),
+                (&main_uri, 0u32, 0u32, SymbolKind::Variable),
+                "sanity: g must stay main.R's own line-0 definition, not a \
+                 round-tripped copy from helper's parent-prefix"
+            );
+
+            let stream_h = streamed
+                .symbols
+                .get("h")
+                .expect("stream must have h (from helper.R) in scope");
+            let direct_h = direct
+                .symbols
+                .get("h")
+                .expect("recursive must have h (from helper.R) in scope");
+
+            // h flows through the forward source() edge with helper.R
+            // provenance in both paths.
+            assert_eq!(
+                symbol_provenance(stream_h),
+                symbol_provenance(direct_h),
+                "ScopeStream and recursive resolver must agree on h's \
+                 provenance tuple."
+            );
+            assert_eq!(
+                symbol_provenance(direct_h),
+                (&helper_uri, 1u32, 0u32, SymbolKind::Variable),
+                "sanity: h must be attributed to helper.R's line-1 definition"
+            );
+        }
+
+        /// Provenance parity for the parent-prefix override mechanic: a
+        /// parent-prefix binding for a name is later overridden by a forward
+        /// source() that defines the same name.
+        ///
+        /// Setup:
+        ///   parent.R  k <- 1            (line 0)
+        ///             source("main.R")  (line 1)  -- forward parent -> main
+        ///   main.R    # @lsp-sourced-by parent.R (line 0) -- backward main -> parent
+        ///             source("helper.R")           (line 1) -- forward main -> helper
+        ///   helper.R  k <- 2            (line 0)
+        ///
+        /// Resolving main.R: `k` first arrives as a parent-prefix binding
+        /// (from parent.R, line 0), then the forward source() of helper.R
+        /// overrides it with helper.R's `k <- 2`. The recursive resolver does
+        /// this via the `parent_prefix_symbol_names.remove` + `insert`
+        /// marker-override in the recursive resolver's forward-source merge;
+        /// ScopeStream reaches the same answer via its separate-prefix
+        /// approach. Both paths must resolve `k` to helper.R's definition
+        /// with identical provenance tuples.
+        #[test]
+        fn test_scope_stream_parent_prefix_override_matches_recursive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+
+            // parent.R: defines k at line 0, sources main.R at line 1.
+            let parent_code = "k <- 1\nsource(\"main.R\")\n";
+            // main.R: backward directive to parent.R on line 0, sources
+            // helper.R at line 1.
+            let main_code = "# @lsp-sourced-by parent.R\nsource(\"helper.R\")\n";
+            // helper.R: defines k at line 0, col 0.
+            let helper_code = "k <- 2\n";
+
+            let parent_tree = parse_r(parent_code);
+            let main_tree = parse_r(main_code);
+            let helper_tree = parse_r(helper_code);
+
+            let parent_artifacts =
+                Arc::new(compute_artifacts(&parent_uri, &parent_tree, parent_code));
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let helper_artifacts =
+                Arc::new(compute_artifacts(&helper_uri, &helper_tree, helper_code));
+
+            // parent.R sources main.R (forward edge from line 1).
+            let parent_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "main.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            // main.R: backward directive to parent.R AND forward source of
+            // helper.R (from line 1).
+            let main_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helper.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                sourced_by: vec![BackwardDirective {
+                    path: "parent.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            });
+            let helper_meta = std::sync::Arc::new(CrossFileMetadata::default());
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&helper_uri, &helper_meta, Some(&workspace_root), |_| None);
+            // get_content closure lets the graph resolve main's backward
+            // directive's call site against parent.R.
+            let parent_code_owned = parent_code.to_string();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_code_owned.clone())
+                } else {
+                    None
+                }
+            });
+
+            let parent_uri_a = parent_uri.clone();
+            let main_uri_a = main_uri.clone();
+            let helper_uri_a = helper_uri.clone();
+            let parent_arts_c = parent_artifacts.clone();
+            let main_arts_c = main_artifacts.clone();
+            let helper_arts_c = helper_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri_a {
+                    Some(parent_arts_c.clone())
+                } else if uri == &main_uri_a {
+                    Some(main_arts_c.clone())
+                } else if uri == &helper_uri_a {
+                    Some(helper_arts_c.clone())
+                } else {
+                    None
+                }
+            };
+            let parent_uri_m = parent_uri.clone();
+            let main_uri_m = main_uri.clone();
+            let helper_uri_m = helper_uri.clone();
+            let parent_meta_c = parent_meta.clone();
+            let main_meta_c = main_meta.clone();
+            let helper_meta_c = helper_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &parent_uri_m {
+                    Some(parent_meta_c.clone())
+                } else if uri == &main_uri_m {
+                    Some(main_meta_c.clone())
+                } else if uri == &helper_uri_m {
+                    Some(helper_meta_c.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Build the stream once and advance monotonically.  First stop:
+            // line 0 col 0 — before the source("helper.R") call on line 1
+            // fires — to prove the parent-prefix edge genuinely forms.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(0, 0);
+            let streamed_early = stream.snapshot();
+
+            // Second stop: line 2 col 0 — after source("helper.R") has fired.
+            stream.advance_to(2, 0);
+            let streamed_late = stream.snapshot();
+
+            // Direct resolver at the early position (before source fires).
+            let mut throwaway_early = ParentPrefixCache::new();
+            let direct_early = scope_at_position_with_graph_cached(
+                &main_uri,
+                0,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway_early,
+                None,
+            );
+
+            // Direct resolver at the late position (after source fires).
+            let mut throwaway_late = ParentPrefixCache::new();
+            let direct_late = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway_late,
+                None,
+            );
+
+            // ── Early-position assertions ────────────────────────────────────
+            // At line 0 (before helper.R is sourced) k should be visible via
+            // the parent-prefix edge from parent.R.  This proves the edge
+            // actually forms; without it the override assertion below is
+            // vacuous.
+            let stream_k_early = streamed_early
+                .symbols
+                .get("k")
+                .expect("stream must have k in scope at main.R line 0 (parent-prefix)");
+            let direct_k_early = direct_early
+                .symbols
+                .get("k")
+                .expect("direct resolver must have k in scope at main.R line 0 (parent-prefix)");
+
+            // Stream and direct agree at the early position.
+            assert_eq!(
+                symbol_provenance(stream_k_early),
+                symbol_provenance(direct_k_early),
+                "ScopeStream and recursive resolver must agree on k's \
+                 provenance at main.R line 0 (early, pre-source)"
+            );
+
+            // Concrete expected value: parent.R line 0 col 0, Variable.
+            assert_eq!(
+                symbol_provenance(direct_k_early),
+                (&parent_uri, 0u32, 0u32, SymbolKind::Variable),
+                "at main.R line 0, k must resolve to parent.R's line-0 \
+                 definition (parent-prefix edge before any forward source fires)"
+            );
+
+            // ── Late-position assertions ─────────────────────────────────────
+            let stream_k_late = streamed_late
+                .symbols
+                .get("k")
+                .expect("stream must have k in scope in main.R");
+            let direct_k_late = direct_late
+                .symbols
+                .get("k")
+                .expect("recursive must have k in scope in main.R");
+
+            // Full-tuple parity between the two paths.
+            assert_eq!(
+                symbol_provenance(stream_k_late),
+                symbol_provenance(direct_k_late),
+                "ScopeStream and recursive resolver must agree on k's \
+                 provenance tuple. The recursive resolver overrides the \
+                 parent-prefix binding via the \
+                 parent_prefix_symbol_names.remove + insert marker-override \
+                 in its forward-source merge; ScopeStream must reach the \
+                 same answer via its separate-prefix approach."
+            );
+
+            // Concrete intent: the forward source() of helper.R overrides
+            // the parent-prefix binding from parent.R, so k resolves to
+            // helper.R's line-0 definition.
+            assert_eq!(
+                symbol_provenance(direct_k_late),
+                (&helper_uri, 0u32, 0u32, SymbolKind::Variable),
+                "sanity: k must resolve to helper.R's line-0 definition \
+                 (forward source overrides the parent-prefix binding from \
+                 parent.R)"
+            );
+        }
+
+        /// Shared cyclic fixture for the two `(MAX, MAX)`-boundary tests below.
+        ///
+        /// Builds a three-symbol `main.R` that sources `helper.R`, and a
+        /// `helper.R` whose `# @lsp-sourced-by main.R` directive closes the
+        /// cycle (main -> helper via the forward `source()`, helper -> main via
+        /// the backward directive):
+        ///
+        /// ```text
+        ///   main.R    early <- 1            (line 0)
+        ///             source("helper.R")    (line 1)  -- forward main -> helper
+        ///             late  <- 2            (line 2)
+        ///   helper.R  # @lsp-sourced-by main.R (line 0) -- backward helper -> main
+        ///             h <- 1                (line 1)
+        /// ```
+        ///
+        /// Returns everything a caller needs to drive both the cached and the
+        /// uncached resolvers: the two URIs, the graph, owned artifacts/metadata
+        /// maps, and the workspace root. The `'static` closures the resolvers
+        /// want are built by the callers (each test owns its own clones) so this
+        /// helper can stay closure-free.
+        ///
+        /// Metadata is hand-built (`ForwardSource`/`BackwardDirective` constructed
+        /// directly rather than extracted from source text) to pin the exact cycle
+        /// edges independently of the parser.
+        #[allow(clippy::type_complexity)]
+        fn build_cyclic_fixture() -> (
+            Url, // main_uri
+            Url, // helper_uri
+            Url, // workspace_root
+            crate::cross_file::dependency::DependencyGraph,
+            std::collections::HashMap<Url, Arc<ScopeArtifacts>>,
+            std::collections::HashMap<
+                Url,
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            >,
+        ) {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+
+            // main.R: early at line 0, source("helper.R") at line 1, late at
+            // line 2.
+            let main_code = "early <- 1\nsource(\"helper.R\")\nlate <- 2\n";
+            // helper.R: backward directive to main.R on line 0, defines h at
+            // line 1 -> closes the cycle.
+            let helper_code = "# @lsp-sourced-by main.R\nh <- 1\n";
+
+            let main_tree = parse_r(main_code);
+            let helper_tree = parse_r(helper_code);
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let helper_artifacts =
+                Arc::new(compute_artifacts(&helper_uri, &helper_tree, helper_code));
+
+            let main_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helper.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let helper_meta = std::sync::Arc::new(CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "main.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            });
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            // get_content closure lets the graph resolve helper's backward
+            // directive's call site against main.R.
+            let main_code_owned = main_code.to_string();
+            graph.update_file(&helper_uri, &helper_meta, Some(&workspace_root), |uri| {
+                if uri == &main_uri {
+                    Some(main_code_owned.clone())
+                } else {
+                    None
+                }
+            });
+
+            let mut artifacts = std::collections::HashMap::new();
+            artifacts.insert(main_uri.clone(), main_artifacts);
+            artifacts.insert(helper_uri.clone(), helper_artifacts);
+
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(main_uri.clone(), main_meta);
+            metadata.insert(helper_uri.clone(), helper_meta);
+
+            (
+                main_uri,
+                helper_uri,
+                workspace_root,
+                graph,
+                artifacts,
+                metadata,
+            )
+        }
+
+        /// Anti-drift parity for the cyclic fixture: the streaming snapshot
+        /// (`ScopeStream::snapshot`) and the cached point resolver
+        /// (`scope_at_position_with_graph_cached`) must produce *identical*
+        /// scope at `main.R (2, 0)` — after `early` and after the
+        /// `source("helper.R")` on line 1 has fired, but before `late` (whose
+        /// definition anchor is line 2 col 0) enters scope.
+        ///
+        /// Both seed the parent prefix at `(MAX, MAX)` — the cached resolver's
+        /// miss path and the streaming `compute_or_get_cached_prefix` use the
+        /// same seed — so their prefixes agree even though each path here uses
+        /// its own `ParentPrefixCache` instance. This pins that the streaming
+        /// iterator's incremental replay never drifts from the one-shot cached
+        /// resolver across a forward+backward cycle. We assert agreement on the
+        /// full symbol set, each symbol's provenance tuple
+        /// `(source_uri, defined_line, defined_column, kind)`, and the package
+        /// surface (`loaded_packages` / `inherited_packages` /
+        /// `package_origins`).
+        ///
+        /// Concrete expectations at `main.R (2, 0)`:
+        /// - `early` visible, attributed to main.R line 0 col 0;
+        /// - `h` visible, attributed to helper.R line 1 col 0 (flows in through
+        ///   the forward `source()` edge once it has fired);
+        /// - `late` NOT visible (its definition is later in main.R's timeline).
+        #[test]
+        fn test_cyclic_cached_streaming_recursive_agree() {
+            let (main_uri, helper_uri, workspace_root, graph, artifacts, metadata) =
+                build_cyclic_fixture();
+
+            let artifacts_c = artifacts.clone();
+            let get_artifacts =
+                move |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts_c.get(uri).cloned() };
+            let metadata_c = metadata.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { metadata_c.get(uri).cloned() };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let is_cancelled = || false;
+
+            // Streaming path: advance to (2, 0) and snapshot.
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(2, 0);
+            let streamed = stream.snapshot();
+
+            // Cached point resolver at the same position.
+            let mut throwaway = ParentPrefixCache::new();
+            let cached = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+                None,
+            );
+
+            // Identical symbol name sets (asserted separately from the full
+            // identity set below so a pure name-set divergence fails with a
+            // clear message).
+            let stream_names: std::collections::BTreeSet<String> =
+                streamed.symbols.keys().map(|n| n.to_string()).collect();
+            let cached_names: std::collections::BTreeSet<String> =
+                cached.symbols.keys().map(|n| n.to_string()).collect();
+            assert_eq!(
+                stream_names, cached_names,
+                "ScopeStream::snapshot and scope_at_position_with_graph_cached \
+                 must expose the same symbol names at main.R (2, 0)"
+            );
+
+            // Identical provenance tuple for every symbol.
+            assert_eq!(
+                symbol_identity_set(&streamed),
+                symbol_identity_set(&cached),
+                "ScopeStream and cached resolver must agree on every symbol's \
+                 provenance tuple at main.R (2, 0)"
+            );
+
+            // Identical package surface (the core anti-drift guarantee for
+            // package origins through the cycle).
+            assert_eq!(
+                streamed.loaded_packages, cached.loaded_packages,
+                "loaded_packages must match between streaming and cached at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                streamed.inherited_packages, cached.inherited_packages,
+                "inherited_packages must match between streaming and cached at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                streamed.package_origins, cached.package_origins,
+                "package_origins must match between streaming and cached at \
+                 main.R (2, 0)"
+            );
+
+            // Concrete expectations, asserted on the cached result (proven
+            // equal to the streaming result above).
+            let early = cached
+                .symbols
+                .get("early")
+                .expect("early must be visible at main.R (2, 0)");
+            assert_eq!(
+                symbol_provenance(early),
+                (&main_uri, 0u32, 0u32, SymbolKind::Variable),
+                "early must be attributed to main.R line 0 col 0"
+            );
+            let h = cached
+                .symbols
+                .get("h")
+                .expect("h must be visible at main.R (2, 0) once source() has fired");
+            assert_eq!(
+                symbol_provenance(h),
+                (&helper_uri, 1u32, 0u32, SymbolKind::Variable),
+                "h must be attributed to helper.R line 1 col 0 (through the \
+                 forward source() edge)"
+            );
+            assert!(
+                !cached.symbols.contains_key("late"),
+                "late (defined later in main.R) must NOT be visible at \
+                 main.R (2, 0). Symbols present: {:?}",
+                cached_names
+            );
+        }
+
+        /// Pin the cyclic `(MAX, MAX)` parent-prefix over-approximation as
+        /// intentional (issue #374).
+        ///
+        /// Compares `scope_at_position_with_graph_cached` (the cached resolver;
+        /// cache-miss path seeds the visited map at `(u32::MAX, u32::MAX)` so a
+        /// single cache slot covers every position in `main.R` within a
+        /// snapshot) against the uncached `scope_at_position_with_graph` (which
+        /// seeds the visited map at the REAL query `(line, column)`). The query
+        /// is `main.R (2, 0)`: after `early`, after the `source("helper.R")` on
+        /// line 1 has fired (so the cycle genuinely re-enters main.R through
+        /// helper's backward `# @lsp-sourced-by main.R` directive), and before
+        /// `late` (line 2 col 0) enters scope.
+        ///
+        /// OBSERVED OUTCOME (this is the pin): at this query the two paths agree
+        /// *completely*. Every observable field matches — symbol name set,
+        /// per-symbol provenance tuples `(source_uri, defined_line,
+        /// defined_column, kind)`, `loaded_packages`, `inherited_packages`,
+        /// `package_origins`, and `visible_positions`. Both EXCLUDE `late`.
+        ///
+        /// Why they agree despite different seeds: the cached parent-prefix walk
+        /// re-enters `main.R` at `(MAX, MAX)` and could therefore *see* `late`,
+        /// but the same-file leak filter (`symbol.source_uri == queried_uri`
+        /// drops parent-prefix copies of the queried file's own symbols) masks
+        /// that symbol-level difference, and `entry().or_insert()` merging keeps
+        /// STEP 2 sound. So `late` never surfaces from the wider seed. The
+        /// `(MAX, MAX)` seed is therefore a *deliberate over-approximation* of
+        /// the parent prefix: position-invariant per snapshot (required for
+        /// cache determinism — tightening it would demand position-dependent
+        /// cache keys, defeating the cache) and kept sound at the symbol level
+        /// by the leak filter. This test pins "cyclic cached == uncached at this
+        /// query"; if a future change made the cached path leak `late` (or
+        /// otherwise diverge), the assertions below would fail.
+        #[test]
+        fn test_cyclic_cached_overapproximates_vs_uncached_point_query() {
+            let (main_uri, _helper_uri, workspace_root, graph, artifacts, metadata) =
+                build_cyclic_fixture();
+
+            let artifacts_c = artifacts.clone();
+            let get_artifacts =
+                move |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts_c.get(uri).cloned() };
+            let metadata_c = metadata.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { metadata_c.get(uri).cloned() };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let is_cancelled = || false;
+
+            // Cached resolver (seeds visited at (MAX, MAX) for the parent
+            // prefix).
+            let mut cache = ParentPrefixCache::new();
+            let cached = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut cache,
+                None,
+            );
+
+            // Uncached resolver (seeds visited at the REAL (line, column)).
+            let uncached = scope_at_position_with_graph(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                None,
+            );
+
+            // BOTH exclude `late`: the same-file leak filter masks the
+            // symbol-level difference the (MAX, MAX) seed could otherwise
+            // introduce.
+            assert!(
+                !cached.symbols.contains_key("late"),
+                "cached resolver must NOT surface `late` at main.R (2, 0) \
+                 despite seeding the parent prefix at (MAX, MAX); the same-file \
+                 leak filter masks it"
+            );
+            assert!(
+                !uncached.symbols.contains_key("late"),
+                "uncached resolver must NOT surface `late` at main.R (2, 0)"
+            );
+
+            // CHARACTERIZATION: at this query the cached and uncached outputs
+            // agree on every observable field. Assert each one explicitly so a
+            // future divergence (e.g. `late` leaking, or package-origin drift)
+            // turns into a precise failure.
+            let cached_syms = symbol_identity_set(&cached);
+            let uncached_syms = symbol_identity_set(&uncached);
+            assert_eq!(
+                cached_syms, uncached_syms,
+                "cached and uncached must agree on the full set of symbols and \
+                 their provenance tuples at main.R (2, 0)"
+            );
+
+            assert_eq!(
+                cached.loaded_packages, uncached.loaded_packages,
+                "cached and uncached must agree on loaded_packages at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                cached.inherited_packages, uncached.inherited_packages,
+                "cached and uncached must agree on inherited_packages at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                cached.package_origins, uncached.package_origins,
+                "cached and uncached must agree on package_origins at \
+                 main.R (2, 0)"
+            );
+
+            let mut cached_vp: Vec<(String, (u32, u32))> = cached
+                .visible_positions
+                .iter()
+                .map(|(u, p)| (u.to_string(), *p))
+                .collect();
+            cached_vp.sort();
+            let mut uncached_vp: Vec<(String, (u32, u32))> = uncached
+                .visible_positions
+                .iter()
+                .map(|(u, p)| (u.to_string(), *p))
+                .collect();
+            uncached_vp.sort();
+            assert_eq!(
+                cached_vp, uncached_vp,
+                "cached and uncached must agree on visible_positions at \
+                 main.R (2, 0)"
             );
         }
     }
