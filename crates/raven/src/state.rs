@@ -2025,12 +2025,10 @@ mod tests {
 
         const NUM_CHAINS: usize = 30;
         const CHAIN_LEN: usize = 10;
+        const PER_SEED_BUDGET: usize = 200;
 
         let mut state = WorldState::new(vec![PathBuf::from("/tmp/raven-test-libpath")]);
-        assert_eq!(
-            state.cross_file_config.max_transitive_dependents_visited, 200,
-            "test assumes default per-seed budget of 200"
-        );
+        state.cross_file_config.max_transitive_dependents_visited = PER_SEED_BUDGET;
         // 30 × 10 = 300 nodes total; with an unscaled shared budget of 200
         // the BFS would truncate.
         assert!(NUM_CHAINS * CHAIN_LEN > state.cross_file_config.max_transitive_dependents_visited);

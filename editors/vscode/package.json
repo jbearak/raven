@@ -984,6 +984,12 @@
           "minimum": 1,
           "description": "Maximum total chain depth for cross-file dependency resolution. Limits the combined depth of forward and backward traversal to prevent excessive analysis in complex dependency graphs. Default is 20."
         },
+        "raven.crossFile.maxTransitiveDependentsVisited": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 1,
+          "description": "Maximum number of files Raven visits while traversing the cross-file dependency graph for dependent revalidation, package-scope snapshots, and open-neighborhood pinning. Raise this if Raven warns that cross-file analysis was truncated in a large workspace."
+        },
         "raven.crossFile.assumeCallSite": {
           "type": "string",
           "enum": [

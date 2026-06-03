@@ -50,6 +50,7 @@ export interface RavenInitializationOptions {
         maxBackwardDepth?: number;
         maxForwardDepth?: number;
         maxChainDepth?: number;
+        maxTransitiveDependentsVisited?: number;
         assumeCallSite?: "start" | "end";
         indexWorkspace?: boolean;
         maxRevalidationsPerTrigger?: number;
@@ -175,6 +176,7 @@ export function getInitializationOptions(
     const maxBackwardDepth = getExplicitSetting<number>(config, 'crossFile.maxBackwardDepth');
     const maxForwardDepth = getExplicitSetting<number>(config, 'crossFile.maxForwardDepth');
     const maxChainDepth = getExplicitSetting<number>(config, 'crossFile.maxChainDepth');
+    const maxTransitiveDependentsVisited = getExplicitSetting<number>(config, 'crossFile.maxTransitiveDependentsVisited');
     const assumeCallSite = getExplicitSetting<"start" | "end">(config, 'crossFile.assumeCallSite');
     const indexWorkspace = getExplicitSetting<boolean>(config, 'crossFile.indexWorkspace');
     const maxRevalidationsPerTrigger = getExplicitSetting<number>(config, 'crossFile.maxRevalidationsPerTrigger');
@@ -244,6 +246,7 @@ export function getInitializationOptions(
         maxBackwardDepth !== undefined ||
         maxForwardDepth !== undefined ||
         maxChainDepth !== undefined ||
+        maxTransitiveDependentsVisited !== undefined ||
         assumeCallSite !== undefined ||
         indexWorkspace !== undefined ||
         maxRevalidationsPerTrigger !== undefined ||
@@ -268,6 +271,9 @@ export function getInitializationOptions(
         }
         if (maxChainDepth !== undefined) {
             options.crossFile.maxChainDepth = maxChainDepth;
+        }
+        if (maxTransitiveDependentsVisited !== undefined) {
+            options.crossFile.maxTransitiveDependentsVisited = maxTransitiveDependentsVisited;
         }
         if (assumeCallSite !== undefined) {
             options.crossFile.assumeCallSite = assumeCallSite;

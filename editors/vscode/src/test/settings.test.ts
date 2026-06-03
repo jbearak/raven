@@ -83,6 +83,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.maxBackwardDepth', jsonPath: ['crossFile', 'maxBackwardDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.maxForwardDepth', jsonPath: ['crossFile', 'maxForwardDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.maxChainDepth', jsonPath: ['crossFile', 'maxChainDepth'], type: 'number' },
+    { vsCodeKey: 'crossFile.maxTransitiveDependentsVisited', jsonPath: ['crossFile', 'maxTransitiveDependentsVisited'], type: 'number' },
     { vsCodeKey: 'crossFile.assumeCallSite', jsonPath: ['crossFile', 'assumeCallSite'], type: 'enum', enumValues: ['start', 'end'] as const },
     { vsCodeKey: 'crossFile.indexWorkspace', jsonPath: ['crossFile', 'indexWorkspace'], type: 'boolean' },
     { vsCodeKey: 'crossFile.maxRevalidationsPerTrigger', jsonPath: ['crossFile', 'maxRevalidationsPerTrigger'], type: 'number' },
@@ -521,6 +522,17 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, false);
         assert.strictEqual(options.crossFile?.onDemandIndexing?.maxTransitiveDepth, 5);
         assert.strictEqual(options.crossFile?.onDemandIndexing?.maxQueueSize, 100);
+    });
+
+    test('maxTransitiveDependentsVisited transmits correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['crossFile.maxTransitiveDependentsVisited', 1234],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.crossFile?.maxTransitiveDependentsVisited, 1234);
     });
 
     /**
