@@ -15073,6 +15073,442 @@ y <- filter(df)"#;
                  parent.R)"
             );
         }
+
+        /// Shared cyclic fixture for the two `(MAX, MAX)`-boundary tests below.
+        ///
+        /// Builds a three-symbol `main.R` that sources `helper.R`, and a
+        /// `helper.R` whose `# @lsp-sourced-by main.R` directive closes the
+        /// cycle (main -> helper via the forward `source()`, helper -> main via
+        /// the backward directive):
+        ///
+        /// ```text
+        ///   main.R    early <- 1            (line 0)
+        ///             source("helper.R")    (line 1)  -- forward main -> helper
+        ///             late  <- 2            (line 2)
+        ///   helper.R  # @lsp-sourced-by main.R (line 0) -- backward helper -> main
+        ///             h <- 1                (line 1)
+        /// ```
+        ///
+        /// Returns everything a caller needs to drive both the cached and the
+        /// uncached resolvers: the two URIs, the graph, owned artifacts/metadata
+        /// maps, and the workspace root. The `'static` closures the resolvers
+        /// want are built by the callers (each test owns its own clones) so this
+        /// helper can stay closure-free.
+        ///
+        /// Metadata is hand-built (`ForwardSource`/`BackwardDirective` constructed
+        /// directly rather than extracted from source text) to pin the exact cycle
+        /// edges independently of the parser.
+        #[allow(clippy::type_complexity)]
+        fn build_cyclic_fixture() -> (
+            Url, // main_uri
+            Url, // helper_uri
+            Url, // workspace_root
+            crate::cross_file::dependency::DependencyGraph,
+            std::collections::HashMap<Url, Arc<ScopeArtifacts>>,
+            std::collections::HashMap<
+                Url,
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            >,
+        ) {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+
+            // main.R: early at line 0, source("helper.R") at line 1, late at
+            // line 2.
+            let main_code = "early <- 1\nsource(\"helper.R\")\nlate <- 2\n";
+            // helper.R: backward directive to main.R on line 0, defines h at
+            // line 1 -> closes the cycle.
+            let helper_code = "# @lsp-sourced-by main.R\nh <- 1\n";
+
+            let main_tree = parse_r(main_code);
+            let helper_tree = parse_r(helper_code);
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let helper_artifacts =
+                Arc::new(compute_artifacts(&helper_uri, &helper_tree, helper_code));
+
+            let main_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helper.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let helper_meta = std::sync::Arc::new(CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "main.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            });
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            // get_content closure lets the graph resolve helper's backward
+            // directive's call site against main.R.
+            let main_code_owned = main_code.to_string();
+            graph.update_file(&helper_uri, &helper_meta, Some(&workspace_root), |uri| {
+                if uri == &main_uri {
+                    Some(main_code_owned.clone())
+                } else {
+                    None
+                }
+            });
+
+            let mut artifacts = std::collections::HashMap::new();
+            artifacts.insert(main_uri.clone(), main_artifacts);
+            artifacts.insert(helper_uri.clone(), helper_artifacts);
+
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(main_uri.clone(), main_meta);
+            metadata.insert(helper_uri.clone(), helper_meta);
+
+            (
+                main_uri,
+                helper_uri,
+                workspace_root,
+                graph,
+                artifacts,
+                metadata,
+            )
+        }
+
+        /// Anti-drift parity for the cyclic fixture: the streaming snapshot
+        /// (`ScopeStream::snapshot`) and the cached point resolver
+        /// (`scope_at_position_with_graph_cached`) must produce *identical*
+        /// scope at `main.R (2, 0)` — after `early` and after the
+        /// `source("helper.R")` on line 1 has fired, but before `late` (whose
+        /// definition anchor is line 2 col 0) enters scope.
+        ///
+        /// Both seed the parent prefix at `(MAX, MAX)` — the cached resolver's
+        /// miss path and the streaming `compute_or_get_cached_prefix` use the
+        /// same seed — so their prefixes agree even though each path here uses
+        /// its own `ParentPrefixCache` instance. This pins that the streaming
+        /// iterator's incremental replay never drifts from the one-shot cached
+        /// resolver across a forward+backward cycle. We assert agreement on the
+        /// full symbol set, each symbol's provenance tuple
+        /// `(source_uri, defined_line, defined_column, kind)`, and the package
+        /// surface (`loaded_packages` / `inherited_packages` /
+        /// `package_origins`).
+        ///
+        /// Concrete expectations at `main.R (2, 0)`:
+        /// - `early` visible, attributed to main.R line 0 col 0;
+        /// - `h` visible, attributed to helper.R line 1 col 0 (flows in through
+        ///   the forward `source()` edge once it has fired);
+        /// - `late` NOT visible (its definition is later in main.R's timeline).
+        #[test]
+        fn test_cyclic_cached_streaming_recursive_agree() {
+            let (main_uri, helper_uri, workspace_root, graph, artifacts, metadata) =
+                build_cyclic_fixture();
+
+            let artifacts_c = artifacts.clone();
+            let get_artifacts =
+                move |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts_c.get(uri).cloned() };
+            let metadata_c = metadata.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { metadata_c.get(uri).cloned() };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let is_cancelled = || false;
+
+            // Streaming path: advance to (2, 0) and snapshot.
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(2, 0);
+            let streamed = stream.snapshot();
+
+            // Cached point resolver at the same position.
+            let mut throwaway = ParentPrefixCache::new();
+            let cached = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+                None,
+            );
+
+            // Identical symbol name sets.
+            let mut stream_names: Vec<String> =
+                streamed.symbols.keys().map(|n| n.to_string()).collect();
+            stream_names.sort();
+            let mut cached_names: Vec<String> =
+                cached.symbols.keys().map(|n| n.to_string()).collect();
+            cached_names.sort();
+            assert_eq!(
+                stream_names, cached_names,
+                "ScopeStream::snapshot and scope_at_position_with_graph_cached \
+                 must expose the same symbol names at main.R (2, 0)"
+            );
+
+            // Identical provenance tuple for every symbol.
+            for name in &stream_names {
+                let s = &streamed.symbols[name.as_str()];
+                let c = &cached.symbols[name.as_str()];
+                assert_eq!(
+                    (&s.source_uri, s.defined_line, s.defined_column, s.kind),
+                    (&c.source_uri, c.defined_line, c.defined_column, c.kind),
+                    "ScopeStream and cached resolver must agree on the \
+                     provenance tuple for `{name}` at main.R (2, 0)"
+                );
+            }
+
+            // Identical package surface (the core anti-drift guarantee for
+            // package origins through the cycle).
+            assert_eq!(
+                streamed.loaded_packages, cached.loaded_packages,
+                "loaded_packages must match between streaming and cached at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                streamed.inherited_packages, cached.inherited_packages,
+                "inherited_packages must match between streaming and cached at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                streamed.package_origins, cached.package_origins,
+                "package_origins must match between streaming and cached at \
+                 main.R (2, 0)"
+            );
+
+            // Concrete expectations, asserted on the cached result (proven
+            // equal to the streaming result above).
+            let early = cached
+                .symbols
+                .get("early")
+                .expect("early must be visible at main.R (2, 0)");
+            assert_eq!(
+                (
+                    &early.source_uri,
+                    early.defined_line,
+                    early.defined_column,
+                    early.kind
+                ),
+                (&main_uri, 0u32, 0u32, SymbolKind::Variable),
+                "early must be attributed to main.R line 0 col 0"
+            );
+            let h = cached
+                .symbols
+                .get("h")
+                .expect("h must be visible at main.R (2, 0) once source() has fired");
+            assert_eq!(
+                (&h.source_uri, h.defined_line, h.defined_column, h.kind),
+                (&helper_uri, 1u32, 0u32, SymbolKind::Variable),
+                "h must be attributed to helper.R line 1 col 0 (through the \
+                 forward source() edge)"
+            );
+            assert!(
+                !cached.symbols.contains_key("late"),
+                "late (defined later in main.R) must NOT be visible at \
+                 main.R (2, 0). Symbols present: {:?}",
+                cached_names
+            );
+        }
+
+        /// Pin the cyclic `(MAX, MAX)` parent-prefix over-approximation as
+        /// intentional (issue #374).
+        ///
+        /// Compares `scope_at_position_with_graph_cached` (the cached resolver;
+        /// cache-miss path seeds the visited map at `(u32::MAX, u32::MAX)` so a
+        /// single cache slot covers every position in `main.R` within a
+        /// snapshot) against the uncached `scope_at_position_with_graph` (which
+        /// seeds the visited map at the REAL query `(line, column)`). The query
+        /// is `main.R (2, 0)`: after `early`, after the `source("helper.R")` on
+        /// line 1 has fired (so the cycle genuinely re-enters main.R through
+        /// helper's backward `# @lsp-sourced-by main.R` directive), and before
+        /// `late` (line 2 col 0) enters scope.
+        ///
+        /// OBSERVED OUTCOME (this is the pin): at this query the two paths agree
+        /// *completely*. Every observable field matches — symbol name set,
+        /// per-symbol provenance tuples `(source_uri, defined_line,
+        /// defined_column, kind)`, `loaded_packages`, `inherited_packages`,
+        /// `package_origins`, and `visible_positions`. Both EXCLUDE `late`.
+        ///
+        /// Why they agree despite different seeds: the cached parent-prefix walk
+        /// re-enters `main.R` at `(MAX, MAX)` and could therefore *see* `late`,
+        /// but the same-file leak filter (`symbol.source_uri == queried_uri`
+        /// drops parent-prefix copies of the queried file's own symbols) masks
+        /// that symbol-level difference, and `entry().or_insert()` merging keeps
+        /// STEP 2 sound. So `late` never surfaces from the wider seed. The
+        /// `(MAX, MAX)` seed is therefore a *deliberate over-approximation* of
+        /// the parent prefix: position-invariant per snapshot (required for
+        /// cache determinism — tightening it would demand position-dependent
+        /// cache keys, defeating the cache) and kept sound at the symbol level
+        /// by the leak filter. This test pins "cyclic cached == uncached at this
+        /// query"; if a future change made the cached path leak `late` (or
+        /// otherwise diverge), the assertions below would fail.
+        #[test]
+        fn test_cyclic_cached_overapproximates_vs_uncached_point_query() {
+            let (main_uri, _helper_uri, workspace_root, graph, artifacts, metadata) =
+                build_cyclic_fixture();
+
+            let artifacts_c = artifacts.clone();
+            let get_artifacts =
+                move |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts_c.get(uri).cloned() };
+            let metadata_c = metadata.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { metadata_c.get(uri).cloned() };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let is_cancelled = || false;
+
+            // Cached resolver (seeds visited at (MAX, MAX) for the parent
+            // prefix).
+            let mut cache = ParentPrefixCache::new();
+            let cached = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut cache,
+                None,
+            );
+
+            // Uncached resolver (seeds visited at the REAL (line, column)).
+            let uncached = scope_at_position_with_graph(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                None,
+            );
+
+            // BOTH exclude `late`: the same-file leak filter masks the
+            // symbol-level difference the (MAX, MAX) seed could otherwise
+            // introduce.
+            assert!(
+                !cached.symbols.contains_key("late"),
+                "cached resolver must NOT surface `late` at main.R (2, 0) \
+                 despite seeding the parent prefix at (MAX, MAX); the same-file \
+                 leak filter masks it"
+            );
+            assert!(
+                !uncached.symbols.contains_key("late"),
+                "uncached resolver must NOT surface `late` at main.R (2, 0)"
+            );
+
+            // CHARACTERIZATION: at this query the cached and uncached outputs
+            // agree on every observable field. Assert each one explicitly so a
+            // future divergence (e.g. `late` leaking, or package-origin drift)
+            // turns into a precise failure.
+            // `SymbolKind` is not `Ord`, so render it to a string for a stable
+            // sort key; the string form still distinguishes every variant.
+            let mut cached_syms: Vec<(String, String, u32, u32, String)> = cached
+                .symbols
+                .iter()
+                .map(|(n, s)| {
+                    (
+                        n.to_string(),
+                        s.source_uri.to_string(),
+                        s.defined_line,
+                        s.defined_column,
+                        format!("{:?}", s.kind),
+                    )
+                })
+                .collect();
+            cached_syms.sort();
+            let mut uncached_syms: Vec<(String, String, u32, u32, String)> = uncached
+                .symbols
+                .iter()
+                .map(|(n, s)| {
+                    (
+                        n.to_string(),
+                        s.source_uri.to_string(),
+                        s.defined_line,
+                        s.defined_column,
+                        format!("{:?}", s.kind),
+                    )
+                })
+                .collect();
+            uncached_syms.sort();
+            assert_eq!(
+                cached_syms, uncached_syms,
+                "cached and uncached must agree on the full set of symbols and \
+                 their provenance tuples at main.R (2, 0)"
+            );
+
+            assert_eq!(
+                cached.loaded_packages, uncached.loaded_packages,
+                "cached and uncached must agree on loaded_packages at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                cached.inherited_packages, uncached.inherited_packages,
+                "cached and uncached must agree on inherited_packages at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
+                cached.package_origins, uncached.package_origins,
+                "cached and uncached must agree on package_origins at \
+                 main.R (2, 0)"
+            );
+
+            let mut cached_vp: Vec<(String, (u32, u32))> = cached
+                .visible_positions
+                .iter()
+                .map(|(u, p)| (u.to_string(), *p))
+                .collect();
+            cached_vp.sort();
+            let mut uncached_vp: Vec<(String, (u32, u32))> = uncached
+                .visible_positions
+                .iter()
+                .map(|(u, p)| (u.to_string(), *p))
+                .collect();
+            uncached_vp.sort();
+            assert_eq!(
+                cached_vp, uncached_vp,
+                "cached and uncached must agree on visible_positions at \
+                 main.R (2, 0)"
+            );
+        }
     }
 
     // ============================================================================
