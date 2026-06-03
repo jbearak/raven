@@ -903,21 +903,9 @@ mod tests {
         fs::write(&r_file, "x=1\n").unwrap();
 
         let settings = assignment_warn_settings();
-        let base_lint = crate::backend::parse_lint_config(&settings, false).unwrap();
-        let base_section = settings.get("linting").cloned().unwrap();
-        let overrides = crate::config_file::compile_lint_overrides(&settings, root);
-        let mut diags = Vec::new();
-        let mut operator_error = false;
-        // Walk the directory, not individual files.
-        walk(
-            root,
-            root,
-            &base_section,
-            &base_lint,
-            &overrides,
-            &mut diags,
-            &mut operator_error,
-        );
+        // Walk the directory, not individual files (`lint_one` hands its
+        // `file` argument straight to `walk`, which dispatches dirs too).
+        let (diags, operator_error) = lint_one(root, root, &settings);
 
         assert!(!operator_error, "unexpected operator error");
         // All three files must contribute findings.
