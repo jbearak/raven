@@ -14503,9 +14503,10 @@ y <- filter(df)"#;
         ///   a.R     defines `f` at line 0, col 0  (function).
         ///   b.R     has a comment on line 0, defines `f` at line 1, col 0.
         ///
-        /// First-source-wins (recursive `entry().or_insert` at
-        /// scope.rs:3979; stream `or_insert` at scope.rs:5424) means `f`
-        /// must resolve to a.R's line-0 definition in *both* paths.
+        /// First-source-wins (the recursive resolver's first-source-wins
+        /// `entry().or_insert()` in its forward-source merge;
+        /// `ScopeStream::resolve_source_contribution`'s `or_insert`) means
+        /// `f` must resolve to a.R's line-0 definition in *both* paths.
         #[test]
         fn test_scope_stream_diamond_source_provenance_matches_recursive() {
             use crate::cross_file::dependency::DependencyGraph;
@@ -14904,10 +14905,11 @@ y <- filter(df)"#;
         /// Resolving main.R: `k` first arrives as a parent-prefix binding
         /// (from parent.R, line 0), then the forward source() of helper.R
         /// overrides it with helper.R's `k <- 2`. The recursive resolver does
-        /// this via `parent_prefix_symbol_names.remove(&name)` +
-        /// `insert` (scope.rs:3976-3977); ScopeStream reaches the same answer
-        /// via its separate-prefix approach. Both paths must resolve `k` to
-        /// helper.R's definition with identical provenance tuples.
+        /// this via the `parent_prefix_symbol_names.remove` + `insert`
+        /// marker-override in the recursive resolver's forward-source merge;
+        /// ScopeStream reaches the same answer via its separate-prefix
+        /// approach. Both paths must resolve `k` to helper.R's definition
+        /// with identical provenance tuples.
         #[test]
         fn test_scope_stream_parent_prefix_override_matches_recursive() {
             use crate::cross_file::dependency::DependencyGraph;
@@ -15155,9 +15157,10 @@ y <- filter(df)"#;
                 ),
                 "ScopeStream and recursive resolver must agree on k's \
                  provenance tuple. The recursive resolver overrides the \
-                 parent-prefix binding via parent_prefix_symbol_names.remove \
-                 + insert (scope.rs:3976); ScopeStream must reach the same \
-                 answer via its separate-prefix approach."
+                 parent-prefix binding via the \
+                 parent_prefix_symbol_names.remove + insert marker-override \
+                 in its forward-source merge; ScopeStream must reach the \
+                 same answer via its separate-prefix approach."
             );
 
             // Concrete intent: the forward source() of helper.R overrides

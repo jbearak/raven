@@ -209,10 +209,11 @@ fn bench_scope_resolution(c: &mut Criterion) {
 /// requires monotonic advancement).
 const SWEEP_POSITIONS: usize = 100;
 
-/// Build `SWEEP_POSITIONS` document-order (line, column) positions that wrap
-/// and repeat once `i` exceeds `line_count * columns.len()`. Repeated positions
-/// exercise `advance_to` no-op/re-query paths without skewing comparisons.
-/// Positions are sorted ascending so the streaming cursor advances monotonically.
+/// Build `SWEEP_POSITIONS` document-order (line, column) positions. Line and
+/// column indices wrap independently, so positions repeat after a few sweeps
+/// of the file; repeats are fine — they exercise `advance_to` no-op/re-query
+/// paths consistently across all three arms. Positions are sorted ascending so
+/// the streaming cursor advances monotonically.
 fn sweep_positions(content: &str) -> Vec<(u32, u32)> {
     let line_count = content.lines().count().max(1) as u32;
     let columns: &[u32] = &[0, 4, 8];
