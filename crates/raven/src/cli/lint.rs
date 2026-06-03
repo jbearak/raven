@@ -261,16 +261,8 @@ fn walk(
     operator_error: &mut bool,
 ) {
     if path.is_file() {
-        if is_chunk_file(path) {
-            // Design requires a one-line note; the file otherwise contributes
-            // nothing to JSON / SARIF output.
-            eprintln!(
-                "raven lint: skipping {} (chunk-bearing file; lint is R-only — see docs/cli.md)",
-                path.display()
-            );
-            return;
-        }
-        if !is_r_file(path) {
+        let chunk = is_chunk_file(path);
+        if !chunk && !is_r_file(path) {
             return;
         }
         let rel = path.strip_prefix(root).unwrap_or(path);
@@ -310,9 +302,20 @@ fn walk(
                 return;
             }
         };
+        // For chunk files (.Rmd/.qmd), mask the document to its R chunk bodies
+        // before parsing and linting. `mask_to_r` replaces all non-R-body lines
+        // (prose, YAML, fences, non-R chunk bodies) with empty strings while
+        // keeping every line at its original index, so lint findings computed on
+        // the masked text carry document coordinates directly.
+        let effective_text: std::borrow::Cow<str> = if chunk {
+            std::borrow::Cow::Owned(crate::chunks::mask_to_r(&text))
+        } else {
+            std::borrow::Cow::Borrowed(&text)
+        };
         // Use the same thread-local parser pool the LSP uses; avoids
         // per-file Parser construction.
-        let parse_result = crate::parser_pool::with_parser(|p| p.parse(&text, None));
+        let parse_result =
+            crate::parser_pool::with_parser(|p| p.parse(effective_text.as_ref(), None));
         let tree = match parse_result {
             Some(t) => t,
             None => {
@@ -321,7 +324,7 @@ fn walk(
                 return;
             }
         };
-        for d in crate::linting::run_lints(&text, tree.root_node(), &effective) {
+        for d in crate::linting::run_lints(effective_text.as_ref(), tree.root_node(), &effective) {
             out.push((path.to_path_buf(), d));
         }
     } else if path.is_dir() {
@@ -742,5 +745,185 @@ mod tests {
         // Before this migration a non-UTF-8 file set operator_error → exit 2.
         // Now it is an ERROR finding (parity with `raven check`) → exit 1.
         assert_eq!(run(args), EXIT_LINT_FAILED);
+    }
+
+    /// Settings that enable linting with the `assignment_operator` rule set to
+    /// flag `=` as a warning (default style is `<-`, default severity is HINT,
+    /// but for tests we use WARNING so we can distinguish from no-finding).
+    fn assignment_warn_settings() -> serde_json::Value {
+        serde_json::json!({
+            "linting": {
+                "enabled": true,
+                "assignmentOperatorSeverity": "warning"
+            }
+        })
+    }
+
+    /// A minimal .Rmd document with one R chunk containing `x=1` (assignment
+    /// operator finding) on line 3 (0-based), with surrounding prose. The prose
+    /// lines contain `y=2` which would be a finding if treated as R code.
+    fn rmd_with_chunk_finding() -> &'static str {
+        "---\ntitle: Test\n---\n\n```{r}\nx=1\n```\n\nProse y=2 here.\n"
+    }
+
+    #[test]
+    fn lint_flags_finding_inside_rmd_chunk_at_document_coords() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let file = root.join("doc.Rmd");
+        fs::write(&file, rmd_with_chunk_finding()).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(!operator_error, "unexpected operator error");
+        // `x=1` is on line 5 (0-based) of the document (after "---", "title:
+        // Test", "---", "", "```{r}"). run_lints reports 0-based lines, so
+        // range.start.line == 5. There must be at least one finding here.
+        let chunk_finding = diags.iter().find(|(p, d)| {
+            p == &file
+                && d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "assignment_operator".to_string(),
+                    ))
+        });
+        assert!(
+            chunk_finding.is_some(),
+            "expected an assignment_operator finding; got {diags:?}"
+        );
+        let (_, d) = chunk_finding.unwrap();
+        assert_eq!(
+            d.range.start.line, 5,
+            "finding must be at document line 5 (0-based); got {:?}",
+            d.range.start.line
+        );
+        // Prose line 8 (`Prose y=2 here.`) must NOT produce an
+        // assignment_operator finding — it is masked out as non-R.
+        assert!(
+            !diags.iter().any(|(_, d2)| {
+                d2.range.start.line == 8
+                    && d2.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "assignment_operator".to_string(),
+                        ))
+            }),
+            "prose line must not produce an assignment_operator finding"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_rmd_prose() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Prose-only .Rmd: `x=1` in prose would trigger assignment_operator if
+        // treated as R, but masking must blank it. No R chunks at all.
+        // The document deliberately has no trailing newline so trailing_blank_lines
+        // doesn't fire on the masked (all-empty) text.
+        let content = "---\ntitle: Test\n---\n\nThis is prose. x=1 here.";
+        let file = root.join("prose_only.Rmd");
+        fs::write(&file, content).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(!operator_error, "unexpected operator error");
+        // No assignment_operator finding must appear — prose is masked.
+        assert!(
+            !diags.iter().any(|(_, d)| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "assignment_operator".to_string()
+                ))),
+            "prose-only Rmd must produce no assignment_operator finding; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lint_nolint_inside_chunk_respected() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Line 5 (0-based) = `x=1 # nolint`  → assignment_operator suppressed
+        // Line 6 (0-based) = `y=2`            → assignment_operator flagged (non-vacuous)
+        // The document has no trailing newline to avoid trailing_blank_lines noise.
+        let content = "---\ntitle: Test\n---\n\n```{r}\nx=1 # nolint\ny=2\n```";
+        let file = root.join("nolint.Rmd");
+        fs::write(&file, content).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(!operator_error, "unexpected operator error");
+        // `x=1 # nolint` on line 5 must be suppressed: no assignment_operator
+        // finding at line 5.
+        assert!(
+            !diags.iter().any(|(_, d)| {
+                d.range.start.line == 5
+                    && d.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "assignment_operator".to_string(),
+                        ))
+            }),
+            "assignment_operator on line 5 must be suppressed by # nolint; got {diags:?}"
+        );
+        // `y=2` on line 6 must produce an assignment_operator finding (non-vacuous).
+        assert!(
+            diags.iter().any(|(_, d)| {
+                d.range.start.line == 6
+                    && d.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "assignment_operator".to_string(),
+                        ))
+            }),
+            "assignment_operator on line 6 (y=2) must not be suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lint_walk_includes_chunk_files() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // A directory with one .Rmd and one plain .R; both have a triggering
+        // pattern so both should produce findings.
+        let rmd = root.join("doc.Rmd");
+        let r_file = root.join("plain.R");
+        fs::write(&rmd, rmd_with_chunk_finding()).unwrap();
+        fs::write(&r_file, "x=1\n").unwrap();
+
+        let settings = assignment_warn_settings();
+        let base_lint = crate::backend::parse_lint_config(&settings, false).unwrap();
+        let base_section = settings.get("linting").cloned().unwrap();
+        let overrides = crate::config_file::compile_lint_overrides(&settings, root);
+        let mut diags = Vec::new();
+        let mut operator_error = false;
+        // Walk the directory, not individual files.
+        walk(
+            root,
+            root,
+            &base_section,
+            &base_lint,
+            &overrides,
+            &mut diags,
+            &mut operator_error,
+        );
+
+        assert!(!operator_error, "unexpected operator error");
+        // Both files must contribute findings.
+        let rmd_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &rmd).collect();
+        let r_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &r_file).collect();
+        assert!(
+            !rmd_findings.is_empty(),
+            "directory walk must include .Rmd findings; got {diags:?}"
+        );
+        assert!(
+            !r_findings.is_empty(),
+            "directory walk must include .R findings; got {diags:?}"
+        );
     }
 }
