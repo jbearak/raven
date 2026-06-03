@@ -1197,6 +1197,59 @@ mod tests {
     }
 
     #[test]
+    fn rmd_params_respected_in_check() {
+        // knitr/Quarto inject a `params` object into parameterized reports
+        // whose frontmatter declares a top-level `params:` key. `raven check`
+        // shares the snapshot diagnostic pipeline, so it must NOT flag `params`
+        // as undefined for such a report. The use is a bare assignment RHS (not
+        // a call argument) so the undefined-variable collector inspects it.
+        let tmp = TempDir::new().unwrap();
+        let rmd = tmp.path().join("report.Rmd");
+        fs::write(
+            &rmd,
+            "---\ntitle: Report\nparams:\n  year: 2024\n---\n\n```{r}\nyr <- params$year\n```\n",
+        )
+        .unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![rmd.clone()];
+        assert_eq!(run_blocking(args.clone()), EXIT_OK);
+
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message.contains("Undefined variable: params")),
+            "params must not be flagged when frontmatter declares it; got {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Guard against a vacuous pass: the SAME chunk without `params:` in the
+        // frontmatter MUST flag `params` as undefined.
+        let rmd2 = tmp.path().join("noparams.Rmd");
+        fs::write(
+            &rmd2,
+            "---\ntitle: Report\n---\n\n```{r}\nyr <- params$year\n```\n",
+        )
+        .unwrap();
+        let mut args2 = base_args(tmp.path());
+        args2.paths = vec![rmd2.clone()];
+        let diags2 = collect_diagnostics_blocking(&args2);
+        assert!(
+            diags2
+                .iter()
+                .any(|(_, d)| d.message.contains("Undefined variable: params")),
+            "without a params: frontmatter, params must be flagged; got {:?}",
+            diags2
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn rmd_missing_source_in_chunk_flagged() {
         // A chunk that source()s an absent file produces a missing-file
         // diagnostic (WARNING by default) at the chunk's document line.

@@ -412,6 +412,81 @@ pub fn mask_to_r(text: &str) -> String {
     masked.join("\n")
 }
 
+/// Returns `true` iff the document's leading YAML frontmatter declares a
+/// top-level `params:` key.
+///
+/// knitr/Quarto inject a `params` object into the document's R environment
+/// whenever the YAML frontmatter declares a top-level `params:` mapping. The
+/// masked analysis blanks the frontmatter, so the undefined-variable
+/// diagnostic would otherwise flag every `params$...` use in a parameterized
+/// report. Callers use this sniff (on the RAW document text) to recognize
+/// `params` as a defined global for such documents. See
+/// `diagnostics_from_snapshot` in `handlers.rs` for the injection point.
+///
+/// ## Frontmatter contract (single-key sniff, no YAML parser)
+///
+/// * The frontmatter is a leading YAML block: the first non-empty line — after
+///   an optional leading BOM (U+FEFF) — must be exactly `---` (trimmed). If it
+///   is not, the document has no frontmatter and this returns `false`.
+/// * The block ends at the next line that is exactly `---` or `...` (trimmed).
+///   A `params:` declaration must appear *inside* this block; a `params:` line
+///   in prose after the frontmatter does not count.
+/// * Within the block, a TOP-LEVEL `params:` key is a line whose first
+///   character is `p` (column 0, no leading indentation) matching
+///   `^params:\s*(#.*)?$` (key with no inline value, optional trailing
+///   comment) or `^params:\s*\S` (key with an inline value). Nested/indented
+///   `params:` keys, `# params:` comment lines, and `myparams:` do NOT match.
+/// * This is intentionally a single-key sniff consistent with how the knit
+///   pipeline (`editors/vscode/src/knit/yaml-frontmatter.ts`) sniffs
+///   frontmatter delimiters — it pulls in no YAML crate.
+pub fn frontmatter_declares_params(text: &str) -> bool {
+    // Strip an optional leading BOM so the first delimiter is recognized.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+
+    let mut lines = text.split('\n');
+
+    // Find the opening delimiter: the first non-empty line must be `---`.
+    let opened = loop {
+        match lines.next() {
+            Some(line) => {
+                let trimmed = line.trim_end_matches('\r').trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                break trimmed == "---";
+            }
+            None => break false,
+        }
+    };
+    if !opened {
+        return false;
+    }
+
+    // Scan the block until the closing delimiter (`---` or `...`).
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "..." {
+            return false;
+        }
+        if line_is_top_level_params_key(line) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True for a frontmatter line that declares a top-level `params:` mapping key
+/// (column 0, no indentation). Any line beginning with `params:` at column 0
+/// is a top-level key — whether it has no inline value (`params:`, optionally
+/// with a trailing `# comment`) or an inline value (`params: foo`). A leading
+/// space (`  params:`), a comment (`# params:`), or a different key
+/// (`myparams:`) does not begin with the literal `params:` prefix and so does
+/// not match.
+fn line_is_top_level_params_key(line: &str) -> bool {
+    line.strip_prefix("params:").is_some()
+}
+
 /// Returns `true` iff `line` (0-based) falls within the body of an R chunk
 /// in the given (raw) R Markdown / Quarto text.
 ///
@@ -895,5 +970,111 @@ mod tests {
         // Unclosed chunk: body runs to EOF; line 1 is inside the body.
         let src = "```{r}\nx <- 1";
         assert!(position_in_r_chunk_body(src, 1));
+    }
+
+    // =========================================================================
+    // frontmatter_declares_params tests
+    // =========================================================================
+
+    #[test]
+    fn params_declared_with_nested_keys() {
+        let src = "---\ntitle: My report\nparams:\n  year: 2024\n  region: \"north\"\n---\n\n```{r}\nprint(params$year)\n```\n";
+        assert!(frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn params_declared_with_inline_value() {
+        // `params:` followed by an inline value (unusual but valid YAML).
+        let src = "---\nparams: ~\n---\n";
+        assert!(frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn params_declared_with_inline_comment() {
+        let src = "---\ntitle: T\nparams:   # report parameters\n  year: 2024\n---\n";
+        assert!(frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn params_declared_with_bom_before_delimiter() {
+        let src = "\u{FEFF}---\nparams:\n  year: 2024\n---\n```{r}\nparams$year\n```\n";
+        assert!(frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn params_declared_after_leading_blank_lines() {
+        // Blank lines before the opening `---` are tolerated.
+        let src = "\n\n---\nparams:\n  year: 2024\n---\n";
+        assert!(frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn params_declared_handles_crlf() {
+        let src = "---\r\nparams:\r\n  year: 2024\r\n---\r\n";
+        assert!(frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn params_closing_delimiter_dots() {
+        // YAML allows `...` as a document end marker; `params:` before it counts.
+        let src = "---\nparams:\n  year: 2024\n...\n```{r}\nparams$year\n```\n";
+        assert!(frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn no_params_when_no_frontmatter() {
+        let src = "```{r}\nparams$year\n```\n";
+        assert!(!frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn no_params_when_frontmatter_lacks_params() {
+        let src = "---\ntitle: My report\nauthor: A. Author\n---\n```{r}\nx <- 1\n```\n";
+        assert!(!frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn no_params_when_params_is_nested() {
+        // `params:` indented under another key is NOT a top-level declaration.
+        let src = "---\nrmarkdown:\n  params:\n    year: 2024\n---\n";
+        assert!(!frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn no_params_when_params_only_in_prose() {
+        // `params:` appears after the frontmatter closes — it's prose, not YAML.
+        let src = "---\ntitle: T\n---\n\nThe params: are documented below.\nparams: not yaml\n";
+        assert!(!frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn no_params_when_params_is_comment_in_frontmatter() {
+        // A `# params:` comment line inside the frontmatter does NOT declare
+        // the key (it starts with `#`, not `params:` at column 0). Documented
+        // behavior: comment lines are ignored.
+        let src = "---\ntitle: T\n# params: would go here\n---\n";
+        assert!(!frontmatter_declares_params(src));
+    }
+
+    #[test]
+    fn no_params_when_key_is_a_different_name() {
+        // `myparams:` (prefix) and `params_extra:` (suffix) must not match the
+        // literal `params:` key at column 0.
+        let src = "---\nmyparams:\n  year: 2024\n---\n";
+        assert!(!frontmatter_declares_params(src));
+        let src2 = "---\nparams_extra: 1\n---\n";
+        assert!(!frontmatter_declares_params(src2));
+    }
+
+    #[test]
+    fn no_params_for_empty_document() {
+        assert!(!frontmatter_declares_params(""));
+    }
+
+    #[test]
+    fn no_params_when_first_nonempty_line_is_not_delimiter() {
+        // A document that opens with prose has no frontmatter block at all.
+        let src = "# Heading\n---\nparams:\n  year: 2024\n---\n";
+        assert!(!frontmatter_declares_params(src));
     }
 }

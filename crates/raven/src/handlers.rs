@@ -126,6 +126,16 @@ pub(crate) struct DiagnosticsSnapshot {
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
 
+    /// True when this is an Rmd/Quarto document whose RAW YAML frontmatter
+    /// declares a top-level `params:` key. knitr/Quarto inject a `params`
+    /// object into the document's R environment for such reports, but the
+    /// masked analysis text blanks the frontmatter — so `params` appears
+    /// undefined. The undefined-variable and out-of-scope collectors treat
+    /// `params` as a defined global when this is set. Computed from
+    /// `doc.text()` (the RAW text) in [`DiagnosticsSnapshot::build`], because
+    /// `snapshot.text` is masked and no longer contains the frontmatter.
+    pub rmd_declared_params: bool,
+
     /// STEP 1 (parent walk) cache shared across all `get_scope` calls in this
     /// snapshot's diagnostic pass. STEP 1 is position-invariant within one
     /// pass for a given URI (parametrized only by `query_inside_function`),
@@ -153,6 +163,12 @@ impl DiagnosticsSnapshot {
         // parsed from this exact text, so the two stay consistent and every
         // diagnostic range is a valid document coordinate.
         let text = doc.analysis_text();
+        // Detect a `params:` frontmatter declaration on the RAW text (the
+        // analysis `text` above is masked, so its YAML frontmatter is blanked
+        // and would never reveal `params:`). Only Rmd/Quarto documents carry a
+        // knitr/Quarto-injected `params` object; plain .R files never do.
+        let rmd_declared_params =
+            doc.is_rmd_document() && crate::chunks::frontmatter_declares_params(&doc.text());
         // Get enriched metadata. The snapshot owns its `directive_meta` so it
         // can mutate `inherited_working_directory` in place; we deep-clone
         // only this single entry, while neighbors stay Arc-wrapped.
@@ -308,6 +324,7 @@ impl DiagnosticsSnapshot {
             cycle_closing_snippet,
             package_library: state.package_library.clone(),
             file_type: doc.file_type,
+            rmd_declared_params,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             scope_contribution: state.package_state.scope_contribution().clone(),
         })
@@ -5272,6 +5289,15 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         if is_reserved_word(name) {
             continue;
         }
+        // knitr/Quarto-injected `params` is a defined global in parameterized
+        // Rmd/Quarto reports (frontmatter declares `params:`). The out-of-scope
+        // collector would otherwise misattribute a `params` use to a later
+        // `source()` whose target happens to export `params`. Mirror the
+        // undefined-variable collector's guard. See
+        // `DiagnosticsSnapshot::rmd_declared_params`.
+        if snapshot.rmd_declared_params && name == "params" {
+            continue;
+        }
 
         // Stream-based visibility check. Collapses the original
         // `locally_resolved_usages` set + `scope.symbols.contains_key`
@@ -5581,6 +5607,17 @@ fn collect_undefined_variables_from_snapshot(
         }
 
         if is_builtin(&name) {
+            continue;
+        }
+
+        // knitr/Quarto inject a `params` object into parameterized reports
+        // whose frontmatter declares a top-level `params:` key. The masked
+        // analysis text blanks that frontmatter, so `params` would otherwise
+        // be flagged undefined. Treat it as a defined global, but ONLY for
+        // Rmd/Quarto docs that actually declare it — plain .R files and Rmd
+        // docs without `params:` still flag legitimate uses. See
+        // `DiagnosticsSnapshot::rmd_declared_params`.
+        if snapshot.rmd_declared_params && name == "params" {
             continue;
         }
 
@@ -10397,6 +10434,85 @@ mod semantic_warning_pipeline_tests {
             .insert(uri.clone(), Document::new(code, None));
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
         (snapshot, uri)
+    }
+
+    /// Build a snapshot for a `.Rmd` document. The URI extension makes the
+    /// document classify as Rmd (masked analysis), exercising the
+    /// `params`-frontmatter recognition path.
+    fn build_rmd_snapshot(code: &str) -> (DiagnosticsSnapshot, Url) {
+        let uri = Url::parse("file:///report.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+        state.lint_config = LintConfig {
+            enabled: false,
+            ..LintConfig::default()
+        };
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        (snapshot, uri)
+    }
+
+    fn undefined_params_messages(diags: &[super::Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter(|d| d.message.contains("Undefined variable: params"))
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn rmd_params_not_flagged_when_frontmatter_declares() {
+        // Frontmatter declares `params:` → knitr injects `params`, so a
+        // `params$year` use in a chunk must NOT be flagged undefined. The use
+        // is a bare statement (not a call argument), so the undefined-variable
+        // collector actually inspects it.
+        let code =
+            "---\ntitle: Report\nparams:\n  year: 2024\n---\n\n```{r}\nx <- params$year\n```\n";
+        let (snapshot, uri) = build_rmd_snapshot(code);
+        assert!(snapshot.rmd_declared_params, "frontmatter declares params:");
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            undefined_params_messages(&diags).is_empty(),
+            "params must not be flagged when frontmatter declares it; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_params_flagged_when_frontmatter_absent() {
+        // Same chunk, but no `params:` in the frontmatter → `params` is a
+        // genuinely undefined variable and must be flagged.
+        let code = "---\ntitle: Report\n---\n\n```{r}\nx <- params$year\n```\n";
+        let (snapshot, uri) = build_rmd_snapshot(code);
+        assert!(
+            !snapshot.rmd_declared_params,
+            "frontmatter does not declare params:"
+        );
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            !undefined_params_messages(&diags).is_empty(),
+            "params must be flagged when frontmatter does not declare it; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plain_r_params_still_flagged() {
+        // Regression: a plain .R file using `params` is never an Rmd report, so
+        // the injection must not apply — `params` stays flagged.
+        let (snapshot, uri) = build_snapshot_with_lint_disabled("x <- params$year\n");
+        assert!(!snapshot.rmd_declared_params, "plain .R is never Rmd");
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            !undefined_params_messages(&diags).is_empty(),
+            "params must still be flagged in a plain .R file; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
