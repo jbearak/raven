@@ -190,7 +190,7 @@ impl Default for CrossFileConfig {
             cache_workspace_index_max_entries: 5000,
             hoist_globals_in_functions: true,
             backward_dependencies: BackwardDependencyMode::Auto,
-            max_transitive_dependents_visited: 200,
+            max_transitive_dependents_visited: 2000,
             package_mode: PackageMode::Auto,
         }
     }
@@ -250,6 +250,7 @@ mod tests {
         assert!(config.hoist_globals_in_functions);
         // Backward dependencies default
         assert_eq!(config.backward_dependencies, BackwardDependencyMode::Auto);
+        assert_eq!(config.max_transitive_dependents_visited, 2000);
         // Libpath watcher defaults — keep in sync with parse_cross_file_config
         // (which clamps debounce to [100, 5000]) and the VS Code extension's
         // initializationOptions.

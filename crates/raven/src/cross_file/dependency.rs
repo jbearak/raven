@@ -663,6 +663,10 @@ pub struct DependencyGraph {
     subgraph_cache: SubgraphCache,
     /// Counter of subgraph cache hits — exposed for tests.
     subgraph_cache_hits: std::sync::atomic::AtomicU64,
+    /// Counter of traversals truncated by the max-visited budget.
+    visited_budget_truncations: std::sync::atomic::AtomicU64,
+    /// Counter of traversals truncated by max-depth limits.
+    depth_truncations: std::sync::atomic::AtomicU64,
 }
 
 impl Default for DependencyGraph {
@@ -681,6 +685,8 @@ impl Default for DependencyGraph {
                 SUBGRAPH_CACHE_CAPACITY,
             ))),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
+            depth_truncations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -705,6 +711,8 @@ impl Clone for DependencyGraph {
                 SUBGRAPH_CACHE_CAPACITY,
             ))),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
+            depth_truncations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -1154,6 +1162,8 @@ impl DependencyGraph {
                 SUBGRAPH_CACHE_CAPACITY,
             ))),
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
+            depth_truncations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1244,6 +1254,38 @@ impl DependencyGraph {
             .unwrap_or_default()
     }
 
+    fn record_visited_budget_truncation(&self) {
+        self.visited_budget_truncations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_depth_truncation(&self) {
+        self.depth_truncations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn has_unvisited_dependents(&self, uri: &Url, visited: &HashMap<Url, usize>) -> bool {
+        self.backward
+            .get(uri)
+            .is_some_and(|edges| edges.iter().any(|edge| !visited.contains_key(&edge.from)))
+    }
+
+    fn has_unvisited_dependencies(&self, uri: &Url, visited: &HashMap<Url, usize>) -> bool {
+        self.forward
+            .get(uri)
+            .is_some_and(|edges| edges.iter().any(|edge| !visited.contains_key(&edge.to)))
+    }
+
+    fn has_unvisited_neighbors(&self, uri: &Url, visited: &HashSet<Url>) -> bool {
+        self.forward
+            .get(uri)
+            .is_some_and(|edges| edges.iter().any(|edge| !visited.contains(&edge.to)))
+            || self
+                .backward
+                .get(uri)
+                .is_some_and(|edges| edges.iter().any(|edge| !visited.contains(&edge.from)))
+    }
+
     /// Get all transitive dependents (files that depend on uri directly or indirectly).
     ///
     /// `max_visited` caps the total number of nodes explored during DFS to prevent
@@ -1275,6 +1317,7 @@ impl DependencyGraph {
         max_visited: usize,
     ) {
         if current_depth > max_depth {
+            self.record_depth_truncation();
             return;
         }
         let is_first_visit = match visited.get(uri) {
@@ -1282,6 +1325,7 @@ impl DependencyGraph {
             Some(_) => false,
             None => {
                 if visited.len() >= max_visited {
+                    self.record_visited_budget_truncation();
                     return;
                 }
                 true
@@ -1292,11 +1336,15 @@ impl DependencyGraph {
             result.push(uri.clone());
         }
         if current_depth == max_depth {
+            if self.has_unvisited_dependents(uri, visited) {
+                self.record_depth_truncation();
+            }
             return;
         }
 
         for edge in self.get_dependents(uri) {
             if visited.len() >= max_visited && !visited.contains_key(&edge.from) {
+                self.record_visited_budget_truncation();
                 break;
             }
             self.collect_dependents(
@@ -1350,6 +1398,7 @@ impl DependencyGraph {
         let mut visited: HashMap<Url, usize> = HashMap::new();
         for root in roots {
             if visited.len() >= max_visited {
+                self.record_visited_budget_truncation();
                 break;
             }
             self.collect_dependencies(root, max_depth, 0, &mut visited, &mut result, max_visited);
@@ -1373,6 +1422,7 @@ impl DependencyGraph {
         max_visited: usize,
     ) {
         if current_depth > max_depth {
+            self.record_depth_truncation();
             return;
         }
         let is_first_visit = match visited.get(uri) {
@@ -1380,6 +1430,7 @@ impl DependencyGraph {
             Some(_) => false,
             None => {
                 if visited.len() >= max_visited {
+                    self.record_visited_budget_truncation();
                     return;
                 }
                 true
@@ -1390,11 +1441,15 @@ impl DependencyGraph {
             result.push(uri.clone());
         }
         if current_depth == max_depth {
+            if self.has_unvisited_dependencies(uri, visited) {
+                self.record_depth_truncation();
+            }
             return;
         }
 
         for edge in self.get_dependencies(uri) {
             if visited.len() >= max_visited && !visited.contains_key(&edge.to) {
+                self.record_visited_budget_truncation();
                 break;
             }
             self.collect_dependencies(
@@ -1536,50 +1591,22 @@ impl DependencyGraph {
     ///
     /// `max_visited` caps the total number of nodes collected to prevent
     /// unbounded expansion in dense bidirectional graphs.
+    ///
+    /// Single-seed convenience wrapper around
+    /// [`Self::collect_neighborhood_multi`].
     pub fn collect_neighborhood(
         &self,
         uri: &Url,
         max_depth: usize,
         max_visited: usize,
     ) -> HashSet<Url> {
-        let mut visited = HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back((uri.clone(), 0usize));
-        visited.insert(uri.clone());
-
-        while let Some((current, depth)) = queue.pop_front() {
-            if depth >= max_depth || visited.len() >= max_visited {
-                continue;
-            }
-            // Follow forward edges (children)
-            if let Some(edges) = self.forward.get(&current) {
-                for edge in edges {
-                    if visited.len() >= max_visited {
-                        break;
-                    }
-                    if visited.insert(edge.to.clone()) {
-                        queue.push_back((edge.to.clone(), depth + 1));
-                    }
-                }
-            }
-            // Follow backward edges (parents)
-            if let Some(edges) = self.backward.get(&current) {
-                for edge in edges {
-                    if visited.len() >= max_visited {
-                        break;
-                    }
-                    if visited.insert(edge.from.clone()) {
-                        queue.push_back((edge.from.clone(), depth + 1));
-                    }
-                }
-            }
-        }
-        visited
+        self.collect_neighborhood_multi(std::iter::once(uri.clone()), max_depth, max_visited)
     }
 
-    /// Multi-seed variant of `collect_neighborhood`. Performs a single BFS
-    /// from all seeds sharing one visited set and one global `max_visited`
-    /// budget, avoiding redundant traversal of shared ancestors.
+    /// Multi-seed neighborhood walk: a single BFS from all seeds sharing one
+    /// visited set and one global `max_visited` budget, avoiding redundant
+    /// traversal of shared ancestors. [`Self::collect_neighborhood`] is the
+    /// single-seed wrapper.
     pub fn collect_neighborhood_multi(
         &self,
         seeds: impl IntoIterator<Item = Url>,
@@ -1595,12 +1622,24 @@ impl DependencyGraph {
         }
 
         while let Some((current, depth)) = queue.pop_front() {
-            if depth >= max_depth || visited.len() >= max_visited {
+            if depth >= max_depth {
+                if self.has_unvisited_neighbors(&current, &visited) {
+                    self.record_depth_truncation();
+                }
+                continue;
+            }
+            if visited.len() >= max_visited {
+                if self.has_unvisited_neighbors(&current, &visited) {
+                    self.record_visited_budget_truncation();
+                }
                 continue;
             }
             if let Some(edges) = self.forward.get(&current) {
                 for edge in edges {
                     if visited.len() >= max_visited {
+                        if !visited.contains(&edge.to) {
+                            self.record_visited_budget_truncation();
+                        }
                         break;
                     }
                     if visited.insert(edge.to.clone()) {
@@ -1611,6 +1650,9 @@ impl DependencyGraph {
             if let Some(edges) = self.backward.get(&current) {
                 for edge in edges {
                     if visited.len() >= max_visited {
+                        if !visited.contains(&edge.from) {
+                            self.record_visited_budget_truncation();
+                        }
                         break;
                     }
                     if visited.insert(edge.from.clone()) {
@@ -1705,6 +1747,18 @@ impl DependencyGraph {
     /// Exposed for tests; not used in production code.
     pub fn subgraph_cache_hits(&self) -> u64 {
         self.subgraph_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of traversals that hit the max-visited budget.
+    pub fn visited_budget_truncations(&self) -> u64 {
+        self.visited_budget_truncations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of traversals that hit a depth limit while more edges remained.
+    pub fn depth_truncations(&self) -> u64 {
+        self.depth_truncations
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -2209,6 +2263,72 @@ mod tests {
         // Full traversal returns all 5
         let all_dependents = graph.get_transitive_dependents(&hub, 10, 200);
         assert_eq!(all_dependents.len(), 5);
+    }
+
+    #[test]
+    fn visited_budget_counter_increments_when_transitive_walk_truncates() {
+        let mut graph = DependencyGraph::new();
+        let hub = url("hub.R");
+        for i in 0..5 {
+            let spoke = url(&format!("spoke_{i}.R"));
+            graph.update_file(
+                &spoke,
+                &make_meta_with_source("hub.R", 1),
+                Some(&workspace_root()),
+                |_| None,
+            );
+        }
+
+        let _ = graph.get_transitive_dependents(&hub, 10, 3);
+
+        assert!(
+            graph.visited_budget_truncations() > 0,
+            "budget-limited traversal should record a truncation"
+        );
+    }
+
+    #[test]
+    fn depth_counter_increments_when_transitive_walk_has_more_edges_at_limit() {
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        graph.update_file(
+            &a,
+            &make_meta_with_source("b.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &b,
+            &make_meta_with_source("c.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+
+        let _ = graph.get_transitive_dependencies(&a, 1, 200);
+
+        assert!(
+            graph.depth_truncations() > 0,
+            "depth-limited traversal should record a truncation when children remain"
+        );
+    }
+
+    #[test]
+    fn truncation_counters_stay_zero_when_budget_and_depth_are_sufficient() {
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        graph.update_file(
+            &a,
+            &make_meta_with_source("b.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+
+        let _ = graph.get_transitive_dependencies(&a, 10, 200);
+        let _ = graph.collect_neighborhood(&a, 10, 200);
+
+        assert_eq!(graph.visited_budget_truncations(), 0);
+        assert_eq!(graph.depth_truncations(), 0);
     }
 
     #[test]

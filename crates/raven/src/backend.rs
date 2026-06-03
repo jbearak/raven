@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::task::{Context, Poll};
 
@@ -199,6 +200,12 @@ pub(crate) fn parse_cross_file_config(
         }
         if let Some(v) = cross_file.get("maxChainDepth").and_then(|v| v.as_u64()) {
             config.max_chain_depth = v as usize;
+        }
+        if let Some(v) = cross_file
+            .get("maxTransitiveDependentsVisited")
+            .and_then(|v| v.as_u64())
+        {
+            config.max_transitive_dependents_visited = v as usize;
         }
         if let Some(v) = cross_file.get("assumeCallSite").and_then(|v| v.as_str()) {
             config.assume_call_site = match v {
@@ -1140,6 +1147,52 @@ pub struct Backend {
     state: Arc<RwLock<WorldState>>,
     background_indexer: Arc<crate::cross_file::BackgroundIndexer>,
     request_cancellation: Arc<RequestCancellationRegistry>,
+    traversal_truncation: Arc<TraversalTruncationState>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TraversalTruncationDelta {
+    visited_budget: u64,
+    depth: u64,
+}
+
+impl TraversalTruncationDelta {
+    fn total(&self) -> u64 {
+        self.visited_budget.saturating_add(self.depth)
+    }
+}
+
+#[derive(Debug, Default)]
+struct TraversalTruncationState {
+    visited_budget_baseline: AtomicU64,
+    depth_baseline: AtomicU64,
+    visited_budget_notified: AtomicBool,
+}
+
+impl TraversalTruncationState {
+    fn consume_delta(
+        &self,
+        visited_budget_total: u64,
+        depth_total: u64,
+    ) -> TraversalTruncationDelta {
+        let visited_budget_previous = self
+            .visited_budget_baseline
+            .swap(visited_budget_total, Ordering::AcqRel);
+        let depth_previous = self.depth_baseline.swap(depth_total, Ordering::AcqRel);
+
+        TraversalTruncationDelta {
+            visited_budget: visited_budget_total.saturating_sub(visited_budget_previous),
+            depth: depth_total.saturating_sub(depth_previous),
+        }
+    }
+
+    fn should_show_visited_budget_notice(&self) -> bool {
+        !self.visited_budget_notified.swap(true, Ordering::AcqRel)
+    }
+
+    fn reset_notice_throttle(&self) {
+        self.visited_budget_notified.store(false, Ordering::Release);
+    }
 }
 
 impl Backend {
@@ -1233,6 +1286,16 @@ impl Backend {
         }
         final_ready
     }
+
+    async fn check_and_warn_traversal_truncation(&self) {
+        check_and_warn_traversal_truncation(
+            &self.state,
+            &self.client,
+            self.traversal_truncation.as_ref(),
+        )
+        .await;
+    }
+
     #[allow(dead_code)]
     pub fn new(client: Client) -> Self {
         Self::new_with_request_cancellation(client, Arc::new(RequestCancellationRegistry::new()))
@@ -1253,6 +1316,7 @@ impl Backend {
             state,
             background_indexer,
             request_cancellation,
+            traversal_truncation: Arc::new(TraversalTruncationState::default()),
         }
     }
 }
@@ -1722,6 +1786,53 @@ fn rebuild_work_items_after_reenrichment(
         .collect()
 }
 
+async fn check_and_warn_traversal_truncation(
+    state_arc: &Arc<RwLock<WorldState>>,
+    client: &Client,
+    traversal_truncation: &TraversalTruncationState,
+) {
+    let (visited_budget_total, depth_total, max_visited, max_chain_depth) = {
+        let state = state_arc.read().await;
+        (
+            state.cross_file_graph.visited_budget_truncations(),
+            state.cross_file_graph.depth_truncations(),
+            state.cross_file_config.max_transitive_dependents_visited,
+            state.cross_file_config.max_chain_depth,
+        )
+    };
+
+    let delta = traversal_truncation.consume_delta(visited_budget_total, depth_total);
+    if delta.total() == 0 {
+        return;
+    }
+
+    if delta.visited_budget > 0 {
+        log::warn!(
+            "Cross-file traversal visited-budget limit hit {} time(s); max_transitive_dependents_visited={}",
+            delta.visited_budget,
+            max_visited
+        );
+        if traversal_truncation.should_show_visited_budget_notice() {
+            client
+                .show_message(
+                    MessageType::WARNING,
+                    format!(
+                        "Raven: this workspace's R dependency graph exceeded the cross-file analysis budget (visited the maximum of {max_visited} files), so some cross-file diagnostics may be incomplete. Increase `raven.crossFile.maxTransitiveDependentsVisited` (current: {max_visited}) to analyze more files."
+                    ),
+                )
+                .await;
+        }
+    }
+
+    if delta.depth > 0 {
+        log::debug!(
+            "Cross-file traversal depth limit hit {} time(s); max_chain_depth={}",
+            delta.depth,
+            max_chain_depth
+        );
+    }
+}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -1734,6 +1845,7 @@ async fn run_debounced_diagnostics(
     debounce_ms: u64,
     trigger_version: Option<i32>,
     trigger_revision: Option<u64>,
+    traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
     // Schedule with cancellation token
     let token = {
@@ -1784,6 +1896,10 @@ async fn run_debounced_diagnostics(
     let Some((snapshot, workspace_folder, missing_file_severity)) = snapshot_data else {
         return;
     };
+
+    if let Some(traversal_truncation) = traversal_truncation.as_deref() {
+        check_and_warn_traversal_truncation(&state_arc, &client, traversal_truncation).await;
+    }
 
     // Compute diagnostics WITHOUT holding any lock
     let sync_diagnostics =
@@ -1922,6 +2038,7 @@ struct ReconciliationDecisions {
     old_diagnostics_enabled: bool,
     new_diagnostics_enabled: bool,
     packages_enabled: bool,
+    max_transitive_dependents_visited_changed: bool,
     trigger_on_open_paren_changed: bool,
     new_trigger_on_open_paren: bool,
     /// `Some(root)` when `packageMode` flipped to a non-Disabled mode and
@@ -2152,6 +2269,7 @@ impl LanguageServer for Backend {
         let root_for_pkg_inputs: Option<std::path::PathBuf> =
             folders.first().and_then(|u| u.to_file_path().ok());
         let client_clone = self.client.clone();
+        let traversal_truncation = self.traversal_truncation.clone();
         if index_workspace {
             tokio::task::spawn(async move {
                 // Run the blocking scan in a blocking task
@@ -2280,6 +2398,7 @@ impl LanguageServer for Backend {
                         for (uri, trigger_version, trigger_revision) in work_items {
                             let state_arc = state_clone.clone();
                             let client = client_clone.clone();
+                            let traversal_truncation = traversal_truncation.clone();
                             tokio::spawn(run_debounced_diagnostics(
                                 state_arc,
                                 client,
@@ -2287,6 +2406,7 @@ impl LanguageServer for Backend {
                                 debounce_ms,
                                 trigger_version,
                                 trigger_revision,
+                                Some(traversal_truncation),
                             ));
                         }
                     }
@@ -2551,8 +2671,15 @@ impl LanguageServer for Backend {
                 for uri in open_uris {
                     let state_arc = Arc::clone(&self.state);
                     let client = self.client.clone();
+                    let traversal_truncation = self.traversal_truncation.clone();
                     tokio::spawn(async move {
-                        Backend::publish_diagnostics_via_arc(state_arc, client, &uri).await;
+                        Backend::publish_diagnostics_via_arc(
+                            state_arc,
+                            client,
+                            &uri,
+                            Some(traversal_truncation),
+                        )
+                        .await;
                     });
                 }
                 Ok(Some(serde_json::json!({ "cleared": cleared })))
@@ -3436,6 +3563,7 @@ impl LanguageServer for Backend {
         for (affected_uri, trigger_version, trigger_revision) in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
+            let traversal_truncation = self.traversal_truncation.clone();
 
             tokio::spawn(run_debounced_diagnostics(
                 state_arc,
@@ -3444,6 +3572,7 @@ impl LanguageServer for Backend {
                 debounce_ms,
                 trigger_version,
                 trigger_revision,
+                Some(traversal_truncation),
             ));
         }
 
@@ -3451,6 +3580,7 @@ impl LanguageServer for Backend {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let stabilization_uri = uri.clone();
+            let traversal_truncation = self.traversal_truncation.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(750)).await;
                 let (trigger_version, trigger_revision) = {
@@ -3474,6 +3604,7 @@ impl LanguageServer for Backend {
                     0,
                     trigger_version,
                     trigger_revision,
+                    Some(traversal_truncation),
                 )
                 .await;
             });
@@ -3855,6 +3986,7 @@ impl LanguageServer for Backend {
             let client = self.client.clone();
             let revalidation_uri = uri.clone();
             let direct_packages = packages_to_prefetch;
+            let traversal_truncation = self.traversal_truncation.clone();
             tokio::spawn(async move {
                 // Extend direct library_calls with inherited packages from
                 // parent source() chains. Snapshot under the lock, release it,
@@ -3940,6 +4072,7 @@ impl LanguageServer for Backend {
                     debounce_ms,
                     trigger_version,
                     trigger_revision,
+                    Some(traversal_truncation),
                 )
                 .await;
             });
@@ -3951,6 +4084,7 @@ impl LanguageServer for Backend {
         for (affected_uri, trigger_version, trigger_revision) in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
+            let traversal_truncation = self.traversal_truncation.clone();
             let debounce = if affected_uri == uri {
                 edited_file_debounce_ms
             } else {
@@ -3964,8 +4098,11 @@ impl LanguageServer for Backend {
                 debounce,
                 trigger_version,
                 trigger_revision,
+                Some(traversal_truncation),
             ));
         }
+
+        self.check_and_warn_traversal_truncation().await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -4099,6 +4236,7 @@ impl LanguageServer for Backend {
         for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
             let state_arc = self.state.clone();
             let client = self.client.clone();
+            let traversal_truncation = self.traversal_truncation.clone();
             tokio::spawn(run_debounced_diagnostics(
                 state_arc,
                 client,
@@ -4106,6 +4244,7 @@ impl LanguageServer for Backend {
                 debounce_ms,
                 trigger_version,
                 trigger_revision,
+                Some(traversal_truncation),
             ));
         }
     }
@@ -4653,6 +4792,7 @@ impl LanguageServer for Backend {
         if !uris_to_update.is_empty() {
             let state_arc = self.state.clone();
             let client = self.client.clone();
+            let traversal_truncation = self.traversal_truncation.clone();
             let mut affected_for_async = affected_open_docs.clone();
             // Track URIs already in `affected_for_async` so the post-update
             // recomputation can union new neighbors without rescans.
@@ -4930,8 +5070,13 @@ impl LanguageServer for Backend {
                         .mark_force_republish_many(affected_for_async.iter());
                 }
                 for uri in affected_for_async {
-                    Backend::publish_diagnostics_via_arc(state_arc.clone(), client.clone(), &uri)
-                        .await;
+                    Backend::publish_diagnostics_via_arc(
+                        state_arc.clone(),
+                        client.clone(),
+                        &uri,
+                        Some(traversal_truncation.clone()),
+                    )
+                    .await;
                 }
             });
         } else {
@@ -5544,6 +5689,9 @@ impl Backend {
             };
 
             let packages_enabled = state.cross_file_config.packages_enabled;
+            let max_transitive_dependents_visited_changed =
+                state.cross_file_config.max_transitive_dependents_visited
+                    != prev.prev_cross_file.max_transitive_dependents_visited;
 
             // If `package_mode` changed, apply the setting change via the
             // event-driven path. For Disabled: translate immediately
@@ -5598,6 +5746,7 @@ impl Backend {
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
                 packages_enabled,
+                max_transitive_dependents_visited_changed,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
                 pkg_mode_io_needed,
@@ -5614,11 +5763,16 @@ impl Backend {
             old_diagnostics_enabled,
             new_diagnostics_enabled,
             packages_enabled,
+            max_transitive_dependents_visited_changed,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
             pkg_mode_io_needed,
             open_uris,
         } = decisions;
+
+        if max_transitive_dependents_visited_changed {
+            self.traversal_truncation.reset_notice_throttle();
+        }
 
         // --- Package mode rebuild: repopulate inputs after mode switch ---
         // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
@@ -6299,10 +6453,11 @@ impl Backend {
 
     /// Free-standing variant of `publish_diagnostics` usable from background tasks.
     /// Delegates to the same debounced pipeline.
-    pub(crate) async fn publish_diagnostics_via_arc(
+    async fn publish_diagnostics_via_arc(
         state_arc: Arc<RwLock<WorldState>>,
         client: Client,
         uri: &Url,
+        traversal_truncation: Option<Arc<TraversalTruncationState>>,
     ) {
         let (debounce_ms, trigger_version, trigger_revision) = {
             let state = state_arc.read().await;
@@ -6318,11 +6473,13 @@ impl Backend {
             debounce_ms,
             trigger_version,
             trigger_revision,
+            traversal_truncation,
         ));
     }
 
     async fn publish_diagnostics(&self, uri: &Url) {
-        publish_diagnostics_inner(&self.state, &self.client, uri).await
+        publish_diagnostics_inner(&self.state, &self.client, uri).await;
+        self.check_and_warn_traversal_truncation().await;
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -6427,8 +6584,13 @@ impl Backend {
         };
 
         for uri in affected_uris {
-            Backend::publish_diagnostics_via_arc(self.state.clone(), self.client.clone(), &uri)
-                .await;
+            Backend::publish_diagnostics_via_arc(
+                self.state.clone(),
+                self.client.clone(),
+                &uri,
+                Some(self.traversal_truncation.clone()),
+            )
+            .await;
         }
     }
 }
@@ -7047,7 +7209,7 @@ async fn run_libpath_consumer(
                     let state_arc2 = Arc::clone(&state_arc);
                     let client2 = client.clone();
                     tokio::spawn(async move {
-                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri).await;
+                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri, None).await;
                     });
                 }
             }
@@ -7067,7 +7229,7 @@ async fn run_libpath_consumer(
                     let state_arc2 = Arc::clone(&state_arc);
                     let client2 = client.clone();
                     tokio::spawn(async move {
-                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri).await;
+                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri, None).await;
                     });
                 }
 
@@ -7924,6 +8086,37 @@ mod tests {
         }
     }
 
+    mod traversal_truncation_notice {
+        use super::super::TraversalTruncationState;
+
+        #[test]
+        fn delta_detects_new_truncations_and_advances_baselines() {
+            let state = TraversalTruncationState::default();
+
+            let delta = state.consume_delta(3, 2);
+
+            assert_eq!(delta.visited_budget, 3);
+            assert_eq!(delta.depth, 2);
+            assert_eq!(state.consume_delta(3, 2).total(), 0);
+
+            let delta = state.consume_delta(5, 4);
+            assert_eq!(delta.visited_budget, 2);
+            assert_eq!(delta.depth, 2);
+        }
+
+        #[test]
+        fn visited_budget_notice_is_throttled_until_reset() {
+            let state = TraversalTruncationState::default();
+
+            assert!(state.should_show_visited_budget_notice());
+            assert!(!state.should_show_visited_budget_notice());
+
+            state.reset_notice_throttle();
+
+            assert!(state.should_show_visited_budget_notice());
+        }
+    }
+
     // ============================================================================
     // Unit Tests for Configuration Parsing Defaults
     // Property 4: Configuration parsing defaults to enabled when absent
@@ -8159,6 +8352,20 @@ mod tests {
                 .unwrap();
             assert!(!cfg.packages_watch_library_paths);
             assert_eq!(cfg.packages_watch_debounce_ms, 250);
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_max_transitive_dependents_visited() {
+            let settings = json!({
+                "crossFile": {
+                    "maxTransitiveDependentsVisited": 1234
+                }
+            });
+
+            let cfg = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cfg.max_transitive_dependents_visited, 1234);
         }
 
         #[test]

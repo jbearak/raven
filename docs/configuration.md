@@ -68,6 +68,7 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rPath`
 | `raven.crossFile.maxBackwardDepth` | `10` | Maximum depth for backward directive traversal |
 | `raven.crossFile.maxForwardDepth` | `10` | Maximum depth for forward source() traversal |
 | `raven.crossFile.maxChainDepth` | `20` | Maximum total chain depth (emits diagnostic when exceeded) |
+| `raven.crossFile.maxTransitiveDependentsVisited` | `2000` | Maximum files visited while traversing the cross-file dependency graph. If this budget truncates analysis, Raven logs a warning and shows a throttled editor warning with this setting name. |
 | `raven.crossFile.maxRevalidationsPerTrigger` | `10` | Max open documents to revalidate per change |
 | `raven.crossFile.revalidationDebounceMs` | `200` | Debounce delay for dependent file diagnostics (ms) |
 | `raven.crossFile.editedFileDebounceMs` | `50` | Debounce delay for the actively-edited file (ms). *LSP init-only — not exposed in the VS Code Settings UI.* |
