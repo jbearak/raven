@@ -305,7 +305,9 @@ impl Document {
         let analysis_text = if self.chunk_kind == ChunkKind::Rmd {
             let masked = crate::chunks::mask_to_r(&raw_text);
             self.masked_text = Some(masked);
-            self.masked_text.as_deref().unwrap_or(&raw_text)
+            self.masked_text
+                .as_deref()
+                .expect("masked_text was just set")
         } else {
             // Keep the field `None` for non-Rmd docs; analysis text == raw text.
             self.masked_text = None;
@@ -2067,11 +2069,12 @@ mod tests {
         // Raw contents updated.
         assert!(doc.text().contains("newsym <- 2"));
         // masked_text re-derived and consistent with the raw contents.
-        assert_eq!(doc.analysis_text(), crate::chunks::mask_to_r(&doc.text()));
+        let analysis = doc.analysis_text();
+        assert_eq!(analysis, crate::chunks::mask_to_r(&doc.text()));
         // Tree reparsed from the masked text: no ERROR nodes, new symbol present.
         let tree = doc.tree.as_ref().expect("tree after change");
         assert!(!tree_has_error(tree), "no ERROR nodes after in-chunk edit");
-        assert!(tree_has_identifier(tree, &doc.analysis_text(), "newsym"));
+        assert!(tree_has_identifier(tree, &analysis, "newsym"));
         // Revision bumped.
         assert!(doc.revision > v0);
     }
@@ -2099,7 +2102,8 @@ mod tests {
 
         assert!(doc.text().contains("different prose entirely"));
         // Prose is still blanked in the analysis text.
-        assert_eq!(doc.analysis_text(), crate::chunks::mask_to_r(&doc.text()));
+        let analysis = doc.analysis_text();
+        assert_eq!(analysis, crate::chunks::mask_to_r(&doc.text()));
         let tree = doc.tree.as_ref().expect("tree after prose change");
         assert!(
             !tree_has_error(tree),
@@ -2107,7 +2111,7 @@ mod tests {
         );
         // The R chunk body is still on line 2 (geometry preserved) and the
         // symbol is still visible.
-        assert!(tree_has_identifier(tree, &doc.analysis_text(), "x"));
+        assert!(tree_has_identifier(tree, &analysis, "x"));
     }
 
     #[test]

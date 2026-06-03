@@ -86,6 +86,10 @@ pub(crate) fn empty_base_exports() -> &'static Arc<HashSet<String>> {
 pub(crate) struct DiagnosticsSnapshot {
     // Document data
     pub tree: tree_sitter::Tree,
+    /// Raw source text — `doc.text()`, not `doc.analysis_text()`.
+    /// Paired with `tree` only after the Rmd early-return at the top of
+    /// `diagnostics_from_snapshot` ensures they are never mixed; if Rmd
+    /// diagnostics are ever enabled, this field must switch to `analysis_text()`.
     pub text: String,
     // Cross-file state (pre-collected)
     pub directive_meta: crate::cross_file::CrossFileMetadata,
@@ -1350,9 +1354,12 @@ pub struct SymbolExtractor<'a> {
 impl<'a> SymbolExtractor<'a> {
     /// Create a new SymbolExtractor for the given source text and AST root node.
     ///
+    /// `text` must be the string the `root` node was parsed from — byte offsets
+    /// from the AST are resolved against it.
+    ///
     /// # Arguments
     ///
-    /// * `text` - The source text of the R document
+    /// * `text` - The source text the `root` node was parsed from
     /// * `root` - The root node of the tree-sitter parse tree
     ///
     /// # Examples
@@ -3754,6 +3761,8 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
             // prose lines blanked. The Document carries the resolved kind so
             // untitled buffers (no file extension) still classify correctly via
             // their `languageId`.
+            // `extract_chunks` is purely text-based and never consults `self.root`, so
+            // pairing the analysis-text tree with the raw text is safe here.
             let chunk_extractor = SymbolExtractor::new(&text, tree.root_node());
             raw_symbols.extend(chunk_extractor.extract_chunks(doc.chunk_kind));
             raw_symbols
