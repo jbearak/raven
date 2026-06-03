@@ -927,7 +927,7 @@ mod tests {
     fn walk_includes_rmd_and_qmd() {
         // The empty-PATHS workspace walk collects chunk-bearing documents
         // alongside R sources, including mixed-case extensions
-        // (is_chunk_file is case-insensitive).
+        // (is_chunk_file matches the explicit list Rmd/rmd/RMD/qmd/Qmd/QMD).
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("a.R"), "x <- 1\n").unwrap();
         fs::write(tmp.path().join("report.Rmd"), "prose\n").unwrap();
@@ -1054,6 +1054,10 @@ mod tests {
                         |parent_uri| state.get_enriched_metadata(parent_uri),
                         max_chain_depth,
                     );
+                    // Unlike `run`, skip the `parent_content` map: no test
+                    // routed through this helper uses backward directives
+                    // (`@lsp-sourced-by` match=/inference), which is all that
+                    // closure feeds. The production path in `run` is complete.
                     state.cross_file_graph.update_file(
                         &uri,
                         &meta,

@@ -194,10 +194,9 @@ pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
 /// predicate also matches chunk files so their R chunks are diagnosed
 /// (issue #343).
 ///
-/// Used by `raven check`'s report walk (empty `PATHS` or an explicit directory)
-/// and reused by `raven lint`'s walk so the two commands agree on which files a
-/// directory contributes. Results are unsorted; callers that need deterministic
-/// order sort afterwards.
+/// Used by `raven check`'s report walk (empty `PATHS` or an explicit
+/// directory). Results are unsorted; callers that need deterministic order
+/// sort afterwards.
 pub fn collect_check_target_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     crate::state::collect_files_matching(dir, out, |p| is_r_file(p) || is_chunk_file(p));
 }
