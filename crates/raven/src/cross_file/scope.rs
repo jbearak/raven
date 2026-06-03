@@ -14385,6 +14385,694 @@ y <- filter(df)"#;
                  after source(\"helper.R\") fires"
             );
         }
+
+        /// Provenance parity for a "diamond" merge where two forward
+        /// `source()` calls both define the same name at *different*
+        /// definition positions. The name-set property test cannot
+        /// distinguish first-source-wins from last-source-wins here
+        /// because both paths still record the name `f`; only the full
+        /// `(source_uri, defined_line, defined_column, kind)` tuple
+        /// reveals which definition wins. This is the canonical "names
+        /// match, provenance could diverge" case from issue #374.
+        ///
+        /// Setup:
+        ///   main.R  sources a.R then b.R; then uses f.
+        ///   a.R     defines `f` at line 0, col 0  (function).
+        ///   b.R     has a comment on line 0, defines `f` at line 1, col 0.
+        ///
+        /// First-source-wins (recursive `entry().or_insert` at
+        /// scope.rs:3979; stream `or_insert` at scope.rs:5424) means `f`
+        /// must resolve to a.R's line-0 definition in *both* paths.
+        #[test]
+        fn test_scope_stream_diamond_source_provenance_matches_recursive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::CrossFileMetadata;
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let a_uri = Url::parse("file:///project/a.R").unwrap();
+            let b_uri = Url::parse("file:///project/b.R").unwrap();
+
+            let main_code = "source(\"a.R\")\nsource(\"b.R\")\nuse_f <- f\n";
+            // a.R: `f` defined at line 0, col 0 (a function).
+            let a_code = "f <- function() 1\n";
+            // b.R: comment on line 0 pushes `f` to line 1, col 0 (a
+            // function with a different body). Different defined_line from
+            // a.R, so a last-source-wins regression would change the
+            // provenance tuple.
+            let b_code = "# comment line\nf <- function() 2\n";
+
+            let main_tree = parse_r(main_code);
+            let a_tree = parse_r(a_code);
+            let b_tree = parse_r(b_code);
+
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let a_artifacts = Arc::new(compute_artifacts(&a_uri, &a_tree, a_code));
+            let b_artifacts = Arc::new(compute_artifacts(&b_uri, &b_tree, b_code));
+
+            let main_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                main_code,
+                Some(&main_tree),
+            ));
+            let a_meta = std::sync::Arc::new(CrossFileMetadata::default());
+            let b_meta = std::sync::Arc::new(CrossFileMetadata::default());
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
+
+            let main_uri_a = main_uri.clone();
+            let a_uri_a = a_uri.clone();
+            let b_uri_a = b_uri.clone();
+            let main_arts_c = main_artifacts.clone();
+            let a_arts_c = a_artifacts.clone();
+            let b_arts_c = b_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &main_uri_a {
+                    Some(main_arts_c.clone())
+                } else if uri == &a_uri_a {
+                    Some(a_arts_c.clone())
+                } else if uri == &b_uri_a {
+                    Some(b_arts_c.clone())
+                } else {
+                    None
+                }
+            };
+            let main_uri_m = main_uri.clone();
+            let a_uri_m = a_uri.clone();
+            let b_uri_m = b_uri.clone();
+            let main_meta_c = main_meta.clone();
+            let a_meta_c = a_meta.clone();
+            let b_meta_c = b_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &main_uri_m {
+                    Some(main_meta_c.clone())
+                } else if uri == &a_uri_m {
+                    Some(a_meta_c.clone())
+                } else if uri == &b_uri_m {
+                    Some(b_meta_c.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Query at line 2 col 0: both source() calls have fired.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(2, 0);
+            let streamed = stream.snapshot();
+
+            let mut throwaway = ParentPrefixCache::new();
+            let direct = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+                None,
+            );
+
+            let stream_f = streamed
+                .symbols
+                .get("f")
+                .expect("stream must have f in scope after both source() calls");
+            let direct_f = direct
+                .symbols
+                .get("f")
+                .expect("recursive must have f in scope after both source() calls");
+
+            // Full-tuple parity between the two paths.
+            assert_eq!(
+                (
+                    &stream_f.source_uri,
+                    stream_f.defined_line,
+                    stream_f.defined_column,
+                    stream_f.kind
+                ),
+                (
+                    &direct_f.source_uri,
+                    direct_f.defined_line,
+                    direct_f.defined_column,
+                    direct_f.kind
+                ),
+                "ScopeStream and recursive resolver must agree on the full \
+                 provenance tuple (source_uri, defined_line, defined_column, \
+                 kind) for f when two sources define it at different positions."
+            );
+
+            // Concrete intent: a.R is sourced first, so its line-0 / col-0
+            // function definition wins (first-source-wins).
+            assert_eq!(
+                (
+                    &direct_f.source_uri,
+                    direct_f.defined_line,
+                    direct_f.defined_column,
+                    direct_f.kind
+                ),
+                (&a_uri, 0u32, 0u32, SymbolKind::Function),
+                "sanity: f must resolve to a.R's line-0 function definition \
+                 (first-source-wins), not b.R's line-1 definition"
+            );
+        }
+
+        /// Provenance parity for a forward+backward cycle that round-trips
+        /// a local symbol back through a child's parent-prefix.
+        ///
+        /// Setup (cycle):
+        ///   main.R    g <- 1            (line 0)
+        ///             source("helper.R") (line 1)  -- forward main -> helper
+        ///   helper.R  # @lsp-sourced-by main.R (line 0) -- backward helper -> main
+        ///             h <- 1            (line 1)
+        ///
+        /// When main.R resolves its forward source() of helper.R, helper's
+        /// recursive resolution inherits `g` from main.R (its parent via the
+        /// backward directive) as a *parent-prefix* binding. The same-file
+        /// leak filter (`symbol.source_uri == queried_uri`) plus the
+        /// parent-prefix-only filter must drop that round-tripped copy of
+        /// `g`, leaving main.R's own line-0 definition intact, while `h`
+        /// (genuinely defined in helper.R) flows through with helper.R
+        /// provenance. Both paths must agree.
+        #[test]
+        fn test_scope_stream_self_roundtrip_provenance_matches_recursive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+
+            // main.R: defines g at line 0, sources helper.R at line 1.
+            let main_code = "g <- 1\nsource(\"helper.R\")\n";
+            // helper.R: backward directive to main.R on line 0, defines h
+            // at line 1.
+            let helper_code = "# @lsp-sourced-by main.R\nh <- 1\n";
+
+            let main_tree = parse_r(main_code);
+            let helper_tree = parse_r(helper_code);
+
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let helper_artifacts =
+                Arc::new(compute_artifacts(&helper_uri, &helper_tree, helper_code));
+
+            // main.R sources helper.R (forward edge from line 1).
+            let main_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helper.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            // helper.R is sourced-by main.R (backward edge).
+            let helper_meta = std::sync::Arc::new(CrossFileMetadata {
+                sourced_by: vec![BackwardDirective {
+                    path: "main.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            });
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+            // get_content closure lets the graph resolve helper's backward
+            // directive's call site against main.R.
+            let main_code_owned = main_code.to_string();
+            graph.update_file(&helper_uri, &helper_meta, Some(&workspace_root), |uri| {
+                if uri == &main_uri {
+                    Some(main_code_owned.clone())
+                } else {
+                    None
+                }
+            });
+
+            let main_uri_a = main_uri.clone();
+            let helper_uri_a = helper_uri.clone();
+            let main_arts_c = main_artifacts.clone();
+            let helper_arts_c = helper_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &main_uri_a {
+                    Some(main_arts_c.clone())
+                } else if uri == &helper_uri_a {
+                    Some(helper_arts_c.clone())
+                } else {
+                    None
+                }
+            };
+            let main_uri_m = main_uri.clone();
+            let helper_uri_m = helper_uri.clone();
+            let main_meta_c = main_meta.clone();
+            let helper_meta_c = helper_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &main_uri_m {
+                    Some(main_meta_c.clone())
+                } else if uri == &helper_uri_m {
+                    Some(helper_meta_c.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Query at line 2 col 0: g is defined and the source() of
+            // helper.R has fired.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(2, 0);
+            let streamed = stream.snapshot();
+
+            let mut throwaway = ParentPrefixCache::new();
+            let direct = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway,
+                None,
+            );
+
+            let stream_g = streamed
+                .symbols
+                .get("g")
+                .expect("stream must keep g (local main.R definition) in scope");
+            let direct_g = direct
+                .symbols
+                .get("g")
+                .expect("recursive must keep g (local main.R definition) in scope");
+
+            // g's provenance must stay the local main.R line-0 definition in
+            // both paths: the same-file leak filter must drop the copy of g
+            // that round-trips back through helper's parent-prefix.
+            assert_eq!(
+                (
+                    &stream_g.source_uri,
+                    stream_g.defined_line,
+                    stream_g.defined_column,
+                    stream_g.kind
+                ),
+                (
+                    &direct_g.source_uri,
+                    direct_g.defined_line,
+                    direct_g.defined_column,
+                    direct_g.kind
+                ),
+                "ScopeStream and recursive resolver must agree on g's \
+                 provenance tuple across the forward+backward cycle."
+            );
+            assert_eq!(
+                (
+                    &direct_g.source_uri,
+                    direct_g.defined_line,
+                    direct_g.defined_column,
+                    direct_g.kind
+                ),
+                (&main_uri, 0u32, 0u32, SymbolKind::Variable),
+                "sanity: g must stay main.R's own line-0 definition, not a \
+                 round-tripped copy from helper's parent-prefix"
+            );
+
+            let stream_h = streamed
+                .symbols
+                .get("h")
+                .expect("stream must have h (from helper.R) in scope");
+            let direct_h = direct
+                .symbols
+                .get("h")
+                .expect("recursive must have h (from helper.R) in scope");
+
+            // h flows through the forward source() edge with helper.R
+            // provenance in both paths.
+            assert_eq!(
+                (
+                    &stream_h.source_uri,
+                    stream_h.defined_line,
+                    stream_h.defined_column,
+                    stream_h.kind
+                ),
+                (
+                    &direct_h.source_uri,
+                    direct_h.defined_line,
+                    direct_h.defined_column,
+                    direct_h.kind
+                ),
+                "ScopeStream and recursive resolver must agree on h's \
+                 provenance tuple."
+            );
+            assert_eq!(
+                (
+                    &direct_h.source_uri,
+                    direct_h.defined_line,
+                    direct_h.defined_column,
+                    direct_h.kind
+                ),
+                (&helper_uri, 1u32, 0u32, SymbolKind::Variable),
+                "sanity: h must be attributed to helper.R's line-1 definition"
+            );
+        }
+
+        /// Provenance parity for the parent-prefix override mechanic: a
+        /// parent-prefix binding for a name is later overridden by a forward
+        /// source() that defines the same name.
+        ///
+        /// Setup:
+        ///   parent.R  k <- 1            (line 0)
+        ///             source("main.R")  (line 1)  -- forward parent -> main
+        ///   main.R    # @lsp-sourced-by parent.R (line 0) -- backward main -> parent
+        ///             source("helper.R")           (line 1) -- forward main -> helper
+        ///   helper.R  k <- 2            (line 0)
+        ///
+        /// Resolving main.R: `k` first arrives as a parent-prefix binding
+        /// (from parent.R, line 0), then the forward source() of helper.R
+        /// overrides it with helper.R's `k <- 2`. The recursive resolver does
+        /// this via `parent_prefix_symbol_names.remove(&name)` +
+        /// `insert` (scope.rs:3976-3977); ScopeStream reaches the same answer
+        /// via its separate-prefix approach. Both paths must resolve `k` to
+        /// helper.R's definition with identical provenance tuples.
+        #[test]
+        fn test_scope_stream_parent_prefix_override_matches_recursive() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{
+                BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+            };
+
+            let workspace_root = Url::parse("file:///project").unwrap();
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let main_uri = Url::parse("file:///project/main.R").unwrap();
+            let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+
+            // parent.R: defines k at line 0, sources main.R at line 1.
+            let parent_code = "k <- 1\nsource(\"main.R\")\n";
+            // main.R: backward directive to parent.R on line 0, sources
+            // helper.R at line 1.
+            let main_code = "# @lsp-sourced-by parent.R\nsource(\"helper.R\")\n";
+            // helper.R: defines k at line 0, col 0.
+            let helper_code = "k <- 2\n";
+
+            let parent_tree = parse_r(parent_code);
+            let main_tree = parse_r(main_code);
+            let helper_tree = parse_r(helper_code);
+
+            let parent_artifacts =
+                Arc::new(compute_artifacts(&parent_uri, &parent_tree, parent_code));
+            let main_artifacts = Arc::new(compute_artifacts(&main_uri, &main_tree, main_code));
+            let helper_artifacts =
+                Arc::new(compute_artifacts(&helper_uri, &helper_tree, helper_code));
+
+            // parent.R sources main.R (forward edge from line 1).
+            let parent_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "main.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            // main.R: backward directive to parent.R AND forward source of
+            // helper.R (from line 1).
+            let main_meta = std::sync::Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "helper.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    ..Default::default()
+                }],
+                sourced_by: vec![BackwardDirective {
+                    path: "parent.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            });
+            let helper_meta = std::sync::Arc::new(CrossFileMetadata::default());
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+            graph.update_file(&helper_uri, &helper_meta, Some(&workspace_root), |_| None);
+            // get_content closure lets the graph resolve main's backward
+            // directive's call site against parent.R.
+            let parent_code_owned = parent_code.to_string();
+            graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_code_owned.clone())
+                } else {
+                    None
+                }
+            });
+
+            let parent_uri_a = parent_uri.clone();
+            let main_uri_a = main_uri.clone();
+            let helper_uri_a = helper_uri.clone();
+            let parent_arts_c = parent_artifacts.clone();
+            let main_arts_c = main_artifacts.clone();
+            let helper_arts_c = helper_artifacts.clone();
+            let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri_a {
+                    Some(parent_arts_c.clone())
+                } else if uri == &main_uri_a {
+                    Some(main_arts_c.clone())
+                } else if uri == &helper_uri_a {
+                    Some(helper_arts_c.clone())
+                } else {
+                    None
+                }
+            };
+            let parent_uri_m = parent_uri.clone();
+            let main_uri_m = main_uri.clone();
+            let helper_uri_m = helper_uri.clone();
+            let parent_meta_c = parent_meta.clone();
+            let main_meta_c = main_meta.clone();
+            let helper_meta_c = helper_meta.clone();
+            let get_metadata = move |uri: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > {
+                if uri == &parent_uri_m {
+                    Some(parent_meta_c.clone())
+                } else if uri == &main_uri_m {
+                    Some(main_meta_c.clone())
+                } else if uri == &helper_uri_m {
+                    Some(helper_meta_c.clone())
+                } else {
+                    None
+                }
+            };
+
+            let base_exports: HashSet<String> = HashSet::new();
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let is_cancelled = || false;
+
+            // Build the stream once and advance monotonically.  First stop:
+            // line 0 col 0 — before the source("helper.R") call on line 1
+            // fires — to prove the parent-prefix edge genuinely forms.
+            let mut stream = ScopeStream::new(
+                &main_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &prefix_cache,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(0, 0);
+            let streamed_early = stream.snapshot();
+
+            // Second stop: line 2 col 0 — after source("helper.R") has fired.
+            stream.advance_to(2, 0);
+            let streamed_late = stream.snapshot();
+
+            // Direct resolver at the early position (before source fires).
+            let mut throwaway_early = ParentPrefixCache::new();
+            let direct_early = scope_at_position_with_graph_cached(
+                &main_uri,
+                0,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway_early,
+                None,
+            );
+
+            // Direct resolver at the late position (after source fires).
+            let mut throwaway_late = ParentPrefixCache::new();
+            let direct_late = scope_at_position_with_graph_cached(
+                &main_uri,
+                2,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &is_cancelled,
+                &mut throwaway_late,
+                None,
+            );
+
+            // ── Early-position assertions ────────────────────────────────────
+            // At line 0 (before helper.R is sourced) k should be visible via
+            // the parent-prefix edge from parent.R.  This proves the edge
+            // actually forms; without it the override assertion below is
+            // vacuous.
+            let stream_k_early = streamed_early
+                .symbols
+                .get("k")
+                .expect("stream must have k in scope at main.R line 0 (parent-prefix)");
+            let direct_k_early = direct_early
+                .symbols
+                .get("k")
+                .expect("direct resolver must have k in scope at main.R line 0 (parent-prefix)");
+
+            // Stream and direct agree at the early position.
+            assert_eq!(
+                (
+                    &stream_k_early.source_uri,
+                    stream_k_early.defined_line,
+                    stream_k_early.defined_column,
+                    stream_k_early.kind
+                ),
+                (
+                    &direct_k_early.source_uri,
+                    direct_k_early.defined_line,
+                    direct_k_early.defined_column,
+                    direct_k_early.kind
+                ),
+                "ScopeStream and recursive resolver must agree on k's \
+                 provenance at main.R line 0 (early, pre-source)"
+            );
+
+            // Concrete expected value: parent.R line 0 col 0, Variable.
+            assert_eq!(
+                (
+                    &direct_k_early.source_uri,
+                    direct_k_early.defined_line,
+                    direct_k_early.defined_column,
+                    direct_k_early.kind
+                ),
+                (&parent_uri, 0u32, 0u32, SymbolKind::Variable),
+                "at main.R line 0, k must resolve to parent.R's line-0 \
+                 definition (parent-prefix edge before any forward source fires)"
+            );
+
+            // ── Late-position assertions ─────────────────────────────────────
+            let stream_k_late = streamed_late
+                .symbols
+                .get("k")
+                .expect("stream must have k in scope in main.R");
+            let direct_k_late = direct_late
+                .symbols
+                .get("k")
+                .expect("recursive must have k in scope in main.R");
+
+            // Full-tuple parity between the two paths.
+            assert_eq!(
+                (
+                    &stream_k_late.source_uri,
+                    stream_k_late.defined_line,
+                    stream_k_late.defined_column,
+                    stream_k_late.kind
+                ),
+                (
+                    &direct_k_late.source_uri,
+                    direct_k_late.defined_line,
+                    direct_k_late.defined_column,
+                    direct_k_late.kind
+                ),
+                "ScopeStream and recursive resolver must agree on k's \
+                 provenance tuple. The recursive resolver overrides the \
+                 parent-prefix binding via parent_prefix_symbol_names.remove \
+                 + insert (scope.rs:3976); ScopeStream must reach the same \
+                 answer via its separate-prefix approach."
+            );
+
+            // Concrete intent: the forward source() of helper.R overrides
+            // the parent-prefix binding from parent.R, so k resolves to
+            // helper.R's line-0 definition.
+            assert_eq!(
+                (
+                    &direct_k_late.source_uri,
+                    direct_k_late.defined_line,
+                    direct_k_late.defined_column,
+                    direct_k_late.kind
+                ),
+                (&helper_uri, 0u32, 0u32, SymbolKind::Variable),
+                "sanity: k must resolve to helper.R's line-0 definition \
+                 (forward source overrides the parent-prefix binding from \
+                 parent.R)"
+            );
+        }
     }
 
     // ============================================================================
