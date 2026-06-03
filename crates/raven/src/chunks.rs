@@ -7,6 +7,9 @@
 //! Used by `SymbolExtractor::extract_chunks` to surface chunk entries in the
 //! document outline. Kept aligned with the TypeScript detector so the two
 //! continue to produce the same `header_line` / `end_line` for any document.
+//! The module also provides [`mask_to_r`] for the geometry-preserving masked
+//! analysis representation of Rmd/Quarto documents, which replaces all
+//! non-R-body lines with empty strings while preserving line/column geometry.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -326,6 +329,25 @@ fn chunk_reuse_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\s*<<[^>]+>>\s*\r?$").expect("chunk reuse reference regex"))
 }
 
+/// Body-line range of an R chunk, clamped to the document.
+///
+/// Returns `None` when the chunk is not R, has no body, or starts past EOF.
+/// The returned `(body_start, end_line)` pair is guaranteed to satisfy
+/// `body_start <= end_line < total_lines`.
+fn r_chunk_body_range(chunk: &Chunk, total_lines: u32) -> Option<(u32, u32)> {
+    if !is_r_chunk_language(&chunk.language) {
+        return None;
+    }
+    let body_start = chunk.header_line.saturating_add(1);
+    if body_start > chunk.end_line || body_start >= total_lines {
+        return None;
+    }
+    Some((
+        body_start,
+        chunk.end_line.min(total_lines.saturating_sub(1)),
+    ))
+}
+
 /// Produce R-parseable text from an R Markdown / Quarto document with
 /// **identical line/column geometry** to the source.
 ///
@@ -370,19 +392,9 @@ pub fn mask_to_r(text: &str) -> String {
     let chunks = detect_chunks(text, ChunkKind::Rmd);
 
     for chunk in &chunks {
-        if !is_r_chunk_language(&chunk.language) {
+        let Some((body_start, end_line)) = r_chunk_body_range(chunk, total_lines as u32) else {
             continue;
-        }
-        let body_start = chunk.header_line.saturating_add(1);
-        // Mirror bounds logic from `semantic_tokens_for_rmd_document`.
-        if body_start > chunk.end_line {
-            continue;
-        }
-        if body_start >= total_lines as u32 {
-            continue;
-        }
-        let end_line = chunk.end_line.min((total_lines as u32).saturating_sub(1));
-
+        };
         for idx in body_start as usize..=end_line as usize {
             // Blank knitr chunk-reuse references; keep everything else.
             if !reuse_re.is_match(segments[idx]) {
@@ -412,17 +424,9 @@ pub fn position_in_r_chunk_body(text: &str, line: u32) -> bool {
     let chunks = detect_chunks(text, ChunkKind::Rmd);
 
     for chunk in &chunks {
-        if !is_r_chunk_language(&chunk.language) {
+        let Some((body_start, end_line)) = r_chunk_body_range(chunk, total_lines as u32) else {
             continue;
-        }
-        let body_start = chunk.header_line.saturating_add(1);
-        if body_start > chunk.end_line {
-            continue;
-        }
-        if body_start >= total_lines as u32 {
-            continue;
-        }
-        let end_line = chunk.end_line.min((total_lines as u32).saturating_sub(1));
+        };
         if line >= body_start && line <= end_line {
             return true;
         }
@@ -870,5 +874,26 @@ mod tests {
         let src = "```{r}\nx <- 1\n```\n";
         // Line 99 is way past the end.
         assert!(!position_in_r_chunk_body(src, 99));
+    }
+
+    #[test]
+    fn mask_bom_on_fence_header_line() {
+        // BOM lives on line 0, which is the header fence itself. The header
+        // is never an R body line, so line 0 must be blanked even though the
+        // BOM-stripped text would match the fence pattern.
+        let src = "\u{FEFF}```{r}\nx <- 1\n```\n";
+        let masked = mask_to_r(src);
+        let lines: Vec<&str> = masked.split('\n').collect();
+        assert_eq!(seg_count(&masked), seg_count(src));
+        assert_eq!(lines[0], ""); // header with BOM → blanked
+        assert_eq!(lines[1], "x <- 1"); // R body → kept verbatim
+        assert_eq!(lines[2], ""); // closing fence → blanked
+    }
+
+    #[test]
+    fn position_in_r_chunk_body_unclosed_chunk() {
+        // Unclosed chunk: body runs to EOF; line 1 is inside the body.
+        let src = "```{r}\nx <- 1";
+        assert!(position_in_r_chunk_body(src, 1));
     }
 }
