@@ -145,7 +145,36 @@ use crate::package_library::PackageLibrary;
 use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::WorkspaceIndex;
 
-/// A parsed document
+/// A parsed document.
+///
+/// # Raw text vs. analysis text (Rmd/Quarto invariant)
+///
+/// A `Document` carries two views of its content that are deliberately kept
+/// distinct for R Markdown / Quarto (`ChunkKind::Rmd`) documents:
+///
+/// * **Raw view** — [`contents`](Document::contents) / [`text()`](Document::text)
+///   is *always* the verbatim document as the editor sees it. Anything that
+///   operates on the literal source uses this: LSP incremental sync, chunk/fence
+///   detection, the Markdown outline, raw snippet retrieval, knit/run-chunk, and
+///   semantic-token re-detection of chunks.
+///
+/// * **Analysis view** — [`tree`](Document::tree) together with
+///   [`analysis_text()`](Document::analysis_text). For an Rmd document these are
+///   derived from [`chunks::mask_to_r`]: every non-R-chunk-body line is blanked
+///   so the R tree-sitter parser sees only real R code. All AST work — parsing,
+///   scope/symbol extraction, diagnostics, completion, hover — must pair
+///   `tree` with `analysis_text()`, **never** with `text()`. Byte offsets in
+///   `tree` index into `analysis_text()`; slicing `text()` with them mis-slices
+///   (and can panic on a non-UTF-8 boundary) because the masked text is a
+///   different byte string of a different length.
+///
+/// For plain R / JAGS / Stan documents `analysis_text()` *is* `text()` and the
+/// distinction collapses, so behavior-neutral call sites may use either.
+///
+/// `mask_to_r` is **geometry-preserving**: line count and the line/column of
+/// every kept R-body character are identical between the two views. Therefore
+/// `Position`/`Range` values (line + UTF-16 column) are interchangeable across
+/// the two; only *byte* offsets are view-specific.
 #[derive(Clone)]
 pub struct Document {
     pub contents: Rope,
@@ -157,6 +186,11 @@ pub struct Document {
     /// (i.e. `# %%` cells) otherwise. Mirrors the client-side classifier in
     /// `editors/vscode/src/chunks/chunk-detector.ts`.
     pub chunk_kind: ChunkKind,
+    /// Masked analysis text for Rmd/Quarto documents (`chunks::mask_to_r` of the
+    /// raw contents), or `None` for plain R / JAGS / Stan. The `tree` is parsed
+    /// from this when present. Kept in sync with `contents` by `apply_change`.
+    /// Exposed read-only via [`analysis_text()`](Document::analysis_text).
+    masked_text: Option<String>,
     pub version: Option<i32>,
     pub revision: u64,
 }
@@ -168,9 +202,10 @@ impl Document {
     }
 
     pub fn new_with_uri(text: &str, version: Option<i32>, uri: &Url) -> Self {
-        let mut doc = Self::new_with_file_type(text, version, file_type_from_uri(uri));
-        doc.chunk_kind = classify_chunk_document(uri.path());
-        doc
+        // Determine the chunk kind BEFORE parsing: for Rmd/Quarto documents the
+        // tree must be parsed from the masked analysis text, not the raw text.
+        let chunk_kind = classify_chunk_document(uri.path());
+        Self::new_with_kind(text, version, file_type_from_uri(uri), chunk_kind)
     }
 
     pub fn new_with_language_id(
@@ -179,33 +214,59 @@ impl Document {
         uri: &Url,
         language_id: Option<&str>,
     ) -> Self {
-        let mut doc = Self::new_with_file_type(
+        // Determine the chunk kind BEFORE parsing (see `new_with_uri`).
+        let chunk_kind = classify_chunk_document_for(language_id, uri.path());
+        Self::new_with_kind(
             text,
             version,
             file_type_from_language_id_or_uri(language_id, uri),
-        );
-        doc.chunk_kind = classify_chunk_document_for(language_id, uri.path());
-        doc
+            chunk_kind,
+        )
     }
 
     pub fn new_with_file_type(text: &str, version: Option<i32>, file_type: FileType) -> Self {
+        // No URI/languageId signal, so default to `# %%` cell detection.
+        Self::new_with_kind(text, version, file_type, ChunkKind::R)
+    }
+
+    /// Shared constructor: builds the analysis representation up front so the
+    /// `tree` is parsed from the right text (masked for Rmd, raw otherwise) and
+    /// `loaded_packages` is extracted from the same `(tree, text)` pair.
+    fn new_with_kind(
+        text: &str,
+        version: Option<i32>,
+        file_type: FileType,
+        chunk_kind: ChunkKind,
+    ) -> Self {
         let contents = Rope::from_str(text);
-        let tree = parse_document(&contents, file_type);
-        let loaded_packages = extract_loaded_packages(&tree, text);
+        // Mask Rmd/Quarto bodies so the R parser only sees real R code; plain R
+        // (and JAGS/Stan) keep their raw text.
+        let masked_text = if chunk_kind == ChunkKind::Rmd {
+            Some(crate::chunks::mask_to_r(text))
+        } else {
+            None
+        };
+        let analysis_text = masked_text.as_deref().unwrap_or(text);
+        let tree = parse_document_text(analysis_text, file_type);
+        // Extract from the SAME text the tree was parsed from, so `library()`
+        // calls inside chunks are found and prose mentions are not.
+        let loaded_packages = extract_loaded_packages(&tree, analysis_text);
         Self {
             contents,
             tree,
             loaded_packages,
             file_type,
-            // Default to `# %%` cell detection; URI/languageId-aware
-            // constructors override this above.
-            chunk_kind: ChunkKind::R,
+            chunk_kind,
+            masked_text,
             version,
             revision: 0,
         }
     }
 
     pub fn apply_change(&mut self, change: TextDocumentContentChangeEvent) {
+        // Always apply the edit to the RAW contents exactly as before — LSP
+        // incremental sync, chunk detection, and the outline all rely on the
+        // verbatim source.
         if let Some(range) = change.range {
             let start_line = range.start.line as usize;
             let start_utf16_char = range.start.character as usize;
@@ -229,9 +290,30 @@ impl Document {
         }
 
         self.revision += 1;
-        self.tree = parse_document(&self.contents, self.file_type);
-        let text = self.contents.to_string();
-        self.loaded_packages = extract_loaded_packages(&self.tree, &text);
+
+        let raw_text = self.contents.to_string();
+        // Re-derive the analysis text and parse the tree from it.
+        //
+        // For Rmd documents we re-mask the FULL new raw text and parse from
+        // scratch (no incremental tree-sitter edit). The previous tree's byte
+        // offsets reference the OLD masked text, whereas the LSP edit ranges
+        // are computed against the raw text — feeding the latter into an
+        // incremental `Tree::edit` would corrupt the former. A full reparse per
+        // change is acceptable: tree-sitter is fast, and incremental masking is
+        // a future optimization. (Plain R already reparses from scratch here,
+        // so this is not a regression for the common case.)
+        let analysis_text = if self.chunk_kind == ChunkKind::Rmd {
+            let masked = crate::chunks::mask_to_r(&raw_text);
+            self.masked_text = Some(masked);
+            self.masked_text.as_deref().unwrap_or(&raw_text)
+        } else {
+            // Keep the field `None` for non-Rmd docs; analysis text == raw text.
+            self.masked_text = None;
+            &raw_text
+        };
+
+        self.tree = parse_document_text(analysis_text, self.file_type);
+        self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);
     }
 
     #[allow(dead_code)]
@@ -241,6 +323,21 @@ impl Document {
 
     pub fn text(&self) -> String {
         self.contents.to_string()
+    }
+
+    /// The text the [`tree`](Document::tree) was parsed from: the masked
+    /// analysis text for Rmd/Quarto documents, the raw text otherwise.
+    ///
+    /// Use this — never [`text()`](Document::text) — whenever you slice the
+    /// document by byte offsets taken from `tree` (e.g. `node.byte_range()` /
+    /// `node.utf8_text(...)`). For plain R / JAGS / Stan this equals `text()`,
+    /// so the choice is behavior-neutral there. See the [`Document`] type docs
+    /// for the full raw-vs-analysis invariant.
+    pub fn analysis_text(&self) -> String {
+        match &self.masked_text {
+            Some(masked) => masked.clone(),
+            None => self.contents.to_string(),
+        }
     }
 
     /// True when the document is an R Markdown / Quarto document. The R
@@ -269,16 +366,18 @@ fn utf16_offset_to_char_offset(line_text: &str, utf16_offset: usize) -> usize {
     char_count
 }
 
-fn parse_r(contents: &Rope) -> Option<Tree> {
+fn parse_r_text(text: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
-    let text = contents.to_string();
-    parser.parse(&text, None)
+    parser.parse(text, None)
 }
 
-fn parse_document(contents: &Rope, file_type: FileType) -> Option<Tree> {
+/// Parse `text` (the analysis text — masked for Rmd, raw otherwise) into a
+/// tree-sitter tree appropriate for `file_type`. All current file types parse
+/// with the R grammar.
+fn parse_document_text(text: &str, file_type: FileType) -> Option<Tree> {
     match file_type {
-        FileType::R | FileType::Jags | FileType::Stan => parse_r(contents),
+        FileType::R | FileType::Jags | FileType::Stan => parse_r_text(text),
     }
 }
 
@@ -1855,6 +1954,185 @@ mod tests {
         });
 
         assert_eq!(doc.text(), "line1\n🎉test");
+    }
+
+    // ========================================================================
+    // Masked analysis representation for Rmd/Quarto documents (Task 2)
+    // ========================================================================
+
+    /// True iff the tree contains at least one ERROR node anywhere.
+    fn tree_has_error(tree: &Tree) -> bool {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.is_error() || node.kind() == "ERROR" {
+                return true;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        false
+    }
+
+    /// True iff the tree contains an `identifier` node whose text equals `name`.
+    /// Slices against `text`, which MUST be the text the tree was parsed from.
+    fn tree_has_identifier(tree: &Tree, text: &str, name: &str) -> bool {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && &text[node.byte_range()] == name {
+                return true;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        false
+    }
+
+    fn rmd_uri() -> Url {
+        Url::parse("file:///tmp/report.Rmd").unwrap()
+    }
+
+    fn r_uri() -> Url {
+        Url::parse("file:///tmp/script.R").unwrap()
+    }
+
+    #[test]
+    fn rmd_document_tree_is_parsed_from_masked_text() {
+        // Prose + YAML + a valid R chunk. A raw parse would treat the prose and
+        // YAML as garbage and produce ERROR nodes; the masked parse must not.
+        let src = "---\ntitle: Demo\n---\n\nSome prose here.\n\n```{r}\nx <- 1\nf <- function(a) a + 1\n```\n\nMore prose.\n";
+        let doc = Document::new_with_uri(src, None, &rmd_uri());
+        assert_eq!(doc.chunk_kind, ChunkKind::Rmd);
+        let tree = doc.tree.as_ref().expect("Rmd doc should have a parse tree");
+        assert!(
+            !tree_has_error(tree),
+            "masked-derived tree for an Rmd doc with valid R chunks must have no ERROR nodes"
+        );
+        // The chunk symbol must be visible in the masked tree, sliced against
+        // the analysis text (which is what the tree was parsed from).
+        let analysis = doc.analysis_text();
+        assert!(tree_has_identifier(tree, &analysis, "f"));
+        assert!(tree_has_identifier(tree, &analysis, "x"));
+    }
+
+    #[test]
+    fn analysis_text_is_masked_for_rmd_and_raw_for_plain_r() {
+        let rmd_src = "prose\n```{r}\nx <- 1\n```\n";
+        let rmd_doc = Document::new_with_uri(rmd_src, None, &rmd_uri());
+        assert_eq!(rmd_doc.analysis_text(), crate::chunks::mask_to_r(rmd_src));
+        // The raw contents are untouched.
+        assert_eq!(rmd_doc.text(), rmd_src);
+
+        let r_src = "x <- 1\nf <- function() 2\n";
+        let r_doc = Document::new_with_uri(r_src, None, &r_uri());
+        assert_eq!(r_doc.analysis_text(), r_doc.text());
+        assert_eq!(r_doc.analysis_text(), r_src);
+    }
+
+    #[test]
+    fn rmd_loaded_packages_come_from_chunk_bodies_only() {
+        // `library(dplyr)` lives inside an R chunk; a prose line mentions
+        // `library(ignored)` and a Python chunk loads nothing R-relevant.
+        let src = "Intro mentions library(ignored) inline.\n\n```{r}\nlibrary(dplyr)\nx <- 1\n```\n\n```{python}\nimport os\n```\n";
+        let doc = Document::new_with_uri(src, None, &rmd_uri());
+        assert_eq!(doc.loaded_packages, vec!["dplyr".to_string()]);
+    }
+
+    #[test]
+    fn rmd_apply_change_inside_chunk_reparses_from_masked_text() {
+        let src = "prose\n```{r}\nx <- 1\n```\n";
+        let mut doc = Document::new_with_uri(src, Some(1), &rmd_uri());
+        let v0 = doc.revision;
+
+        // Insert a new statement on the body line: replace "x <- 1" with
+        // "x <- 1\nnewsym <- 2" (line 2, full-line range).
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 2,
+                    character: 0,
+                },
+                end: Position {
+                    line: 2,
+                    character: 6,
+                },
+            }),
+            range_length: None,
+            text: "x <- 1\nnewsym <- 2".to_string(),
+        });
+
+        // Raw contents updated.
+        assert!(doc.text().contains("newsym <- 2"));
+        // masked_text re-derived and consistent with the raw contents.
+        assert_eq!(doc.analysis_text(), crate::chunks::mask_to_r(&doc.text()));
+        // Tree reparsed from the masked text: no ERROR nodes, new symbol present.
+        let tree = doc.tree.as_ref().expect("tree after change");
+        assert!(!tree_has_error(tree), "no ERROR nodes after in-chunk edit");
+        assert!(tree_has_identifier(tree, &doc.analysis_text(), "newsym"));
+        // Revision bumped.
+        assert!(doc.revision > v0);
+    }
+
+    #[test]
+    fn rmd_apply_change_to_prose_keeps_tree_clean() {
+        let src = "prose line\n```{r}\nx <- 1\n```\n";
+        let mut doc = Document::new_with_uri(src, Some(1), &rmd_uri());
+
+        // Edit the prose on line 0 only.
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 10,
+                },
+            }),
+            range_length: None,
+            text: "different prose entirely".to_string(),
+        });
+
+        assert!(doc.text().contains("different prose entirely"));
+        // Prose is still blanked in the analysis text.
+        assert_eq!(doc.analysis_text(), crate::chunks::mask_to_r(&doc.text()));
+        let tree = doc.tree.as_ref().expect("tree after prose change");
+        assert!(
+            !tree_has_error(tree),
+            "prose edits must not introduce ERROR nodes"
+        );
+        // The R chunk body is still on line 2 (geometry preserved) and the
+        // symbol is still visible.
+        assert!(tree_has_identifier(tree, &doc.analysis_text(), "x"));
+    }
+
+    #[test]
+    fn plain_r_apply_change_uses_raw_text_for_analysis() {
+        // Regression: a plain .R doc's analysis_text tracks the raw contents and
+        // the tree continues to reflect edits.
+        let mut doc = Document::new_with_uri("x <- 1\n", Some(1), &r_uri());
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 1,
+                    character: 0,
+                },
+                end: Position {
+                    line: 1,
+                    character: 0,
+                },
+            }),
+            range_length: None,
+            text: "yvar <- 2\n".to_string(),
+        });
+        assert_eq!(doc.text(), "x <- 1\nyvar <- 2\n");
+        assert_eq!(doc.analysis_text(), doc.text());
+        let tree = doc.tree.as_ref().unwrap();
+        assert!(tree_has_identifier(tree, &doc.analysis_text(), "yvar"));
     }
 
     #[test]

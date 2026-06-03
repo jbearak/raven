@@ -413,10 +413,12 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 2. Legacy open documents
+    // 2. Legacy open documents. Return the analysis text (masked for Rmd) so
+    //    the caller's byte-offset slices into `tree` align; identical to the
+    //    raw text for plain R / JAGS / Stan.
     if let Some(doc) = state.documents.get(uri) {
         if let Some(tree) = &doc.tree {
-            return Some((doc.text(), tree.clone()));
+            return Some((doc.analysis_text(), tree.clone()));
         } else {
             log::debug!("Document found but has no parsed tree: {}", uri);
         }
@@ -434,10 +436,10 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 4. Legacy workspace index
+    // 4. Legacy workspace index (analysis text, see step 2).
     if let Some(doc) = state.workspace_index.get(uri) {
         if let Some(tree) = &doc.tree {
-            return Some((doc.text(), tree.clone()));
+            return Some((doc.analysis_text(), tree.clone()));
         } else {
             log::debug!("Document in workspace_index has no parsed tree: {}", uri);
         }
@@ -469,7 +471,10 @@ fn resolve_from_current_file(
 ) -> Option<FunctionSignature> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
-    let text = doc.text();
+    // Analysis text (masked for Rmd) matches `tree`'s byte offsets; equals the
+    // raw text for plain R. Signature help is gated for Rmd at the entry point,
+    // but pairing the tree with the analysis text is the correct invariant.
+    let text = doc.analysis_text();
 
     // Search for the nearest function definition before cursor position
     let func_node =

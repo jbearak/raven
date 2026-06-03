@@ -3716,11 +3716,18 @@ impl BlockDetector {
 pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
+    // Raw text drives the text-based detectors (chunk fences, `# %%` cells,
+    // section dividers, Stan/JAGS block scanning) that must see the verbatim
+    // document. The analysis text is what `tree` was parsed from, so AST symbol
+    // extraction (which slices by `tree` byte offsets) must use it instead.
+    // For plain R / JAGS / Stan the two are identical; only Rmd/Quarto differ,
+    // where the analysis text is the masked R body.
     let text = doc.text();
+    let analysis_text = doc.analysis_text();
 
     let raw_symbols = match doc.file_type {
         FileType::Stan => {
-            let extractor = SymbolExtractor::new(&text, tree.root_node());
+            let extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
             let mut raw_symbols =
                 extractor.extract_decorative_sections(ModelCommentStyle::DoubleSlash);
             raw_symbols.extend(collect_stan_document_symbols(&text));
@@ -3729,7 +3736,7 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
             raw_symbols
         }
         FileType::Jags => {
-            let extractor = SymbolExtractor::new(&text, tree.root_node());
+            let extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
             let mut raw_symbols = extractor.extract_ast_symbols();
             raw_symbols.extend(extractor.extract_decorative_sections(ModelCommentStyle::Hash));
             raw_symbols.extend(extractor.extract_loops());
@@ -3737,18 +3744,24 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
             raw_symbols
         }
         FileType::R => {
-            let extractor = SymbolExtractor::new(&text, tree.root_node());
-            let mut raw_symbols = extractor.extract_all();
-            // Surface R Markdown / Quarto code chunks and `.R` `# %%` cells
-            // in the outline. The Document carries the resolved kind so that
-            // untitled buffers (no file extension) still classify correctly
-            // via their `languageId`.
-            raw_symbols.extend(extractor.extract_chunks(doc.chunk_kind));
+            // AST symbols (assignments, S4, R6) and comment-section detection
+            // run against the analysis text so `tree` byte offsets align — for
+            // Rmd docs this surfaces real R symbols defined inside chunk bodies.
+            let ast_extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
+            let mut raw_symbols = ast_extractor.extract_all();
+            // Chunk detection (R Markdown / Quarto fences and `.R` `# %%` cells)
+            // must scan the RAW text: the masked analysis text has its fence and
+            // prose lines blanked. The Document carries the resolved kind so
+            // untitled buffers (no file extension) still classify correctly via
+            // their `languageId`.
+            let chunk_extractor = SymbolExtractor::new(&text, tree.root_node());
+            raw_symbols.extend(chunk_extractor.extract_chunks(doc.chunk_kind));
             raw_symbols
         }
     };
 
-    // Calculate line count for HierarchyBuilder
+    // Calculate line count for HierarchyBuilder. Geometry is identical between
+    // raw and analysis text, so either gives the same count; use the raw text.
     let line_count = text.lines().count() as u32;
 
     // Use HierarchyBuilder to build the hierarchical structure
@@ -4076,7 +4089,9 @@ fn collect_legacy_ast_symbols(
         }
         seen_uris.insert(uri.clone());
         if let Some(tree) = &doc.tree {
-            let text = doc.text();
+            // Pair the tree with the analysis text it was parsed from (masked
+            // for Rmd docs) so byte-offset slices in `collect_symbols` align.
+            let text = doc.analysis_text();
             let mut file_symbols = Vec::new();
             collect_symbols(tree.root_node(), &text, &mut file_symbols);
             let container_name = extract_container_name(uri);
@@ -14712,7 +14727,8 @@ pub fn goto_definition_with_cancel(
             continue;
         }
         if let Some(tree) = &doc.tree {
-            let file_text = doc.text();
+            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
+            let file_text = doc.analysis_text();
             if let Some(def_range) = find_definition_in_tree(tree.root_node(), name, &file_text) {
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: file_uri.clone(),
@@ -14731,7 +14747,8 @@ pub fn goto_definition_with_cancel(
             continue;
         }
         if let Some(tree) = &doc.tree {
-            let file_text = doc.text();
+            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
+            let file_text = doc.analysis_text();
             if let Some(def_range) = find_definition_in_tree(tree.root_node(), name, &file_text) {
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: file_uri.clone(),
@@ -15009,7 +15026,8 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             continue;
         }
         if let Some(tree) = &doc.tree {
-            let file_text = doc.text();
+            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
+            let file_text = doc.analysis_text();
             find_references_in_tree(tree.root_node(), name, &file_text, file_uri, &mut locations);
         }
     }
@@ -15024,7 +15042,8 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             continue;
         }
         if let Some(tree) = &doc.tree {
-            let file_text = doc.text();
+            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
+            let file_text = doc.analysis_text();
             find_references_in_tree(tree.root_node(), name, &file_text, file_uri, &mut locations);
         }
     }
@@ -15217,11 +15236,12 @@ fn find_user_function_signature(
     current_uri: &Url,
     name: &str,
 ) -> Option<String> {
-    // 1. Search current document
+    // 1. Search current document. Analysis text (masked for Rmd) matches the
+    //    tree's byte offsets; identical to raw text for plain R.
     if let Some(doc) = state.get_document(current_uri)
         && let Some(tree) = &doc.tree
     {
-        let text = doc.text();
+        let text = doc.analysis_text();
         if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
             return Some(extract_function_signature(func_node, name, &text));
         }
@@ -15233,7 +15253,7 @@ fn find_user_function_signature(
             continue;
         }
         if let Some(tree) = &doc.tree {
-            let text = doc.text();
+            let text = doc.analysis_text();
             if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
                 return Some(extract_function_signature(func_node, name, &text));
             }
@@ -15243,7 +15263,7 @@ fn find_user_function_signature(
     // 3. Search workspace index
     for doc in state.workspace_index.values() {
         if let Some(tree) = &doc.tree {
-            let text = doc.text();
+            let text = doc.analysis_text();
             if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
                 return Some(extract_function_signature(func_node, name, &text));
             }
@@ -21886,10 +21906,10 @@ result <- data %>% filter(x > 0)
             DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
         };
 
-        // The outline should include both the `x` assignment (R-parsed) and
-        // the `setup` chunk (text-detected). We don't pin the count because
-        // the parser may or may not surface `x` depending on how the prose
-        // confuses tree-sitter-r; the chunk entry is the contract.
+        // The outline includes the `setup` chunk (text-detected from the raw
+        // text). Since Task 2 the masked analysis tree also surfaces the `x`
+        // assignment from the chunk body, nested under the chunk; here we only
+        // pin the chunk entry, which is the stable contract for this test.
         let chunk = symbols
             .iter()
             .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
@@ -21921,6 +21941,48 @@ result <- data %>% filter(x > 0)
             .find(|s| s.kind == SymbolKind::OBJECT && s.name == "setup")
             .expect("chunk entry");
         assert_eq!(chunk.range.start.line, 2);
+    }
+
+    #[test]
+    fn test_document_symbol_surfaces_chunk_body_function_for_rmd() {
+        // Task 2: the masked analysis tree lets AST symbol extraction surface
+        // real R symbols defined inside R chunk bodies, at the correct document
+        // line (ranges align by geometry). The chunk entry is still present.
+        use crate::state::{Document, WorldState};
+
+        let code = "---\ntitle: T\n---\n\nProse.\n\n```{r demo}\nmy_fun <- function(a) a + 1\n```\n\nMore prose.\n";
+        let uri = Url::parse("file:///report.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+
+        // The chunk entry (text-detected from raw text) is still present.
+        let chunk = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::OBJECT && s.name == "demo")
+            .expect("chunk entry");
+        assert_eq!(chunk.range.start.line, 6, "chunk header is on line 6");
+
+        // The function defined inside the chunk is now an outline symbol,
+        // nested under the chunk, at the correct document line (line 7).
+        let my_fun = chunk
+            .children
+            .as_ref()
+            .and_then(|kids| kids.iter().find(|s| s.name == "my_fun"))
+            .expect("my_fun should be surfaced under the chunk");
+        assert_eq!(my_fun.kind, SymbolKind::FUNCTION);
+        assert_eq!(
+            my_fun.range.start.line, 7,
+            "my_fun is defined on document line 7 (geometry preserved)"
+        );
     }
 
     #[test]
