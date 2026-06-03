@@ -34,6 +34,8 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **[Syntax highlighting](docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
+Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: [syntax highlighting](docs/syntax-highlighting.md#jags-and-stan), [completions](docs/completion.md#jags-and-stan) (keywords, distributions, file-local symbols), [go-to-definition](docs/go-to-definition.md#jags-and-stan), [find references](docs/find-references.md#jags-and-stan), and [document outline with model structure navigation](docs/document-outline.md#jags-and-stan-model-structure).
+
 ### R session integration
 
 - **[R console](docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
@@ -42,9 +44,6 @@ Raven's sister project [Sight](https://github.com/jbearak/sight) implements a la
 - **[Plot viewer](docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
 - **[Data viewer](docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
 - **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
-
-> [!TIP]
-> Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: [syntax highlighting](docs/syntax-highlighting.md#jags-and-stan), [completions](docs/completion.md#jags-and-stan) (keywords, distributions, file-local symbols), [go-to-definition](docs/go-to-definition.md#jags-and-stan), [find references](docs/find-references.md#jags-and-stan), and [document outline with model structure navigation](docs/document-outline.md#jags-and-stan-model-structure).
 
 ## How Raven Differs
 
