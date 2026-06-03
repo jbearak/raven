@@ -2006,21 +2006,6 @@ mod tests {
     // Masked analysis representation for Rmd/Quarto documents (Task 2)
     // ========================================================================
 
-    /// True iff the tree contains at least one ERROR node anywhere.
-    fn tree_has_error(tree: &Tree) -> bool {
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            if node.is_error() || node.kind() == "ERROR" {
-                return true;
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-        false
-    }
-
     /// True iff the tree contains an `identifier` node whose text equals `name`.
     /// Slices against `text`, which MUST be the text the tree was parsed from.
     fn tree_has_identifier(tree: &Tree, text: &str, name: &str) -> bool {
@@ -2054,7 +2039,7 @@ mod tests {
         assert_eq!(doc.chunk_kind, ChunkKind::Rmd);
         let tree = doc.tree.as_ref().expect("Rmd doc should have a parse tree");
         assert!(
-            !tree_has_error(tree),
+            !tree.root_node().has_error(),
             "masked-derived tree for an Rmd doc with valid R chunks must have no ERROR nodes"
         );
         // The chunk symbol must be visible in the masked tree, sliced against
@@ -2117,7 +2102,10 @@ mod tests {
         assert_eq!(analysis, crate::chunks::mask_to_r(&doc.text()));
         // Tree reparsed from the masked text: no ERROR nodes, new symbol present.
         let tree = doc.tree.as_ref().expect("tree after change");
-        assert!(!tree_has_error(tree), "no ERROR nodes after in-chunk edit");
+        assert!(
+            !tree.root_node().has_error(),
+            "no ERROR nodes after in-chunk edit"
+        );
         assert!(tree_has_identifier(tree, &analysis, "newsym"));
         // Revision bumped.
         assert!(doc.revision > v0);
@@ -2150,7 +2138,7 @@ mod tests {
         assert_eq!(analysis, crate::chunks::mask_to_r(&doc.text()));
         let tree = doc.tree.as_ref().expect("tree after prose change");
         assert!(
-            !tree_has_error(tree),
+            !tree.root_node().has_error(),
             "prose edits must not introduce ERROR nodes"
         );
         // The R chunk body is still on line 2 (geometry preserved) and the

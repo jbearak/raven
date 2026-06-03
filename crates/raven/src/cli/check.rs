@@ -155,6 +155,82 @@ Exit codes:
     );
 }
 
+/// Open a report target that the workspace scan did NOT index (a path reached
+/// through a different symlink alias, OR a chunk file — `.Rmd`/`.qmd` are
+/// deliberately outside the R-only workspace scan) into `state.documents` and
+/// wire its outgoing edges into the dependency graph.
+///
+/// `text` is the already-decoded file contents (the caller owns the
+/// `read_source` error handling). `path` is used only to classify the chunk
+/// kind via its extension.
+///
+/// Workspace-scanned files get their edges from
+/// `build_dependency_graph_from_workspace`, but a disk-fallback target was never
+/// passed to `update_file`. Without this, `cached_neighborhood_subgraph(uri, …)`
+/// returns an empty neighborhood, so a chunk `source("R/util.R")` wouldn't
+/// resolve — producing false undefined-variable positives and losing
+/// missing-file context. This mirrors `backend`'s did_open: extract masked
+/// metadata for the path, enrich it with the inherited working directory,
+/// pre-collect parent content for any backward directives, then update the
+/// graph. The masked extraction reads chunk-body `source()`/`library()` calls
+/// only (never prose).
+///
+/// Single source of truth for both `run`'s report loop and the
+/// `collect_diagnostics_blocking` test helper, so production and test exercise
+/// identical disk-fallback behavior.
+fn open_disk_fallback_target(
+    state: &mut crate::state::WorldState,
+    uri: &Url,
+    path: &Path,
+    text: &str,
+) {
+    // Pass an honest language id so the Document classifies the chunk kind
+    // correctly: "rmd" for `.Rmd`/`.qmd` (the constructor reads the URI to
+    // classify it as Rmd and masks the prose), "r" otherwise.
+    // `file_type_from_language_id("rmd")` is `None`, so the `FileType` still
+    // falls back to R via the URI — only the chunk masking differs.
+    let language_id = if is_chunk_file(path) { "rmd" } else { "r" };
+    state.open_document_with_language_id(uri.clone(), text, Some(1), Some(language_id));
+
+    let workspace_root = state.workspace_folders.first().cloned();
+    let max_chain_depth = state.cross_file_config.max_chain_depth;
+    let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), text);
+    crate::cross_file::enrich_metadata_with_inherited_wd(
+        &mut meta,
+        uri,
+        workspace_root.as_ref(),
+        |parent_uri| state.get_enriched_metadata(parent_uri),
+        max_chain_depth,
+    );
+    // Pre-collect parent content for any backward directives (`@lsp-sourced-by`
+    // with `match=`/inference call sites) before the mutable `update_file`
+    // borrow, mirroring did_open. Forward `source()` edges — the only kind chunk
+    // targets normally have — don't consult this closure, so it's empty in the
+    // common case.
+    let backward_path_ctx =
+        crate::cross_file::path_resolve::PathContext::new(uri, workspace_root.as_ref());
+    let parent_content: std::collections::HashMap<Url, String> = meta
+        .sourced_by
+        .iter()
+        .filter_map(|d| {
+            let ctx = backward_path_ctx.as_ref()?;
+            let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+            let parent_uri = Url::from_file_path(resolved).ok()?;
+            let content = state
+                .documents
+                .get(&parent_uri)
+                .map(|doc| doc.text())
+                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+            Some((parent_uri, content))
+        })
+        .collect();
+    state
+        .cross_file_graph
+        .update_file(uri, &meta, workspace_root.as_ref(), |parent_uri| {
+            parent_content.get(parent_uri).cloned()
+        });
+}
+
 pub async fn run(args: CheckArgs) -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
@@ -256,65 +332,7 @@ pub async fn run(args: CheckArgs) -> i32 {
                     continue;
                 }
             };
-            // Pass an honest language id so the Document classifies the chunk
-            // kind correctly: "rmd" for `.Rmd`/`.qmd` (the constructor reads
-            // the URI to classify it as Rmd and masks the prose), "r"
-            // otherwise. `file_type_from_language_id("rmd")` is `None`, so the
-            // `FileType` still falls back to R via the URI — only the chunk
-            // masking differs.
-            let language_id = if is_chunk_file(path) { "rmd" } else { "r" };
-            state.open_document_with_language_id(uri.clone(), &text, Some(1), Some(language_id));
-
-            // Wire the disk-fallback target's outgoing edges into the
-            // dependency graph. Workspace-scanned files get their edges from
-            // `build_dependency_graph_from_workspace`, but a disk-fallback
-            // target (always the case for `.Rmd`/`.qmd`, which the R-only scan
-            // skips) was never passed to `update_file`. Without this,
-            // `cached_neighborhood_subgraph(uri, …)` returns an empty
-            // neighborhood, so a chunk `source("R/util.R")` wouldn't resolve —
-            // producing false undefined-variable positives and losing
-            // missing-file context. Mirror `backend`'s did_open: extract masked
-            // metadata for the path, enrich it with the inherited working
-            // directory, then update the graph. The masked extraction reads
-            // chunk-body `source()`/`library()` calls only (never prose).
-            let workspace_root = state.workspace_folders.first().cloned();
-            let max_chain_depth = state.cross_file_config.max_chain_depth;
-            let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), &text);
-            crate::cross_file::enrich_metadata_with_inherited_wd(
-                &mut meta,
-                &uri,
-                workspace_root.as_ref(),
-                |parent_uri| state.get_enriched_metadata(parent_uri),
-                max_chain_depth,
-            );
-            // Pre-collect parent content for any backward directives
-            // (`@lsp-sourced-by` with `match=`/inference call sites) before the
-            // mutable `update_file` borrow, mirroring did_open. Forward
-            // `source()` edges — the only kind chunk targets normally have —
-            // don't consult this closure, so it's empty in the common case.
-            let backward_path_ctx =
-                crate::cross_file::path_resolve::PathContext::new(&uri, workspace_root.as_ref());
-            let parent_content: std::collections::HashMap<Url, String> = meta
-                .sourced_by
-                .iter()
-                .filter_map(|d| {
-                    let ctx = backward_path_ctx.as_ref()?;
-                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                    let parent_uri = Url::from_file_path(resolved).ok()?;
-                    let content = state
-                        .documents
-                        .get(&parent_uri)
-                        .map(|doc| doc.text())
-                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                    Some((parent_uri, content))
-                })
-                .collect();
-            state.cross_file_graph.update_file(
-                &uri,
-                &meta,
-                workspace_root.as_ref(),
-                |parent_uri| parent_content.get(parent_uri).cloned(),
-            );
+            open_disk_fallback_target(&mut state, &uri, path, &text);
         }
         // Both arms above leave the document in `state.documents`; collect its
         // attached packages from the doc already in hand (free — the loop opens
@@ -1039,33 +1057,10 @@ mod tests {
                     state.documents.insert(uri.clone(), doc);
                 } else {
                     let text = crate::state::read_source(path).unwrap();
-                    let language_id = if is_chunk_file(path) { "rmd" } else { "r" };
-                    state.open_document_with_language_id(
-                        uri.clone(),
-                        &text,
-                        Some(1),
-                        Some(language_id),
-                    );
-                    let workspace_root = state.workspace_folders.first().cloned();
-                    let max_chain_depth = state.cross_file_config.max_chain_depth;
-                    let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), &text);
-                    crate::cross_file::enrich_metadata_with_inherited_wd(
-                        &mut meta,
-                        &uri,
-                        workspace_root.as_ref(),
-                        |parent_uri| state.get_enriched_metadata(parent_uri),
-                        max_chain_depth,
-                    );
-                    // Unlike `run`, skip the `parent_content` map: no test
-                    // routed through this helper uses backward directives
-                    // (`@lsp-sourced-by` match=/inference), which is all that
-                    // closure feeds. The production path in `run` is complete.
-                    state.cross_file_graph.update_file(
-                        &uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                        |_| None,
-                    );
+                    // Same disk-fallback path `run` uses, so production and test
+                    // exercise identical behavior (including the backward-directive
+                    // parent_content map).
+                    super::open_disk_fallback_target(&mut state, &uri, path, &text);
                 }
                 let diags = compute_file_diagnostics(&state, &uri).await;
                 state.close_document(&uri);

@@ -735,20 +735,14 @@ pub fn semantic_tokens_for_rmd_document(text: &str) -> SemanticTokens {
     }
 
     for chunk in &chunks {
-        if !crate::chunks::is_r_chunk_language(&chunk.language) {
-            continue;
-        }
         // Body lines: lines after the header fence, up to but not including the
-        // closing fence (end_line is the last content line, inclusive). When
-        // body_start > end_line the chunk is empty — skip it.
-        let body_start = chunk.header_line.saturating_add(1);
-        if body_start > chunk.end_line {
+        // closing fence (end_line is the last content line, inclusive).
+        // `r_chunk_body_range` folds the R-language guard, the empty-chunk skip,
+        // and the EOF clamp into one shared chokepoint (see chunks.rs).
+        let Some((body_start, end_line)) = crate::chunks::r_chunk_body_range(chunk, total_lines)
+        else {
             continue;
-        }
-        if body_start >= total_lines {
-            continue;
-        }
-        let end_line = chunk.end_line.min(total_lines.saturating_sub(1));
+        };
         let body_lines = &document_lines[body_start as usize..=end_line as usize];
         let body_text = body_lines.join("\n");
         if body_text.is_empty() {
@@ -3754,31 +3748,35 @@ impl BlockDetector {
 pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
-    // Raw text drives the text-based detectors (chunk fences, `# %%` cells,
-    // section dividers, Stan/JAGS block scanning) that must see the verbatim
-    // document. The analysis text is what `tree` was parsed from, so AST symbol
-    // extraction (which slices by `tree` byte offsets) must use it instead.
-    // For plain R / JAGS / Stan the two are identical; only Rmd/Quarto differ,
-    // where the analysis text is the masked R body.
-    let text = doc.text();
+    // The analysis text is what `tree` was parsed from, so AST symbol extraction
+    // (which slices by `tree` byte offsets) must use it. The text-based detectors
+    // (chunk fences, `# %%` cells, section dividers, Stan/JAGS block scanning)
+    // must see the verbatim document. For plain R / JAGS / Stan the two are
+    // identical, so a single `analysis_text` binding serves both roles there;
+    // only Rmd/Quarto differ (analysis text is the masked R body), and only the
+    // R branch below materializes the raw text in that case.
     let analysis_text = doc.analysis_text();
 
     let raw_symbols = match doc.file_type {
         FileType::Stan => {
+            // Stan is never an Rmd document, so `analysis_text` is the verbatim
+            // text and serves the raw-text detectors too.
             let extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
             let mut raw_symbols =
                 extractor.extract_decorative_sections(ModelCommentStyle::DoubleSlash);
-            raw_symbols.extend(collect_stan_document_symbols(&text));
+            raw_symbols.extend(collect_stan_document_symbols(&analysis_text));
             raw_symbols.extend(extractor.extract_loops());
-            raw_symbols.extend(BlockDetector::detect_stan(&text));
+            raw_symbols.extend(BlockDetector::detect_stan(&analysis_text));
             raw_symbols
         }
         FileType::Jags => {
+            // JAGS is never an Rmd document, so `analysis_text` is the verbatim
+            // text and serves the raw-text block detector too.
             let extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
             let mut raw_symbols = extractor.extract_ast_symbols();
             raw_symbols.extend(extractor.extract_decorative_sections(ModelCommentStyle::Hash));
             raw_symbols.extend(extractor.extract_loops());
-            raw_symbols.extend(BlockDetector::detect_jags(&text));
+            raw_symbols.extend(BlockDetector::detect_jags(&analysis_text));
             raw_symbols
         }
         FileType::R => {
@@ -3788,21 +3786,26 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
             let ast_extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
             let mut raw_symbols = ast_extractor.extract_all();
             // Chunk detection (R Markdown / Quarto fences and `.R` `# %%` cells)
-            // must scan the RAW text: the masked analysis text has its fence and
-            // prose lines blanked. The Document carries the resolved kind so
-            // untitled buffers (no file extension) still classify correctly via
-            // their `languageId`.
-            // `extract_chunks` is purely text-based and never consults `self.root`, so
-            // pairing the analysis-text tree with the raw text is safe here.
-            let chunk_extractor = SymbolExtractor::new(&text, tree.root_node());
+            // must scan the RAW text: an Rmd doc's masked analysis text has its
+            // fence and prose lines blanked. For plain R the raw text equals
+            // `analysis_text` (no `# %%` line is masked), so only an Rmd document
+            // needs a distinct raw-text materialization. The Document carries the
+            // resolved kind so untitled buffers (no file extension) still classify
+            // correctly via their `languageId`. `extract_chunks` is purely
+            // text-based and never consults `self.root`, so pairing the
+            // analysis-text tree with the raw text is safe here.
+            let rmd_raw_text = doc.is_rmd_document().then(|| doc.text());
+            let raw_text = rmd_raw_text.as_deref().unwrap_or(&analysis_text);
+            let chunk_extractor = SymbolExtractor::new(raw_text, tree.root_node());
             raw_symbols.extend(chunk_extractor.extract_chunks(doc.chunk_kind));
             raw_symbols
         }
     };
 
     // Calculate line count for HierarchyBuilder. Geometry is identical between
-    // raw and analysis text, so either gives the same count; use the raw text.
-    let line_count = text.lines().count() as u32;
+    // raw and analysis text, so either gives the same count; use the analysis
+    // text (always materialized).
+    let line_count = analysis_text.lines().count() as u32;
 
     // Use HierarchyBuilder to build the hierarchical structure
     let builder = HierarchyBuilder::new(raw_symbols, line_count);
@@ -10408,6 +10411,34 @@ mod invalid_assignment_target_tests {
     }
 }
 
+/// Build a `DiagnosticsSnapshot` for an Rmd document inserted directly into
+/// `state.documents` (so `get_enriched_metadata` resolves the masked
+/// `documents` arm rather than the raw DocumentStore entry). The `.Rmd`/`.qmd`
+/// URI makes the document classify as Rmd (masked analysis). `configure` runs
+/// before the document is inserted, so it can flip `lint_config`,
+/// `cross_file_config`, etc.
+///
+/// Shared file-level helper so `semantic_warning_pipeline_tests` and `tests`
+/// both build Rmd snapshots through one code path.
+#[cfg(test)]
+pub(crate) fn build_rmd_snapshot(
+    code: &str,
+    uri_str: &str,
+    configure: impl FnOnce(&mut crate::state::WorldState),
+) -> (DiagnosticsSnapshot, Url) {
+    use crate::state::{Document, WorldState};
+    let uri = Url::parse(uri_str).unwrap();
+    let mut state = WorldState::new(vec![]);
+    state.cross_file_config.diagnostics_enabled = true;
+    state.workspace_scan_complete = true;
+    configure(&mut state);
+    state
+        .documents
+        .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+    let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+    (snapshot, uri)
+}
+
 /// Regression guard: semantic-warning rules must fire through `diagnostics_from_snapshot`
 /// even when the style-lint master switch (`LintConfig::enabled`) is off.
 ///
@@ -10416,7 +10447,9 @@ mod invalid_assignment_target_tests {
 /// behind `run_lints` would silently suppress them for any user with linting disabled.
 #[cfg(test)]
 mod semantic_warning_pipeline_tests {
-    use super::{DiagCancelToken, DiagnosticsSnapshot, diagnostics_from_snapshot};
+    use super::{
+        DiagCancelToken, DiagnosticsSnapshot, build_rmd_snapshot, diagnostics_from_snapshot,
+    };
     use crate::linting::LintConfig;
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::Url;
@@ -10437,22 +10470,17 @@ mod semantic_warning_pipeline_tests {
         (snapshot, uri)
     }
 
-    /// Build a snapshot for a `.Rmd` document. The URI extension makes the
-    /// document classify as Rmd (masked analysis), exercising the
-    /// `params`-frontmatter recognition path.
-    fn build_rmd_snapshot(code: &str) -> (DiagnosticsSnapshot, Url) {
-        let uri = Url::parse("file:///report.Rmd").unwrap();
-        let mut state = WorldState::new(vec![]);
-        state.workspace_scan_complete = true;
-        state.lint_config = LintConfig {
-            enabled: false,
-            ..LintConfig::default()
-        };
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
-        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
-        (snapshot, uri)
+    /// Build a snapshot for a `.Rmd` document with the opt-in lint master switch
+    /// off, exercising the `params`-frontmatter recognition path. Wraps the
+    /// shared file-level [`build_rmd_snapshot`] with a configure closure that
+    /// disables linting (semantic rules must still fire).
+    fn build_rmd_snapshot_lint_disabled(code: &str) -> (DiagnosticsSnapshot, Url) {
+        build_rmd_snapshot(code, "file:///report.Rmd", |state| {
+            state.lint_config = LintConfig {
+                enabled: false,
+                ..LintConfig::default()
+            };
+        })
     }
 
     fn undefined_params_messages(diags: &[super::Diagnostic]) -> Vec<String> {
@@ -10471,7 +10499,7 @@ mod semantic_warning_pipeline_tests {
         // collector actually inspects it.
         let code =
             "---\ntitle: Report\nparams:\n  year: 2024\n---\n\n```{r}\nx <- params$year\n```\n";
-        let (snapshot, uri) = build_rmd_snapshot(code);
+        let (snapshot, uri) = build_rmd_snapshot_lint_disabled(code);
         assert!(snapshot.rmd_declared_params, "frontmatter declares params:");
         let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
             .expect("diagnostics returned");
@@ -10487,7 +10515,7 @@ mod semantic_warning_pipeline_tests {
         // Same chunk, but no `params:` in the frontmatter → `params` is a
         // genuinely undefined variable and must be flagged.
         let code = "---\ntitle: Report\n---\n\n```{r}\nx <- params$year\n```\n";
-        let (snapshot, uri) = build_rmd_snapshot(code);
+        let (snapshot, uri) = build_rmd_snapshot_lint_disabled(code);
         assert!(
             !snapshot.rmd_declared_params,
             "frontmatter does not declare params:"
@@ -22502,26 +22530,8 @@ result <- data %>% filter(x > 0)
     // would yield for the equivalent chunk-body content.
     // =====================================================================
 
-    /// Build a snapshot for an Rmd document inserted directly into
-    /// `state.documents` (so `get_enriched_metadata` resolves the masked
-    /// `documents` arm rather than the raw DocumentStore entry).
-    fn build_rmd_snapshot(
-        code: &str,
-        uri_str: &str,
-        configure: impl FnOnce(&mut crate::state::WorldState),
-    ) -> (DiagnosticsSnapshot, Url) {
-        use crate::state::{Document, WorldState};
-        let uri = Url::parse(uri_str).unwrap();
-        let mut state = WorldState::new(vec![]);
-        state.cross_file_config.diagnostics_enabled = true;
-        state.workspace_scan_complete = true;
-        configure(&mut state);
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
-        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
-        (snapshot, uri)
-    }
+    // `build_rmd_snapshot` is the shared file-level `#[cfg(test)]` helper (see
+    // above `mod semantic_warning_pipeline_tests`); pulled in via `use super::*`.
 
     fn rmd_diagnostics(
         code: &str,

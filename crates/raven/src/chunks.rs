@@ -333,8 +333,9 @@ fn chunk_reuse_re() -> &'static Regex {
 ///
 /// Returns `None` when the chunk is not R, has no body, or starts past EOF.
 /// The returned `(body_start, end_line)` pair is guaranteed to satisfy
-/// `body_start <= end_line < total_lines`.
-fn r_chunk_body_range(chunk: &Chunk, total_lines: u32) -> Option<(u32, u32)> {
+/// `body_start <= end_line < total_lines`. Folds the [`is_r_chunk_language`]
+/// guard so callers iterate all chunks and let-else past the non-R ones.
+pub(crate) fn r_chunk_body_range(chunk: &Chunk, total_lines: u32) -> Option<(u32, u32)> {
     if !is_r_chunk_language(&chunk.language) {
         return None;
     }
@@ -359,7 +360,7 @@ fn r_chunk_body_range(chunk: &Chunk, total_lines: u32) -> Option<(u32, u32)> {
 /// * [`detect_chunks`] with [`ChunkKind::Rmd`] locates R chunk bodies. A
 ///   chunk is R when [`is_r_chunk_language`] returns `true` for its language
 ///   tag. Body lines are `(chunk.header_line + 1)..=chunk.end_line`, clamped
-///   the same way as `semantic_tokens_for_rmd_document`:
+///   by [`r_chunk_body_range`] (shared with `semantic_tokens_for_rmd_document`):
 ///   - skip when `body_start > end_line` (empty chunk) or
 ///     `body_start >= total_lines` (header at EOF);
 ///   - clamp `end_line` to `total_lines - 1`.
@@ -441,7 +442,7 @@ pub fn mask_to_r(text: &str) -> String {
 ///   frontmatter delimiters — it pulls in no YAML crate.
 pub fn frontmatter_declares_params(text: &str) -> bool {
     // Strip an optional leading BOM so the first delimiter is recognized.
-    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let text = crate::utf16::strip_leading_bom_for_scan(text);
 
     let mut lines = text.split('\n');
 
@@ -469,22 +470,16 @@ pub fn frontmatter_declares_params(text: &str) -> bool {
         if trimmed == "---" || trimmed == "..." {
             return false;
         }
-        if line_is_top_level_params_key(line) {
+        // A top-level `params:` key sits at column 0 (no indentation): a line
+        // beginning with the literal `params:` prefix, whether bare (optionally
+        // a trailing `# comment`) or with an inline value (`params: foo`). A
+        // leading space (`  params:`), a comment (`# params:`), or a different
+        // key (`myparams:`) lacks that prefix and so does not match.
+        if line.starts_with("params:") {
             return true;
         }
     }
     false
-}
-
-/// True for a frontmatter line that declares a top-level `params:` mapping key
-/// (column 0, no indentation). Any line beginning with `params:` at column 0
-/// is a top-level key — whether it has no inline value (`params:`, optionally
-/// with a trailing `# comment`) or an inline value (`params: foo`). A leading
-/// space (`  params:`), a comment (`# params:`), or a different key
-/// (`myparams:`) does not begin with the literal `params:` prefix and so does
-/// not match.
-fn line_is_top_level_params_key(line: &str) -> bool {
-    line.strip_prefix("params:").is_some()
 }
 
 /// Returns `true` iff `line` (0-based) falls within the body of an R chunk

@@ -885,9 +885,12 @@ impl DocumentStore {
     /// classification — NOT re-derived by path — so untitled Rmd/Quarto
     /// buffers (no file extension) mask correctly.
     fn masked_text_for(chunk_kind: ChunkKind, content: &str) -> Option<String> {
-        match chunk_kind {
-            ChunkKind::Rmd => Some(crate::chunks::mask_to_r(content)),
-            ChunkKind::R => None,
+        // Thin adapter over the shared `analysis_text_for_kind` chokepoint: it
+        // returns an owned masked string for Rmd and borrows `content` for plain
+        // R. Owned -> `Some(masked)`; Borrowed -> `None` (raw `content` is used).
+        match crate::cross_file::analysis_text_for_kind(chunk_kind, content) {
+            std::borrow::Cow::Owned(masked) => Some(masked),
+            std::borrow::Cow::Borrowed(_) => None,
         }
     }
 

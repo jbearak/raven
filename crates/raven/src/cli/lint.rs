@@ -304,16 +304,19 @@ fn walk(
                 return;
             }
         };
-        // For chunk files (.Rmd/.qmd), mask the document to its R chunk bodies
-        // before parsing and linting. `mask_to_r` replaces all non-R-body lines
-        // (prose, YAML, fences, non-R chunk bodies) with empty strings while
-        // keeping every line at its original index, so lint findings computed on
-        // the masked text carry document coordinates directly.
-        let effective_text: std::borrow::Cow<str> = if chunk {
-            std::borrow::Cow::Owned(crate::chunks::mask_to_r(&text))
+        // For chunk files (.Rmd/.qmd), this masks the document to its R chunk
+        // bodies before parsing and linting: all non-R-body lines (prose, YAML,
+        // fences, non-R chunk bodies) become empty strings while every line keeps
+        // its original index, so lint findings carry document coordinates
+        // directly. Routed through the shared `analysis_text_for_kind` chokepoint
+        // so `raven lint` derives its R-analysis view identically to the LSP and
+        // `raven check`. `chunk` is `is_chunk_file(path)`, i.e. `.Rmd`/`.qmd`.
+        let chunk_kind = if chunk {
+            crate::chunks::ChunkKind::Rmd
         } else {
-            std::borrow::Cow::Borrowed(&text)
+            crate::chunks::ChunkKind::R
         };
+        let effective_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
         // Use the same thread-local parser pool the LSP uses; avoids
         // per-file Parser construction.
         let parse_result =
