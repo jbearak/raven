@@ -3709,8 +3709,10 @@ impl LanguageServer for Backend {
                 // pass per keystroke. Only Rmd carries a mask; plain R's
                 // analysis text equals raw text, so pass `None` there.
                 let text = doc.analysis_text();
-                let precomputed_masked = doc.is_rmd_document().then(|| text.clone());
                 let mut meta = crate::cross_file::extract_metadata(&text);
+                // Extract first, then move `text` into the mask slot — avoids
+                // cloning the masked String a second time per keystroke.
+                let precomputed_masked = doc.is_rmd_document().then_some(text);
                 let uri_clone = uri.clone();
                 let workspace_root = state.workspace_folders.first().cloned();
 
