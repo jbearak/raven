@@ -3405,14 +3405,16 @@ pub fn selection_range(
     // `descendant_for_point_range` would return the document root and surface a
     // nonsensical whole-document selection. Restrict to chunk-body positions
     // (checked against the RAW text, where fences/prose are still present).
-    let raw_text = doc.text();
-    let is_rmd = doc.is_rmd_document();
+    // Materialized lazily so plain-R requests (the common case) skip the clone.
+    let rmd_raw_text = doc.is_rmd_document().then(|| doc.text());
     let mut results = Vec::new();
     for pos in positions {
         // `position_in_r_chunk_body` re-scans the document per call (O(doc));
         // acceptable here because selection-range requests carry only the
         // active cursors (typically one or two positions).
-        if is_rmd && !crate::chunks::position_in_r_chunk_body(&raw_text, pos.line) {
+        if let Some(raw) = &rmd_raw_text
+            && !crate::chunks::position_in_r_chunk_body(raw, pos.line)
+        {
             continue;
         }
         let point = lsp_position_to_ts_point(&text, pos);
