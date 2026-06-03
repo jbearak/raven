@@ -11304,36 +11304,9 @@ lineLength = 200
     /// and the `TempDir` backing the file. Shared by the on-type-formatting
     /// chunk/prose tests.
     async fn open_rmd(content: &str) -> (tower_lsp::LspService<Backend>, Url, TempDir) {
-        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
-
         let tmp = TempDir::new().unwrap();
-        let rmd_path = tmp.path().join("report.Rmd");
-        fs::write(&rmd_path, content).unwrap();
-
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
-        let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "t".into(),
-                }]),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let uri = Url::from_file_path(&rmd_path).unwrap();
-        backend
-            .did_open(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: uri.clone(),
-                    language_id: "rmd".into(),
-                    version: 1,
-                    text: content.into(),
-                },
-            })
-            .await;
+        fs::write(tmp.path().join("report.Rmd"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "report.Rmd", "rmd", content).await;
         (svc, uri, tmp)
     }
 
