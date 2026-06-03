@@ -36940,6 +36940,65 @@ result <- helper_func(42)"#;
     }
 
     #[test]
+    fn test_completion_transitive_survives_local_parent_cycle_pollution() {
+        let mut owned_files: Vec<(String, String)> = Vec::new();
+        owned_files.push((
+            "main.r".to_string(),
+            "source(\"scripts/functions.r\")\nuse_here\n".to_string(),
+        ));
+
+        let mut functions = String::new();
+        functions.push_str("source(\"scripts/functions/target.r\")\n");
+        for i in 0..120 {
+            functions.push_str(&format!("source(\"scripts/functions/helper_{i:03}.r\")\n"));
+            owned_files.push((
+                format!("scripts/functions/helper_{i:03}.r"),
+                format!("helper_{i:03} <- function() {{ {i} }}\n"),
+            ));
+        }
+        // The queried file's forward child is first reached at this narrow
+        // call-site through the backward chain below. That parent-prefix walk
+        // records the target and helpers in the shared visited map, then later
+        // records functions.r itself at EOF. The final runner_0.r -> main.r
+        // edge is local=TRUE, so those non-declared symbols cannot self-rescue
+        // through STEP 1; they must arrive via main.r's real forward source().
+        // Without the pre-STEP-1 visited snapshot, that source() sees the
+        // polluted map and resolves functions.r to an empty scope.
+        functions.push_str("source(\"scripts/bridge.r\")\n");
+        owned_files.push(("scripts/functions.r".to_string(), functions));
+        owned_files.push((
+            "scripts/functions/target.r".to_string(),
+            "cascade_target <- function() {}\n".to_string(),
+        ));
+
+        owned_files.push((
+            "scripts/bridge.r".to_string(),
+            "source(\"scripts/runner_1.r\")\n".to_string(),
+        ));
+        owned_files.push((
+            "scripts/runner_1.r".to_string(),
+            "source(\"scripts/functions.r\")\nsource(\"scripts/runner_0.r\")\n".to_string(),
+        ));
+        owned_files.push((
+            "scripts/runner_0.r".to_string(),
+            "source(\"main.r\", local = TRUE)\n".to_string(),
+        ));
+
+        let files: Vec<(&str, &str)> = owned_files
+            .iter()
+            .map(|(path, code)| (path.as_str(), code.as_str()))
+            .collect();
+        let (_tmp, state, root) = cross_file_completion_world(&files, "main.r");
+        let uri = Url::from_file_path(root.join("main.r")).unwrap();
+
+        let labels = completion_labels(&state, &uri, 1, 7);
+        assert!(
+            labels.iter().any(|l| l == "cascade_target"),
+            "cascade_target should complete in main.r despite local-parent cycle pollution; got {labels:?}"
+        );
+    }
+
+    #[test]
     fn test_hover_symbol_shadowing() {
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
