@@ -11263,20 +11263,8 @@ lineLength = 200
             .await;
 
         let state = backend.state.read().await;
-        let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri)
-            .expect("snapshot built for report.Rmd");
-
-        // Reproduce the publish-path match guard exactly.
-        let diagnostics = if snapshot.file_type == crate::file_type::FileType::R {
-            crate::handlers::diagnostics_from_snapshot(
-                &snapshot,
-                &uri,
-                &crate::handlers::DiagCancelToken::never(),
-            )
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // `snapshot_diagnostics` reproduces the publish-path match guard.
+        let diagnostics = snapshot_diagnostics(&state, &uri);
 
         assert!(
             diagnostics
