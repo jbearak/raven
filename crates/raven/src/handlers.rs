@@ -36719,6 +36719,285 @@ result <- helper_func(42)"#;
         }
     }
 
+    // ====================================================================
+    // Cross-file completion: transitive source() chains, sibling visibility,
+    // workspace-root fallback, and source() cycles.
+    //
+    // These mirror how the editor sees a real project: the workspace is
+    // scanned (so every file is indexed as a *closed* neighbor), and only the
+    // file under the cursor is opened. Completion must then surface symbols
+    // brought in transitively, exactly as the position-aware scope does.
+    //
+    // Regression: transitively-sourced symbols silently failed to appear in
+    // completion for files high in a deep source() chain (e.g. a top-level
+    // `main.r` that `source()`s a `functions.r` which in turn sources the
+    // file defining the symbol), while the symbol *was* still treated as
+    // defined by the undefined-variable diagnostic. Root cause: the scope
+    // engine shared one `visited` map between its backward parent-prefix walk
+    // (STEP 1) and its forward source() expansion (STEP 2); when the queried
+    // file participated in a source() cycle, STEP 1 recorded a forward child
+    // at the (MAX,MAX) sentinel, so STEP 2's revisit guard short-circuited the
+    // real forward source() to an empty scope. See the `forward_visited_base`
+    // snapshot in `scope::scope_at_position_with_graph_recursive`.
+    // ====================================================================
+
+    /// Build a WorldState the way the editor does: write `files` to a temp dir
+    /// on disk, run the real workspace scan so every file is indexed as a
+    /// closed neighbor, apply the index (which also builds the dependency graph
+    /// and marks the scan complete), then open just `open` — the file under the
+    /// cursor. Returns the temp dir (kept alive), the state, and the root path.
+    fn cross_file_completion_world(
+        files: &[(&str, &str)],
+        open: &str,
+    ) -> (tempfile::TempDir, WorldState, std::path::PathBuf) {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        for (rel, code) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, code).unwrap();
+        }
+        let ws_root = Url::from_directory_path(&root).unwrap();
+        let mut state = WorldState::new(vec![]);
+        state.workspace_folders = vec![ws_root.clone()];
+        let scan = crate::state::scan_workspace(&[ws_root], 20);
+        state.apply_workspace_index(scan.0, scan.1, scan.2);
+        let open_code = files
+            .iter()
+            .find(|(rel, _)| *rel == open)
+            .expect("`open` must be one of `files`")
+            .1;
+        let open_uri = Url::from_file_path(root.join(open)).unwrap();
+        state
+            .documents
+            .insert(open_uri, Document::new(open_code, None));
+        (tmp, state, root)
+    }
+
+    /// Completion item labels offered at (line, col) in `uri`.
+    fn completion_labels(state: &WorldState, uri: &Url, line: u32, col: u32) -> Vec<String> {
+        match super::completion(state, uri, Position::new(line, col), None) {
+            Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
+            Some(CompletionResponse::List(list)) => {
+                list.items.into_iter().map(|i| i.label).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The user's reported scenario:
+    ///   grandparent.R: source("parent.R")
+    ///   parent.R:      source("child.R"); source("second_child.R")
+    ///   child.R:       my_function <- function() {}
+    /// `my_function` must tab-complete in parent.R (below the child source),
+    /// in grandparent.R (transitively, below the parent source), and in
+    /// second_child.R (a sibling sourced *after* child by the shared parent).
+    fn grandparent_chain_files() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("grandparent.R", "source(\"parent.R\")\nuse_here\n"),
+            (
+                "parent.R",
+                "source(\"child.R\")\nuse_here\nsource(\"second_child.R\")\nuse_here\n",
+            ),
+            ("child.R", "my_function <- function() {}\n"),
+            ("second_child.R", "use_here\nother <- 1\n"),
+        ]
+    }
+
+    #[test]
+    fn test_completion_transitive_chain_parent_below_child_source() {
+        let files = grandparent_chain_files();
+        // parent.R opened; cursor on line 1 (between source("child.R") and
+        // source("second_child.R")). my_function from child.R is in scope.
+        let (_tmp, state, root) = cross_file_completion_world(&files, "parent.R");
+        let uri = Url::from_file_path(root.join("parent.R")).unwrap();
+
+        let labels = completion_labels(&state, &uri, 1, 7);
+        assert!(
+            labels.iter().any(|l| l == "my_function"),
+            "my_function (from child.R, sourced above) should complete in parent.R; got {labels:?}"
+        );
+
+        // Also visible at end-of-file.
+        let labels_eof = completion_labels(&state, &uri, 3, 7);
+        assert!(
+            labels_eof.iter().any(|l| l == "my_function"),
+            "my_function should still complete at parent.R EOF; got {labels_eof:?}"
+        );
+    }
+
+    #[test]
+    fn test_completion_transitive_chain_grandparent() {
+        let files = grandparent_chain_files();
+        // grandparent.R opened; cursor on line 1, below source("parent.R").
+        // my_function is reachable only transitively: grandparent -> parent -> child.
+        let (_tmp, state, root) = cross_file_completion_world(&files, "grandparent.R");
+        let uri = Url::from_file_path(root.join("grandparent.R")).unwrap();
+
+        let labels = completion_labels(&state, &uri, 1, 7);
+        assert!(
+            labels.iter().any(|l| l == "my_function"),
+            "my_function should complete transitively in grandparent.R; got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn test_completion_transitive_chain_sibling_second_child() {
+        let files = grandparent_chain_files();
+        // second_child.R opened; it is sourced by parent.R *after* child.R, so
+        // child.R's my_function is in scope at the top of second_child.R.
+        let (_tmp, state, root) = cross_file_completion_world(&files, "second_child.R");
+        let uri = Url::from_file_path(root.join("second_child.R")).unwrap();
+
+        let labels = completion_labels(&state, &uri, 0, 7);
+        assert!(
+            labels.iter().any(|l| l == "my_function"),
+            "my_function should complete in second_child.R (sibling sourced after child.R); got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn test_completion_transitive_workspace_root_fallback() {
+        // Mirrors the reported real-world layout: a top-level `main.r` sources
+        // `scripts/functions.r`, which sources its children with
+        // WORKSPACE-ROOT-relative paths (`scripts/functions/<f>.r`). Those inner
+        // paths only resolve via the workspace-root fallback (relative to
+        // scripts/ they would be scripts/scripts/...). Completion in `main.r`
+        // must surface the transitively-defined symbol.
+        let files = vec![
+            ("main.r", "source(\"scripts/functions.r\")\nuse_here\n"),
+            (
+                "scripts/functions.r",
+                "source(\"scripts/functions/getPosterior.r\")\nsource(\"scripts/functions/getPosteriors.r\")\nuse_here\n",
+            ),
+            (
+                "scripts/functions/getPosterior.r",
+                "getPosterior <- function() {}\n",
+            ),
+            (
+                "scripts/functions/getPosteriors.r",
+                "getPosteriors <- function() {}\n",
+            ),
+        ];
+
+        // Opened in the leaf-most aggregator (1 hop): works historically.
+        let (_tmp, state, root) = cross_file_completion_world(&files, "scripts/functions.r");
+        let fns_uri = Url::from_file_path(root.join("scripts/functions.r")).unwrap();
+        let labels = completion_labels(&state, &fns_uri, 2, 7);
+        assert!(
+            labels.iter().any(|l| l == "getPosterior")
+                && labels.iter().any(|l| l == "getPosteriors"),
+            "getPosterior(s) should complete in functions.r (1-hop + ws-root fallback); got {labels:?}"
+        );
+
+        // Opened in the top-level main.r (2 hops, transitive): the regression.
+        let (_tmp2, state2, root2) = cross_file_completion_world(&files, "main.r");
+        let main_uri = Url::from_file_path(root2.join("main.r")).unwrap();
+        let labels_main = completion_labels(&state2, &main_uri, 1, 7);
+        assert!(
+            labels_main.iter().any(|l| l == "getPosterior")
+                && labels_main.iter().any(|l| l == "getPosteriors"),
+            "getPosterior(s) should complete transitively in main.r; got {labels_main:?}"
+        );
+    }
+
+    #[test]
+    fn test_completion_transitive_survives_source_cycle() {
+        // The queried file participates in a source() cycle: a wrapper script
+        // `source()`s `main.r`, and `main.r`'s own forward source() chain leads
+        // (via `runner.r`) back to `main.r`. Transitive symbols defined down the
+        // forward chain must still complete in `main.r` — the cycle must not
+        // cause the forward source() to resolve to an empty scope.
+        let files = vec![
+            ("main.r", "source(\"helpers.r\")\nuse_here\n"),
+            (
+                "helpers.r",
+                "source(\"runner.r\")\nhelper <- function() {}\n",
+            ),
+            (
+                "runner.r",
+                "source(\"main.r\")\ndeep_symbol <- function() {}\n",
+            ),
+            // Backward parents of main.r (wrappers that run it), as in real projects.
+            ("run_all.r", "source(\"main.r\")\n"),
+            ("validate.r", "v <- 1\nsource(\"main.r\")\n"),
+        ];
+        let (_tmp, state, root) = cross_file_completion_world(&files, "main.r");
+        let uri = Url::from_file_path(root.join("main.r")).unwrap();
+
+        let labels = completion_labels(&state, &uri, 1, 7);
+        assert!(
+            labels.iter().any(|l| l == "helper"),
+            "helper (from helpers.r) should complete in main.r despite the source() cycle; got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "deep_symbol"),
+            "deep_symbol (transitive, via helpers.r -> runner.r) should complete in main.r; got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn test_completion_transitive_survives_local_parent_cycle_pollution() {
+        let mut owned_files: Vec<(String, String)> = Vec::new();
+        owned_files.push((
+            "main.r".to_string(),
+            "source(\"scripts/functions.r\")\nuse_here\n".to_string(),
+        ));
+
+        let mut functions = String::new();
+        functions.push_str("source(\"scripts/functions/target.r\")\n");
+        for i in 0..120 {
+            functions.push_str(&format!("source(\"scripts/functions/helper_{i:03}.r\")\n"));
+            owned_files.push((
+                format!("scripts/functions/helper_{i:03}.r"),
+                format!("helper_{i:03} <- function() {{ {i} }}\n"),
+            ));
+        }
+        // The queried file's forward child is first reached at this narrow
+        // call-site through the backward chain below. That parent-prefix walk
+        // records the target and helpers in the shared visited map, then later
+        // records functions.r itself at EOF. The final runner_0.r -> main.r
+        // edge is local=TRUE, so those non-declared symbols cannot self-rescue
+        // through STEP 1; they must arrive via main.r's real forward source().
+        // Without the pre-STEP-1 visited snapshot, that source() sees the
+        // polluted map and resolves functions.r to an empty scope.
+        functions.push_str("source(\"scripts/bridge.r\")\n");
+        owned_files.push(("scripts/functions.r".to_string(), functions));
+        owned_files.push((
+            "scripts/functions/target.r".to_string(),
+            "cascade_target <- function() {}\n".to_string(),
+        ));
+
+        owned_files.push((
+            "scripts/bridge.r".to_string(),
+            "source(\"scripts/runner_1.r\")\n".to_string(),
+        ));
+        owned_files.push((
+            "scripts/runner_1.r".to_string(),
+            "source(\"scripts/functions.r\")\nsource(\"scripts/runner_0.r\")\n".to_string(),
+        ));
+        owned_files.push((
+            "scripts/runner_0.r".to_string(),
+            "source(\"main.r\", local = TRUE)\n".to_string(),
+        ));
+
+        let files: Vec<(&str, &str)> = owned_files
+            .iter()
+            .map(|(path, code)| (path.as_str(), code.as_str()))
+            .collect();
+        let (_tmp, state, root) = cross_file_completion_world(&files, "main.r");
+        let uri = Url::from_file_path(root.join("main.r")).unwrap();
+
+        let labels = completion_labels(&state, &uri, 1, 7);
+        assert!(
+            labels.iter().any(|l| l == "cascade_target"),
+            "cascade_target should complete in main.r despite local-parent cycle pollution; got {labels:?}"
+        );
+    }
+
     #[test]
     fn test_hover_symbol_shadowing() {
         let library_paths = r_env::find_library_paths();
