@@ -5292,9 +5292,9 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         // knitr/Quarto-injected `params` is a defined global in parameterized
         // Rmd/Quarto reports (frontmatter declares `params:`). The out-of-scope
         // collector would otherwise misattribute a `params` use to a later
-        // `source()` whose target happens to export `params`. Mirror the
-        // undefined-variable collector's guard. See
-        // `DiagnosticsSnapshot::rmd_declared_params`.
+        // `source()` whose target happens to export `params`. A matching guard
+        // in the undefined-variable collector keeps the two in sync; update
+        // both together. See `DiagnosticsSnapshot::rmd_declared_params`.
         if snapshot.rmd_declared_params && name == "params" {
             continue;
         }
@@ -5615,8 +5615,9 @@ fn collect_undefined_variables_from_snapshot(
         // analysis text blanks that frontmatter, so `params` would otherwise
         // be flagged undefined. Treat it as a defined global, but ONLY for
         // Rmd/Quarto docs that actually declare it — plain .R files and Rmd
-        // docs without `params:` still flag legitimate uses. See
-        // `DiagnosticsSnapshot::rmd_declared_params`.
+        // docs without `params:` still flag legitimate uses. A matching guard
+        // in the out-of-scope collector keeps the two in sync; update both
+        // together. See `DiagnosticsSnapshot::rmd_declared_params`.
         if snapshot.rmd_declared_params && name == "params" {
             continue;
         }
