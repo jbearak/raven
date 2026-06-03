@@ -83,7 +83,9 @@ pub fn print_help() {
 Usage: raven lint [OPTIONS] [PATHS...]
 
 Lints each .R / .r file against the rules configured in raven.toml
-(or .lintr) and prints diagnostics.
+(or .lintr) and prints diagnostics. R Markdown / Quarto files
+(.Rmd / .qmd) are linted too: the R code inside chunks is checked,
+prose and non-R chunks are ignored.
 
 Options:
   --config PATH               Path to raven.toml (default: search upward)
@@ -889,11 +891,14 @@ mod tests {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        // A directory with one .Rmd and one plain .R; both have a triggering
-        // pattern so both should produce findings.
+        // A directory with one .Rmd, one .qmd, and one plain .R; all have a
+        // triggering pattern so all should produce findings (.qmd shares the
+        // .Rmd dispatch path via is_chunk_file — pin it end-to-end too).
         let rmd = root.join("doc.Rmd");
+        let qmd = root.join("paper.qmd");
         let r_file = root.join("plain.R");
         fs::write(&rmd, rmd_with_chunk_finding()).unwrap();
+        fs::write(&qmd, rmd_with_chunk_finding()).unwrap();
         fs::write(&r_file, "x=1\n").unwrap();
 
         let settings = assignment_warn_settings();
@@ -914,12 +919,17 @@ mod tests {
         );
 
         assert!(!operator_error, "unexpected operator error");
-        // Both files must contribute findings.
+        // All three files must contribute findings.
         let rmd_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &rmd).collect();
+        let qmd_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &qmd).collect();
         let r_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &r_file).collect();
         assert!(
             !rmd_findings.is_empty(),
             "directory walk must include .Rmd findings; got {diags:?}"
+        );
+        assert!(
+            !qmd_findings.is_empty(),
+            "directory walk must include .qmd findings; got {diags:?}"
         );
         assert!(
             !r_findings.is_empty(),

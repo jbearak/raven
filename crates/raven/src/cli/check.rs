@@ -114,10 +114,12 @@ pub fn print_help() {
 Usage: raven check [OPTIONS] [PATHS...]
 
 Indexes the workspace, then reports the full diagnostic set for the requested
-files (or every R file in the workspace when no PATHS are given): syntax errors,
-semantic checks, style lints, cross-file diagnostics (missing source files,
-circular dependencies, out-of-scope usage), missing-package warnings, and
-undefined-variable diagnostics. Honors raven.toml / .lintr.
+files (or every R / R Markdown / Quarto file in the workspace when no PATHS are
+given): syntax errors, semantic checks, style lints, cross-file diagnostics
+(missing source files, circular dependencies, out-of-scope usage),
+missing-package warnings, and undefined-variable diagnostics. For .Rmd / .qmd
+the R code inside chunks is analyzed; prose and non-R chunks are ignored.
+Honors raven.toml / .lintr.
 
 Options:
   --workspace DIR             Workspace root to index (default: current directory)
