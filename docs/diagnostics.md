@@ -223,7 +223,7 @@ Diagnostics are suppressed for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files 
 
 ## R Markdown and Quarto
 
-R Markdown (`.Rmd`) and Quarto (`.qmd`) documents are diagnosed chunk-by-chunk. Raven analyzes a masked view of the document in which every non-R line — prose, YAML front matter, and non-R fenced blocks (Python, Bash, etc.) — is blanked while R chunk bodies are preserved at their original line and column positions. As a result:
+In R Markdown (`.Rmd`) and Quarto (`.qmd`) documents, the R code inside chunks is diagnosed as a single R program. Raven analyzes a masked view of the document in which every non-R line — prose, YAML front matter, and non-R fenced blocks (Python, Bash, etc.) — is blanked while R chunk bodies are preserved at their original line and column positions. As a result:
 
 - Syntax errors, undefined variables, and lint findings inside `{r}` (and `{rscript}`) chunks are reported at the document's own coordinates, exactly as they would be in a `.R` file.
 - Prose, YAML, markdown links, and non-R chunks never produce diagnostics.

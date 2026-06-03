@@ -13,7 +13,7 @@ Raven is under active development. The gaps below reflect features that exist in
 R chunk bodies in `.Rmd` / `.qmd` documents are fully analyzed as first-class R code. The following gaps are accepted limitations of the current implementation:
 
 - **Inline R expressions** (`\`r expr\`` in prose) are not analyzed. Only fenced chunk bodies (```` ```{r} ... ``` ```` ) are treated as R.
-- **Cross-chunk delimiter leak** — chunk bodies are analyzed as a single concatenated R program. An unclosed delimiter (`"`, `(`, `{`) in one chunk body can swallow the opening of the next chunk, causing the next chunk's parse to fail. The unclosed delimiter in the offending chunk is itself flagged as a parse error. This is a consequence of the single-parse model knitr uses.
+- **Cross-chunk delimiter leak** — chunk bodies are analyzed as a single concatenated R program. An unclosed delimiter (`"`, `(`, `{`) in one chunk body can swallow the opening of the next chunk, causing the next chunk's parse to fail. The unclosed delimiter in the offending chunk is itself flagged as a parse error. This is a consequence of Raven's single-parse analysis model (knitr itself evaluates chunks one at a time and would stop at the offending chunk).
 - **Non-R chunks not analyzed** — `{python}`, `{bash}`, `{julia}`, and other non-R fenced blocks are never analyzed or linted.
 - **knitr chunk-reuse lines** (`<<label>>`) are blanked (treated as empty lines) and not resolved.
 

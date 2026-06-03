@@ -24,7 +24,7 @@ Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct sy
 
 The R code inside chunk bodies is first-class. Raven analyzes all R chunk bodies as a single R program, so the editor's R language features work inside chunks of `.Rmd` / `.qmd` documents and resolve symbols across chunks (a function defined in one chunk can be used, navigated to, and completed in a later chunk):
 
-- [Diagnostics](./diagnostics.md), [completion](./completion.md), [hover](./hover.md), [signature help](./completion.md), [go-to-definition](./go-to-definition.md), [find-references](./find-references.md), folding, expand-selection, and on-type [indentation](./indentation.md).
+- [Diagnostics](./diagnostics.md), [completion](./completion.md), [hover](./hover.md), signature help, [go-to-definition](./go-to-definition.md), [find-references](./find-references.md), folding, expand-selection, and on-type [indentation](./indentation.md).
 
 These features apply only inside R chunk bodies. On prose, YAML front matter, or non-R chunks they stand down — completion, signature help, and on-type indentation produce nothing rather than treating the line as top-level R. Non-R chunks (`{python}`, `{bash}`, …) are not analyzed as R.
 
