@@ -13797,6 +13797,14 @@ y <- filter(df)"#;
                 .collect()
         }
 
+        /// Per-symbol sibling of [`symbol_identity_set`]: project one symbol's
+        /// provenance into a comparable tuple. Keeps the observable-field list in
+        /// one place — adding a provenance field updates every assertion at once
+        /// instead of ~19 hand-spelled tuples.
+        fn symbol_provenance(s: &ScopedSymbol) -> (&Url, u32, u32, SymbolKind) {
+            (&s.source_uri, s.defined_line, s.defined_column, s.kind)
+        }
+
         /// Build a 2-file fixture (`main.R` + `helper.R`) with a
         /// dependency edge derived from `main.R`'s `source()` call (if
         /// any). Returns the components needed for both `ScopeStream::new`
@@ -14633,18 +14641,8 @@ y <- filter(df)"#;
 
             // Full-tuple parity between the two paths.
             assert_eq!(
-                (
-                    &stream_f.source_uri,
-                    stream_f.defined_line,
-                    stream_f.defined_column,
-                    stream_f.kind
-                ),
-                (
-                    &direct_f.source_uri,
-                    direct_f.defined_line,
-                    direct_f.defined_column,
-                    direct_f.kind
-                ),
+                symbol_provenance(stream_f),
+                symbol_provenance(direct_f),
                 "ScopeStream and recursive resolver must agree on the full \
                  provenance tuple (source_uri, defined_line, defined_column, \
                  kind) for f when two sources define it at different positions."
@@ -14653,12 +14651,7 @@ y <- filter(df)"#;
             // Concrete intent: a.R is sourced first, so its line-0 / col-0
             // function definition wins (first-source-wins).
             assert_eq!(
-                (
-                    &direct_f.source_uri,
-                    direct_f.defined_line,
-                    direct_f.defined_column,
-                    direct_f.kind
-                ),
+                symbol_provenance(direct_f),
                 (&a_uri, 0u32, 0u32, SymbolKind::Function),
                 "sanity: f must resolve to a.R's line-0 function definition \
                  (first-source-wins), not b.R's line-1 definition"
@@ -14823,28 +14816,13 @@ y <- filter(df)"#;
             // both paths: the same-file leak filter must drop the copy of g
             // that round-trips back through helper's parent-prefix.
             assert_eq!(
-                (
-                    &stream_g.source_uri,
-                    stream_g.defined_line,
-                    stream_g.defined_column,
-                    stream_g.kind
-                ),
-                (
-                    &direct_g.source_uri,
-                    direct_g.defined_line,
-                    direct_g.defined_column,
-                    direct_g.kind
-                ),
+                symbol_provenance(stream_g),
+                symbol_provenance(direct_g),
                 "ScopeStream and recursive resolver must agree on g's \
                  provenance tuple across the forward+backward cycle."
             );
             assert_eq!(
-                (
-                    &direct_g.source_uri,
-                    direct_g.defined_line,
-                    direct_g.defined_column,
-                    direct_g.kind
-                ),
+                symbol_provenance(direct_g),
                 (&main_uri, 0u32, 0u32, SymbolKind::Variable),
                 "sanity: g must stay main.R's own line-0 definition, not a \
                  round-tripped copy from helper's parent-prefix"
@@ -14862,28 +14840,13 @@ y <- filter(df)"#;
             // h flows through the forward source() edge with helper.R
             // provenance in both paths.
             assert_eq!(
-                (
-                    &stream_h.source_uri,
-                    stream_h.defined_line,
-                    stream_h.defined_column,
-                    stream_h.kind
-                ),
-                (
-                    &direct_h.source_uri,
-                    direct_h.defined_line,
-                    direct_h.defined_column,
-                    direct_h.kind
-                ),
+                symbol_provenance(stream_h),
+                symbol_provenance(direct_h),
                 "ScopeStream and recursive resolver must agree on h's \
                  provenance tuple."
             );
             assert_eq!(
-                (
-                    &direct_h.source_uri,
-                    direct_h.defined_line,
-                    direct_h.defined_column,
-                    direct_h.kind
-                ),
+                symbol_provenance(direct_h),
                 (&helper_uri, 1u32, 0u32, SymbolKind::Variable),
                 "sanity: h must be attributed to helper.R's line-1 definition"
             );
@@ -15100,30 +15063,15 @@ y <- filter(df)"#;
 
             // Stream and direct agree at the early position.
             assert_eq!(
-                (
-                    &stream_k_early.source_uri,
-                    stream_k_early.defined_line,
-                    stream_k_early.defined_column,
-                    stream_k_early.kind
-                ),
-                (
-                    &direct_k_early.source_uri,
-                    direct_k_early.defined_line,
-                    direct_k_early.defined_column,
-                    direct_k_early.kind
-                ),
+                symbol_provenance(stream_k_early),
+                symbol_provenance(direct_k_early),
                 "ScopeStream and recursive resolver must agree on k's \
                  provenance at main.R line 0 (early, pre-source)"
             );
 
             // Concrete expected value: parent.R line 0 col 0, Variable.
             assert_eq!(
-                (
-                    &direct_k_early.source_uri,
-                    direct_k_early.defined_line,
-                    direct_k_early.defined_column,
-                    direct_k_early.kind
-                ),
+                symbol_provenance(direct_k_early),
                 (&parent_uri, 0u32, 0u32, SymbolKind::Variable),
                 "at main.R line 0, k must resolve to parent.R's line-0 \
                  definition (parent-prefix edge before any forward source fires)"
@@ -15141,18 +15089,8 @@ y <- filter(df)"#;
 
             // Full-tuple parity between the two paths.
             assert_eq!(
-                (
-                    &stream_k_late.source_uri,
-                    stream_k_late.defined_line,
-                    stream_k_late.defined_column,
-                    stream_k_late.kind
-                ),
-                (
-                    &direct_k_late.source_uri,
-                    direct_k_late.defined_line,
-                    direct_k_late.defined_column,
-                    direct_k_late.kind
-                ),
+                symbol_provenance(stream_k_late),
+                symbol_provenance(direct_k_late),
                 "ScopeStream and recursive resolver must agree on k's \
                  provenance tuple. The recursive resolver overrides the \
                  parent-prefix binding via the \
@@ -15165,12 +15103,7 @@ y <- filter(df)"#;
             // the parent-prefix binding from parent.R, so k resolves to
             // helper.R's line-0 definition.
             assert_eq!(
-                (
-                    &direct_k_late.source_uri,
-                    direct_k_late.defined_line,
-                    direct_k_late.defined_column,
-                    direct_k_late.kind
-                ),
+                symbol_provenance(direct_k_late),
                 (&helper_uri, 0u32, 0u32, SymbolKind::Variable),
                 "sanity: k must resolve to helper.R's line-0 definition \
                  (forward source overrides the parent-prefix binding from \
@@ -15381,8 +15314,8 @@ y <- filter(df)"#;
                 let s = &streamed.symbols[name.as_str()];
                 let c = &cached.symbols[name.as_str()];
                 assert_eq!(
-                    (&s.source_uri, s.defined_line, s.defined_column, s.kind),
-                    (&c.source_uri, c.defined_line, c.defined_column, c.kind),
+                    symbol_provenance(s),
+                    symbol_provenance(c),
                     "ScopeStream and cached resolver must agree on the \
                      provenance tuple for `{name}` at main.R (2, 0)"
                 );
@@ -15413,12 +15346,7 @@ y <- filter(df)"#;
                 .get("early")
                 .expect("early must be visible at main.R (2, 0)");
             assert_eq!(
-                (
-                    &early.source_uri,
-                    early.defined_line,
-                    early.defined_column,
-                    early.kind
-                ),
+                symbol_provenance(early),
                 (&main_uri, 0u32, 0u32, SymbolKind::Variable),
                 "early must be attributed to main.R line 0 col 0"
             );
@@ -15427,7 +15355,7 @@ y <- filter(df)"#;
                 .get("h")
                 .expect("h must be visible at main.R (2, 0) once source() has fired");
             assert_eq!(
-                (&h.source_uri, h.defined_line, h.defined_column, h.kind),
+                symbol_provenance(h),
                 (&helper_uri, 1u32, 0u32, SymbolKind::Variable),
                 "h must be attributed to helper.R line 1 col 0 (through the \
                  forward source() edge)"
