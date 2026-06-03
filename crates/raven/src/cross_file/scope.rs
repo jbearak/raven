@@ -5503,6 +5503,8 @@ where
 /// out-of-order targets are no-ops). Returns `0` if the stream can't be
 /// constructed (no artifacts for `uri`).
 #[cfg(feature = "test-support")]
+// Reason: mirrors `ScopeStream::new`'s parameter surface 1:1; bundling into a
+// struct for a bench-only wrapper with a single caller isn't worth the churn.
 #[allow(clippy::too_many_arguments)]
 pub fn bench_scope_stream_sweep<F, G>(
     uri: &Url,
