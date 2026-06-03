@@ -129,6 +129,20 @@ fn build_nested_interval_tree(depth: usize) -> FunctionScopeTree {
 // file_0.R (the root of the source chain) for chain depths 1, 5, and 15.
 // ---------------------------------------------------------------------------
 
+/// Per-depth fixture shared by `bench_scope_resolution` and
+/// `bench_diagnostic_sweep` — the two groups deliberately use the same
+/// workspace shape so their numbers are comparable. Enough files to cover
+/// the chain, plus a few extra.
+fn config_for_depth(depth: usize) -> FixtureConfig {
+    FixtureConfig {
+        file_count: (depth + 5).max(10),
+        functions_per_file: 5,
+        source_chain_depth: depth,
+        library_calls_per_file: 1,
+        extra_lines_per_file: 3,
+    }
+}
+
 fn bench_scope_resolution(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_file_scope_resolution");
     group.sample_size(20);
@@ -136,16 +150,7 @@ fn bench_scope_resolution(c: &mut Criterion) {
     let chain_depths: &[usize] = &[1, 5, 15];
 
     for &depth in chain_depths {
-        // Create a workspace with the specified chain depth.
-        // Use enough files to cover the chain, plus a few extra.
-        let file_count = (depth + 5).max(10);
-        let config = FixtureConfig {
-            file_count,
-            functions_per_file: 5,
-            source_chain_depth: depth,
-            library_calls_per_file: 1,
-            extra_lines_per_file: 3,
-        };
+        let config = config_for_depth(depth);
 
         let workspace = create_fixture_workspace(&config);
         let workspace_path = workspace.path();
@@ -201,21 +206,16 @@ fn bench_scope_resolution(c: &mut Criterion) {
 // Expected: streaming << per-position cached << per-position uncached.
 // ---------------------------------------------------------------------------
 
-/// Number of document-order positions to sweep per arm. Fixed across depths so
-/// the three arms are directly comparable. The bench fixture's `file_0.R` has
-/// fewer lines than K, so `sweep_positions` wraps and repeats; that is fine —
-/// it exercises `advance_to` no-op/re-query paths consistently across all three
-/// arms. The result is sorted back into document order (the ScopeStream cursor
-/// requires monotonic advancement).
+/// Number of document-order positions to sweep per arm, fixed across depths.
 const SWEEP_POSITIONS: usize = 100;
 
-/// Build `SWEEP_POSITIONS` document-order (line, column) positions. Line and
-/// column indices wrap independently, so positions repeat after a few sweeps
-/// of the file; repeats are fine — they exercise `advance_to` no-op/re-query
-/// paths consistently across all three arms. Positions are sorted ascending so
-/// the streaming cursor advances monotonically.
-fn sweep_positions(content: &str) -> Vec<(u32, u32)> {
-    let line_count = content.lines().count().max(1) as u32;
+/// Build `SWEEP_POSITIONS` document-order (line, column) positions for a file
+/// with `line_count` lines. Line and column indices wrap independently, so
+/// positions repeat after a few sweeps of the file; repeats are fine — they
+/// exercise `advance_to` no-op/re-query paths. Positions are sorted ascending
+/// so the streaming cursor advances monotonically.
+fn sweep_positions(line_count: usize) -> Vec<(u32, u32)> {
+    let line_count = line_count.max(1) as u32;
     let columns: &[u32] = &[0, 4, 8];
     let mut positions = Vec::with_capacity(SWEEP_POSITIONS);
     for i in 0..SWEEP_POSITIONS {
@@ -240,14 +240,7 @@ fn bench_diagnostic_sweep(c: &mut Criterion) {
     let names: &[&str] = &["func_0_0", "var_0_0", "func_1_0", "missing_sym"];
 
     for &depth in chain_depths {
-        let file_count = (depth + 5).max(10);
-        let config = FixtureConfig {
-            file_count,
-            functions_per_file: 5,
-            source_chain_depth: depth,
-            library_calls_per_file: 1,
-            extra_lines_per_file: 3,
-        };
+        let config = config_for_depth(depth);
 
         let workspace = create_fixture_workspace(&config);
         let workspace_path = workspace.path();
@@ -259,7 +252,7 @@ fn bench_diagnostic_sweep(c: &mut Criterion) {
         let base_exports: HashSet<String> = HashSet::new();
 
         let content = std::fs::read_to_string(workspace_path.join("file_0.R")).unwrap();
-        let positions = sweep_positions(&content);
+        let positions = sweep_positions(content.lines().count());
 
         let get_artifacts = |u: &Url| artifacts_map.get(u).cloned();
         let get_metadata = |u: &Url| metadata_map.get(u).cloned();

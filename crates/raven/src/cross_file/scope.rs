@@ -13771,6 +13771,32 @@ y <- filter(df)"#;
             })
         }
 
+        /// Project a resolver result's symbols into a sorted set of
+        /// `(name, source_uri, defined_line, defined_column, kind)` tuples
+        /// for identity comparison. A bare-name comparison would silently
+        /// miss provenance regressions (e.g. a first- vs last-source-wins
+        /// flip that keeps the name but changes the definition site).
+        /// `SymbolKind` is not `Ord`, so the kind is rendered via `Debug`
+        /// for a stable sort key; the string form still distinguishes every
+        /// variant.
+        fn symbol_identity_set(
+            scope: &ScopeAtPosition,
+        ) -> std::collections::BTreeSet<(String, String, u32, u32, String)> {
+            scope
+                .symbols
+                .iter()
+                .map(|(n, s)| {
+                    (
+                        n.to_string(),
+                        s.source_uri.to_string(),
+                        s.defined_line,
+                        s.defined_column,
+                        format!("{:?}", s.kind),
+                    )
+                })
+                .collect()
+        }
+
         /// Build a 2-file fixture (`main.R` + `helper.R`) with a
         /// dependency edge derived from `main.R`'s `source()` call (if
         /// any). Returns the components needed for both `ScopeStream::new`
@@ -13946,36 +13972,8 @@ y <- filter(df)"#;
                     // (different `ScopedSymbol` for the same name, affecting
                     // hover and find-references — see AGENTS.md learning on
                     // `entry().or_insert()` for Source events).
-                    let streamed_identity: std::collections::BTreeSet<(
-                        String, String, u32, u32, String,
-                    )> = streamed
-                        .symbols
-                        .iter()
-                        .map(|(n, s)| {
-                            (
-                                n.to_string(),
-                                s.source_uri.to_string(),
-                                s.defined_line,
-                                s.defined_column,
-                                format!("{:?}", s.kind),
-                            )
-                        })
-                        .collect();
-                    let direct_identity: std::collections::BTreeSet<(
-                        String, String, u32, u32, String,
-                    )> = direct
-                        .symbols
-                        .iter()
-                        .map(|(n, s)| {
-                            (
-                                n.to_string(),
-                                s.source_uri.to_string(),
-                                s.defined_line,
-                                s.defined_column,
-                                format!("{:?}", s.kind),
-                            )
-                        })
-                        .collect();
+                    let streamed_identity = symbol_identity_set(&streamed);
+                    let direct_identity = symbol_identity_set(&direct);
                     prop_assert_eq!(
                         &streamed_identity,
                         &direct_identity,
@@ -15545,36 +15543,8 @@ y <- filter(df)"#;
             // agree on every observable field. Assert each one explicitly so a
             // future divergence (e.g. `late` leaking, or package-origin drift)
             // turns into a precise failure.
-            // `SymbolKind` is not `Ord`, so render it to a string for a stable
-            // sort key; the string form still distinguishes every variant.
-            let mut cached_syms: Vec<(String, String, u32, u32, String)> = cached
-                .symbols
-                .iter()
-                .map(|(n, s)| {
-                    (
-                        n.to_string(),
-                        s.source_uri.to_string(),
-                        s.defined_line,
-                        s.defined_column,
-                        format!("{:?}", s.kind),
-                    )
-                })
-                .collect();
-            cached_syms.sort();
-            let mut uncached_syms: Vec<(String, String, u32, u32, String)> = uncached
-                .symbols
-                .iter()
-                .map(|(n, s)| {
-                    (
-                        n.to_string(),
-                        s.source_uri.to_string(),
-                        s.defined_line,
-                        s.defined_column,
-                        format!("{:?}", s.kind),
-                    )
-                })
-                .collect();
-            uncached_syms.sort();
+            let cached_syms = symbol_identity_set(&cached);
+            let uncached_syms = symbol_identity_set(&uncached);
             assert_eq!(
                 cached_syms, uncached_syms,
                 "cached and uncached must agree on the full set of symbols and \
