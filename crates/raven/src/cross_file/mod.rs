@@ -114,6 +114,45 @@ pub fn analysis_text_for_kind(
     }
 }
 
+/// The `Option`-returning sibling of [`analysis_text_for_kind`] for callers that
+/// store `masked_text: Option<String>` (an open document's analysis text is the
+/// masked string for Rmd/Quarto, or `None` to mean "use the raw text as-is").
+///
+/// Returns `Some(masked)` for [`ChunkKind::Rmd`](crate::chunks::ChunkKind::Rmd)
+/// (the geometry-preserving [`crate::chunks::mask_to_r`] mask) and `None` for
+/// [`ChunkKind::R`](crate::chunks::ChunkKind::R), where analysis text equals raw
+/// text. This is the single masking chokepoint for `masked_text` fields:
+/// [`crate::state::Document`] and [`crate::document_store::DocumentStore`] both
+/// route through it so their analysis views can never diverge.
+pub(crate) fn masked_analysis_text(
+    chunk_kind: crate::chunks::ChunkKind,
+    text: &str,
+) -> Option<String> {
+    match analysis_text_for_kind(chunk_kind, text) {
+        std::borrow::Cow::Owned(masked) => Some(masked),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
+/// Classify a `did_open`'d document by its editor `language_id`-then-URI and
+/// return its [`ChunkKind`](crate::chunks::ChunkKind) paired with the R-analysis
+/// view of `text` ([`analysis_text_for_kind`]).
+///
+/// This is the chokepoint for the `did_open` branches in `backend.rs`, which all
+/// classify the same way before extracting metadata and opening the
+/// `DocumentStore`. `language_id`-then-URI classification (not path-only) is what
+/// lets untitled `.Rmd`/`.qmd` buffers — which have no file extension — mask
+/// correctly (#343).
+pub(crate) fn classify_and_mask<'a>(
+    language_id: Option<&str>,
+    uri: &tower_lsp::lsp_types::Url,
+    text: &'a str,
+) -> (crate::chunks::ChunkKind, std::borrow::Cow<'a, str>) {
+    let chunk_kind = crate::chunks::classify_chunk_document_for(language_id, uri.path());
+    let analysis_text = analysis_text_for_kind(chunk_kind, text);
+    (chunk_kind, analysis_text)
+}
+
 /// Extract cross-file metadata from `content`, masking R Markdown / Quarto
 /// prose first so directives, `source()` calls, and `library()` calls are
 /// taken from R chunk bodies only (never from prose or YAML front matter).

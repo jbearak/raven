@@ -22332,7 +22332,9 @@ result <- data %>% filter(x > 0)
     /// re-classified by path, parsed the buffer RAW, and leaked prose symbols.
     async fn open_untitled_rmd(state: &mut crate::state::WorldState, uri: &Url, content: &str) {
         let chunk_kind = crate::chunks::classify_chunk_document_for(Some("rmd"), uri.path());
-        let meta = crate::cross_file::extract_metadata(&crate::chunks::mask_to_r(content));
+        let meta = crate::cross_file::extract_metadata(&crate::cross_file::analysis_text_for_kind(
+            chunk_kind, content,
+        ));
         state
             .document_store
             .open_with_metadata(uri.clone(), content, 1, chunk_kind, meta)

@@ -310,12 +310,10 @@ fn walk(
         // its original index, so lint findings carry document coordinates
         // directly. Routed through the shared `analysis_text_for_kind` chokepoint
         // so `raven lint` derives its R-analysis view identically to the LSP and
-        // `raven check`. `chunk` is `is_chunk_file(path)`, i.e. `.Rmd`/`.qmd`.
-        let chunk_kind = if chunk {
-            crate::chunks::ChunkKind::Rmd
-        } else {
-            crate::chunks::ChunkKind::R
-        };
+        // `raven check`. Classify via the canonical `classify_chunk_document`
+        // (not a local re-derivation of the `chunk` guard above) so this site
+        // can never drift from the project-wide `.Rmd`/`.qmd` classifier.
+        let chunk_kind = crate::chunks::classify_chunk_document(&path.to_string_lossy());
         let effective_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
         // Use the same thread-local parser pool the LSP uses; avoids
         // per-file Parser construction.

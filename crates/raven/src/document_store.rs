@@ -356,7 +356,7 @@ impl DocumentStore {
             content,
         ));
         let (masked_text, tree, loaded_packages, artifacts) =
-            Self::compute_derived(&uri, chunk_kind, content, metadata.as_ref());
+            Self::compute_derived(&uri, chunk_kind, content, metadata.as_ref(), None);
 
         let state = DocumentState {
             uri: uri.clone(),
@@ -443,7 +443,7 @@ impl DocumentStore {
         let contents = Rope::from_str(content);
         let metadata = Arc::new(metadata);
         let (masked_text, tree, loaded_packages, artifacts) =
-            Self::compute_derived(&uri, chunk_kind, content, metadata.as_ref());
+            Self::compute_derived(&uri, chunk_kind, content, metadata.as_ref(), None);
 
         let state = DocumentState {
             uri: uri.clone(),
@@ -532,7 +532,7 @@ impl DocumentStore {
                 &content,
             ));
             let (masked_text, tree, loaded_packages, artifacts) =
-                Self::compute_derived(uri, chunk_kind, &content, metadata.as_ref());
+                Self::compute_derived(uri, chunk_kind, &content, metadata.as_ref(), None);
             state.masked_text = masked_text;
             state.tree = tree;
             state.loaded_packages = loaded_packages;
@@ -552,12 +552,21 @@ impl DocumentStore {
     ///
     /// Like `update`, but uses the provided metadata instead of extracting it.
     /// Use this when metadata has been enriched with inherited_working_directory.
+    ///
+    /// `precomputed_masked` is forwarded to
+    /// [`compute_derived`](Self::compute_derived): on the `did_change` hot path
+    /// the caller has already masked this exact raw content for this exact
+    /// `chunk_kind` (the legacy [`crate::state::Document`] masks it in
+    /// `apply_change`), so it hands the result in to avoid a second
+    /// [`chunks::mask_to_r`](crate::chunks::mask_to_r) pass per keystroke. Pass
+    /// `None` to mask here. It is consumed only for [`ChunkKind::Rmd`].
     pub async fn update_with_metadata(
         &mut self,
         uri: &Url,
         changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
         metadata: CrossFileMetadata,
+        precomputed_masked: Option<String>,
     ) {
         self.mark_update_started(uri);
         if let Some(state) = self.documents.get_mut(uri) {
@@ -575,8 +584,13 @@ impl DocumentStore {
             let chunk_kind = state.chunk_kind;
             let content = state.contents.to_string();
             let metadata = Arc::new(metadata);
-            let (masked_text, tree, loaded_packages, artifacts) =
-                Self::compute_derived(uri, chunk_kind, &content, metadata.as_ref());
+            let (masked_text, tree, loaded_packages, artifacts) = Self::compute_derived(
+                uri,
+                chunk_kind,
+                &content,
+                metadata.as_ref(),
+                precomputed_masked,
+            );
             state.masked_text = masked_text;
             state.tree = tree;
             state.loaded_packages = loaded_packages;
@@ -874,26 +888,6 @@ impl DocumentStore {
         crate::parser_pool::with_parser(|parser| parser.parse(content, None))
     }
 
-    /// Masked analysis text for a document of the given [`ChunkKind`], or
-    /// `None` for plain R.
-    ///
-    /// Masks via [`chunks::mask_to_r`](crate::chunks::mask_to_r) when
-    /// `chunk_kind` is [`ChunkKind::Rmd`] so the `tree`/`metadata`/`artifacts`
-    /// of an open `.Rmd`/`.qmd` document are derived from R chunk bodies only,
-    /// never prose (issue #343). `contents` stays raw; this is purely the
-    /// analysis view. The kind is the document's stored, open-time
-    /// classification — NOT re-derived by path — so untitled Rmd/Quarto
-    /// buffers (no file extension) mask correctly.
-    fn masked_text_for(chunk_kind: ChunkKind, content: &str) -> Option<String> {
-        // Thin adapter over the shared `analysis_text_for_kind` chokepoint: it
-        // returns an owned masked string for Rmd and borrows `content` for plain
-        // R. Owned -> `Some(masked)`; Borrowed -> `None` (raw `content` is used).
-        match crate::cross_file::analysis_text_for_kind(chunk_kind, content) {
-            std::borrow::Cow::Owned(masked) => Some(masked),
-            std::borrow::Cow::Borrowed(_) => None,
-        }
-    }
-
     /// Compute the analysis-derived fields (`masked_text`, `tree`,
     /// `loaded_packages`, `artifacts`) for an open document from its RAW
     /// `content`, parsing and extracting from the masked analysis text for
@@ -907,18 +901,35 @@ impl DocumentStore {
     /// `chunk_kind` is the document's stored, open-time classification (see
     /// [`DocumentState::chunk_kind`]); `uri` is used only for artifact
     /// attribution, never to re-derive masking (#343).
+    ///
+    /// `precomputed_masked` lets a caller that has *already* masked the same raw
+    /// content for this exact `chunk_kind` (e.g. the `did_change` path, where
+    /// [`crate::state::Document::apply_change`] just masked it) hand the result
+    /// in to skip a redundant [`chunks::mask_to_r`](crate::chunks::mask_to_r)
+    /// pass on the hot per-keystroke path. It is consumed only for
+    /// [`ChunkKind::Rmd`]; for plain R `masked_text` is always `None` and the
+    /// argument is ignored. Pass `None` to mask here. Correctness rests on the
+    /// caller's promise that it is the mask of the *same content and kind* — the
+    /// store does not (and cannot cheaply) re-verify it.
     fn compute_derived(
         uri: &Url,
         chunk_kind: ChunkKind,
         content: &str,
         metadata: &CrossFileMetadata,
+        precomputed_masked: Option<String>,
     ) -> (
         Option<String>,
         Option<Tree>,
         Vec<String>,
         Arc<ScopeArtifacts>,
     ) {
-        let masked_text = Self::masked_text_for(chunk_kind, content);
+        let masked_text = match chunk_kind {
+            // Reuse the caller's mask when supplied; otherwise mask via the
+            // shared chokepoint. Plain R never has masked text.
+            ChunkKind::Rmd => precomputed_masked
+                .or_else(|| crate::cross_file::masked_analysis_text(chunk_kind, content)),
+            ChunkKind::R => None,
+        };
         let analysis_text = masked_text.as_deref().unwrap_or(content);
         let tree = Self::parse_content(analysis_text);
         let loaded_packages = Self::extract_packages(&tree, analysis_text);

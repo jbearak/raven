@@ -240,12 +240,10 @@ impl Document {
     ) -> Self {
         let contents = Rope::from_str(text);
         // Mask Rmd/Quarto bodies so the R parser only sees real R code; plain R
-        // (and JAGS/Stan) keep their raw text.
-        let masked_text = if chunk_kind == ChunkKind::Rmd {
-            Some(crate::chunks::mask_to_r(text))
-        } else {
-            None
-        };
+        // (and JAGS/Stan) keep their raw text. Routed through the shared
+        // `masked_analysis_text` chokepoint so this and the DocumentStore can
+        // never derive divergent analysis views.
+        let masked_text = crate::cross_file::masked_analysis_text(chunk_kind, text);
         let analysis_text = masked_text.as_deref().unwrap_or(text);
         let tree = parse_document_text(analysis_text, file_type);
         // Extract from the SAME text the tree was parsed from, so `library()`
@@ -302,17 +300,9 @@ impl Document {
         // change is acceptable: tree-sitter is fast, and incremental masking is
         // a future optimization. (Plain R already reparses from scratch here,
         // so this is not a regression for the common case.)
-        let analysis_text = if self.chunk_kind == ChunkKind::Rmd {
-            let masked = crate::chunks::mask_to_r(&raw_text);
-            self.masked_text = Some(masked);
-            self.masked_text
-                .as_deref()
-                .expect("masked_text was just set")
-        } else {
-            // Keep the field `None` for non-Rmd docs; analysis text == raw text.
-            self.masked_text = None;
-            &raw_text
-        };
+        self.masked_text = crate::cross_file::masked_analysis_text(self.chunk_kind, &raw_text);
+        // `Some(masked)` for Rmd, `None` for plain R (analysis text == raw text).
+        let analysis_text = self.masked_text.as_deref().unwrap_or(&raw_text);
 
         self.tree = parse_document_text(analysis_text, self.file_type);
         self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);

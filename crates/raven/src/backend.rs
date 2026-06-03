@@ -2864,9 +2864,8 @@ impl LanguageServer for Backend {
             // languageId-then-URI so untitled `.Rmd`/`.qmd` buffers (no file
             // extension) are masked too — and reuse the same `chunk_kind` for
             // the DocumentStore open below so its tree/artifacts agree.
-            let chunk_kind =
-                crate::chunks::classify_chunk_document_for(Some(language_id.as_str()), uri.path());
-            let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+            let (chunk_kind, analysis_text) =
+                crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
             let mut meta = crate::cross_file::extract_metadata(&analysis_text);
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
@@ -3265,11 +3264,8 @@ impl LanguageServer for Backend {
                 // Masked for Rmd/Quarto (chunk bodies only); raw otherwise.
                 // Classify by languageId-then-URI so untitled buffers mask, and
                 // extract metadata from that same masked view (#343).
-                let chunk_kind = crate::chunks::classify_chunk_document_for(
-                    Some(language_id.as_str()),
-                    uri.path(),
-                );
-                let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+                let (chunk_kind, analysis_text) =
+                    crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
                 let mut meta = crate::cross_file::extract_metadata(&analysis_text);
                 log::trace!(
                     "did_open re-enrich: uri={}, sources={}, sourced_by={}",
@@ -3432,9 +3428,8 @@ impl LanguageServer for Backend {
             // languageId-then-URI classification masks untitled buffers (#343);
             // extract metadata from the same masked view so the graph and the
             // DocumentStore tree/artifacts agree (chunk bodies only for Rmd).
-            let chunk_kind =
-                crate::chunks::classify_chunk_document_for(Some(language_id.as_str()), uri.path());
-            let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+            let (chunk_kind, analysis_text) =
+                crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
             let mut meta = crate::cross_file::extract_metadata(&analysis_text);
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut meta,
@@ -3699,84 +3694,100 @@ impl LanguageServer for Backend {
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
             // Extract and enrich metadata with inherited working directory
-            let (packages_to_prefetch, enriched_meta, wd_affected, edges_changed) =
-                if let Some(doc) = state.documents.get(&uri) {
-                    // Analysis text: masked for Rmd/Quarto (chunk bodies only),
-                    // raw otherwise. Feeds the graph + DocumentStore (#343).
-                    let text = doc.analysis_text();
-                    let mut meta = crate::cross_file::extract_metadata(&text);
-                    let uri_clone = uri.clone();
-                    let workspace_root = state.workspace_folders.first().cloned();
+            let (
+                packages_to_prefetch,
+                enriched_meta,
+                precomputed_masked,
+                wd_affected,
+                edges_changed,
+            ) = if let Some(doc) = state.documents.get(&uri) {
+                // Analysis text: masked for Rmd/Quarto (chunk bodies only),
+                // raw otherwise. Feeds the graph + DocumentStore (#343).
+                // `apply_change` above already masked this exact raw content
+                // for this doc's fixed chunk kind, so we hand the Rmd mask to
+                // `update_with_metadata` below to skip a second `mask_to_r`
+                // pass per keystroke. Only Rmd carries a mask; plain R's
+                // analysis text equals raw text, so pass `None` there.
+                let text = doc.analysis_text();
+                let precomputed_masked = doc.is_rmd_document().then(|| text.clone());
+                let mut meta = crate::cross_file::extract_metadata(&text);
+                let uri_clone = uri.clone();
+                let workspace_root = state.workspace_folders.first().cloned();
 
-                    // Enrich metadata with inherited working directory before any use
-                    // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
-                    crate::cross_file::enrich_metadata_with_inherited_wd(
-                        &mut meta,
-                        &uri_clone,
-                        workspace_root.as_ref(),
-                        |parent_uri| state.get_enriched_metadata(parent_uri),
-                        max_chain_depth,
-                    );
+                // Enrich metadata with inherited working directory before any use
+                // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut meta,
+                    &uri_clone,
+                    workspace_root.as_ref(),
+                    |parent_uri| state.get_enriched_metadata(parent_uri),
+                    max_chain_depth,
+                );
 
-                    // Collect package names for prefetch (validate names to
-                    // reject suspicious inputs before R subprocess calls)
-                    let pkgs: Vec<String> = if packages_enabled {
-                        extract_loaded_packages_from_library_calls(&meta.library_calls)
-                    } else {
-                        Vec::new()
-                    };
-
-                    // Pre-collect content for potential parent files to avoid borrow conflicts
-                    // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
-                    // Backward directives should always be resolved relative to the file's directory
-                    let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                        &uri_clone,
-                        workspace_root.as_ref(),
-                    );
-                    let parent_content: std::collections::HashMap<Url, String> = meta
-                        .sourced_by
-                        .iter()
-                        .filter_map(|d| {
-                            let ctx = backward_path_ctx.as_ref()?;
-                            let resolved =
-                                crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                            let parent_uri = Url::from_file_path(resolved).ok()?;
-                            let content = state
-                                .documents
-                                .get(&parent_uri)
-                                .map(|doc| doc.text())
-                                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                            Some((parent_uri, content))
-                        })
-                        .collect();
-
-                    let graph_result = state.cross_file_graph.update_file(
-                        &uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                        |parent_uri| parent_content.get(parent_uri).cloned(),
-                    );
-
-                    // Invalidate children affected by working directory change (Requirement 8)
-                    let wd_children =
-                        crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                            &uri,
-                            old_meta.as_deref(),
-                            &meta,
-                            &state.cross_file_graph,
-                            &state.cross_file_meta,
-                        );
-
-                    (pkgs, Some(meta), wd_children, graph_result.edges_changed)
+                // Collect package names for prefetch (validate names to
+                // reject suspicious inputs before R subprocess calls)
+                let pkgs: Vec<String> = if packages_enabled {
+                    extract_loaded_packages_from_library_calls(&meta.library_calls)
                 } else {
-                    (Vec::new(), None, Vec::new(), false)
+                    Vec::new()
                 };
+
+                // Pre-collect content for potential parent files to avoid borrow conflicts
+                // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+                // Backward directives should always be resolved relative to the file's directory
+                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                    &uri_clone,
+                    workspace_root.as_ref(),
+                );
+                let parent_content: std::collections::HashMap<Url, String> = meta
+                    .sourced_by
+                    .iter()
+                    .filter_map(|d| {
+                        let ctx = backward_path_ctx.as_ref()?;
+                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                        let parent_uri = Url::from_file_path(resolved).ok()?;
+                        let content = state
+                            .documents
+                            .get(&parent_uri)
+                            .map(|doc| doc.text())
+                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                        Some((parent_uri, content))
+                    })
+                    .collect();
+
+                let graph_result = state.cross_file_graph.update_file(
+                    &uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                    |parent_uri| parent_content.get(parent_uri).cloned(),
+                );
+
+                // Invalidate children affected by working directory change (Requirement 8)
+                let wd_children =
+                    crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                        &uri,
+                        old_meta.as_deref(),
+                        &meta,
+                        &state.cross_file_graph,
+                        &state.cross_file_meta,
+                    );
+
+                (
+                    pkgs,
+                    Some(meta),
+                    precomputed_masked,
+                    wd_children,
+                    graph_result.edges_changed,
+                )
+            } else {
+                (Vec::new(), None, None, Vec::new(), false)
+            };
 
             // Update new DocumentStore with enriched metadata (Requirement 1.4)
             if let Some(meta) = enriched_meta {
                 state
                     .document_store
-                    .update_with_metadata(&uri, changes, version, meta)
+                    .update_with_metadata(&uri, changes, version, meta, precomputed_masked)
                     .await;
             } else {
                 state.document_store.update(&uri, changes, version).await;
