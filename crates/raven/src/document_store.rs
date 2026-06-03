@@ -845,9 +845,11 @@ impl DocumentStore {
     /// derived from R chunk bodies only, never prose (issue #343). `contents`
     /// stays raw; this is purely the analysis view.
     fn masked_text_for(uri: &Url, content: &str) -> Option<String> {
-        match crate::chunks::classify_chunk_document(uri.path()) {
-            crate::chunks::ChunkKind::Rmd => Some(crate::chunks::mask_to_r(content)),
-            crate::chunks::ChunkKind::R => None,
+        // Delegate to the shared classify-and-mask chokepoint so the two
+        // never drift; `Borrowed` means "plain R, analysis text == raw".
+        match crate::cross_file::analysis_text_for_path(uri.path(), content) {
+            std::borrow::Cow::Owned(masked) => Some(masked),
+            std::borrow::Cow::Borrowed(_) => None,
         }
     }
 
