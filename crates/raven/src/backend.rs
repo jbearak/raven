@@ -2860,8 +2860,14 @@ impl LanguageServer for Backend {
             // Extract and enrich metadata with inherited working directory.
             // For Rmd/Quarto docs this masks the prose first so the graph,
             // DocumentStore, and on-demand indexing see only chunk-body
-            // source()/library() calls and directives (#343).
-            let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), &text);
+            // source()/library() calls and directives (#343). Classify by
+            // languageId-then-URI so untitled `.Rmd`/`.qmd` buffers (no file
+            // extension) are masked too — and reuse the same `chunk_kind` for
+            // the DocumentStore open below so its tree/artifacts agree.
+            let chunk_kind =
+                crate::chunks::classify_chunk_document_for(Some(language_id.as_str()), uri.path());
+            let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+            let mut meta = crate::cross_file::extract_metadata(&analysis_text);
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
@@ -2876,10 +2882,12 @@ impl LanguageServer for Backend {
                 max_chain_depth,
             );
 
-            // Update new DocumentStore with enriched metadata (Requirement 1.3)
+            // Update new DocumentStore with enriched metadata (Requirement 1.3).
+            // `chunk_kind` was classified above by languageId-then-URI so
+            // untitled `.Rmd`/`.qmd` buffers mask their tree/artifacts (#343).
             state
                 .document_store
-                .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                 .await;
 
             // Update legacy documents HashMap (for migration compatibility)
@@ -3254,8 +3262,15 @@ impl LanguageServer for Backend {
                 let workspace_root = state.workspace_folders.first().cloned();
                 let max_chain_depth = state.cross_file_config.max_chain_depth;
 
-                // Masked for Rmd/Quarto (chunk bodies only); raw otherwise (#343).
-                let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), &text);
+                // Masked for Rmd/Quarto (chunk bodies only); raw otherwise.
+                // Classify by languageId-then-URI so untitled buffers mask, and
+                // extract metadata from that same masked view (#343).
+                let chunk_kind = crate::chunks::classify_chunk_document_for(
+                    Some(language_id.as_str()),
+                    uri.path(),
+                );
+                let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+                let mut meta = crate::cross_file::extract_metadata(&analysis_text);
                 log::trace!(
                     "did_open re-enrich: uri={}, sources={}, sourced_by={}",
                     uri,
@@ -3278,7 +3293,7 @@ impl LanguageServer for Backend {
 
                 state
                     .document_store
-                    .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                    .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                     .await;
                 state.open_document_with_language_id(
                     uri.clone(),
@@ -3414,8 +3429,13 @@ impl LanguageServer for Backend {
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
-            // Masked for Rmd/Quarto (chunk bodies only); raw otherwise (#343).
-            let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), &text);
+            // languageId-then-URI classification masks untitled buffers (#343);
+            // extract metadata from the same masked view so the graph and the
+            // DocumentStore tree/artifacts agree (chunk bodies only for Rmd).
+            let chunk_kind =
+                crate::chunks::classify_chunk_document_for(Some(language_id.as_str()), uri.path());
+            let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+            let mut meta = crate::cross_file::extract_metadata(&analysis_text);
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut meta,
                 &uri,
@@ -3426,7 +3446,7 @@ impl LanguageServer for Backend {
 
             state
                 .document_store
-                .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                 .await;
             state.open_document_with_language_id(
                 uri.clone(),

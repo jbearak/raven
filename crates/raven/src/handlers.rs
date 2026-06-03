@@ -22298,6 +22298,89 @@ result <- data %>% filter(x > 0)
         );
     }
 
+    /// Open an untitled `.Rmd` buffer into the `DocumentStore` exactly as
+    /// `did_open` does for an editor `languageId: "rmd"` — no file extension,
+    /// classified by languageId. Before #343's untitled-buffer fix the store
+    /// re-classified by path, parsed the buffer RAW, and leaked prose symbols.
+    async fn open_untitled_rmd(state: &mut crate::state::WorldState, uri: &Url, content: &str) {
+        let chunk_kind = crate::chunks::classify_chunk_document_for(Some("rmd"), uri.path());
+        let meta = crate::cross_file::extract_metadata(&crate::chunks::mask_to_r(content));
+        state
+            .document_store
+            .open_with_metadata(uri.clone(), content, 1, chunk_kind, meta)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_references_skip_untitled_rmd_prose() {
+        // Adversarial probe: a `.R` file references `data_helper`; an untitled
+        // Rmd buffer mentions `data_helper` only in PROSE (its chunk does not).
+        // find-references from the .R file must NOT return a location inside the
+        // untitled Rmd's prose — the buffer's tree must be masked (#343).
+        use crate::state::Document;
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+
+        let r_uri = Url::parse("file:///main.R").unwrap();
+        let r_code = "data_helper <- function() 1\ndata_helper()\n";
+        state
+            .documents
+            .insert(r_uri.clone(), Document::new_with_uri(r_code, None, &r_uri));
+
+        // Untitled Rmd: `data_helper` appears in prose; the R chunk defines an
+        // unrelated function, so a correctly-masked buffer yields no reference.
+        let untitled = Url::parse("untitled:Untitled-1").unwrap();
+        let rmd = "We call data_helper in this report.\n\n```{r}\nother_fn <- function() 2\n```\n";
+        open_untitled_rmd(&mut state, &untitled, rmd).await;
+
+        // Query references for `data_helper` from the .R file (line 1, the use).
+        let refs = super::references(&state, &r_uri, Position::new(1, 0))
+            .expect("references must resolve from the .R file");
+        assert!(
+            refs.iter().all(|loc| loc.uri != untitled),
+            "find-references must not surface a location in the untitled Rmd's prose, got {:?}",
+            refs
+        );
+        // Sanity: the .R definition + use are still found.
+        assert!(
+            refs.iter().any(|loc| loc.uri == r_uri),
+            "find-references must still find the .R occurrences, got {:?}",
+            refs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_symbol_untitled_rmd_chunk_not_prose() {
+        // workspace/symbol on a workspace whose only open document is an untitled
+        // Rmd must surface a CHUNK-defined function and must NOT surface a
+        // prose-"defined" one. Pre-fix, the buffer's artifacts came from a
+        // RAW parse, exposing prose tokens and missing chunk symbols (#343).
+        let mut state = WorldState::new(vec![]);
+        state.workspace_scan_complete = true;
+
+        let untitled = Url::parse("untitled:Untitled-2").unwrap();
+        // Prose contains an assignment-looking line `prose_symbol <- 1` that a
+        // RAW parse would treat as a top-level definition; the real chunk
+        // defines `chunk_symbol`.
+        let rmd =
+            "prose_symbol <- 1 in prose, not code.\n\n```{r}\nchunk_symbol <- function() 3\n```\n";
+        open_untitled_rmd(&mut state, &untitled, rmd).await;
+
+        let chunk_hits = super::workspace_symbol(&state, "chunk_symbol").unwrap_or_default();
+        assert!(
+            chunk_hits.iter().any(|s| s.name == "chunk_symbol"),
+            "workspace/symbol must surface the chunk-defined `chunk_symbol`, got {:?}",
+            chunk_hits.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let prose_hits = super::workspace_symbol(&state, "prose_symbol").unwrap_or_default();
+        assert!(
+            !prose_hits.iter().any(|s| s.name == "prose_symbol"),
+            "workspace/symbol must NOT surface the prose-only `prose_symbol`, got {:?}",
+            prose_hits.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn test_hover_active_in_rmd_chunk_and_inert_in_prose() {
         let (state, uri) = rmd_handler_fixture();

@@ -92,7 +92,23 @@ pub fn analysis_text_for_path<'a>(
     path_or_uri: &str,
     content: &'a str,
 ) -> std::borrow::Cow<'a, str> {
-    match crate::chunks::classify_chunk_document(path_or_uri) {
+    analysis_text_for_kind(crate::chunks::classify_chunk_document(path_or_uri), content)
+}
+
+/// The R-analysis view of `content` for an already-classified document: the
+/// geometry-preserving [`crate::chunks::mask_to_r`] mask for
+/// [`ChunkKind::Rmd`](crate::chunks::ChunkKind::Rmd), the raw `content`
+/// borrowed unchanged for [`ChunkKind::R`](crate::chunks::ChunkKind::R).
+///
+/// Use this when the caller already knows the kind from the editor's
+/// `languageId`-then-URI classification (e.g. `did_open`, where path-based
+/// classification would mis-handle untitled `.Rmd`/`.qmd` buffers, #343).
+/// [`analysis_text_for_path`] is the path-classified convenience wrapper.
+pub fn analysis_text_for_kind(
+    chunk_kind: crate::chunks::ChunkKind,
+    content: &str,
+) -> std::borrow::Cow<'_, str> {
+    match chunk_kind {
         crate::chunks::ChunkKind::Rmd => std::borrow::Cow::Owned(crate::chunks::mask_to_r(content)),
         crate::chunks::ChunkKind::R => std::borrow::Cow::Borrowed(content),
     }

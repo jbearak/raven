@@ -1513,13 +1513,22 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
     log::trace!("Scanning file: {}", uri);
     let doc = Document::new_with_uri(&text, None, &uri);
 
-    let cross_file_meta = crate::cross_file::extract_metadata(&text);
+    // Pair `doc.tree` with the analysis text it was parsed from (masked for
+    // Rmd/Quarto, raw otherwise) for both metadata extraction and artifact
+    // computation, so byte offsets align (#343). The scan currently never sees
+    // chunk files (`is_stat_model_extension` excludes `.rmd`/`.qmd`), so this is
+    // behavior-neutral today; the pairing must stay analysis-consistent in case
+    // that ever changes — feeding raw `&text` against a masked tree would
+    // mis-slice (and panic on a non-UTF-8 boundary in multibyte prose).
+    let analysis_text = doc.analysis_text();
+
+    let cross_file_meta = crate::cross_file::extract_metadata(&analysis_text);
 
     let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
         crate::cross_file::scope::compute_artifacts_with_metadata(
             &uri,
             tree,
-            &text,
+            &analysis_text,
             Some(&cross_file_meta),
         )
     } else {
@@ -2400,5 +2409,52 @@ mod tests {
             }
             assert_eq!(current, chain_url(chain, CHAIN_LEN - 1));
         }
+    }
+
+    /// Finding 3 (#343): `process_workspace_file` must pair the document's
+    /// `tree` with its **analysis text** (masked for Rmd) when extracting
+    /// metadata and computing artifacts. The workspace scan currently never
+    /// hands this function a chunk file (`is_stat_model_extension` excludes
+    /// `.rmd`/`.qmd`), but the raw/masked pairing must stay analysis-consistent
+    /// so a future scan-scope change can't silently mis-slice. Multibyte prose
+    /// makes the regression a hard failure (mid-char slice), not a quiet one.
+    #[test]
+    fn process_workspace_file_pairs_masked_tree_with_masked_text() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("report.Rmd");
+        // Multibyte prose contains `prose_symbol`; the chunk defines
+        // `chunk_symbol`. A masked-consistent scan yields the chunk symbol only.
+        let src =
+            "Prélude éééé prose_symbol éééé.\n\n```{r}\nchunk_symbol <- function(a) a + 1\n```\n";
+        fs::write(&path, src).unwrap();
+
+        let processed = process_workspace_file(&path).expect("process_workspace_file must succeed");
+
+        // Artifacts derive from the masked analysis text: the chunk symbol is
+        // exported, the prose symbol is not.
+        let interface = &processed.new_index_entry.artifacts.exported_interface;
+        assert!(
+            interface.keys().any(|k| &**k == "chunk_symbol"),
+            "chunk-defined symbol must be in the exported interface, got {:?}",
+            interface.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !interface.keys().any(|k| &**k == "prose_symbol"),
+            "prose token must NOT be in the exported interface, got {:?}",
+            interface.keys().collect::<Vec<_>>()
+        );
+        // The document's tree must slice cleanly against its analysis text
+        // (would panic on the multibyte prose if paired with raw text).
+        let doc_tree = processed
+            .document
+            .tree
+            .as_ref()
+            .expect("Rmd doc must have a tree");
+        let analysis = processed.document.analysis_text();
+        assert!(
+            tree_has_identifier(doc_tree, &analysis, "chunk_symbol"),
+            "masked tree must contain the chunk-defined identifier"
+        );
     }
 }
