@@ -1368,16 +1368,9 @@ fn try_extract_member_assignment(
     op: ExtractOp,
     out: &mut Vec<Candidate>,
 ) {
-    let Some(op_node) = node.child_by_field_name("operator") else {
+    let Some(target) = assignment_target(node, text) else {
         return;
     };
-    let op_text = node_text(op_node, text);
-    let target = match op_text {
-        "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
-        "->" | "->>" => node.child_by_field_name("rhs"),
-        _ => return,
-    };
-    let Some(target) = target else { return };
     if let Some(candidate) = member_assignment_candidate_from_extract(
         node, target, text, col_mapper, file_uri, path, rhs_name, op,
     ) {
@@ -1467,21 +1460,9 @@ fn collect_constructor_candidates(
     let Some(value_node) = assignment_value_node(assignment, text) else {
         return;
     };
-
-    if value_node.kind() != "call" {
+    if !is_allowlisted_constructor_call(value_node, text) {
         return;
     }
-    let Some(func_node) = value_node.child_by_field_name("function") else {
-        return;
-    };
-    if func_node.kind() != "identifier" {
-        return;
-    }
-    let func_name = node_text(func_node, text);
-    if !CONSTRUCTOR_ALLOWLIST.contains(&func_name) {
-        return;
-    }
-
     let Some(args_node) = value_node.child_by_field_name("arguments") else {
         return;
     };
@@ -1573,21 +1554,23 @@ fn assignment_target<'a>(node: Node<'a>, text: &str) -> Option<Node<'a>> {
     }
 }
 
+/// Is `node` a call to one of the allowlisted constructors (`list`, `c`,
+/// `data.frame`, …)?
+fn is_allowlisted_constructor_call(node: Node, text: &str) -> bool {
+    node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .filter(|func| func.kind() == "identifier")
+            .is_some_and(|func| CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)))
+}
+
 /// For an assignment whose value is an allowlisted-constructor call, return
 /// `(target, ctor_call)`. Used to find whole-value writes with constructor RHS
 /// (`alpha$beta <- list(...)`).
 fn assignment_constructor_call<'a>(node: Node<'a>, text: &str) -> Option<(Node<'a>, Node<'a>)> {
     let target = assignment_target(node, text)?;
     let value = assignment_value_node(node, text)?;
-    if value.kind() != "call" {
-        return None;
-    }
-    let func = value.child_by_field_name("function")?;
-    if func.kind() == "identifier" && CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)) {
-        Some((target, value))
-    } else {
-        None
-    }
+    is_allowlisted_constructor_call(value, text).then_some((target, value))
 }
 
 /// If `target`'s spine is a non-empty prefix of `path` (`head` + `segments[..k]`
@@ -1701,14 +1684,7 @@ fn named_arg_constructor_value<'a>(args: Node<'a>, text: &str, name: &str) -> Op
             continue;
         }
         let value = child.child_by_field_name("value")?;
-        if value.kind() != "call" {
-            return None;
-        }
-        let func = value.child_by_field_name("function")?;
-        if func.kind() == "identifier" && CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)) {
-            return Some(value);
-        }
-        return None;
+        return is_allowlisted_constructor_call(value, text).then_some(value);
     }
     None
 }
@@ -1716,21 +1692,12 @@ fn named_arg_constructor_value<'a>(args: Node<'a>, text: &str, name: &str) -> Op
 fn ascend_to_assignment_for<'a>(start: Node<'a>, text: &str, lhs_name: &str) -> Option<Node<'a>> {
     let mut current = start;
     loop {
-        if current.kind() == "binary_operator" {
-            let op_text = current
-                .child_by_field_name("operator")
-                .map(|n| node_text(n, text));
-            let target = match op_text {
-                Some("<-") | Some("=") | Some("<<-") => current.child_by_field_name("lhs"),
-                Some("->") | Some("->>") => current.child_by_field_name("rhs"),
-                _ => None,
-            };
-            if let Some(t) = target
-                && t.kind() == "identifier"
-                && node_text(t, text) == lhs_name
-            {
-                return Some(current);
-            }
+        if current.kind() == "binary_operator"
+            && let Some(target) = assignment_target(current, text)
+            && target.kind() == "identifier"
+            && node_text(target, text) == lhs_name
+        {
+            return Some(current);
         }
         current = current.parent()?;
     }
