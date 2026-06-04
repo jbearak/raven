@@ -1,10 +1,45 @@
 //! Resolve and enumerate candidates for the RHS identifier of `$` and `@`.
 //!
-//! See `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md`.
+//! See `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md` (Step 1)
+//! and `docs/superpowers/specs/2026-06-04-nested-dollar-member-completion-design.md`
+//! (Step 2: nested paths + reassignment semantics).
+//!
+//! ## The container path
+//!
+//! The LHS is modeled as a [`QualifiedPath`] — a head identifier plus zero or
+//! more intermediate [`Segment`]s, built from the AST by [`build_qualified_path`]
+//! (`$`/`@`/`[["lit"]]` steps; bails on any non-static step). The single-level
+//! case (`foo$bar`) is `segments.is_empty()` and reproduces the pre-Step-2
+//! behavior exactly; everything below generalizes "match `foo`" to "match the
+//! container path `head + segments`":
+//!   - member assignments match when the assignment target's spine equals the
+//!     path (`alpha$beta$gamma <- ...` for path `alpha$beta`);
+//!   - constructor literals are *descended* along `segments`
+//!     (`alpha <- list(beta = list(gamma = ...))`);
+//!   - a whole-value write to a prefix (`alpha$beta <- list(...)`) contributes
+//!     its named arguments and acts as an establishing site (below).
+//!
+//! ## Reassignment (establishing-site cutoff)
+//!
+//! Members reflect the value live at the cursor. A whole-value (re)write of an
+//! intermediate prefix (`alpha$beta <- ...`, constructor or opaque) is an
+//! *establishing site*; members declared before the latest visible one are
+//! dropped (see [`collect_prefix_writes`] and the cutoff in the core collector).
+//! A site only counts in the head's own scope — a rewrite inside an unrelated
+//! function body modifies a local copy and is excluded. To order sites and
+//! members that live in different files, each maps to a global,
+//! execution-ordered key (cursor-file events anchor at their own position;
+//! directly-sourced events anchor at the `source()` call site, the within-file
+//! position breaking ties). A `source()` that brings the head's defining file
+//! into scope is itself an establishing event, so a cursor-file reassignment
+//! drops upstream members sourced before it, and a within-helper reassignment
+//! drops that helper's own earlier members. The residual imprecision is narrowed
+//! to a defining file reached only *transitively* (no direct source line) and to
+//! reassignments in a third sourced file, where members are kept conservatively.
 //!
 //! For `foo$bar` (or `foo@bar`) where the cursor is on `bar`:
 //!
-//! 1. Resolve `foo` via the existing position-aware scope.
+//! 1. Resolve `foo` (the path head) via the existing position-aware scope.
 //! 2. Collect candidates from the defining file and the files that actually
 //!    contribute to the cursor's resolved cross-file scope:
 //!    - **Defining file**: `foo$bar <- ...` member-assignments,
@@ -117,6 +152,71 @@ impl<'a> ColMapper<'a> {
     }
 }
 
+/// One intermediate step in a `$`/`@`/`[["lit"]]` access chain. `op` is the
+/// operator that produced this segment from its parent; a `[["lit"]]` subscript
+/// is recorded as [`ExtractOp::Dollar`] because it is `$`-equivalent for member
+/// resolution (mirrors `member_assignment_candidate_from_string_subscript`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    pub name: String,
+    pub op: ExtractOp,
+}
+
+/// The container an `$`/`@` member is being resolved against: a head identifier
+/// plus zero or more intermediate [`Segment`]s. `segments.is_empty()` is the
+/// single-level (depth-1) case and reproduces the pre-Step-2 behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedPath {
+    pub head: String,
+    pub segments: Vec<Segment>,
+}
+
+/// Walk the left-spine of an `extract_operator`/`subset2` node into a
+/// [`QualifiedPath`]. Bails to `None` on any non-static step: a computed index
+/// (`alpha[[i]]`, `alpha[[1]]`), a call (`f()$x`), or a non-literal subscript.
+/// The spine must bottom out at a single `identifier` (the head). A `[["lit"]]`
+/// subscript (`subset2`) is `$`-equivalent and recorded as [`ExtractOp::Dollar`].
+pub fn build_qualified_path(lhs: Node, text: &str) -> Option<QualifiedPath> {
+    let mut rev_segments: Vec<Segment> = Vec::new();
+    let mut node = lhs;
+    loop {
+        match node.kind() {
+            "identifier" => {
+                rev_segments.reverse();
+                return Some(QualifiedPath {
+                    head: node_text(node, text).to_string(),
+                    segments: rev_segments,
+                });
+            }
+            "extract_operator" => {
+                let op = crate::extract_op::op_from_node(node.child_by_field_name("operator")?)?;
+                let rhs = node.child_by_field_name("rhs")?;
+                if rhs.kind() != "identifier" {
+                    return None;
+                }
+                rev_segments.push(Segment {
+                    name: node_text(rhs, text).to_string(),
+                    op,
+                });
+                node = node.child_by_field_name("lhs")?;
+            }
+            "subset2" => {
+                // `foo[["lit"]]` — `$`-equivalent. Reject computed/numeric indices.
+                let func = node.child_by_field_name("function")?;
+                let args = node.child_by_field_name("arguments")?;
+                let string_node = first_direct_string_argument(args)?;
+                let name = simple_string_literal_value(string_node, text)?;
+                rev_segments.push(Segment {
+                    name: name.to_string(),
+                    op: ExtractOp::Dollar,
+                });
+                node = func;
+            }
+            _ => return None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn member_assignment_candidate_from_extract(
     assignment: Node,
@@ -124,7 +224,7 @@ fn member_assignment_candidate_from_extract(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
 ) -> Option<Candidate> {
@@ -138,18 +238,22 @@ fn member_assignment_candidate_from_extract(
     ) {
         return None;
     }
-    let t_lhs = target.child_by_field_name("lhs")?;
     let t_rhs = target.child_by_field_name("rhs")?;
-    if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
+    if t_rhs.kind() != "identifier" {
         return None;
     }
     let member_name = node_text(t_rhs, text);
-    if node_text(t_lhs, text) != lhs_name
-        || rhs_name.is_some_and(|rhs_name| member_name != rhs_name)
-    {
+    if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
-    let lhs_range = node_range(t_lhs, col_mapper);
+    // The assignment target's container spine (everything left of the final
+    // `$`/`@`) must equal `path` (`head` + intermediate `segments`).
+    let t_lhs = target.child_by_field_name("lhs")?;
+    if !target_spine_is_path(t_lhs, text, path) {
+        return None;
+    }
+    let head_id = leftmost_identifier(t_lhs)?;
+    let lhs_range = node_range(head_id, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
@@ -160,6 +264,30 @@ fn member_assignment_candidate_from_extract(
     })
 }
 
+/// Does `target`'s left-spine equal `path` (`head` + `segments`)? `target` is
+/// the container half of an assignment target (`alpha$beta` in
+/// `alpha$beta$gamma <- ...`). Matching is by name and op per segment, via the
+/// shared [`build_qualified_path`] walker, so a `[["lit"]]` step matches a
+/// `Dollar` segment.
+fn target_spine_is_path(target: Node, text: &str, path: &QualifiedPath) -> bool {
+    match build_qualified_path(target, text) {
+        Some(actual) => actual.head == path.head && actual.segments == path.segments,
+        None => false,
+    }
+}
+
+/// Leftmost `identifier` on a node's left-spine (the head of an access chain).
+fn leftmost_identifier(mut node: Node) -> Option<Node> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "extract_operator" => node = node.child_by_field_name("lhs")?,
+            "subset" | "subset2" => node = node.child_by_field_name("function")?,
+            _ => return None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn member_assignment_candidate_from_string_subscript(
     assignment: Node,
@@ -167,7 +295,7 @@ fn member_assignment_candidate_from_string_subscript(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
 ) -> Option<Candidate> {
@@ -175,16 +303,17 @@ fn member_assignment_candidate_from_string_subscript(
         return None;
     }
     let t_lhs = target.child_by_field_name("function")?;
-    if t_lhs.kind() != "identifier" || node_text(t_lhs, text) != lhs_name {
+    if !target_spine_is_path(t_lhs, text, path) {
         return None;
     }
+    let head_id = leftmost_identifier(t_lhs)?;
     let args = target.child_by_field_name("arguments")?;
     let string_node = first_direct_string_argument(args)?;
     let member_name = simple_string_literal_value(string_node, text)?;
     if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
-    let lhs_range = node_range(t_lhs, col_mapper);
+    let lhs_range = node_range(head_id, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
@@ -286,8 +415,7 @@ pub fn resolve_qualified_member(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: &str,
     op: ExtractOp,
 ) -> Option<Location> {
@@ -295,8 +423,7 @@ pub fn resolve_qualified_member(
         state,
         uri,
         position,
-        lhs_node_kind,
-        lhs_name,
+        path,
         rhs_name,
         op,
         &DiagCancelToken::never(),
@@ -319,8 +446,7 @@ pub fn resolve_qualified_member_with_cancel(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: &str,
     op: ExtractOp,
     cancel: &DiagCancelToken,
@@ -329,8 +455,7 @@ pub fn resolve_qualified_member_with_cancel(
         state,
         uri,
         position,
-        lhs_node_kind,
-        lhs_name,
+        path,
         Some(rhs_name),
         op,
         cancel,
@@ -356,16 +481,14 @@ pub fn complete_qualified_members(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     op: ExtractOp,
 ) -> Vec<QualifiedMemberCompletion> {
     complete_qualified_members_with_cancel(
         state,
         uri,
         position,
-        lhs_node_kind,
-        lhs_name,
+        path,
         op,
         &DiagCancelToken::never(),
     )
@@ -380,20 +503,12 @@ pub fn complete_qualified_members_with_cancel(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Vec<QualifiedMemberCompletion> {
     let Some(batch) = collect_qualified_member_candidates_with_cancel(
-        state,
-        uri,
-        position,
-        lhs_node_kind,
-        lhs_name,
-        None,
-        op,
-        cancel,
+        state, uri, position, path, None, op, cancel,
     ) else {
         return Vec::new();
     };
@@ -457,15 +572,15 @@ fn collect_qualified_member_candidates_with_cancel(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Option<CandidateBatch> {
-    if lhs_node_kind != "identifier" || cancel.is_cancelled() {
+    if cancel.is_cancelled() {
         return None;
     }
+    let lhs_name = path.head.as_str();
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
     let scope = crate::handlers::get_cross_file_scope_with_cache(
@@ -488,6 +603,15 @@ fn collect_qualified_member_candidates_with_cancel(
 
     let defining_uri = symbol.source_uri.clone();
     let cursor_uri = uri.clone();
+
+    // Whole-value prefix (re)writes that can reset the members at `path`, each
+    // tagged with the file it lives in. Fed by the cursor-file walk (a
+    // reassignment the user typed) and the defining-file walk (the head's own
+    // file reassigning its value in place). The cutoff below maps each to a
+    // global, execution-ordered key so a within-file reassignment in a sourced
+    // file orders correctly against the cursor instead of collapsing to its
+    // `source()` line.
+    let mut prefix_write_sites: Vec<(Url, EffectPos)> = Vec::new();
 
     let mut defining_candidates: Vec<Candidate> = Vec::new();
     {
@@ -514,7 +638,7 @@ fn collect_qualified_member_candidates_with_cancel(
             &defining_text,
             &defining_col_mapper,
             &defining_uri,
-            lhs_name,
+            path,
             rhs_name,
             op,
             &mut defining_candidates,
@@ -528,7 +652,7 @@ fn collect_qualified_member_candidates_with_cancel(
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
-                lhs_name,
+                path,
                 rhs_name,
             ) {
                 defining_candidates.push(candidate);
@@ -541,11 +665,28 @@ fn collect_qualified_member_candidates_with_cancel(
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
-                lhs_name,
+                path,
                 rhs_name,
                 &mut defining_candidates,
             );
         }
+        // The defining file's own prefix writes feed the cutoff (its value can
+        // be reassigned in place), gated to the head's function scope so a
+        // function-local rewrite of a top-level value never resets it — the same
+        // identity the `fn_scope == symbol_fn_scope` retain below applies to
+        // member candidates.
+        collect_prefix_writes(
+            defining_tree.root_node(),
+            &defining_text,
+            &defining_col_mapper,
+            &defining_uri,
+            path,
+            rhs_name,
+            &mut defining_candidates,
+            symbol_fn_scope,
+            Some(&mut prefix_write_sites),
+            false,
+        );
 
         // Defining-file candidates are collected from the same tree that owns
         // the resolved `lhs_name` binding. The textual LHS match, same-function
@@ -596,10 +737,27 @@ fn collect_qualified_member_candidates_with_cancel(
                     &candidate_text,
                     &candidate_col_mapper,
                     candidate_uri,
-                    lhs_name,
+                    path,
                     rhs_name,
                     op,
                     &mut needs_validation,
+                    false,
+                );
+                let candidate_sites = if *candidate_uri == cursor_uri {
+                    Some(&mut prefix_write_sites)
+                } else {
+                    None
+                };
+                collect_prefix_writes(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    path,
+                    rhs_name,
+                    &mut needs_validation,
+                    None, // cross-file head is global: only top-level writes reset it
+                    candidate_sites,
                     false,
                 );
             } else {
@@ -628,10 +786,27 @@ fn collect_qualified_member_candidates_with_cancel(
                     &candidate_text,
                     &candidate_col_mapper,
                     candidate_uri,
-                    lhs_name,
+                    path,
                     rhs_name,
                     op,
                     &mut cross_file_candidates,
+                    true, // skip function bodies
+                );
+                let candidate_sites = if *candidate_uri == cursor_uri {
+                    Some(&mut prefix_write_sites)
+                } else {
+                    None
+                };
+                collect_prefix_writes(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    path,
+                    rhs_name,
+                    &mut cross_file_candidates,
+                    None, // cross-file head is global: only top-level writes reset it
+                    candidate_sites,
                     true, // skip function bodies
                 );
                 // Apply visibility cutoff.
@@ -690,6 +865,69 @@ fn collect_qualified_member_candidates_with_cancel(
 
     let mut all_candidates = defining_candidates;
     all_candidates.extend(cross_file_candidates);
+
+    // Establishing-site cutoff (reassignment semantics): a whole-value (re)write
+    // of an intermediate prefix replaces the members declared before it. Members
+    // at or after the latest such write survive; earlier ones (including those
+    // from the head binding's constructor, and those from upstream files sourced
+    // before the write) are dropped.
+    //
+    // Events and candidates live in different files, so comparing raw line
+    // numbers would conflate two coordinate systems (a cursor-file line 2 is not
+    // "after" a sourced helper's line 2). Map each to a global, execution-ordered
+    // key `(anchor_line, anchor_col, file_rank, within_line, within_col)`:
+    //
+    // - cursor-file event: anchors at its own position, `file_rank` 1.
+    // - directly-sourced file's event: anchors at the `source()` call site,
+    //   `file_rank` 0, with the within-file position breaking ties so that a
+    //   reassignment later *inside* a helper drops that helper's earlier members.
+    // - transitively-reached file: no anchor — excluded from the cutoff, and its
+    //   members are kept conservatively (over-offer, never wrong-variable).
+    //
+    // The establishing events are the collected prefix writes (cursor file +
+    // defining file) plus the `source()` that brings the head's defining file
+    // into scope — sourcing re-establishes the whole value, so it competes for
+    // the latest cutoff.
+    if !path.segments.is_empty() {
+        let source_pos = direct_source_positions(state, &cursor_uri, position);
+        type Key = (u32, u32, u8, u32, u32);
+        let global_key = |uri: &Url, line: u32, col: u32| -> Option<Key> {
+            if *uri == cursor_uri {
+                Some((line, col, 1, line, col))
+            } else {
+                source_pos.get(uri).map(|&(sl, sc)| (sl, sc, 0, line, col))
+            }
+        };
+        let cursor_key: Key = (
+            position.line,
+            position.character,
+            1,
+            position.line,
+            position.character,
+        );
+        // The head's defining file is (re)established where it is sourced, so a
+        // cursor-file write before that `source()` is superseded and one after it
+        // wins. A same-file head needs no event: the effect-after-definition
+        // retain already drops members above the head binding.
+        let head_establishment = (defining_uri != cursor_uri)
+            .then(|| global_key(&defining_uri, symbol.defined_line, symbol.defined_column))
+            .flatten();
+        let cutoff = prefix_write_sites
+            .iter()
+            .filter_map(|(uri, pos)| global_key(uri, pos.line, pos.utf16_column))
+            .chain(head_establishment)
+            .filter(|&k| k <= cursor_key)
+            .max();
+        if let Some(cutoff) = cutoff {
+            all_candidates.retain(|c| {
+                match global_key(&c.uri, c.effect.line, c.effect.utf16_column) {
+                    Some(k) => k >= cutoff,
+                    None => true,
+                }
+            });
+        }
+    }
+
     let contributor_distances = contributor_file_distances(
         &state.cross_file_graph,
         &cursor_uri,
@@ -705,6 +943,33 @@ fn collect_qualified_member_candidates_with_cancel(
         contributor_ranks,
         contributor_distances,
     })
+}
+
+/// Map each file directly sourced by `cursor_uri` to the latest `source()`
+/// call-site position in the cursor file that is at or before `cursor`. Used by
+/// the establishing-site cutoff to order an upstream candidate's contribution
+/// (its source point) against a cursor-file reassignment. Transitively-sourced
+/// files are absent (the cutoff keeps those conservatively).
+fn direct_source_positions(
+    state: &WorldState,
+    cursor_uri: &Url,
+    cursor: Position,
+) -> HashMap<Url, (u32, u32)> {
+    let mut map: HashMap<Url, (u32, u32)> = HashMap::new();
+    for edge in state.cross_file_graph.get_dependencies(cursor_uri) {
+        if let (Some(line), Some(col)) = (edge.call_site_line, edge.call_site_column)
+            && (line, col) <= (cursor.line, cursor.character)
+        {
+            map.entry(edge.to.clone())
+                .and_modify(|p| {
+                    if (line, col) > *p {
+                        *p = (line, col);
+                    }
+                })
+                .or_insert((line, col));
+        }
+    }
+    map
 }
 
 fn contributor_file_ranks(chain: &[Url]) -> HashMap<Url, usize> {
@@ -1124,12 +1389,22 @@ fn collect_member_assignments(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
     skip_functions: bool,
 ) {
+    for_each_binary_operator(root, skip_functions, |node| {
+        try_extract_member_assignment(node, text, col_mapper, file_uri, path, rhs_name, op, out);
+    });
+}
+
+/// Walk the tree, invoking `f` on every `binary_operator` node. Skips atomic
+/// leaf subtrees (and function bodies when `skip_functions`). Shared by the
+/// member-assignment and prefix-write discovery passes so they traverse
+/// identically.
+fn for_each_binary_operator<'a>(root: Node<'a>, skip_functions: bool, mut f: impl FnMut(Node<'a>)) {
     let mut cursor = root.walk();
     let mut descended = true; // treat root as just-entered
     loop {
@@ -1159,9 +1434,7 @@ fn collect_member_assignments(
             ) || (skip_functions && kind == "function_definition");
             if !skip {
                 if kind == "binary_operator" {
-                    try_extract_member_assignment(
-                        node, text, col_mapper, file_uri, lhs_name, rhs_name, op, out,
-                    );
+                    f(node);
                 }
                 // Descend into children if this node has any.
                 if cursor.goto_first_child() {
@@ -1189,29 +1462,22 @@ fn try_extract_member_assignment(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
 ) {
-    let Some(op_node) = node.child_by_field_name("operator") else {
+    let Some(target) = assignment_target(node, text) else {
         return;
     };
-    let op_text = node_text(op_node, text);
-    let target = match op_text {
-        "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
-        "->" | "->>" => node.child_by_field_name("rhs"),
-        _ => return,
-    };
-    let Some(target) = target else { return };
     if let Some(candidate) = member_assignment_candidate_from_extract(
-        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
+        node, target, text, col_mapper, file_uri, path, rhs_name, op,
     ) {
         out.push(candidate);
         return;
     }
     if let Some(candidate) = member_assignment_candidate_from_string_subscript(
-        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
+        node, target, text, col_mapper, file_uri, path, rhs_name, op,
     ) {
         out.push(candidate);
     }
@@ -1225,7 +1491,7 @@ fn collect_constructor_candidate(
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: &str,
 ) -> Option<Candidate> {
     let mut candidates = Vec::new();
@@ -1236,7 +1502,7 @@ fn collect_constructor_candidate(
         file_uri,
         defined_line,
         defined_column_utf16,
-        lhs_name,
+        path,
         Some(rhs_name),
         &mut candidates,
     );
@@ -1263,10 +1529,11 @@ fn collect_constructor_candidates(
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     out: &mut Vec<Candidate>,
 ) {
+    let lhs_name = path.head.as_str();
     // LSP columns are UTF-16 units; tree-sitter Point columns are byte offsets.
     // `defined_line` always points to a valid line in `text` (it comes from
     // the artifacts' Def event, which was emitted from a real tree-sitter
@@ -1292,26 +1559,65 @@ fn collect_constructor_candidates(
     let Some(value_node) = assignment_value_node(assignment, text) else {
         return;
     };
-
-    if value_node.kind() != "call" {
+    if !is_allowlisted_constructor_call(value_node, text) {
         return;
     }
-    let Some(func_node) = value_node.child_by_field_name("function") else {
-        return;
-    };
-    if func_node.kind() != "identifier" {
-        return;
-    }
-    let func_name = node_text(func_node, text);
-    if !CONSTRUCTOR_ALLOWLIST.contains(&func_name) {
-        return;
-    }
-
     let Some(args_node) = value_node.child_by_field_name("arguments") else {
         return;
     };
-    let mut walker = args_node.walk();
-    for child in args_node.children(&mut walker) {
+    // Descend the constructor following the intermediate segments, then
+    // enumerate the terminal named arguments.
+    let Some(terminal_args) = descend_constructor_args(args_node, text, &path.segments) else {
+        return;
+    };
+    // Constructor candidates become visible only after the defining assignment
+    // completes, so use the effect position for the shared symbol identity check.
+    let effect = EffectPos::from_node_end(assignment, col_mapper);
+    let lhs_pos = Position::new(effect.line, effect.utf16_column);
+    push_constructor_named_args(
+        terminal_args,
+        text,
+        col_mapper,
+        file_uri,
+        assignment,
+        lhs_pos,
+        rhs_name,
+        out,
+    );
+}
+
+/// Descend `args` following `segments` — each must be a named argument whose
+/// value is an allowlisted constructor call. Returns the terminal argument
+/// list, or `None` if any segment cannot be followed.
+fn descend_constructor_args<'a>(
+    mut args: Node<'a>,
+    text: &str,
+    segments: &[Segment],
+) -> Option<Node<'a>> {
+    for seg in segments {
+        let child_call = named_arg_constructor_value(args, text, &seg.name)?;
+        args = child_call.child_by_field_name("arguments")?;
+    }
+    Some(args)
+}
+
+/// Push one [`Candidate`] per named argument of `args` (filtered by `rhs_name`
+/// when provided), using the supplied assignment metadata and `lhs_pos`.
+#[allow(clippy::too_many_arguments)]
+fn push_constructor_named_args(
+    args: Node,
+    text: &str,
+    col_mapper: &ColMapper,
+    file_uri: &Url,
+    assignment: Node,
+    lhs_pos: Position,
+    rhs_name: Option<&str>,
+    out: &mut Vec<Candidate>,
+) {
+    let effect = EffectPos::from_node_end(assignment, col_mapper);
+    let fn_scope = enclosing_function_id(assignment);
+    let mut walker = args.walk();
+    for child in args.children(&mut walker) {
         if child.kind() != "argument" {
             continue;
         }
@@ -1325,41 +1631,163 @@ fn collect_constructor_candidates(
         if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
             continue;
         }
-        let name_range = node_range(name_node, col_mapper);
-        let effect = EffectPos::from_node_end(assignment, col_mapper);
-        // Constructor candidates become visible only after the defining
-        // assignment completes, so use the effect position for the shared
-        // symbol identity check.
-        let lhs_pos = Position::new(effect.line, effect.utf16_column);
         out.push(Candidate {
             name: member_name.to_string(),
             uri: file_uri.clone(),
             effect,
-            name_range,
-            fn_scope: enclosing_function_id(assignment),
+            name_range: node_range(name_node, col_mapper),
+            fn_scope,
             lhs_pos,
         });
     }
 }
 
+/// For an assignment `binary_operator`, return its target node (the LHS for
+/// `<-`/`=`/`<<-`, the RHS for `->`/`->>`). `None` for non-assignment operators.
+fn assignment_target<'a>(node: Node<'a>, text: &str) -> Option<Node<'a>> {
+    let op_node = node.child_by_field_name("operator")?;
+    match node_text(op_node, text) {
+        "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
+        "->" | "->>" => node.child_by_field_name("rhs"),
+        _ => None,
+    }
+}
+
+/// Is `node` a call to one of the allowlisted constructors (`list`, `c`,
+/// `data.frame`, …)?
+fn is_allowlisted_constructor_call(node: Node, text: &str) -> bool {
+    node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .filter(|func| func.kind() == "identifier")
+            .is_some_and(|func| CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)))
+}
+
+/// If `target`'s spine is a non-empty prefix of `path` (`head` + `segments[..k]`
+/// for some `1 <= k <= segments.len()`), return that prefix length `k`. Walks
+/// the spine once via [`build_qualified_path`].
+fn target_path_prefix_len(target: Node, text: &str, path: &QualifiedPath) -> Option<usize> {
+    let actual = build_qualified_path(target, text)?;
+    let k = actual.segments.len();
+    if actual.head == path.head
+        && (1..=path.segments.len()).contains(&k)
+        && actual.segments.as_slice() == &path.segments[..k]
+    {
+        Some(k)
+    } else {
+        None
+    }
+}
+
+/// Single walk over `root` handling whole-value writes to a prefix of `path`
+/// longer than the head (`alpha$beta <- ...` for path `[alpha, beta, ...]`):
+///
+/// - **Members** — when the write's RHS is an allowlisted constructor, descend
+///   it to the full path and push one candidate per terminal named argument.
+/// - **Establishing sites** — when `establishing_sites` is `Some`, record this
+///   write's `(file, effect position)` regardless of its RHS shape (constructor,
+///   opaque call, or bare value), but only when the write executes in
+///   `live_scope` (its nearest enclosing function id equals `live_scope`). A
+///   write inside some *other* function targets that function's local copy and
+///   cannot reset the value visible at the cursor, so it must not become a
+///   cutoff — the same identity the `fn_scope == symbol_fn_scope` retain applies
+///   to member candidates. Pass `live_scope = None` for cross-file walks (the
+///   head is a global; only top-level writes reset it).
+#[allow(clippy::too_many_arguments)]
+fn collect_prefix_writes(
+    root: Node,
+    text: &str,
+    col_mapper: &ColMapper,
+    file_uri: &Url,
+    path: &QualifiedPath,
+    rhs_name: Option<&str>,
+    out: &mut Vec<Candidate>,
+    live_scope: FunctionScopeId,
+    mut establishing_sites: Option<&mut Vec<(Url, EffectPos)>>,
+    skip_functions: bool,
+) {
+    if path.segments.is_empty() {
+        return;
+    }
+    for_each_binary_operator(root, skip_functions, |node| {
+        let Some(target) = assignment_target(node, text) else {
+            return;
+        };
+        let Some(k) = target_path_prefix_len(target, text, path) else {
+            return;
+        };
+        // A whole-value write to a prefix of `path`, in the head's scope, is an
+        // establishing site. Writes in a nested/unrelated function scope modify a
+        // local copy and are skipped.
+        if let Some(sites) = establishing_sites.as_deref_mut()
+            && enclosing_function_id(node) == live_scope
+        {
+            sites.push((file_uri.clone(), EffectPos::from_node_end(node, col_mapper)));
+        }
+        // A constructor RHS additionally contributes member candidates.
+        let Some(value) = assignment_value_node(node, text) else {
+            return;
+        };
+        if !is_allowlisted_constructor_call(value, text) {
+            return;
+        }
+        let Some(ctor_args) = value.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some(terminal_args) = descend_constructor_args(ctor_args, text, &path.segments[k..])
+        else {
+            return;
+        };
+        // Use the head identifier position so cross-file validation and region
+        // partitioning treat these like member-assignment candidates.
+        let Some(head_id) = leftmost_identifier(target) else {
+            return;
+        };
+        let lhs_pos = node_range(head_id, col_mapper).start;
+        push_constructor_named_args(
+            terminal_args,
+            text,
+            col_mapper,
+            file_uri,
+            node,
+            lhs_pos,
+            rhs_name,
+            out,
+        );
+    });
+}
+
+/// In `args` (a constructor call's argument list), find a named argument
+/// `name = <call>` whose value is a call to an allowlisted constructor, and
+/// return that call node. Used to descend nested constructor literals along a
+/// [`QualifiedPath`].
+fn named_arg_constructor_value<'a>(args: Node<'a>, text: &str, name: &str) -> Option<Node<'a>> {
+    let mut walker = args.walk();
+    for child in args.children(&mut walker) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        if name_node.kind() != "identifier" || node_text(name_node, text) != name {
+            continue;
+        }
+        let value = child.child_by_field_name("value")?;
+        return is_allowlisted_constructor_call(value, text).then_some(value);
+    }
+    None
+}
+
 fn ascend_to_assignment_for<'a>(start: Node<'a>, text: &str, lhs_name: &str) -> Option<Node<'a>> {
     let mut current = start;
     loop {
-        if current.kind() == "binary_operator" {
-            let op_text = current
-                .child_by_field_name("operator")
-                .map(|n| node_text(n, text));
-            let target = match op_text {
-                Some("<-") | Some("=") | Some("<<-") => current.child_by_field_name("lhs"),
-                Some("->") | Some("->>") => current.child_by_field_name("rhs"),
-                _ => None,
-            };
-            if let Some(t) = target
-                && t.kind() == "identifier"
-                && node_text(t, text) == lhs_name
-            {
-                return Some(current);
-            }
+        if current.kind() == "binary_operator"
+            && let Some(target) = assignment_target(current, text)
+            && target.kind() == "identifier"
+            && node_text(target, text) == lhs_name
+        {
+            return Some(current);
         }
         current = current.parent()?;
     }
@@ -1462,23 +1890,399 @@ mod tests {
         }
     }
 
+    fn parse_r(text: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .expect("load tree-sitter-r");
+        parser.parse(text, None).expect("parse")
+    }
+
+    /// Find the widest `extract_operator`/`subset2`/`identifier` node whose byte
+    /// range ends at `end_byte` (the LHS of a trailing access in these tests).
+    fn lhs_node_ending_at(tree: &tree_sitter::Tree, end_byte: usize) -> tree_sitter::Node<'_> {
+        fn rec<'a>(n: tree_sitter::Node<'a>, end: usize, best: &mut Option<tree_sitter::Node<'a>>) {
+            if n.end_byte() == end
+                && matches!(n.kind(), "extract_operator" | "subset2" | "identifier")
+            {
+                match best {
+                    None => *best = Some(n),
+                    Some(b) if n.start_byte() < b.start_byte() => *best = Some(n),
+                    _ => {}
+                }
+            }
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                rec(ch, end, best);
+            }
+        }
+        let mut best = None;
+        rec(tree.root_node(), end_byte, &mut best);
+        best.expect("no lhs node ends at end_byte")
+    }
+
+    #[test]
+    fn build_path_single_identifier() {
+        let text = "alpha";
+        let tree = parse_r(text);
+        let lhs = lhs_node_ending_at(&tree, text.len());
+        let path = super::build_qualified_path(lhs, text).expect("path");
+        assert_eq!(path.head, "alpha");
+        assert!(path.segments.is_empty());
+    }
+
+    #[test]
+    fn build_path_two_dollar_segments() {
+        let text = "alpha$beta";
+        let tree = parse_r(text);
+        let lhs = lhs_node_ending_at(&tree, text.len());
+        let path = super::build_qualified_path(lhs, text).expect("path");
+        assert_eq!(path.head, "alpha");
+        assert_eq!(path.segments.len(), 1);
+        assert_eq!(path.segments[0].name, "beta");
+        assert_eq!(path.segments[0].op, crate::extract_op::ExtractOp::Dollar);
+    }
+
+    #[test]
+    fn build_path_mixed_dollar_at_and_subscript() {
+        let text = "alpha@beta[[\"gamma\"]]";
+        let tree = parse_r(text);
+        let lhs = lhs_node_ending_at(&tree, text.len());
+        let path = super::build_qualified_path(lhs, text).expect("path");
+        assert_eq!(path.head, "alpha");
+        let names: Vec<_> = path.segments.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["beta", "gamma"]);
+        assert_eq!(path.segments[0].op, crate::extract_op::ExtractOp::At);
+        // `[["lit"]]` is `$`-equivalent for member purposes.
+        assert_eq!(path.segments[1].op, crate::extract_op::ExtractOp::Dollar);
+    }
+
+    #[test]
+    fn build_path_bails_on_non_static_segment() {
+        for text in ["f()$x", "alpha[[i]]$x", "alpha[[1]]$x"] {
+            let tree = parse_r(text);
+            let lhs = lhs_node_ending_at(&tree, text.len());
+            assert!(
+                super::build_qualified_path(lhs, text).is_none(),
+                "expected None for {text:?}"
+            );
+        }
+    }
+
+    fn dollar_path(head: &str, segments: &[&str]) -> super::QualifiedPath {
+        super::QualifiedPath {
+            head: head.to_string(),
+            segments: segments
+                .iter()
+                .map(|s| super::Segment {
+                    name: s.to_string(),
+                    op: crate::extract_op::ExtractOp::Dollar,
+                })
+                .collect(),
+        }
+    }
+
     fn completion_names(
         state: &WorldState,
         uri: &Url,
         position: Position,
         lhs_name: &str,
     ) -> Vec<String> {
+        completion_path_names(state, uri, position, lhs_name, &[])
+    }
+
+    fn completion_path_names(
+        state: &WorldState,
+        uri: &Url,
+        position: Position,
+        head: &str,
+        segments: &[&str],
+    ) -> Vec<String> {
+        let path = dollar_path(head, segments);
         super::complete_qualified_members(
             state,
             uri,
             position,
-            "identifier",
-            lhs_name,
+            &path,
             crate::extract_op::ExtractOp::Dollar,
         )
         .into_iter()
         .map(|completion| completion.name)
         .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn nested_assignment_members_depth2() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha$beta <- list()
+alpha$beta$gamma <- 1
+alpha$beta$delta <- 2
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///n.R", code);
+        // Cursor on the trailing `alpha$beta$` line (0-based line 4, after `$`).
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(4, 11), "alpha", &["beta"]);
+        names.sort();
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_constructor_descent_depth2() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = 1, delta = 2))
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///c.R", code);
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(1, 11), "alpha", &["beta"]);
+        names.sort();
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_constructor_descent_depth3() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = list(epsilon = 1, zeta = 2)))
+alpha$beta$gamma$
+";
+        let uri = add_indexed_doc(&mut state, "file:///c3.R", code);
+        let mut names = completion_path_names(
+            &state,
+            &uri,
+            Position::new(1, 17),
+            "alpha",
+            &["beta", "gamma"],
+        );
+        names.sort();
+        assert_eq!(names, vec!["epsilon".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn intermediate_constructor_assignment() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha$beta <- list(gamma = 1, delta = 2)
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///i.R", code);
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(2, 11), "alpha", &["beta"]);
+        names.sort();
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn reassignment_replaces_earlier_members_same_file() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = 1))
+alpha$beta <- list(delta = 2)
+alpha$beta$epsilon <- 3
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///r.R", code);
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(3, 11), "alpha", &["beta"]);
+        names.sort();
+        // gamma was replaced by the whole-value rewrite on line 1; delta + epsilon survive.
+        assert_eq!(names, vec!["delta".to_string(), "epsilon".to_string()]);
+    }
+
+    #[test]
+    fn extension_before_reassignment_is_excluded() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list())
+alpha$beta$old <- 1
+alpha$beta <- list(fresh = 2)
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///r2.R", code);
+        let names = completion_path_names(&state, &uri, Position::new(3, 11), "alpha", &["beta"]);
+        // `old` was added before the rewrite on line 2 → excluded. Only `fresh`.
+        assert_eq!(names, vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn empty_reassignment_resets_members() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha$beta$gamma <- 1
+alpha$beta <- list()
+alpha$beta$delta <- 2
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///r3.R", code);
+        let names = completion_path_names(&state, &uri, Position::new(4, 11), "alpha", &["beta"]);
+        // The empty `alpha$beta <- list()` on line 2 resets; only the later `delta`.
+        assert_eq!(names, vec!["delta".to_string()]);
+    }
+
+    #[test]
+    fn function_local_rewrite_does_not_drop_top_level_members() {
+        // A whole-value rewrite of `alpha$beta` *inside a function body* targets
+        // that function's local copy — it must not be treated as an establishing
+        // site for the top-level `alpha$beta`, which still has `gamma`.
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = 1))
+f <- function() {
+  alpha$beta <- list(delta = 2)
+}
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///fl.R", code);
+        let names = completion_path_names(&state, &uri, Position::new(4, 11), "alpha", &["beta"]);
+        // The function-local rewrite (and its `delta`) are out of scope; `gamma`
+        // survives — it was NOT dropped by a spurious in-function cutoff.
+        assert_eq!(names, vec!["gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_below_cursor_not_offered() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list())
+alpha$beta$gamma <- 1
+alpha$beta$
+alpha$beta$delta <- 2
+";
+        let uri = add_indexed_doc(&mut state, "file:///p.R", code);
+        // Cursor on line 2; `delta` is assigned on line 3 (below) and must not appear.
+        let names = completion_path_names(&state, &uri, Position::new(2, 11), "alpha", &["beta"]);
+        assert_eq!(names, vec!["gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_cross_file() {
+        // `alpha` + its nested structure declared in helpers.R; extended in main.R
+        // after the source() call.
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+alpha$beta$delta <- 2
+alpha$beta$
+";
+        let helpers_code = "alpha <- list(beta = list(gamma = 1))\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let mut names =
+            completion_path_names(&state, &main_uri, Position::new(2, 11), "alpha", &["beta"]);
+        names.sort();
+        // gamma from helpers.R (the establishing site) + delta extended in main.R.
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_cross_file_reassignment_drops_upstream() {
+        // main.R sources helpers.R (which declares alpha$beta with gamma), then
+        // WHOLLY reassigns alpha$beta. The upstream gamma was replaced and must
+        // not be offered — otherwise completion and go-to-definition would point
+        // at a member that no longer exists.
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+alpha$beta <- list(delta = 2)
+alpha$beta$
+";
+        let helpers_code = "alpha <- list(beta = list(gamma = 1))\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let names =
+            completion_path_names(&state, &main_uri, Position::new(2, 11), "alpha", &["beta"]);
+        assert_eq!(names, vec!["delta".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_cross_file_reassignment_before_source_keeps_upstream() {
+        // The reassignment is BEFORE the source() that brings alpha into scope,
+        // so the source re-establishes the upstream value: gamma survives.
+        let mut state = fresh_state();
+        let main_code = "\
+alpha$beta <- list(delta = 2)
+source(\"helpers.R\")
+alpha$beta$
+";
+        let helpers_code = "alpha <- list(beta = list(gamma = 1))\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let names =
+            completion_path_names(&state, &main_uri, Position::new(2, 11), "alpha", &["beta"]);
+        // gamma (sourced after the reassignment) is kept; delta predates the
+        // source so the cursor-file cutoff drops it.
+        assert_eq!(names, vec!["gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_within_helper_reassignment_drops_earlier() {
+        // The reassignment lives entirely *inside* the sourced helper: it first
+        // declares alpha$beta with `stale`, then wholly rewrites alpha$beta to
+        // `fresh`. The cursor file only sources it. Ordering both helper events
+        // by the same source anchor would keep `stale`; the within-file position
+        // must break the tie so the helper-local rewrite drops it.
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+alpha$beta$
+";
+        let helpers_code = "\
+alpha <- list(beta = list(stale = 0))
+alpha$beta <- list(fresh = 2)
+";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let names =
+            completion_path_names(&state, &main_uri, Position::new(1, 11), "alpha", &["beta"]);
+        assert_eq!(names, vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn non_static_chain_yields_nothing() {
+        let mut state = fresh_state();
+        let code = "alpha <- list(beta = list(gamma = 1))\n";
+        let uri = add_indexed_doc(&mut state, "file:///b.R", code);
+        // A head that does not resolve in scope yields no members (the resolver
+        // never falls back to a free-identifier lookup).
+        let names = completion_path_names(&state, &uri, Position::new(0, 0), "nonexistent", &["x"]);
+        assert!(names.is_empty(), "expected no members, got {names:?}");
+    }
+
+    #[test]
+    fn mixed_dollar_at_chain_depth2() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha@beta$gamma <- 1
+alpha@beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///m.R", code);
+        // Container path is `alpha@beta` (segment via `@`); completing its `$`
+        // members must find `gamma` from the mixed-chain assignment.
+        let path = super::QualifiedPath {
+            head: "alpha".to_string(),
+            segments: vec![super::Segment {
+                name: "beta".to_string(),
+                op: crate::extract_op::ExtractOp::At,
+            }],
+        };
+        let names: Vec<String> = super::complete_qualified_members(
+            &state,
+            &uri,
+            Position::new(2, 11),
+            &path,
+            crate::extract_op::ExtractOp::Dollar,
+        )
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+        assert_eq!(names, vec!["gamma".to_string()]);
     }
 
     /// Perf reproducer: scales the number of `df$col_K <- ...` assignments and
@@ -1501,14 +2305,14 @@ mod tests {
 
             let mut state = fresh_state();
             let uri = add_indexed_doc(&mut state, "file:///perf.R", &code);
+            let df_path = dollar_path("df", &[]);
 
             // Warm-up to populate any one-shot caches.
             let _ = super::complete_qualified_members(
                 &state,
                 &uri,
                 Position::new(cursor_line, 3),
-                "identifier",
-                "df",
+                &df_path,
                 crate::extract_op::ExtractOp::Dollar,
             );
 
@@ -1519,8 +2323,7 @@ mod tests {
                     &state,
                     &uri,
                     Position::new(cursor_line, 3),
-                    "identifier",
-                    "df",
+                    &df_path,
                     crate::extract_op::ExtractOp::Dollar,
                 );
                 *s = start.elapsed();
@@ -1599,12 +2402,12 @@ mod tests {
             }
 
             // Warm-up.
+            let df_path = dollar_path("df", &[]);
             let _ = super::complete_qualified_members(
                 &state,
                 &main_uri,
                 Position::new(cursor_line, 3),
-                "identifier",
-                "df",
+                &df_path,
                 crate::extract_op::ExtractOp::Dollar,
             );
 
@@ -1615,8 +2418,7 @@ mod tests {
                     &state,
                     &main_uri,
                     Position::new(cursor_line, 3),
-                    "identifier",
-                    "df",
+                    &df_path,
                     crate::extract_op::ExtractOp::Dollar,
                 );
                 *s = start.elapsed();
@@ -1824,16 +2626,47 @@ foo$
         assert!(goto_definition(&state, &uri, pos).is_none());
     }
 
-    /// Chained access `foo$bar$baz` returns None (Step-1 limitation,
-    /// documented in the spec).
+    /// Chained access `foo$bar$baz` resolves to the nested constructor member
+    /// (Step-2: the Step-1 "returns None" limitation is lifted).
     #[test]
-    fn chained_access_returns_none() {
+    fn chained_access_resolves_nested_member() {
         let mut state = fresh_state();
         let code = "foo <- list(bar = list(baz = 1))\nuse(foo$bar$baz)\n";
         let uri = add_doc(&mut state, "file:///t.R", code);
         // cursor on `baz`
         let pos = Position::new(1, 13);
-        assert!(goto_definition(&state, &uri, pos).is_none());
+        let l = loc(goto_definition(&state, &uri, pos));
+        assert_eq!(l.range.start.line, 0); // the `baz = 1` constructor argument
+    }
+
+    #[test]
+    fn goto_def_nested_member_jumps_to_assignment() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list())
+alpha$beta$gamma <- 1
+x <- alpha$beta$gamma
+";
+        let uri = add_doc(&mut state, "file:///g.R", code);
+        // cursor on `gamma` in the use on line 2
+        let l = loc(goto_definition(&state, &uri, Position::new(2, 17)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 1); // the `alpha$beta$gamma <- 1` line
+    }
+
+    #[test]
+    fn goto_def_nested_no_false_positive() {
+        let mut state = fresh_state();
+        let code = "\
+gamma <- 99
+alpha <- list(beta = list(gamma = 1))
+y <- alpha$beta$gamma
+";
+        let uri = add_doc(&mut state, "file:///g2.R", code);
+        // `gamma` here must resolve to the constructor member (line 1), not the
+        // top-level `gamma <- 99` on line 0.
+        let l = loc(goto_definition(&state, &uri, Position::new(2, 17)));
+        assert_eq!(l.range.start.line, 1);
     }
 
     /// LHS-shape gate: parenthesized LHS → None.
@@ -2089,8 +2922,7 @@ foo$
             &state,
             &main_uri,
             Position::new(2, 4),
-            "identifier",
-            "foo",
+            &dollar_path("foo", &[]),
             crate::extract_op::ExtractOp::Dollar,
         );
 

@@ -50,6 +50,8 @@ When you cmd-click the RHS of `$` or `@` (e.g. `config$host`), Raven resolves it
 - Member assignments: `config$host <- …`, `config[["host"]] <- …` (both apply to `$`); `object@slot <- …` (applies to `@`)
 - Constructor literals: named arguments in `list()`, `data.frame()`, `tibble()`, `c()`, S4 `new()`, etc.
 
+Nested members resolve against the full container path at any depth — cmd-clicking `gamma` in `alpha$beta$gamma` resolves it as a member of `alpha$beta` (descending nested constructor literals or matching `alpha$beta$gamma <- …` assignments), never as the free variable `gamma`. `$`, `@`, and `[["lit"]]` segments may be mixed in the chain.
+
 If multiple candidates exist across the dependency graph, Raven tie-breaks by graph distance (closer wins). Cmd-clicking on `$` or `@` itself (the punctuation) does nothing — only identifiers are navigable.
 
 For the full scope rules, see [$ and @ Member Resolution](cross-file.md#-and--member-resolution) in the cross-file doc.

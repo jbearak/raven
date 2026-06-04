@@ -71,6 +71,27 @@ Members are discovered from:
 - Assignments: `foo$bar <- …`, `foo[["bar"]] <- …`
 - Constructor literals: named arguments in `list()`, `data.frame()`, `tibble()`, etc.
 
+Member completion follows nested access at any depth, and `$`, `@`, and
+`[["lit"]]` segments are interchangeable in the chain:
+
+```r
+config <- list(db = list(host = "localhost", port = 8080))
+config$db$              # Offers: host, port
+config[["db"]]$         # Same — `[["db"]]` is equivalent to `$db`
+```
+
+Members reflect the value that is live at the cursor, so a whole reassignment of
+an intermediate value replaces its earlier members:
+
+```r
+config$db <- list(url = "…")   # whole-value rewrite
+config$db$                     # Offers: url (earlier host/port are replaced)
+```
+
+Because the container is resolved as a path, an unrelated top-level variable
+that happens to share an intermediate name (a `db` elsewhere) never leaks its
+members into `config$db$`.
+
 ## Cross-File Completions
 
 Symbols from sourced files appear with their source file indicated:

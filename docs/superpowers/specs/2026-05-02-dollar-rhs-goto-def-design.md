@@ -44,7 +44,7 @@ Out of scope for Step 1:
 - Aliasing (`foo <- bar; foo$x`).
 - Function-return inference (`foo <- make_thing()`).
 - Package-data introspection (`pkg::dataset$col`).
-- Chained access (`foo$bar$baz` — returns `None`).
+- Chained access (`foo$bar$baz` — returns `None`). **Implemented in Step 2 — see `2026-06-04-nested-dollar-member-completion-design.md`.**
 - Hover / completion / find-references for qualified members (go-to-def only).
 
 ## Behavior contract
