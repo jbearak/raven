@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, Url};
 use tree_sitter::Tree;
 
+use crate::chunks::ChunkKind;
 use crate::cross_file::scope::ScopeArtifacts;
 use crate::cross_file::types::CrossFileMetadata;
 
@@ -83,24 +84,86 @@ pub struct DocumentStoreMetrics {
 /// Contains all data needed for LSP operations on an open document,
 /// including parsed AST, cross-file metadata, and scope artifacts.
 ///
+/// # Raw content vs. analysis text (Rmd/Quarto invariant)
+///
+/// Like [`crate::state::Document`], an open `DocumentState` keeps two views of
+/// its content distinct for R Markdown / Quarto (`.Rmd` / `.qmd`) documents:
+///
+/// * [`contents`](DocumentState::contents) is **always** the verbatim raw
+///   document — `ContentProvider::get_content` returns it unchanged, so raw
+///   consumers (snippets, find-references text scans for non-R languages) see
+///   the literal source.
+/// * [`tree`](DocumentState::tree), [`metadata`](DocumentState::metadata),
+///   [`artifacts`](DocumentState::artifacts), and
+///   [`loaded_packages`](DocumentState::loaded_packages) are derived from the
+///   **masked analysis text** ([`chunks::mask_to_r`](crate::chunks::mask_to_r))
+///   for Rmd docs, so the R parser and scope engine see only real R chunk
+///   bodies — never prose or YAML. Byte offsets in `tree` index into the masked
+///   analysis text, exposed by [`analysis_text()`](DocumentState::analysis_text);
+///   slicing `contents` with them mis-slices.
+///
+/// For plain R / JAGS / Stan the analysis text equals the raw text and the
+/// distinction collapses. `mask_to_r` is geometry-preserving, so `Position` /
+/// `Range` (line + UTF-16 column) values are interchangeable across the two
+/// views — only *byte* offsets are view-specific. Anything pairing `tree` with
+/// a text MUST use [`analysis_text()`](DocumentState::analysis_text).
+///
+/// Whether a document is masked is fixed by its
+/// [`chunk_kind`](DocumentState::chunk_kind), determined at open time from the
+/// editor's `languageId`-then-URI classification — **not** re-derived by path.
+/// Untitled `.Rmd`/`.qmd` buffers (`untitled:Untitled-1`, languageId
+/// `"rmd"`/`"quarto"`) have no file extension, so re-classifying by path alone
+/// would parse them RAW and leak prose into find-references / workspace-symbol
+/// (#343). Saved `.Rmd` files classify identically either way.
+///
 /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5**
 pub struct DocumentState {
     /// Document URI
     pub uri: Url,
     /// LSP document version
     pub version: i32,
-    /// File content as a rope for efficient editing
+    /// How this document is classified for chunk masking, fixed at open time
+    /// from the editor's `languageId`-then-URI classification
+    /// ([`chunks::classify_chunk_document_for`](crate::chunks::classify_chunk_document_for)).
+    /// [`ChunkKind::Rmd`] means the analysis-derived fields below are masked;
+    /// [`ChunkKind::R`] means they equal the raw view. Preserved across updates
+    /// (a document's language never changes mid-session).
+    pub chunk_kind: ChunkKind,
+    /// File content as a rope for efficient editing (RAW, verbatim source)
     pub contents: Rope,
-    /// Parsed AST (None if parsing failed)
+    /// Masked analysis text for Rmd/Quarto documents
+    /// ([`chunks::mask_to_r`](crate::chunks::mask_to_r) of `contents`), `None`
+    /// for plain R / JAGS / Stan. The `tree`/`metadata`/`artifacts` are derived
+    /// from this when present. Exposed read-only via
+    /// [`analysis_text()`](DocumentState::analysis_text).
+    masked_text: Option<String>,
+    /// Parsed AST (None if parsing failed). Parsed from the analysis text
+    /// (masked for Rmd, raw otherwise).
     pub tree: Option<Tree>,
-    /// Packages loaded via library() calls
+    /// Packages loaded via library() calls (from chunk bodies for Rmd)
     pub loaded_packages: Vec<String>,
-    /// Cross-file metadata (source() calls, directives)
+    /// Cross-file metadata (source() calls, directives; chunk-derived for Rmd)
     pub metadata: Arc<CrossFileMetadata>,
-    /// Scope artifacts (exported symbols, timeline)
+    /// Scope artifacts (exported symbols, timeline; chunk-derived for Rmd)
     pub artifacts: Arc<ScopeArtifacts>,
     /// Internal revision counter for change detection
     pub revision: u64,
+}
+
+impl DocumentState {
+    /// The text the [`tree`](DocumentState::tree) was parsed from: the masked
+    /// analysis text for Rmd/Quarto documents, the raw text otherwise.
+    ///
+    /// Use this — never `contents.to_string()` — whenever you slice the
+    /// document by byte offsets taken from `tree`. For plain R / JAGS / Stan
+    /// this equals the raw text, so the choice is behavior-neutral there. See
+    /// the [`DocumentState`] type docs for the full raw-vs-analysis invariant.
+    pub fn analysis_text(&self) -> String {
+        match &self.masked_text {
+            Some(masked) => masked.clone(),
+            None => self.contents.to_string(),
+        }
+    }
 }
 
 impl DocumentState {
@@ -111,6 +174,10 @@ impl DocumentState {
 
         // Rope content (approximate: chars * average bytes per char)
         let content_size = self.contents.len_bytes();
+
+        // Masked analysis text (Rmd/Quarto only): a near-full second copy of
+        // the document, so it must count toward the eviction budget.
+        let masked_size = self.masked_text.as_ref().map_or(0, |s| s.len());
 
         // Tree size (conservative estimate based on typical AST overhead)
         let tree_size = self.tree.as_ref().map(|_| content_size).unwrap_or(0);
@@ -132,7 +199,13 @@ impl DocumentState {
             + self.artifacts.exported_interface.len() * 128  // Approximate per-symbol size
             + self.artifacts.timeline.len() * 64;
 
-        base_size + content_size + tree_size + packages_size + metadata_size + artifacts_size
+        base_size
+            + content_size
+            + masked_size
+            + tree_size
+            + packages_size
+            + metadata_size
+            + artifacts_size
     }
 }
 
@@ -281,29 +354,26 @@ impl DocumentStore {
     /// * `version` - LSP document version
     pub async fn open(&mut self, uri: Url, content: &str, version: i32) {
         self.mark_update_started(&uri);
-        // Parse content
+        // Parse content. `contents` keeps the RAW source; tree/metadata/
+        // artifacts derive from the masked analysis text for Rmd/Quarto (#343).
+        // No `languageId` here, so classify by path — this entry point is for
+        // callers (tests, internal) that always have a real file extension;
+        // the LSP path uses `open_with_metadata` with the editor's languageId.
+        let chunk_kind = crate::chunks::classify_chunk_document(uri.path());
         let contents = Rope::from_str(content);
-        let tree = Self::parse_content(content);
-        let loaded_packages = Self::extract_packages(&tree, content);
-        let metadata = Arc::new(crate::cross_file::extract_metadata(content));
-        let artifacts = Arc::new(if let Some(ref tree) = tree {
-            // Use compute_artifacts_with_metadata to include declared symbols from directives
-            // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            crate::cross_file::scope::compute_artifacts_with_metadata(
-                &uri,
-                tree,
-                content,
-                Some(metadata.as_ref()),
-            )
-        } else {
-            ScopeArtifacts::default()
-        });
+        let metadata = Arc::new(crate::cross_file::extract_metadata_for_path(
+            uri.path(),
+            content,
+        ));
+        let (masked_text, tree, loaded_packages, artifacts) =
+            Self::compute_derived(&uri, chunk_kind, content, metadata.as_ref(), None);
 
         let state = DocumentState {
             uri: uri.clone(),
             version,
+            chunk_kind,
             contents,
+            masked_text,
             tree,
             loaded_packages,
             metadata,
@@ -358,40 +428,39 @@ impl DocumentStore {
         self.signal_update_complete(&uri);
     }
 
-    /// Open a document with pre-enriched metadata
+    /// Open a document with pre-enriched metadata and an explicit chunk kind.
     ///
-    /// Like `open`, but uses the provided metadata instead of extracting it.
-    /// Use this when metadata has been enriched with inherited_working_directory.
+    /// Like `open`, but uses the provided metadata instead of extracting it,
+    /// and takes the editor-supplied `chunk_kind` (from
+    /// [`chunks::classify_chunk_document_for`](crate::chunks::classify_chunk_document_for)
+    /// on the `did_open` `languageId`-then-URI) rather than re-classifying by
+    /// path. This is the LSP open path; it is the only place that can mask
+    /// untitled `.Rmd`/`.qmd` buffers correctly (#343). Use this when metadata
+    /// has been enriched with inherited_working_directory.
     pub async fn open_with_metadata(
         &mut self,
         uri: Url,
         content: &str,
         version: i32,
+        chunk_kind: ChunkKind,
         metadata: CrossFileMetadata,
     ) {
         self.mark_update_started(&uri);
+        // `contents` keeps the RAW source; tree/artifacts derive from the
+        // masked analysis text for Rmd/Quarto. The caller-supplied `metadata`
+        // is used as-is — backend.rs already extracts it from the masked
+        // analysis text for Rmd docs (#343).
         let contents = Rope::from_str(content);
-        let tree = Self::parse_content(content);
-        let loaded_packages = Self::extract_packages(&tree, content);
         let metadata = Arc::new(metadata);
-        let artifacts = Arc::new(if let Some(ref tree) = tree {
-            // Use compute_artifacts_with_metadata to include declared symbols from directives
-            // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            crate::cross_file::scope::compute_artifacts_with_metadata(
-                &uri,
-                tree,
-                content,
-                Some(metadata.as_ref()),
-            )
-        } else {
-            ScopeArtifacts::default()
-        });
+        let (masked_text, tree, loaded_packages, artifacts) =
+            Self::compute_derived(&uri, chunk_kind, content, metadata.as_ref(), None);
 
         let state = DocumentState {
             uri: uri.clone(),
             version,
+            chunk_kind,
             contents,
+            masked_text,
             tree,
             loaded_packages,
             metadata,
@@ -459,24 +528,26 @@ impl DocumentStore {
             state.version = version;
             state.revision += 1;
 
-            // Reparse and recompute derived data
+            // Reparse and recompute derived data. `contents` stays RAW;
+            // tree/metadata/artifacts derive from the masked analysis text for
+            // Rmd/Quarto (#343). The chunk kind is fixed at open and preserved
+            // here — a document's language never changes mid-session — so an
+            // untitled Rmd buffer keeps masking across edits. Path-based
+            // metadata extraction is acceptable for plain R; for Rmd the
+            // `update_with_metadata` variant supplies masked-derived metadata.
+            let chunk_kind = state.chunk_kind;
             let content = state.contents.to_string();
-            state.tree = Self::parse_content(&content);
-            state.loaded_packages = Self::extract_packages(&state.tree, &content);
-            state.metadata = Arc::new(crate::cross_file::extract_metadata(&content));
-            state.artifacts = Arc::new(if let Some(ref tree) = state.tree {
-                // Use compute_artifacts_with_metadata to include declared symbols from directives
-                // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
-                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                crate::cross_file::scope::compute_artifacts_with_metadata(
-                    uri,
-                    tree,
-                    &content,
-                    Some(state.metadata.as_ref()),
-                )
-            } else {
-                ScopeArtifacts::default()
-            });
+            let metadata = Arc::new(crate::cross_file::extract_metadata_for_path(
+                uri.path(),
+                &content,
+            ));
+            let (masked_text, tree, loaded_packages, artifacts) =
+                Self::compute_derived(uri, chunk_kind, &content, metadata.as_ref(), None);
+            state.masked_text = masked_text;
+            state.tree = tree;
+            state.loaded_packages = loaded_packages;
+            state.metadata = metadata;
+            state.artifacts = artifacts;
 
             // Update access order
             self.touch_access(uri);
@@ -491,12 +562,21 @@ impl DocumentStore {
     ///
     /// Like `update`, but uses the provided metadata instead of extracting it.
     /// Use this when metadata has been enriched with inherited_working_directory.
+    ///
+    /// `precomputed_masked` is forwarded to
+    /// [`compute_derived`](Self::compute_derived): on the `did_change` hot path
+    /// the caller has already masked this exact raw content for this exact
+    /// `chunk_kind` (the legacy [`crate::state::Document`] masks it in
+    /// `apply_change`), so it hands the result in to avoid a second
+    /// [`chunks::mask_to_r`](crate::chunks::mask_to_r) pass per keystroke. Pass
+    /// `None` to mask here. It is consumed only for [`ChunkKind::Rmd`].
     pub async fn update_with_metadata(
         &mut self,
         uri: &Url,
         changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
         metadata: CrossFileMetadata,
+        precomputed_masked: Option<String>,
     ) {
         self.mark_update_started(uri);
         if let Some(state) = self.documents.get_mut(uri) {
@@ -506,23 +586,26 @@ impl DocumentStore {
             state.version = version;
             state.revision += 1;
 
+            // `contents` stays RAW; tree/artifacts derive from the masked
+            // analysis text for Rmd/Quarto. Caller-supplied `metadata` is
+            // already masked-derived for Rmd (backend.rs, #343). The chunk kind
+            // is fixed at open and preserved across edits, so an untitled Rmd
+            // buffer keeps masking its tree/artifacts here.
+            let chunk_kind = state.chunk_kind;
             let content = state.contents.to_string();
-            state.tree = Self::parse_content(&content);
-            state.loaded_packages = Self::extract_packages(&state.tree, &content);
-            state.metadata = Arc::new(metadata);
-            state.artifacts = Arc::new(if let Some(ref tree) = state.tree {
-                // Use compute_artifacts_with_metadata to include declared symbols from directives
-                // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
-                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                crate::cross_file::scope::compute_artifacts_with_metadata(
-                    uri,
-                    tree,
-                    &content,
-                    Some(state.metadata.as_ref()),
-                )
-            } else {
-                ScopeArtifacts::default()
-            });
+            let metadata = Arc::new(metadata);
+            let (masked_text, tree, loaded_packages, artifacts) = Self::compute_derived(
+                uri,
+                chunk_kind,
+                &content,
+                metadata.as_ref(),
+                precomputed_masked,
+            );
+            state.masked_text = masked_text;
+            state.tree = tree;
+            state.loaded_packages = loaded_packages;
+            state.metadata = metadata;
+            state.artifacts = artifacts;
 
             self.touch_access(uri);
             self.signal_update_complete(uri);
@@ -813,6 +896,66 @@ impl DocumentStore {
     /// Parse R content into a tree
     fn parse_content(content: &str) -> Option<Tree> {
         crate::parser_pool::with_parser(|parser| parser.parse(content, None))
+    }
+
+    /// Compute the analysis-derived fields (`masked_text`, `tree`,
+    /// `loaded_packages`, `artifacts`) for an open document from its RAW
+    /// `content`, parsing and extracting from the masked analysis text for
+    /// Rmd/Quarto and from raw text otherwise. The supplied `metadata` is used
+    /// for artifact computation (it must already be masked-derived for Rmd —
+    /// callers pass enriched metadata extracted from the same analysis text).
+    ///
+    /// Returns `(masked_text, tree, loaded_packages, artifacts)`; the caller
+    /// owns assembling the `DocumentState` (and keeps `contents` raw).
+    ///
+    /// `chunk_kind` is the document's stored, open-time classification (see
+    /// [`DocumentState::chunk_kind`]); `uri` is used only for artifact
+    /// attribution, never to re-derive masking (#343).
+    ///
+    /// `precomputed_masked` lets a caller that has *already* masked the same raw
+    /// content for this exact `chunk_kind` (e.g. the `did_change` path, where
+    /// [`crate::state::Document::apply_change`] just masked it) hand the result
+    /// in to skip a redundant [`chunks::mask_to_r`](crate::chunks::mask_to_r)
+    /// pass on the hot per-keystroke path. It is consumed only for
+    /// [`ChunkKind::Rmd`]; for plain R `masked_text` is always `None` and the
+    /// argument is ignored. Pass `None` to mask here. Correctness rests on the
+    /// caller's promise that it is the mask of the *same content and kind* — the
+    /// store does not (and cannot cheaply) re-verify it.
+    fn compute_derived(
+        uri: &Url,
+        chunk_kind: ChunkKind,
+        content: &str,
+        metadata: &CrossFileMetadata,
+        precomputed_masked: Option<String>,
+    ) -> (
+        Option<String>,
+        Option<Tree>,
+        Vec<String>,
+        Arc<ScopeArtifacts>,
+    ) {
+        let masked_text = match chunk_kind {
+            // Reuse the caller's mask when supplied; otherwise mask via the
+            // shared chokepoint. Plain R never has masked text.
+            ChunkKind::Rmd => precomputed_masked
+                .or_else(|| crate::cross_file::masked_analysis_text(chunk_kind, content)),
+            ChunkKind::R => None,
+        };
+        let analysis_text = masked_text.as_deref().unwrap_or(content);
+        let tree = Self::parse_content(analysis_text);
+        let loaded_packages = Self::extract_packages(&tree, analysis_text);
+        let artifacts = Arc::new(if let Some(ref tree) = tree {
+            // Pair the tree with the analysis text it was parsed from so
+            // artifact byte offsets align (Requirements 5.1-5.4).
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                analysis_text,
+                Some(metadata),
+            )
+        } else {
+            ScopeArtifacts::default()
+        });
+        (masked_text, tree, loaded_packages, artifacts)
     }
 
     /// Extract loaded packages from parsed tree

@@ -2857,8 +2857,16 @@ impl LanguageServer for Backend {
                         .map(|a| a.interface_hash)
                 });
 
-            // Extract and enrich metadata with inherited working directory
-            let mut meta = crate::cross_file::extract_metadata(&text);
+            // Extract and enrich metadata with inherited working directory.
+            // For Rmd/Quarto docs this masks the prose first so the graph,
+            // DocumentStore, and on-demand indexing see only chunk-body
+            // source()/library() calls and directives (#343). Classify by
+            // languageId-then-URI so untitled `.Rmd`/`.qmd` buffers (no file
+            // extension) are masked too — and reuse the same `chunk_kind` for
+            // the DocumentStore open below so its tree/artifacts agree.
+            let (chunk_kind, analysis_text) =
+                crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
+            let mut meta = crate::cross_file::extract_metadata(&analysis_text);
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
@@ -2873,10 +2881,12 @@ impl LanguageServer for Backend {
                 max_chain_depth,
             );
 
-            // Update new DocumentStore with enriched metadata (Requirement 1.3)
+            // Update new DocumentStore with enriched metadata (Requirement 1.3).
+            // `chunk_kind` was classified above by languageId-then-URI so
+            // untitled `.Rmd`/`.qmd` buffers mask their tree/artifacts (#343).
             state
                 .document_store
-                .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                 .await;
 
             // Update legacy documents HashMap (for migration compatibility)
@@ -3251,7 +3261,12 @@ impl LanguageServer for Backend {
                 let workspace_root = state.workspace_folders.first().cloned();
                 let max_chain_depth = state.cross_file_config.max_chain_depth;
 
-                let mut meta = crate::cross_file::extract_metadata(&text);
+                // Masked for Rmd/Quarto (chunk bodies only); raw otherwise.
+                // Classify by languageId-then-URI so untitled buffers mask, and
+                // extract metadata from that same masked view (#343).
+                let (chunk_kind, analysis_text) =
+                    crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
+                let mut meta = crate::cross_file::extract_metadata(&analysis_text);
                 log::trace!(
                     "did_open re-enrich: uri={}, sources={}, sourced_by={}",
                     uri,
@@ -3274,7 +3289,7 @@ impl LanguageServer for Backend {
 
                 state
                     .document_store
-                    .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                    .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                     .await;
                 state.open_document_with_language_id(
                     uri.clone(),
@@ -3410,7 +3425,12 @@ impl LanguageServer for Backend {
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
-            let mut meta = crate::cross_file::extract_metadata(&text);
+            // languageId-then-URI classification masks untitled buffers (#343);
+            // extract metadata from the same masked view so the graph and the
+            // DocumentStore tree/artifacts agree (chunk bodies only for Rmd).
+            let (chunk_kind, analysis_text) =
+                crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
+            let mut meta = crate::cross_file::extract_metadata(&analysis_text);
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut meta,
                 &uri,
@@ -3421,7 +3441,7 @@ impl LanguageServer for Backend {
 
             state
                 .document_store
-                .open_with_metadata(uri.clone(), &text, version, meta.clone())
+                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                 .await;
             state.open_document_with_language_id(
                 uri.clone(),
@@ -3674,82 +3694,102 @@ impl LanguageServer for Backend {
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
             // Extract and enrich metadata with inherited working directory
-            let (packages_to_prefetch, enriched_meta, wd_affected, edges_changed) =
-                if let Some(doc) = state.documents.get(&uri) {
-                    let text = doc.text();
-                    let mut meta = crate::cross_file::extract_metadata(&text);
-                    let uri_clone = uri.clone();
-                    let workspace_root = state.workspace_folders.first().cloned();
+            let (
+                packages_to_prefetch,
+                enriched_meta,
+                precomputed_masked,
+                wd_affected,
+                edges_changed,
+            ) = if let Some(doc) = state.documents.get(&uri) {
+                // Analysis text: masked for Rmd/Quarto (chunk bodies only),
+                // raw otherwise. Feeds the graph + DocumentStore (#343).
+                // `apply_change` above already masked this exact raw content
+                // for this doc's fixed chunk kind, so we hand the Rmd mask to
+                // `update_with_metadata` below to skip a second `mask_to_r`
+                // pass per keystroke. Only Rmd carries a mask; plain R's
+                // analysis text equals raw text, so pass `None` there.
+                let text = doc.analysis_text();
+                let mut meta = crate::cross_file::extract_metadata(&text);
+                // Extract first, then move `text` into the mask slot — avoids
+                // cloning the masked String a second time per keystroke.
+                let precomputed_masked = doc.is_rmd_document().then_some(text);
+                let uri_clone = uri.clone();
+                let workspace_root = state.workspace_folders.first().cloned();
 
-                    // Enrich metadata with inherited working directory before any use
-                    // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
-                    crate::cross_file::enrich_metadata_with_inherited_wd(
-                        &mut meta,
-                        &uri_clone,
-                        workspace_root.as_ref(),
-                        |parent_uri| state.get_enriched_metadata(parent_uri),
-                        max_chain_depth,
-                    );
+                // Enrich metadata with inherited working directory before any use
+                // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut meta,
+                    &uri_clone,
+                    workspace_root.as_ref(),
+                    |parent_uri| state.get_enriched_metadata(parent_uri),
+                    max_chain_depth,
+                );
 
-                    // Collect package names for prefetch (validate names to
-                    // reject suspicious inputs before R subprocess calls)
-                    let pkgs: Vec<String> = if packages_enabled {
-                        extract_loaded_packages_from_library_calls(&meta.library_calls)
-                    } else {
-                        Vec::new()
-                    };
-
-                    // Pre-collect content for potential parent files to avoid borrow conflicts
-                    // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
-                    // Backward directives should always be resolved relative to the file's directory
-                    let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                        &uri_clone,
-                        workspace_root.as_ref(),
-                    );
-                    let parent_content: std::collections::HashMap<Url, String> = meta
-                        .sourced_by
-                        .iter()
-                        .filter_map(|d| {
-                            let ctx = backward_path_ctx.as_ref()?;
-                            let resolved =
-                                crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                            let parent_uri = Url::from_file_path(resolved).ok()?;
-                            let content = state
-                                .documents
-                                .get(&parent_uri)
-                                .map(|doc| doc.text())
-                                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                            Some((parent_uri, content))
-                        })
-                        .collect();
-
-                    let graph_result = state.cross_file_graph.update_file(
-                        &uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                        |parent_uri| parent_content.get(parent_uri).cloned(),
-                    );
-
-                    // Invalidate children affected by working directory change (Requirement 8)
-                    let wd_children =
-                        crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                            &uri,
-                            old_meta.as_deref(),
-                            &meta,
-                            &state.cross_file_graph,
-                            &state.cross_file_meta,
-                        );
-
-                    (pkgs, Some(meta), wd_children, graph_result.edges_changed)
+                // Collect package names for prefetch (validate names to
+                // reject suspicious inputs before R subprocess calls)
+                let pkgs: Vec<String> = if packages_enabled {
+                    extract_loaded_packages_from_library_calls(&meta.library_calls)
                 } else {
-                    (Vec::new(), None, Vec::new(), false)
+                    Vec::new()
                 };
+
+                // Pre-collect content for potential parent files to avoid borrow conflicts
+                // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+                // Backward directives should always be resolved relative to the file's directory
+                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                    &uri_clone,
+                    workspace_root.as_ref(),
+                );
+                let parent_content: std::collections::HashMap<Url, String> = meta
+                    .sourced_by
+                    .iter()
+                    .filter_map(|d| {
+                        let ctx = backward_path_ctx.as_ref()?;
+                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+                        let parent_uri = Url::from_file_path(resolved).ok()?;
+                        let content = state
+                            .documents
+                            .get(&parent_uri)
+                            .map(|doc| doc.text())
+                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                        Some((parent_uri, content))
+                    })
+                    .collect();
+
+                let graph_result = state.cross_file_graph.update_file(
+                    &uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                    |parent_uri| parent_content.get(parent_uri).cloned(),
+                );
+
+                // Invalidate children affected by working directory change (Requirement 8)
+                let wd_children =
+                    crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                        &uri,
+                        old_meta.as_deref(),
+                        &meta,
+                        &state.cross_file_graph,
+                        &state.cross_file_meta,
+                    );
+
+                (
+                    pkgs,
+                    Some(meta),
+                    precomputed_masked,
+                    wd_children,
+                    graph_result.edges_changed,
+                )
+            } else {
+                (Vec::new(), None, None, Vec::new(), false)
+            };
 
             // Update new DocumentStore with enriched metadata (Requirement 1.4)
             if let Some(meta) = enriched_meta {
                 state
                     .document_store
-                    .update_with_metadata(&uri, changes, version, meta)
+                    .update_with_metadata(&uri, changes, version, meta, precomputed_masked)
                     .await;
             } else {
                 state.document_store.update(&uri, changes, version).await;
@@ -5405,10 +5445,21 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Skip Rmd/Quarto: indentation rules designed for R syntax would
-        // produce surprising edits on prose, YAML, or non-R chunk content.
-        if doc.is_rmd_document() {
-            log::trace!("on_type_formatting: skipping Rmd/Quarto document {}", uri);
+        let position = params.text_document_position.position;
+
+        // Rmd/Quarto: indentation is first-class inside R chunk bodies, but a
+        // prose/YAML line maps to a blank masked line that the R indentation
+        // engine would treat as top-level R — applying R rules to markdown.
+        // Short-circuit unless the position is inside an R chunk body. The
+        // chunk-position check uses the RAW text (fences are blanked in the
+        // masked analysis text).
+        if doc.is_rmd_document()
+            && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+        {
+            log::trace!(
+                "on_type_formatting: skipping prose position in Rmd/Quarto document {}",
+                uri
+            );
             return Ok(None);
         }
 
@@ -5421,8 +5472,10 @@ impl LanguageServer for Backend {
             }
         };
 
-        let source = doc.text();
-        let position = params.text_document_position.position;
+        // The tree is parsed from the analysis text (masked for Rmd); the
+        // indentation engine must receive the same text so its byte offsets
+        // and tree-sitter points line up. Behavior-neutral for plain R.
+        let source = doc.analysis_text();
 
         // Get indentation style from server configuration
         let style = state.indentation_config.style;
@@ -6000,14 +6053,22 @@ impl Backend {
             }
         };
 
-        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
+        // Analysis text: masked for Rmd/Quarto (chunk bodies only), raw
+        // otherwise. The tree, metadata, and artifacts derive from this so a
+        // `.Rmd` reached via a backward directive contributes chunk-defined
+        // symbols and chunk library()/source() calls — not prose. The cached
+        // content and `IndexEntry.contents` below stay RAW (see those sites).
+        let analysis_text_cow =
+            crate::cross_file::analysis_text_for_path(file_uri.path(), &content);
+        let analysis_text: &str = &analysis_text_cow;
+        let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
         let mut cross_file_meta =
-            crate::cross_file::extract_metadata_with_tree(&content, tree.as_ref());
+            crate::cross_file::extract_metadata_with_tree(analysis_text, tree.as_ref());
         let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 file_uri,
                 tree,
-                &content,
+                analysis_text,
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),
@@ -6071,6 +6132,10 @@ impl Backend {
         };
 
         let cross_file_meta = std::sync::Arc::new(cross_file_meta);
+        // Raw-content / masked-analysis split (#343): `contents` holds the
+        // verbatim RAW source (serves snippets / get_content), while `tree`,
+        // `metadata`, and `artifacts` were derived above from the masked
+        // analysis text (chunk bodies only for Rmd/Quarto).
         let index_entry = crate::workspace_index::IndexEntry {
             contents: ropey::Rope::from_str(&content),
             tree,
@@ -6083,6 +6148,7 @@ impl Backend {
 
         {
             let mut state = self.state.write().await;
+            // RAW content cache (serves snippets / get_content), not masked.
             state
                 .cross_file_file_cache
                 .insert(file_uri.clone(), snapshot.clone(), content.clone());
@@ -6325,9 +6391,14 @@ impl Backend {
             }
         };
 
-        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
+        // Analysis text: masked for Rmd/Quarto (chunk bodies only), raw
+        // otherwise (#343). Cached content / `IndexEntry.contents` stay RAW.
+        let analysis_text_cow =
+            crate::cross_file::analysis_text_for_path(file_uri.path(), &content);
+        let analysis_text: &str = &analysis_text_cow;
+        let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
         let mut cross_file_meta =
-            crate::cross_file::extract_metadata_with_tree(&content, tree.as_ref());
+            crate::cross_file::extract_metadata_with_tree(analysis_text, tree.as_ref());
         if cross_file_meta.working_directory.is_none()
             && cross_file_meta.inherited_working_directory.is_none()
         {
@@ -6338,7 +6409,7 @@ impl Backend {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 file_uri,
                 tree,
-                &content,
+                analysis_text,
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),
@@ -6393,6 +6464,10 @@ impl Backend {
         };
 
         let cross_file_meta = std::sync::Arc::new(cross_file_meta);
+        // Raw-content / masked-analysis split (#343): `contents` holds the
+        // verbatim RAW source (serves snippets / get_content), while `tree`,
+        // `metadata`, and `artifacts` were derived above from the masked
+        // analysis text (chunk bodies only for Rmd/Quarto).
         let index_entry = crate::workspace_index::IndexEntry {
             contents: ropey::Rope::from_str(&content),
             tree,
@@ -6405,6 +6480,7 @@ impl Backend {
 
         {
             let mut state = self.state.write().await;
+            // RAW content cache (serves snippets / get_content), not masked.
             state
                 .cross_file_file_cache
                 .insert(file_uri.clone(), snapshot.clone(), content.clone());
@@ -6673,11 +6749,19 @@ pub(crate) async fn publish_diagnostics_inner(
             None
         };
 
-        // Extract metadata for async missing file checks
-        let directive_meta = state
-            .documents
-            .get(uri)
-            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+        // Metadata for async missing-file checks. Reuse the snapshot's
+        // `directive_meta`, which is `extract_metadata` (not just directives):
+        // it carries AST-detected `source()` calls AND is masked-correct for
+        // Rmd/Quarto (chunk bodies only). The old `parse_directives(doc.text())`
+        // here was raw and directives-only, so an AST `source("missing.R")`
+        // inside a chunk was stripped by `diagnostics_async_standalone`'s
+        // retain() and never re-added — losing the missing-file diagnostic
+        // (#343). Mirrors the dependent-revalidation path, which already passes
+        // `snapshot.directive_meta`. When the snapshot is absent (diagnostics
+        // disabled) the async phase below is skipped, so the fallback is inert.
+        let directive_meta = snapshot
+            .as_ref()
+            .map(|s| s.directive_meta.clone())
             .unwrap_or_default();
 
         let workspace_folder = state.workspace_folders.first().cloned();
@@ -6698,13 +6782,13 @@ pub(crate) async fn publish_diagnostics_inner(
     // the heavy phase the snapshot pattern was designed to keep
     // lock-free (see DiagnosticsSnapshot doc comment in handlers.rs).
     // Replicate the remaining `handlers::diagnostics` early-exits via
-    // snapshot fields, which already mirror `doc.file_type` and
-    // `doc.chunk_kind` from build time.
+    // snapshot fields, which already mirror `doc.file_type` from build time.
     let sync_diagnostics = match snapshot {
-        Some(snap)
-            if snap.file_type == crate::file_type::FileType::R
-                && snap.chunk_kind != crate::chunks::ChunkKind::Rmd =>
-        {
+        // Rmd/Quarto documents flow through too (issue #343): the snapshot
+        // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
+        // sees only real R chunk-body content. JAGS/Stan stay suppressed via the
+        // `file_type == R` condition.
+        Some(snap) if snap.file_type == crate::file_type::FileType::R => {
             handlers::diagnostics_from_snapshot(&snap, uri, &handlers::DiagCancelToken::never())
                 .unwrap_or_default()
         }
@@ -11132,5 +11216,556 @@ lineLength = 200
             .expect("snapshot built for tests/test-a.R");
         assert_eq!(r_snap.lint_config.line_length, 30);
         assert_eq!(test_snap.lint_config.line_length, 200);
+    }
+
+    /// Issue #343: an open Rmd document must flow through the publish-path
+    /// dispatch (`publish_diagnostics_inner` Phase 1 build + Phase 2 match
+    /// guard) and produce chunk diagnostics. The document is opened via the
+    /// real `did_open` path, whose DocumentStore entry now stores
+    /// masked-derived metadata/tree (#343 Task 5), so the snapshot is
+    /// masked-correct: diagnostics fall only on R chunk-body lines, never
+    /// prose. This mirrors the exact match arm in `publish_diagnostics_inner`:
+    /// build the snapshot, then run `diagnostics_from_snapshot` iff
+    /// `file_type == R`.
+    #[tokio::test]
+    async fn rmd_document_flows_through_publish_path_and_flags_chunk_error() {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let tmp = TempDir::new().unwrap();
+        let rmd_path = tmp.path().join("report.Rmd");
+        // Prose + a chunk with a syntax error (`x <- (`) on document line 5.
+        let content = "# Title\n\nSome [prose](url) here.\n\n```{r}\nx <- (\n```\n";
+        fs::write(&rmd_path, content).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(&rmd_path).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "rmd".into(),
+                    version: 1,
+                    text: content.into(),
+                },
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        // `snapshot_diagnostics` reproduces the publish-path match guard.
+        let diagnostics = snapshot_diagnostics(&state, &uri);
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR) && d.range.start.line == 5),
+            "the chunk syntax error must surface on document line 5 through the publish path, got {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        // Prose lines (heading, markdown link) must not produce diagnostics.
+        assert!(
+            diagnostics.iter().all(|d| d.range.start.line == 5),
+            "no diagnostics may land on prose lines, got {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Open an Rmd document through the real `did_open` path. Returns the owned
+    /// `LspService` (keep it alive for the test's duration), the backend's URI,
+    /// and the `TempDir` backing the file. Shared by the on-type-formatting
+    /// chunk/prose tests.
+    async fn open_rmd(content: &str) -> (tower_lsp::LspService<Backend>, Url, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("report.Rmd"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "report.Rmd", "rmd", content).await;
+        (svc, uri, tmp)
+    }
+
+    fn on_type_params(
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> tower_lsp::lsp_types::DocumentOnTypeFormattingParams {
+        use tower_lsp::lsp_types::{
+            DocumentOnTypeFormattingParams, FormattingOptions, Position, TextDocumentPositionParams,
+        };
+        DocumentOnTypeFormattingParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            ch: "\n".into(),
+            options: FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Issue #343 Task 4: on-type-formatting indents inside an R chunk body.
+    /// The indentation engine receives the masked analysis text, so a newline
+    /// inside a function body produces a body-indent edit at document
+    /// coordinates exactly as a plain-R file would.
+    #[tokio::test]
+    async fn on_type_formatting_indents_inside_rmd_chunk() {
+        // Cursor lands on the blank line 3, inside the brace block opened on
+        // line 2; the engine should indent it under the block.
+        //   0  ```{r}
+        //   1  prose-free chunk
+        //   2  f <- function() {
+        //   3  (cursor here, empty)
+        //   4  }
+        //   5  ```
+        let content = "```{r}\nx <- 1\nf <- function() {\n\n}\n```\n";
+        let (svc, uri, _tmp) = open_rmd(content).await;
+
+        let edits = svc
+            .inner()
+            .on_type_formatting(on_type_params(&uri, 3, 0))
+            .await
+            .expect("on_type_formatting must not error");
+        let edits = edits.expect("on_type_formatting must return edits inside a chunk body");
+        assert!(
+            !edits.is_empty() && edits.iter().any(|e| e.new_text.contains(' ')),
+            "indentation edit must add leading spaces inside the chunk function body, got {:?}",
+            edits
+        );
+    }
+
+    /// The complement: a newline on a prose line must be inert. Without the
+    /// prose guard the engine would treat the blank masked line as top-level R
+    /// and apply R indentation rules to markdown.
+    #[tokio::test]
+    async fn on_type_formatting_inert_on_rmd_prose() {
+        // Line 2 is prose; an Enter there must yield no edits.
+        let content = "```{r}\nx <- 1\n```\n\nSome prose line.\n";
+        let (svc, uri, _tmp) = open_rmd(content).await;
+
+        let edits = svc
+            .inner()
+            .on_type_formatting(on_type_params(&uri, 4, 5))
+            .await
+            .expect("on_type_formatting must not error");
+        assert!(
+            edits.is_none() || edits.as_ref().is_some_and(|e| e.is_empty()),
+            "on_type_formatting must be inert on a prose line, got {:?}",
+            edits
+        );
+    }
+
+    // ====================================================================
+    // Issue #343 Task 5: outgoing-only chunk-aware cross-file metadata.
+    //
+    // These exercise the production did_open / publish / on-demand paths to
+    // prove that for an open `.Rmd`, cross-file metadata feeding the
+    // dependency graph, the DocumentStore, and the async missing-file phase
+    // is derived from the MASKED analysis text (chunk bodies only), never
+    // from prose, while raw content remains available to non-analysis
+    // consumers.
+    // ====================================================================
+
+    /// Open an arbitrary file (by path under a freshly-initialized workspace)
+    /// through the real `did_open` path. Returns the live `LspService`, the
+    /// document URI, and the backing `TempDir`. The `TempDir` must already
+    /// contain the workspace fixtures; `path` is relative to it.
+    async fn open_in_workspace(
+        tmp: &TempDir,
+        rel_path: &str,
+        language_id: &str,
+        content: &str,
+    ) -> (tower_lsp::LspService<Backend>, Url) {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let uri = Url::from_file_path(tmp.path().join(rel_path)).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: language_id.into(),
+                    version: 1,
+                    text: content.into(),
+                },
+            })
+            .await;
+        (svc, uri)
+    }
+
+    fn snapshot_diagnostics(
+        state: &WorldState,
+        uri: &Url,
+    ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let snapshot =
+            crate::handlers::DiagnosticsSnapshot::build(state, uri).expect("snapshot must build");
+        if snapshot.file_type == crate::file_type::FileType::R {
+            crate::handlers::diagnostics_from_snapshot(
+                &snapshot,
+                uri,
+                &crate::handlers::DiagCancelToken::never(),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Flag #1: an open Rmd whose chunk `source()`s an existing helper must
+    /// produce an outgoing dependency-graph edge, and a symbol defined in the
+    /// helper used in a later chunk must NOT be flagged undefined.
+    #[tokio::test]
+    async fn rmd_chunk_source_produces_outgoing_edge_and_resolves_symbol() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        // Prose mentions `source(\"prose_decoy.R\")` which must be ignored; the
+        // real source() lives in an R chunk. A later chunk uses helper_fn().
+        let rmd = concat!(
+            "# Report\n",
+            "\n",
+            "Prose calls source(\"prose_decoy.R\") but that is not R.\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+            "\n",
+            "More prose.\n",
+            "\n",
+            "```{r}\n",
+            "y <- helper_fn()\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let backend = svc.inner();
+        let state = backend.state.read().await;
+
+        // Outgoing edge analysis.Rmd -> helpers.R exists, and the decoy does not.
+        let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
+        let decoy_uri = Url::from_file_path(tmp.path().join("prose_decoy.R")).unwrap();
+        let deps = state.cross_file_graph.get_dependencies(&uri);
+        let targets: Vec<&Url> = deps.iter().map(|e| &e.to).collect();
+        assert!(
+            targets.contains(&&helpers_uri),
+            "chunk source() must add an outgoing edge to helpers.R; edges: {:?}",
+            targets
+        );
+        assert!(
+            !targets.contains(&&decoy_uri),
+            "prose source() must NOT add an edge; edges: {:?}",
+            targets
+        );
+
+        // helper_fn used in a later chunk must resolve (no undefined-var diag).
+        let diags = snapshot_diagnostics(&state, &uri);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: helper_fn")),
+            "helper_fn from the sourced helper must resolve; diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Flag #3: a chunk `source("nonexistent.R")` must yield a missing-file
+    /// diagnostic through the ASYNC publish path. The async path strips the
+    /// sync missing-file diagnostics and re-adds them from a separately-built
+    /// `directive_meta`. Pre-fix, `publish_diagnostics_inner` Phase 1 built
+    /// that meta from `parse_directives(doc.text())` — RAW and directives-only,
+    /// so it carried NO AST `source()` calls — and the chunk's missing-file
+    /// diagnostic was silently lost. The fix sources `directive_meta` from
+    /// `snapshot.directive_meta` (full `extract_metadata`, masked for Rmd).
+    #[tokio::test]
+    async fn rmd_chunk_missing_source_flagged_through_async_publish_path() {
+        let tmp = TempDir::new().unwrap();
+        let rmd = concat!(
+            "# Report\n",
+            "\n",
+            "```{r}\n",
+            "source(\"nonexistent.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let backend = svc.inner();
+
+        // Reproduce publish_diagnostics_inner Phase 1-3 exactly (the production
+        // async path), then assert the missing-file diagnostic survives at the
+        // chunk's document line (line 3, 0-based).
+        let (snapshot, directive_meta, raw_text, workspace_folder, missing_file_severity) = {
+            let state = backend.state.read().await;
+            let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri);
+            // Production Phase 1 sources directive_meta from the snapshot.
+            let directive_meta = snapshot
+                .as_ref()
+                .map(|s| s.directive_meta.clone())
+                .unwrap_or_default();
+            let raw_text = state.get_document(&uri).map(|d| d.text()).unwrap();
+            let wf = state.workspace_folders.first().cloned();
+            let sev = state.cross_file_config.missing_file_severity;
+            (snapshot, directive_meta, raw_text, wf, sev)
+        };
+        let snapshot = snapshot.expect("snapshot must build for Rmd");
+
+        // The production directive_meta carries the chunk's AST source() call...
+        assert!(
+            directive_meta
+                .sources
+                .iter()
+                .any(|s| s.path == "nonexistent.R"),
+            "snapshot.directive_meta (the production async-phase source) must carry the chunk source() call"
+        );
+        // ...whereas the PRE-FIX source (raw `parse_directives`) does not — this
+        // is exactly why the old code lost the diagnostic. Guarding it pins the
+        // fix at the seam: a regression to `parse_directives(doc.text())` would
+        // feed `diagnostics_async_standalone` a meta with no AST source() call.
+        let prefix_meta = crate::cross_file::directive::parse_directives(&raw_text);
+        assert!(
+            !prefix_meta
+                .sources
+                .iter()
+                .any(|s| s.path == "nonexistent.R"),
+            "the pre-fix raw parse_directives must NOT carry the chunk source() — it is directives-only and prose-blind"
+        );
+
+        let sync_diagnostics = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap_or_default();
+        let diagnostics = crate::handlers::diagnostics_async_standalone(
+            &uri,
+            sync_diagnostics,
+            &directive_meta,
+            workspace_folder.as_ref(),
+            missing_file_severity,
+        )
+        .await;
+
+        assert!(
+            diagnostics.iter().any(|d| {
+                (d.message.starts_with("File not found:")
+                    || d.message.starts_with("Cannot resolve path:"))
+                    && d.range.start.line == 3
+            }),
+            "missing-file diagnostic for the chunk source() must survive the async path on line 3; got {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A `# @lsp-cd` directive in Rmd PROSE must be ignored (prose is masked
+    /// away), while the same directive inside an R chunk is honored. Asserted
+    /// cheaply at the metadata-extraction seam via `extract_metadata_for_path`,
+    /// the shared helper every Rmd extraction site routes through.
+    #[test]
+    fn rmd_lsp_cd_directive_honored_in_chunk_ignored_in_prose() {
+        // Prose `# @lsp-cd` — masked away, so no working_directory.
+        let prose_cd = "# @lsp-cd /tmp/prose\n\n```{r}\nx <- 1\n```\n";
+        let meta = crate::cross_file::extract_metadata_for_path("a.Rmd", prose_cd);
+        assert!(
+            meta.working_directory.is_none(),
+            "a @lsp-cd in prose must not set working_directory; got {:?}",
+            meta.working_directory
+        );
+
+        // Chunk `# @lsp-cd` — a real directive inside R chunk body.
+        let chunk_cd = "# heading\n\n```{r}\n# @lsp-cd /tmp/chunk\nx <- 1\n```\n";
+        let meta = crate::cross_file::extract_metadata_for_path("a.Rmd", chunk_cd);
+        assert_eq!(
+            meta.working_directory.as_deref(),
+            Some("/tmp/chunk"),
+            "a @lsp-cd inside a chunk must set working_directory"
+        );
+    }
+
+    /// Flag #2: after did_open of an Rmd, the DocumentStore exposes
+    /// chunk-defined symbols via `get_artifacts` (not prose garbage), while
+    /// `get_content` still returns the verbatim RAW text.
+    #[tokio::test]
+    async fn rmd_document_store_artifacts_masked_content_raw() {
+        let tmp = TempDir::new().unwrap();
+        let rmd = concat!(
+            "# Heading is prose, not a symbol\n",
+            "\n",
+            "Some prose with words like analyze and report.\n",
+            "\n",
+            "```{r}\n",
+            "chunk_symbol <- function() 1\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let backend = svc.inner();
+        let state = backend.state.read().await;
+
+        use crate::content_provider::ContentProvider;
+        let cp = state.content_provider();
+        // RAW content is preserved verbatim (prose included).
+        let content = cp.get_content(&uri).expect("content available");
+        assert_eq!(content, rmd, "get_content must return RAW Rmd text");
+        assert!(
+            content.contains("Heading is prose"),
+            "raw content must still contain prose"
+        );
+
+        // Artifacts expose the chunk-defined symbol, derived from masked text.
+        let artifacts = cp.get_artifacts(&uri).expect("artifacts available");
+        let names: Vec<String> = artifacts
+            .exported_interface
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "chunk_symbol"),
+            "DocumentStore artifacts must include the chunk-defined symbol; got {:?}",
+            names
+        );
+
+        // DocumentStore metadata must be masked-derived (no prose noise).
+        let meta = cp.get_metadata(&uri).expect("metadata available");
+        assert!(
+            meta.sources.is_empty(),
+            "no source() in chunks, so metadata.sources must be empty (prose ignored); got {:?}",
+            meta.sources
+        );
+    }
+
+    /// Flag #2 / DocumentState invariant: the DocumentStore's `tree` must be
+    /// parsed from the masked analysis text. Pairing the tree with the raw
+    /// content would mis-slice; here we assert the tree + analysis_text pair
+    /// is self-consistent (the tree's root spans the masked text length).
+    #[tokio::test]
+    async fn rmd_document_store_tree_paired_with_masked_text() {
+        let tmp = TempDir::new().unwrap();
+        let rmd = "# prose\n\n```{r}\nz <- 1\n```\n";
+        fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let backend = svc.inner();
+        let state = backend.state.read().await;
+
+        let doc_state = state
+            .document_store
+            .get_without_touch(&uri)
+            .expect("document in store");
+        let analysis = doc_state.analysis_text();
+        let masked = crate::chunks::mask_to_r(rmd);
+        assert_eq!(
+            analysis, masked,
+            "DocumentState analysis_text must be masked"
+        );
+        let tree = doc_state.tree.as_ref().expect("tree parsed");
+        assert_eq!(
+            tree.root_node().end_byte(),
+            analysis.len(),
+            "tree must be parsed from the masked analysis text"
+        );
+    }
+
+    /// Flag #4: opening a `.R` helper that declares `# @lsp-sourced-by
+    /// analysis.Rmd` triggers on-demand indexing of the (closed) Rmd from disk.
+    /// That extraction must be MASKED so `helper_fn` (defined in a chunk) is in
+    /// the helper's inherited scope and is not flagged undefined. The Rmd's
+    /// indexed content stays RAW while its indexed metadata reflects only chunk
+    /// content.
+    #[tokio::test]
+    async fn r_file_sourced_by_rmd_resolves_chunk_symbol_via_masked_on_demand() {
+        let tmp = TempDir::new().unwrap();
+        let rmd = concat!(
+            "# Analysis\n",
+            "\n",
+            "Prose source(\"prose_decoy.R\") here.\n",
+            "\n",
+            "```{r}\n",
+            "library(tools)\n",
+            "helper_fn <- function() 1\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
+        let helper = concat!("# @lsp-sourced-by analysis.Rmd\n", "x <- helper_fn()\n",);
+        fs::write(tmp.path().join("helpers.R"), helper).unwrap();
+
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helpers.R", "r", helper).await;
+        let backend = svc.inner();
+        let state = backend.state.read().await;
+
+        // The Rmd was indexed on demand. Its indexed metadata reflects ONLY
+        // chunk content: library(tools) is detected, the prose decoy source()
+        // is NOT.
+        let rmd_uri = Url::from_file_path(tmp.path().join("analysis.Rmd")).unwrap();
+        let rmd_meta = state
+            .get_enriched_metadata(&rmd_uri)
+            .expect("Rmd indexed metadata available");
+        assert!(
+            rmd_meta
+                .library_calls
+                .iter()
+                .any(|lc| lc.package == "tools"),
+            "masked on-demand extraction must find library(tools) from the chunk; got {:?}",
+            rmd_meta.library_calls
+        );
+        assert!(
+            rmd_meta.sources.is_empty(),
+            "prose source() decoy must not appear in indexed Rmd metadata; got {:?}",
+            rmd_meta.sources
+        );
+
+        // The indexed RAW content (file cache) still contains prose.
+        let cached = state
+            .cross_file_file_cache
+            .get(&rmd_uri)
+            .expect("Rmd content cached");
+        assert!(
+            cached.contains("Prose source"),
+            "cross_file_file_cache must hold RAW Rmd content (with prose)"
+        );
+
+        // helper_fn (chunk-defined in the parent Rmd) resolves in helpers.R.
+        let diags = snapshot_diagnostics(&state, &helper_uri);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: helper_fn")),
+            "helper_fn from the parent Rmd chunk must resolve in helpers.R; diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
     }
 }

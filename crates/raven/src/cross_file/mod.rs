@@ -75,6 +75,98 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     extract_metadata_with_tree(content, tree.as_ref())
 }
 
+/// The R-analysis view of `content` for the file identified by `path_or_uri`:
+/// the geometry-preserving [`crate::chunks::mask_to_r`] mask for R Markdown /
+/// Quarto documents (`.Rmd` / `.qmd`), and the raw `content` borrowed
+/// unchanged for everything else.
+///
+/// This is the single place that pairs path-based classification with masking
+/// for closed-file / on-demand-indexing call sites that only have a path and a
+/// byte string (no constructed `Document`). Open documents should prefer the
+/// already-masked [`crate::state::Document::analysis_text`] instead of
+/// re-masking here.
+///
+/// Returns a `Cow` so the plain-R case (the overwhelming majority) borrows
+/// without allocating.
+pub fn analysis_text_for_path<'a>(
+    path_or_uri: &str,
+    content: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    analysis_text_for_kind(crate::chunks::classify_chunk_document(path_or_uri), content)
+}
+
+/// The R-analysis view of `content` for an already-classified document: the
+/// geometry-preserving [`crate::chunks::mask_to_r`] mask for
+/// [`ChunkKind::Rmd`](crate::chunks::ChunkKind::Rmd), the raw `content`
+/// borrowed unchanged for [`ChunkKind::R`](crate::chunks::ChunkKind::R).
+///
+/// Use this when the caller already knows the kind from the editor's
+/// `languageId`-then-URI classification (e.g. `did_open`, where path-based
+/// classification would mis-handle untitled `.Rmd`/`.qmd` buffers, #343).
+/// [`analysis_text_for_path`] is the path-classified convenience wrapper.
+pub fn analysis_text_for_kind(
+    chunk_kind: crate::chunks::ChunkKind,
+    content: &str,
+) -> std::borrow::Cow<'_, str> {
+    match chunk_kind {
+        crate::chunks::ChunkKind::Rmd => std::borrow::Cow::Owned(crate::chunks::mask_to_r(content)),
+        crate::chunks::ChunkKind::R => std::borrow::Cow::Borrowed(content),
+    }
+}
+
+/// The `Option`-returning sibling of [`analysis_text_for_kind`] for callers that
+/// store `masked_text: Option<String>` (an open document's analysis text is the
+/// masked string for Rmd/Quarto, or `None` to mean "use the raw text as-is").
+///
+/// Returns `Some(masked)` for [`ChunkKind::Rmd`](crate::chunks::ChunkKind::Rmd)
+/// (the geometry-preserving [`crate::chunks::mask_to_r`] mask) and `None` for
+/// [`ChunkKind::R`](crate::chunks::ChunkKind::R), where analysis text equals raw
+/// text. This is the single masking chokepoint for `masked_text` fields:
+/// [`crate::state::Document`] and [`crate::document_store::DocumentStore`] both
+/// route through it so their analysis views can never diverge.
+pub(crate) fn masked_analysis_text(
+    chunk_kind: crate::chunks::ChunkKind,
+    text: &str,
+) -> Option<String> {
+    match analysis_text_for_kind(chunk_kind, text) {
+        std::borrow::Cow::Owned(masked) => Some(masked),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
+/// Classify a `did_open`'d document by its editor `language_id`-then-URI and
+/// return its [`ChunkKind`](crate::chunks::ChunkKind) paired with the R-analysis
+/// view of `text` ([`analysis_text_for_kind`]).
+///
+/// This is the chokepoint for the `did_open` branches in `backend.rs`, which all
+/// classify the same way before extracting metadata and opening the
+/// `DocumentStore`. `language_id`-then-URI classification (not path-only) is what
+/// lets untitled `.Rmd`/`.qmd` buffers — which have no file extension — mask
+/// correctly (#343).
+pub(crate) fn classify_and_mask<'a>(
+    language_id: Option<&str>,
+    uri: &tower_lsp::lsp_types::Url,
+    text: &'a str,
+) -> (crate::chunks::ChunkKind, std::borrow::Cow<'a, str>) {
+    let chunk_kind = crate::chunks::classify_chunk_document_for(language_id, uri.path());
+    let analysis_text = analysis_text_for_kind(chunk_kind, text);
+    (chunk_kind, analysis_text)
+}
+
+/// Extract cross-file metadata from `content`, masking R Markdown / Quarto
+/// prose first so directives, `source()` calls, and `library()` calls are
+/// taken from R chunk bodies only (never from prose or YAML front matter).
+///
+/// For non-Rmd files this is identical to [`extract_metadata`]. Use this at any
+/// site that extracts metadata from a path-identified file's *raw* content
+/// (file-cache fallbacks, on-demand indexing, legacy-document arms) so that
+/// `.Rmd` / `.qmd` files contribute outgoing edges from their chunks rather
+/// than spurious prose-derived ones (issue #343).
+pub fn extract_metadata_for_path(path_or_uri: &str, content: &str) -> CrossFileMetadata {
+    let analysis = analysis_text_for_path(path_or_uri, content);
+    extract_metadata(&analysis)
+}
+
 /// Extract cross-file metadata using a pre-parsed tree when available.
 ///
 /// This avoids redundant parsing when the caller already has a tree-sitter `Tree`.

@@ -261,6 +261,15 @@ On-demand indexing is used to index files that are not currently open in the edi
 
 See `crates/raven/src/cross_file/background_indexer.rs`.
 
+### Rmd/Quarto raw-content vs masked-analysis split (#343)
+
+For `.Rmd` / `.qmd` documents, everywhere we store or extract cross-file data we keep two views distinct (mirroring the `Document` type docs in `state.rs`):
+
+- **Raw content** — `DocumentStore::DocumentState.contents`, `IndexEntry.contents`, and the `cross_file_file_cache` entry stay verbatim. `ContentProvider::get_content` returns raw, serving snippets and non-R-language text scans.
+- **Masked analysis** — the `tree`, `metadata`, `artifacts`, and `loaded_packages` on those same entries are derived from `chunks::mask_to_r` (chunk bodies only). Byte offsets in the stored `tree` index into the masked text, exposed by `DocumentState::analysis_text()`; pairing the tree with raw content mis-slices.
+
+The single chokepoint helpers live in `cross_file/mod.rs`: `analysis_text_for_path(path, content)` (masks for Rmd, borrows raw otherwise) and `extract_metadata_for_path(path, content)`. Every metadata-extraction site that starts from a path-identified file's raw content (did_open, on-demand indexing, file-cache fallbacks in `state.rs`, the legacy-document arms in `content_provider.rs`) routes through these so `.Rmd` files contribute outgoing edges from chunks, never spurious prose-derived ones. `.Rmd`/`.qmd` are intentionally excluded from the proactive workspace scan (outgoing-only); incoming relationships come from an open Rmd or a `.R` file's `@lsp-sourced-by` backward directive.
+
 ## Package library internals
 
 Raven prefers static parsing for package exports and uses R subprocesses selectively.

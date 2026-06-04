@@ -81,6 +81,10 @@ source("utils.R")
 help  # Offers: helper_function — "from utils.R" as the item detail
 ```
 
+## R Markdown / Quarto
+
+Inside `.Rmd` / `.qmd` documents, completions work inside R chunk bodies: local definitions, cross-file symbols, package exports, function parameters, and `$` members all resolve across chunks as if the document were a single R program. On prose, YAML front matter, or non-R chunks, completion returns nothing rather than treating the line as R.
+
 ## JAGS and Stan
 
 For `.stan`, `.jags`, and `.bugs` files, Raven offers completions tailored to each language:

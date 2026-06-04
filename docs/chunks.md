@@ -20,6 +20,20 @@ Only **R** chunks are sent to the R console. Chunks tagged with other languages 
 
 Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct symbol kind, separate from section headers — see [Document Outline](./document-outline.md#r-markdown--quarto-chunks).
 
+## Language features inside chunks
+
+The R code inside chunk bodies is first-class. Raven analyzes all R chunk bodies as a single R program, so the editor's R language features work inside chunks of `.Rmd` / `.qmd` documents and resolve symbols across chunks (a function defined in one chunk can be used, navigated to, and completed in a later chunk):
+
+- [Diagnostics](./diagnostics.md), [completion](./completion.md), [hover](./hover.md), signature help, [go-to-definition](./go-to-definition.md), [find-references](./find-references.md), folding, expand-selection, and on-type [indentation](./indentation.md).
+
+These features apply only inside R chunk bodies. On prose, YAML front matter, or non-R chunks they stand down — completion, signature help, and on-type indentation produce nothing rather than treating the line as top-level R. Non-R chunks (`{python}`, `{bash}`, …) are not analyzed as R.
+
+### Cross-file resolution from chunks
+
+Cross-file awareness ([Cross-File Analysis](./cross-file.md)) reads only chunk bodies, never prose. A `source("helpers.R")` written inside an R chunk creates a real dependency edge — symbols defined in the sourced file resolve in later chunks, and a missing target is flagged — while the same text in prose or a comment outside a chunk is ignored. `library()` calls and `# @lsp-cd` / `@lsp-sourced-by`-style directives are likewise honored only inside chunks.
+
+The relationship also works in the other direction: a plain `.R` file can declare `# @lsp-sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
+
 ## Keyboard shortcuts
 
 | Mac | Windows/Linux | Action |

@@ -48,7 +48,7 @@ Two ways to disable AST-aware indentation:
 
 The difference: `"off"` is a Raven setting that keeps `formatOnType` available for other languages. Disabling `formatOnType` is a VS Code editor setting that affects all languages (unless overridden per-language).
 
-Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files as a default. This is the lowest-priority setting in VS Code — if you explicitly set `editor.formatOnType` to `false` (globally or for `[r]`), your setting takes precedence. Note that Tier 2 indentation applies only to plain R files; Rmd and Quarto files use Tier 1 only.
+Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files as a default. This is the lowest-priority setting in VS Code — if you explicitly set `editor.formatOnType` to `false` (globally or for `[r]`), your setting takes precedence. Tier 2 indentation also applies inside R code chunks of R Markdown and Quarto files — pressing Enter inside a chunk body indents exactly as it would in a plain `.R` file. On prose, YAML front matter, or a non-R chunk, Tier 2 stands down so markdown isn't reflowed with R rules (Tier 1 still applies).
 
 ## Styles
 
@@ -129,7 +129,7 @@ if (condition) {
 
 ### Indentation not working at all
 
-1. Check that the file's language mode is R (status bar), not R Markdown or Quarto
+1. Check the file's language mode (status bar): R, R Markdown, and Quarto are all supported — but in `.Rmd` / `.qmd` files, Tier 2 indentation applies only inside R chunk bodies, not in prose or YAML
 2. Verify Raven is running (check VS Code's status bar)
 3. Reload VS Code: `Ctrl+Shift+P` → "Developer: Reload Window"
 

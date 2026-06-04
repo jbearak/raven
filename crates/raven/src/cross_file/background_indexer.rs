@@ -290,10 +290,16 @@ impl BackgroundIndexer {
         let content = crate::state::read_source_async(&path).await?;
         let metadata_fs = tokio::fs::metadata(&path).await?;
 
-        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&content, None));
+        // Parse and extract from the analysis text: masked for Rmd/Quarto
+        // (chunk bodies only, never prose), raw for plain R. The raw `content`
+        // is still what gets hashed/cached below — only the derived
+        // tree/metadata/artifacts use the masked view (issue #343).
+        let analysis_text = crate::cross_file::analysis_text_for_path(uri.path(), &content);
+        let tree =
+            crate::parser_pool::with_parser(|parser| parser.parse(analysis_text.as_ref(), None));
 
         // Extract cross-file metadata
-        let mut cross_file_meta = extract_metadata_with_tree(&content, tree.as_ref());
+        let mut cross_file_meta = extract_metadata_with_tree(&analysis_text, tree.as_ref());
 
         // Enrich metadata with inherited working directory
         // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
@@ -319,7 +325,7 @@ impl BackgroundIndexer {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 uri,
                 tree,
-                &content,
+                &analysis_text,
                 Some(&cross_file_meta),
             ),
             None => crate::cross_file::scope::ScopeArtifacts::default(),

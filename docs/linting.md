@@ -121,6 +121,7 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 - **Raven:** `raven.linting.trailingBlankLinesSeverity` (default `"hint"`).
 - **`lintr` equivalent:** `lintr::trailing_blank_lines_linter()`.
 - Also fires when the file is missing a final newline.
+- Does not apply to `.Rmd` / `.qmd` documents: the rule describes the file's shape, and a chunk document's shape is Markdown, not R.
 
 ### Assignment operator
 
@@ -293,6 +294,7 @@ Notes:
 
 ## Performance and scope notes
 
+- **R Markdown / Quarto.** Lint rules apply inside R chunk bodies of `.Rmd` / `.qmd` documents — both in the editor and via `raven lint`. Prose, YAML front matter, and non-R chunks are never linted. `# nolint`, `# nolint start` / `# nolint end`, and `# @lsp-ignore` markers work inside chunk bodies exactly as in plain `.R` files. The one exception is [trailing blank lines](#trailing-blank-lines), which describes the file's shape — Markdown, not R — and is disabled for chunk documents.
 - **Static, no R subprocess.** Raven's lint rules run against the tree-sitter parse it already maintains for completions and diagnostics. There's no `lintr` install, no `R` process, no startup cost. The `commented_code` rule re-parses each candidate comment body via a thread-local parser pool; every other rule walks only the already-parsed tree.
 - **UTF-16 line length.** Raven measures line length in UTF-16 code units (matching LSP position reporting), so a non-BMP character counts as two. `lintr` counts characters; for ASCII-only code the two agree.
 - **`commented_code` differs subtly from `lintr`.** Both decide whether a comment body "looks like code" by parsing it, but Raven parses with tree-sitter and `lintr` parses with R itself. Edge cases that exercise R-specific syntax (very old `_` assignment, non-ASCII operator overloads, etc.) may be classified differently.

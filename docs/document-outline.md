@@ -127,6 +127,8 @@ Chunk #3        {python}
 
 Chunks use a distinct symbol kind (`OBJECT`) so the outline filter can include or exclude them separately from section headers.
 
+R symbols defined *inside* an R chunk body — functions, variable assignments, S4/R6 classes — also appear in the outline, nested under their chunk, at their real document line. Prose, YAML front matter, and non-R chunk bodies are ignored, so a `library(...)` call in prose or a Python chunk never produces a phantom outline entry. (For non-R chunks only the chunk entry itself is shown.)
+
 ### `# %%` cells in `.R` files
 
 Plain `.R` files use the VS Code interactive-cell convention: a `# %%` line starts a new cell that runs until the next marker, a section divider, or end of file. Any text after the marker is used as the label:

@@ -83,7 +83,7 @@ Cmd-click on a symbol that comes from an installed package (e.g. `dplyr::mutate`
 
 ## R Markdown and Quarto
 
-Go-to-definition is disabled in `.Rmd` and `.qmd` documents — Raven returns no result rather than resolving across prose and chunk boundaries. Edit a chunk's R in a `.R` file if you need navigation. (Hover and find-references are likewise disabled in these documents.)
+Go-to-definition works inside R code chunks of `.Rmd` and `.qmd` documents. Raven treats all R chunk bodies as one R program, so you can jump from a use in one chunk to a definition in an earlier chunk; the definition lands on the correct document line. Invoking it on prose, YAML front matter, or a non-R chunk returns no result. (Hover and find-references behave the same way.)
 
 ## JAGS and Stan
 

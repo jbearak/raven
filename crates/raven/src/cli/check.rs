@@ -21,7 +21,7 @@ use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use crate::cli::shared::{
     ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
-    absolute_path, collect_r_file_paths, encoding_diagnostic, is_chunk_file, is_r_file,
+    absolute_path, collect_check_target_paths, encoding_diagnostic, is_chunk_file, is_r_file,
     parse_color_choice, parse_output_format, parse_severity_level, render, resolve_color_from_env,
 };
 
@@ -114,10 +114,12 @@ pub fn print_help() {
 Usage: raven check [OPTIONS] [PATHS...]
 
 Indexes the workspace, then reports the full diagnostic set for the requested
-files (or every R file in the workspace when no PATHS are given): syntax errors,
-semantic checks, style lints, cross-file diagnostics (missing source files,
-circular dependencies, out-of-scope usage), missing-package warnings, and
-undefined-variable diagnostics. Honors raven.toml / .lintr.
+files (or every R / R Markdown / Quarto file in the workspace when no PATHS are
+given): syntax errors, semantic checks, style lints, cross-file diagnostics
+(missing source files, circular dependencies, out-of-scope usage),
+missing-package warnings, and undefined-variable diagnostics. For .Rmd / .qmd
+the R code inside chunks is analyzed; prose and non-R chunks are ignored.
+Honors raven.toml / .lintr.
 
 Options:
   --workspace DIR             Workspace root to index (default: current directory)
@@ -151,6 +153,82 @@ Exit codes:
 ",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// Open a report target that the workspace scan did NOT index (a path reached
+/// through a different symlink alias, OR a chunk file — `.Rmd`/`.qmd` are
+/// deliberately outside the R-only workspace scan) into `state.documents` and
+/// wire its outgoing edges into the dependency graph.
+///
+/// `text` is the already-decoded file contents (the caller owns the
+/// `read_source` error handling). `path` is used only to classify the chunk
+/// kind via its extension.
+///
+/// Workspace-scanned files get their edges from
+/// `build_dependency_graph_from_workspace`, but a disk-fallback target was never
+/// passed to `update_file`. Without this, `cached_neighborhood_subgraph(uri, …)`
+/// returns an empty neighborhood, so a chunk `source("R/util.R")` wouldn't
+/// resolve — producing false undefined-variable positives and losing
+/// missing-file context. This mirrors `backend`'s did_open: extract masked
+/// metadata for the path, enrich it with the inherited working directory,
+/// pre-collect parent content for any backward directives, then update the
+/// graph. The masked extraction reads chunk-body `source()`/`library()` calls
+/// only (never prose).
+///
+/// Single source of truth for both `run`'s report loop and the
+/// `collect_diagnostics_blocking` test helper, so production and test exercise
+/// identical disk-fallback behavior.
+fn open_disk_fallback_target(
+    state: &mut crate::state::WorldState,
+    uri: &Url,
+    path: &Path,
+    text: &str,
+) {
+    // Pass an honest language id so the Document classifies the chunk kind
+    // correctly: "rmd" for `.Rmd`/`.qmd` (the constructor reads the URI to
+    // classify it as Rmd and masks the prose), "r" otherwise.
+    // `file_type_from_language_id("rmd")` is `None`, so the `FileType` still
+    // falls back to R via the URI — only the chunk masking differs.
+    let language_id = if is_chunk_file(path) { "rmd" } else { "r" };
+    state.open_document_with_language_id(uri.clone(), text, Some(1), Some(language_id));
+
+    let workspace_root = state.workspace_folders.first().cloned();
+    let max_chain_depth = state.cross_file_config.max_chain_depth;
+    let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), text);
+    crate::cross_file::enrich_metadata_with_inherited_wd(
+        &mut meta,
+        uri,
+        workspace_root.as_ref(),
+        |parent_uri| state.get_enriched_metadata(parent_uri),
+        max_chain_depth,
+    );
+    // Pre-collect parent content for any backward directives (`@lsp-sourced-by`
+    // with `match=`/inference call sites) before the mutable `update_file`
+    // borrow, mirroring did_open. Forward `source()` edges — the only kind chunk
+    // targets normally have — don't consult this closure, so it's empty in the
+    // common case.
+    let backward_path_ctx =
+        crate::cross_file::path_resolve::PathContext::new(uri, workspace_root.as_ref());
+    let parent_content: std::collections::HashMap<Url, String> = meta
+        .sourced_by
+        .iter()
+        .filter_map(|d| {
+            let ctx = backward_path_ctx.as_ref()?;
+            let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+            let parent_uri = Url::from_file_path(resolved).ok()?;
+            let content = state
+                .documents
+                .get(&parent_uri)
+                .map(|doc| doc.text())
+                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+            Some((parent_uri, content))
+        })
+        .collect();
+    state
+        .cross_file_graph
+        .update_file(uri, &meta, workspace_root.as_ref(), |parent_uri| {
+            parent_content.get(parent_uri).cloned()
+        });
 }
 
 pub async fn run(args: CheckArgs) -> i32 {
@@ -214,14 +292,6 @@ pub async fn run(args: CheckArgs) -> i32 {
     let mut reported_loaded_packages = std::collections::BTreeSet::new();
 
     for path in &targets {
-        if is_chunk_file(path) {
-            // Chunk extraction isn't supported on the command line; mirror lint.
-            eprintln!(
-                "raven check: skipping {} (chunk-bearing file; diagnostics are R-only — see docs/cli.md)",
-                path.display()
-            );
-            continue;
-        }
         let Ok(uri) = Url::from_file_path(path) else {
             eprintln!(
                 "raven check: cannot convert path to URL: {}",
@@ -238,9 +308,11 @@ pub async fn run(args: CheckArgs) -> i32 {
         // that halves the tree-sitter work (parse once during the scan, not
         // again here). Fall back to reading from disk only for a target the
         // scan didn't index (e.g. a path the report walk reached through a
-        // different symlink alias). Either way the document is removed
-        // afterwards to bound memory across a large report set; the clone keeps
-        // the index entry intact for other files' cross-file resolution.
+        // different symlink alias, OR a chunk file — `.Rmd`/`.qmd` are
+        // deliberately outside the R-only workspace scan). Either way the
+        // document is removed afterwards to bound memory across a large report
+        // set; the clone keeps the index entry intact for other files'
+        // cross-file resolution.
         if let Some(doc) = state.workspace_index.get(&uri).cloned() {
             state.documents.insert(uri.clone(), doc);
         } else {
@@ -260,7 +332,7 @@ pub async fn run(args: CheckArgs) -> i32 {
                     continue;
                 }
             };
-            state.open_document_with_language_id(uri.clone(), &text, Some(1), Some("r"));
+            open_disk_fallback_target(&mut state, &uri, path, &text);
         }
         // Both arms above leave the document in `state.documents`; collect its
         // attached packages from the doc already in hand (free — the loop opens
@@ -513,22 +585,41 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
 /// (or a configured library path) makes the package installed-but-uncached.
 ///
 /// Covers the directly-attached packages (`library()` / `require()`) of each
-/// reported file, read from the already-parsed workspace index. Cross-file
-/// *inherited* packages (attached in a `source()`d file) and packages of
-/// targets the scan did not index are not prefetched here, so calls relying on
-/// those stay conservatively suppressed — a narrower gap than before, noted in
-/// `docs/cli.md`. No-op when the library isn't ready (e.g. R absent with no
-/// configured library paths).
+/// reported file. R-source targets read their already-parsed `loaded_packages`
+/// from the workspace index (free). Chunk-bearing targets (`.Rmd`/`.qmd`) are
+/// never in the R-only scan, so they're read from disk and masked here so a
+/// chunk `library()` call warms its package's exports too — without this the
+/// undefined-variable check would conservatively suppress bare calls to an
+/// installed-but-uncached package attached only inside a chunk, under-reporting
+/// relative to the editor. Cross-file *inherited* packages (attached in a
+/// `source()`d file) and packages of non-chunk targets the scan did not index
+/// are not prefetched here, so calls relying on those stay conservatively
+/// suppressed — a narrower gap than before, noted in `docs/cli.md`. No-op when
+/// the library isn't ready (e.g. R absent with no configured library paths).
 async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &[PathBuf]) {
     if !state.package_library_ready {
         return;
     }
     let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
     for path in targets {
-        if let Ok(uri) = Url::from_file_path(path)
-            && let Some(doc) = state.workspace_index.get(&uri)
-        {
+        let Ok(uri) = Url::from_file_path(path) else {
+            continue;
+        };
+        if let Some(doc) = state.workspace_index.get(&uri) {
             packages.extend(doc.loaded_packages.iter().cloned());
+        } else if is_chunk_file(path) {
+            // Chunk files are outside the R-only scan, so they have no index
+            // entry. Read + construct a throwaway Document best-effort so its
+            // masked `loaded_packages` (chunk-body `library()`/`require()` calls
+            // only, never prose) drive the warm-up exactly as an indexed R
+            // file's would. An unreadable / mis-encoded file just contributes no
+            // packages — its read failure surfaces as a finding in the report
+            // loop.
+            if let Ok(text) = crate::state::read_source(path) {
+                let doc =
+                    crate::state::Document::new_with_language_id(&text, Some(1), &uri, Some("rmd"));
+                packages.extend(doc.loaded_packages.iter().cloned());
+            }
         }
     }
     let packages: Vec<String> = packages
@@ -622,11 +713,11 @@ async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -
 }
 
 /// Resolve which files to report diagnostics for. Empty `paths` means every R
-/// file under the workspace root. Explicit paths are taken as-is (files) or
-/// walked (directories). The result is sorted and de-duplicated for stable
-/// output. An explicitly-named chunk file (`.Rmd`/`.qmd`) is included so the
-/// caller can emit the one-line skip note; chunk files found while walking a
-/// directory are not collected (they aren't R sources for diagnostics).
+/// source (`.R`/`.r`) and chunk-bearing document (`.Rmd`/`.qmd`) under the
+/// workspace root. Explicit paths are taken as-is (files) or walked
+/// (directories). The result is sorted and de-duplicated for stable output.
+/// Chunk files are collected both as explicit args and while walking a
+/// directory, so `raven check` diagnoses the R chunks inside them (issue #343).
 ///
 /// Every resolved path is canonicalized so its file URI matches the canonical
 /// `root` used to build the dependency graph. Without this, on platforms where
@@ -644,13 +735,13 @@ fn collect_report_targets(
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if paths.is_empty() {
-        collect_r_file_paths(root, &mut out);
+        collect_check_target_paths(root, &mut out);
     } else {
         for p in paths {
             let abs = absolute_path(root, p);
             let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
             if abs.is_dir() {
-                collect_r_file_paths(&abs, &mut out);
+                collect_check_target_paths(&abs, &mut out);
             } else if abs.is_file() {
                 if is_r_file(&abs) || is_chunk_file(&abs) {
                     out.push(abs);
@@ -844,9 +935,34 @@ mod tests {
 
         let mut operator_error = false;
         let targets = collect_report_targets(&[], tmp.path(), &mut operator_error);
-        // Two .R/.r files; .Rmd not collected during the walk; .git skipped.
-        assert_eq!(targets.len(), 2);
-        assert!(targets.iter().all(|p| is_r_file(p)));
+        // Two .R/.r files + the .Rmd (its R chunks are diagnosed, #343); .git
+        // skipped.
+        assert_eq!(targets.len(), 3, "got {targets:?}");
+        assert!(targets.iter().all(|p| is_r_file(p) || is_chunk_file(p)));
+        assert!(targets.iter().any(|p| is_chunk_file(p)));
+        assert!(!operator_error);
+    }
+
+    #[test]
+    fn walk_includes_rmd_and_qmd() {
+        // The empty-PATHS workspace walk collects chunk-bearing documents
+        // alongside R sources, including mixed-case extensions
+        // (is_chunk_file matches `.rmd`/`.qmd` case-insensitively).
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.R"), "x <- 1\n").unwrap();
+        fs::write(tmp.path().join("report.Rmd"), "prose\n").unwrap();
+        fs::write(tmp.path().join("paper.qmd"), "prose\n").unwrap();
+        fs::write(tmp.path().join("UPPER.RMD"), "prose\n").unwrap();
+        fs::write(tmp.path().join("UPPER.QMD"), "prose\n").unwrap();
+
+        let mut operator_error = false;
+        let targets = collect_report_targets(&[], tmp.path(), &mut operator_error);
+        assert_eq!(targets.len(), 5, "got {targets:?}");
+        let chunk_count = targets.iter().filter(|p| is_chunk_file(p)).count();
+        assert_eq!(
+            chunk_count, 4,
+            "all four chunk files collected; got {targets:?}"
+        );
         assert!(!operator_error);
     }
 
@@ -913,6 +1029,253 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("clean.R"), "x <- 1\ny <- x + 1\n").unwrap();
         assert_eq!(run_blocking(base_args(tmp.path())), EXIT_OK);
+    }
+
+    /// Run `raven check` and capture the diagnostics it would compute, without
+    /// the process-global stdout capture the renderer uses. Mirrors `run`'s
+    /// indexing + report loop so a test can assert on the exact `(path,
+    /// Diagnostic)` pairs (line/character) rather than just the exit code.
+    /// R-independent: callers that want package awareness configure
+    /// `additionalLibraryPaths`.
+    fn collect_diagnostics_blocking(args: &CheckArgs) -> Vec<(PathBuf, Diagnostic)> {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let root = std::fs::canonicalize(args.workspace.as_ref().unwrap()).unwrap();
+            let workspace_url = Url::from_file_path(&root).unwrap();
+            let mut state =
+                build_indexed_state(&root, &workspace_url, args.no_config, None).unwrap();
+            if !args.report_uninstalled {
+                state.cross_file_config.packages_missing_package_severity = None;
+            }
+            maybe_init_r(&mut state, &root).await;
+            let mut operator_error = false;
+            let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
+            prefetch_reported_packages(&state, &targets).await;
+            let mut all = Vec::new();
+            for path in &targets {
+                let uri = Url::from_file_path(path).unwrap();
+                if let Some(doc) = state.workspace_index.get(&uri).cloned() {
+                    state.documents.insert(uri.clone(), doc);
+                } else {
+                    let text = crate::state::read_source(path).unwrap();
+                    // Same disk-fallback path `run` uses, so production and test
+                    // exercise identical behavior (including the backward-directive
+                    // parent_content map).
+                    super::open_disk_fallback_target(&mut state, &uri, path, &text);
+                }
+                let diags = compute_file_diagnostics(&state, &uri).await;
+                state.close_document(&uri);
+                for d in diags {
+                    all.push((path.clone(), d));
+                }
+            }
+            all
+        })
+    }
+
+    #[test]
+    fn explicit_rmd_chunk_syntax_error_exits_failed() {
+        // A syntax error inside an R chunk of a `.Rmd` must be reported, and at
+        // DOCUMENT coordinates (not chunk-relative): the masked text preserves
+        // line geometry, so the error's line equals its physical line in the
+        // file. Prose lines precede the chunk to make the offset non-trivial.
+        let tmp = TempDir::new().unwrap();
+        let rmd = tmp.path().join("report.Rmd");
+        // Lines (0-based):
+        //   0: "# Title"
+        //   1: ""
+        //   2: "Some prose."
+        //   3: "```{r}"
+        //   4: "f <- function( {"   <- hard syntax error here
+        //   5: "```"
+        fs::write(
+            &rmd,
+            "# Title\n\nSome prose.\n```{r}\nf <- function( {\n```\n",
+        )
+        .unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![rmd.clone()];
+        assert_eq!(run_blocking(args.clone()), EXIT_LINT_FAILED);
+
+        // Assert the finding lands on the chunk body line (document line 4),
+        // proving geometry-preserving masking.
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            diags.iter().any(|(_, d)| d.range.start.line == 4
+                && d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+            "syntax error expected at document line 4 (0-based); got {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_prose_only_exits_ok() {
+        // A `.Rmd` with no R chunks — only prose and a python chunk whose body
+        // is invalid R — must produce no findings: prose is masked out and the
+        // python chunk is not an R chunk, so its body never reaches the R
+        // parser.
+        let tmp = TempDir::new().unwrap();
+        let rmd = tmp.path().join("prose.Rmd");
+        fs::write(
+            &rmd,
+            "# Heading\n\nJust prose, no R here.\n\n```{python}\nthis is ( not valid R\n```\n",
+        )
+        .unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![rmd.clone()];
+        assert_eq!(run_blocking(args.clone()), EXIT_OK);
+        assert!(
+            collect_diagnostics_blocking(&args).is_empty(),
+            "prose-only / non-R-chunk Rmd must yield no findings"
+        );
+    }
+
+    #[test]
+    fn rmd_chunk_source_resolves_cross_file() {
+        // A chunk that `source()`s a sibling R file and then calls a function
+        // defined there must NOT flag that function as undefined — proving the
+        // CLI wires the opened Rmd's `source()` edge into the dependency graph
+        // (the did_open parity step). The reverse — the same call WITHOUT the
+        // source() line — IS flagged, so the test can't pass vacuously.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(
+            tmp.path().join("R/util.R"),
+            "helper_fn <- function(x) x + 1\n",
+        )
+        .unwrap();
+
+        // With source(): clean.
+        let analysis = tmp.path().join("analysis.Rmd");
+        fs::write(
+            &analysis,
+            "# Analysis\n```{r}\nsource(\"R/util.R\")\nresult <- helper_fn(41)\n```\n",
+        )
+        .unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![analysis.clone()];
+        let with_source = collect_diagnostics_blocking(&args);
+        assert!(
+            !with_source
+                .iter()
+                .any(|(_, d)| d.message.contains("helper_fn")),
+            "helper_fn must resolve through the sourced sibling; got {:?}",
+            with_source
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Without source(): helper_fn is undefined and flagged. (Guards against
+        // a vacuous pass where nothing is checked at all.)
+        let no_source = tmp.path().join("nosrc.Rmd");
+        fs::write(
+            &no_source,
+            "# Analysis\n```{r}\nresult <- helper_fn(41)\n```\n",
+        )
+        .unwrap();
+        let mut args2 = base_args(tmp.path());
+        args2.paths = vec![no_source.clone()];
+        let without_source = collect_diagnostics_blocking(&args2);
+        assert!(
+            without_source
+                .iter()
+                .any(|(_, d)| d.message.contains("Undefined variable: helper_fn")),
+            "without source(), helper_fn must be flagged undefined; got {:?}",
+            without_source
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_params_respected_in_check() {
+        // knitr/Quarto inject a `params` object into parameterized reports
+        // whose frontmatter declares a top-level `params:` key. `raven check`
+        // shares the snapshot diagnostic pipeline, so it must NOT flag `params`
+        // as undefined for such a report. The use is a bare assignment RHS (not
+        // a call argument) so the undefined-variable collector inspects it.
+        let tmp = TempDir::new().unwrap();
+        let rmd = tmp.path().join("report.Rmd");
+        fs::write(
+            &rmd,
+            "---\ntitle: Report\nparams:\n  year: 2024\n---\n\n```{r}\nyr <- params$year\n```\n",
+        )
+        .unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![rmd.clone()];
+        assert_eq!(run_blocking(args.clone()), EXIT_OK);
+
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message.contains("Undefined variable: params")),
+            "params must not be flagged when frontmatter declares it; got {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Guard against a vacuous pass: the SAME chunk without `params:` in the
+        // frontmatter MUST flag `params` as undefined.
+        let rmd2 = tmp.path().join("noparams.Rmd");
+        fs::write(
+            &rmd2,
+            "---\ntitle: Report\n---\n\n```{r}\nyr <- params$year\n```\n",
+        )
+        .unwrap();
+        let mut args2 = base_args(tmp.path());
+        args2.paths = vec![rmd2.clone()];
+        let diags2 = collect_diagnostics_blocking(&args2);
+        assert!(
+            diags2
+                .iter()
+                .any(|(_, d)| d.message.contains("Undefined variable: params")),
+            "without a params: frontmatter, params must be flagged; got {:?}",
+            diags2
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_missing_source_in_chunk_flagged() {
+        // A chunk that source()s an absent file produces a missing-file
+        // diagnostic (WARNING by default) at the chunk's document line.
+        // Mirrors `missing_source_passes_when_threshold_raised`: it fails at the
+        // default threshold and passes once --max-severity is raised to warning.
+        let tmp = TempDir::new().unwrap();
+        let rmd = tmp.path().join("main.Rmd");
+        // Lines: 0 "# M", 1 "```{r}", 2 "source(\"nope.R\")", 3 "```"
+        fs::write(&rmd, "# M\n```{r}\nsource(\"nope.R\")\n```\n").unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![rmd.clone()];
+        assert_eq!(run_blocking(args.clone()), EXIT_LINT_FAILED);
+
+        // The missing-file finding lands on the chunk body line (document line 2).
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            diags
+                .iter()
+                .any(|(_, d)| d.range.start.line == 2 && d.message.to_lowercase().contains("not")),
+            "missing-source finding expected at document line 2; got {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // Raising the threshold to warning lets the WARNING-level missing-file
+        // diagnostic pass, exactly like the plain-R case.
+        let mut raised = args.clone();
+        raised.max_severity = SeverityLevel::Warning;
+        assert_eq!(run_blocking(raised), EXIT_OK);
     }
 
     #[test]

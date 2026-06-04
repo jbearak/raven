@@ -404,28 +404,38 @@ pub(crate) fn get_text_and_tree(
     state: &WorldState,
     uri: &Url,
 ) -> Option<(String, tree_sitter::Tree)> {
-    // 1. Enriched open documents (authoritative for open files)
+    // 1. Enriched open documents (authoritative for open files). Return the
+    //    analysis text (masked for Rmd/Quarto, raw otherwise) so the caller's
+    //    byte-offset slices into `tree` align — `contents` is RAW and would
+    //    mis-slice (or panic on a non-UTF-8 boundary) for `.Rmd`/`.qmd` (#343).
     if let Some(doc) = state.document_store.get_without_touch(uri) {
         if let Some(tree) = &doc.tree {
-            return Some((doc.contents.to_string(), tree.clone()));
+            return Some((doc.analysis_text(), tree.clone()));
         } else {
             log::debug!("Document in document_store has no parsed tree: {}", uri);
         }
     }
 
-    // 2. Legacy open documents
+    // 2. Legacy open documents. Return the analysis text (masked for Rmd) so
+    //    the caller's byte-offset slices into `tree` align; identical to the
+    //    raw text for plain R / JAGS / Stan.
     if let Some(doc) = state.documents.get(uri) {
         if let Some(tree) = &doc.tree {
-            return Some((doc.text(), tree.clone()));
+            return Some((doc.analysis_text(), tree.clone()));
         } else {
             log::debug!("Document found but has no parsed tree: {}", uri);
         }
     }
 
-    // 3. New workspace index (indexed closed files)
+    // 3. New workspace index (indexed closed files). The entry's `tree` is
+    //    parsed from the masked analysis text for Rmd/Quarto (on-demand
+    //    indexing), while `contents` is RAW — pair the tree with the masked
+    //    analysis view so byte offsets align (#343).
     if let Some(entry) = state.workspace_index_new.get(uri) {
         if let Some(tree) = &entry.tree {
-            return Some((entry.contents.to_string(), tree.clone()));
+            let raw = entry.contents.to_string();
+            let text = crate::cross_file::analysis_text_for_path(uri.path(), &raw).into_owned();
+            return Some((text, tree.clone()));
         } else {
             log::debug!(
                 "Document in workspace_index_new has no parsed tree: {}",
@@ -434,19 +444,24 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 4. Legacy workspace index
+    // 4. Legacy workspace index (analysis text, see step 2).
     if let Some(doc) = state.workspace_index.get(uri) {
         if let Some(tree) = &doc.tree {
-            return Some((doc.text(), tree.clone()));
+            return Some((doc.analysis_text(), tree.clone()));
         } else {
             log::debug!("Document in workspace_index has no parsed tree: {}", uri);
         }
     }
 
-    // 5. File cache — content available but no pre-parsed tree; parse on demand
+    // 5. File cache — content available but no pre-parsed tree; parse on demand.
+    //    The cache stores RAW content; parse (and return) the masked analysis
+    //    text for Rmd/Quarto so a closed `.Rmd` resolves chunk-defined symbols
+    //    rather than failing closed, and the (text, tree) pair stays aligned
+    //    (raw == analysis for plain R, so this is behavior-neutral there) (#343).
     if let Some(content) = state.cross_file_file_cache.get(uri) {
-        if let Some(tree) = crate::parser_pool::with_parser(|p| p.parse(&content, None)) {
-            return Some((content, tree));
+        let analysis = crate::cross_file::analysis_text_for_path(uri.path(), &content).into_owned();
+        if let Some(tree) = crate::parser_pool::with_parser(|p| p.parse(&analysis, None)) {
+            return Some((analysis, tree));
         } else {
             log::debug!("Failed to parse file cache content for: {}", uri);
         }
@@ -469,7 +484,10 @@ fn resolve_from_current_file(
 ) -> Option<FunctionSignature> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
-    let text = doc.text();
+    // Analysis text (masked for Rmd) matches `tree`'s byte offsets; equals the
+    // raw text for plain R. Signature help is gated for Rmd at the entry point,
+    // but pairing the tree with the analysis text is the correct invariant.
+    let text = doc.analysis_text();
 
     // Search for the nearest function definition before cursor position
     let func_node =
@@ -2013,5 +2031,108 @@ mod property_tests {
                 first_key
             );
         }
+    }
+
+    // -- get_text_and_tree raw/masked pairing (#343, final adversarial review) --
+
+    /// Rmd source whose chunk defines `myfun`, preceded by MULTIBYTE prose.
+    ///
+    /// `mask_to_r` blanks the prose lines but preserves line count, so the
+    /// masked analysis text is SHORTER (in bytes) than the raw source. The
+    /// chunk-defined function's byte offsets in the masked tree therefore land
+    /// at *different* byte positions than the same text in the raw source — and
+    /// the raw source's multibyte prose means those offsets can fall mid-char,
+    /// panicking `&text[start..end]`. Pairing the masked tree with the raw text
+    /// is the regressed behavior this test locks out.
+    const MULTIBYTE_RMD: &str = "Prélude éééé éééé éééé\n\n```{r}\nmyfun <- function(alpha, beta) {\n  alpha + beta\n}\n```\n";
+
+    /// Mirror of `resolve_from_cross_file`'s post-`get_text_and_tree` slicing:
+    /// locate `myfun`'s definition at its known line and extract its formals.
+    /// Returns the parameter names. Panics if the (text, tree) pair mis-aligns
+    /// on a char boundary — exactly the regression under test.
+    fn extract_params_via_get_text_and_tree(state: &WorldState, uri: &Url) -> Vec<String> {
+        let (text, tree) =
+            get_text_and_tree(state, uri).expect("get_text_and_tree must find the document");
+        // `myfun` is defined on document line 3 (0-based) in MULTIBYTE_RMD.
+        let func_node = find_function_definition_at_line(tree.root_node(), "myfun", &text, 3)
+            .expect("function definition must be found at line 3");
+        let params_node = func_node
+            .children(&mut func_node.walk())
+            .find(|c| c.kind() == "parameters")
+            .expect("function must have a parameters node");
+        extract_from_ast(params_node, &text)
+            .into_iter()
+            .map(|p| p.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn get_text_and_tree_pairs_masked_tree_with_masked_text_document_store_arm() {
+        // DocumentStore arm (step 1): an open `.Rmd` whose chunk defines a
+        // function, reached via cross-file resolution. Before the fix this
+        // returned RAW text paired with the masked tree, panicking on the
+        // multibyte prose (or silently mis-slicing for ASCII prose).
+        let uri = Url::parse("file:///doc.Rmd").unwrap();
+        let mut state = WorldState::new(vec![]);
+        state
+            .document_store
+            .open(uri.clone(), MULTIBYTE_RMD, 1)
+            .await;
+
+        let params = extract_params_via_get_text_and_tree(&state, &uri);
+        assert_eq!(
+            params,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "chunk-defined function's formals must extract from the masked analysis text"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_text_and_tree_pairs_masked_tree_with_masked_text_workspace_index_arm() {
+        // workspace_index_new arm (step 3): an on-demand-indexed (closed) `.Rmd`
+        // pairs a masked `tree` with RAW `contents`. Mirror that construction
+        // and confirm `get_text_and_tree` returns the masked analysis text so
+        // the tree's byte offsets align.
+        use crate::cross_file::file_cache::FileSnapshot;
+
+        let uri = Url::parse("file:///closed.Rmd").unwrap();
+        let analysis = crate::cross_file::analysis_text_for_path(uri.path(), MULTIBYTE_RMD);
+        let tree = crate::parser_pool::with_parser(|p| p.parse(analysis.as_ref(), None));
+        let metadata = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+            &analysis,
+            tree.as_ref(),
+        ));
+        let artifacts = std::sync::Arc::new(match tree.as_ref() {
+            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                &uri,
+                tree,
+                &analysis,
+                Some(&metadata),
+            ),
+            None => crate::cross_file::scope::ScopeArtifacts::default(),
+        });
+        let entry = crate::workspace_index::IndexEntry {
+            // RAW contents, as on-demand indexing stores them (#343).
+            contents: ropey::Rope::from_str(MULTIBYTE_RMD),
+            tree,
+            loaded_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: MULTIBYTE_RMD.len() as u64,
+                content_hash: None,
+            },
+            metadata,
+            artifacts,
+            indexed_at_version: 0,
+        };
+        let state = WorldState::new(vec![]);
+        state.workspace_index_new.insert(uri.clone(), entry);
+
+        let params = extract_params_via_get_text_and_tree(&state, &uri);
+        assert_eq!(
+            params,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "chunk-defined function's formals must extract from the masked analysis text"
+        );
     }
 }

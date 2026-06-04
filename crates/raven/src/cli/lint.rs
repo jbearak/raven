@@ -83,7 +83,9 @@ pub fn print_help() {
 Usage: raven lint [OPTIONS] [PATHS...]
 
 Lints each .R / .r file against the rules configured in raven.toml
-(or .lintr) and prints diagnostics.
+(or .lintr) and prints diagnostics. R Markdown / Quarto files
+(.Rmd / .qmd) are linted too: the R code inside chunks is checked,
+prose and non-R chunks are ignored.
 
 Options:
   --config PATH               Path to raven.toml (default: search upward)
@@ -261,16 +263,8 @@ fn walk(
     operator_error: &mut bool,
 ) {
     if path.is_file() {
-        if is_chunk_file(path) {
-            // Design requires a one-line note; the file otherwise contributes
-            // nothing to JSON / SARIF output.
-            eprintln!(
-                "raven lint: skipping {} (chunk-bearing file; lint is R-only — see docs/cli.md)",
-                path.display()
-            );
-            return;
-        }
-        if !is_r_file(path) {
+        let chunk = is_chunk_file(path);
+        if !chunk && !is_r_file(path) {
             return;
         }
         let rel = path.strip_prefix(root).unwrap_or(path);
@@ -310,9 +304,31 @@ fn walk(
                 return;
             }
         };
+        // For chunk files (.Rmd/.qmd), this masks the document to its R chunk
+        // bodies before parsing and linting: all non-R-body lines (prose, YAML,
+        // fences, non-R chunk bodies) become empty strings while every line keeps
+        // its original index, so lint findings carry document coordinates
+        // directly. Routed through the shared `analysis_text_for_kind` chokepoint
+        // so `raven lint` derives its R-analysis view identically to the LSP and
+        // `raven check`. Classify via the canonical `classify_chunk_document`
+        // (not a local re-derivation of the `chunk` guard above) so this site
+        // can never drift from the project-wide `.Rmd`/`.qmd` classifier.
+        let chunk_kind = crate::chunks::classify_chunk_document(&path.to_string_lossy());
+        let effective_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+        // The trailing-blank-lines rule describes the FILE's shape, but lints
+        // run on the masked analysis text, where the closing fence / prose
+        // after the last chunk is blanked — it would read as trailing blank
+        // lines at EOF on virtually every Rmd/Quarto document. The raw file's
+        // shape is Markdown, not R, so the rule simply doesn't apply to chunk
+        // documents. Mirrors the editor (`DiagnosticsSnapshot::build`).
+        let mut effective = effective;
+        if chunk_kind == crate::chunks::ChunkKind::Rmd {
+            effective.trailing_blank_lines_severity = None;
+        }
         // Use the same thread-local parser pool the LSP uses; avoids
         // per-file Parser construction.
-        let parse_result = crate::parser_pool::with_parser(|p| p.parse(&text, None));
+        let parse_result =
+            crate::parser_pool::with_parser(|p| p.parse(effective_text.as_ref(), None));
         let tree = match parse_result {
             Some(t) => t,
             None => {
@@ -321,7 +337,7 @@ fn walk(
                 return;
             }
         };
-        for d in crate::linting::run_lints(&text, tree.root_node(), &effective) {
+        for d in crate::linting::run_lints(effective_text.as_ref(), tree.root_node(), &effective) {
             out.push((path.to_path_buf(), d));
         }
     } else if path.is_dir() {
@@ -742,5 +758,221 @@ mod tests {
         // Before this migration a non-UTF-8 file set operator_error → exit 2.
         // Now it is an ERROR finding (parity with `raven check`) → exit 1.
         assert_eq!(run(args), EXIT_LINT_FAILED);
+    }
+
+    /// Settings that enable linting with the `assignment_operator` rule set to
+    /// flag `=` as a warning (default style is `<-`, default severity is HINT,
+    /// but for tests we use WARNING so we can distinguish from no-finding).
+    fn assignment_warn_settings() -> serde_json::Value {
+        serde_json::json!({
+            "linting": {
+                "enabled": true,
+                "assignmentOperatorSeverity": "warning"
+            }
+        })
+    }
+
+    /// A minimal .Rmd document with one R chunk containing `x=1` (assignment
+    /// operator finding) on line 3 (0-based), with surrounding prose. The prose
+    /// lines contain `y=2` which would be a finding if treated as R code.
+    fn rmd_with_chunk_finding() -> &'static str {
+        "---\ntitle: Test\n---\n\n```{r}\nx=1\n```\n\nProse y=2 here.\n"
+    }
+
+    #[test]
+    fn lint_flags_finding_inside_rmd_chunk_at_document_coords() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let file = root.join("doc.Rmd");
+        fs::write(&file, rmd_with_chunk_finding()).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(!operator_error, "unexpected operator error");
+        // `x=1` is on line 5 (0-based) of the document (after "---", "title:
+        // Test", "---", "", "```{r}"). run_lints reports 0-based lines, so
+        // range.start.line == 5. There must be at least one finding here.
+        let chunk_finding = diags.iter().find(|(p, d)| {
+            p == &file
+                && d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "assignment_operator".to_string(),
+                    ))
+        });
+        assert!(
+            chunk_finding.is_some(),
+            "expected an assignment_operator finding; got {diags:?}"
+        );
+        let (_, d) = chunk_finding.unwrap();
+        assert_eq!(
+            d.range.start.line, 5,
+            "finding must be at document line 5 (0-based); got {:?}",
+            d.range.start.line
+        );
+        // Prose line 8 (`Prose y=2 here.`) must NOT produce an
+        // assignment_operator finding — it is masked out as non-R.
+        assert!(
+            !diags.iter().any(|(_, d2)| {
+                d2.range.start.line == 8
+                    && d2.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "assignment_operator".to_string(),
+                        ))
+            }),
+            "prose line must not produce an assignment_operator finding"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_rmd_prose() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Prose-only .Rmd: `x=1` in prose would trigger assignment_operator if
+        // treated as R, but masking must blank it. No R chunks at all.
+        let content = "---\ntitle: Test\n---\n\nThis is prose. x=1 here.";
+        let file = root.join("prose_only.Rmd");
+        fs::write(&file, content).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(!operator_error, "unexpected operator error");
+        // No assignment_operator finding must appear — prose is masked.
+        assert!(
+            !diags.iter().any(|(_, d)| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "assignment_operator".to_string()
+                ))),
+            "prose-only Rmd must produce no assignment_operator finding; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lint_nolint_inside_chunk_respected() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Line 5 (0-based) = `x=1 # nolint`  → assignment_operator suppressed
+        // Line 6 (0-based) = `y=2`            → assignment_operator flagged (non-vacuous)
+        let content = "---\ntitle: Test\n---\n\n```{r}\nx=1 # nolint\ny=2\n```";
+        let file = root.join("nolint.Rmd");
+        fs::write(&file, content).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+
+        assert!(!operator_error, "unexpected operator error");
+        // `x=1 # nolint` on line 5 must be suppressed: no assignment_operator
+        // finding at line 5.
+        assert!(
+            !diags.iter().any(|(_, d)| {
+                d.range.start.line == 5
+                    && d.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "assignment_operator".to_string(),
+                        ))
+            }),
+            "assignment_operator on line 5 must be suppressed by # nolint; got {diags:?}"
+        );
+        // `y=2` on line 6 must produce an assignment_operator finding (non-vacuous).
+        assert!(
+            diags.iter().any(|(_, d)| {
+                d.range.start.line == 6
+                    && d.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "assignment_operator".to_string(),
+                        ))
+            }),
+            "assignment_operator on line 6 (y=2) must not be suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lint_rmd_exempt_from_trailing_blank_lines() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // The closing fence and prose after the last chunk are blanked in the
+        // masked analysis text, so the file-shape rule would otherwise read
+        // them as trailing blank lines at EOF on virtually every Rmd. The rule
+        // is disabled for chunk documents (the raw file's shape is Markdown,
+        // not R) — but stays active for plain .R files.
+        let rmd = root.join("doc.Rmd");
+        fs::write(&rmd, "```{r}\nx <- 1\n```\n\nClosing prose.\n").unwrap();
+        let r_file = root.join("plain.R");
+        fs::write(&r_file, "x <- 1\n\n\n").unwrap();
+
+        let settings = serde_json::json!({
+            "linting": { "enabled": true, "trailingBlankLinesSeverity": "warning" }
+        });
+        let trailing = |diags: &[(PathBuf, Diagnostic)]| {
+            diags.iter().any(|(_, d)| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "trailing_blank_lines".to_string(),
+                    ))
+            })
+        };
+
+        let (rmd_diags, err) = lint_one(root, &rmd, &settings);
+        assert!(!err, "unexpected operator error");
+        assert!(
+            !trailing(&rmd_diags),
+            "masked Rmd must not produce trailing_blank_lines findings; got {rmd_diags:?}"
+        );
+
+        let (r_diags, err) = lint_one(root, &r_file, &settings);
+        assert!(!err, "unexpected operator error");
+        assert!(
+            trailing(&r_diags),
+            "plain .R must still be flagged (non-vacuous); got {r_diags:?}"
+        );
+    }
+
+    #[test]
+    fn lint_walk_includes_chunk_files() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // A directory with one .Rmd, one .qmd, and one plain .R; all have a
+        // triggering pattern so all should produce findings (.qmd shares the
+        // .Rmd dispatch path via is_chunk_file — pin it end-to-end too).
+        let rmd = root.join("doc.Rmd");
+        let qmd = root.join("paper.qmd");
+        let r_file = root.join("plain.R");
+        fs::write(&rmd, rmd_with_chunk_finding()).unwrap();
+        fs::write(&qmd, rmd_with_chunk_finding()).unwrap();
+        fs::write(&r_file, "x=1\n").unwrap();
+
+        let settings = assignment_warn_settings();
+        // Walk the directory, not individual files (`lint_one` hands its
+        // `file` argument straight to `walk`, which dispatches dirs too).
+        let (diags, operator_error) = lint_one(root, root, &settings);
+
+        assert!(!operator_error, "unexpected operator error");
+        // All three files must contribute findings.
+        let rmd_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &rmd).collect();
+        let qmd_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &qmd).collect();
+        let r_findings: Vec<_> = diags.iter().filter(|(p, _)| p == &r_file).collect();
+        assert!(
+            !rmd_findings.is_empty(),
+            "directory walk must include .Rmd findings; got {diags:?}"
+        );
+        assert!(
+            !qmd_findings.is_empty(),
+            "directory walk must include .qmd findings; got {diags:?}"
+        );
+        assert!(
+            !r_findings.is_empty(),
+            "directory walk must include .R findings; got {diags:?}"
+        );
     }
 }
