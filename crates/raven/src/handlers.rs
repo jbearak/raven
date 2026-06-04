@@ -5860,13 +5860,19 @@ fn collect_undefined_variables_from_snapshot(
 /// handling, NSE / formula context) are intentionally NOT included here —
 /// those legitimately differ between pipelines.
 ///
-/// Note on the named-argument branch: it is only observable from
-/// `collect_identifier_usages_utf16` (the use-before-source pipeline). The
-/// undefined-variable pipeline (`collect_usages_with_context`) already
-/// early-returns on every identifier inside call arguments via its
+/// Note on the named-argument branch: within the diagnostics pipelines it is
+/// only observable from `collect_identifier_usages_utf16` (the use-before-source
+/// pipeline). The undefined-variable pipeline (`collect_usages_with_context`)
+/// already early-returns on every identifier inside call arguments via its
 /// `in_call_like_arguments` context flag, so the named-arg check here never
 /// fires for that consumer. The branch is still load-bearing — removing it
 /// would re-introduce the named-arg false positive in the utf16 pipeline.
+///
+/// Consumers beyond diagnostics: `hover` calls this predicate to suppress
+/// hovers on structural non-references — attributing a named-argument label
+/// (`title` in `labs(title = ...)`) to a definition or package was the reported
+/// `from {base}` bug — so hover and the diagnostics pass agree on what counts as
+/// a value reference.
 fn is_structural_non_reference(node: Node, text: &str) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
 
@@ -13758,6 +13764,14 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             }),
             range: Some(node_range),
         });
+    }
+
+    // Suppress hovers on structural non-references; see
+    // `is_structural_non_reference`. Gated on `identifier` because strings
+    // (file-path hover) must not reach the predicate, and placed after the
+    // namespace branch so qualified `pkg::name` hovers still resolve.
+    if node.kind() == "identifier" && is_structural_non_reference(node, &text) {
+        return None;
     }
 
     // Try cross-file symbols (includes local scope with definition extraction)
@@ -37952,6 +37966,33 @@ result <- my_func(1, 2)"#;
         // Should return None for truly undefined symbols (after trying all fallbacks)
         // This tests the graceful handling when no definition is found anywhere
         assert!(hover_result.is_none());
+    }
+
+    #[test]
+    fn test_hover_named_argument_label_is_not_a_reference() {
+        // Regression: hovering the NAME of a named call argument (`title` in
+        // `labs(title = ...)`) must not resolve it as a value reference. The
+        // reported bug attributed it to `from {base}`; here we make the bug
+        // hermetically reproducible by defining a local `title` that the old
+        // code would surface via the cross-file scope. A named-argument label
+        // is a structural non-reference, so hover must return None.
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "title <- \"default\"\nlabs(title = \"MPG vs Weight\")";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Column 7 lands inside `title` of `labs(title = ...)` on line 1.
+        let position = Position::new(1, 7);
+        let hover_result = hover_blocking(&state, &uri, position);
+
+        assert!(
+            hover_result.is_none(),
+            "named-argument label must not produce a value-reference hover, got: {hover_result:?}"
+        );
     }
 
     #[test]
