@@ -12363,7 +12363,11 @@ fn ts_point_to_lsp_position(text: &str, point: Point) -> Position {
 
 #[derive(Debug, Clone)]
 struct DollarMemberCompletionContext {
-    lhs_name: String,
+    /// Container the member is completed against (`alpha$beta` in
+    /// `alpha$beta$gam|`), built from the AST so `$`/`@`/`[["lit"]]` segments
+    /// all work and an intermediate segment is never treated as a free variable.
+    path: crate::qualified_resolve::QualifiedPath,
+    op: crate::extract_op::ExtractOp,
     typed_prefix: String,
     replace_range: Range,
 }
@@ -12396,31 +12400,59 @@ fn detect_dollar_member_completion_context(
         return None;
     }
 
-    let dollar_byte = token_start - 1;
-    let mut lhs_start = dollar_byte;
-    while lhs_start > 0 && is_r_identifier_continue_byte(bytes[lhs_start - 1]) {
-        lhs_start -= 1;
-    }
-    if lhs_start == dollar_byte || !is_r_identifier_start_byte(bytes[lhs_start]) {
-        return None;
-    }
-    if lhs_start > 0 && matches!(bytes[lhs_start - 1], b':' | b'@') {
-        return None;
-    }
+    let op_byte = token_start - 1;
+    // The container path comes from the AST subexpression ending just before the
+    // trigger `$`. This keeps the text scan only for the parts tree-sitter parses
+    // poorly (the trigger, typed prefix, and replace range) and gives full
+    // `$`/`@`/`[["lit"]]` parity. Bails on namespace (`pkg::obj$`), call-result
+    // (`f()$`), or computed-index (`x[[i]]$`) LHS — never guessing.
+    let path = lhs_path_ending_at(tree, text, line_idx, op_byte)?;
 
-    let lhs_name = line[lhs_start..dollar_byte].to_string();
     let typed_prefix = line[token_start..cursor_byte].to_string();
     let start_character = crate::utf16::byte_offset_to_utf16_column(line, token_start);
     let end_character = crate::utf16::byte_offset_to_utf16_column(line, token_end);
 
     Some(DollarMemberCompletionContext {
-        lhs_name,
+        path,
+        op: crate::extract_op::ExtractOp::Dollar,
         typed_prefix,
         replace_range: Range {
             start: Position::new(position.line, start_character),
             end: Position::new(position.line, end_character),
         },
     })
+}
+
+/// Build the [`crate::qualified_resolve::QualifiedPath`] for the container whose
+/// subexpression ends at byte `op_byte` on `line_idx` (the byte just before the
+/// trigger `$`). Selects the widest `extract_operator`/`subset2`/`identifier`
+/// node ending exactly there, then walks it with the shared spine-walker. Bails
+/// to `None` for a namespace LHS (`pkg::obj$`) or any non-static container.
+fn lhs_path_ending_at(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    line_idx: usize,
+    op_byte: usize,
+) -> Option<crate::qualified_resolve::QualifiedPath> {
+    let target_end = Point::new(line_idx, op_byte);
+    let probe = Point::new(line_idx, op_byte.saturating_sub(1));
+    let start_node = tree
+        .root_node()
+        .descendant_for_point_range(probe, target_end)?;
+    let mut best: Option<tree_sitter::Node> = None;
+    let mut cur = Some(start_node);
+    while let Some(node) = cur {
+        if node.end_position() == target_end {
+            match node.kind() {
+                "extract_operator" | "subset2" | "identifier" => best = Some(node),
+                // `pkg::obj$` is namespace access, not member completion.
+                "namespace_operator" => return None,
+                _ => {}
+            }
+        }
+        cur = node.parent();
+    }
+    crate::qualified_resolve::build_qualified_path(best?, text)
 }
 
 fn position_in_string_or_comment(
@@ -12453,22 +12485,34 @@ fn is_r_identifier_continue_byte(byte: u8) -> bool {
     is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
+/// Render a container path for completion-item detail text, e.g.
+/// `alpha`, `alpha$beta`, `alpha@slot$beta`.
+fn render_qualified_path(path: &crate::qualified_resolve::QualifiedPath) -> String {
+    let mut rendered = path.head.clone();
+    for seg in &path.segments {
+        let op = match seg.op {
+            crate::extract_op::ExtractOp::Dollar => '$',
+            crate::extract_op::ExtractOp::At => '@',
+        };
+        rendered.push(op);
+        rendered.push_str(&seg.name);
+    }
+    rendered
+}
+
 fn dollar_member_completion_items(
     state: &WorldState,
     uri: &Url,
     position: Position,
     context: &DollarMemberCompletionContext,
 ) -> Vec<CompletionItem> {
-    let path = crate::qualified_resolve::QualifiedPath {
-        head: context.lhs_name.clone(),
-        segments: Vec::new(),
-    };
+    let rendered_path = render_qualified_path(&context.path);
     crate::qualified_resolve::complete_qualified_members(
         state,
         uri,
         position,
-        &path,
-        crate::extract_op::ExtractOp::Dollar,
+        &context.path,
+        context.op,
     )
     .into_iter()
     .filter(|candidate| {
@@ -12476,11 +12520,11 @@ fn dollar_member_completion_items(
     })
     .map(|candidate| {
         let detail = if candidate.uri == *uri {
-            format!("member of {}", context.lhs_name)
+            format!("member of {}", rendered_path)
         } else {
             let relative_path =
                 compute_relative_path(&candidate.uri, state.workspace_folders.first());
-            format!("member of {} from {}", context.lhs_name, relative_path)
+            format!("member of {} from {}", rendered_path, relative_path)
         };
         CompletionItem {
             label: candidate.name.clone(),
@@ -46199,8 +46243,55 @@ mod dollar_member_completion_tests {
             detect_dollar_member_completion_context(doc.tree.as_ref().unwrap(), &code, position)
                 .expect("dollar-chain completion context");
 
-        assert_eq!(context.lhs_name, "bar");
+        // The container path is the full `foo$bar`, not just the nearest segment
+        // `bar` (which previously leaked an unrelated top-level `bar`).
+        assert_eq!(context.path.head, "foo");
+        let segments: Vec<&str> = context
+            .path
+            .segments
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(segments, vec!["bar"]);
         assert_eq!(context.typed_prefix, "");
+    }
+
+    #[test]
+    fn completion_nested_dollar_chain() {
+        let items =
+            completion_items("alpha <- list(beta = list(gamma = 1, delta = 2))\nalpha$beta$|");
+        let labels = sorted_labels(&items);
+        assert!(
+            labels.contains(&"gamma".to_string()) && labels.contains(&"delta".to_string()),
+            "expected nested members gamma+delta, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_subscript_segment_parity() {
+        let items = completion_items("alpha <- list(beta = list(gamma = 1))\nalpha[[\"beta\"]]$|");
+        let labels = sorted_labels(&items);
+        assert!(
+            labels.contains(&"gamma".to_string()),
+            "expected gamma via [[\"beta\"]] segment, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_no_false_positive_on_collision() {
+        // An unrelated top-level `beta` must NOT leak its members into `alpha$beta$`.
+        let items = completion_items(
+            "beta <- list(zeta = 1)\nalpha <- list(beta = list(gamma = 2))\nalpha$beta$|",
+        );
+        let labels = sorted_labels(&items);
+        assert!(
+            labels.contains(&"gamma".to_string()),
+            "expected gamma, got {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"zeta".to_string()),
+            "leaked unrelated `beta` member zeta, got {labels:?}"
+        );
     }
 
     #[test]
