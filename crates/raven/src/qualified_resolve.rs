@@ -1,10 +1,36 @@
 //! Resolve and enumerate candidates for the RHS identifier of `$` and `@`.
 //!
-//! See `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md`.
+//! See `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md` (Step 1)
+//! and `docs/superpowers/specs/2026-06-04-nested-dollar-member-completion-design.md`
+//! (Step 2: nested paths + reassignment semantics).
+//!
+//! ## The container path
+//!
+//! The LHS is modeled as a [`QualifiedPath`] — a head identifier plus zero or
+//! more intermediate [`Segment`]s, built from the AST by [`build_qualified_path`]
+//! (`$`/`@`/`[["lit"]]` steps; bails on any non-static step). The single-level
+//! case (`foo$bar`) is `segments.is_empty()` and reproduces the pre-Step-2
+//! behavior exactly; everything below generalizes "match `foo`" to "match the
+//! container path `head + segments`":
+//!   - member assignments match when the assignment target's spine equals the
+//!     path (`alpha$beta$gamma <- ...` for path `alpha$beta`);
+//!   - constructor literals are *descended* along `segments`
+//!     (`alpha <- list(beta = list(gamma = ...))`);
+//!   - a whole-value write to a prefix (`alpha$beta <- list(...)`) contributes
+//!     its named arguments and acts as an establishing site (below).
+//!
+//! ## Reassignment (establishing-site cutoff)
+//!
+//! Members reflect the value live at the cursor. A whole-value (re)write of an
+//! intermediate prefix in the cursor file (`alpha$beta <- ...`, constructor or
+//! opaque) is an *establishing site*; members declared before the latest such
+//! site are dropped (see [`collect_establishing_site_positions`] and the cutoff
+//! in the core collector). Cross-file establishing-site ordering is left to the
+//! contributor-chain union — the documented residual imprecision.
 //!
 //! For `foo$bar` (or `foo@bar`) where the cursor is on `bar`:
 //!
-//! 1. Resolve `foo` via the existing position-aware scope.
+//! 1. Resolve `foo` (the path head) via the existing position-aware scope.
 //! 2. Collect candidates from the defining file and the files that actually
 //!    contribute to the cursor's resolved cross-file scope:
 //!    - **Defining file**: `foo$bar <- ...` member-assignments,
