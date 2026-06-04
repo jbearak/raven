@@ -2400,6 +2400,36 @@ foo$
         assert_eq!(l.range.start.line, 0); // the `baz = 1` constructor argument
     }
 
+    #[test]
+    fn goto_def_nested_member_jumps_to_assignment() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list())
+alpha$beta$gamma <- 1
+x <- alpha$beta$gamma
+";
+        let uri = add_doc(&mut state, "file:///g.R", code);
+        // cursor on `gamma` in the use on line 2
+        let l = loc(goto_definition(&state, &uri, Position::new(2, 17)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 1); // the `alpha$beta$gamma <- 1` line
+    }
+
+    #[test]
+    fn goto_def_nested_no_false_positive() {
+        let mut state = fresh_state();
+        let code = "\
+gamma <- 99
+alpha <- list(beta = list(gamma = 1))
+y <- alpha$beta$gamma
+";
+        let uri = add_doc(&mut state, "file:///g2.R", code);
+        // `gamma` here must resolve to the constructor member (line 1), not the
+        // top-level `gamma <- 99` on line 0.
+        let l = loc(goto_definition(&state, &uri, Position::new(2, 17)));
+        assert_eq!(l.range.start.line, 1);
+    }
+
     /// LHS-shape gate: parenthesized LHS → None.
     #[test]
     fn parenthesized_lhs_returns_none() {
