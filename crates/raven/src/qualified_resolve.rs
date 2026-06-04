@@ -800,6 +800,36 @@ fn collect_qualified_member_candidates_with_cancel(
 
     let mut all_candidates = defining_candidates;
     all_candidates.extend(cross_file_candidates);
+
+    // Establishing-site cutoff (reassignment semantics): a whole-value (re)write
+    // of an intermediate prefix in the cursor file replaces members declared
+    // before it. Members at or after the latest such write survive; earlier ones
+    // (including those from the head binding's constructor) are dropped. Only the
+    // cursor file's sites are considered; cross-file ordering is left to the
+    // contributor-chain union (see the design's residual-imprecision note).
+    if !path.segments.is_empty()
+        && let Some((cursor_text, cursor_tree)) =
+            crate::parameter_resolver::get_text_and_tree(state, &cursor_uri)
+    {
+        let cursor_col_mapper = ColMapper::new(&cursor_text);
+        let cutoff = collect_establishing_site_positions(
+            cursor_tree.root_node(),
+            &cursor_text,
+            &cursor_col_mapper,
+            path,
+            false,
+        )
+        .into_iter()
+        .filter(|s| (s.line, s.utf16_column) <= (position.line, position.character))
+        .max_by_key(|s| (s.line, s.utf16_column));
+        if let Some(cutoff) = cutoff {
+            all_candidates.retain(|c| {
+                c.uri != cursor_uri
+                    || (c.effect.line, c.effect.utf16_column) >= (cutoff.line, cutoff.utf16_column)
+            });
+        }
+    }
+
     let contributor_distances = contributor_file_distances(
         &state.cross_file_graph,
         &cursor_uri,
@@ -1587,6 +1617,51 @@ fn collect_prefix_write_constructor_candidates(
     }
 }
 
+/// Effect positions of whole-value writes to a prefix of `path` longer than the
+/// head (`alpha$beta <- ...`, `alpha$beta$gamma <- ...` for path
+/// `[alpha, beta, gamma]`), regardless of the RHS shape (constructor, opaque
+/// call, or bare value). These are the *establishing sites* whose latest visible
+/// occurrence resets the members at `path`. Returns one position per matching
+/// assignment.
+fn collect_establishing_site_positions(
+    root: Node,
+    text: &str,
+    col_mapper: &ColMapper,
+    path: &QualifiedPath,
+    skip_functions: bool,
+) -> Vec<EffectPos> {
+    let mut sites = Vec::new();
+    if path.segments.is_empty() {
+        return sites;
+    }
+    let prefixes: Vec<QualifiedPath> = (1..=path.segments.len())
+        .map(|k| QualifiedPath {
+            head: path.head.clone(),
+            segments: path.segments[..k].to_vec(),
+        })
+        .collect();
+    for_each_binary_operator(root, skip_functions, |node| {
+        let Some(op_node) = node.child_by_field_name("operator") else {
+            return;
+        };
+        let target = match node_text(op_node, text) {
+            "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
+            "->" | "->>" => node.child_by_field_name("rhs"),
+            _ => return,
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if prefixes
+            .iter()
+            .any(|prefix| target_spine_is_path(target, text, prefix))
+        {
+            sites.push(EffectPos::from_node_end(node, col_mapper));
+        }
+    });
+    sites
+}
+
 /// In `args` (a constructor call's argument list), find a named argument
 /// `name = <call>` whose value is a call to an allowlisted constructor, and
 /// return that call node. Used to descend nested constructor literals along a
@@ -1921,6 +1996,54 @@ alpha$beta$
             completion_path_names(&state, &uri, Position::new(2, 11), "alpha", &["beta"]);
         names.sort();
         assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn reassignment_replaces_earlier_members_same_file() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = 1))
+alpha$beta <- list(delta = 2)
+alpha$beta$epsilon <- 3
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///r.R", code);
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(3, 11), "alpha", &["beta"]);
+        names.sort();
+        // gamma was replaced by the whole-value rewrite on line 1; delta + epsilon survive.
+        assert_eq!(names, vec!["delta".to_string(), "epsilon".to_string()]);
+    }
+
+    #[test]
+    fn extension_before_reassignment_is_excluded() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list())
+alpha$beta$old <- 1
+alpha$beta <- list(fresh = 2)
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///r2.R", code);
+        let names = completion_path_names(&state, &uri, Position::new(3, 11), "alpha", &["beta"]);
+        // `old` was added before the rewrite on line 2 → excluded. Only `fresh`.
+        assert_eq!(names, vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn empty_reassignment_resets_members() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha$beta$gamma <- 1
+alpha$beta <- list()
+alpha$beta$delta <- 2
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///r3.R", code);
+        let names = completion_path_names(&state, &uri, Position::new(4, 11), "alpha", &["beta"]);
+        // The empty `alpha$beta <- list()` on line 2 resets; only the later `delta`.
+        assert_eq!(names, vec!["delta".to_string()]);
     }
 
     /// Perf reproducer: scales the number of `df$col_K <- ...` assignments and
