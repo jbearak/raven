@@ -5846,12 +5846,13 @@ fn collect_undefined_variables_from_snapshot(
 /// Returns true when `node` is the *target* of an assignment — the LHS of
 /// `x <- 1` / `x = 1` / `x <<- 1`, or the RHS target of `1 -> x` / `1 ->> x`.
 ///
-/// Such an identifier is a structural non-reference for diagnostics (it binds a
-/// name rather than using one — see `is_structural_non_reference`, which
-/// delegates here), but it is a *definition site*: `hover` excludes assignment
-/// targets from its structural-non-reference suppression so hovering a
-/// definition still surfaces it.
-fn is_assignment_target(node: Node, text: &str) -> bool {
+/// One of the two halves of `is_structural_non_reference`. An assignment target
+/// binds a name rather than using one, so diagnostics treat it as a
+/// non-reference — but it is a *definition site*, so `hover` does NOT suppress it
+/// (it surfaces the definition; regression: hovering `add` in
+/// `add <- function(...)`). That is why hover suppresses on `is_structural_label`
+/// rather than the full predicate.
+fn is_assignment_target(node: Node) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
 
     let Some(parent) = node.parent() else {
@@ -5860,48 +5861,35 @@ fn is_assignment_target(node: Node, text: &str) -> bool {
     if parent.kind() != "binary_operator" {
         return false;
     }
-
-    let mut cursor = parent.walk();
-    let mut children = parent.children(&mut cursor);
-    let first = children.next();
-    let second = children.next();
-    let third = children.next();
-
-    let (Some(first), Some(second)) = (first, second) else {
+    let Some(op) = parent.child_by_field_name("operator") else {
         return false;
     };
-    let op_text = node_text(second, text);
-    // Left-assignment LHS: `x <- 1`, `x = 1`, `x <<- 1`.
-    if first.id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
-        return true;
-    }
-    // Right-assignment target: `1 -> x`, `1 ->> x`.
-    if let Some(third) = third
-        && third.id() == node.id()
-        && matches!(op_text, "->" | "->>")
-    {
-        return true;
-    }
-
-    false
+    // The operator token's `kind()` is its literal text. Left-assignment writes
+    // the lhs; right-assignment writes the rhs.
+    let target = match op.kind() {
+        "<-" | "=" | "<<-" => parent.child_by_field_name("lhs"),
+        "->" | "->>" => parent.child_by_field_name("rhs"),
+        _ => return false,
+    };
+    target.is_some_and(|t| t.id() == node.id())
 }
 
-/// Returns true if the given identifier node is a *structural non-reference*:
-/// an identifier that exists in the AST but never refers to a value at runtime,
-/// regardless of which diagnostic pipeline is consuming it.
+/// Returns true for the *non-definition* structural non-references: identifiers
+/// that name an argument, parameter, member, or namespace rather than binding or
+/// plainly referencing a value — named-argument labels (`n` in `f(n = 1)`),
+/// function-parameter NAMES (not their default expressions), identifiers directly
+/// inside a `parameters` list, both sides of a `namespace_operator`
+/// (`pkg::name` / `pkg:::name`), and the rhs of an `extract_operator`
+/// (`obj$name` / `obj@slot`).
 ///
-/// Covers the universal skips that EVERY usage collector in this file must
-/// honor — the LHS of `<-` / `=` / `<<-`, the RHS target of `->` / `->>`, named
-/// argument labels, function-parameter NAMES (not their default expressions),
-/// identifiers directly inside a `parameters` list, both sides of a
-/// `namespace_operator` (`pkg::name` / `pkg:::name`), and the rhs field of
-/// `extract_operator` (`obj$name` / `obj@slot`). A previous regression
-/// (`test_extract_operator_rhs_does_not_emit_used_before_sourced`) showed
-/// what happens when the two production collectors fall out of sync on one of
-/// these skips, so they must call this predicate instead of duplicating the
-/// checks inline. Pipeline-specific skips (e.g. `for_statement` iterator
-/// handling, NSE / formula context) are intentionally NOT included here —
-/// those legitimately differ between pipelines.
+/// The other half of `is_structural_non_reference` (everything that is NOT an
+/// `is_assignment_target`). `hover` suppresses on exactly this set: unlike an
+/// assignment target, none of these have a definition to surface, and attributing
+/// a named-argument label (`title` in `labs(title = ...)`) to a package was the
+/// reported `from {base}` bug. Both `is_structural_non_reference` and the hover
+/// guard call this, so they agree on these cases by construction. Revisiting the
+/// blanket hover suppression of these to match mainstream LSPs is tracked in
+/// <https://github.com/jbearak/raven/issues/382>.
 ///
 /// Note on the named-argument branch: within the diagnostics pipelines it is
 /// only observable from `collect_identifier_usages_utf16` (the use-before-source
@@ -5910,25 +5898,8 @@ fn is_assignment_target(node: Node, text: &str) -> bool {
 /// `in_call_like_arguments` context flag, so the named-arg check here never
 /// fires for that consumer. The branch is still load-bearing — removing it
 /// would re-introduce the named-arg false positive in the utf16 pipeline.
-///
-/// Consumers beyond diagnostics: `hover` calls this predicate to suppress
-/// hovers on structural non-references — attributing a named-argument label
-/// (`title` in `labs(title = ...)`) to a definition or package was the reported
-/// `from {base}` bug — so hover and the diagnostics pass agree on what counts as
-/// a value reference. Hover makes ONE exception: assignment targets (see
-/// `is_assignment_target`) are definition sites, so hover excludes them from the
-/// suppression to keep surfacing the definition (regression: hovering `add` in
-/// `add <- function(...)`). Diagnostics still treat them as non-references.
-fn is_structural_non_reference(node: Node, text: &str) -> bool {
+fn is_structural_label(node: Node) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
-
-    // Assignment targets bind a name rather than use one. They are
-    // structural non-references for diagnostics, but a *definition site* for
-    // hover — see `is_assignment_target` and the hover guard, which excludes
-    // them so hovering a definition still surfaces it.
-    if is_assignment_target(node, text) {
-        return true;
-    }
 
     let Some(parent) = node.parent() else {
         return false;
@@ -5973,6 +5944,28 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
     }
 
     false
+}
+
+/// Returns true if the given identifier node is a *structural non-reference*:
+/// an identifier that exists in the AST but never refers to a value at runtime,
+/// regardless of which diagnostic pipeline is consuming it.
+///
+/// The union of its two halves — `is_assignment_target` (assignment definition
+/// sites) and `is_structural_label` (argument / parameter / member / namespace
+/// label positions); see each for the exact membership. EVERY usage collector in
+/// this file must call this predicate rather than re-deriving the checks inline —
+/// a previous regression
+/// (`test_extract_operator_rhs_does_not_emit_used_before_sourced`) showed what
+/// happens when the two production collectors fall out of sync. Pipeline-specific
+/// skips (e.g. `for_statement` iterator handling, NSE / formula context) are
+/// intentionally NOT included here — those legitimately differ between pipelines.
+///
+/// `hover` is a non-diagnostics consumer, but it suppresses on
+/// `is_structural_label` ONLY, not this full predicate: assignment targets are
+/// definition sites it must still surface.
+fn is_structural_non_reference(node: Node) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+    is_assignment_target(node) || is_structural_label(node)
 }
 
 /// Returns true when `node` is an identifier inside a default-parameter
@@ -6092,7 +6085,7 @@ fn collect_identifier_usages_utf16<'a>(
     };
 
     if node.kind() == "identifier" {
-        if is_structural_non_reference(node, text) {
+        if is_structural_non_reference(node) {
             return;
         }
 
@@ -11319,7 +11312,7 @@ fn collect_usages_with_context<'a>(
             return;
         }
 
-        if is_structural_non_reference(node, text) {
+        if is_structural_non_reference(node) {
             return;
         }
 
@@ -13797,16 +13790,12 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         });
     }
 
-    // Suppress hovers on structural non-references; see
-    // `is_structural_non_reference`. Gated on `identifier` because strings
-    // (file-path hover) must not reach the predicate, and placed after the
-    // namespace branch so qualified `pkg::name` hovers still resolve.
-    // Assignment targets are excluded: they are definition sites, so hovering
-    // `add` in `add <- function(...)` must still surface the definition.
-    if node.kind() == "identifier"
-        && is_structural_non_reference(node, &text)
-        && !is_assignment_target(node, &text)
-    {
+    // Suppress hovers on structural labels (see `is_structural_label` for the
+    // set and the rationale, including why assignment targets are excluded).
+    // Gated on `identifier` because strings (file-path hover) must not reach the
+    // predicate, and placed after the namespace branch so qualified `pkg::name`
+    // hovers still resolve.
+    if node.kind() == "identifier" && is_structural_label(node) {
         return None;
     }
 
@@ -43254,7 +43243,7 @@ source(\"helpers.R\")
 
         let tree = parse_r_code(code);
         let node = nth_identifier_named(&tree, code, name, occurrence);
-        let actual = is_structural_non_reference(node, code);
+        let actual = is_structural_non_reference(node);
         let parent_kind = node.parent().map(|p| p.kind().to_string());
         assert_eq!(
             actual, expected,
