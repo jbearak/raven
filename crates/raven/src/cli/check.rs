@@ -276,8 +276,9 @@ pub async fn run(args: CheckArgs) -> i32 {
 
     // Auto-detect R for installed-package / base-symbol awareness. Any failure
     // (R absent, init error, no library paths) degrades gracefully and prints
-    // its own one-line note to stderr.
-    maybe_init_r(&mut state, &root).await;
+    // its own one-line note to stderr. The returned verdict feeds the
+    // missing-export-metadata warning below.
+    let shipped_db_load = maybe_init_r(&mut state, &root).await;
 
     // Resolve which files to report diagnostics for. A named path that does not
     // exist is an operator error (exit 2), matching `raven lint`.
@@ -371,14 +372,11 @@ pub async fn run(args: CheckArgs) -> i32 {
     render(args.format, &all_diags, &root, args.quiet, use_color);
 
     if !missing_export_metadata_packages.is_empty() {
-        let tier3_present = crate::package_db::locate_shipped_db_candidates()
-            .into_iter()
-            .any(|p| p.exists());
         eprintln!(
             "{}",
             format_missing_export_metadata_warning(
                 &missing_export_metadata_packages,
-                tier3_present
+                shipped_db_load
             )
         );
     }
@@ -526,7 +524,15 @@ fn resolve_project_config(
 /// readiness gate. The three R-related degradations each print a one-line note
 /// to stderr so CI shows what was missing; `Disabled` (the user turned package
 /// awareness off in `raven.toml`) is silent, matching the editor.
-async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
+///
+/// Returns the build's [`ShippedDbLoad`] verdict so the caller can tailor the
+/// missing-export-metadata warning (absent / loaded / present-but-failed)
+/// without re-stat-ing disk — the build already knows whether the shipped
+/// `names.db` actually loaded, which a bare `Path::exists()` cannot tell.
+async fn maybe_init_r(
+    state: &mut crate::state::WorldState,
+    root: &Path,
+) -> crate::package_library::ShippedDbLoad {
     // Snapshot config into locals before the call so the later `state`
     // mutation doesn't conflict with the borrow.
     let r_path = state.cross_file_config.packages_r_path.clone();
@@ -559,6 +565,7 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
     use crate::package_library::PackageLibraryStatus::*;
     state.package_library_ready = outcome.consumer_ready();
     let status = outcome.status;
+    let shipped_db_load = outcome.shipped_db_load;
     state.package_library = outcome.library;
     match status {
         Ready | Disabled => {}
@@ -572,6 +579,7 @@ async fn maybe_init_r(state: &mut crate::state::WorldState, root: &Path) {
             "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
         ),
     }
+    shipped_db_load
 }
 
 /// Warm the package-export cache for the packages the reported files attach,
@@ -668,15 +676,27 @@ async fn collect_missing_export_metadata_packages(
 /// Warn that some attached packages' exported symbols couldn't be loaded, so the
 /// undefined-variable diagnostics above may be unreliable — then steer the user
 /// to a fix. Leads with impact, then the obvious remedy (install the package),
-/// then a CI-specific fallback.
+/// then a database-specific fallback.
 ///
-/// `tier3_present` is computed by the caller from `p.exists()` over the shipped
-/// database's candidate paths — it means *a database file is on disk*, NOT that
-/// it loaded and was searched successfully (a corrupt/unsupported file also sets
-/// it, and separately produces its own load note). So the present-database
-/// branch must not claim a successful lookup; it states the actionable
-/// conclusion (the package isn't available from the database → use `freeze`).
-fn format_missing_export_metadata_warning(packages: &[String], tier3_present: bool) -> String {
+/// The fallback depends on the Tier 3 shipped database's actual load state
+/// ([`ShippedDbLoad`]) — a three-way signal, not a present/absent boolean. The
+/// distinction matters because `p.exists()` ("a database file is on disk") does
+/// NOT mean it loaded and was searched: a corrupt/unsupported file also exists.
+///
+/// - `Loaded` — the database loaded and was searched; the package genuinely
+///   isn't in it, so it's likely private or off CRAN/Bioconductor → `freeze`.
+/// - `Absent` — no database installed → `raven packages update` to download it
+///   (or `freeze` a snapshot from a machine where the package is installed).
+/// - `Failed` — a database file is present but corrupt/unsupported, so it was
+///   never searched. `freeze` is the wrong advice here (the package may well be
+///   in a working copy); steer to `raven packages update` to re-download a good
+///   copy. The specific load error is printed separately as a load note.
+fn format_missing_export_metadata_warning(
+    packages: &[String],
+    shipped_db_load: crate::package_library::ShippedDbLoad,
+) -> String {
+    use crate::package_library::ShippedDbLoad::*;
+
     let mut names = packages.to_vec();
     names.sort();
     names.dedup();
@@ -697,18 +717,22 @@ fn format_missing_export_metadata_warning(packages: &[String], tier3_present: bo
          To fix: install {noun} in your R library."
     );
 
-    if tier3_present {
-        format!(
+    match shipped_db_load {
+        Loaded => format!(
             "{head}\n\
              Raven's package symbol database doesn't provide {obj} — {inst} likely private or not on CRAN/Bioconductor.\n\
              Capture {obj} with `raven packages freeze` on a machine where {inst} installed, and commit the result."
-        )
-    } else {
-        format!(
+        ),
+        Absent => format!(
             "{head}\n\
              In CI without R, run `raven packages update` before `raven check` to download Raven's package symbol database,\n\
              or commit a `raven packages freeze` snapshot made on a machine where {inst} installed."
-        )
+        ),
+        Failed => format!(
+            "{head}\n\
+             Raven's package symbol database is present but failed to load (corrupt or unsupported format), so it was not searched — see the load note above.\n\
+             Run `raven packages update` to re-download a working database."
+        ),
     }
 }
 
@@ -820,12 +844,15 @@ mod tests {
 
     #[test]
     fn formats_missing_metadata_warning_for_absent_tier3() {
-        let msg =
-            super::format_missing_export_metadata_warning(&["foo".into(), "bar".into()], false);
+        use crate::package_library::ShippedDbLoad;
+        let msg = super::format_missing_export_metadata_warning(
+            &["foo".into(), "bar".into()],
+            ShippedDbLoad::Absent,
+        );
         // Names are sorted, so order is deterministic.
         assert!(msg.contains("couldn't load exported symbols for bar, foo"));
         assert!(msg.contains("install these packages in your R library"));
-        // Variant A steers to `update` (then `freeze`) as the CI fallback.
+        // Absent steers to `update` (then `freeze`) as the CI fallback.
         assert!(msg.contains("run `raven packages update` before `raven check`"));
         assert!(msg.contains("raven packages freeze"));
         assert!(!msg.contains("Tier"));
@@ -833,7 +860,9 @@ mod tests {
 
     #[test]
     fn formats_missing_metadata_warning_absent_tier3_singular() {
-        let msg = super::format_missing_export_metadata_warning(&["foo".into()], false);
+        use crate::package_library::ShippedDbLoad;
+        let msg =
+            super::format_missing_export_metadata_warning(&["foo".into()], ShippedDbLoad::Absent);
         assert!(msg.contains("couldn't load exported symbols for foo"));
         assert!(msg.contains("install this package in your R library"));
         assert!(msg.contains("where it's installed"));
@@ -842,13 +871,31 @@ mod tests {
 
     #[test]
     fn formats_missing_metadata_warning_for_present_tier3_miss() {
-        let msg = super::format_missing_export_metadata_warning(&["foo".into()], true);
+        use crate::package_library::ShippedDbLoad;
+        let msg =
+            super::format_missing_export_metadata_warning(&["foo".into()], ShippedDbLoad::Loaded);
         assert!(msg.contains("couldn't load exported symbols for foo"));
         // Singular wording for a single package.
         assert!(msg.contains("install this package in your R library"));
         assert!(msg.contains("Raven's package symbol database doesn't provide it"));
         assert!(msg.contains("raven packages freeze"));
         assert!(!msg.contains("Tier"));
+    }
+
+    #[test]
+    fn formats_missing_metadata_warning_for_failed_tier3() {
+        use crate::package_library::ShippedDbLoad;
+        let msg =
+            super::format_missing_export_metadata_warning(&["foo".into()], ShippedDbLoad::Failed);
+        assert!(msg.contains("couldn't load exported symbols for foo"));
+        // A present-but-unusable DB: explain that, and steer toward re-downloading
+        // a good copy rather than freezing project metadata.
+        assert!(msg.contains("present but failed to load"));
+        assert!(msg.contains("Run `raven packages update` to re-download"));
+        assert!(
+            !msg.contains("raven packages freeze"),
+            "freeze is wrong advice when the DB merely failed to load: {msg}"
+        );
     }
 
     #[test]
