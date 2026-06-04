@@ -50,18 +50,24 @@ against the **full container path**, at arbitrary depth:
    (its members), and so on — unbounded depth.
 2. Eliminate the wrong-variable completion: an intermediate segment is never
    reinterpreted as a free variable.
-3. Keep `$`/`@`/mixed chains working symmetrically.
+3. Treat `$`, `@`, and `[["literal"]]` chain segments uniformly and at full
+   parity across both surfaces — a chain may mix them at any position.
+4. Reflect reassignment: members come from the value that is **live at the
+   cursor**, so a whole reassignment of an intermediate value replaces its
+   earlier members rather than unioning with them.
 
 Surfaces in scope: **completion + go-to-definition** (they share the core
 resolver). Hover is out of scope — it is not wired to this resolver today.
 
-Out of scope (unchanged from Step 1, plus one Step-2 limitation):
+Out of scope (unchanged from Step 1):
 
 - Aliasing (`x <- alpha$beta; x$…`).
 - Function-return inference (`alpha <- make_thing()`).
 - S4 slot / R6 field declarations as a structure source.
 - Package-data introspection (`pkg::dataset$col`).
-- **Whole-prefix reassignment delete semantics** — see Limitations.
+- Navigating to / completing the string-literal position *inside* a `[["…"]]`
+  subscript (neither surface does this today); `[["…"]]` is supported only as a
+  container-path segment.
 
 ## Why unbounded depth is not extra work
 
@@ -91,21 +97,27 @@ For `alpha$beta$gamma` with the cursor / typed prefix on `gamma`:
 `gamma` is the member being resolved or completed. `segments == []` is the
 depth-1 case.
 
-## Building the path (two entry points, both already exist)
+## Building the path (one shared spine-walker)
 
-- **Completion** — `detect_dollar_member_completion_context` (`handlers.rs`)
-  currently walks back one identifier. Generalize it to consume a leftward chain
-  of `<ident>$` segments, building `head + segments`, and bail to `None` on any
-  non-static boundary (`]`, `)`, a computed index). This preserves its
-  robustness to the incomplete trailing-`$` case that tree-sitter parses poorly.
-  `[["literal"]]` segments inside the chain are a stretch/parity item for
-  completion (goto-def gets them free via the AST); the initial completion
-  scanner handles `$`-delimited identifier segments.
+Both surfaces build the container path with a single shared routine that walks
+an `extract_operator` / `subset` / `subset2` node's **left-spine**, collecting
+one `Segment` per `$`/`@`/`[["literal"]]` step until it bottoms out at the head
+`identifier`. Any non-static step — a computed index (`alpha[[i]]`), a call
+(`f()$x`), or a non-literal subscript — makes the walker bail to `None`. This
+shared walker is what gives full `$`/`@`/`[["…"]]` parity on both surfaces.
 
-- **Go-to-definition** — `handlers.rs` already hands the resolver the `lhs_node`
-  AST node (`extract_operator_rhs`). Walk that node's left-spine to collect
-  segments; the head must bottom out at an `identifier`. Any non-static segment
-  → bail (it already returns `None` safely today).
+- **Go-to-definition** already hands the resolver the `lhs_node` AST node
+  (`extract_operator_rhs`, `handlers.rs`); feed it straight to the spine-walker.
+
+- **Completion** keeps `detect_dollar_member_completion_context` for the part
+  tree-sitter parses poorly — locating the trigger `$`, the typed prefix, and
+  the replace range from text (the incomplete trailing token). But the
+  **container path** is taken from the AST: descend to the node ending just
+  before the trigger `$` (the LHS subexpression, e.g. `alpha[["beta"]]` in
+  `alpha[["beta"]]$gam`) and hand it to the same spine-walker. The LHS of a
+  trailing `$` is a complete subexpression even though the `$` itself parses to
+  an error node, so this is robust. If the AST descent fails (an unbalanced or
+  mid-edit LHS), bail to `None` rather than guessing.
 
 ## Discovery — three shapes, each a generalization of an existing collector
 
@@ -129,9 +141,15 @@ declared structure. Each shape walks `segments` of arbitrary length.
    `environment`, `list2env`, `new`).
 
 3. **Intermediate constructor assignment.** `alpha$beta <- list(gamma = …)`:
-   the target spine equals the container path and the RHS is an allowlisted
-   constructor; enumerate its named args. This is shape 1's matcher feeding
-   shape 2's enumerator.
+   the target spine is a prefix of the container path (down to and including the
+   path itself) and the RHS is an allowlisted constructor; descend the remaining
+   segments and enumerate named args at the terminal. This is shape 1's matcher
+   feeding shape 2's enumerator.
+
+These three shapes are the *site inventory*, not the final answer. Shapes 2 and
+3 produce **establishing sites** (whole-value writes); shape 1 produces
+**member-extension writes**. The next section decides which establishing site is
+live and which extensions sit after it — the combination is not a naive union.
 
 ## Position-aware and cross-file — reused, not rebuilt
 
@@ -147,7 +165,9 @@ scope, so "which binding of `alpha` is live at the cursor" is untouched.
 - **`pick_winner`** (latest-effect-wins → graph distance → contributor order) is
   unchanged and operates per member name.
 
-So cross-file nested resolution costs almost nothing beyond the wider matcher.
+Beyond the wider matcher, the one genuinely new phase is the establishing-site
+cutoff (next section), which reuses this same ordering rather than introducing
+its own.
 
 ## Safety — false positive eliminated by construction
 
@@ -159,34 +179,71 @@ unrelated top-level `beta` can never leak its members. Head unresolved, head
 resolving to a `package:` symbol, or any non-static segment → empty result,
 matching goto-def's existing safe degradation.
 
-## Limitations
+## Reassignment semantics — the establishing-site cutoff
 
-**Whole-prefix reassignment delete semantics.** A later whole reassignment of an
-intermediate value should remove members declared earlier:
+Members must reflect the value that is **live at the cursor**. At depth-1 this
+already works: scope resolves the head to its latest binding before the cursor,
+and constructor descent reads only that binding. The Step-2 generalization
+extends the same "latest write wins, and it replaces what came before" rule to
+intermediate prefixes.
+
+For a container path `P = head + segments`, resolve members in two phases:
+
+1. **Find the establishing site** — the latest write, visible at the cursor,
+   that (re)establishes the *whole* value at `P`. Candidates are:
+   - the head's resolved scope binding (descended along `segments`), and
+   - any assignment whose target spine is a **prefix** of `P` longer than the
+     head (`alpha$beta <- …` when resolving `alpha$beta$…`; a write to a shorter
+     prefix re-establishes everything below it).
+
+   The latest is chosen with the same ordering the resolver already trusts —
+   effect position with per-file visible cutoffs, then dependency-graph
+   distance, then contributor order. "Descend to `P`" follows the write's RHS
+   through allowlisted-constructor named args; if a step is opaque (a call, a
+   bare identifier), `P` has no statically known members *at that site*, but the
+   site still counts as the establishing cutoff.
+
+2. **Enumerate members of `P`** as the union of:
+   - named arguments of the constructor reached at the establishing site, and
+   - member-extension writes to exactly `P` (`P$m <- …`, `P[["m"]] <- …`) whose
+     effect is **after** the establishing site and at or before the cursor.
+
+   Per-name collisions within the union resolve by latest-effect-wins, as today.
+
+The phase-1 cutoff is what delivers delete semantics:
 
 ```r
 alpha <- list(beta = list(gamma = 1))
-alpha$beta <- list(delta = 2)   # ideally `gamma` no longer a member
-alpha$beta$                     # this design still offers BOTH gamma and delta
+alpha$beta <- list(delta = 2)   # latest establishing site for alpha$beta
+alpha$beta$                     # offers `delta` only — `gamma` was replaced
 ```
 
-Discovery unions member candidates and resolves *collisions* with the existing
-latest-effect-wins rule, but it does not model a whole-prefix overwrite as
-deleting the earlier structure. The result over-offers; it is never the
-wrong variable. This is documented and pinned by a test asserting the current
-behavior, so a future fix has a baseline.
+The earlier `list(gamma = 1)` is an *earlier* establishing site, so it is below
+the cutoff and excluded. A subsequent `alpha$beta$epsilon <- 3` is added (it is
+after the cutoff).
+
+**Residual cross-file imprecision.** Ordering establishing sites that live in
+*different files* relies on the contributor-chain / visible-cutoff ordering —
+the same basis `pick_winner` already uses for cross-file member selection. No
+new class of imprecision is introduced; the worst case for a pathological
+cross-file whole-prefix reassignment is the same coarse ordering the depth-1
+cross-file path already accepts.
 
 ## Testing
 
 `qualified_resolve.rs` already has a substantial test module; extend it.
 
-- Each discovery shape at depth-2 and depth-3; mixed `$`/`@` chains.
+- Each discovery shape at depth-2 and depth-3.
+- `[["literal"]]` interior chain segments on both surfaces (`alpha[["beta"]]$`,
+  `alpha$beta[["gamma"]]$`) and mixed `$`/`@`/`[[…]]` chains.
 - The false-positive regression: the `beta`-collision must yield only
   `alpha$beta`'s members.
+- Reassignment delete semantics: a whole reassignment of an intermediate value
+  excludes its earlier members and keeps later extensions (`gamma` gone,
+  `delta` + `epsilon` present).
 - Cross-file nested: structure declared in a sourced file and extended in the
   cursor file; plus position-awareness (a member assigned below the cursor is
   not offered).
-- The reassignment limitation, asserting current (over-offering) behavior.
 - Completion integration (handlers/completion tests) and goto-def integration
   for nested paths.
 - Non-static bail cases: `f()$x$`, `alpha[[i]]$x$` → empty result.
@@ -203,9 +260,12 @@ behavior, so a future fix has a baseline.
 ## Edit surface
 
 - `crates/raven/src/qualified_resolve.rs` — `QualifiedPath`/`Segment` types, the
-  generalized collectors, reused winner selection.
-- `crates/raven/src/handlers.rs` — the two path-builders (completion text
-  scanner; goto-def AST left-spine walk).
+  shared left-spine path-builder, the generalized collectors, the
+  establishing-site cutoff, reused winner selection.
+- `crates/raven/src/handlers.rs` — `detect_dollar_member_completion_context`
+  reduced to locating the trigger `$` / typed prefix / replace range, then
+  seeding the shared spine-walker from the LHS AST node (the same walker
+  goto-def uses).
 - The three doc files above.
 
 No new modules. No changes to scope resolution, the dependency graph, or the
