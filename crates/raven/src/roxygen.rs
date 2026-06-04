@@ -323,6 +323,33 @@ pub fn get_function_doc(block: &RoxygenBlock) -> Option<String> {
     block.fallback.clone()
 }
 
+/// Resolve a user-defined function's `@param` documentation for `param_name`,
+/// given the function-definition line (0-based) in `text`.
+///
+/// The single shared combination of [`extract_roxygen_block`] + [`get_param_doc`]
+/// for callers that look up exactly one parameter from a known definition line:
+/// completion-resolve's parameter path and hover's named-argument / parameter
+/// branches. Signature help deliberately does NOT use this — it extracts the
+/// block once and loops over every parameter, so re-extracting per call would be
+/// wasteful. Returns `None` when no comment block precedes the function or the
+/// parameter is undocumented.
+pub fn user_function_param_doc(text: &str, func_line: u32, param_name: &str) -> Option<String> {
+    let block = extract_roxygen_block(text, func_line)?;
+    get_param_doc(&block, param_name)
+}
+
+/// Resolve a user-defined function's title/description documentation, given the
+/// function-definition line (0-based) in `text`.
+///
+/// The single shared combination of [`extract_roxygen_block`] +
+/// [`get_function_doc`] for the same single-lookup callers as
+/// [`user_function_param_doc`]. Returns `None` when no comment block precedes the
+/// function or it carries no documentation.
+pub fn user_function_doc(text: &str, func_line: u32) -> Option<String> {
+    let block = extract_roxygen_block(text, func_line)?;
+    get_function_doc(&block)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,6 +853,58 @@ my_func <- function(...) {}
             block.params.get("...").map(|s| s.as_str()),
             Some("Additional arguments")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // user_function_param_doc / user_function_doc — the shared single-lookup
+    // combinations used by completion-resolve and hover.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_user_function_param_doc_resolves() {
+        let code = "\
+#' Add two numbers
+#' @param a The first addend
+#' @param b The second addend
+add <- function(a, b) a + b
+";
+        assert_eq!(
+            user_function_param_doc(code, 3, "a"),
+            Some("The first addend".to_string())
+        );
+        assert_eq!(
+            user_function_param_doc(code, 3, "b"),
+            Some("The second addend".to_string())
+        );
+        // Undocumented parameter → None (not a guess).
+        assert_eq!(user_function_param_doc(code, 3, "c"), None);
+    }
+
+    #[test]
+    fn test_user_function_param_doc_no_block() {
+        // No comment block above the function → None.
+        let code = "add <- function(a, b) a + b\n";
+        assert_eq!(user_function_param_doc(code, 0, "a"), None);
+    }
+
+    #[test]
+    fn test_user_function_doc_resolves() {
+        let code = "\
+#' Add two numbers
+#'
+#' Sums its two arguments.
+#' @param a The first addend
+add <- function(a, b) a + b
+";
+        let doc = user_function_doc(code, 4).unwrap();
+        assert!(doc.contains("Add two numbers"));
+        assert!(doc.contains("Sums its two arguments."));
+    }
+
+    #[test]
+    fn test_user_function_doc_no_block() {
+        let code = "add <- function(a, b) a + b\n";
+        assert_eq!(user_function_doc(code, 0), None);
     }
 }
 

@@ -243,6 +243,36 @@ fn node_text<'a>(node: Node<'a>, text: &'a str) -> &'a str {
 ///    resolver's position-aware `loaded_packages` + `inherited_packages`, then
 ///    query R subprocess (stub for now — Task 4.1 adds `get_function_formals`)
 ///
+/// Resolve a function signature using ONLY user-defined sources: the user
+/// signature cache, the current file's AST, then cross-file scope.
+///
+/// Unlike [`resolve`], this never performs package resolution or an R subprocess
+/// (no `block_on`), so it is safe to call from an async context such as `hover`.
+/// Returns `None` for package / built-in / unknown callees. [`resolve`] delegates
+/// its unqualified Phase 0-user/1/2 path here so the two cannot drift.
+pub fn resolve_user_only(
+    state: &WorldState,
+    cache: &SignatureCache,
+    function_name: &str,
+    current_uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+) -> Option<FunctionSignature> {
+    // Check user cache (current file + cross-file)
+    let user_cache_key = format!("{}#{}", current_uri.as_str(), function_name);
+    if let Some(sig) = cache.get_user(&user_cache_key) {
+        return Some(sig);
+    }
+
+    // Phase 1: Local AST search (current file)
+    if let Some(sig) = resolve_from_current_file(state, cache, function_name, current_uri, position)
+    {
+        return Some(sig);
+    }
+
+    // Phase 2: Cross-file scope
+    resolve_from_cross_file(state, cache, function_name, current_uri, position)
+}
+
 /// This function is synchronous and may block on R subprocess for package
 /// functions. The backend wraps it in `spawn_blocking`.
 pub fn resolve(
@@ -267,26 +297,10 @@ pub fn resolve(
     // --- Phases 1 & 2: Local / cross-file (only for unqualified calls) ---
     // Namespace-qualified calls (e.g., dplyr::filter) skip user-defined lookup
     // and go straight to package resolution.
-    if namespace.is_none() {
-        // Check user cache (current file + cross-file)
-        let user_cache_key = format!("{}#{}", current_uri.as_str(), function_name);
-        if let Some(sig) = cache.get_user(&user_cache_key) {
-            return Some(sig);
-        }
-
-        // Phase 1: Local AST search (current file)
-        if let Some(sig) =
-            resolve_from_current_file(state, cache, function_name, current_uri, position)
-        {
-            return Some(sig);
-        }
-
-        // Phase 2: Cross-file scope
-        if let Some(sig) =
-            resolve_from_cross_file(state, cache, function_name, current_uri, position)
-        {
-            return Some(sig);
-        }
+    if namespace.is_none()
+        && let Some(sig) = resolve_user_only(state, cache, function_name, current_uri, position)
+    {
+        return Some(sig);
     }
 
     // --- Phase 3: Package resolution ---

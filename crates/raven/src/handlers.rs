@@ -5883,13 +5883,20 @@ fn is_assignment_target(node: Node) -> bool {
 /// (`obj$name` / `obj@slot`).
 ///
 /// The other half of `is_structural_non_reference` (everything that is NOT an
-/// `is_assignment_target`). `hover` suppresses on exactly this set: unlike an
-/// assignment target, none of these have a definition to surface, and attributing
-/// a named-argument label (`title` in `labs(title = ...)`) to a package was the
-/// reported `from {base}` bug. Both `is_structural_non_reference` and the hover
-/// guard call this, so they agree on these cases by construction. Revisiting the
-/// blanket hover suppression of these to match mainstream LSPs is tracked in
-/// <https://github.com/jbearak/raven/issues/382>.
+/// `is_assignment_target`). This predicate is the hover **suppression backstop**:
+/// unlike an assignment target, none of these is a plain value lookup, and
+/// attributing a named-argument label (`title` in `labs(title = ...)`) to a
+/// package was the reported `from {base}` bug. Both `is_structural_non_reference`
+/// and the hover guard call this, so they agree on these cases by construction.
+///
+/// Per issue #382, `hover` now *resolves* several of these labels before this
+/// backstop runs — a named-arg label to a user function's formal, a parameter
+/// name to its `@param` doc, an `obj$name` member to its local definition, and
+/// the package side of `pkg::name` to its `DESCRIPTION` metadata. Those are
+/// hover-only carve-outs layered *on top of* this predicate (see `hover`); the
+/// predicate itself is unchanged, so diagnostics are unaffected, and any label
+/// hover cannot resolve still falls through to suppression here (resolve-or-
+/// suppress, never resolve-or-attribute).
 ///
 /// Note on the named-argument branch: within the diagnostics pipelines it is
 /// only observable from `collect_identifier_usages_utf16` (the use-before-source
@@ -13089,6 +13096,139 @@ fn find_namespace_context<'a>(node: &Node<'a>, text: &'a str) -> Option<&'a str>
     }
 }
 
+/// True when `node` is the package (LHS) identifier of a `namespace_operator`
+/// (`pkg` in `pkg::name` / `pkg:::name`), as opposed to the member (RHS) name.
+///
+/// Hover uses this to split the namespace branch: the package side shows the
+/// package's DESCRIPTION metadata (issue #382 step 1) while the member side
+/// keeps showing the qualified help topic.
+fn is_namespace_package_side(node: Node) -> bool {
+    node.parent()
+        .filter(|p| p.kind() == "namespace_operator")
+        .and_then(|p| p.child_by_field_name("lhs"))
+        .is_some_and(|lhs| lhs.id() == node.id())
+}
+
+/// Build the hover markdown for the package side of `pkg::name` — the package's
+/// `Title`/`Description` from its installed DESCRIPTION, or a "not installed"
+/// note when no library path contains the package.
+///
+/// Session-free: reads DESCRIPTION off disk (no R subprocess), mirroring
+/// `parse_description_depends`'s consumers. This replaces the old `pkg::pkg`
+/// help-lookup artifact that rendered an awkward `from {pkg}` for the LHS.
+fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
+    let Some(pkg_dir) = state.package_library.find_package_directory(pkg) else {
+        return format!("Package `{}` is not installed.", pkg);
+    };
+
+    let meta = crate::namespace_parser::parse_description_metadata(&pkg_dir.join("DESCRIPTION"))
+        .unwrap_or_default();
+
+    let mut value = match meta.title {
+        Some(title) => format!("**{}** — {}", pkg, title),
+        None => format!("**{}**", pkg),
+    };
+    if let Some(description) = meta.description {
+        value.push_str("\n\n");
+        value.push_str(&description);
+    }
+    value
+}
+
+/// True when `node` is the NAME of a function parameter at a definition site —
+/// the `name` field of a `parameter`/`default_parameter`, or a bare identifier
+/// directly inside a `parameters` list. Mirrors the parameter branches of
+/// [`is_structural_label`]; hover uses it to attempt `@param` resolution
+/// (#382 step 3) before that predicate would otherwise suppress the node.
+fn is_parameter_name(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if matches!(parent.kind(), "parameter" | "default_parameter") {
+        return parent
+            .child_by_field_name("name")
+            .is_some_and(|n| n.id() == node.id());
+    }
+    parent.kind() == "parameters"
+}
+
+/// If `param_node` (a parameter name) sits inside a *named* function definition
+/// (`name <- function(...)`, `name = function(...)`, or `function(...) -> name`),
+/// return the definition's start line (0-based) for roxygen lookup. Anonymous
+/// functions (arguments, IIFEs, list values) yield `None`, so hover never
+/// attributes a stray comment block to an unnamed function's parameter.
+fn enclosing_named_function_line(param_node: Node) -> Option<u32> {
+    // The parameter list is a direct child of its function_definition, so the
+    // nearest function_definition ancestor is the one that owns this parameter.
+    let mut current = param_node;
+    let func_def = loop {
+        let parent = current.parent()?;
+        if parent.kind() == "function_definition" {
+            break parent;
+        }
+        current = parent;
+    };
+
+    // A function only carries roxygen when it is bound to a name.
+    let assign = func_def.parent()?;
+    if assign.kind() != "binary_operator" {
+        return None;
+    }
+    let op = assign.child_by_field_name("operator")?;
+    let assigned = match op.kind() {
+        "<-" | "=" | "<<-" => assign.child_by_field_name("rhs"),
+        "->" | "->>" => assign.child_by_field_name("lhs"),
+        _ => return None,
+    };
+    assigned
+        .filter(|n| n.id() == func_def.id())
+        .map(|_| func_def.start_position().row as u32)
+}
+
+/// Render a hover body for a function parameter: a code block with the
+/// parameter declaration (`name`, or `name = default`), an optional
+/// "parameter of `fn`" attribution, then its documentation when present.
+/// Shared by the named-argument (#382 step 2; passes `owner`) and
+/// parameter-definition (#382 step 3; `owner` is `None` since the function is
+/// already at the cursor) hover branches.
+fn parameter_hover(decl: &str, owner: Option<&str>, doc: Option<&str>) -> String {
+    let mut value = format!("```r\n{}\n```", decl);
+    if let Some(owner) = owner {
+        value.push_str(&format!("\n\nparameter of `{}`", owner));
+    }
+    if let Some(doc) = doc {
+        value.push_str("\n\n");
+        value.push_str(doc);
+    }
+    value
+}
+
+/// If `node` is a named-argument *label* (`title` in `f(title = ...)`) whose
+/// immediately-enclosing call has a plain-identifier callee, return that callee
+/// identifier node; otherwise `None`.
+///
+/// Gates #382 step 2 strictly on the `argument.name` field — a positional value
+/// (`x` in `f(x, p = 1)`) has no `name` field and is not a label. Resolves
+/// against the *immediately*-enclosing call, so `param` in `f(g(param = 1))`
+/// returns `g`, not `f`. A non-identifier callee (`pkg::fn`, `obj$method`) is
+/// not a user-defined-function candidate and yields `None`.
+fn named_arg_call_function(node: Node) -> Option<Node> {
+    let argument = node.parent()?;
+    if argument.kind() != "argument" || argument.child_by_field_name("name")?.id() != node.id() {
+        return None;
+    }
+    let arguments = argument.parent()?;
+    if arguments.kind() != "arguments" {
+        return None;
+    }
+    let call = arguments.parent()?;
+    if call.kind() != "call" {
+        return None;
+    }
+    let func = call.child_by_field_name("function")?;
+    (func.kind() == "identifier").then_some(func)
+}
+
 // ============================================================================
 // Completion Item Resolve
 // ============================================================================
@@ -13196,8 +13336,7 @@ fn resolve_user_param_doc(
     param_name: &str,
 ) -> Option<String> {
     let text = read_file_content(document_contents, uri_str)?;
-    let block = crate::roxygen::extract_roxygen_block(&text, func_line)?;
-    crate::roxygen::get_param_doc(&block, param_name)
+    crate::roxygen::user_function_param_doc(&text, func_line, param_name)
 }
 
 /// Resolve documentation for a user-defined function name completion item.
@@ -13214,10 +13353,7 @@ fn resolve_user_function_documentation(
         data.get("func_line").and_then(|v| v.as_u64()),
     ) {
         let text = read_file_content(document_contents, uri_str);
-        text.and_then(|t| {
-            let block = crate::roxygen::extract_roxygen_block(&t, func_line as u32)?;
-            crate::roxygen::get_function_doc(&block)
-        })
+        text.and_then(|t| crate::roxygen::user_function_doc(&t, func_line as u32))
     } else {
         None
     };
@@ -13396,6 +13532,94 @@ fn extract_statement_from_tree(
         line: symbol.defined_line,
         column: symbol.defined_column,
     })
+}
+
+/// Build a [`DefinitionInfo`] for a local member definition discovered by the
+/// qualified-member resolver (`obj$name`/`obj@slot`, #382 step 4): the
+/// assignment/constructor statement enclosing the member token at `location`.
+///
+/// Reuses the same `find_assignment_statement` + `extract_statement_text`
+/// machinery as `extract_statement_from_tree`'s variable path, so a resolved
+/// member renders exactly like any other local definition.
+fn member_definition_info(
+    state: &WorldState,
+    location: &tower_lsp::lsp_types::Location,
+) -> Option<DefinitionInfo> {
+    let uri = &location.uri;
+    let line = location.range.start.line;
+    let column = location.range.start.character;
+
+    let content = if let Some(doc) = state.documents.get(uri) {
+        doc.analysis_text()
+    } else {
+        state.cross_file_file_cache.get(uri)?
+    };
+
+    if let Some(doc) = state.documents.get(uri) {
+        let tree = doc.tree.as_ref()?;
+        member_definition_from_tree(tree, &content, uri, line, column)
+    } else {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
+        let parsed = parser.parse(&content, None)?;
+        member_definition_from_tree(&parsed, &content, uri, line, column)
+    }
+}
+
+fn member_definition_from_tree(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    uri: &Url,
+    line: u32,
+    column: u32,
+) -> Option<DefinitionInfo> {
+    let line_text = content.lines().nth(line as usize).unwrap_or("");
+    let byte_col = utf16_column_to_byte_offset(line_text, column);
+    let row = line as usize;
+    let point_start = tree_sitter::Point::new(row, byte_col);
+    let point_end = tree_sitter::Point::new(row, next_utf8_char_boundary(line_text, byte_col));
+    let root = tree.root_node();
+    let node = root
+        .named_descendant_for_point_range(point_start, point_end)
+        .or_else(|| root.descendant_for_point_range(point_start, point_end))?;
+
+    let statement_node = find_assignment_statement(node, content)?;
+    let statement = extract_statement_text(statement_node, content);
+
+    Some(DefinitionInfo {
+        statement,
+        source_uri: uri.clone(),
+        line,
+        column,
+    })
+}
+
+/// Render the standard local/sourced-definition hover body: a code block with
+/// the definition statement followed by a file-location line — "this file,
+/// line N" for same-file definitions, or "[rel/path](uri), line N" otherwise.
+/// Shared by the cross-file-scope hover path and the qualified-member
+/// (#382 step 4) path so they cannot drift.
+fn local_definition_hover(
+    state: &WorldState,
+    def_info: &DefinitionInfo,
+    current_uri: &Url,
+) -> String {
+    // No escaping needed inside code blocks — markdown does not interpret
+    // special characters there.
+    let mut value = format!("```r\n{}\n```\n\n", def_info.statement);
+    if def_info.source_uri == *current_uri {
+        value.push_str(&format!("this file, line {}", def_info.line + 1));
+    } else {
+        let workspace_root = state.workspace_folders.first();
+        let relative_path = compute_relative_path(&def_info.source_uri, workspace_root);
+        value.push_str(&format!(
+            "[{}]({}), line {}",
+            relative_path,
+            def_info.source_uri.as_str(),
+            def_info.line + 1
+        ));
+    }
+    value
 }
 
 /// Result of finding a statement node - includes whether to extract header only
@@ -13742,10 +13966,12 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
 
 /// Provide hover information for the symbol at a given text document position.
 ///
-/// Tries, in order:
-/// 1. Cross-file symbol resolution (including local definitions), returning an extracted definition or signature with source attribution.
-/// 2. Package exports discovered from the combined package scope, returning a signature and package attribution.
-/// 3. Cached R help text or a one-time lookup of R help for builtins and other symbols.
+/// Tries, in order (see `docs/hover.md` for the user-facing contract):
+/// 1. Namespace qualifier `pkg::name`: the member side resolves the qualified help topic; the package side (`pkg`) shows the package's `DESCRIPTION` `Title`/`Description` (#382 step 1).
+/// 2. Structural labels — *resolve where possible, otherwise suppress* (#382 steps 2-4, layered on top of `is_structural_label`): a named-argument label → a user function's exact formal; a parameter name at a definition site → its `@param` roxygen; an `obj$name`/`obj@slot` member → its local definition (via `qualified_resolve`). A label that resolves to none of these falls through to the `is_structural_label` backstop and produces nothing — **resolve-or-suppress, never resolve-or-attribute**, so the #379 `from {base}` misattribution cannot recur.
+/// 3. Cross-file symbol resolution (including local definitions), returning an extracted definition or signature with source attribution.
+/// 4. Package exports discovered from the combined package scope, returning a signature and package attribution.
+/// 5. Cached R help text or a one-time lookup of R help for builtins and other symbols.
 ///
 /// The produced hover content is Markdown (code block for signatures/definitions and optional attribution) and the hover range corresponds to the identifier node under the cursor.
 ///
@@ -13815,6 +14041,19 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     // scope happened to surface (often `base`/`stats::filter`), and the
     // bold help-panel link would point at the wrong package.
     if let Some(qualifier_pkg) = find_namespace_context(&node, &text) {
+        // Package side (`pkg` in `pkg::name`): show the package's DESCRIPTION
+        // Title/Description instead of a `pkg::pkg` help artifact (#382 step 1).
+        // The member (RHS) side keeps the qualified help-topic behavior below.
+        if node.kind() == "identifier" && is_namespace_package_side(node) {
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: package_metadata_hover(state, name),
+                }),
+                range: Some(node_range),
+            });
+        }
+
         let pkg_owned = qualifier_pkg.to_string();
         let mut value = build_help_panel_link(name, &pkg_owned);
         if let Some(help_text) =
@@ -13835,6 +14074,93 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             }),
             range: Some(node_range),
         });
+    }
+
+    // #382 steps 2-4: structural labels that hover can now *resolve* rather than
+    // blanket-suppress. Each branch is purely additive and gated on its own AST
+    // shape, and any label that does NOT resolve falls through to the
+    // `is_structural_label` gate below — so the invariant is resolve-or-suppress,
+    // never resolve-or-attribute (the #379 `from {base}` defect class). The
+    // shared predicate is left untouched, so diagnostics are unaffected.
+    if node.kind() == "identifier" {
+        // Step 2: a named-argument label that resolves to a *user-defined*
+        // function's exact (non-`...`) formal shows that formal + default +
+        // `@param` doc. Package/builtin/unresolvable callees, and labels that
+        // are not a real formal, fall through to suppression — never to package
+        // attribution (the #379 `from {base}` defect). `resolve_user_only` makes
+        // no R-subprocess call, so it is safe in this async context.
+        if let Some(func_node) = named_arg_call_function(node) {
+            let funcname = node_text(func_node, &text);
+            if let Some(signature) = crate::parameter_resolver::resolve_user_only(
+                state,
+                &state.signature_cache,
+                funcname,
+                uri,
+                position,
+            ) && let Some(param) = signature
+                .parameters
+                .iter()
+                .find(|p| p.name == name && !p.is_dots)
+            {
+                let decl = match &param.default_value {
+                    Some(default) => format!("{} = {}", name, default),
+                    None => name.to_string(),
+                };
+                let param_doc = match &signature.source {
+                    crate::parameter_resolver::SignatureSource::CurrentFile { uri, line }
+                    | crate::parameter_resolver::SignatureSource::CrossFile { uri, line } => {
+                        state.get_document(uri).and_then(|doc| {
+                            crate::roxygen::user_function_param_doc(&doc.text(), *line, name)
+                        })
+                    }
+                    crate::parameter_resolver::SignatureSource::RSubprocess { .. } => None,
+                };
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: parameter_hover(&decl, Some(funcname), param_doc.as_deref()),
+                    }),
+                    range: Some(node_range),
+                });
+            }
+        }
+
+        // Step 3: a parameter name at a definition site shows its `@param`
+        // roxygen when the enclosing *named* function is documented; otherwise
+        // it falls through to suppression (nothing for undocumented/anonymous).
+        if is_parameter_name(node)
+            && let Some(func_line) = enclosing_named_function_line(node)
+            && let Some(doc) = crate::roxygen::user_function_param_doc(&text, func_line, name)
+        {
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: parameter_hover(name, None, Some(&doc)),
+                }),
+                range: Some(node_range),
+            });
+        }
+
+        // Step 4: an `obj$name` / `obj@slot` member whose container has a *local*
+        // member definition shows that definition — reusing go-to-definition's
+        // `qualified_resolve`, so the two stay in parity. Members of
+        // package/runtime objects have no static definition and fall through to
+        // suppression (no live session to inspect).
+        if let Some((lhs_node, op)) = crate::extract_op::extract_operator_rhs(node)
+            && let Some(path) = crate::qualified_resolve::build_qualified_path(lhs_node, &text)
+            && let Some(location) = crate::qualified_resolve::resolve_qualified_member(
+                state, uri, position, &path, name, op,
+            )
+            && let Some(def_info) = member_definition_info(state, &location)
+        {
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: local_definition_hover(state, &def_info, uri),
+                }),
+                range: Some(node_range),
+            });
+        }
     }
 
     // Suppress hovers on structural labels (see `is_structural_label` for the
@@ -13905,22 +14231,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         let workspace_root = state.workspace_folders.first();
         match extract_definition_statement(symbol, state) {
             Some(def_info) => {
-                // Note: No escaping needed inside code blocks - markdown doesn't interpret special chars there
-                value.push_str(&format!("```r\n{}\n```\n\n", def_info.statement));
-
-                // Add file location
-                if def_info.source_uri == *uri {
-                    value.push_str(&format!("this file, line {}", def_info.line + 1));
-                } else {
-                    let relative_path = compute_relative_path(&def_info.source_uri, workspace_root);
-                    let absolute_path = def_info.source_uri.as_str();
-                    value.push_str(&format!(
-                        "[{}]({}), line {}",
-                        relative_path,
-                        absolute_path,
-                        def_info.line + 1
-                    ));
-                }
+                value = local_definition_hover(state, &def_info, uri);
             }
             None => {
                 // Graceful fallback: show symbol info without definition statement
@@ -38080,6 +38391,419 @@ result <- my_func(1, 2)"#;
         assert!(
             hover_result.is_some(),
             "hovering a definition's assignment target must surface the definition, got None"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #382 step 1: package-side namespace hover (`pkg` in `pkg::name`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_hover_namespace_package_side_shows_description() {
+        // Hovering the package side of `pkg::fn` shows the package's
+        // Title/Description from its DESCRIPTION, not a `pkg::pkg` / `from {pkg}`
+        // artifact.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let pkg_dir = tmp.path().join("mypkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("NAMESPACE"), "export(foo)\n").unwrap();
+        fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: mypkg\nTitle: My Example Package\nDescription: Does useful things\n  across multiple lines.\n",
+        )
+        .unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "mypkg::foo()";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Column 2 lands inside `mypkg` (the package side).
+        let position = Position::new(0, 2);
+        let hover = hover_blocking(&state, &uri, position).expect("package-side hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("My Example Package"),
+                "title missing: {value}"
+            );
+            assert!(
+                value.contains("Does useful things across multiple lines."),
+                "folded description missing: {value}"
+            );
+            assert!(
+                !value.contains("from {"),
+                "must not render a from-{{pkg}} artifact: {value}"
+            );
+            assert!(
+                !value.contains("mypkg::mypkg"),
+                "must not render the pkg::pkg help artifact: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_namespace_package_side_not_installed() {
+        // The package side of an uninstalled `pkg::fn` shows a clear note rather
+        // than nothing or a misattribution.
+        let mut state = WorldState::new(Vec::new());
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![std::path::PathBuf::from(
+            "/nonexistent_raven_libpath_382",
+        )]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "nosuchpkg::foo()";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let position = Position::new(0, 2);
+        let hover =
+            hover_blocking(&state, &uri, position).expect("package-side hover even when missing");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert_eq!(value, "Package `nosuchpkg` is not installed.");
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // #382 step 3: parameter name at a definition site -> @param roxygen
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_hover_parameter_def_shows_param_doc() {
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "\
+#' Add two numbers
+#' @param a the first addend
+#' @param b the second addend
+add <- function(a, b) a + b
+";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Line 3 (0-based) is `add <- function(a, b) a + b`; `a` is at column 16.
+        let position = Position::new(3, 16);
+        let hover = hover_blocking(&state, &uri, position).expect("param-def hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(value.contains("the first addend"), "got: {value}");
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_parameter_def_undocumented_returns_none() {
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "add <- function(a, b) a + b\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `a` is at column 16; the function is undocumented, so hover suppresses.
+        let position = Position::new(0, 16);
+        let hover = hover_blocking(&state, &uri, position);
+        assert!(
+            hover.is_none(),
+            "undocumented parameter must be suppressed, got: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn test_hover_anonymous_function_param_returns_none() {
+        // A roxygen block above an anonymous IIFE must NOT be attributed to its
+        // parameter — only named functions carry roxygen.
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "#' @param x the x\n(function(x) x)(1)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `x` (the parameter) is at column 10 of line 1: `(function(x) x)(1)`.
+        let position = Position::new(1, 10);
+        let hover = hover_blocking(&state, &uri, position);
+        assert!(
+            hover.is_none(),
+            "anonymous-function parameter must be suppressed, got: {hover:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #382 step 2: named-arg label -> enclosing function's formal
+    // (gating & guardrails — don't reintroduce #379)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_hover_named_arg_resolves_user_formal() {
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "f <- function(x, param) x + param\nf(param = 5)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `param` in `f(param = 5)` (line 1) starts at column 2.
+        let position = Position::new(1, 2);
+        let hover = hover_blocking(&state, &uri, position).expect("named-arg formal hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("param"),
+                "should mention the formal: {value}"
+            );
+            assert!(
+                value.contains("parameter of `f`"),
+                "should attribute to f: {value}"
+            );
+            assert!(
+                !value.contains("from {"),
+                "must not fall through to package attribution: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_named_arg_shows_default_and_param_doc() {
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "\
+#' @param param the tuning knob
+f <- function(x, param = 10) x + param
+f(param = 5)
+";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `param` in `f(param = 5)` is on line 2, column 2.
+        let position = Position::new(2, 2);
+        let hover = hover_blocking(&state, &uri, position).expect("named-arg hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("param = 10"),
+                "should show the default: {value}"
+            );
+            assert!(
+                value.contains("the tuning knob"),
+                "should show the @param doc: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_named_arg_positional_value_not_a_formal() {
+        // `f(val, param = 2)` hovering `val` (a positional value) must resolve as
+        // the local variable, NEVER as "formal x of f".
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "f <- function(x, param) x + param\nval <- 1\nf(val, param = 2)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `val` in `f(val, param = 2)` (line 2) starts at column 2.
+        let position = Position::new(2, 2);
+        let hover = hover_blocking(&state, &uri, position).expect("variable hover for val");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                !value.contains("parameter of"),
+                "a positional value must not be read as a formal: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_named_arg_value_identifier_not_a_label() {
+        // `f(param = value)` hovering `value` → variable hover, not a label.
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "f <- function(x, param) x + param\nvalue <- 7\nf(param = value)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `value` in `f(param = value)` (line 2) starts at column 10.
+        let position = Position::new(2, 10);
+        let hover = hover_blocking(&state, &uri, position).expect("variable hover for value");
+        if let HoverContents::Markup(MarkupContent { value: v, .. }) = hover.contents {
+            assert!(
+                !v.contains("parameter of"),
+                "the value identifier must not be read as a label: {v}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_named_arg_inner_call_resolves_against_inner_fn() {
+        // `f(g(param = 1))` hovering `param` resolves against `g`, not `f`.
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "f <- function(a) a\ng <- function(param) param\nf(g(param = 1))\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `param` in `f(g(param = 1))` (line 2) starts at column 4.
+        let position = Position::new(2, 4);
+        let hover = hover_blocking(&state, &uri, position).expect("inner-call formal hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("parameter of `g`"),
+                "must resolve against the immediately-enclosing call g: {value}"
+            );
+            assert!(
+                !value.contains("parameter of `f`"),
+                "must not resolve against the outer call f: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_named_arg_data_keyword_suppressed() {
+        // `list(a = 1)` / `data.frame(z = 1)`: the key is a data key, not a formal
+        // of a user-defined function → nothing (no `...` chase, no package
+        // attribution).
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "list(a = 1)\ndata.frame(z = 1)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `a` in `list(a = 1)` is at column 5.
+        assert!(
+            hover_blocking(&state, &uri, Position::new(0, 5)).is_none(),
+            "list key must be suppressed"
+        );
+        // `z` in `data.frame(z = 1)` is at column 11.
+        assert!(
+            hover_blocking(&state, &uri, Position::new(1, 11)).is_none(),
+            "data.frame key must be suppressed"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #382 step 4: obj$name / obj@slot members with a local definition
+    // (parity with go-to-definition via qualified_resolve)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_hover_dollar_member_local_assignment() {
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "foo <- list()\nfoo$bar <- 99\nuse(foo$bar)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `bar` in `use(foo$bar)` (line 2) is at column 8.
+        let position = Position::new(2, 8);
+        let hover = hover_blocking(&state, &uri, position).expect("member-assignment hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("foo$bar <- 99"),
+                "should show the member definition: {value}"
+            );
+            assert!(
+                value.contains("this file, line 2"),
+                "should show the definition location: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_dollar_member_constructor_literal() {
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "foo <- list(bar = 1, baz = 2)\nuse(foo$bar)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `bar` in `use(foo$bar)` (line 1) is at column 9.
+        let position = Position::new(1, 9);
+        let hover = hover_blocking(&state, &uri, position).expect("constructor-literal hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("foo <- list(bar = 1, baz = 2)"),
+                "should show the constructor statement: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_at_slot_local_assignment() {
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "obj <- list()\nobj@slot <- 5\nuse(obj@slot)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `slot` in `use(obj@slot)` (line 2) is at column 8.
+        let position = Position::new(2, 8);
+        let hover = hover_blocking(&state, &uri, position).expect("slot-assignment hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("obj@slot <- 5"),
+                "should show the slot definition: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_dollar_member_unresolved_suppressed() {
+        // `obj` has no local member definition, and there is no live session to
+        // inspect a runtime object — so the member hover is suppressed.
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_scan_complete = true;
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "use(obj$name)\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `name` in `use(obj$name)` is at column 8.
+        let position = Position::new(0, 8);
+        let hover = hover_blocking(&state, &uri, position);
+        assert!(
+            hover.is_none(),
+            "an unresolved member must be suppressed, got: {hover:?}"
         );
     }
 
