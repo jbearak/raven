@@ -5843,6 +5843,49 @@ fn collect_undefined_variables_from_snapshot(
     }
 }
 
+/// Returns true when `node` is the *target* of an assignment — the LHS of
+/// `x <- 1` / `x = 1` / `x <<- 1`, or the RHS target of `1 -> x` / `1 ->> x`.
+///
+/// Such an identifier is a structural non-reference for diagnostics (it binds a
+/// name rather than using one — see `is_structural_non_reference`, which
+/// delegates here), but it is a *definition site*: `hover` excludes assignment
+/// targets from its structural-non-reference suppression so hovering a
+/// definition still surfaces it.
+fn is_assignment_target(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "binary_operator" {
+        return false;
+    }
+
+    let mut cursor = parent.walk();
+    let mut children = parent.children(&mut cursor);
+    let first = children.next();
+    let second = children.next();
+    let third = children.next();
+
+    let (Some(first), Some(second)) = (first, second) else {
+        return false;
+    };
+    let op_text = node_text(second, text);
+    // Left-assignment LHS: `x <- 1`, `x = 1`, `x <<- 1`.
+    if first.id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
+        return true;
+    }
+    // Right-assignment target: `1 -> x`, `1 ->> x`.
+    if let Some(third) = third
+        && third.id() == node.id()
+        && matches!(op_text, "->" | "->>")
+    {
+        return true;
+    }
+
+    false
+}
+
 /// Returns true if the given identifier node is a *structural non-reference*:
 /// an identifier that exists in the AST but never refers to a value at runtime,
 /// regardless of which diagnostic pipeline is consuming it.
@@ -5872,36 +5915,24 @@ fn collect_undefined_variables_from_snapshot(
 /// hovers on structural non-references — attributing a named-argument label
 /// (`title` in `labs(title = ...)`) to a definition or package was the reported
 /// `from {base}` bug — so hover and the diagnostics pass agree on what counts as
-/// a value reference.
+/// a value reference. Hover makes ONE exception: assignment targets (see
+/// `is_assignment_target`) are definition sites, so hover excludes them from the
+/// suppression to keep surfacing the definition (regression: hovering `add` in
+/// `add <- function(...)`). Diagnostics still treat them as non-references.
 fn is_structural_non_reference(node: Node, text: &str) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
+
+    // Assignment targets bind a name rather than use one. They are
+    // structural non-references for diagnostics, but a *definition site* for
+    // hover — see `is_assignment_target` and the hover guard, which excludes
+    // them so hovering a definition still surfaces it.
+    if is_assignment_target(node, text) {
+        return true;
+    }
 
     let Some(parent) = node.parent() else {
         return false;
     };
-
-    if parent.kind() == "binary_operator" {
-        let mut cursor = parent.walk();
-        let mut children = parent.children(&mut cursor);
-        let first = children.next();
-        let second = children.next();
-        let third = children.next();
-
-        if let (Some(first), Some(second)) = (first, second) {
-            let op_text = node_text(second, text);
-            // Left-assignment LHS: `x <- 1`, `x = 1`, `x <<- 1`.
-            if first.id() == node.id() && matches!(op_text, "<-" | "=" | "<<-") {
-                return true;
-            }
-            // Right-assignment target: `1 -> x`, `1 ->> x`.
-            if let Some(third) = third
-                && third.id() == node.id()
-                && matches!(op_text, "->" | "->>")
-            {
-                return true;
-            }
-        }
-    }
 
     // Named argument: `n = 1` in `f(..., n = 1)`.
     if parent.kind() == "argument"
@@ -13770,7 +13801,12 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     // `is_structural_non_reference`. Gated on `identifier` because strings
     // (file-path hover) must not reach the predicate, and placed after the
     // namespace branch so qualified `pkg::name` hovers still resolve.
-    if node.kind() == "identifier" && is_structural_non_reference(node, &text) {
+    // Assignment targets are excluded: they are definition sites, so hovering
+    // `add` in `add <- function(...)` must still surface the definition.
+    if node.kind() == "identifier"
+        && is_structural_non_reference(node, &text)
+        && !is_assignment_target(node, &text)
+    {
         return None;
     }
 
@@ -37992,6 +38028,32 @@ result <- my_func(1, 2)"#;
         assert!(
             hover_result.is_none(),
             "named-argument label must not produce a value-reference hover, got: {hover_result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hover_assignment_target_definition_is_a_reference() {
+        // Regression (PR #379 over-reach): an assignment target is a structural
+        // non-reference for *diagnostics* (it defines a binding, it is not a
+        // use), but it IS a definition site — hovering it must still surface the
+        // definition. The structural-non-reference hover guard suppressed every
+        // such identifier, which broke hover on `add` in `add <- function(...)`.
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "add <- function(a, b) {\n    a + b\n}\n";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Column 0 lands on `add`, the assignment target / definition name.
+        let position = Position::new(0, 0);
+        let hover_result = hover_blocking(&state, &uri, position);
+
+        assert!(
+            hover_result.is_some(),
+            "hovering a definition's assignment target must surface the definition, got None"
         );
     }
 
