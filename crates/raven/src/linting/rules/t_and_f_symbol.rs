@@ -66,9 +66,10 @@ fn is_excluded_position(ident: Node<'_>) -> bool {
         "binary_operator" => is_assignment_target(parent, ident),
         "extract_operator" => {
             // `$` / `@`: skip the RHS field name; LHS is a real reference.
-            parent
-                .child_by_field_name("rhs")
-                .is_some_and(|rhs| rhs.id() == ident.id())
+            // Centralized in `crate::extract_op` so this predicate,
+            // go-to-def's qualified-member resolver, and
+            // `handlers.rs::is_structural_label` cannot drift on the AST shape.
+            crate::extract_op::extract_operator_rhs(ident).is_some()
         }
         "argument" => {
             // Named argument: `foo(T = TRUE)` — `T` here is a parameter label.
