@@ -222,12 +222,18 @@ The earlier `list(gamma = 1)` is an *earlier* establishing site, so it is below
 the cutoff and excluded. A subsequent `alpha$beta$epsilon <- 3` is added (it is
 after the cutoff).
 
-**Residual cross-file imprecision.** Ordering establishing sites that live in
-*different files* relies on the contributor-chain / visible-cutoff ordering —
-the same basis `pick_winner` already uses for cross-file member selection. No
-new class of imprecision is introduced; the worst case for a pathological
-cross-file whole-prefix reassignment is the same coarse ordering the depth-1
-cross-file path already accepts.
+**Cross-file reassignment.** A `source()` that brings the head's defining file
+into scope is itself an establishing event, so it competes with cursor-file
+prefix writes for the latest cutoff. A cursor-file reassignment after the
+`source()` therefore drops the upstream members it replaced (and a `source()`
+after a cursor-file reassignment re-establishes them). This is ordered by the
+direct source-call line in the cursor file.
+
+**Residual imprecision.** When the defining file is reached only *transitively*
+(no direct `source()` call in the cursor file), there is no cursor-file line to
+order it against, so upstream members are kept conservatively (over-offer, never
+wrong-variable). This is the same coarse contributor-chain basis `pick_winner`
+already accepts for cross-file selection.
 
 ## Testing
 

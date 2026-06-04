@@ -22,11 +22,14 @@
 //! ## Reassignment (establishing-site cutoff)
 //!
 //! Members reflect the value live at the cursor. A whole-value (re)write of an
-//! intermediate prefix in the cursor file (`alpha$beta <- ...`, constructor or
-//! opaque) is an *establishing site*; members declared before the latest such
-//! site are dropped (see [`collect_establishing_site_positions`] and the cutoff
-//! in the core collector). Cross-file establishing-site ordering is left to the
-//! contributor-chain union — the documented residual imprecision.
+//! intermediate prefix (`alpha$beta <- ...`, constructor or opaque) is an
+//! *establishing site*; members declared before the latest visible one are
+//! dropped (see [`collect_prefix_writes`] and the cutoff in the core collector).
+//! A `source()` that brings the head's defining file into scope is itself an
+//! establishing event, so a cursor-file reassignment also drops members from
+//! upstream files sourced before it. The residual imprecision is narrowed to a
+//! defining file reached only *transitively* (no direct source line in the
+//! cursor file), where upstream members are kept conservatively.
 //!
 //! For `foo$bar` (or `foo@bar`) where the cursor is on `bar`:
 //!
