@@ -19,11 +19,12 @@ Hover returns nothing for symbols R doesn't recognize and that aren't in scope.
 Hover tries sources in this order and stops at the first match. This matches the logic in `crates/raven/src/handlers.rs::hover`:
 
 1. **Namespace qualifier.** If the cursor is inside a `pkg::name` or `pkg:::name` expression, the qualifier wins — even if the file-local scope would resolve `name` to something else. Without this rule, hovering `filter` inside `dplyr::filter(...)` could show `stats::filter` whenever the workspace happened to surface that one first.
-2. **Cross-file scope.** Raven resolves the identifier through the dependency graph at the cursor's position. If it finds a local definition, a sourced definition, a declared symbol, or a package export that's in scope, it builds the hover from that symbol.
-3. **Package exports from loaded packages.** If the identifier isn't in the cross-file scope but it matches a symbol exported by any package loaded at the cursor (including packages inherited from parent files), hover shows that package's help topic.
-4. **R help fallback.** For anything left over — base/recommended built-ins, or symbols whose origin Raven can't infer — hover asks R for a help topic and returns it verbatim in a code block.
+2. **Structural non-references stop here.** An identifier that never refers to a value at runtime — a named-argument label (`title` in `labs(title = ...)`), an assignment target, a function-parameter name, or the member name in `obj$name` — produces no hover. These are not lookups, so attributing them to a definition or package (e.g. the misleading `from {base}`) would be wrong. Hover and the diagnostics pass share one predicate for this distinction, so they always agree on what counts as a reference.
+3. **Cross-file scope.** Raven resolves the identifier through the dependency graph at the cursor's position. If it finds a local definition, a sourced definition, a declared symbol, or a package export that's in scope, it builds the hover from that symbol.
+4. **Package exports from loaded packages.** If the identifier isn't in the cross-file scope but it matches a symbol exported by any package loaded at the cursor (including packages inherited from parent files), hover shows that package's help topic.
+5. **R help fallback.** For anything left over — base/recommended built-ins, or symbols whose origin Raven can't infer — hover asks R for a help topic and returns it verbatim in a code block.
 
-Each step takes the first hit and stops; steps 2–4 never run once a match is found.
+Each step takes the first hit and stops; steps 3–5 never run once a match is found.
 
 ## File Location Lines
 
