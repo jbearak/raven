@@ -351,8 +351,7 @@ pub fn resolve_qualified_member(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: &str,
     op: ExtractOp,
 ) -> Option<Location> {
@@ -360,8 +359,7 @@ pub fn resolve_qualified_member(
         state,
         uri,
         position,
-        lhs_node_kind,
-        lhs_name,
+        path,
         rhs_name,
         op,
         &DiagCancelToken::never(),
@@ -384,8 +382,7 @@ pub fn resolve_qualified_member_with_cancel(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: &str,
     op: ExtractOp,
     cancel: &DiagCancelToken,
@@ -394,8 +391,7 @@ pub fn resolve_qualified_member_with_cancel(
         state,
         uri,
         position,
-        lhs_node_kind,
-        lhs_name,
+        path,
         Some(rhs_name),
         op,
         cancel,
@@ -421,16 +417,14 @@ pub fn complete_qualified_members(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     op: ExtractOp,
 ) -> Vec<QualifiedMemberCompletion> {
     complete_qualified_members_with_cancel(
         state,
         uri,
         position,
-        lhs_node_kind,
-        lhs_name,
+        path,
         op,
         &DiagCancelToken::never(),
     )
@@ -445,20 +439,12 @@ pub fn complete_qualified_members_with_cancel(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Vec<QualifiedMemberCompletion> {
     let Some(batch) = collect_qualified_member_candidates_with_cancel(
-        state,
-        uri,
-        position,
-        lhs_node_kind,
-        lhs_name,
-        None,
-        op,
-        cancel,
+        state, uri, position, path, None, op, cancel,
     ) else {
         return Vec::new();
     };
@@ -522,15 +508,15 @@ fn collect_qualified_member_candidates_with_cancel(
     state: &WorldState,
     uri: &Url,
     position: Position,
-    lhs_node_kind: &str,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Option<CandidateBatch> {
-    if lhs_node_kind != "identifier" || cancel.is_cancelled() {
+    if cancel.is_cancelled() {
         return None;
     }
+    let lhs_name = path.head.as_str();
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
     let scope = crate::handlers::get_cross_file_scope_with_cache(
@@ -1606,18 +1592,31 @@ mod tests {
         }
     }
 
+    fn dollar_path(head: &str, segments: &[&str]) -> super::QualifiedPath {
+        super::QualifiedPath {
+            head: head.to_string(),
+            segments: segments
+                .iter()
+                .map(|s| super::Segment {
+                    name: s.to_string(),
+                    op: crate::extract_op::ExtractOp::Dollar,
+                })
+                .collect(),
+        }
+    }
+
     fn completion_names(
         state: &WorldState,
         uri: &Url,
         position: Position,
         lhs_name: &str,
     ) -> Vec<String> {
+        let path = dollar_path(lhs_name, &[]);
         super::complete_qualified_members(
             state,
             uri,
             position,
-            "identifier",
-            lhs_name,
+            &path,
             crate::extract_op::ExtractOp::Dollar,
         )
         .into_iter()
@@ -1645,14 +1644,14 @@ mod tests {
 
             let mut state = fresh_state();
             let uri = add_indexed_doc(&mut state, "file:///perf.R", &code);
+            let df_path = dollar_path("df", &[]);
 
             // Warm-up to populate any one-shot caches.
             let _ = super::complete_qualified_members(
                 &state,
                 &uri,
                 Position::new(cursor_line, 3),
-                "identifier",
-                "df",
+                &df_path,
                 crate::extract_op::ExtractOp::Dollar,
             );
 
@@ -1663,8 +1662,7 @@ mod tests {
                     &state,
                     &uri,
                     Position::new(cursor_line, 3),
-                    "identifier",
-                    "df",
+                    &df_path,
                     crate::extract_op::ExtractOp::Dollar,
                 );
                 *s = start.elapsed();
@@ -1743,12 +1741,12 @@ mod tests {
             }
 
             // Warm-up.
+            let df_path = dollar_path("df", &[]);
             let _ = super::complete_qualified_members(
                 &state,
                 &main_uri,
                 Position::new(cursor_line, 3),
-                "identifier",
-                "df",
+                &df_path,
                 crate::extract_op::ExtractOp::Dollar,
             );
 
@@ -1759,8 +1757,7 @@ mod tests {
                     &state,
                     &main_uri,
                     Position::new(cursor_line, 3),
-                    "identifier",
-                    "df",
+                    &df_path,
                     crate::extract_op::ExtractOp::Dollar,
                 );
                 *s = start.elapsed();
@@ -2233,8 +2230,7 @@ foo$
             &state,
             &main_uri,
             Position::new(2, 4),
-            "identifier",
-            "foo",
+            &dollar_path("foo", &[]),
             crate::extract_op::ExtractOp::Dollar,
         );
 

@@ -12459,12 +12459,15 @@ fn dollar_member_completion_items(
     position: Position,
     context: &DollarMemberCompletionContext,
 ) -> Vec<CompletionItem> {
+    let path = crate::qualified_resolve::QualifiedPath {
+        head: context.lhs_name.clone(),
+        segments: Vec::new(),
+    };
     crate::qualified_resolve::complete_qualified_members(
         state,
         uri,
         position,
-        "identifier",
-        &context.lhs_name,
+        &path,
         crate::extract_op::ExtractOp::Dollar,
     )
     .into_iter()
@@ -14847,27 +14850,17 @@ pub fn goto_definition_with_cancel(
     // `docs/superpowers/specs/2026-05-02-dollar-rhs-goto-def-design.md`.
     if let Some((lhs_node, op)) = crate::extract_op::extract_operator_rhs(node) {
         let rhs_name = node_text(node, &text);
-        let lhs_name = node_text(lhs_node, &text);
+        // Build the container path from the LHS subtree. Nested chains
+        // (`alpha$beta$gamma`) resolve against the full path; a non-static LHS
+        // (`f()$x`, `alpha[[i]]$x`) yields `None` and falls through to nothing.
+        let path = crate::qualified_resolve::build_qualified_path(lhs_node, &text)?;
         let location = if cancel.is_never() {
             crate::qualified_resolve::resolve_qualified_member(
-                state,
-                uri,
-                position,
-                lhs_node.kind(),
-                lhs_name,
-                rhs_name,
-                op,
+                state, uri, position, &path, rhs_name, op,
             )
         } else {
             crate::qualified_resolve::resolve_qualified_member_with_cancel(
-                state,
-                uri,
-                position,
-                lhs_node.kind(),
-                lhs_name,
-                rhs_name,
-                op,
-                cancel,
+                state, uri, position, &path, rhs_name, op, cancel,
             )
         };
         return location.map(GotoDefinitionResponse::Scalar);
