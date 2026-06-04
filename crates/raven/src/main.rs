@@ -44,10 +44,10 @@ analysis-stats <path>        Profile workspace analysis phases
   --only <phase>             Run only the specified phase
                              (scan, parse, metadata, scope, packages)
 packages <subcommand>        Generate / maintain package databases
-  fetch                      Fetch a repo's Tier 2 .raven/packages.json from r-universe (R-free)
-  freeze                     Write a repo's Tier 2 .raven/packages.json
-  update                     Download the names.db sidecar
-  build-shipped-db           Maintainer-only Tier 3 names.db builder
+  freeze                     Write symbols exported by packages used in this repo to .raven/packages.json
+  fetch                      Like freeze, but fetches package exports from r-universe (use when packages aren't installed locally)
+  update                     Download Raven's package symbol database (for use in CI when packages aren't installed in the runner)
+  build-shipped-db           Maintainer-only package symbol database builder
   build-embedded-base        Maintainer-only embedded base-package table builder
   validate-shipped-db       Maintainer-only names.db compatibility/integrity validator
 freeze, fetch                Top-level aliases for raven packages freeze/fetch

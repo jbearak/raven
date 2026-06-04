@@ -665,24 +665,51 @@ async fn collect_missing_export_metadata_packages(
     missing
 }
 
+/// Warn that some attached packages' exported symbols couldn't be loaded, so the
+/// undefined-variable diagnostics above may be unreliable — then steer the user
+/// to a fix. Leads with impact, then the obvious remedy (install the package),
+/// then a CI-specific fallback.
+///
+/// `tier3_present` is computed by the caller from `p.exists()` over the shipped
+/// database's candidate paths — it means *a database file is on disk*, NOT that
+/// it loaded and was searched successfully (a corrupt/unsupported file also sets
+/// it, and separately produces its own load note). So the present-database
+/// branch must not claim a successful lookup; it states the actionable
+/// conclusion (the package isn't available from the database → use `freeze`).
 fn format_missing_export_metadata_warning(packages: &[String], tier3_present: bool) -> String {
     let mut names = packages.to_vec();
     names.sort();
     names.dedup();
+    let n = names.len();
     names.truncate(8);
     let names = names.join(", ");
 
-    let (detail, verb) = if tier3_present {
-        (
-            "Raven checked installed packages, .raven/packages.json, and names.db.",
-            "refresh",
+    // Count-aware nouns/pronouns so a single package reads naturally.
+    let (noun, obj, inst) = if n == 1 {
+        ("this package", "it", "it's")
+    } else {
+        ("these packages", "them", "they're")
+    };
+
+    let head = format!(
+        "raven check: couldn't load exported symbols for {names}.\n\
+         Some \"Undefined variable\" warnings above may be inaccurate as a result.\n\
+         To fix: install {noun} in your R library."
+    );
+
+    if tier3_present {
+        format!(
+            "{head}\n\
+             Raven's package symbol database doesn't provide {obj} — {inst} likely private or not on CRAN/Bioconductor.\n\
+             Capture {obj} with `raven packages freeze` on a machine where {inst} installed, and commit the result."
         )
     } else {
-        ("Tier 3 names.db is not installed.", "install")
-    };
-    format!(
-        "raven check: package export metadata is missing for {names}.\n{detail}\nRun `raven packages update` to {verb} names.db, or `raven packages freeze` to capture project package metadata."
-    )
+        format!(
+            "{head}\n\
+             In CI without R, run `raven packages update` before `raven check` to download Raven's package symbol database,\n\
+             or commit a `raven packages freeze` snapshot made on a machine where {inst} installed."
+        )
+    }
 }
 
 /// Run the full diagnostic pipeline for one already-opened document. Returns an
@@ -795,23 +822,33 @@ mod tests {
     fn formats_missing_metadata_warning_for_absent_tier3() {
         let msg =
             super::format_missing_export_metadata_warning(&["foo".into(), "bar".into()], false);
-        assert!(
-            msg.contains("package export metadata is missing for bar, foo")
-                || msg.contains("package export metadata is missing for foo, bar")
-        );
-        assert!(msg.contains("Tier 3 names.db is not installed"));
-        assert!(msg.contains("raven packages update"));
+        // Names are sorted, so order is deterministic.
+        assert!(msg.contains("couldn't load exported symbols for bar, foo"));
+        assert!(msg.contains("install these packages in your R library"));
+        // Variant A steers to `update` (then `freeze`) as the CI fallback.
+        assert!(msg.contains("run `raven packages update` before `raven check`"));
         assert!(msg.contains("raven packages freeze"));
+        assert!(!msg.contains("Tier"));
+    }
+
+    #[test]
+    fn formats_missing_metadata_warning_absent_tier3_singular() {
+        let msg = super::format_missing_export_metadata_warning(&["foo".into()], false);
+        assert!(msg.contains("couldn't load exported symbols for foo"));
+        assert!(msg.contains("install this package in your R library"));
+        assert!(msg.contains("where it's installed"));
+        assert!(!msg.contains("Tier"));
     }
 
     #[test]
     fn formats_missing_metadata_warning_for_present_tier3_miss() {
         let msg = super::format_missing_export_metadata_warning(&["foo".into()], true);
-        assert!(
-            msg.contains("Raven checked installed packages, .raven/packages.json, and names.db")
-        );
-        assert!(msg.contains("raven packages update"));
+        assert!(msg.contains("couldn't load exported symbols for foo"));
+        // Singular wording for a single package.
+        assert!(msg.contains("install this package in your R library"));
+        assert!(msg.contains("Raven's package symbol database doesn't provide it"));
         assert!(msg.contains("raven packages freeze"));
+        assert!(!msg.contains("Tier"));
     }
 
     #[test]

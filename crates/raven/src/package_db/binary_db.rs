@@ -51,7 +51,7 @@ impl std::fmt::Display for ShippedDbError {
             ShippedDbError::UnsupportedFormat { found, supported } => write!(
                 f,
                 "names.db has container format v{found}; this Raven understands v{supported}. \
-                 The bundled database is incompatible with this build — Tier 3 export resolution \
+                 The bundled database is incompatible with this build, so its package metadata \
                  is unavailable. Upgrade Raven to match the bundled database."
             ),
             ShippedDbError::Corrupt(d) => write!(f, "names.db is unreadable: {d}"),

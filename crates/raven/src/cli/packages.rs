@@ -883,7 +883,7 @@ pub async fn run_update(args: UpdateArgs) -> Result<(), String> {
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .ok_or_else(|| {
                 "could not determine Raven user-data directory; rerun with --dest-dir, or set \
-                 RAVEN_NAMES_DB to override sidecar lookup"
+                 RAVEN_NAMES_DB to override the database location"
                     .to_string()
             })?,
     };
@@ -1152,8 +1152,8 @@ fn write_unique_temp(dest_dir: &Path, prefix: &str, bytes: Vec<u8>) -> Result<Pa
     }
 
     Err(format!(
-        "could not create unique temporary sidecar in {}; rerun with --dest-dir pointing to a \
-         writable directory, or set RAVEN_NAMES_DB to override sidecar lookup",
+        "could not create unique temporary database file in {}; rerun with --dest-dir pointing to a \
+         writable directory, or set RAVEN_NAMES_DB to override the database location",
         dest_dir.display()
     ))
 }
@@ -1179,8 +1179,8 @@ fn backup_existing_final(final_path: &Path) -> Result<Option<PathBuf>, String> {
     }
 
     Err(format!(
-        "could not create unique backup sidecar for {}; rerun with --dest-dir pointing to a \
-         writable directory, or set RAVEN_NAMES_DB to override sidecar lookup",
+        "could not create unique backup database file for {}; rerun with --dest-dir pointing to a \
+         writable directory, or set RAVEN_NAMES_DB to override the database location",
         final_path.display()
     ))
 }
@@ -1263,7 +1263,7 @@ fn replace_file(tmp: &Path, final_path: &Path) -> std::io::Result<()> {
 fn sidecar_write_error(path: &Path, action: &str, error: std::io::Error) -> String {
     format!(
         "could not {action} {}: {error}; rerun with --dest-dir pointing to a writable \
-         directory, or set RAVEN_NAMES_DB to override sidecar lookup",
+         directory, or set RAVEN_NAMES_DB to override the database location",
         path.display()
     )
 }
