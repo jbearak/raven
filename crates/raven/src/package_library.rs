@@ -1713,6 +1713,30 @@ impl PackageLibrary {
     }
 }
 
+/// Load result of the Tier 3 shipped `names.db`, captured during
+/// [`build_package_library`]. This is a richer signal than "a names.db file is
+/// on disk": it distinguishes *absent* from *present-but-unusable*, which a bare
+/// `Path::exists()` check cannot. Consumers that advise the user (e.g. `raven
+/// check`'s missing-metadata warning) need that distinction — a corrupt or
+/// unsupported DB should steer toward `raven packages update` (re-download a
+/// good copy), not `raven packages freeze` (which only helps when the DB loaded
+/// fine but genuinely lacks the package).
+///
+/// Derived from the same [`crate::package_db::binary_db::ShippedDbProvider::from_file`]
+/// calls that wire the provider, so it never disagrees with whether a working
+/// Tier 3 provider was actually installed. `load_notes` carries the human-readable
+/// failure text; this carries the structured verdict so callers don't parse strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShippedDbLoad {
+    /// No shipped `names.db` candidate exists on disk.
+    Absent,
+    /// A shipped `names.db` was found and loaded successfully (provider wired).
+    Loaded,
+    /// A shipped `names.db` file is present but failed to load — `Corrupt` or
+    /// `UnsupportedFormat`. The detail is also recorded in `load_notes`.
+    Failed,
+}
+
 /// Outcome of [`build_package_library`]: the constructed library plus a single
 /// build status that records R/Tier-1 initialization and any degradation reason.
 /// Consumer readiness is derived by [`PackageLibraryOutcome::consumer_ready`],
@@ -1731,6 +1755,10 @@ pub struct PackageLibraryOutcome {
     /// `Disabled` early-return and the Tier-1-only capture path, which wire no
     /// providers.
     pub load_notes: Vec<String>,
+    /// Whether the Tier 3 shipped `names.db` was absent, loaded, or
+    /// present-but-failed. `Absent` on the `Disabled` early-return and the
+    /// Tier-1-only capture path, which never open the shipped DB.
+    pub shipped_db_load: ShippedDbLoad,
 }
 
 impl PackageLibraryOutcome {
@@ -1827,6 +1855,7 @@ pub async fn build_package_library(
             library: Arc::new(PackageLibrary::new_empty()),
             status: PackageLibraryStatus::Disabled,
             load_notes: Vec::new(),
+            shipped_db_load: ShippedDbLoad::Absent,
         };
     }
 
@@ -1840,7 +1869,7 @@ pub async fn build_package_library(
 
     // Open the fallback DBs off the async runtime (mmap + ~10-20 ms blake3).
     let shipped_db_candidates = crate::package_db::locate_shipped_db_candidates();
-    let (providers, notes) = tokio::task::spawn_blocking(move || {
+    let (providers, notes, shipped_db_load) = tokio::task::spawn_blocking(move || {
         let mut providers: Vec<Box<dyn crate::package_db::PackageMetadataProvider>> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         // Tier 2 first (repo DB), then Tier 3 (shipped DB).
@@ -1851,20 +1880,29 @@ pub async fn build_package_library(
                 Err(e) => notes.push(e.to_string()), // explain-and-continue
             }
         }
+        // Track the Tier 3 verdict alongside the provider: `Absent` until a
+        // candidate proves otherwise. A successful load wins and stops the scan;
+        // a failed candidate records `Failed` but keeps looking, so a later
+        // working candidate still upgrades the verdict to `Loaded`.
+        let mut shipped_db_load = ShippedDbLoad::Absent;
         for path in shipped_db_candidates {
             match crate::package_db::binary_db::ShippedDbProvider::from_file(&path) {
                 Ok(Some(p)) => {
                     providers.push(Box::new(p));
+                    shipped_db_load = ShippedDbLoad::Loaded;
                     break;
                 }
                 Ok(None) => {}
-                Err(e) => notes.push(format!("{}: {e}", path.display())),
+                Err(e) => {
+                    notes.push(format!("{}: {e}", path.display()));
+                    shipped_db_load = ShippedDbLoad::Failed;
+                }
             }
         }
-        (providers, notes)
+        (providers, notes, shipped_db_load)
     })
     .await
-    .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+    .unwrap_or_else(|_| (Vec::new(), Vec::new(), ShippedDbLoad::Absent));
 
     for note in &notes {
         log::warn!("{note}");
@@ -1875,6 +1913,7 @@ pub async fn build_package_library(
         library: Arc::new(lib),
         status,
         load_notes: notes,
+        shipped_db_load,
     }
 }
 
@@ -1920,6 +1959,7 @@ pub async fn build_package_library_tier1_only(
         library: Arc::new(lib),
         status,
         load_notes: Vec::new(),
+        shipped_db_load: ShippedDbLoad::Absent,
     }
 }
 
@@ -1988,6 +2028,12 @@ mod tests {
         // Too short / bad magic => ShippedDb::open returns Corrupt => a load note.
         std::fs::write(&bad, b"NOT A RAVEN DB").unwrap();
 
+        // Point the user-data candidate at an empty dir so the bad env DB is the
+        // only shipped-DB candidate that exists — otherwise a real machine-level
+        // names.db would load after it and flip the verdict to `Loaded`.
+        let empty_user_data = dir.path().join("user-data");
+        std::fs::create_dir_all(&empty_user_data).unwrap();
+        let _user_data_guard = crate::package_db::test_user_data_dir_guard(empty_user_data);
         let _db_env = NamesDbEnvGuard::set(&bad);
         let outcome = build_package_library(None, &[], None, true).await;
 
@@ -2001,6 +2047,8 @@ mod tests {
             "the note should mention names.db; got {:?}",
             outcome.load_notes
         );
+        // ...and the structured verdict reports present-but-failed, not absent.
+        assert_eq!(outcome.shipped_db_load, ShippedDbLoad::Failed);
     }
 
     #[tokio::test]
@@ -2049,6 +2097,9 @@ mod tests {
                 .exports
                 .contains("lower_export")
         );
+        // A failed candidate followed by a working one resolves to `Loaded`:
+        // the working DB was searched, so `freeze` would be the right advice.
+        assert_eq!(outcome.shipped_db_load, ShippedDbLoad::Loaded);
     }
 
     /// Pins the readiness predicate and degradation precedence
@@ -2110,6 +2161,7 @@ mod tests {
             library: Arc::new(PackageLibrary::new_empty()),
             status: PackageLibraryStatus::RNotFound,
             load_notes: Vec::new(),
+            shipped_db_load: ShippedDbLoad::Absent,
         };
 
         assert!(!outcome.consumer_ready());
@@ -2123,6 +2175,7 @@ mod tests {
             library: Arc::new(lib),
             status: PackageLibraryStatus::RNotFound,
             load_notes: Vec::new(),
+            shipped_db_load: ShippedDbLoad::Absent,
         };
 
         assert!(outcome.consumer_ready());
@@ -2145,6 +2198,7 @@ mod tests {
             library: Arc::new(lib),
             status: PackageLibraryStatus::RNotFound,
             load_notes: Vec::new(),
+            shipped_db_load: ShippedDbLoad::Absent,
         };
 
         assert!(outcome.consumer_ready());
@@ -2156,6 +2210,7 @@ mod tests {
             library: Arc::new(PackageLibrary::new_empty()),
             status: PackageLibraryStatus::Ready,
             load_notes: Vec::new(),
+            shipped_db_load: ShippedDbLoad::Absent,
         };
 
         assert!(outcome.consumer_ready());
