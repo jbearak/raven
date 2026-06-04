@@ -608,7 +608,7 @@ fn collect_qualified_member_candidates_with_cancel(
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
-                lhs_name,
+                path,
                 rhs_name,
             ) {
                 defining_candidates.push(candidate);
@@ -621,7 +621,7 @@ fn collect_qualified_member_candidates_with_cancel(
                 &defining_uri,
                 symbol.defined_line,
                 symbol.defined_column,
-                lhs_name,
+                path,
                 rhs_name,
                 &mut defining_candidates,
             );
@@ -1305,7 +1305,7 @@ fn collect_constructor_candidate(
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: &str,
 ) -> Option<Candidate> {
     let mut candidates = Vec::new();
@@ -1316,7 +1316,7 @@ fn collect_constructor_candidate(
         file_uri,
         defined_line,
         defined_column_utf16,
-        lhs_name,
+        path,
         Some(rhs_name),
         &mut candidates,
     );
@@ -1343,10 +1343,11 @@ fn collect_constructor_candidates(
     file_uri: &Url,
     defined_line: u32,
     defined_column_utf16: u32,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     out: &mut Vec<Candidate>,
 ) {
+    let lhs_name = path.head.as_str();
     // LSP columns are UTF-16 units; tree-sitter Point columns are byte offsets.
     // `defined_line` always points to a valid line in `text` (it comes from
     // the artifacts' Def event, which was emitted from a real tree-sitter
@@ -1390,8 +1391,20 @@ fn collect_constructor_candidates(
     let Some(args_node) = value_node.child_by_field_name("arguments") else {
         return;
     };
-    let mut walker = args_node.walk();
-    for child in args_node.children(&mut walker) {
+    // Descend the constructor following the intermediate segments. Each segment
+    // must be a named argument whose value is itself an allowlisted constructor.
+    let mut current_args = args_node;
+    for seg in &path.segments {
+        let Some(child_call) = named_arg_constructor_value(current_args, text, &seg.name) else {
+            return; // segment not present as a nested constructor → no members here
+        };
+        let Some(child_args) = child_call.child_by_field_name("arguments") else {
+            return;
+        };
+        current_args = child_args;
+    }
+    let mut walker = current_args.walk();
+    for child in current_args.children(&mut walker) {
         if child.kind() != "argument" {
             continue;
         }
@@ -1420,6 +1433,35 @@ fn collect_constructor_candidates(
             lhs_pos,
         });
     }
+}
+
+/// In `args` (a constructor call's argument list), find a named argument
+/// `name = <call>` whose value is a call to an allowlisted constructor, and
+/// return that call node. Used to descend nested constructor literals along a
+/// [`QualifiedPath`].
+fn named_arg_constructor_value<'a>(args: Node<'a>, text: &str, name: &str) -> Option<Node<'a>> {
+    let mut walker = args.walk();
+    for child in args.children(&mut walker) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        if name_node.kind() != "identifier" || node_text(name_node, text) != name {
+            continue;
+        }
+        let value = child.child_by_field_name("value")?;
+        if value.kind() != "call" {
+            return None;
+        }
+        let func = value.child_by_field_name("function")?;
+        if func.kind() == "identifier" && CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)) {
+            return Some(value);
+        }
+        return None;
+    }
+    None
 }
 
 fn ascend_to_assignment_for<'a>(start: Node<'a>, text: &str, lhs_name: &str) -> Option<Node<'a>> {
@@ -1679,6 +1721,39 @@ alpha$beta$
             completion_path_names(&state, &uri, Position::new(4, 11), "alpha", &["beta"]);
         names.sort();
         assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_constructor_descent_depth2() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = 1, delta = 2))
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///c.R", code);
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(1, 11), "alpha", &["beta"]);
+        names.sort();
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_constructor_descent_depth3() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = list(epsilon = 1, zeta = 2)))
+alpha$beta$gamma$
+";
+        let uri = add_indexed_doc(&mut state, "file:///c3.R", code);
+        let mut names = completion_path_names(
+            &state,
+            &uri,
+            Position::new(1, 17),
+            "alpha",
+            &["beta", "gamma"],
+        );
+        names.sort();
+        assert_eq!(names, vec!["epsilon".to_string(), "zeta".to_string()]);
     }
 
     /// Perf reproducer: scales the number of `df$col_K <- ...` assignments and
@@ -2022,16 +2097,17 @@ foo$
         assert!(goto_definition(&state, &uri, pos).is_none());
     }
 
-    /// Chained access `foo$bar$baz` returns None (Step-1 limitation,
-    /// documented in the spec).
+    /// Chained access `foo$bar$baz` resolves to the nested constructor member
+    /// (Step-2: the Step-1 "returns None" limitation is lifted).
     #[test]
-    fn chained_access_returns_none() {
+    fn chained_access_resolves_nested_member() {
         let mut state = fresh_state();
         let code = "foo <- list(bar = list(baz = 1))\nuse(foo$bar$baz)\n";
         let uri = add_doc(&mut state, "file:///t.R", code);
         // cursor on `baz`
         let pos = Position::new(1, 13);
-        assert!(goto_definition(&state, &uri, pos).is_none());
+        let l = loc(goto_definition(&state, &uri, pos));
+        assert_eq!(l.range.start.line, 0); // the `baz = 1` constructor argument
     }
 
     /// LHS-shape gate: parenthesized LHS → None.
