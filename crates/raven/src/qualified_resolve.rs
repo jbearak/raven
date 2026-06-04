@@ -626,6 +626,16 @@ fn collect_qualified_member_candidates_with_cancel(
                 &mut defining_candidates,
             );
         }
+        collect_prefix_write_constructor_candidates(
+            defining_tree.root_node(),
+            &defining_text,
+            &defining_col_mapper,
+            &defining_uri,
+            path,
+            rhs_name,
+            &mut defining_candidates,
+            false,
+        );
 
         // Defining-file candidates are collected from the same tree that owns
         // the resolved `lhs_name` binding. The textual LHS match, same-function
@@ -682,6 +692,16 @@ fn collect_qualified_member_candidates_with_cancel(
                     &mut needs_validation,
                     false,
                 );
+                collect_prefix_write_constructor_candidates(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    path,
+                    rhs_name,
+                    &mut needs_validation,
+                    false,
+                );
             } else {
                 // File doesn't define lhs_name itself, but the visible binding
                 // can still change between top-level positions via `source()`,
@@ -711,6 +731,16 @@ fn collect_qualified_member_candidates_with_cancel(
                     path,
                     rhs_name,
                     op,
+                    &mut cross_file_candidates,
+                    true, // skip function bodies
+                );
+                collect_prefix_write_constructor_candidates(
+                    candidate_tree.root_node(),
+                    &candidate_text,
+                    &candidate_col_mapper,
+                    candidate_uri,
+                    path,
+                    rhs_name,
                     &mut cross_file_candidates,
                     true, // skip function bodies
                 );
@@ -1210,6 +1240,16 @@ fn collect_member_assignments(
     out: &mut Vec<Candidate>,
     skip_functions: bool,
 ) {
+    for_each_binary_operator(root, skip_functions, |node| {
+        try_extract_member_assignment(node, text, col_mapper, file_uri, path, rhs_name, op, out);
+    });
+}
+
+/// Walk the tree, invoking `f` on every `binary_operator` node. Skips atomic
+/// leaf subtrees (and function bodies when `skip_functions`). Shared by the
+/// member-assignment and prefix-write discovery passes so they traverse
+/// identically.
+fn for_each_binary_operator<'a>(root: Node<'a>, skip_functions: bool, mut f: impl FnMut(Node<'a>)) {
     let mut cursor = root.walk();
     let mut descended = true; // treat root as just-entered
     loop {
@@ -1239,9 +1279,7 @@ fn collect_member_assignments(
             ) || (skip_functions && kind == "function_definition");
             if !skip {
                 if kind == "binary_operator" {
-                    try_extract_member_assignment(
-                        node, text, col_mapper, file_uri, path, rhs_name, op, out,
-                    );
+                    f(node);
                 }
                 // Descend into children if this node has any.
                 if cursor.goto_first_child() {
@@ -1391,20 +1429,57 @@ fn collect_constructor_candidates(
     let Some(args_node) = value_node.child_by_field_name("arguments") else {
         return;
     };
-    // Descend the constructor following the intermediate segments. Each segment
-    // must be a named argument whose value is itself an allowlisted constructor.
-    let mut current_args = args_node;
-    for seg in &path.segments {
-        let Some(child_call) = named_arg_constructor_value(current_args, text, &seg.name) else {
-            return; // segment not present as a nested constructor → no members here
-        };
-        let Some(child_args) = child_call.child_by_field_name("arguments") else {
-            return;
-        };
-        current_args = child_args;
+    // Descend the constructor following the intermediate segments, then
+    // enumerate the terminal named arguments.
+    let Some(terminal_args) = descend_constructor_args(args_node, text, &path.segments) else {
+        return;
+    };
+    // Constructor candidates become visible only after the defining assignment
+    // completes, so use the effect position for the shared symbol identity check.
+    let effect = EffectPos::from_node_end(assignment, col_mapper);
+    let lhs_pos = Position::new(effect.line, effect.utf16_column);
+    push_constructor_named_args(
+        terminal_args,
+        text,
+        col_mapper,
+        file_uri,
+        assignment,
+        lhs_pos,
+        rhs_name,
+        out,
+    );
+}
+
+/// Descend `args` following `segments` — each must be a named argument whose
+/// value is an allowlisted constructor call. Returns the terminal argument
+/// list, or `None` if any segment cannot be followed.
+fn descend_constructor_args<'a>(
+    mut args: Node<'a>,
+    text: &str,
+    segments: &[Segment],
+) -> Option<Node<'a>> {
+    for seg in segments {
+        let child_call = named_arg_constructor_value(args, text, &seg.name)?;
+        args = child_call.child_by_field_name("arguments")?;
     }
-    let mut walker = current_args.walk();
-    for child in current_args.children(&mut walker) {
+    Some(args)
+}
+
+/// Push one [`Candidate`] per named argument of `args` (filtered by `rhs_name`
+/// when provided), using the supplied assignment metadata and `lhs_pos`.
+#[allow(clippy::too_many_arguments)]
+fn push_constructor_named_args(
+    args: Node,
+    text: &str,
+    col_mapper: &ColMapper,
+    file_uri: &Url,
+    assignment: Node,
+    lhs_pos: Position,
+    rhs_name: Option<&str>,
+    out: &mut Vec<Candidate>,
+) {
+    let mut walker = args.walk();
+    for child in args.children(&mut walker) {
         if child.kind() != "argument" {
             continue;
         }
@@ -1418,19 +1493,96 @@ fn collect_constructor_candidates(
         if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
             continue;
         }
-        let name_range = node_range(name_node, col_mapper);
-        let effect = EffectPos::from_node_end(assignment, col_mapper);
-        // Constructor candidates become visible only after the defining
-        // assignment completes, so use the effect position for the shared
-        // symbol identity check.
-        let lhs_pos = Position::new(effect.line, effect.utf16_column);
         out.push(Candidate {
             name: member_name.to_string(),
             uri: file_uri.clone(),
-            effect,
-            name_range,
+            effect: EffectPos::from_node_end(assignment, col_mapper),
+            name_range: node_range(name_node, col_mapper),
             fn_scope: enclosing_function_id(assignment),
             lhs_pos,
+        });
+    }
+}
+
+/// If `node` is an assignment whose target spine equals `prefix` and whose
+/// value is an allowlisted-constructor call, return `(assignment, target,
+/// ctor_call)`. Used to find whole-value writes to an intermediate path
+/// (`alpha$beta <- list(...)`).
+fn prefix_assignment_constructor<'a>(
+    node: Node<'a>,
+    text: &str,
+    prefix: &QualifiedPath,
+) -> Option<(Node<'a>, Node<'a>, Node<'a>)> {
+    let op_node = node.child_by_field_name("operator")?;
+    let target = match node_text(op_node, text) {
+        "<-" | "=" | "<<-" => node.child_by_field_name("lhs")?,
+        "->" | "->>" => node.child_by_field_name("rhs")?,
+        _ => return None,
+    };
+    if !target_spine_is_path(target, text, prefix) {
+        return None;
+    }
+    let value = assignment_value_node(node, text)?;
+    if value.kind() != "call" {
+        return None;
+    }
+    let func = value.child_by_field_name("function")?;
+    if func.kind() == "identifier" && CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)) {
+        Some((node, target, value))
+    } else {
+        None
+    }
+}
+
+/// Collect members contributed by an assignment whose target spine is a prefix
+/// of `path` longer than the head (`alpha$beta <- list(...)` for path
+/// `[alpha, beta, ...]`), with an allowlisted-constructor RHS, descended to the
+/// full path. Each terminal named argument becomes a candidate.
+#[allow(clippy::too_many_arguments)]
+fn collect_prefix_write_constructor_candidates(
+    root: Node,
+    text: &str,
+    col_mapper: &ColMapper,
+    file_uri: &Url,
+    path: &QualifiedPath,
+    rhs_name: Option<&str>,
+    out: &mut Vec<Candidate>,
+    skip_functions: bool,
+) {
+    for k in 1..=path.segments.len() {
+        let prefix = QualifiedPath {
+            head: path.head.clone(),
+            segments: path.segments[..k].to_vec(),
+        };
+        let remaining: Vec<Segment> = path.segments[k..].to_vec();
+        for_each_binary_operator(root, skip_functions, |node| {
+            let Some((assignment, target, ctor)) =
+                prefix_assignment_constructor(node, text, &prefix)
+            else {
+                return;
+            };
+            let Some(ctor_args) = ctor.child_by_field_name("arguments") else {
+                return;
+            };
+            let Some(terminal_args) = descend_constructor_args(ctor_args, text, &remaining) else {
+                return;
+            };
+            // Use the head identifier position so cross-file validation and
+            // region partitioning treat these like member-assignment candidates.
+            let Some(head_id) = leftmost_identifier(target) else {
+                return;
+            };
+            let lhs_pos = node_range(head_id, col_mapper).start;
+            push_constructor_named_args(
+                terminal_args,
+                text,
+                col_mapper,
+                file_uri,
+                assignment,
+                lhs_pos,
+                rhs_name,
+                out,
+            );
         });
     }
 }
@@ -1754,6 +1906,21 @@ alpha$beta$gamma$
         );
         names.sort();
         assert_eq!(names, vec!["epsilon".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn intermediate_constructor_assignment() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha$beta <- list(gamma = 1, delta = 2)
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///i.R", code);
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(2, 11), "alpha", &["beta"]);
+        names.sort();
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
     }
 
     /// Perf reproducer: scales the number of `df$col_K <- ...` assignments and
