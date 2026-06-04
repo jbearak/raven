@@ -29,9 +29,10 @@ Guiding rule for which jargon to remove:
 
 ## Scope
 
-Four areas of user-facing copy (the `check` warning, `--help` text, the
+Four areas of user-facing CLI copy (the `check` warning, `--help` text, the
 package-database load error, and `packages update` error guidance), plus one
-help-text reordering. No control-flow, signature, or data-structure changes. The
+help-text reordering, plus a terminology alignment pass over the published user
+docs (Change 5). No control-flow, signature, or data-structure changes. The
 `check` warning keeps its existing `tier3_present: bool` branch — only the two
 message bodies change.
 
@@ -211,28 +212,76 @@ and are left as-is.
 
 ---
 
+## Change 5 — align user-facing docs to "package symbol database"
+
+The published user docs name the database(s) inconsistently — "export
+database", "package-export database", "the export databases". Align them all to
+**"package symbol database"** (singular "symbol", matching the CLI strings and
+this spec), across every tier and the umbrella, so the docs and the CLI agree.
+
+**Rename only the database *name* phrases:**
+- `export database` → `package symbol database`
+- `export databases` → `package symbol databases`
+- `package-export database` → `package symbol database`
+
+**Do NOT touch "export" as a technical concept** — these stay verbatim:
+`exports`, `export names`, `export resolution`, "the exports your dependencies
+expose", "a package's exports", "a package export" (hover), "package-export
+coverage" ([cli.md:82](docs/cli.md:82) — this means *coverage of exports*, not a
+database name).
+
+**Files in scope (published user docs only):**
+`README.md`, `docs/cli.md`, `docs/package-database.md`, `docs/diagnostics.md`,
+`docs/cross-file.md`, `docs/r-package-dev.md`, `docs/hover.md`. Known
+name-phrase sites: [cli.md:12](docs/cli.md:12), [:26](docs/cli.md:26),
+[:76](docs/cli.md:76), [:78](docs/cli.md:78), [:173](docs/cli.md:173);
+[package-database.md:79](docs/package-database.md:79);
+[diagnostics.md:67](docs/diagnostics.md:67). (Re-grep at implementation time —
+this list is indicative, not exhaustive.)
+
+**Light rewording, not mechanical replace, where repetition results:**
+[cli.md:173](docs/cli.md:173) "the export databases Raven uses to resolve
+package symbols" → "the databases Raven uses to resolve package symbols" (avoid
+"package symbol databases … package symbols").
+
+**Explicit non-goals (leave as-is):**
+- The doc **page title and filename** "Package database" / `package-database.md`
+  and every `[Package database](package-database.md)` link — "Package database"
+  is already the umbrella name and is not an "export database" phrase; renaming
+  the page would ripple through CLAUDE.md's doc map and cross-links for no
+  terminology gain.
+- `docs/development.md` (maintainer/internal) and everything under
+  `docs/superpowers/specs|plans/**` (historical design records) — these
+  deliberately preserve the vocabulary current at the time they were written.
+  This includes the `#package-export-databases-…` anchor in
+  `docs/development.md` that [package-database.md:119](docs/package-database.md:119)
+  links to — keep that link intact.
+
+---
+
 ## What is explicitly NOT changed
 
 - Internal code identifiers, type names, function names, struct fields.
-- Module-level doc comments and the developer docs under `docs/` (e.g.
-  `docs/package-database.md`, `docs/cli.md`) — these are reference material where
-  the tier model and `names.db` are the correct vocabulary.
+- Module-level **doc comments** in source, the maintainer doc
+  `docs/development.md`, and everything under `docs/superpowers/specs|plans/**` —
+  reference/historical material that preserves the tier and `names.db`
+  vocabulary current when written. (Published user docs *are* changed — Change
+  5.)
 - The `RAVEN_NAMES_DB` environment variable name.
 - Literal `names.db` filenames/paths in error and success output where the user
   acts on the actual file.
+- The "Package database" doc page title, `package-database.md` filename, and its
+  cross-links (umbrella name, not an "export database" phrase — see Change 5).
 - The VS Code extension TS strings — already plain ("package database").
-
-## Terminology note (deferred)
-
-User-facing prose adopts **"package symbol database"** for `names.db`. The
-existing user doc `docs/cli.md` uses "package-export database". This spec leaves
-that doc as-is to keep the change focused; aligning the doc to one term is a
-separate, optional follow-up.
 
 ## Testing & verification
 
 - Update the two `check.rs` unit tests (Change 1), including the `n == 1`
   singular-wording coverage.
+- Change 5 is docs-only prose; verify by re-grepping the in-scope user docs for
+  `export database` / `package-export database` after the edits (expected: no
+  name-phrase hits remain; concept uses of "export"/"export names" still
+  present).
 - No other test pins any changed string (verified: help text, the `binary_db`
   `UnsupportedFormat` text, and the "sidecar" strings are not asserted anywhere;
   the package tests that mention `names.db` / `RAVEN_NAMES_DB` assert only
