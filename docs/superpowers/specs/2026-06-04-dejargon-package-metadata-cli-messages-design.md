@@ -59,7 +59,7 @@ wraps arbitrarily in narrow terminals.
 ### Variant A — symbol database **not** installed (`tier3_present == false`)
 
 Template:
-```
+```text
 raven check: couldn't load exported symbols for {names}.
 Some "Undefined variable" warnings above may be inaccurate as a result.
 To fix: install {noun} in your R library.
@@ -68,7 +68,7 @@ or commit a `raven packages freeze` snapshot made on a machine where {inst} inst
 ```
 
 Rendered, n == 2:
-```
+```text
 raven check: couldn't load exported symbols for bar, foo.
 Some "Undefined variable" warnings above may be inaccurate as a result.
 To fix: install these packages in your R library.
@@ -87,7 +87,7 @@ was absent from it. It states the actionable conclusion instead — the package
 isn't available from the database, so `freeze` is the path:
 
 Template:
-```
+```text
 raven check: couldn't load exported symbols for {names}.
 Some "Undefined variable" warnings above may be inaccurate as a result.
 To fix: install {noun} in your R library.
@@ -96,7 +96,7 @@ Capture {obj} with `raven packages freeze` on a machine where {inst} installed, 
 ```
 
 Rendered, n == 1:
-```
+```text
 raven check: couldn't load exported symbols for foo.
 Some "Undefined variable" warnings above may be inaccurate as a result.
 To fix: install this package in your R library.
