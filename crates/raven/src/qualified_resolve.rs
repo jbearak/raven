@@ -189,7 +189,7 @@ fn member_assignment_candidate_from_extract(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
 ) -> Option<Candidate> {
@@ -203,18 +203,22 @@ fn member_assignment_candidate_from_extract(
     ) {
         return None;
     }
-    let t_lhs = target.child_by_field_name("lhs")?;
     let t_rhs = target.child_by_field_name("rhs")?;
-    if t_lhs.kind() != "identifier" || t_rhs.kind() != "identifier" {
+    if t_rhs.kind() != "identifier" {
         return None;
     }
     let member_name = node_text(t_rhs, text);
-    if node_text(t_lhs, text) != lhs_name
-        || rhs_name.is_some_and(|rhs_name| member_name != rhs_name)
-    {
+    if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
-    let lhs_range = node_range(t_lhs, col_mapper);
+    // The assignment target's container spine (everything left of the final
+    // `$`/`@`) must equal `path` (`head` + intermediate `segments`).
+    let t_lhs = target.child_by_field_name("lhs")?;
+    if !target_spine_is_path(t_lhs, text, path) {
+        return None;
+    }
+    let head_id = leftmost_identifier(t_lhs)?;
+    let lhs_range = node_range(head_id, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
@@ -225,6 +229,30 @@ fn member_assignment_candidate_from_extract(
     })
 }
 
+/// Does `target`'s left-spine equal `path` (`head` + `segments`)? `target` is
+/// the container half of an assignment target (`alpha$beta` in
+/// `alpha$beta$gamma <- ...`). Matching is by name and op per segment, via the
+/// shared [`build_qualified_path`] walker, so a `[["lit"]]` step matches a
+/// `Dollar` segment.
+fn target_spine_is_path(target: Node, text: &str, path: &QualifiedPath) -> bool {
+    match build_qualified_path(target, text) {
+        Some(actual) => actual.head == path.head && actual.segments == path.segments,
+        None => false,
+    }
+}
+
+/// Leftmost `identifier` on a node's left-spine (the head of an access chain).
+fn leftmost_identifier(mut node: Node) -> Option<Node> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "extract_operator" => node = node.child_by_field_name("lhs")?,
+            "subset" | "subset2" => node = node.child_by_field_name("function")?,
+            _ => return None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn member_assignment_candidate_from_string_subscript(
     assignment: Node,
@@ -232,7 +260,7 @@ fn member_assignment_candidate_from_string_subscript(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
 ) -> Option<Candidate> {
@@ -240,16 +268,17 @@ fn member_assignment_candidate_from_string_subscript(
         return None;
     }
     let t_lhs = target.child_by_field_name("function")?;
-    if t_lhs.kind() != "identifier" || node_text(t_lhs, text) != lhs_name {
+    if !target_spine_is_path(t_lhs, text, path) {
         return None;
     }
+    let head_id = leftmost_identifier(t_lhs)?;
     let args = target.child_by_field_name("arguments")?;
     let string_node = first_direct_string_argument(args)?;
     let member_name = simple_string_literal_value(string_node, text)?;
     if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
-    let lhs_range = node_range(t_lhs, col_mapper);
+    let lhs_range = node_range(head_id, col_mapper);
     Some(Candidate {
         name: member_name.to_string(),
         uri: file_uri.clone(),
@@ -565,7 +594,7 @@ fn collect_qualified_member_candidates_with_cancel(
             &defining_text,
             &defining_col_mapper,
             &defining_uri,
-            lhs_name,
+            path,
             rhs_name,
             op,
             &mut defining_candidates,
@@ -647,7 +676,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     &candidate_text,
                     &candidate_col_mapper,
                     candidate_uri,
-                    lhs_name,
+                    path,
                     rhs_name,
                     op,
                     &mut needs_validation,
@@ -679,7 +708,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     &candidate_text,
                     &candidate_col_mapper,
                     candidate_uri,
-                    lhs_name,
+                    path,
                     rhs_name,
                     op,
                     &mut cross_file_candidates,
@@ -1175,7 +1204,7 @@ fn collect_member_assignments(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
@@ -1211,7 +1240,7 @@ fn collect_member_assignments(
             if !skip {
                 if kind == "binary_operator" {
                     try_extract_member_assignment(
-                        node, text, col_mapper, file_uri, lhs_name, rhs_name, op, out,
+                        node, text, col_mapper, file_uri, path, rhs_name, op, out,
                     );
                 }
                 // Descend into children if this node has any.
@@ -1240,7 +1269,7 @@ fn try_extract_member_assignment(
     text: &str,
     col_mapper: &ColMapper,
     file_uri: &Url,
-    lhs_name: &str,
+    path: &QualifiedPath,
     rhs_name: Option<&str>,
     op: ExtractOp,
     out: &mut Vec<Candidate>,
@@ -1256,13 +1285,13 @@ fn try_extract_member_assignment(
     };
     let Some(target) = target else { return };
     if let Some(candidate) = member_assignment_candidate_from_extract(
-        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
+        node, target, text, col_mapper, file_uri, path, rhs_name, op,
     ) {
         out.push(candidate);
         return;
     }
     if let Some(candidate) = member_assignment_candidate_from_string_subscript(
-        node, target, text, col_mapper, file_uri, lhs_name, rhs_name, op,
+        node, target, text, col_mapper, file_uri, path, rhs_name, op,
     ) {
         out.push(candidate);
     }
@@ -1611,7 +1640,17 @@ mod tests {
         position: Position,
         lhs_name: &str,
     ) -> Vec<String> {
-        let path = dollar_path(lhs_name, &[]);
+        completion_path_names(state, uri, position, lhs_name, &[])
+    }
+
+    fn completion_path_names(
+        state: &WorldState,
+        uri: &Url,
+        position: Position,
+        head: &str,
+        segments: &[&str],
+    ) -> Vec<String> {
+        let path = dollar_path(head, segments);
         super::complete_qualified_members(
             state,
             uri,
@@ -1622,6 +1661,24 @@ mod tests {
         .into_iter()
         .map(|completion| completion.name)
         .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn nested_assignment_members_depth2() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha$beta <- list()
+alpha$beta$gamma <- 1
+alpha$beta$delta <- 2
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///n.R", code);
+        // Cursor on the trailing `alpha$beta$` line (0-based line 4, after `$`).
+        let mut names =
+            completion_path_names(&state, &uri, Position::new(4, 11), "alpha", &["beta"]);
+        names.sort();
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
     }
 
     /// Perf reproducer: scales the number of `df$col_K <- ...` assignments and
