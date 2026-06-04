@@ -848,22 +848,39 @@ fn collect_qualified_member_candidates_with_cancel(
     all_candidates.extend(cross_file_candidates);
 
     // Establishing-site cutoff (reassignment semantics): a whole-value (re)write
-    // of an intermediate prefix in the cursor file replaces members declared
-    // before it. Members at or after the latest such write survive; earlier ones
-    // (including those from the head binding's constructor) are dropped. The
-    // sites were collected while walking the cursor file above; only the cursor
-    // file's sites are considered (cross-file ordering is handled below / left to
-    // the contributor-chain union).
-    if let Some(cutoff) = establishing_sites
-        .iter()
-        .copied()
-        .filter(|s| (s.line, s.utf16_column) <= (position.line, position.character))
-        .max_by_key(|s| (s.line, s.utf16_column))
-    {
-        all_candidates.retain(|c| {
-            c.uri != cursor_uri
-                || (c.effect.line, c.effect.utf16_column) >= (cutoff.line, cutoff.utf16_column)
-        });
+    // of an intermediate prefix replaces members declared before it. Members at
+    // or after the latest such write survive; earlier ones (including those from
+    // the head binding's constructor, and those from upstream files sourced
+    // before the write) are dropped. The establishing events are the cursor
+    // file's prefix writes (collected above) plus the `source()` that brings the
+    // head's defining file into scope — a source re-establishes the whole value,
+    // so it competes for the latest cutoff.
+    if !path.segments.is_empty() {
+        let source_pos = direct_source_positions(state, &cursor_uri, position);
+        let head_source = source_pos.get(&defining_uri).copied();
+        let cursor = (position.line, position.character);
+        let cutoff = establishing_sites
+            .iter()
+            .map(|s| (s.line, s.utf16_column))
+            .chain(head_source)
+            .filter(|&pos| pos <= cursor)
+            .max();
+        if let Some(cutoff) = cutoff {
+            all_candidates.retain(|c| {
+                if c.uri == cursor_uri {
+                    (c.effect.line, c.effect.utf16_column) >= cutoff
+                } else {
+                    // Drop an upstream candidate whose file was sourced before the
+                    // cutoff (the reassignment replaced it). Keep it if sourced at
+                    // or after the cutoff, or reached only transitively (no direct
+                    // source line — conservative).
+                    match source_pos.get(&c.uri) {
+                        Some(&src) => src >= cutoff,
+                        None => true,
+                    }
+                }
+            });
+        }
     }
 
     let contributor_distances = contributor_file_distances(
@@ -881,6 +898,33 @@ fn collect_qualified_member_candidates_with_cancel(
         contributor_ranks,
         contributor_distances,
     })
+}
+
+/// Map each file directly sourced by `cursor_uri` to the latest `source()`
+/// call-site position in the cursor file that is at or before `cursor`. Used by
+/// the establishing-site cutoff to order an upstream candidate's contribution
+/// (its source point) against a cursor-file reassignment. Transitively-sourced
+/// files are absent (the cutoff keeps those conservatively).
+fn direct_source_positions(
+    state: &WorldState,
+    cursor_uri: &Url,
+    cursor: Position,
+) -> HashMap<Url, (u32, u32)> {
+    let mut map: HashMap<Url, (u32, u32)> = HashMap::new();
+    for edge in state.cross_file_graph.get_dependencies(cursor_uri) {
+        if let (Some(line), Some(col)) = (edge.call_site_line, edge.call_site_column)
+            && (line, col) <= (cursor.line, cursor.character)
+        {
+            map.entry(edge.to.clone())
+                .and_modify(|p| {
+                    if (line, col) > *p {
+                        *p = (line, col);
+                    }
+                })
+                .or_insert((line, col));
+        }
+    }
+    map
 }
 
 fn contributor_file_ranks(chain: &[Url]) -> HashMap<Url, usize> {
@@ -2061,6 +2105,46 @@ alpha$beta$
         names.sort();
         // gamma from helpers.R (the establishing site) + delta extended in main.R.
         assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_cross_file_reassignment_drops_upstream() {
+        // main.R sources helpers.R (which declares alpha$beta with gamma), then
+        // WHOLLY reassigns alpha$beta. The upstream gamma was replaced and must
+        // not be offered — otherwise completion and go-to-definition would point
+        // at a member that no longer exists.
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+alpha$beta <- list(delta = 2)
+alpha$beta$
+";
+        let helpers_code = "alpha <- list(beta = list(gamma = 1))\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let names =
+            completion_path_names(&state, &main_uri, Position::new(2, 11), "alpha", &["beta"]);
+        assert_eq!(names, vec!["delta".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_cross_file_reassignment_before_source_keeps_upstream() {
+        // The reassignment is BEFORE the source() that brings alpha into scope,
+        // so the source re-establishes the upstream value: gamma survives.
+        let mut state = fresh_state();
+        let main_code = "\
+alpha$beta <- list(delta = 2)
+source(\"helpers.R\")
+alpha$beta$
+";
+        let helpers_code = "alpha <- list(beta = list(gamma = 1))\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let names =
+            completion_path_names(&state, &main_uri, Position::new(2, 11), "alpha", &["beta"]);
+        // gamma (sourced after the reassignment) is kept; delta predates the
+        // source so the cursor-file cutoff drops it.
+        assert_eq!(names, vec!["gamma".to_string()]);
     }
 
     #[test]
