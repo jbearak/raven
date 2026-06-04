@@ -2046,6 +2046,83 @@ alpha$beta$
         assert_eq!(names, vec!["delta".to_string()]);
     }
 
+    #[test]
+    fn nested_member_below_cursor_not_offered() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list())
+alpha$beta$gamma <- 1
+alpha$beta$
+alpha$beta$delta <- 2
+";
+        let uri = add_indexed_doc(&mut state, "file:///p.R", code);
+        // Cursor on line 2; `delta` is assigned on line 3 (below) and must not appear.
+        let names = completion_path_names(&state, &uri, Position::new(2, 11), "alpha", &["beta"]);
+        assert_eq!(names, vec!["gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_cross_file() {
+        // `alpha` + its nested structure declared in helpers.R; extended in main.R
+        // after the source() call.
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+alpha$beta$delta <- 2
+alpha$beta$
+";
+        let helpers_code = "alpha <- list(beta = list(gamma = 1))\n";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let mut names =
+            completion_path_names(&state, &main_uri, Position::new(2, 11), "alpha", &["beta"]);
+        names.sort();
+        // gamma from helpers.R (the establishing site) + delta extended in main.R.
+        assert_eq!(names, vec!["delta".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn non_static_chain_yields_nothing() {
+        let mut state = fresh_state();
+        let code = "alpha <- list(beta = list(gamma = 1))\n";
+        let uri = add_indexed_doc(&mut state, "file:///b.R", code);
+        // A head that does not resolve in scope yields no members (the resolver
+        // never falls back to a free-identifier lookup).
+        let names = completion_path_names(&state, &uri, Position::new(0, 0), "nonexistent", &["x"]);
+        assert!(names.is_empty(), "expected no members, got {names:?}");
+    }
+
+    #[test]
+    fn mixed_dollar_at_chain_depth2() {
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list()
+alpha@beta$gamma <- 1
+alpha@beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///m.R", code);
+        // Container path is `alpha@beta` (segment via `@`); completing its `$`
+        // members must find `gamma` from the mixed-chain assignment.
+        let path = super::QualifiedPath {
+            head: "alpha".to_string(),
+            segments: vec![super::Segment {
+                name: "beta".to_string(),
+                op: crate::extract_op::ExtractOp::At,
+            }],
+        };
+        let names: Vec<String> = super::complete_qualified_members(
+            &state,
+            &uri,
+            Position::new(2, 11),
+            &path,
+            crate::extract_op::ExtractOp::Dollar,
+        )
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+        assert_eq!(names, vec!["gamma".to_string()]);
+    }
+
     /// Perf reproducer: scales the number of `df$col_K <- ...` assignments and
     /// prints how long `complete_qualified_members` takes. Run with:
     ///

@@ -46278,6 +46278,24 @@ mod dollar_member_completion_tests {
     }
 
     #[test]
+    fn completion_non_static_lhs_yields_no_members() {
+        // Call-result, computed-index, and namespace LHS must not produce member
+        // completions (the AST path-builder bails).
+        for code in [
+            "make <- function() list(x = 1)\nmake()$|",
+            "alpha <- list(beta = 1)\ni <- 1\nalpha[[i]]$|",
+            "pkg::obj$|",
+        ] {
+            let items = completion_items(code);
+            let labels = sorted_labels(&items);
+            assert!(
+                !labels.iter().any(|l| l == "x" || l == "beta"),
+                "non-static LHS leaked members for {code:?}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
     fn completion_no_false_positive_on_collision() {
         // An unrelated top-level `beta` must NOT leak its members into `alpha$beta$`.
         let items = completion_items(
