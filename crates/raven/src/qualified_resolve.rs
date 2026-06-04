@@ -1534,6 +1534,8 @@ fn push_constructor_named_args(
     rhs_name: Option<&str>,
     out: &mut Vec<Candidate>,
 ) {
+    let effect = EffectPos::from_node_end(assignment, col_mapper);
+    let fn_scope = enclosing_function_id(assignment);
     let mut walker = args.walk();
     for child in args.children(&mut walker) {
         if child.kind() != "argument" {
@@ -1552,39 +1554,53 @@ fn push_constructor_named_args(
         out.push(Candidate {
             name: member_name.to_string(),
             uri: file_uri.clone(),
-            effect: EffectPos::from_node_end(assignment, col_mapper),
+            effect,
             name_range: node_range(name_node, col_mapper),
-            fn_scope: enclosing_function_id(assignment),
+            fn_scope,
             lhs_pos,
         });
     }
 }
 
-/// If `node` is an assignment whose target spine equals `prefix` and whose
-/// value is an allowlisted-constructor call, return `(assignment, target,
-/// ctor_call)`. Used to find whole-value writes to an intermediate path
-/// (`alpha$beta <- list(...)`).
-fn prefix_assignment_constructor<'a>(
-    node: Node<'a>,
-    text: &str,
-    prefix: &QualifiedPath,
-) -> Option<(Node<'a>, Node<'a>, Node<'a>)> {
+/// For an assignment `binary_operator`, return its target node (the LHS for
+/// `<-`/`=`/`<<-`, the RHS for `->`/`->>`). `None` for non-assignment operators.
+fn assignment_target<'a>(node: Node<'a>, text: &str) -> Option<Node<'a>> {
     let op_node = node.child_by_field_name("operator")?;
-    let target = match node_text(op_node, text) {
-        "<-" | "=" | "<<-" => node.child_by_field_name("lhs")?,
-        "->" | "->>" => node.child_by_field_name("rhs")?,
-        _ => return None,
-    };
-    if !target_spine_is_path(target, text, prefix) {
-        return None;
+    match node_text(op_node, text) {
+        "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
+        "->" | "->>" => node.child_by_field_name("rhs"),
+        _ => None,
     }
+}
+
+/// For an assignment whose value is an allowlisted-constructor call, return
+/// `(target, ctor_call)`. Used to find whole-value writes with constructor RHS
+/// (`alpha$beta <- list(...)`).
+fn assignment_constructor_call<'a>(node: Node<'a>, text: &str) -> Option<(Node<'a>, Node<'a>)> {
+    let target = assignment_target(node, text)?;
     let value = assignment_value_node(node, text)?;
     if value.kind() != "call" {
         return None;
     }
     let func = value.child_by_field_name("function")?;
     if func.kind() == "identifier" && CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)) {
-        Some((node, target, value))
+        Some((target, value))
+    } else {
+        None
+    }
+}
+
+/// If `target`'s spine is a non-empty prefix of `path` (`head` + `segments[..k]`
+/// for some `1 <= k <= segments.len()`), return that prefix length `k`. Walks
+/// the spine once via [`build_qualified_path`].
+fn target_path_prefix_len(target: Node, text: &str, path: &QualifiedPath) -> Option<usize> {
+    let actual = build_qualified_path(target, text)?;
+    let k = actual.segments.len();
+    if actual.head == path.head
+        && (1..=path.segments.len()).contains(&k)
+        && actual.segments.as_slice() == &path.segments[..k]
+    {
+        Some(k)
     } else {
         None
     }
@@ -1593,7 +1609,7 @@ fn prefix_assignment_constructor<'a>(
 /// Collect members contributed by an assignment whose target spine is a prefix
 /// of `path` longer than the head (`alpha$beta <- list(...)` for path
 /// `[alpha, beta, ...]`), with an allowlisted-constructor RHS, descended to the
-/// full path. Each terminal named argument becomes a candidate.
+/// full path. Each terminal named argument becomes a candidate. Single tree walk.
 #[allow(clippy::too_many_arguments)]
 fn collect_prefix_write_constructor_candidates(
     root: Node,
@@ -1605,42 +1621,40 @@ fn collect_prefix_write_constructor_candidates(
     out: &mut Vec<Candidate>,
     skip_functions: bool,
 ) {
-    for k in 1..=path.segments.len() {
-        let prefix = QualifiedPath {
-            head: path.head.clone(),
-            segments: path.segments[..k].to_vec(),
-        };
-        let remaining: Vec<Segment> = path.segments[k..].to_vec();
-        for_each_binary_operator(root, skip_functions, |node| {
-            let Some((assignment, target, ctor)) =
-                prefix_assignment_constructor(node, text, &prefix)
-            else {
-                return;
-            };
-            let Some(ctor_args) = ctor.child_by_field_name("arguments") else {
-                return;
-            };
-            let Some(terminal_args) = descend_constructor_args(ctor_args, text, &remaining) else {
-                return;
-            };
-            // Use the head identifier position so cross-file validation and
-            // region partitioning treat these like member-assignment candidates.
-            let Some(head_id) = leftmost_identifier(target) else {
-                return;
-            };
-            let lhs_pos = node_range(head_id, col_mapper).start;
-            push_constructor_named_args(
-                terminal_args,
-                text,
-                col_mapper,
-                file_uri,
-                assignment,
-                lhs_pos,
-                rhs_name,
-                out,
-            );
-        });
+    if path.segments.is_empty() {
+        return;
     }
+    for_each_binary_operator(root, skip_functions, |node| {
+        let Some((target, ctor)) = assignment_constructor_call(node, text) else {
+            return;
+        };
+        let Some(k) = target_path_prefix_len(target, text, path) else {
+            return;
+        };
+        let Some(ctor_args) = ctor.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some(terminal_args) = descend_constructor_args(ctor_args, text, &path.segments[k..])
+        else {
+            return;
+        };
+        // Use the head identifier position so cross-file validation and region
+        // partitioning treat these like member-assignment candidates.
+        let Some(head_id) = leftmost_identifier(target) else {
+            return;
+        };
+        let lhs_pos = node_range(head_id, col_mapper).start;
+        push_constructor_named_args(
+            terminal_args,
+            text,
+            col_mapper,
+            file_uri,
+            node,
+            lhs_pos,
+            rhs_name,
+            out,
+        );
+    });
 }
 
 /// Effect positions of whole-value writes to a prefix of `path` longer than the
@@ -1648,7 +1662,7 @@ fn collect_prefix_write_constructor_candidates(
 /// `[alpha, beta, gamma]`), regardless of the RHS shape (constructor, opaque
 /// call, or bare value). These are the *establishing sites* whose latest visible
 /// occurrence resets the members at `path`. Returns one position per matching
-/// assignment.
+/// assignment. Single tree walk.
 fn collect_establishing_site_positions(
     root: Node,
     text: &str,
@@ -1660,27 +1674,9 @@ fn collect_establishing_site_positions(
     if path.segments.is_empty() {
         return sites;
     }
-    let prefixes: Vec<QualifiedPath> = (1..=path.segments.len())
-        .map(|k| QualifiedPath {
-            head: path.head.clone(),
-            segments: path.segments[..k].to_vec(),
-        })
-        .collect();
     for_each_binary_operator(root, skip_functions, |node| {
-        let Some(op_node) = node.child_by_field_name("operator") else {
-            return;
-        };
-        let target = match node_text(op_node, text) {
-            "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
-            "->" | "->>" => node.child_by_field_name("rhs"),
-            _ => return,
-        };
-        let Some(target) = target else {
-            return;
-        };
-        if prefixes
-            .iter()
-            .any(|prefix| target_spine_is_path(target, text, prefix))
+        if let Some(target) = assignment_target(node, text)
+            && target_path_prefix_len(target, text, path).is_some()
         {
             sites.push(EffectPos::from_node_end(node, col_mapper));
         }
