@@ -595,6 +595,12 @@ fn collect_qualified_member_candidates_with_cancel(
     let defining_uri = symbol.source_uri.clone();
     let cursor_uri = uri.clone();
 
+    // Establishing-site positions collected while walking the cursor file (the
+    // only file whose sites feed the reassignment cutoff). Populated by whichever
+    // `collect_prefix_writes` call walks the cursor file (defining block when
+    // cursor == defining, else the matching cross-file iteration).
+    let mut establishing_sites: Vec<EffectPos> = Vec::new();
+
     let mut defining_candidates: Vec<Candidate> = Vec::new();
     {
         let (defining_text, defining_tree) =
@@ -652,7 +658,8 @@ fn collect_qualified_member_candidates_with_cancel(
                 &mut defining_candidates,
             );
         }
-        collect_prefix_write_constructor_candidates(
+        let defining_sites = (defining_uri == cursor_uri).then_some(&mut establishing_sites);
+        collect_prefix_writes(
             defining_tree.root_node(),
             &defining_text,
             &defining_col_mapper,
@@ -660,6 +667,7 @@ fn collect_qualified_member_candidates_with_cancel(
             path,
             rhs_name,
             &mut defining_candidates,
+            defining_sites,
             false,
         );
 
@@ -718,7 +726,12 @@ fn collect_qualified_member_candidates_with_cancel(
                     &mut needs_validation,
                     false,
                 );
-                collect_prefix_write_constructor_candidates(
+                let candidate_sites = if *candidate_uri == cursor_uri {
+                    Some(&mut establishing_sites)
+                } else {
+                    None
+                };
+                collect_prefix_writes(
                     candidate_tree.root_node(),
                     &candidate_text,
                     &candidate_col_mapper,
@@ -726,6 +739,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     path,
                     rhs_name,
                     &mut needs_validation,
+                    candidate_sites,
                     false,
                 );
             } else {
@@ -760,7 +774,12 @@ fn collect_qualified_member_candidates_with_cancel(
                     &mut cross_file_candidates,
                     true, // skip function bodies
                 );
-                collect_prefix_write_constructor_candidates(
+                let candidate_sites = if *candidate_uri == cursor_uri {
+                    Some(&mut establishing_sites)
+                } else {
+                    None
+                };
+                collect_prefix_writes(
                     candidate_tree.root_node(),
                     &candidate_text,
                     &candidate_col_mapper,
@@ -768,6 +787,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     path,
                     rhs_name,
                     &mut cross_file_candidates,
+                    candidate_sites,
                     true, // skip function bodies
                 );
                 // Apply visibility cutoff.
@@ -830,30 +850,20 @@ fn collect_qualified_member_candidates_with_cancel(
     // Establishing-site cutoff (reassignment semantics): a whole-value (re)write
     // of an intermediate prefix in the cursor file replaces members declared
     // before it. Members at or after the latest such write survive; earlier ones
-    // (including those from the head binding's constructor) are dropped. Only the
-    // cursor file's sites are considered; cross-file ordering is left to the
-    // contributor-chain union (see the design's residual-imprecision note).
-    if !path.segments.is_empty()
-        && let Some((cursor_text, cursor_tree)) =
-            crate::parameter_resolver::get_text_and_tree(state, &cursor_uri)
-    {
-        let cursor_col_mapper = ColMapper::new(&cursor_text);
-        let cutoff = collect_establishing_site_positions(
-            cursor_tree.root_node(),
-            &cursor_text,
-            &cursor_col_mapper,
-            path,
-            false,
-        )
-        .into_iter()
+    // (including those from the head binding's constructor) are dropped. The
+    // sites were collected while walking the cursor file above; only the cursor
+    // file's sites are considered (cross-file ordering is handled below / left to
+    // the contributor-chain union).
+    if let Some(cutoff) = establishing_sites
+        .iter()
+        .copied()
         .filter(|s| (s.line, s.utf16_column) <= (position.line, position.character))
-        .max_by_key(|s| (s.line, s.utf16_column));
-        if let Some(cutoff) = cutoff {
-            all_candidates.retain(|c| {
-                c.uri != cursor_uri
-                    || (c.effect.line, c.effect.utf16_column) >= (cutoff.line, cutoff.utf16_column)
-            });
-        }
+        .max_by_key(|s| (s.line, s.utf16_column))
+    {
+        all_candidates.retain(|c| {
+            c.uri != cursor_uri
+                || (c.effect.line, c.effect.utf16_column) >= (cutoff.line, cutoff.utf16_column)
+        });
     }
 
     let contributor_distances = contributor_file_distances(
@@ -1564,15 +1574,6 @@ fn is_allowlisted_constructor_call(node: Node, text: &str) -> bool {
             .is_some_and(|func| CONSTRUCTOR_ALLOWLIST.contains(&node_text(func, text)))
 }
 
-/// For an assignment whose value is an allowlisted-constructor call, return
-/// `(target, ctor_call)`. Used to find whole-value writes with constructor RHS
-/// (`alpha$beta <- list(...)`).
-fn assignment_constructor_call<'a>(node: Node<'a>, text: &str) -> Option<(Node<'a>, Node<'a>)> {
-    let target = assignment_target(node, text)?;
-    let value = assignment_value_node(node, text)?;
-    is_allowlisted_constructor_call(value, text).then_some((target, value))
-}
-
 /// If `target`'s spine is a non-empty prefix of `path` (`head` + `segments[..k]`
 /// for some `1 <= k <= segments.len()`), return that prefix length `k`. Walks
 /// the spine once via [`build_qualified_path`].
@@ -1589,12 +1590,19 @@ fn target_path_prefix_len(target: Node, text: &str, path: &QualifiedPath) -> Opt
     }
 }
 
-/// Collect members contributed by an assignment whose target spine is a prefix
-/// of `path` longer than the head (`alpha$beta <- list(...)` for path
-/// `[alpha, beta, ...]`), with an allowlisted-constructor RHS, descended to the
-/// full path. Each terminal named argument becomes a candidate. Single tree walk.
+/// Single walk over `root` handling whole-value writes to a prefix of `path`
+/// longer than the head (`alpha$beta <- ...` for path `[alpha, beta, ...]`):
+///
+/// - **Members** — when the write's RHS is an allowlisted constructor, descend
+///   it to the full path and push one candidate per terminal named argument.
+/// - **Establishing sites** — when `establishing_sites` is `Some`, record this
+///   write's effect position regardless of its RHS shape (constructor, opaque
+///   call, or bare value). The latest visible site resets the members at `path`.
+///
+/// Pass `establishing_sites = Some(...)` only when `root` is the cursor file's
+/// tree; the cutoff considers only the cursor file's sites.
 #[allow(clippy::too_many_arguments)]
-fn collect_prefix_write_constructor_candidates(
+fn collect_prefix_writes(
     root: Node,
     text: &str,
     col_mapper: &ColMapper,
@@ -1602,19 +1610,31 @@ fn collect_prefix_write_constructor_candidates(
     path: &QualifiedPath,
     rhs_name: Option<&str>,
     out: &mut Vec<Candidate>,
+    mut establishing_sites: Option<&mut Vec<EffectPos>>,
     skip_functions: bool,
 ) {
     if path.segments.is_empty() {
         return;
     }
     for_each_binary_operator(root, skip_functions, |node| {
-        let Some((target, ctor)) = assignment_constructor_call(node, text) else {
+        let Some(target) = assignment_target(node, text) else {
             return;
         };
         let Some(k) = target_path_prefix_len(target, text, path) else {
             return;
         };
-        let Some(ctor_args) = ctor.child_by_field_name("arguments") else {
+        // Any whole-value write to a prefix of `path` is an establishing site.
+        if let Some(sites) = establishing_sites.as_deref_mut() {
+            sites.push(EffectPos::from_node_end(node, col_mapper));
+        }
+        // A constructor RHS additionally contributes member candidates.
+        let Some(value) = assignment_value_node(node, text) else {
+            return;
+        };
+        if !is_allowlisted_constructor_call(value, text) {
+            return;
+        }
+        let Some(ctor_args) = value.child_by_field_name("arguments") else {
             return;
         };
         let Some(terminal_args) = descend_constructor_args(ctor_args, text, &path.segments[k..])
@@ -1638,33 +1658,6 @@ fn collect_prefix_write_constructor_candidates(
             out,
         );
     });
-}
-
-/// Effect positions of whole-value writes to a prefix of `path` longer than the
-/// head (`alpha$beta <- ...`, `alpha$beta$gamma <- ...` for path
-/// `[alpha, beta, gamma]`), regardless of the RHS shape (constructor, opaque
-/// call, or bare value). These are the *establishing sites* whose latest visible
-/// occurrence resets the members at `path`. Returns one position per matching
-/// assignment. Single tree walk.
-fn collect_establishing_site_positions(
-    root: Node,
-    text: &str,
-    col_mapper: &ColMapper,
-    path: &QualifiedPath,
-    skip_functions: bool,
-) -> Vec<EffectPos> {
-    let mut sites = Vec::new();
-    if path.segments.is_empty() {
-        return sites;
-    }
-    for_each_binary_operator(root, skip_functions, |node| {
-        if let Some(target) = assignment_target(node, text)
-            && target_path_prefix_len(target, text, path).is_some()
-        {
-            sites.push(EffectPos::from_node_end(node, col_mapper));
-        }
-    });
-    sites
 }
 
 /// In `args` (a constructor call's argument list), find a named argument
