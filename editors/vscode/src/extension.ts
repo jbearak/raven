@@ -48,7 +48,6 @@ import {
     resolveRConsoleActivation,
 } from './r-console-activation';
 import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit';
-import { registerInstallNags } from './recommendations/install-nag';
 import { validateServerBinary } from './server-binary-check';
 import { dotLintrAutoEnableAllowed } from './lintr-auto-enable';
 
@@ -439,13 +438,6 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // `raven.rmdKnit.enabled` to match the resolved gate gates the
     // command-palette entry.
     registerKnit(context, r_console_resolved === 'enabled', () => client);
-
-    // Install nags: one-time recommendation to install quarto.quarto
-    // for .qmd grammar / preview. Raven ships its own R Markdown
-    // grammar so there is no parallel nag for `.Rmd`. Activates
-    // regardless of the R-console gate — about grammar and
-    // discoverability, not subprocess features.
-    registerInstallNags(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //
