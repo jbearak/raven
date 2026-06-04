@@ -33,10 +33,16 @@ pub fn extract_operator_rhs(node: Node) -> Option<(Node, ExtractOp)> {
     }
     let lhs = parent.child_by_field_name("lhs")?;
     let op_node = parent.child_by_field_name("operator")?;
-    let op = match op_node.kind() {
-        "$" => ExtractOp::Dollar,
-        "@" => ExtractOp::At,
-        _ => return None,
-    };
+    let op = op_from_node(op_node)?;
     Some((lhs, op))
+}
+
+/// Map a `$`/`@` operator node to [`ExtractOp`]. Returns `None` for any other
+/// node kind.
+pub fn op_from_node(op_node: Node) -> Option<ExtractOp> {
+    match op_node.kind() {
+        "$" => Some(ExtractOp::Dollar),
+        "@" => Some(ExtractOp::At),
+        _ => None,
+    }
 }

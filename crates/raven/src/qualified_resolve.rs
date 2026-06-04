@@ -117,6 +117,71 @@ impl<'a> ColMapper<'a> {
     }
 }
 
+/// One intermediate step in a `$`/`@`/`[["lit"]]` access chain. `op` is the
+/// operator that produced this segment from its parent; a `[["lit"]]` subscript
+/// is recorded as [`ExtractOp::Dollar`] because it is `$`-equivalent for member
+/// resolution (mirrors `member_assignment_candidate_from_string_subscript`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    pub name: String,
+    pub op: ExtractOp,
+}
+
+/// The container an `$`/`@` member is being resolved against: a head identifier
+/// plus zero or more intermediate [`Segment`]s. `segments.is_empty()` is the
+/// single-level (depth-1) case and reproduces the pre-Step-2 behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedPath {
+    pub head: String,
+    pub segments: Vec<Segment>,
+}
+
+/// Walk the left-spine of an `extract_operator`/`subset2` node into a
+/// [`QualifiedPath`]. Bails to `None` on any non-static step: a computed index
+/// (`alpha[[i]]`, `alpha[[1]]`), a call (`f()$x`), or a non-literal subscript.
+/// The spine must bottom out at a single `identifier` (the head). A `[["lit"]]`
+/// subscript (`subset2`) is `$`-equivalent and recorded as [`ExtractOp::Dollar`].
+pub fn build_qualified_path(lhs: Node, text: &str) -> Option<QualifiedPath> {
+    let mut rev_segments: Vec<Segment> = Vec::new();
+    let mut node = lhs;
+    loop {
+        match node.kind() {
+            "identifier" => {
+                rev_segments.reverse();
+                return Some(QualifiedPath {
+                    head: node_text(node, text).to_string(),
+                    segments: rev_segments,
+                });
+            }
+            "extract_operator" => {
+                let op = crate::extract_op::op_from_node(node.child_by_field_name("operator")?)?;
+                let rhs = node.child_by_field_name("rhs")?;
+                if rhs.kind() != "identifier" {
+                    return None;
+                }
+                rev_segments.push(Segment {
+                    name: node_text(rhs, text).to_string(),
+                    op,
+                });
+                node = node.child_by_field_name("lhs")?;
+            }
+            "subset2" => {
+                // `foo[["lit"]]` — `$`-equivalent. Reject computed/numeric indices.
+                let func = node.child_by_field_name("function")?;
+                let args = node.child_by_field_name("arguments")?;
+                let string_node = first_direct_string_argument(args)?;
+                let name = simple_string_literal_value(string_node, text)?;
+                rev_segments.push(Segment {
+                    name: name.to_string(),
+                    op: ExtractOp::Dollar,
+                });
+                node = func;
+            }
+            _ => return None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn member_assignment_candidate_from_extract(
     assignment: Node,
@@ -1459,6 +1524,85 @@ mod tests {
         match result {
             Some(GotoDefinitionResponse::Scalar(l)) => l,
             other => panic!("expected Scalar location, got {:?}", other),
+        }
+    }
+
+    fn parse_r(text: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .expect("load tree-sitter-r");
+        parser.parse(text, None).expect("parse")
+    }
+
+    /// Find the widest `extract_operator`/`subset2`/`identifier` node whose byte
+    /// range ends at `end_byte` (the LHS of a trailing access in these tests).
+    fn lhs_node_ending_at(tree: &tree_sitter::Tree, end_byte: usize) -> tree_sitter::Node<'_> {
+        fn rec<'a>(n: tree_sitter::Node<'a>, end: usize, best: &mut Option<tree_sitter::Node<'a>>) {
+            if n.end_byte() == end
+                && matches!(n.kind(), "extract_operator" | "subset2" | "identifier")
+            {
+                match best {
+                    None => *best = Some(n),
+                    Some(b) if n.start_byte() < b.start_byte() => *best = Some(n),
+                    _ => {}
+                }
+            }
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                rec(ch, end, best);
+            }
+        }
+        let mut best = None;
+        rec(tree.root_node(), end_byte, &mut best);
+        best.expect("no lhs node ends at end_byte")
+    }
+
+    #[test]
+    fn build_path_single_identifier() {
+        let text = "alpha";
+        let tree = parse_r(text);
+        let lhs = lhs_node_ending_at(&tree, text.len());
+        let path = super::build_qualified_path(lhs, text).expect("path");
+        assert_eq!(path.head, "alpha");
+        assert!(path.segments.is_empty());
+    }
+
+    #[test]
+    fn build_path_two_dollar_segments() {
+        let text = "alpha$beta";
+        let tree = parse_r(text);
+        let lhs = lhs_node_ending_at(&tree, text.len());
+        let path = super::build_qualified_path(lhs, text).expect("path");
+        assert_eq!(path.head, "alpha");
+        assert_eq!(path.segments.len(), 1);
+        assert_eq!(path.segments[0].name, "beta");
+        assert_eq!(path.segments[0].op, crate::extract_op::ExtractOp::Dollar);
+    }
+
+    #[test]
+    fn build_path_mixed_dollar_at_and_subscript() {
+        let text = "alpha@beta[[\"gamma\"]]";
+        let tree = parse_r(text);
+        let lhs = lhs_node_ending_at(&tree, text.len());
+        let path = super::build_qualified_path(lhs, text).expect("path");
+        assert_eq!(path.head, "alpha");
+        let names: Vec<_> = path.segments.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["beta", "gamma"]);
+        assert_eq!(path.segments[0].op, crate::extract_op::ExtractOp::At);
+        // `[["lit"]]` is `$`-equivalent for member purposes.
+        assert_eq!(path.segments[1].op, crate::extract_op::ExtractOp::Dollar);
+    }
+
+    #[test]
+    fn build_path_bails_on_non_static_segment() {
+        for text in ["f()$x", "alpha[[i]]$x", "alpha[[1]]$x"] {
+            let tree = parse_r(text);
+            let lhs = lhs_node_ending_at(&tree, text.len());
+            assert!(
+                super::build_qualified_path(lhs, text).is_none(),
+                "expected None for {text:?}"
+            );
         }
     }
 
