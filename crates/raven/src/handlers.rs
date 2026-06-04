@@ -288,7 +288,7 @@ impl DiagnosticsSnapshot {
             }
             base
         };
-        let lint_config = if state.lint_overrides.is_empty() {
+        let mut lint_config = if state.lint_overrides.is_empty() {
             base_lint_config
         } else {
             let merged = crate::config_file::merge_settings(
@@ -306,6 +306,15 @@ impl DiagnosticsSnapshot {
                 uri,
             )
         };
+        // The trailing-blank-lines rule describes the FILE's shape, but lints
+        // run on the masked analysis text, where the closing fence / prose
+        // after the last chunk is blanked — it would read as trailing blank
+        // lines at EOF on virtually every Rmd/Quarto document. The raw file's
+        // shape is Markdown, not R, so the rule simply doesn't apply to chunk
+        // documents. Mirrors `raven lint` (`cli/lint.rs` `walk`).
+        if doc.is_rmd_document() {
+            lint_config.trailing_blank_lines_severity = None;
+        }
 
         Some(DiagnosticsSnapshot {
             tree,
@@ -328,6 +337,16 @@ impl DiagnosticsSnapshot {
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             scope_contribution: state.package_state.scope_contribution().clone(),
         })
+    }
+
+    /// True when `name` is the knitr/Quarto-injected `params` object of a
+    /// parameterized report: the document is Rmd/Quarto and its frontmatter
+    /// declares a top-level `params:` key (see
+    /// [`DiagnosticsSnapshot::rmd_declared_params`]). The undefined-variable
+    /// and out-of-scope collectors both treat such a use as a defined global;
+    /// this helper is the single source of that rule.
+    fn is_implicit_rmd_params(&self, name: &str) -> bool {
+        self.rmd_declared_params && name == "params"
     }
 
     /// Resolve cross-file scope from pre-collected snapshot data.
@@ -3409,18 +3428,31 @@ pub fn selection_range(
     let rmd_raw_text = doc.is_rmd_document().then(|| doc.text());
     let mut results = Vec::new();
     for pos in positions {
+        // The response is positional — `result[i]` answers `positions[i]` —
+        // so every requested position must yield exactly one entry. Positions
+        // with no meaningful selection (Rmd prose, no node at the point) get
+        // an empty range at the cursor (a no-op for "expand selection")
+        // rather than being dropped, which would misalign every later
+        // cursor's selection.
+        let empty_at_cursor = SelectionRange {
+            range: Range {
+                start: pos,
+                end: pos,
+            },
+            parent: None,
+        };
         // `position_in_r_chunk_body` re-scans the document per call (O(doc));
         // acceptable here because selection-range requests carry only the
         // active cursors (typically one or two positions).
         if let Some(raw) = &rmd_raw_text
             && !crate::chunks::position_in_r_chunk_body(raw, pos.line)
         {
+            results.push(empty_at_cursor);
             continue;
         }
         let point = lsp_position_to_ts_point(&text, pos);
-        if let Some(range) = build_selection_range(tree.root_node(), point, &text) {
-            results.push(range);
-        }
+        results
+            .push(build_selection_range(tree.root_node(), point, &text).unwrap_or(empty_at_cursor));
     }
 
     Some(results)
@@ -5294,13 +5326,10 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         if is_reserved_word(name) {
             continue;
         }
-        // knitr/Quarto-injected `params` is a defined global in parameterized
-        // Rmd/Quarto reports (frontmatter declares `params:`). The out-of-scope
-        // collector would otherwise misattribute a `params` use to a later
-        // `source()` whose target happens to export `params`. A matching guard
-        // in the undefined-variable collector keeps the two in sync; update
-        // both together. See `DiagnosticsSnapshot::rmd_declared_params`.
-        if snapshot.rmd_declared_params && name == "params" {
+        // knitr/Quarto-injected `params` (see `is_implicit_rmd_params`): the
+        // out-of-scope collector would otherwise misattribute a `params` use
+        // to a later `source()` whose target happens to export `params`.
+        if snapshot.is_implicit_rmd_params(name) {
             continue;
         }
 
@@ -5615,15 +5644,11 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
 
-        // knitr/Quarto inject a `params` object into parameterized reports
-        // whose frontmatter declares a top-level `params:` key. The masked
-        // analysis text blanks that frontmatter, so `params` would otherwise
-        // be flagged undefined. Treat it as a defined global, but ONLY for
-        // Rmd/Quarto docs that actually declare it — plain .R files and Rmd
-        // docs without `params:` still flag legitimate uses. A matching guard
-        // in the out-of-scope collector keeps the two in sync; update both
-        // together. See `DiagnosticsSnapshot::rmd_declared_params`.
-        if snapshot.rmd_declared_params && name == "params" {
+        // knitr/Quarto-injected `params` (see `is_implicit_rmd_params`): the
+        // masked analysis text blanks the frontmatter, so a declared `params`
+        // would otherwise be flagged undefined. Plain .R files and Rmd docs
+        // without `params:` still flag legitimate uses.
+        if snapshot.is_implicit_rmd_params(&name) {
             continue;
         }
 
@@ -10543,6 +10568,32 @@ mod semantic_warning_pipeline_tests {
             !undefined_params_messages(&diags).is_empty(),
             "params must still be flagged in a plain .R file; got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn snapshot_disables_trailing_blank_lines_for_rmd_only() {
+        // Lints run on the masked analysis text, where the closing fence /
+        // prose after the last chunk is blanked — the file-shape
+        // trailing-blank-lines rule would misfire at EOF on virtually every
+        // Rmd. The snapshot build switches it off for Rmd/Quarto docs (the
+        // raw file's shape is Markdown, not R) while leaving plain .R alone.
+        let enable_lints = |state: &mut WorldState| {
+            state.lint_config = LintConfig {
+                enabled: true,
+                ..LintConfig::default()
+            };
+        };
+        let code = "```{r}\nx <- 1\n```\n\nClosing prose.\n";
+        let (snapshot, _) = build_rmd_snapshot(code, "file:///report.Rmd", enable_lints);
+        assert!(
+            snapshot.lint_config.trailing_blank_lines_severity.is_none(),
+            "trailing_blank_lines must be disabled for Rmd documents"
+        );
+        let (snapshot, _) = build_rmd_snapshot("x <- 1\n", "file:///plain.R", enable_lints);
+        assert!(
+            snapshot.lint_config.trailing_blank_lines_severity.is_some(),
+            "trailing_blank_lines must stay active for plain .R (default HINT)"
         );
     }
 
@@ -22295,13 +22346,25 @@ result <- data %>% filter(x > 0)
         let prose_pos = Position::new(6, 4); // inside "Some prose paragraph."
 
         // selection_range must NOT surface the whole-document root range for a
-        // blank masked (prose) line — it yields no range for that position.
+        // blank masked (prose) line. The response is positional (result[i]
+        // answers positions[i]), so the prose position still yields exactly
+        // one entry — an empty range at the cursor with no parent.
         let sel =
             super::selection_range(&state, &uri, vec![prose_pos]).expect("selection_range Some");
-        assert!(
-            sel.is_empty(),
-            "selection_range must be empty at a prose position, got {:?}",
+        assert_eq!(
+            sel.len(),
+            1,
+            "positional contract: one entry per requested position, got {:?}",
             sel
+        );
+        assert_eq!(
+            (sel[0].range.start, sel[0].range.end),
+            (prose_pos, prose_pos),
+            "prose position must yield an empty range at the cursor"
+        );
+        assert!(
+            sel[0].parent.is_none(),
+            "prose fallback must have no parent to expand to"
         );
 
         assert!(

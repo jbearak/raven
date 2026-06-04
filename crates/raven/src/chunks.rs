@@ -488,7 +488,11 @@ pub fn frontmatter_declares_params(text: &str) -> bool {
 /// "Body" means the lines strictly after the header fence and before (or at)
 /// `end_line` — same bounds as [`mask_to_r`]. Header lines, closing fence
 /// lines, prose, YAML front matter, and non-R chunk bodies all return `false`.
-/// A `line` beyond the end of the document returns `false`.
+/// A knitr chunk-reuse line (`<<label>>`) inside an R body also returns
+/// `false` — [`mask_to_r`] blanks it, so reporting it as R would activate
+/// positional features (completion, signature help) on a line the analysis
+/// view treats as blank. A `line` beyond the end of the document returns
+/// `false`.
 pub fn position_in_r_chunk_body(text: &str, line: u32) -> bool {
     let total_lines = text.split('\n').count();
     let chunks = detect_chunks(text, ChunkKind::Rmd);
@@ -498,7 +502,12 @@ pub fn position_in_r_chunk_body(text: &str, line: u32) -> bool {
             continue;
         };
         if line >= body_start && line <= end_line {
-            return true;
+            // Same reuse-line test as `mask_to_r`: split on '\n' keeps any
+            // trailing '\r', which the regex tolerates.
+            return !text
+                .split('\n')
+                .nth(line as usize)
+                .is_some_and(|l| chunk_reuse_re().is_match(l));
         }
     }
     false
@@ -965,6 +974,18 @@ mod tests {
         // Unclosed chunk: body runs to EOF; line 1 is inside the body.
         let src = "```{r}\nx <- 1";
         assert!(position_in_r_chunk_body(src, 1));
+    }
+
+    #[test]
+    fn position_in_r_chunk_body_false_for_chunk_reuse_line() {
+        // A knitr `<<label>>` reuse line sits inside the body range but is
+        // blanked by mask_to_r — the guard must agree with the masked view.
+        let src = "```{r}\nx <- 1\n<<setup>>\n```\n";
+        assert!(position_in_r_chunk_body(src, 1)); // real R body line
+        assert!(!position_in_r_chunk_body(src, 2)); // reuse line → non-R
+        // CRLF variant: split('\n') keeps the '\r'; the regex tolerates it.
+        let crlf = "```{r}\r\n<<setup>>\r\n```\r\n";
+        assert!(!position_in_r_chunk_body(crlf, 1));
     }
 
     // =========================================================================

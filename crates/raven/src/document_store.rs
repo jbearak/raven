@@ -175,6 +175,10 @@ impl DocumentState {
         // Rope content (approximate: chars * average bytes per char)
         let content_size = self.contents.len_bytes();
 
+        // Masked analysis text (Rmd/Quarto only): a near-full second copy of
+        // the document, so it must count toward the eviction budget.
+        let masked_size = self.masked_text.as_ref().map_or(0, |s| s.len());
+
         // Tree size (conservative estimate based on typical AST overhead)
         let tree_size = self.tree.as_ref().map(|_| content_size).unwrap_or(0);
 
@@ -195,7 +199,13 @@ impl DocumentState {
             + self.artifacts.exported_interface.len() * 128  // Approximate per-symbol size
             + self.artifacts.timeline.len() * 64;
 
-        base_size + content_size + tree_size + packages_size + metadata_size + artifacts_size
+        base_size
+            + content_size
+            + masked_size
+            + tree_size
+            + packages_size
+            + metadata_size
+            + artifacts_size
     }
 }
 

@@ -947,7 +947,7 @@ mod tests {
     fn walk_includes_rmd_and_qmd() {
         // The empty-PATHS workspace walk collects chunk-bearing documents
         // alongside R sources, including mixed-case extensions
-        // (is_chunk_file matches the explicit list Rmd/rmd/RMD/qmd/Qmd/QMD).
+        // (is_chunk_file matches `.rmd`/`.qmd` case-insensitively).
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("a.R"), "x <- 1\n").unwrap();
         fs::write(tmp.path().join("report.Rmd"), "prose\n").unwrap();

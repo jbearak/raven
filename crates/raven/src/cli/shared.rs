@@ -153,11 +153,15 @@ pub fn is_r_file(p: &Path) -> bool {
     )
 }
 
+/// True for chunk-bearing document extensions (`.Rmd` / `.qmd`), matched
+/// case-insensitively so the CLI walk agrees with the canonical
+/// [`crate::chunks::classify_chunk_document`] (which lowercases the whole
+/// path) — a `report.rMd` saved on a case-insensitive filesystem must be
+/// collected by the same rule that later classifies it.
 pub fn is_chunk_file(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|s| s.to_str()),
-        Some("Rmd") | Some("rmd") | Some("RMD") | Some("qmd") | Some("Qmd") | Some("QMD")
-    )
+    p.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rmd") || ext.eq_ignore_ascii_case("qmd"))
 }
 
 /// Return `path` unchanged when already absolute; otherwise resolve it against
@@ -573,7 +577,12 @@ mod tests {
         assert!(!is_r_file(Path::new("a.Rmd")));
         assert!(is_chunk_file(Path::new("a.Rmd")));
         assert!(is_chunk_file(Path::new("a.qmd")));
+        // Case-insensitive, matching classify_chunk_document — including
+        // capitalizations outside the common Rmd/rmd/RMD set.
+        assert!(is_chunk_file(Path::new("a.rMd")));
+        assert!(is_chunk_file(Path::new("a.QmD")));
         assert!(!is_chunk_file(Path::new("a.R")));
+        assert!(!is_chunk_file(Path::new("a.rmdx")));
     }
 
     #[test]

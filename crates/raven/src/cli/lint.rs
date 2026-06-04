@@ -315,6 +315,16 @@ fn walk(
         // can never drift from the project-wide `.Rmd`/`.qmd` classifier.
         let chunk_kind = crate::chunks::classify_chunk_document(&path.to_string_lossy());
         let effective_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+        // The trailing-blank-lines rule describes the FILE's shape, but lints
+        // run on the masked analysis text, where the closing fence / prose
+        // after the last chunk is blanked — it would read as trailing blank
+        // lines at EOF on virtually every Rmd/Quarto document. The raw file's
+        // shape is Markdown, not R, so the rule simply doesn't apply to chunk
+        // documents. Mirrors the editor (`DiagnosticsSnapshot::build`).
+        let mut effective = effective;
+        if chunk_kind == crate::chunks::ChunkKind::Rmd {
+            effective.trailing_blank_lines_severity = None;
+        }
         // Use the same thread-local parser pool the LSP uses; avoids
         // per-file Parser construction.
         let parse_result =
@@ -824,8 +834,6 @@ mod tests {
         let root = tmp.path();
         // Prose-only .Rmd: `x=1` in prose would trigger assignment_operator if
         // treated as R, but masking must blank it. No R chunks at all.
-        // The document deliberately has no trailing newline so trailing_blank_lines
-        // doesn't fire on the masked (all-empty) text.
         let content = "---\ntitle: Test\n---\n\nThis is prose. x=1 here.";
         let file = root.join("prose_only.Rmd");
         fs::write(&file, content).unwrap();
@@ -852,7 +860,6 @@ mod tests {
         let root = tmp.path();
         // Line 5 (0-based) = `x=1 # nolint`  → assignment_operator suppressed
         // Line 6 (0-based) = `y=2`            → assignment_operator flagged (non-vacuous)
-        // The document has no trailing newline to avoid trailing_blank_lines noise.
         let content = "---\ntitle: Test\n---\n\n```{r}\nx=1 # nolint\ny=2\n```";
         let file = root.join("nolint.Rmd");
         fs::write(&file, content).unwrap();
@@ -883,6 +890,49 @@ mod tests {
                         ))
             }),
             "assignment_operator on line 6 (y=2) must not be suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lint_rmd_exempt_from_trailing_blank_lines() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // The closing fence and prose after the last chunk are blanked in the
+        // masked analysis text, so the file-shape rule would otherwise read
+        // them as trailing blank lines at EOF on virtually every Rmd. The rule
+        // is disabled for chunk documents (the raw file's shape is Markdown,
+        // not R) — but stays active for plain .R files.
+        let rmd = root.join("doc.Rmd");
+        fs::write(&rmd, "```{r}\nx <- 1\n```\n\nClosing prose.\n").unwrap();
+        let r_file = root.join("plain.R");
+        fs::write(&r_file, "x <- 1\n\n\n").unwrap();
+
+        let settings = serde_json::json!({
+            "linting": { "enabled": true, "trailingBlankLinesSeverity": "warning" }
+        });
+        let trailing = |diags: &[(PathBuf, Diagnostic)]| {
+            diags.iter().any(|(_, d)| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "trailing_blank_lines".to_string(),
+                    ))
+            })
+        };
+
+        let (rmd_diags, err) = lint_one(root, &rmd, &settings);
+        assert!(!err, "unexpected operator error");
+        assert!(
+            !trailing(&rmd_diags),
+            "masked Rmd must not produce trailing_blank_lines findings; got {rmd_diags:?}"
+        );
+
+        let (r_diags, err) = lint_one(root, &r_file, &settings);
+        assert!(!err, "unexpected operator error");
+        assert!(
+            trailing(&r_diags),
+            "plain .R must still be flagged (non-vacuous); got {r_diags:?}"
         );
     }
 
