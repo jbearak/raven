@@ -70,7 +70,7 @@ Raven can resolve a package's **export names** from three sources — installed 
 
 | | Export resolution | Missing-package ("not installed") |
 |---|---|---|
-| **Language server (interactive)** | tiers 1→2→3 (prevents an undefined-variable storm when R is absent and Tier 2 metadata or Tier 3 sidecars cover the package) | Fires when install state is known and the package is absent — regardless of the database. Export metadata stops the symbol storm when coverage exists but never masks the "install this dependency" nudge. |
+| **Language server (interactive)** | tiers 1→2→3 (prevents an undefined-variable storm when R is absent and Tier 2 metadata or the Tier 3 database covers the package) | Fires when install state is known and the package is absent — regardless of the database. Export metadata stops the symbol storm when coverage exists but never masks the "install this dependency" nudge. |
 | **`raven check` (CI)** | tiers 1→2→3 | **Suppressed by default** (CI deliberately omits installation). Re-enable with [`--report-uninstalled`](cli.md#missing-package-reporting-in-ci). |
 
 When enabled, `--report-uninstalled` reports `library()` calls **not present in the local library paths** — *not* relative to the Tier 2/Tier 3 export metadata. Reach for it when a `library(X)` call must really succeed at runtime: CI that installs packages (e.g. `renv::restore()`) and wants to catch failures, or CI that **actually runs your R scripts** after `raven check` (e.g. R-package development), where an uninstalled package is a real error. Gate-only CI that never executes the scripts wants the default.
