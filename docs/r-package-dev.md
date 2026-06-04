@@ -251,13 +251,13 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 ## Generating a package database for CI
 
-`raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's `names.db` sidecar when it is present, so they don't show as undefined variables. That sidecar isn't bundled with the binary; run `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded R base-package coverage.
+`raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's `names.db` database when it is present, so they don't show as undefined variables. That database isn't bundled with the binary; run `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded R base-package coverage.
 
 Generate and commit `.raven/packages.json` (Tier 2) when CI needs reproducible, project-specific package metadata pinned to what your project actually installed. That is distinct from `raven packages update`, which restores broad Tier 3 coverage from the moving `names-db` Release and is not version-pinned by the project.
 
 Tier 2 also improves diagnostic accuracy in two common cases:
 
-1. you depend on packages whose exports **aren't present** in Raven's Tier 3 sidecars (GitHub-only, internal, or not-yet-indexed packages), or
+1. you depend on packages whose exports **aren't present** in Raven's Tier 3 database (GitHub-only, internal, or not-yet-indexed packages), or
 2. you pin package versions whose exports **differ** from the versions Raven captured, in ways that could change your diagnostics (see the [drift caveat](package-database.md#fidelity-caveats)).
 
 To generate the file:
