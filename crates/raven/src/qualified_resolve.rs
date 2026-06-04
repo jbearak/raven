@@ -25,11 +25,17 @@
 //! intermediate prefix (`alpha$beta <- ...`, constructor or opaque) is an
 //! *establishing site*; members declared before the latest visible one are
 //! dropped (see [`collect_prefix_writes`] and the cutoff in the core collector).
-//! A `source()` that brings the head's defining file into scope is itself an
-//! establishing event, so a cursor-file reassignment also drops members from
-//! upstream files sourced before it. The residual imprecision is narrowed to a
-//! defining file reached only *transitively* (no direct source line in the
-//! cursor file), where upstream members are kept conservatively.
+//! A site only counts in the head's own scope — a rewrite inside an unrelated
+//! function body modifies a local copy and is excluded. To order sites and
+//! members that live in different files, each maps to a global,
+//! execution-ordered key (cursor-file events anchor at their own position;
+//! directly-sourced events anchor at the `source()` call site, the within-file
+//! position breaking ties). A `source()` that brings the head's defining file
+//! into scope is itself an establishing event, so a cursor-file reassignment
+//! drops upstream members sourced before it, and a within-helper reassignment
+//! drops that helper's own earlier members. The residual imprecision is narrowed
+//! to a defining file reached only *transitively* (no direct source line) and to
+//! reassignments in a third sourced file, where members are kept conservatively.
 //!
 //! For `foo$bar` (or `foo@bar`) where the cursor is on `bar`:
 //!
@@ -598,11 +604,14 @@ fn collect_qualified_member_candidates_with_cancel(
     let defining_uri = symbol.source_uri.clone();
     let cursor_uri = uri.clone();
 
-    // Establishing-site positions collected while walking the cursor file (the
-    // only file whose sites feed the reassignment cutoff). Populated by whichever
-    // `collect_prefix_writes` call walks the cursor file (defining block when
-    // cursor == defining, else the matching cross-file iteration).
-    let mut establishing_sites: Vec<EffectPos> = Vec::new();
+    // Whole-value prefix (re)writes that can reset the members at `path`, each
+    // tagged with the file it lives in. Fed by the cursor-file walk (a
+    // reassignment the user typed) and the defining-file walk (the head's own
+    // file reassigning its value in place). The cutoff below maps each to a
+    // global, execution-ordered key so a within-file reassignment in a sourced
+    // file orders correctly against the cursor instead of collapsing to its
+    // `source()` line.
+    let mut prefix_write_sites: Vec<(Url, EffectPos)> = Vec::new();
 
     let mut defining_candidates: Vec<Candidate> = Vec::new();
     {
@@ -661,7 +670,11 @@ fn collect_qualified_member_candidates_with_cancel(
                 &mut defining_candidates,
             );
         }
-        let defining_sites = (defining_uri == cursor_uri).then_some(&mut establishing_sites);
+        // The defining file's own prefix writes feed the cutoff (its value can
+        // be reassigned in place), gated to the head's function scope so a
+        // function-local rewrite of a top-level value never resets it — the same
+        // identity the `fn_scope == symbol_fn_scope` retain below applies to
+        // member candidates.
         collect_prefix_writes(
             defining_tree.root_node(),
             &defining_text,
@@ -670,7 +683,8 @@ fn collect_qualified_member_candidates_with_cancel(
             path,
             rhs_name,
             &mut defining_candidates,
-            defining_sites,
+            symbol_fn_scope,
+            Some(&mut prefix_write_sites),
             false,
         );
 
@@ -730,7 +744,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     false,
                 );
                 let candidate_sites = if *candidate_uri == cursor_uri {
-                    Some(&mut establishing_sites)
+                    Some(&mut prefix_write_sites)
                 } else {
                     None
                 };
@@ -742,6 +756,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     path,
                     rhs_name,
                     &mut needs_validation,
+                    None, // cross-file head is global: only top-level writes reset it
                     candidate_sites,
                     false,
                 );
@@ -778,7 +793,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     true, // skip function bodies
                 );
                 let candidate_sites = if *candidate_uri == cursor_uri {
-                    Some(&mut establishing_sites)
+                    Some(&mut prefix_write_sites)
                 } else {
                     None
                 };
@@ -790,6 +805,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     path,
                     rhs_name,
                     &mut cross_file_candidates,
+                    None, // cross-file head is global: only top-level writes reset it
                     candidate_sites,
                     true, // skip function bodies
                 );
@@ -851,36 +867,62 @@ fn collect_qualified_member_candidates_with_cancel(
     all_candidates.extend(cross_file_candidates);
 
     // Establishing-site cutoff (reassignment semantics): a whole-value (re)write
-    // of an intermediate prefix replaces members declared before it. Members at
-    // or after the latest such write survive; earlier ones (including those from
-    // the head binding's constructor, and those from upstream files sourced
-    // before the write) are dropped. The establishing events are the cursor
-    // file's prefix writes (collected above) plus the `source()` that brings the
-    // head's defining file into scope — a source re-establishes the whole value,
-    // so it competes for the latest cutoff.
+    // of an intermediate prefix replaces the members declared before it. Members
+    // at or after the latest such write survive; earlier ones (including those
+    // from the head binding's constructor, and those from upstream files sourced
+    // before the write) are dropped.
+    //
+    // Events and candidates live in different files, so comparing raw line
+    // numbers would conflate two coordinate systems (a cursor-file line 2 is not
+    // "after" a sourced helper's line 2). Map each to a global, execution-ordered
+    // key `(anchor_line, anchor_col, file_rank, within_line, within_col)`:
+    //
+    // - cursor-file event: anchors at its own position, `file_rank` 1.
+    // - directly-sourced file's event: anchors at the `source()` call site,
+    //   `file_rank` 0, with the within-file position breaking ties so that a
+    //   reassignment later *inside* a helper drops that helper's earlier members.
+    // - transitively-reached file: no anchor — excluded from the cutoff, and its
+    //   members are kept conservatively (over-offer, never wrong-variable).
+    //
+    // The establishing events are the collected prefix writes (cursor file +
+    // defining file) plus the `source()` that brings the head's defining file
+    // into scope — sourcing re-establishes the whole value, so it competes for
+    // the latest cutoff.
     if !path.segments.is_empty() {
         let source_pos = direct_source_positions(state, &cursor_uri, position);
-        let head_source = source_pos.get(&defining_uri).copied();
-        let cursor = (position.line, position.character);
-        let cutoff = establishing_sites
+        type Key = (u32, u32, u8, u32, u32);
+        let global_key = |uri: &Url, line: u32, col: u32| -> Option<Key> {
+            if *uri == cursor_uri {
+                Some((line, col, 1, line, col))
+            } else {
+                source_pos.get(uri).map(|&(sl, sc)| (sl, sc, 0, line, col))
+            }
+        };
+        let cursor_key: Key = (
+            position.line,
+            position.character,
+            1,
+            position.line,
+            position.character,
+        );
+        // The head's defining file is (re)established where it is sourced, so a
+        // cursor-file write before that `source()` is superseded and one after it
+        // wins. A same-file head needs no event: the effect-after-definition
+        // retain already drops members above the head binding.
+        let head_establishment = (defining_uri != cursor_uri)
+            .then(|| global_key(&defining_uri, symbol.defined_line, symbol.defined_column))
+            .flatten();
+        let cutoff = prefix_write_sites
             .iter()
-            .map(|s| (s.line, s.utf16_column))
-            .chain(head_source)
-            .filter(|&pos| pos <= cursor)
+            .filter_map(|(uri, pos)| global_key(uri, pos.line, pos.utf16_column))
+            .chain(head_establishment)
+            .filter(|&k| k <= cursor_key)
             .max();
         if let Some(cutoff) = cutoff {
             all_candidates.retain(|c| {
-                if c.uri == cursor_uri {
-                    (c.effect.line, c.effect.utf16_column) >= cutoff
-                } else {
-                    // Drop an upstream candidate whose file was sourced before the
-                    // cutoff (the reassignment replaced it). Keep it if sourced at
-                    // or after the cutoff, or reached only transitively (no direct
-                    // source line — conservative).
-                    match source_pos.get(&c.uri) {
-                        Some(&src) => src >= cutoff,
-                        None => true,
-                    }
+                match global_key(&c.uri, c.effect.line, c.effect.utf16_column) {
+                    Some(k) => k >= cutoff,
+                    None => true,
                 }
             });
         }
@@ -1643,11 +1685,14 @@ fn target_path_prefix_len(target: Node, text: &str, path: &QualifiedPath) -> Opt
 /// - **Members** — when the write's RHS is an allowlisted constructor, descend
 ///   it to the full path and push one candidate per terminal named argument.
 /// - **Establishing sites** — when `establishing_sites` is `Some`, record this
-///   write's effect position regardless of its RHS shape (constructor, opaque
-///   call, or bare value). The latest visible site resets the members at `path`.
-///
-/// Pass `establishing_sites = Some(...)` only when `root` is the cursor file's
-/// tree; the cutoff considers only the cursor file's sites.
+///   write's `(file, effect position)` regardless of its RHS shape (constructor,
+///   opaque call, or bare value), but only when the write executes in
+///   `live_scope` (its nearest enclosing function id equals `live_scope`). A
+///   write inside some *other* function targets that function's local copy and
+///   cannot reset the value visible at the cursor, so it must not become a
+///   cutoff — the same identity the `fn_scope == symbol_fn_scope` retain applies
+///   to member candidates. Pass `live_scope = None` for cross-file walks (the
+///   head is a global; only top-level writes reset it).
 #[allow(clippy::too_many_arguments)]
 fn collect_prefix_writes(
     root: Node,
@@ -1657,7 +1702,8 @@ fn collect_prefix_writes(
     path: &QualifiedPath,
     rhs_name: Option<&str>,
     out: &mut Vec<Candidate>,
-    mut establishing_sites: Option<&mut Vec<EffectPos>>,
+    live_scope: FunctionScopeId,
+    mut establishing_sites: Option<&mut Vec<(Url, EffectPos)>>,
     skip_functions: bool,
 ) {
     if path.segments.is_empty() {
@@ -1670,9 +1716,13 @@ fn collect_prefix_writes(
         let Some(k) = target_path_prefix_len(target, text, path) else {
             return;
         };
-        // Any whole-value write to a prefix of `path` is an establishing site.
-        if let Some(sites) = establishing_sites.as_deref_mut() {
-            sites.push(EffectPos::from_node_end(node, col_mapper));
+        // A whole-value write to a prefix of `path`, in the head's scope, is an
+        // establishing site. Writes in a nested/unrelated function scope modify a
+        // local copy and are skipped.
+        if let Some(sites) = establishing_sites.as_deref_mut()
+            && enclosing_function_id(node) == live_scope
+        {
+            sites.push((file_uri.clone(), EffectPos::from_node_end(node, col_mapper)));
         }
         // A constructor RHS additionally contributes member candidates.
         let Some(value) = assignment_value_node(node, text) else {
@@ -2076,6 +2126,26 @@ alpha$beta$
     }
 
     #[test]
+    fn function_local_rewrite_does_not_drop_top_level_members() {
+        // A whole-value rewrite of `alpha$beta` *inside a function body* targets
+        // that function's local copy — it must not be treated as an establishing
+        // site for the top-level `alpha$beta`, which still has `gamma`.
+        let mut state = fresh_state();
+        let code = "\
+alpha <- list(beta = list(gamma = 1))
+f <- function() {
+  alpha$beta <- list(delta = 2)
+}
+alpha$beta$
+";
+        let uri = add_indexed_doc(&mut state, "file:///fl.R", code);
+        let names = completion_path_names(&state, &uri, Position::new(4, 11), "alpha", &["beta"]);
+        // The function-local rewrite (and its `delta`) are out of scope; `gamma`
+        // survives — it was NOT dropped by a spurious in-function cutoff.
+        assert_eq!(names, vec!["gamma".to_string()]);
+    }
+
+    #[test]
     fn nested_member_below_cursor_not_offered() {
         let mut state = fresh_state();
         let code = "\
@@ -2148,6 +2218,29 @@ alpha$beta$
         // gamma (sourced after the reassignment) is kept; delta predates the
         // source so the cursor-file cutoff drops it.
         assert_eq!(names, vec!["gamma".to_string()]);
+    }
+
+    #[test]
+    fn nested_member_within_helper_reassignment_drops_earlier() {
+        // The reassignment lives entirely *inside* the sourced helper: it first
+        // declares alpha$beta with `stale`, then wholly rewrites alpha$beta to
+        // `fresh`. The cursor file only sources it. Ordering both helper events
+        // by the same source anchor would keep `stale`; the within-file position
+        // must break the tie so the helper-local rewrite drops it.
+        let mut state = fresh_state();
+        let main_code = "\
+source(\"helpers.R\")
+alpha$beta$
+";
+        let helpers_code = "\
+alpha <- list(beta = list(stale = 0))
+alpha$beta <- list(fresh = 2)
+";
+        let (main_uri, _helpers_uri) =
+            setup_two_file_workspace(&mut state, main_code, helpers_code);
+        let names =
+            completion_path_names(&state, &main_uri, Position::new(1, 11), "alpha", &["beta"]);
+        assert_eq!(names, vec!["fresh".to_string()]);
     }
 
     #[test]

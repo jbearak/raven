@@ -222,18 +222,38 @@ The earlier `list(gamma = 1)` is an *earlier* establishing site, so it is below
 the cutoff and excluded. A subsequent `alpha$beta$epsilon <- 3` is added (it is
 after the cutoff).
 
-**Cross-file reassignment.** A `source()` that brings the head's defining file
-into scope is itself an establishing event, so it competes with cursor-file
-prefix writes for the latest cutoff. A cursor-file reassignment after the
-`source()` therefore drops the upstream members it replaced (and a `source()`
-after a cursor-file reassignment re-establishes them). This is ordered by the
-direct source-call line in the cursor file.
+**Scope of an establishing site.** A prefix write only resets the value the
+cursor sees if it executes in the head's own scope. A write inside an *unrelated
+function body* (`function() { alpha$beta <- … }` while `alpha` is top-level)
+targets that function's local copy, so it is excluded from the cutoff — the same
+`fn_scope == symbol_fn_scope` identity the resolver already applies to member
+candidates. Cross-file walks use the global (top-level) scope, since only
+globals cross files.
+
+**Cross-file reassignment.** Events and candidates live in different files, so
+the cutoff cannot compare raw line numbers (cursor-file line 2 is not "after" a
+helper's line 2). Each event and candidate is mapped to a global,
+execution-ordered key `(anchor_line, anchor_col, file_rank, within_line,
+within_col)`:
+
+- a cursor-file event anchors at its own position (`file_rank` 1);
+- a directly-sourced file's event anchors at its `source()` call site
+  (`file_rank` 0), with the within-file position breaking ties.
+
+This makes three orderings fall out of one comparison: a cursor-file
+reassignment after a `source()` drops the upstream members it replaced; a
+`source()` after a cursor-file reassignment re-establishes them; and a
+reassignment *inside* a sourced helper drops that helper's own earlier members
+(the within-file position separates the two same-anchor events).
 
 **Residual imprecision.** When the defining file is reached only *transitively*
-(no direct `source()` call in the cursor file), there is no cursor-file line to
-order it against, so upstream members are kept conservatively (over-offer, never
-wrong-variable). This is the same coarse contributor-chain basis `pick_winner`
-already accepts for cross-file selection.
+(no direct `source()` call in the cursor file), there is no anchor to order it
+against, so its members are kept conservatively (over-offer, never
+wrong-variable). Likewise, establishing sites are gathered only from the cursor
+file and the head's defining file; a reassignment in a *third* sourced file is
+not used as a cutoff (validating its `alpha` identity per write is more than the
+hot path warrants). Both are the same coarse contributor-chain basis
+`pick_winner` already accepts for cross-file selection.
 
 ## Testing
 
@@ -250,6 +270,11 @@ already accepts for cross-file selection.
 - Cross-file nested: structure declared in a sourced file and extended in the
   cursor file; plus position-awareness (a member assigned below the cursor is
   not offered).
+- Cross-file reassignment ordering: a cursor-file reassignment after `source()`
+  drops upstream members; one before `source()` keeps them; a reassignment
+  *inside* the sourced helper drops the helper's own earlier members.
+- Scope of an establishing site: a whole-value rewrite inside an unrelated
+  function body does not reset a top-level value (its members survive).
 - Completion integration (handlers/completion tests) and goto-def integration
   for nested paths.
 - Non-static bail cases: `f()$x$`, `alpha[[i]]$x$` → empty result.
