@@ -232,17 +232,6 @@ fn node_text<'a>(node: Node<'a>, text: &'a str) -> &'a str {
 // Parameter resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve function parameters with multi-phase resolution.
-///
-/// Resolution priority:
-/// 1. **Cache**: Check signature cache first (both package and user caches)
-/// 2. **Local AST**: Search the current file for the nearest in-scope function
-///    definition before the cursor position (works for untitled/unsaved docs)
-/// 3. **Cross-file scope**: Search sourced files for function definitions
-/// 4. **Package**: Determine which package exports the function using the scope
-///    resolver's position-aware `loaded_packages` + `inherited_packages`, then
-///    query R subprocess (stub for now — Task 4.1 adds `get_function_formals`)
-///
 /// Resolve a function signature using ONLY user-defined sources: the user
 /// signature cache, the current file's AST, then cross-file scope.
 ///
@@ -273,6 +262,20 @@ pub fn resolve_user_only(
     resolve_from_cross_file(state, cache, function_name, current_uri, position)
 }
 
+/// Resolve function parameters with multi-phase resolution.
+///
+/// Resolution priority:
+/// 1. **Cache**: Check signature cache first (both package and user caches)
+/// 2. **Local AST**: Search the current file for the nearest in-scope function
+///    definition before the cursor position (works for untitled/unsaved docs)
+/// 3. **Cross-file scope**: Search sourced files for function definitions
+/// 4. **Package**: Determine which package exports the function using the scope
+///    resolver's position-aware `loaded_packages` + `inherited_packages`, then
+///    query R subprocess for its formals
+///
+/// Phases 1-3 (the user-defined path, for unqualified names) are delegated to
+/// [`resolve_user_only`]; phase 4 is the package path unique to this entry point.
+///
 /// This function is synchronous and may block on R subprocess for package
 /// functions. The backend wraps it in `spawn_blocking`.
 pub fn resolve(

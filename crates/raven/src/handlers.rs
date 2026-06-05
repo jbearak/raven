@@ -5858,20 +5858,24 @@ fn is_assignment_target(node: Node) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if parent.kind() != "binary_operator" {
-        return false;
+    assignment_target_node(parent).is_some_and(|t| t.id() == node.id())
+}
+
+/// Given a `binary_operator` node, return the child the assignment *writes* —
+/// the `lhs` for `<-` / `=` / `<<-`, or the `rhs` for `->` / `->>` — or `None`
+/// if `binop` is not an assignment. Centralizes the operator-direction table
+/// shared by `is_assignment_target` and `enclosing_named_function_line`.
+fn assignment_target_node(binop: Node) -> Option<Node> {
+    if binop.kind() != "binary_operator" {
+        return None;
     }
-    let Some(op) = parent.child_by_field_name("operator") else {
-        return false;
-    };
     // The operator token's `kind()` is its literal text. Left-assignment writes
     // the lhs; right-assignment writes the rhs.
-    let target = match op.kind() {
-        "<-" | "=" | "<<-" => parent.child_by_field_name("lhs"),
-        "->" | "->>" => parent.child_by_field_name("rhs"),
-        _ => return false,
-    };
-    target.is_some_and(|t| t.id() == node.id())
+    match binop.child_by_field_name("operator")?.kind() {
+        "<-" | "=" | "<<-" => binop.child_by_field_name("lhs"),
+        "->" | "->>" => binop.child_by_field_name("rhs"),
+        _ => None,
+    }
 }
 
 /// Returns true for the *non-definition* structural non-references: identifiers
@@ -5908,34 +5912,20 @@ fn is_assignment_target(node: Node) -> bool {
 fn is_structural_label(node: Node) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
 
+    // Named-argument label (`n` in `f(n = 1)`) or function-parameter name.
+    // These shapes are centralized in `is_named_argument_label` /
+    // `is_parameter_name` so this predicate and hover's resolve-before-suppress
+    // carve-outs (#382) cannot drift on the AST shape. Parameter *default
+    // expressions* are intentionally NOT labels — they are treated as usages so
+    // the out-of-scope diagnostic flags source-order dependencies like
+    // `function(a = b)` before a later `source()` that defines `b`.
+    if is_named_argument_label(node) || is_parameter_name(node) {
+        return true;
+    }
+
     let Some(parent) = node.parent() else {
         return false;
     };
-
-    // Named argument: `n = 1` in `f(..., n = 1)`.
-    if parent.kind() == "argument"
-        && let Some(name_node) = parent.child_by_field_name("name")
-        && name_node.id() == node.id()
-    {
-        return true;
-    }
-
-    // Parameter NAME only. Default expressions are intentionally treated as
-    // usages: R evaluates them lazily, but the out-of-scope diagnostic flags
-    // source-order dependencies such as `function(a = b)` before a later
-    // `source()` that defines `b`, because relying on that later side effect
-    // is fragile.
-    if matches!(parent.kind(), "parameter" | "default_parameter")
-        && let Some(name_node) = parent.child_by_field_name("name")
-        && name_node.id() == node.id()
-    {
-        return true;
-    }
-
-    // Identifier directly inside a `parameters` list.
-    if parent.kind() == "parameters" {
-        return true;
-    }
 
     // `namespace_operator` (`pkg::name`, `pkg:::name`) — both sides are
     // qualified references, not bare variable lookups.
@@ -5946,11 +5936,24 @@ fn is_structural_label(node: Node) -> bool {
     // RHS of `extract_operator` (`obj$X`, `obj@slot`) — member-name string.
     // Centralized in `crate::extract_op` so go-to-def's qualified-member
     // resolver and this predicate cannot drift on the AST shape.
-    if crate::extract_op::extract_operator_rhs(node).is_some() {
-        return true;
-    }
+    crate::extract_op::extract_operator_rhs(node).is_some()
+}
 
-    false
+/// True when `node` is the *label* (name) of a named call argument — the `name`
+/// field of an `argument`, as in `title` in `f(title = ...)`.
+///
+/// Centralizes the named-argument-label AST shape so `is_structural_label`
+/// (suppression) and hover's named-arg → formal resolution
+/// (`named_arg_call_function`, #382 step 2) cannot drift — the same discipline
+/// `crate::extract_op` applies to the `$`/`@` member shape. A positional value
+/// (`x` in `f(x)`) has no `name` field and is not a label.
+fn is_named_argument_label(node: Node) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "argument"
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name_node| name_node.id() == node.id())
+    })
 }
 
 /// Returns true if the given identifier node is a *structural non-reference*:
@@ -13137,9 +13140,12 @@ fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
 
 /// True when `node` is the NAME of a function parameter at a definition site —
 /// the `name` field of a `parameter`/`default_parameter`, or a bare identifier
-/// directly inside a `parameters` list. Mirrors the parameter branches of
-/// [`is_structural_label`]; hover uses it to attempt `@param` resolution
-/// (#382 step 3) before that predicate would otherwise suppress the node.
+/// directly inside a `parameters` list (a default *value* expression is not a
+/// name and is excluded).
+///
+/// Centralizes the parameter-name AST shape: both [`is_structural_label`]
+/// (suppression) and hover's `@param` resolution (#382 step 3) call this, so the
+/// two cannot drift — the same discipline `crate::extract_op` applies to `$`/`@`.
 fn is_parameter_name(node: Node) -> bool {
     let Some(parent) = node.parent() else {
         return false;
@@ -13169,20 +13175,12 @@ fn enclosing_named_function_line(param_node: Node) -> Option<u32> {
         current = parent;
     };
 
-    // A function only carries roxygen when it is bound to a name.
+    // A function carries roxygen only when bound to a name: it must be the
+    // *value* side of an assignment. Since `func_def` is a direct operand of its
+    // parent, being the value side is exactly "not the written target".
     let assign = func_def.parent()?;
-    if assign.kind() != "binary_operator" {
-        return None;
-    }
-    let op = assign.child_by_field_name("operator")?;
-    let assigned = match op.kind() {
-        "<-" | "=" | "<<-" => assign.child_by_field_name("rhs"),
-        "->" | "->>" => assign.child_by_field_name("lhs"),
-        _ => return None,
-    };
-    assigned
-        .filter(|n| n.id() == func_def.id())
-        .map(|_| func_def.start_position().row as u32)
+    let target = assignment_target_node(assign)?;
+    (target.id() != func_def.id()).then(|| func_def.start_position().row as u32)
 }
 
 /// Render a hover body for a function parameter: a code block with the
@@ -13213,11 +13211,11 @@ fn parameter_hover(decl: &str, owner: Option<&str>, doc: Option<&str>) -> String
 /// returns `g`, not `f`. A non-identifier callee (`pkg::fn`, `obj$method`) is
 /// not a user-defined-function candidate and yields `None`.
 fn named_arg_call_function(node: Node) -> Option<Node> {
-    let argument = node.parent()?;
-    if argument.kind() != "argument" || argument.child_by_field_name("name")?.id() != node.id() {
+    if !is_named_argument_label(node) {
         return None;
     }
-    let arguments = argument.parent()?;
+    // argument -> arguments -> call (the immediately-enclosing call).
+    let arguments = node.parent()?.parent()?;
     if arguments.kind() != "arguments" {
         return None;
     }
@@ -13535,63 +13533,28 @@ fn extract_statement_from_tree(
 }
 
 /// Build a [`DefinitionInfo`] for a local member definition discovered by the
-/// qualified-member resolver (`obj$name`/`obj@slot`, #382 step 4): the
-/// assignment/constructor statement enclosing the member token at `location`.
+/// qualified-member resolver (`obj$name`/`obj@slot`, #382 step 4).
 ///
-/// Reuses the same `find_assignment_statement` + `extract_statement_text`
-/// machinery as `extract_statement_from_tree`'s variable path, so a resolved
-/// member renders exactly like any other local definition.
+/// A `$`/`@` member is always an assignment/constructor definition, so this
+/// delegates to [`extract_definition_statement`] with a synthetic
+/// `Variable`-kind [`ScopedSymbol`] pointing at the member's name range — the
+/// same path local variables take — rather than re-implementing the
+/// content/tree-acquisition and statement-extraction machinery. The synthetic
+/// `name` is unused by that path (which keys off `source_uri` + position).
 fn member_definition_info(
     state: &WorldState,
     location: &tower_lsp::lsp_types::Location,
 ) -> Option<DefinitionInfo> {
-    let uri = &location.uri;
-    let line = location.range.start.line;
-    let column = location.range.start.character;
-
-    let content = if let Some(doc) = state.documents.get(uri) {
-        doc.analysis_text()
-    } else {
-        state.cross_file_file_cache.get(uri)?
+    let symbol = ScopedSymbol {
+        name: std::sync::Arc::from(""),
+        kind: scope::SymbolKind::Variable,
+        source_uri: location.uri.clone(),
+        defined_line: location.range.start.line,
+        defined_column: location.range.start.character,
+        signature: None,
+        is_declared: false,
     };
-
-    if let Some(doc) = state.documents.get(uri) {
-        let tree = doc.tree.as_ref()?;
-        member_definition_from_tree(tree, &content, uri, line, column)
-    } else {
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
-        let parsed = parser.parse(&content, None)?;
-        member_definition_from_tree(&parsed, &content, uri, line, column)
-    }
-}
-
-fn member_definition_from_tree(
-    tree: &tree_sitter::Tree,
-    content: &str,
-    uri: &Url,
-    line: u32,
-    column: u32,
-) -> Option<DefinitionInfo> {
-    let line_text = content.lines().nth(line as usize).unwrap_or("");
-    let byte_col = utf16_column_to_byte_offset(line_text, column);
-    let row = line as usize;
-    let point_start = tree_sitter::Point::new(row, byte_col);
-    let point_end = tree_sitter::Point::new(row, next_utf8_char_boundary(line_text, byte_col));
-    let root = tree.root_node();
-    let node = root
-        .named_descendant_for_point_range(point_start, point_end)
-        .or_else(|| root.descendant_for_point_range(point_start, point_end))?;
-
-    let statement_node = find_assignment_statement(node, content)?;
-    let statement = extract_statement_text(statement_node, content);
-
-    Some(DefinitionInfo {
-        statement,
-        source_uri: uri.clone(),
-        line,
-        column,
-    })
+    extract_definition_statement(&symbol, state)
 }
 
 /// Render the standard local/sourced-definition hover body: a code block with
@@ -14221,19 +14184,17 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             });
         }
 
-        let mut value = String::new();
-
         // Check if this is a package export (source_uri starts with "package:")
         // Package exports have URIs like "package:dplyr" or "package:base"
         let package_name = symbol.source_uri.as_str().strip_prefix("package:");
 
-        // Try to extract definition statement
-        let workspace_root = state.workspace_folders.first();
-        match extract_definition_statement(symbol, state) {
-            Some(def_info) => {
-                value = local_definition_hover(state, &def_info, uri);
-            }
+        // Try to extract the definition statement; otherwise fall back to
+        // signature/package-help info for the symbol.
+        let value = match extract_definition_statement(symbol, state) {
+            Some(def_info) => local_definition_hover(state, &def_info, uri),
             None => {
+                let mut value = String::new();
+                let workspace_root = state.workspace_folders.first();
                 // Graceful fallback: show symbol info without definition statement
                 // For package exports, get full R help documentation
                 // Validates: Requirement 10.2
@@ -14274,8 +14235,9 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                         value.push_str(&format!("\n*Defined in {}*", relative_path));
                     }
                 }
+                value
             }
-        }
+        };
 
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
