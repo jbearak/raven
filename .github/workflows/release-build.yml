@@ -84,27 +84,20 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      # Pin to rust-toolchain.toml's channel so release binaries are built with
-      # the same compiler as CI/dev (reproducible). dtolnay can't read that file
-      # AND must install the per-matrix target's std for this toolchain — which
-      # the file's auto-install would not do — so the version is repeated here.
-      # Keep it in sync with rust-toolchain.toml.
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
-        with:
-          toolchain: "1.96.0"
-          targets: ${{ matrix.target }}
-          # Install the same components rust-toolchain.toml pins
-          # (components = ["rustfmt", "clippy"]) up front, in the same rustup
-          # pass that lays down the toolchain. Otherwise the first `cargo` call
-          # in "Build LSP" triggers a rust-toolchain.toml reconcile that tries to
-          # add rustfmt as `rustfmt-preview`, colliding with the `bin/cargo-fmt`
-          # this step already installed: "detected conflict: 'bin/cargo-fmt'".
-          # The gate workflows (integration.yml) dodge this by letting rustup do
-          # one clean install with no dtolnay step; the release build needs
-          # dtolnay for cross-compile `targets`, so it must request the
-          # components explicitly to keep the later reconcile a no-op.
-          components: rustfmt, clippy
+      # Install the toolchain the way the integration.yml gates do: with NO
+      # toolchain action, so rustup auto-installs rust-toolchain.toml's channel
+      # and its components (rustfmt, clippy) in a single clean pass on first use.
+      #
+      # Using dtolnay/rust-toolchain here pre-installed rustfmt for 1.96.0; the
+      # first `cargo` call in "Build LSP" then reconciled against
+      # rust-toolchain.toml and tried to re-add rustfmt as the manifest's
+      # `rustfmt-preview`, colliding with the `bin/cargo-fmt` already on disk
+      # ("detected conflict: 'bin/cargo-fmt'") — a double-install the always-green
+      # gates never hit because they have no toolchain step. `rustup target add`
+      # both triggers that clean auto-install and adds the per-matrix
+      # cross-compile target's std (what dtolnay's `targets:` used to do).
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry & build artifacts
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
