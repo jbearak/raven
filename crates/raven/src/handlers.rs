@@ -13155,6 +13155,11 @@ fn is_parameter_name(node: Node) -> bool {
             .child_by_field_name("name")
             .is_some_and(|n| n.id() == node.id());
     }
+    // Fallback: a bare identifier sitting *directly* under the `parameters`
+    // container, not wrapped in a `parameter`/`default_parameter` node. The
+    // tree-sitter R grammar emits this shape for some edge-case parameter forms
+    // (e.g. a bare wrapper-less formal in certain parsed/macro source), so we
+    // match on the container node here rather than the per-parameter wrapper.
     parent.kind() == "parameters"
 }
 
