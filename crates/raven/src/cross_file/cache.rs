@@ -154,26 +154,6 @@ impl MetadataCache {
     }
 }
 
-/// Result of parent resolution
-#[derive(Debug, Clone)]
-pub enum ParentResolution {
-    /// Single unambiguous parent
-    Single {
-        parent_uri: Url,
-        call_site_line: Option<u32>,
-        call_site_column: Option<u32>,
-    },
-    /// Multiple possible parents - deterministic but ambiguous
-    Ambiguous {
-        selected_uri: Url,
-        selected_line: Option<u32>,
-        selected_column: Option<u32>,
-        alternatives: Vec<Url>,
-    },
-    /// No parent found
-    None,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

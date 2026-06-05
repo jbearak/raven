@@ -10249,7 +10249,7 @@ pub(crate) fn build_rmd_snapshot(
 ) -> (DiagnosticsSnapshot, Url) {
     use crate::state::{Document, WorldState};
     let uri = Url::parse(uri_str).unwrap();
-    let mut state = WorldState::new(vec![]);
+    let mut state = WorldState::new();
     state.cross_file_config.diagnostics_enabled = true;
     state.workspace_scan_complete = true;
     configure(&mut state);
@@ -10277,7 +10277,7 @@ mod semantic_warning_pipeline_tests {
 
     fn build_snapshot_with_lint_disabled(code: &str) -> (DiagnosticsSnapshot, Url) {
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         // Disable the opt-in lint master switch — semantic rules must still fire.
         state.lint_config = LintConfig {
@@ -16726,7 +16726,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // Create a WorldState with a package that exports "mutate"
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Add a package with "mutate" export
             let mut exports = std::collections::HashSet::new();
@@ -16785,7 +16785,7 @@ result <- "#;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // Create a WorldState with a package that exports "helper_func"
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Add a package with "helper_func" export
             let mut exports = std::collections::HashSet::new();
@@ -16855,7 +16855,7 @@ result <- "#;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // Create a WorldState with a package that exports "if" (hypothetically)
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Add a package with "if" export (edge case - shouldn't override keyword)
             let mut exports = std::collections::HashSet::new();
@@ -16921,7 +16921,7 @@ x <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Add packages with various exports
             let mut dplyr_exports = std::collections::HashSet::new();
@@ -17011,7 +17011,7 @@ result <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Add two packages that both export "common_func"
             let mut pkg1_exports = std::collections::HashSet::new();
@@ -17094,7 +17094,7 @@ x <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Define a function and call it
             let code = "my_func <- function(alpha, beta = 10) { alpha + beta }\nmy_func(";
@@ -17158,7 +17158,7 @@ x <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             let code = "f <- function(x, y) { x + y }\nf(";
             let uri = Url::parse("file:///test_insert.R").unwrap();
@@ -17207,7 +17207,7 @@ x <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             let mut exports = std::collections::HashSet::new();
             exports.insert("my_func".to_string());
@@ -17913,7 +17913,7 @@ clean_data <- function(x) {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Build a PackageLibrary with base packages set, then wrap in Arc
             let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
@@ -17996,7 +17996,7 @@ clean_data <- function(x) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let workspace_root = Url::parse("file:///work/pkg").unwrap();
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_folders = vec![workspace_root.clone()];
             state.workspace_scan_complete = true;
 
@@ -18067,7 +18067,7 @@ clean_data <- function(x) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let workspace_root = Url::parse("file:///work/pkg").unwrap();
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_folders = vec![workspace_root.clone()];
             state.workspace_scan_complete = true;
             state.cross_file_config.packages_enabled = true;
@@ -18136,7 +18136,7 @@ clean_data <- function(x) {
         use std::collections::{BTreeMap, BTreeSet};
 
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_root.clone()];
         state.workspace_scan_complete = true;
         state.cross_file_config.packages_enabled = true;
@@ -18224,7 +18224,7 @@ clean_data <- function(x) {
         use crate::state::{Document, WorldState};
 
         let workspace_root = Url::parse("file:///work").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_root.clone()];
         state.workspace_scan_complete = true;
 
@@ -18288,7 +18288,7 @@ clean_data <- function(x) {
         use std::collections::BTreeSet;
 
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_root.clone()];
         state.workspace_scan_complete = true;
 
@@ -18363,7 +18363,7 @@ clean_data <- function(x) {
         use std::collections::BTreeSet;
 
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_root.clone()];
         state.workspace_scan_complete = true;
 
@@ -18439,7 +18439,7 @@ clean_data <- function(x) {
         use std::collections::BTreeSet;
 
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_root.clone()];
         state.workspace_scan_complete = true;
 
@@ -18518,7 +18518,7 @@ clean_data <- function(x) {
         use std::collections::{BTreeSet, HashSet};
 
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_root.clone()];
         state.workspace_scan_complete = true;
         state.cross_file_config.packages_enabled = true;
@@ -18629,7 +18629,7 @@ clean_data <- function(x) {
         let main_url = Url::from_file_path(&main_path).unwrap();
         let other_url = Url::from_file_path(&other_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_url];
         state.workspace_scan_complete = true;
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
@@ -18746,7 +18746,7 @@ clean_data <- function(x) {
         let main_url = Url::from_file_path(&main_path).unwrap();
         let other_url = Url::from_file_path(&other_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_url];
         state.workspace_scan_complete = true;
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
@@ -18830,7 +18830,7 @@ clean_data <- function(x) {
         use std::collections::{BTreeSet, HashSet};
 
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![workspace_root.clone()];
         state.workspace_scan_complete = true;
         state.cross_file_config.packages_enabled = true;
@@ -20076,7 +20076,7 @@ clean_data <- function(x) {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Create a document with a declared variable
             let code = r#"# @lsp-var my_declared_var
@@ -20126,7 +20126,7 @@ x <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Create a document with a declared function
             let code = r#"# @lsp-func my_declared_func
@@ -20176,7 +20176,7 @@ x <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Create a document with a declared variable on line 2
             let code = r#"x <- 1
@@ -20231,7 +20231,7 @@ y <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Create a document with both declared variable and function
             let code = r#"# @lsp-var my_var
@@ -20290,7 +20290,7 @@ x <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             // Create a document with a user-defined function
             let code = r#"my_func <- function(x, y = 10) { x + y }
@@ -20487,7 +20487,7 @@ result <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             let code = r#"x <- "#;
             let uri = Url::parse("file:///test.R").unwrap();
@@ -20551,7 +20551,7 @@ result <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             let code = r#"my_var <- 42
 my_func <- function(x) { x + 1 }
@@ -20606,7 +20606,7 @@ result <- "#;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
 
             let code = r#"local_var <- 1
 x <- "#;
@@ -22247,7 +22247,7 @@ result <- data %>% filter(x > 0)
 
         let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
         let uri = Url::parse("file:///test.Rmd").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.symbol_config.hierarchical_document_symbol_support = true;
         state
             .documents
@@ -22278,7 +22278,7 @@ result <- data %>% filter(x > 0)
 
         let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
         let uri = Url::parse("file:///test.qmd").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.symbol_config.hierarchical_document_symbol_support = true;
         state
             .documents
@@ -22305,7 +22305,7 @@ result <- data %>% filter(x > 0)
 
         let code = "---\ntitle: T\n---\n\nProse.\n\n```{r demo}\nmy_fun <- function(a) a + 1\n```\n\nMore prose.\n";
         let uri = Url::parse("file:///report.Rmd").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.symbol_config.hierarchical_document_symbol_support = true;
         state
             .documents
@@ -22358,7 +22358,7 @@ result <- data %>% filter(x > 0)
         use crate::state::{Document, WorldState};
         let code = "```{r}\nmy_func <- function(x) {\n  x + 1\n}\n```\n\nSome prose paragraph.\n\n```{r}\nmy_func(2)\n```\n";
         let uri = Url::parse("file:///doc.Rmd").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state
             .documents
@@ -22515,7 +22515,7 @@ result <- data %>% filter(x > 0)
         // find-references from the .R file must NOT return a location inside the
         // untitled Rmd's prose — the buffer's tree must be masked (#343).
         use crate::state::Document;
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
 
         let r_uri = Url::parse("file:///main.R").unwrap();
@@ -22552,7 +22552,7 @@ result <- data %>% filter(x > 0)
         // Rmd must surface a CHUNK-defined function and must NOT surface a
         // prose-"defined" one. Pre-fix, the buffer's artifacts came from a
         // RAW parse, exposing prose tokens and missing chunk symbols (#343).
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
 
         let untitled = Url::parse("untitled:Untitled-2").unwrap();
@@ -22611,7 +22611,7 @@ result <- data %>% filter(x > 0)
         // `x` defined in chunk 1; completion partway through chunk 2 offers it.
         let code = "```{r}\nx <- 1\n```\n\nSome prose with `library(`\n\n```{r}\nx\n```\n";
         let uri = Url::parse("file:///doc.Rmd").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state
             .documents
@@ -22650,7 +22650,7 @@ result <- data %>% filter(x > 0)
         let prose_with_valid_chunk =
             "# A heading\n\nSome prose with [a link](url).\n\n```{r}\nx <- 1\n```\n";
         let uri = Url::parse("file:///doc.Rmd").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.cross_file_config.diagnostics_enabled = true;
         state.documents.insert(
             uri.clone(),
@@ -22875,7 +22875,7 @@ result <- data %>% filter(x > 0)
 
         let code = "Some prose.\n\n```{r setup}\nx <- 1\n```\n";
         let uri = Url::parse("untitled:Untitled-1").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.symbol_config.hierarchical_document_symbol_support = true;
         state.documents.insert(
             uri.clone(),
@@ -22900,7 +22900,7 @@ result <- data %>% filter(x > 0)
 
         let code = "# %% Setup\nlibrary(x)\n\n# %% Analysis\ny <- 2";
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.symbol_config.hierarchical_document_symbol_support = true;
         state
             .documents
@@ -27772,7 +27772,7 @@ y <- 2";
 add <- function(x, y) { x + y }
 "#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "add", &uri, Position::new(5, 0));
@@ -27801,7 +27801,7 @@ add <- function(x, y) { x + y }
 multiply <- function(a, b) { a * b }
 "#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "multiply", &uri, Position::new(3, 0));
@@ -27824,7 +27824,7 @@ multiply <- function(a, b) { a * b }
 divide <- function(x, y) { x / y }
 "#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "divide", &uri, Position::new(1, 0));
@@ -27848,7 +27848,7 @@ divide <- function(x, y) { x / y }
 get_pi <- function() { 3.14159 }
 "#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "get_pi", &uri, Position::new(2, 0));
@@ -27871,7 +27871,7 @@ get_pi <- function() { 3.14159 }
 x <- 42
 "#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "nonexistent", &uri, Position::new(1, 0));
@@ -27893,7 +27893,7 @@ greet <- function(name = "World", greeting = "Hello") {
 }
 "#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         let result = try_build_user_signature(&state, "greet", &uri, Position::new(4, 0));
@@ -27929,7 +27929,7 @@ greet <- function(name = "World", greeting = "Hello") {
         let code = r#"add <- function(x, y) { x + y }
 result <- add(1, 2)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is inside the call to add, after the opening parenthesis
@@ -27964,7 +27964,7 @@ result <- add(1, 2)"#;
     async fn test_signature_help_undefined_function() {
         let code = r#"result <- undefined_func(1, 2)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is inside the call to undefined_func, after the opening paren
@@ -27991,7 +27991,7 @@ result <- add(1, 2)"#;
         let code = r#"add <- function(x, y, z) { x + y + z }
 result <- add(1, 2, 3)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is after the first comma, so second parameter is active
@@ -28013,7 +28013,7 @@ result <- add(1, 2, 3)"#;
         let code = r#"add <- function(x, y, z) { x + y + z }
 result <- add(1, 2, 3)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is after the second comma, so third parameter is active
@@ -28035,7 +28035,7 @@ result <- add(1, 2, 3)"#;
         let code = r#"helper <- function(x) { x * 2 }
 result <- helper(5)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is inside the call to helper
@@ -28065,7 +28065,7 @@ result <- helper(5)"#;
 multiply <- function(x, y) { x * y }
 result <- multiply(3, 4)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is inside the call to multiply
@@ -28106,7 +28106,7 @@ result <- multiply(3, 4)"#;
         let code = r#"get_pi <- function() { 3.14159 }
 result <- get_pi()"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is inside the call to get_pi
@@ -28135,7 +28135,7 @@ result <- get_pi()"#;
 }
 result <- greet("Alice")"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is inside the call to greet
@@ -28170,7 +28170,7 @@ result <- greet("Alice")"#;
         let code = r#"library(base)
 result <- mean(x)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is after "mean(" - simulating typing inside the function call
@@ -28222,7 +28222,7 @@ result <- mean(x)"#;
 multiply <- function(a, b) { a * b }
 result <- add(multiply(2, 3), 5)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Test: Position inside inner call (multiply)
@@ -28265,7 +28265,7 @@ add_numbers <- function(x, y) { x + y }
 
 result <- add_numbers(1, 2)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is after "add_numbers("
@@ -28321,7 +28321,7 @@ calculate <- function(a, b = 10) { a + b }
 
 result <- calculate(5)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Position is after "calculate("
@@ -28357,7 +28357,7 @@ result <- calculate(5)"#;
         let code = r#"func <- function(a, b, c, d) { a + b + c + d }
 result <- func(1, 2, 3, 4)"#;
         let uri = Url::parse("file:///test.R").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.open_document(uri.clone(), code, None);
 
         // Test each parameter position
@@ -28616,7 +28616,7 @@ mod proptests {
             let other_code = format!("{} <- function(b, c) {{ b + c }}", func_name);
             let workspace_code = format!("{} <- function(x, y, z) {{ x + y + z }}", func_name);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(current_uri.clone(), Document::new(&current_code, None));
             state.documents.insert(other_uri.clone(), Document::new(&other_code, None));
             state.workspace_index.insert(workspace_uri.clone(), Document::new(&workspace_code, None));
@@ -28800,7 +28800,7 @@ mod proptests {
             // Create code with user-defined function that shadows a built-in
             let code = format!("{} <- function(x, y) {{ x + y }}", builtin);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Should return user-defined signature, not built-in
@@ -29296,8 +29296,7 @@ mod proptests {
         ) {
             use crate::state::{WorldState, Document};
 
-            let library_paths = vec![];
-            let mut state = WorldState::new(library_paths);
+            let mut state = WorldState::new();
 
             let uri = Url::parse("file:///test.R").unwrap();
             let code = format!("{} <- 42", var_name);
@@ -29322,8 +29321,7 @@ mod proptests {
         ) {
             use crate::state::{WorldState, Document};
 
-            let library_paths = vec![];
-            let mut state = WorldState::new(library_paths);
+            let mut state = WorldState::new();
 
             let main_uri = Url::parse("file:///main.R").unwrap();
             let utils_uri = Url::parse("file:///utils.R").unwrap();
@@ -29355,8 +29353,7 @@ mod proptests {
         ) {
             use crate::state::{WorldState, Document};
 
-            let library_paths = vec![];
-            let mut state = WorldState::new(library_paths);
+            let mut state = WorldState::new();
 
             let uri = Url::parse("file:///test.R").unwrap();
             let code = format!(
@@ -29585,7 +29582,7 @@ mod proptests {
             let code = reserved_word.to_string();
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -29639,7 +29636,7 @@ mod proptests {
             let code = format!("{} <- {}", var_name, reserved_word);
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -29691,7 +29688,7 @@ mod proptests {
             let code = format!("print({})", reserved_word);
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -29742,7 +29739,7 @@ mod proptests {
             let code = var_name.clone();
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -29804,7 +29801,7 @@ mod proptests {
             // the completion provider won't suggest the reserved word as an identifier
             let code = format!("{} <- 1", reserved_word);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -29873,7 +29870,7 @@ mod proptests {
             // (e.g., "if <- function() {}")
             let code = format!("{} <- function() {{}}", reserved_word);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -29917,7 +29914,7 @@ mod proptests {
             // Create code with assignment to non-reserved identifier
             let code = format!("{} <- 1", var_name);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -30668,7 +30665,7 @@ mod proptests {
 
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -30727,7 +30724,7 @@ mod proptests {
 
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -30789,7 +30786,7 @@ mod proptests {
 
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -30868,7 +30865,7 @@ mod proptests {
 
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -30951,7 +30948,7 @@ mod proptests {
 
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -31069,7 +31066,7 @@ mod proptests {
 
             let tree = parse_r_code(&code);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = true;
             state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
             let uri = Url::parse("file:///test.R").unwrap();
@@ -31136,7 +31133,7 @@ mod proptests {
             let blank_lines = "\n".repeat(lines_between);
             let code = format!("# {} {}\n{}", directive_form, var_name, blank_lines);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -31200,7 +31197,7 @@ mod proptests {
             let blank_lines = "\n".repeat(lines_between);
             let code = format!("# {} {}\n{}", directive_form, func_name, blank_lines);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -31263,7 +31260,7 @@ mod proptests {
             // Pattern: # @lsp-var varname\n# @lsp-func funcname\n<cursor>
             let code = format!("# @lsp-var {}\n# @lsp-func {}\n", var_name, func_name);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -31350,7 +31347,7 @@ mod proptests {
 
             let code = format!("{}\n", directive);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -31420,7 +31417,7 @@ mod proptests {
 
             let code = format!("{}\nx <- 1", directive);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -31478,7 +31475,7 @@ mod proptests {
                 var1, var2
             );
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -33934,7 +33931,7 @@ setClass("{}", slots = c(value = "numeric"))
                 func_name, var_name
             );
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             // Set hierarchical_document_symbol_support to TRUE
             state.symbol_config.hierarchical_document_symbol_support = true;
 
@@ -33989,7 +33986,7 @@ setClass("{}", slots = c(value = "numeric"))
                 func_name, var_name
             );
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             // Set hierarchical_document_symbol_support to FALSE (default)
             state.symbol_config.hierarchical_document_symbol_support = false;
 
@@ -34042,7 +34039,7 @@ setClass("{}", slots = c(value = "numeric"))
                 .collect();
             let code = assignments.join("\n");
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
 
             let uri = Url::parse("file:///test.R").unwrap();
@@ -34278,7 +34275,7 @@ setClass("{}", slots = c(value = "numeric"))
             // Create code with assignment to reserved word
             let code = format!("{} <- 42", reserved_word);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
 
             let uri = Url::parse("file:///test.R").unwrap();
@@ -34330,7 +34327,7 @@ setClass("{}", slots = c(value = "numeric"))
             // Create code with assignment to reserved word
             let code = format!("{} <- 42", reserved_word);
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let uri = Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -34408,7 +34405,7 @@ setClass("{}", slots = c(value = "numeric"))
             let uri_str = format!("file:///path/to/{}.R", filename);
             let uri = Url::parse(&uri_str).unwrap();
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             let response = super::workspace_symbol(&state, "");
@@ -34453,7 +34450,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code = format!("{} <- 42\nother_var <- 100", var_name);
             let uri = Url::parse("file:///test.R").unwrap();
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             let response = super::workspace_symbol(&state, query);
@@ -34493,7 +34490,7 @@ setClass("{}", slots = c(value = "numeric"))
 
             let uri = Url::parse("file:///test.R").unwrap();
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.symbol_config = SymbolConfig::with_max_results(max_results);
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
@@ -34525,7 +34522,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code = format!("{} <- 42", var_name);
             let uri = Url::parse("file:///test.R").unwrap();
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             // Add to both documents (open) and workspace_index (closed)
             state.documents.insert(uri.clone(), Document::new(&code, None));
             state.workspace_index.insert(uri.clone(), Document::new(&code, None));
@@ -34554,7 +34551,7 @@ setClass("{}", slots = c(value = "numeric"))
     fn test_workspace_symbol_basic_search() {
         use crate::state::{Document, WorldState};
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
 
         let uri1 = Url::parse("file:///test1.R").unwrap();
         state.documents.insert(
@@ -34582,7 +34579,7 @@ setClass("{}", slots = c(value = "numeric"))
     fn test_workspace_symbol_case_insensitive() {
         use crate::state::{Document, WorldState};
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         state.documents.insert(
             uri.clone(),
@@ -34602,7 +34599,7 @@ setClass("{}", slots = c(value = "numeric"))
     fn test_workspace_symbol_empty_query_returns_all() {
         use crate::state::{Document, WorldState};
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         state.documents.insert(
             uri.clone(),
@@ -34617,7 +34614,7 @@ setClass("{}", slots = c(value = "numeric"))
     fn test_workspace_symbol_correct_uris() {
         use crate::state::{Document, WorldState};
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         let uri1 = Url::parse("file:///dir/file1.R").unwrap();
         state
             .documents
@@ -34642,7 +34639,7 @@ setClass("{}", slots = c(value = "numeric"))
     fn test_workspace_symbol_no_match() {
         use crate::state::{Document, WorldState};
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         state
             .documents
@@ -34656,7 +34653,7 @@ setClass("{}", slots = c(value = "numeric"))
     fn test_workspace_symbol_function_and_variable_kinds() {
         use crate::state::{Document, WorldState};
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         state.documents.insert(
             uri.clone(),
@@ -35212,7 +35209,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code = format!("{}\nmy_test_fn()", func_def);
 
             let uri = Url::parse("file:///test_formatting.R").unwrap();
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Position cursor inside the function call parentheses (line 1, after `(`)
@@ -35393,7 +35390,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code = format!("{}\n{}", func_def, call_line);
 
             let uri = Url::parse("file:///test_case_match.R").unwrap();
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Position cursor at the end of the token inside the call
@@ -35438,7 +35435,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code_nm = format!("{}\n{}", func_def, call_line_nm);
 
             let uri_nm = Url::parse("file:///test_case_nomatch.R").unwrap();
-            let mut state_nm = WorldState::new(vec![]);
+            let mut state_nm = WorldState::new();
             state_nm.documents.insert(uri_nm.clone(), Document::new(&code_nm, None));
 
             let cursor_col_nm = 6 + non_matching_token.len() as u32;
@@ -35521,7 +35518,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code = format!("{}\n{}", func_def, call_line);
 
             let uri = Url::parse("file:///test_ns_suppression.R").unwrap();
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Position cursor at the end of the namespace-qualified token inside the call
@@ -35640,7 +35637,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code = code_lines.join("\n");
 
             let uri = Url::parse("file:///test_mixed_completions.R").unwrap();
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Position cursor inside the function call parentheses on the last line
@@ -35829,7 +35826,7 @@ setClass("{}", slots = c(value = "numeric"))
             let code = format!("{}\nmy_default_fn()", func_def);
 
             let uri = Url::parse("file:///test_default_value.R").unwrap();
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.documents.insert(uri.clone(), Document::new(&code, None));
 
             // Position cursor inside the function call parentheses (line 1, after `(`)
@@ -37010,15 +37007,13 @@ setClass("{}", slots = c(value = "numeric"))
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::r_env;
     use crate::state::{Document, WorldState};
     use std::sync::Arc;
 
     #[test]
     fn test_base_package_functions() {
         // Test that base R functions are recognized
-        let library_paths = r_env::find_library_paths();
-        let _state = WorldState::new(library_paths);
+        let _state = WorldState::new();
 
         let code = "library(stats)\nx <- rnorm(100)\ny <- mean(x)";
         let doc = Document::new(code, None);
@@ -37029,8 +37024,7 @@ mod integration_tests {
 
     #[test]
     fn test_no_spurious_errors_with_common_packages() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         // Test code that uses common package functions
         let test_cases = vec![
@@ -37062,36 +37056,10 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_package_exports_loaded() {
-        let library_paths = r_env::find_library_paths();
-        let state = WorldState::new(library_paths);
-
-        // Try to load stats package metadata
-        if let Some(stats_pkg) = state.library.get("stats") {
-            // stats should export common functions
-            assert!(
-                !stats_pkg.exports.is_empty(),
-                "stats package should have exports"
-            );
-
-            // Check for some known stats exports
-            let has_common_funcs = stats_pkg
-                .exports
-                .iter()
-                .any(|e| e == "rnorm" || e == "lm" || e == "t.test");
-            assert!(
-                has_common_funcs,
-                "stats should export common statistical functions"
-            );
-        }
-    }
-
-    #[test]
     fn test_hover_shows_definition_statement() {
         use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         // Create a test document
         let uri = Url::parse("file:///test.R").unwrap();
@@ -37128,8 +37096,7 @@ mod integration_tests {
         // with those offsets returns garbage (or panics on a char boundary).
         use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         // Build an Rmd document whose masked byte length differs from its raw
         // length: a YAML front matter block (non-R, blanked by masking) followed
@@ -37175,8 +37142,7 @@ mod integration_tests {
 
     #[test]
     fn test_hover_same_file_location_format() {
-        let library_paths = r_env::find_library_paths();
-        let _state = WorldState::new(library_paths);
+        let _state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let def_info = DefinitionInfo {
@@ -37201,8 +37167,7 @@ mod integration_tests {
 
     #[test]
     fn test_hover_cross_file_hyperlink_format() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
 
         let current_uri = Url::parse("file:///workspace/main.R").unwrap();
@@ -37410,8 +37375,7 @@ mod integration_tests {
         use crate::handlers::goto_definition;
         use crate::state::{Document, WorldState};
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = r#"# @lsp-var myvar
@@ -37459,8 +37423,7 @@ x <- myvar + 1"#;
         use crate::handlers::goto_definition;
         use crate::state::{Document, WorldState};
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = r#"# @lsp-func myfunc
@@ -37509,8 +37472,7 @@ result <- myfunc(42)"#;
         use crate::handlers::goto_definition;
         use crate::state::{Document, WorldState};
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         // Symbol declared as variable first (line 0), then as function (line 1)
@@ -37555,8 +37517,7 @@ result <- mysymbol"#;
 
     #[test]
     fn test_cross_file_hover_resolution() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         // Create main.R that sources utils.R
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
@@ -37650,7 +37611,7 @@ result <- helper_func(42)"#;
             fs::write(&path, code).unwrap();
         }
         let ws_root = Url::from_directory_path(&root).unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![ws_root.clone()];
         let scan = crate::state::scan_workspace(&[ws_root], 20);
         state.apply_workspace_index(scan.0, scan.1, scan.2);
@@ -37889,8 +37850,7 @@ result <- helper_func(42)"#;
 
     #[test]
     fn test_hover_symbol_shadowing() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         // Create files with shadowing: local definition should take precedence
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
@@ -37942,8 +37902,7 @@ result <- my_func(1, 2)"#;
 
     #[test]
     fn test_hover_builtin_function_fallback() {
-        let library_paths = r_env::find_library_paths();
-        let state = WorldState::new(library_paths);
+        let state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = r#"result <- mean(c(1, 2, 3))"#;
@@ -37991,8 +37950,7 @@ result <- my_func(1, 2)"#;
         // scope returned `base::filter` (or similar) before the qualifier
         // was checked. The qualifier MUST win — the bold help-panel link
         // and the attribution string must both reference dplyr.
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "result <- dplyr::filter(df, x > 1)";
@@ -38030,8 +37988,7 @@ result <- my_func(1, 2)"#;
 
     #[test]
     fn test_hover_undefined_symbol_returns_none() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = r#"result <- undefined_symbol_that_does_not_exist"#;
@@ -38057,8 +38014,7 @@ result <- my_func(1, 2)"#;
         // hermetically reproducible by defining a local `title` that the old
         // code would surface via the cross-file scope. A named-argument label
         // is a structural non-reference, so hover must return None.
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "title <- \"default\"\nlabs(title = \"MPG vs Weight\")";
@@ -38083,8 +38039,7 @@ result <- my_func(1, 2)"#;
         // use), but it IS a definition site — hovering it must still surface the
         // definition. The structural-non-reference hover guard suppressed every
         // such identifier, which broke hover on `add` in `add <- function(...)`.
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "add <- function(a, b) {\n    a + b\n}\n";
@@ -38124,7 +38079,7 @@ result <- my_func(1, 2)"#;
         )
         .unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
         state.package_library = std::sync::Arc::new(pkg_lib);
@@ -38164,7 +38119,7 @@ result <- my_func(1, 2)"#;
     fn test_hover_namespace_package_side_not_installed() {
         // The package side of an uninstalled `pkg::fn` shows a clear note rather
         // than nothing or a misattribution.
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![std::path::PathBuf::from(
             "/nonexistent_raven_libpath_382",
@@ -38206,7 +38161,7 @@ result <- my_func(1, 2)"#;
         )
         .unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
         state.package_library = std::sync::Arc::new(pkg_lib);
@@ -38247,7 +38202,7 @@ result <- my_func(1, 2)"#;
 
     #[test]
     fn test_hover_parameter_def_shows_param_doc() {
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "\
 #' Add two numbers
@@ -38271,7 +38226,7 @@ add <- function(a, b) a + b
 
     #[test]
     fn test_hover_parameter_def_undocumented_returns_none() {
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "add <- function(a, b) a + b\n";
         state
@@ -38291,7 +38246,7 @@ add <- function(a, b) a + b
     fn test_hover_anonymous_function_param_returns_none() {
         // A roxygen block above an anonymous IIFE must NOT be attributed to its
         // parameter — only named functions carry roxygen.
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "#' @param x the x\n(function(x) x)(1)\n";
         state
@@ -38313,7 +38268,7 @@ add <- function(a, b) a + b
         // roxygen above the *assignment* (`f <-`), not the `function` keyword.
         // Anchoring the @param lookup at the keyword line scans up from `f <-`,
         // misses the block, and wrongly suppresses a documented parameter.
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "\
 #' @param x the tuning knob
@@ -38342,7 +38297,7 @@ f <-
 
     #[test]
     fn test_hover_named_arg_resolves_user_formal() {
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "f <- function(x, param) x + param\nf(param = 5)\n";
         state
@@ -38372,7 +38327,7 @@ f <-
 
     #[test]
     fn test_hover_named_arg_shows_default_and_param_doc() {
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "\
 #' @param param the tuning knob
@@ -38405,7 +38360,7 @@ f(param = 5)
         // Regression (companion to the step-3 multi-line test): the named-arg
         // formal lookup anchors its roxygen at the assignment line, so a
         // function split across lines still surfaces its @param doc.
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "\
 #' @param param the tuning knob
@@ -38442,7 +38397,7 @@ f(param = 5)
         // WorldState, so a position-insensitive `uri#name` signature cache
         // (since removed) would serve the first definition's formals to the
         // second hover and suppress the label (`alpha` has no `beta` formal).
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "\
 f <- function(alpha) alpha
@@ -38480,7 +38435,7 @@ f(beta = 2)
     fn test_hover_named_arg_positional_value_not_a_formal() {
         // `f(val, param = 2)` hovering `val` (a positional value) must resolve as
         // the local variable, NEVER as "formal x of f".
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "f <- function(x, param) x + param\nval <- 1\nf(val, param = 2)\n";
         state
@@ -38503,7 +38458,7 @@ f(beta = 2)
     #[test]
     fn test_hover_named_arg_value_identifier_not_a_label() {
         // `f(param = value)` hovering `value` → variable hover, not a label.
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "f <- function(x, param) x + param\nvalue <- 7\nf(param = value)\n";
         state
@@ -38526,7 +38481,7 @@ f(beta = 2)
     #[test]
     fn test_hover_named_arg_inner_call_resolves_against_inner_fn() {
         // `f(g(param = 1))` hovering `param` resolves against `g`, not `f`.
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "f <- function(a) a\ng <- function(param) param\nf(g(param = 1))\n";
         state
@@ -38555,7 +38510,7 @@ f(beta = 2)
         // `list(a = 1)` / `data.frame(z = 1)`: the key is a data key, not a formal
         // of a user-defined function → nothing (no `...` chase, no package
         // attribution).
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "list(a = 1)\ndata.frame(z = 1)\n";
         state
@@ -38585,7 +38540,7 @@ f(beta = 2)
         // `get_text_and_tree` path.
         use std::sync::Arc;
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
         state.workspace_scan_complete = true;
 
@@ -38673,7 +38628,7 @@ f(beta = 2)
 
     #[test]
     fn test_hover_dollar_member_local_assignment() {
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "foo <- list()\nfoo$bar <- 99\nuse(foo$bar)\n";
@@ -38700,7 +38655,7 @@ f(beta = 2)
 
     #[test]
     fn test_hover_dollar_member_constructor_literal() {
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "foo <- list(bar = 1, baz = 2)\nuse(foo$bar)\n";
@@ -38723,7 +38678,7 @@ f(beta = 2)
 
     #[test]
     fn test_hover_at_slot_local_assignment() {
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "obj <- list()\nobj@slot <- 5\nuse(obj@slot)\n";
@@ -38748,7 +38703,7 @@ f(beta = 2)
     fn test_hover_dollar_member_unresolved_suppressed() {
         // `obj` has no local member definition, and there is no live session to
         // inspect a runtime object — so the member hover is suppressed.
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         let uri = Url::parse("file:///test.R").unwrap();
         let code = "use(obj$name)\n";
@@ -38769,8 +38724,7 @@ f(beta = 2)
     fn test_hover_graceful_fallback_missing_definition_file() {
         use crate::cross_file::ScopedSymbol;
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
         let missing_uri = Url::parse("file:///workspace/missing.R").unwrap(); // File doesn't exist
@@ -38806,8 +38760,7 @@ result <- missing_func(42)"#;
 
     #[test]
     fn test_hover_position_aware_scope_resolution() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///workspace/test.R").unwrap();
         let code = r#"# Before source call - symbol not available
@@ -38867,8 +38820,7 @@ result2 <- helper_func(2)  # Should resolve"#;
 
     #[test]
     fn test_hover_uses_dependency_graph_correctly() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         // Create a chain: main.R -> utils.R -> helpers.R
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
@@ -38938,8 +38890,7 @@ process_data <- function(x) {
 
     #[test]
     fn test_complete_workflow_for_loops_and_functions() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///workspace/test.R").unwrap();
         let code = r#"# Test for loops and function parameters
@@ -39047,8 +38998,7 @@ process_data <- function(data, threshold = 0.5, ...) {
 
     #[test]
     fn test_realistic_r_code_patterns() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         // Create main file with realistic patterns
         let main_uri = Url::parse("file:///workspace/analysis.R").unwrap();
@@ -39251,8 +39201,7 @@ helper_transform <- function(data) {
 
     #[test]
     fn test_cross_file_local_scope_isolation() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let main_uri = Url::parse("file:///workspace/main.R").unwrap();
         let local_uri = Url::parse("file:///workspace/local_source.R").unwrap();
@@ -39346,8 +39295,7 @@ local_var <- 200"#;
 
     #[test]
     fn test_hover_hyperlink_formatting_with_special_paths() {
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
         state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
 
         // Test various path scenarios
@@ -39518,7 +39466,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(__nonexistent_package_xyz__)";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.package_library_ready = true;
         let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
             return;
@@ -39556,7 +39504,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(base)";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.package_library_ready = true;
         // Ensure base is in base_packages by creating a new PackageLibrary
         let mut base_packages = std::collections::HashSet::new();
@@ -39591,7 +39539,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(__nonexistent_package_xyz__) # @lsp-ignore";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.package_library_ready = true;
         let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
             return;
@@ -39622,7 +39570,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(__missing_pkg1__)\nlibrary(__missing_pkg2__)";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.package_library_ready = true;
         let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
             return;
@@ -39653,7 +39601,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(__nonexistent_package_xyz__)";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.package_library_ready = false;
         state
             .documents
@@ -39676,7 +39624,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(__nonexistent_package_xyz__)";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.package_library_ready = true;
         state.package_library =
             std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty());
@@ -39714,7 +39662,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(__raven_not_installed__)";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.package_library_ready = true;
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![tmp.clone()]);
@@ -39763,7 +39711,7 @@ result <- helper_with_spaces(42)"#;
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
         let main_url = Url::from_file_path(&main_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url);
         state
             .documents
@@ -39814,7 +39762,7 @@ result <- helper_with_spaces(42)"#;
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
         let main_url = Url::from_file_path(&main_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.redundant_directive_severity = None; // Disabled
         state
@@ -39856,7 +39804,7 @@ result <- helper_with_spaces(42)"#;
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
         let main_url = Url::from_file_path(&main_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url);
         state
             .documents
@@ -39887,7 +39835,7 @@ result <- helper_with_spaces(42)"#;
         let code = "library(__nonexistent_package_xyz__)";
         let main_url = Url::parse("file:///workspace/main.R").unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.cross_file_config.packages_missing_package_severity = None;
         state
             .documents
@@ -39920,7 +39868,7 @@ result <- helper_with_spaces(42)"#;
         let a_url = Url::from_file_path(&a_path).unwrap();
         let b_url = Url::from_file_path(&b_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
 
         // Use extract_metadata (not parse_directives) to detect AST source() calls
@@ -39998,7 +39946,7 @@ result <- helper_with_spaces(42)"#;
         let a_url = Url::from_file_path(&a_path).unwrap();
         let b_url = Url::from_file_path(&b_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.circular_dependency_severity = None;
 
@@ -40042,7 +39990,7 @@ result <- helper_with_spaces(42)"#;
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
         let main_url = Url::from_file_path(&main_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.missing_file_severity = None;
 
@@ -40078,7 +40026,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let utils_url = Url::from_file_path(&utils_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.out_of_scope_severity = None;
 
@@ -40145,7 +40093,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40233,7 +40181,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40331,7 +40279,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helpers_url = Url::from_file_path(&helpers_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40563,7 +40511,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40650,7 +40598,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40721,7 +40669,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40805,7 +40753,7 @@ result <- helper_with_spaces(42)"#;
         let child_url = Url::from_file_path(&child_path).unwrap();
         let redef_url = Url::from_file_path(&redef_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40890,7 +40838,7 @@ result <- helper_with_spaces(42)"#;
         let data_url = Url::from_file_path(&data_path).unwrap();
         let indices_url = Url::from_file_path(&indices_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity =
@@ -40976,7 +40924,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let utils_url = Url::from_file_path(&utils_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -41038,7 +40986,7 @@ result <- helper_with_spaces(42)"#;
         let a_url = Url::from_file_path(&a_path).unwrap();
         let b_url = Url::from_file_path(&b_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url);
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -41118,7 +41066,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -41184,7 +41132,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -41249,7 +41197,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -41318,7 +41266,7 @@ result <- helper_with_spaces(42)"#;
         let main_url = Url::from_file_path(&main_path).unwrap();
         let helper_url = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -41391,8 +41339,7 @@ result <- helper_with_spaces(42)"#;
         // Test that when a local definition shadows a package export,
         // hover shows the local definition, not the package export.
         // Validates: Requirement 10.4
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///workspace/main.R").unwrap();
 
@@ -41757,8 +41704,7 @@ z <- mutate(5)  # Uses local definition"#;
         // goto_definition navigates to the local definition, not the package.
         // Validates: Requirement 11.3
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///workspace/main.R").unwrap();
 
@@ -41814,8 +41760,7 @@ result <- mutate(1, 2)"#;
         // This is the core mechanism that enables shadowing.
         // Validates: Requirement 11.3
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///workspace/test.R").unwrap();
 
@@ -41925,8 +41870,7 @@ result <- filter(c(1, -2, 3))"#;
         // - After local def: returns local definition location
         // Validates: Requirement 11.3
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///workspace/test.R").unwrap();
 
@@ -41977,8 +41921,7 @@ y <- filter(data)"#;
         // there are multiple definitions of the same symbol.
         // Validates: Requirement 11.3
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
 
         let uri = Url::parse("file:///workspace/test.R").unwrap();
 
@@ -42027,8 +41970,7 @@ y <- x"#;
         let parent_url = Url::from_file_path(&parent_r).unwrap();
         let child_url = Url::from_file_path(&child_r).unwrap();
 
-        let library_paths = r_env::find_library_paths();
-        let mut state = WorldState::new(library_paths);
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
 
         let parent_content = std::fs::read_to_string(&parent_r).unwrap();
@@ -42087,7 +42029,7 @@ y <- x"#;
         let a_url = Url::from_file_path(&a_path).unwrap();
         let b_url = Url::from_file_path(&b_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         // Auto + sourced_by-empty + scan-not-complete defers undefined-variable
         // diagnostics entirely. Mark scan complete so the collector runs.
@@ -42192,7 +42134,7 @@ y <- x"#;
         let child_url = Url::from_file_path(&child_path).unwrap();
         let grandchild_url = Url::from_file_path(&grandchild_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.workspace_scan_complete = true;
 
@@ -42305,7 +42247,7 @@ y <- x"#;
         let child1_url = Url::from_file_path(&child1_path).unwrap();
         let child2_url = Url::from_file_path(&child2_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.workspace_scan_complete = true;
 
@@ -42384,7 +42326,7 @@ y <- x"#;
         let workspace_url = Url::from_file_path(workspace_path).unwrap();
         let file_url = Url::from_file_path(&file_path).unwrap();
 
-        let mut state = WorldState::new(Vec::new());
+        let mut state = WorldState::new();
         state.workspace_folders.push(workspace_url.clone());
         state.workspace_scan_complete = true;
         // Hoisting must be enabled to exercise the affected fast path.
@@ -42447,7 +42389,7 @@ mod position_aware_tests {
     }
 
     fn create_test_state() -> WorldState {
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state
     }
@@ -44071,7 +44013,7 @@ source(\"helpers.R\")
         let indices_code = "idx_a <- 10\n"; // does NOT define xyz
 
         for &workspace_scan_complete in &[false, true] {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.workspace_scan_complete = workspace_scan_complete;
             state.cross_file_config.out_of_scope_severity =
                 Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
@@ -44174,7 +44116,7 @@ source(\"helpers.R\")
         let indices_code = "idx_a <- 10\n";
         let fitmodel_code = "fit_model <- function(data) NULL\n";
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
@@ -44264,7 +44206,7 @@ source(\"helpers.R\")
         let a_code = "helper_a <- function() 1\n";
         let b_code = "helper_b <- function() 2\n";
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.cross_file_config.out_of_scope_severity =
             Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
@@ -44332,7 +44274,7 @@ source(\"helpers.R\")
 
         let fixture = create_self_ref_chain_fixture();
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         // undefined_variable_severity and diagnostics_enabled default to enabled;
         // out_of_scope_severity just needs to be non-None to enable that collector.
@@ -44451,7 +44393,7 @@ source(\"helpers.R\")
         let shrinkage_code = "source(\"main.R\")\nsource(\"validate.R\")\n";
         let validate_code = "source(\"main.R\")\n";
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
 
@@ -44565,7 +44507,7 @@ source(\"helpers.R\")
         let shrinkage_code = "source(\"main.R\")\nsource(\"validate.R\")\n";
         let validate_code = "source(\"main.R\")\n";
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
 
         for (uri, code) in [
@@ -45133,7 +45075,7 @@ mod function_parameter_tests {
     }
 
     fn create_test_state() -> WorldState {
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state
     }
@@ -46420,7 +46362,7 @@ mod diagnostics_master_switch_tests {
             enable_undefined_variable_diag in any::<bool>(),
         ) {
             // Create a WorldState with diagnostics_enabled = false
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.cross_file_config.diagnostics_enabled = false;
 
             // Also vary other diagnostic settings to ensure master switch takes precedence
@@ -46455,7 +46397,7 @@ mod diagnostics_master_switch_tests {
     fn test_master_switch_disabled_with_syntax_error() {
         // Validates: Requirements 1.4, 3.1, 3.4
         // Even code with syntax errors should produce no diagnostics when disabled
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.cross_file_config.diagnostics_enabled = false;
 
         let uri = Url::parse("file:///test.R").unwrap();
@@ -46476,7 +46418,7 @@ mod diagnostics_master_switch_tests {
     fn test_master_switch_disabled_with_undefined_variables() {
         // Validates: Requirements 1.4, 3.1, 3.4
         // Even code with undefined variables should produce no diagnostics when disabled
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.cross_file_config.diagnostics_enabled = false;
         state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING); // Would normally produce diagnostics
 
@@ -46498,7 +46440,7 @@ mod diagnostics_master_switch_tests {
     fn test_master_switch_disabled_takes_precedence_over_individual_settings() {
         // Validates: Requirements 3.4
         // Master switch should take precedence over all individual diagnostic severity settings
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.cross_file_config.diagnostics_enabled = false;
 
         // Enable all individual diagnostic settings
@@ -46564,7 +46506,7 @@ result <- undefined_var
             code in code_with_known_issues(),
         ) {
             // Create a WorldState with diagnostics_enabled = true (the default)
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state.cross_file_config.diagnostics_enabled = true;
 
             // Create a document with code that has known issues
@@ -46591,7 +46533,7 @@ result <- undefined_var
     fn test_master_switch_enabled_with_syntax_error() {
         // Validates: Requirements 1.3, 3.3
         // Code with syntax errors should produce diagnostics when enabled
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.cross_file_config.diagnostics_enabled = true;
 
         let uri = Url::parse("file:///test.R").unwrap();
@@ -46612,7 +46554,7 @@ result <- undefined_var
     fn test_master_switch_enabled_is_transparent() {
         // Validates: Requirements 1.3, 3.3
         // The master switch should be transparent when enabled - same result as if check didn't exist
-        let mut state_enabled = WorldState::new(vec![]);
+        let mut state_enabled = WorldState::new();
         state_enabled.cross_file_config.diagnostics_enabled = true;
 
         let uri = Url::parse("file:///test.R").unwrap();
@@ -46651,7 +46593,7 @@ result <- undefined_var
     fn test_master_switch_enabled_default_behavior() {
         // Validates: Requirements 1.3, 3.3
         // Default state (diagnostics_enabled = true) should compute diagnostics normally
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         // Don't explicitly set diagnostics_enabled - use default
         assert!(
             state.cross_file_config.diagnostics_enabled,
@@ -46799,7 +46741,7 @@ mod dollar_member_completion_tests {
 
     fn completion_items(marked_code: &str) -> Vec<CompletionItem> {
         let (code, position) = code_and_position(marked_code);
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         let uri = Url::parse("file:///test.R").unwrap();
         state
@@ -46828,7 +46770,7 @@ mod dollar_member_completion_tests {
         let main_uri = Url::from_file_path(&main_path).unwrap();
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_uri.clone());
         state
@@ -47064,7 +47006,7 @@ mod completion_visibility_tests {
 
     fn completion_items(marked_code: &str) -> Vec<CompletionItem> {
         let (code, position) = code_and_position(marked_code);
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         let uri = Url::parse("file:///test.R").unwrap();
         state
@@ -47093,7 +47035,7 @@ mod completion_visibility_tests {
         let main_uri = Url::from_file_path(&main_path).unwrap();
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
 
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders.push(workspace_uri.clone());
         state
@@ -47258,7 +47200,7 @@ generated quantities {
 
     fn make_state(code: &str) -> (WorldState, Url) {
         let uri = Url::parse("file:///test/model.stan").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state
             .documents
             .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
@@ -47503,7 +47445,7 @@ generated quantities {
 
     fn make_state(code: &str) -> (WorldState, Url) {
         let uri = Url::parse("file:///test/model.stan").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state
             .documents
             .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
@@ -47700,7 +47642,7 @@ mod jags_goto_definition_tests {
 
     fn make_state(code: &str) -> (WorldState, Url) {
         let uri = Url::parse("file:///test/model.jags").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state
             .documents
             .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
@@ -47956,7 +47898,7 @@ mod file_type_tests {
         ) {
             let uri_str = format!("file:///test/model.{}", ext);
             let uri = Url::parse(&uri_str).unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             state.workspace_scan_complete = true;
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
@@ -47972,7 +47914,7 @@ mod file_type_tests {
         ) {
             let uri_str = "file:///test/model.stan";
             let uri = Url::parse(uri_str).unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             state.workspace_scan_complete = true;
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
@@ -47988,7 +47930,7 @@ mod file_type_tests {
         ) {
             let uri_str = format!("file:///test/script.{}", ext);
             let uri = Url::parse(&uri_str).unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             state.workspace_scan_complete = true;
             // Incomplete assignment is a known syntax error in R
             let code = "x <-";
@@ -48009,7 +47951,7 @@ mod file_type_tests {
                               "while", "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN"];
             let uri_str = format!("file:///test/model.{}", ext);
             let uri = Url::parse(&uri_str).unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
@@ -48035,7 +47977,7 @@ mod file_type_tests {
         ) {
             let uri_str = format!("file:///test/model.{}", ext);
             let uri = Url::parse(&uri_str).unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
@@ -48065,7 +48007,7 @@ mod file_type_tests {
             prop_assume!(!is_r_only_jags_completion_name(&varname));
             let content = format!("model {{ {} ~ dnorm(0, 1) }}\n", varname);
             let uri = Url::parse("file:///test/model.jags").unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(1, 0), None);
@@ -48094,7 +48036,7 @@ mod file_type_tests {
             let r_only_reserved = ["function", "library", "require", "next", "repeat",
                                    "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN"];
             let uri = Url::parse("file:///test/model.stan").unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
@@ -48118,7 +48060,7 @@ mod file_type_tests {
             content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}"
         ) {
             let uri = Url::parse("file:///test/model.stan").unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(0, 0), None);
@@ -48150,7 +48092,7 @@ mod file_type_tests {
         ) {
             let content = format!("data {{ real {}; }}\n", varname);
             let uri = Url::parse("file:///test/model.stan").unwrap();
-            let mut state = crate::state::WorldState::new(vec![]);
+            let mut state = crate::state::WorldState::new();
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = completion(&state, &uri, Position::new(1, 0), None);
@@ -48172,7 +48114,7 @@ mod file_type_tests {
     #[test]
     fn test_untitled_jags_completion_uses_document_language() {
         let uri = Url::parse("untitled:Untitled-1").unwrap();
-        let mut state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new();
         state.documents.insert(
             uri.clone(),
             crate::state::Document::new_with_language_id(
@@ -48245,7 +48187,7 @@ mod block_detector_integration_tests {
     }
 
     fn make_state(uri_str: &str, code: &str) -> (crate::state::WorldState, Url) {
-        let mut state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new();
         state.symbol_config.hierarchical_document_symbol_support = true;
         let uri = Url::parse(uri_str).unwrap();
         let doc = crate::state::Document::new_with_uri(code, None, &uri);
@@ -49034,7 +48976,7 @@ mod issue_149_utf16_handlers {
     use tree_sitter::Point;
 
     fn create_state() -> WorldState {
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state
     }

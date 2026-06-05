@@ -60,7 +60,7 @@ fn main() {
     // ── Phase 2: apply_workspace_index ──
     eprintln!("\n=== Phase 2: apply_workspace_index ===");
     let t1 = Instant::now();
-    let mut state = WorldState::new(vec![]);
+    let mut state = WorldState::new();
     state.workspace_folders = vec![workspace_url.clone()];
     state.cross_file_config.undefined_variable_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);

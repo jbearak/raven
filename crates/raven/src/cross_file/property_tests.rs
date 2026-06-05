@@ -1556,7 +1556,7 @@ proptest! {
 // Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3
 // ============================================================================
 
-use super::scope::{ScopeArtifacts, compute_artifacts, scope_at_position_with_deps};
+use super::scope::{ScopeArtifacts, compute_artifacts};
 
 fn parse_r_tree(code: &str) -> tree_sitter::Tree {
     let mut parser = Parser::new();
@@ -1564,462 +1564,6 @@ fn parse_r_tree(code: &str) -> tree_sitter::Tree {
         .set_language(&tree_sitter_r::LANGUAGE.into())
         .unwrap();
     parser.parse(code, None).unwrap()
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 4: For any scope chain where a symbol s is defined in both a sourced
-    /// file and the current file, the resolved scope SHALL contain the current file's
-    /// definition of s (local definitions shadow inherited ones).
-    #[test]
-    fn prop_local_symbol_precedence(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: defines symbol BEFORE sourcing child (which also defines it)
-        // Local definition should still take precedence
-        let parent_code = format!(
-            "{} <- 1\nsource(\"child.R\")",
-            symbol_name
-        );
-        let parent_tree = parse_r_tree(&parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
-
-        // Child file: defines same symbol
-        let child_code = format!("{} <- 999", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        // Create artifacts lookup
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri {
-                Some(Arc::clone(&parent_artifacts))
-            } else if uri == &child_uri {
-                Some(Arc::clone(&child_artifacts))
-            } else {
-                None
-            }
-        };
-
-        // Resolve path
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        };
-
-        // Get scope at end of parent file
-        let scope = scope_at_position_with_deps(
-            &parent_uri,
-            10, // After all definitions
-            0,
-            &get_artifacts,
-            &resolve_path,
-            10,
-        );
-
-        // Local definition should take precedence (defined in parent, not child)
-        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()));
-        let symbol = scope.symbols.get(symbol_name.as_str()).unwrap();
-        prop_assert_eq!(&symbol.source_uri, &parent_uri);
-    }
-}
-
-// ============================================================================
-// Property 40: Position-Aware Symbol Availability
-// Validates: Requirements 5.3
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 40: For any source() call at position (line, column), symbols from
-    /// the sourced file SHALL only be available for positions strictly after (line, column).
-    #[test]
-    fn prop_position_aware_symbol_availability(
-        symbol_name in r_identifier(),
-        source_line in 2..10u32
-    ) {
-        // Ensure symbol_name doesn't conflict with generated variable names
-        prop_assume!(!symbol_name.starts_with('x') && !symbol_name.starts_with('y'));
-
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: has source() call at specific line
-        let mut parent_lines = vec!["# comment".to_string()];
-        for i in 1..source_line {
-            parent_lines.push(format!("var{} <- {}", i, i));
-        }
-        parent_lines.push("source(\"child.R\")".to_string());
-        parent_lines.push("# after source".to_string());
-        let parent_code = parent_lines.join("\n");
-
-        let parent_tree = parse_r_tree(&parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri {
-                Some(Arc::clone(&parent_artifacts))
-            } else if uri == &child_uri {
-                Some(Arc::clone(&child_artifacts))
-            } else {
-                None
-            }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        };
-
-        // Before source() call - symbol should NOT be available
-        let scope_before = scope_at_position_with_deps(
-            &parent_uri,
-            source_line - 1,
-            0,
-            &get_artifacts,
-            &resolve_path,
-            10,
-        );
-        prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()));
-
-        // After source() call - symbol SHOULD be available
-        let scope_after = scope_at_position_with_deps(
-            &parent_uri,
-            source_line + 1,
-            0,
-            &get_artifacts,
-            &resolve_path,
-            10,
-        );
-        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()));
-    }
-}
-
-// ============================================================================
-// Property 22: Maximum Depth Enforcement
-// Validates: Requirements 5.8
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    /// Property 22: When the source chain exceeds maxChainDepth, the Scope_Resolver
-    /// SHALL stop traversal at the configured depth.
-    #[test]
-    fn prop_maximum_depth_enforcement(
-        symbol_name in r_identifier()
-    ) {
-        // Create a chain: a -> b -> c -> d
-        let uri_a = make_url("a");
-        let uri_b = make_url("b");
-        let uri_c = make_url("c");
-        let uri_d = make_url("d");
-
-        // Each file sources the next and defines a symbol
-        let code_a = "source(\"b.R\")";
-        let code_b = "source(\"c.R\")";
-        let code_c = "source(\"d.R\")";
-        let code_d = format!("{} <- 42", symbol_name);
-
-        let tree_a = parse_r_tree(code_a);
-        let tree_b = parse_r_tree(code_b);
-        let tree_c = parse_r_tree(code_c);
-        let tree_d = parse_r_tree(&code_d);
-
-        let artifacts_a = compute_artifacts(&uri_a, &tree_a, code_a);
-        let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
-        let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
-        let artifacts_d = compute_artifacts(&uri_d, &tree_d, &code_d);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &uri_a { Some(Arc::new(artifacts_a.clone())) }
-            else if uri == &uri_b { Some(Arc::new(artifacts_b.clone())) }
-            else if uri == &uri_c { Some(Arc::new(artifacts_c.clone())) }
-            else if uri == &uri_d { Some(Arc::new(artifacts_d.clone())) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            match path {
-                "b.R" => Some(uri_b.clone()),
-                "c.R" => Some(uri_c.clone()),
-                "d.R" => Some(uri_d.clone()),
-                _ => None,
-            }
-        };
-
-        // With max_depth=2, should NOT reach d (a->b->c, stops before d)
-        let scope_shallow = scope_at_position_with_deps(
-            &uri_a, 10, 0, &get_artifacts, &resolve_path, 2,
-        );
-        prop_assert!(!scope_shallow.symbols.contains_key(symbol_name.as_str()));
-
-        // With max_depth=10, should reach d
-        let scope_deep = scope_at_position_with_deps(
-            &uri_a, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-        prop_assert!(scope_deep.symbols.contains_key(symbol_name.as_str()));
-    }
-}
-
-// ============================================================================
-// Property 7: Circular Dependency Detection
-// Validates: Requirements 5.7, 10.6
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    /// Property 7: For any set of files where file A sources file B and file B
-    /// sources file A, the Scope_Resolver SHALL detect the cycle and break it.
-    #[test]
-    fn prop_circular_dependency_detection(
-        symbol_a in r_identifier(),
-        symbol_b in r_identifier()
-    ) {
-        prop_assume!(symbol_a != symbol_b);
-
-        let uri_a = make_url("a");
-        let uri_b = make_url("b");
-
-        // A sources B and defines symbol_a
-        let code_a = format!("source(\"b.R\")\n{} <- 1", symbol_a);
-        // B sources A and defines symbol_b
-        let code_b = format!("source(\"a.R\")\n{} <- 2", symbol_b);
-
-        let tree_a = parse_r_tree(&code_a);
-        let tree_b = parse_r_tree(&code_b);
-
-        let artifacts_a = compute_artifacts(&uri_a, &tree_a, &code_a);
-        let artifacts_b = compute_artifacts(&uri_b, &tree_b, &code_b);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &uri_a { Some(Arc::new(artifacts_a.clone())) }
-            else if uri == &uri_b { Some(Arc::new(artifacts_b.clone())) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            match path {
-                "a.R" => Some(uri_a.clone()),
-                "b.R" => Some(uri_b.clone()),
-                _ => None,
-            }
-        };
-
-        // Should not infinite loop - cycle should be broken
-        let scope = scope_at_position_with_deps(
-            &uri_a, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Should have symbol_a (defined locally)
-        prop_assert!(scope.symbols.contains_key(symbol_a.as_str()));
-        // Should have symbol_b (from sourced file, before cycle detected)
-        prop_assert!(scope.symbols.contains_key(symbol_b.as_str()));
-    }
-}
-
-// ============================================================================
-// Property 52: Local Source Scope Isolation
-// Validates: Requirements 4.7, 5.3, 7.1, 10.1
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 52: For any source() call with local = TRUE, symbols defined in
-    /// the sourced file SHALL NOT be added to the caller's scope.
-    #[test]
-    fn prop_local_source_scope_isolation(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child with local=TRUE
-        let parent_code = "source(\"child.R\", local = TRUE)";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Get scope at end of parent file
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol from local=TRUE source should NOT be in scope
-        prop_assert!(!scope.symbols.contains_key(symbol_name.as_str()));
-    }
-}
-
-// ============================================================================
-// Property 51: Full Position Precision
-// Validates: Requirements 5.3, 7.1, 7.4
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 51: For any completion, hover, or go-to-definition request at position
-    /// (line, column) on the same line as a source() call at position (line, call_column):
-    /// - If column <= call_column, symbols from the sourced file SHALL NOT be included
-    /// - If column > call_column, symbols from the sourced file SHALL be included
-    #[test]
-    fn prop_full_position_precision(
-        symbol_name in r_identifier(),
-        prefix_len in 0..10usize
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: has prefix before source() on same line
-        let prefix = "x".repeat(prefix_len);
-        let parent_code = format!("{}; source(\"child.R\")", prefix);
-        let parent_tree = parse_r_tree(&parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Find the source() call position in the timeline
-        let source_col = parent_artifacts.timeline.iter()
-            .find_map(|event| {
-                if let super::scope::ScopeEvent::Source { column, .. } = event {
-                    Some(*column)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
-
-        // Before source() call column - symbol should NOT be available
-        if source_col > 0 {
-            let scope_before = scope_at_position_with_deps(
-                &parent_uri, 0, source_col - 1, &get_artifacts, &resolve_path, 10,
-            );
-            prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()));
-        }
-
-        // After source() call - symbol SHOULD be available
-        let scope_after = scope_at_position_with_deps(
-            &parent_uri, 0, source_col + 20, &get_artifacts, &resolve_path, 10,
-        );
-        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()));
-    }
-}
-
-// ============================================================================
-// Property 53: sys.source Conservative Handling
-// Validates: Requirements 4.4
-// ============================================================================
-
-// Note: sys.source with non-resolvable envir is treated as local=TRUE by the
-// source detector. This test verifies that sys.source calls are detected
-// and that the is_sys_source flag is set correctly.
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 53: For any sys.source() call where the envir argument is not
-    /// statically resolvable to .GlobalEnv or globalenv(), the LSP SHALL treat
-    /// it as local = TRUE (no symbol inheritance).
-    #[test]
-    fn prop_sys_source_conservative_handling(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sys.source with globalenv() - should inherit symbols
-        let parent_code = "sys.source(\"child.R\", envir = globalenv())";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // sys.source is detected
-        let has_sys_source = parent_artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::Source { source, .. } if source.is_sys_source)
-        });
-        prop_assert!(has_sys_source);
-
-        // Get scope - sys.source with globalenv() should include symbols
-        // (Note: current implementation doesn't distinguish envir, so this tests detection)
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-        // Symbol should be available (sys.source with globalenv() is not local)
-        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()));
-    }
 }
 
 // ============================================================================
@@ -2504,68 +2048,6 @@ proptest! {
 
         // Interface hashes should be the same (same exported symbols)
         prop_assert_eq!(artifacts1.interface_hash, artifacts2.interface_hash);
-    }
-}
-
-// ============================================================================
-// Property 37: Multiple Source Calls - Earliest Call Site
-// Validates: Requirements 5.9
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    /// Property 37: For any file that is sourced multiple times at different call
-    /// sites in the same parent, symbols from that file SHALL become available
-    /// at the earliest call site.
-    #[test]
-    fn prop_multiple_source_calls_earliest(
-        symbol_name in r_identifier(),
-        first_line in 1..5u32,
-        second_line in 6..10u32
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child twice at different lines
-        let mut parent_lines = vec!["# start".to_string()];
-        for i in 1..first_line {
-            parent_lines.push(format!("x{} <- {}", i, i));
-        }
-        parent_lines.push("source(\"child.R\")".to_string());
-        for i in first_line..second_line {
-            parent_lines.push(format!("y{} <- {}", i, i));
-        }
-        parent_lines.push("source(\"child.R\")".to_string());
-        parent_lines.push("# end".to_string());
-        let parent_code = parent_lines.join("\n");
-
-        let parent_tree = parse_r_tree(&parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Symbol should be available after the FIRST source() call
-        let scope_after_first = scope_at_position_with_deps(
-            &parent_uri, first_line + 1, 0, &get_artifacts, &resolve_path, 10,
-        );
-        prop_assert!(scope_after_first.symbols.contains_key(symbol_name.as_str()));
     }
 }
 
@@ -3121,247 +2603,6 @@ fn test_undefined_variable_severity_configuration() {
 }
 
 // ============================================================================
-// Property 38: Ambiguous Parent Determinism
-// Validates: Requirements 5.10
-// ============================================================================
-
-use super::cache::ParentResolution;
-use super::parent_resolve::{
-    compute_metadata_fingerprint, compute_reverse_edges_hash, resolve_parent,
-};
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 38: For any file with multiple possible parents (via backward directives
-    /// or reverse edges), the Scope_Resolver SHALL deterministically select the same
-    /// parent given the same inputs.
-    #[test]
-    fn prop_ambiguous_parent_determinism(
-        parent1_name in path_component(),
-        parent2_name in path_component()
-    ) {
-        prop_assume!(parent1_name != parent2_name);
-
-        let child_uri = make_url("child");
-        let parent1_uri = make_url(&parent1_name);
-        let parent2_uri = make_url(&parent2_name);
-
-        // Create metadata with two backward directives (ambiguous)
-        let metadata = CrossFileMetadata {
-            sourced_by: vec![
-                BackwardDirective {
-                    path: format!("../{}.R", parent1_name),
-                    call_site: CallSiteSpec::Default,
-                    directive_line: 0,
-                },
-                BackwardDirective {
-                    path: format!("../{}.R", parent2_name),
-                    call_site: CallSiteSpec::Default,
-                    directive_line: 1,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let graph = DependencyGraph::new();
-        let config = CrossFileConfig::default();
-
-        let resolve_path = |path: &str| -> Option<Url> {
-            if path == format!("../{}.R", parent1_name) {
-                Some(parent1_uri.clone())
-            } else if path == format!("../{}.R", parent2_name) {
-                Some(parent2_uri.clone())
-            } else {
-                None
-            }
-        };
-
-        // Resolve parent multiple times
-        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
-        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
-        let result3 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
-
-        // All results should be identical (deterministic)
-        match (&result1, &result2, &result3) {
-            (
-                ParentResolution::Ambiguous { selected_uri: s1, alternatives: a1, .. },
-                ParentResolution::Ambiguous { selected_uri: s2, alternatives: a2, .. },
-                ParentResolution::Ambiguous { selected_uri: s3, alternatives: a3, .. },
-            ) => {
-                prop_assert_eq!(s1, s2, "Selected parent should be deterministic");
-                prop_assert_eq!(s2, s3, "Selected parent should be deterministic");
-                prop_assert_eq!(a1.len(), a2.len(), "Alternatives should be deterministic");
-                prop_assert_eq!(a2.len(), a3.len(), "Alternatives should be deterministic");
-            }
-            _ => {
-                // If not ambiguous, still should be deterministic
-                prop_assert!(matches!((&result1, &result2, &result3),
-                    (ParentResolution::Single { .. }, ParentResolution::Single { .. }, ParentResolution::Single { .. }) |
-                    (ParentResolution::None, ParentResolution::None, ParentResolution::None)
-                ), "Results should be deterministic");
-            }
-        }
-    }
-
-    /// Property 38 extended: Precedence order is respected (line= > match= > reverse edge > default)
-    #[test]
-    fn prop_ambiguous_parent_precedence(
-        parent_name in path_component(),
-        call_site_line in 1..100u32
-    ) {
-        let child_uri = make_url("child");
-        let parent_uri = make_url(&parent_name);
-
-        // Create metadata with explicit line= (highest precedence)
-        let metadata_with_line = CrossFileMetadata {
-            sourced_by: vec![BackwardDirective {
-                path: format!("../{}.R", parent_name),
-                call_site: CallSiteSpec::Line(call_site_line - 1), // 0-based
-                directive_line: 0,
-            }],
-            ..Default::default()
-        };
-
-        // Create metadata with default (lowest precedence)
-        let metadata_with_default = CrossFileMetadata {
-            sourced_by: vec![BackwardDirective {
-                path: format!("../{}.R", parent_name),
-                call_site: CallSiteSpec::Default,
-                directive_line: 0,
-            }],
-            ..Default::default()
-        };
-
-        let graph = DependencyGraph::new();
-        let config = CrossFileConfig::default();
-
-        let resolve_path = |path: &str| -> Option<Url> {
-            if path == format!("../{}.R", parent_name) {
-                Some(parent_uri.clone())
-            } else {
-                None
-            }
-        };
-
-        let result_with_line = resolve_parent(&metadata_with_line, &graph, &child_uri, &config, resolve_path);
-        let result_with_default = resolve_parent(&metadata_with_default, &graph, &child_uri, &config, resolve_path);
-
-        // Both should resolve to the same parent
-        match (&result_with_line, &result_with_default) {
-            (
-                ParentResolution::Single { parent_uri: p1, call_site_line: l1, .. },
-                ParentResolution::Single { parent_uri: p2, call_site_line: l2, .. },
-            ) => {
-                prop_assert_eq!(p1, p2, "Same parent should be selected");
-                // But call site should differ
-                prop_assert_eq!(*l1, Some(call_site_line - 1), "Line= should use explicit line");
-                prop_assert_eq!(*l2, Some(u32::MAX), "Default should use end of file");
-            }
-            _ => prop_assert!(false, "Expected Single resolution for both"),
-        }
-    }
-}
-
-// ============================================================================
-// Property 57: Parent Selection Stability
-// Validates: Requirements 5.10
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 57: For any file with backward directives, once a parent is selected
-    /// for a given (metadata_fingerprint, reverse_edges_hash) cache key, the same
-    /// parent SHALL be selected on subsequent queries until either the file's
-    /// CrossFileMetadata changes OR the reverse edges pointing to this file change.
-    #[test]
-    fn prop_parent_selection_stability(
-        parent_name in path_component()
-    ) {
-        let child_uri = make_url("child");
-        let parent_uri = make_url(&parent_name);
-
-        let metadata = CrossFileMetadata {
-            sourced_by: vec![BackwardDirective {
-                path: format!("../{}.R", parent_name),
-                call_site: CallSiteSpec::Default,
-                directive_line: 0,
-            }],
-            ..Default::default()
-        };
-
-        let graph = DependencyGraph::new();
-
-        // Compute fingerprints
-        let fp1 = compute_metadata_fingerprint(&metadata);
-        let fp2 = compute_metadata_fingerprint(&metadata);
-        let edges_hash1 = compute_reverse_edges_hash(&graph, &child_uri);
-        let edges_hash2 = compute_reverse_edges_hash(&graph, &child_uri);
-
-        // Fingerprints should be stable
-        prop_assert_eq!(fp1, fp2, "Metadata fingerprint should be stable");
-        prop_assert_eq!(edges_hash1, edges_hash2, "Reverse edges hash should be stable");
-
-        // Parent resolution should be stable
-        let config = CrossFileConfig::default();
-        let resolve_path = |path: &str| -> Option<Url> {
-            if path == format!("../{}.R", parent_name) {
-                Some(parent_uri.clone())
-            } else {
-                None
-            }
-        };
-
-        let result1 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
-        let result2 = resolve_parent(&metadata, &graph, &child_uri, &config, resolve_path);
-
-        match (&result1, &result2) {
-            (
-                ParentResolution::Single { parent_uri: p1, .. },
-                ParentResolution::Single { parent_uri: p2, .. },
-            ) => {
-                prop_assert_eq!(p1, p2, "Parent selection should be stable");
-            }
-            _ => prop_assert!(false, "Expected Single resolution"),
-        }
-    }
-
-    /// Property 57 extended: Changing metadata fingerprint should allow re-selection
-    #[test]
-    fn prop_parent_selection_changes_with_metadata(
-        parent1_name in path_component(),
-        parent2_name in path_component()
-    ) {
-        prop_assume!(parent1_name != parent2_name);
-
-        // Two different metadata configurations
-        let metadata1 = CrossFileMetadata {
-            sourced_by: vec![BackwardDirective {
-                path: format!("../{}.R", parent1_name),
-                call_site: CallSiteSpec::Default,
-                directive_line: 0,
-            }],
-            ..Default::default()
-        };
-
-        let metadata2 = CrossFileMetadata {
-            sourced_by: vec![BackwardDirective {
-                path: format!("../{}.R", parent2_name),
-                call_site: CallSiteSpec::Default,
-                directive_line: 0,
-            }],
-            ..Default::default()
-        };
-
-        // Fingerprints should be different
-        let fp1 = compute_metadata_fingerprint(&metadata1);
-        let fp2 = compute_metadata_fingerprint(&metadata2);
-        prop_assert_ne!(fp1, fp2, "Different metadata should have different fingerprints");
-    }
-}
-
-// ============================================================================
 // Property 35: Diagnostics Fanout to Open Files
 // Validates: Requirements 0.4, 13.4
 // ============================================================================
@@ -3790,337 +3031,6 @@ proptest! {
 }
 
 // ============================================================================
-// Property 27: Cross-File Completion Inclusion
-// Validates: Requirements 7.1, 7.4
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 27: For any file with a resolved scope chain containing symbol s
-    /// from a sourced file, completions at a position after the source() call
-    /// SHALL include s.
-    #[test]
-    fn prop_cross_file_completion_inclusion(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child
-        let parent_code = "source(\"child.R\")";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Get scope at end of parent file (after source() call)
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol from child should be in scope (available for completion)
-        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
-            "Symbol from sourced file should be available for completion");
-    }
-}
-
-// ============================================================================
-// Property 28: Completion Source Attribution
-// Validates: Requirements 7.2
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 28: For any completion item for a symbol from a sourced file,
-    /// the completion detail SHALL contain the source file path.
-    #[test]
-    fn prop_completion_source_attribution(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child
-        let parent_code = "source(\"child.R\")";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol should have source_uri pointing to child
-        if let Some(symbol) = scope.symbols.get(symbol_name.as_str()) {
-            prop_assert_eq!(&symbol.source_uri, &child_uri,
-                "Symbol should have source_uri pointing to the sourced file");
-        } else {
-            prop_assert!(false, "Symbol should be in scope");
-        }
-    }
-}
-
-// ============================================================================
-// Property 29: Cross-File Hover Information
-// Validates: Requirements 8.1, 8.2
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 29: For any symbol from a sourced file, hovering over a usage
-    /// SHALL display the source file path and function signature (if applicable).
-    #[test]
-    fn prop_cross_file_hover_information(
-        func_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child
-        let parent_code = "source(\"child.R\")";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines a function
-        let child_code = format!("{} <- function(x, y) {{ x + y }}", func_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Function should be in scope with signature
-        if let Some(symbol) = scope.symbols.get(func_name.as_str()) {
-            prop_assert_eq!(&symbol.source_uri, &child_uri,
-                "Function should have source_uri pointing to the sourced file");
-            prop_assert!(symbol.signature.is_some(),
-                "Function should have a signature for hover");
-            prop_assert!(symbol.signature.as_ref().unwrap().contains(&func_name),
-                "Signature should contain function name");
-        } else {
-            prop_assert!(false, "Function should be in scope");
-        }
-    }
-}
-
-// ============================================================================
-// Property 30: Cross-File Go-to-Definition
-// Validates: Requirements 9.1
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 30: For any symbol defined in a sourced file, go-to-definition
-    /// SHALL navigate to the definition location in that file.
-    #[test]
-    fn prop_cross_file_go_to_definition(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child
-        let parent_code = "source(\"child.R\")";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol on line 0
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol should have definition location in child file
-        if let Some(symbol) = scope.symbols.get(symbol_name.as_str()) {
-            prop_assert_eq!(&symbol.source_uri, &child_uri,
-                "Symbol should be defined in child file");
-            prop_assert_eq!(symbol.defined_line, 0,
-                "Symbol should be defined on line 0");
-        } else {
-            prop_assert!(false, "Symbol should be in scope");
-        }
-    }
-}
-
-// ============================================================================
-// Property 31: Cross-File Undefined Variable Suppression
-// Validates: Requirements 10.1
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 31: For any symbol s defined in a sourced file and used after
-    /// the source() call, no "undefined variable" diagnostic SHALL be emitted for s.
-    #[test]
-    fn prop_cross_file_undefined_variable_suppression(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child
-        let parent_code = "source(\"child.R\")";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Get scope at end of parent file (after source() call)
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol should be in scope, so no undefined variable diagnostic
-        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
-            "Symbol from sourced file should be in scope (no undefined variable diagnostic)");
-    }
-}
-
-// ============================================================================
-// Property 32: Out-of-Scope Symbol Warning
-// Validates: Requirements 10.3
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 32: For any symbol s defined in a sourced file and used before
-    /// the source() call, an "out of scope" diagnostic SHALL be emitted.
-    #[test]
-    fn prop_out_of_scope_symbol_warning(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child on line 5
-        let parent_code = "# line 0\n# line 1\n# line 2\n# line 3\n# line 4\nsource(\"child.R\")";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Get scope BEFORE source() call (line 4)
-        let scope_before = scope_at_position_with_deps(
-            &parent_uri, 4, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol should NOT be in scope before source() call
-        prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()),
-            "Symbol should NOT be in scope before source() call (out of scope)");
-
-        // Get scope AFTER source() call (line 6)
-        let scope_after = scope_at_position_with_deps(
-            &parent_uri, 6, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol SHOULD be in scope after source() call
-        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()),
-            "Symbol should be in scope after source() call");
-    }
-}
-
-// ============================================================================
 // Property 5: Diagnostic Suppression
 // Validates: Requirements 2.2, 2.3, 10.4, 10.5
 // ============================================================================
@@ -4370,53 +3280,6 @@ proptest! {
         prop_assert!(paths.contains(&path1.as_str()));
         prop_assert!(paths.contains(&path2.as_str()));
     }
-
-    /// Test position-aware scope with same-line source() call
-    #[test]
-    fn prop_same_line_source_position_awareness(
-        symbol_name in r_identifier().prop_filter("not x or y", |s| s != "x" && s != "y")
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: x <- 1; source("child.R"); y <- 2
-        // Symbol from child should be available after source() but not before
-        let parent_code = "x <- 1; source(\"child.R\"); y <- 2";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // At column 0 (before x), child symbol should NOT be available
-        let scope_before = scope_at_position_with_deps(
-            &parent_uri, 0, 0, &get_artifacts, &resolve_path, 10,
-        );
-        prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()),
-            "Symbol should NOT be available before source() call");
-
-        // At column 30 (after source()), child symbol SHOULD be available
-        let scope_after = scope_at_position_with_deps(
-            &parent_uri, 0, 30, &get_artifacts, &resolve_path, 10,
-        );
-        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()),
-            "Symbol should be available after source() call");
-    }
 }
 
 // 21.4 v1 R symbol model edge cases
@@ -4658,176 +3521,6 @@ proptest! {
         let scope_in_body = scope_at_position(&artifacts, 0, col_in_body, false);
         prop_assert!(scope_in_body.symbols.contains_key(param_name.as_str()),
             "Parameter with default value should be available within function body");
-    }
-}
-
-// ============================================================================
-// Task 15 Property Tests: Source() Scoping
-// ============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
-
-    /// Property 25: Source local=FALSE global scope
-    /// For any file sourced with local=FALSE, all symbols defined in that file
-    /// should be available in the global scope.
-    #[test]
-    fn prop_source_local_false_global_scope(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child with local=FALSE (default)
-        let parent_code = "source(\"child.R\", local = FALSE)";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Get scope at end of parent file (after source() call)
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol from child should be available in global scope (local=FALSE)
-        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
-            "Symbol from file sourced with local=FALSE should be available in global scope");
-    }
-
-    /// Property 26: Source local=TRUE function scope
-    /// For any file sourced with local=TRUE inside a function, all symbols
-    /// defined in that file should be available only within that function scope.
-    #[test]
-    fn prop_source_local_true_function_scope(
-        symbol_name in r_identifier(),
-        func_name in r_identifier()
-    ) {
-        prop_assume!(symbol_name != func_name);
-
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: function that sources child with local=TRUE
-        let parent_code = format!(
-            "{} <- function() {{ source(\"child.R\", local = TRUE); {} }}",
-            func_name, symbol_name
-        );
-        let parent_tree = parse_r_tree(&parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Get scope within function body (after source() call)
-        // Choose a position after the source() statement so the sourced symbols should be in scope.
-        let source_call_start = parent_code.find("source(\"child.R\"").unwrap_or(0);
-        let col_after_source = parent_code[source_call_start..]
-            .find(';')
-            .map(|j| (source_call_start + j + 1) as u32)
-            .unwrap_or((source_call_start + 1) as u32);
-        let scope_in_function = scope_at_position_with_deps(
-            &parent_uri, 0, col_after_source, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol should be available within function scope (local=TRUE)
-        prop_assert!(scope_in_function.symbols.contains_key(symbol_name.as_str()),
-            "Symbol from file sourced with local=TRUE should be available within function scope");
-
-        // Get scope outside function (global scope)
-        let scope_global = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol should NOT be available in global scope (local=TRUE isolates it)
-        prop_assert!(!scope_global.symbols.contains_key(symbol_name.as_str()),
-            "Symbol from file sourced with local=TRUE should NOT be available in global scope");
-
-        // Function name should be available in global scope
-        prop_assert!(scope_global.symbols.contains_key(func_name.as_str()),
-            "Function name should be available in global scope");
-    }
-
-    /// Property 27: Source local parameter default
-    /// For any source() call without an explicit local parameter, the system
-    /// should treat it as local=FALSE.
-    #[test]
-    fn prop_source_local_parameter_default(
-        symbol_name in r_identifier()
-    ) {
-        let parent_uri = make_url("parent");
-        let child_uri = make_url("child");
-
-        // Parent file: sources child without explicit local parameter (defaults to FALSE)
-        let parent_code = "source(\"child.R\")";
-        let parent_tree = parse_r_tree(parent_code);
-        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Child file: defines symbol
-        let child_code = format!("{} <- 42", symbol_name);
-        let child_tree = parse_r_tree(&child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
-
-        let child_artifacts = Arc::new(child_artifacts);
-        let parent_artifacts = Arc::new(parent_artifacts);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri { Some(Arc::clone(&parent_artifacts)) }
-            else if uri == &child_uri { Some(Arc::clone(&child_artifacts)) }
-            else { None }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
-        };
-
-        // Get scope at end of parent file
-        let scope = scope_at_position_with_deps(
-            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
-        );
-
-        // Symbol should be available (default local=FALSE means global scope)
-        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
-            "Symbol from file sourced without explicit local parameter should be available (default local=FALSE)");
-
-        // Verify the source() call was detected with local=false by default
-        let has_source_call = parent_artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::Source { source, .. }
-                if source.path == "child.R" && !source.local)
-        });
-        prop_assert!(has_source_call,
-            "Source call should be detected with local=false by default");
     }
 }
 
@@ -8179,6 +6872,12 @@ proptest! {
 
 use super::scope::{FunctionScopeInterval, FunctionScopeTree, Position};
 
+/// Test helper: flatten an interval to a `(start_line, start_col, end_line, end_col)` tuple
+/// for order-independent comparison in interval-tree property tests.
+fn iv_tuple(i: &FunctionScopeInterval) -> (u32, u32, u32, u32) {
+    (i.start.line, i.start.column, i.end.line, i.end.column)
+}
+
 /// Produces a strategy yielding valid intervals as (start_line, start_col, end_line, end_col)
 /// where the end position is lexicographically greater than or equal to the start position.
 ///
@@ -8276,8 +6975,8 @@ proptest! {
 
         // Verify the actual intervals match (not just count)
         // Sort both for comparison since order may differ
-        let mut tree_sorted: Vec<_> = tree_results.iter().map(|i| i.as_tuple()).collect();
-        let mut brute_sorted: Vec<_> = brute_force.iter().map(|i| i.as_tuple()).collect();
+        let mut tree_sorted: Vec<_> = tree_results.iter().map(iv_tuple).collect();
+        let mut brute_sorted: Vec<_> = brute_force.iter().map(iv_tuple).collect();
         tree_sorted.sort();
         brute_sorted.sort();
         prop_assert_eq!(
@@ -8489,7 +7188,7 @@ proptest! {
 
         // The result should be the nested interval (later start)
         prop_assert_eq!(
-            result.as_tuple(),
+            iv_tuple(&result),
             nested,
             "Should select nested interval (later start) as innermost"
         );
@@ -8626,7 +7325,7 @@ proptest! {
             let tree_containing: Vec<_> = tree
                 .query_point(Position::new(line, column))
                 .into_iter()
-                .map(|i| i.as_tuple())
+                .map(|i| iv_tuple(&i))
                 .collect();
             let linear_containing = linear_scan_containing(&scopes, line, column);
 
@@ -8651,7 +7350,7 @@ proptest! {
             // We verify that the tree returns an interval with the correct maximum start position.
             let tree_innermost = tree
                 .query_innermost(Position::new(line, column))
-                .map(|i| i.as_tuple());
+                .map(|i| iv_tuple(&i));
             let max_start = find_max_start_position(&scopes, line, column);
 
             match (tree_innermost, max_start) {
@@ -8735,7 +7434,7 @@ proptest! {
         let tree_containing: Vec<_> = tree
             .query_point(Position::new(query_line, query_col))
             .into_iter()
-            .map(|i| i.as_tuple())
+            .map(|i| iv_tuple(&i))
             .collect();
         let linear_containing = linear_scan_containing(&all_scopes, query_line, query_col);
 
@@ -8756,7 +7455,7 @@ proptest! {
         // When multiple intervals have the same maximum start position, either one is valid.
         let tree_innermost = tree
             .query_innermost(Position::new(query_line, query_col))
-            .map(|i| i.as_tuple());
+            .map(|i| iv_tuple(&i));
         let max_start = find_max_start_position(&all_scopes, query_line, query_col);
 
         match (tree_innermost, max_start) {
@@ -8812,7 +7511,7 @@ proptest! {
             let tree_at_start: Vec<_> = tree
                 .query_point(Position::new(sl, sc))
                 .into_iter()
-                .map(|i| i.as_tuple())
+                .map(|i| iv_tuple(&i))
                 .collect();
             let linear_at_start = linear_scan_containing(&scopes, sl, sc);
 
@@ -8833,7 +7532,7 @@ proptest! {
             let tree_at_end: Vec<_> = tree
                 .query_point(Position::new(el, ec))
                 .into_iter()
-                .map(|i| i.as_tuple())
+                .map(|i| iv_tuple(&i))
                 .collect();
             let linear_at_end = linear_scan_containing(&scopes, el, ec);
 
@@ -8854,7 +7553,7 @@ proptest! {
             // When multiple intervals have the same maximum start position, either one is valid.
             let tree_innermost_start = tree
                 .query_innermost(Position::new(sl, sc))
-                .map(|i| i.as_tuple());
+                .map(|i| iv_tuple(&i));
             let max_start_at_start = find_max_start_position(&scopes, sl, sc);
 
             match (tree_innermost_start, max_start_at_start) {
@@ -8891,7 +7590,7 @@ proptest! {
             // Test innermost at end
             let tree_innermost_end = tree
                 .query_innermost(Position::new(el, ec))
-                .map(|i| i.as_tuple());
+                .map(|i| iv_tuple(&i));
             let max_start_at_end = find_max_start_position(&scopes, el, ec);
 
             match (tree_innermost_end, max_start_at_end) {
@@ -12863,7 +11562,7 @@ proptest! {
 // Validates: Requirements 1.1, 2.1, 2.2
 // ============================================================================
 
-use super::dependency::{compute_inherited_working_directory, resolve_parent_working_directory};
+use super::dependency::compute_inherited_working_directory;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
@@ -13149,117 +11848,7 @@ proptest! {
         );
     }
 
-    /// Feature: working-directory-inheritance, Property 1 extended: resolve_parent_working_directory directly
-    /// **Validates: Requirements 1.1, 2.1**
-    ///
-    /// Test resolve_parent_working_directory function directly with explicit parent WD.
-    #[test]
-    fn prop_resolve_parent_wd_with_explicit_wd(
-        workspace in path_component(),
-        parent_subdir in path_component(),
-        parent_explicit_wd in path_component(),
-    ) {
-        // Create workspace root URI
-        let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
 
-        // Create parent file URI: /workspace/parent_subdir/parent.R
-        let parent_uri = Url::parse(&format!("file:///{}/{}/parent.R", workspace, parent_subdir)).unwrap();
-
-        // Parent has explicit @lsp-cd directive (workspace-relative path)
-        let parent_explicit_wd_path = format!("/{}", parent_explicit_wd);
-        let parent_meta = CrossFileMetadata {
-            working_directory: Some(parent_explicit_wd_path.clone()),
-            inherited_working_directory: None,
-            ..Default::default()
-        };
-
-        // Create a metadata getter that returns parent's metadata
-        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
-            if uri == &parent_uri {
-                Some(std::sync::Arc::new(parent_meta.clone()))
-            } else {
-                None
-            }
-        };
-
-        // Resolve parent's working directory
-        let parent_wd = resolve_parent_working_directory(
-            &parent_uri,
-            get_metadata,
-            Some(&workspace_uri),
-        );
-
-        // Should return parent's effective working directory
-        let expected_wd = format!("/{}/{}", workspace, parent_explicit_wd);
-
-        prop_assert!(
-            parent_wd.is_some(),
-            "resolve_parent_working_directory should return Some when parent has explicit @lsp-cd"
-        );
-
-        prop_assert_eq!(
-            parent_wd.as_ref().unwrap(),
-            &expected_wd,
-            "Parent WD should equal parent's explicit @lsp-cd resolved. \
-             parent_explicit_wd='{}', expected='{}', got='{}'",
-            parent_explicit_wd_path, expected_wd, parent_wd.as_ref().unwrap()
-        );
-    }
-
-    /// Feature: working-directory-inheritance, Property 1 extended: resolve_parent_working_directory with implicit WD
-    /// **Validates: Requirements 2.1, 2.2**
-    ///
-    /// Test resolve_parent_working_directory function directly with implicit parent WD (no @lsp-cd).
-    #[test]
-    fn prop_resolve_parent_wd_with_implicit_wd(
-        workspace in path_component(),
-        parent_subdir in path_component(),
-    ) {
-        // Create workspace root URI
-        let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
-
-        // Create parent file URI: /workspace/parent_subdir/parent.R
-        let parent_uri = Url::parse(&format!("file:///{}/{}/parent.R", workspace, parent_subdir)).unwrap();
-
-        // Parent has NO explicit @lsp-cd directive
-        let parent_meta = CrossFileMetadata {
-            working_directory: None,
-            inherited_working_directory: None,
-            ..Default::default()
-        };
-
-        // Create a metadata getter that returns parent's metadata
-        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
-            if uri == &parent_uri {
-                Some(std::sync::Arc::new(parent_meta.clone()))
-            } else {
-                None
-            }
-        };
-
-        // Resolve parent's working directory
-        let parent_wd = resolve_parent_working_directory(
-            &parent_uri,
-            get_metadata,
-            Some(&workspace_uri),
-        );
-
-        // Should return parent's directory (since no explicit @lsp-cd)
-        let expected_wd = format!("/{}/{}", workspace, parent_subdir);
-
-        prop_assert!(
-            parent_wd.is_some(),
-            "resolve_parent_working_directory should return Some even when parent has no explicit @lsp-cd"
-        );
-
-        prop_assert_eq!(
-            parent_wd.as_ref().unwrap(),
-            &expected_wd,
-            "Parent WD should equal parent's directory when no explicit @lsp-cd. \
-             expected='{}', got='{}'",
-            expected_wd, parent_wd.as_ref().unwrap()
-        );
-    }
 
     /// Feature: working-directory-inheritance, Property 1 extended: Parent with relative @lsp-cd
     /// **Validates: Requirements 1.1, 2.2**
@@ -13427,51 +12016,6 @@ proptest! {
         );
     }
 
-    /// Feature: working-directory-inheritance, Property 5 extended: resolve_parent_working_directory fallback
-    /// **Validates: Requirements 5.3**
-    ///
-    /// Test resolve_parent_working_directory function directly when metadata is unavailable.
-    /// The function should fall back to using the parent file's directory.
-    #[test]
-    fn prop_resolve_parent_wd_fallback_when_metadata_unavailable(
-        workspace in path_component(),
-        parent_subdir in path_component(),
-    ) {
-        // Create workspace root URI
-        let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
-
-        // Create parent file URI: /workspace/parent_subdir/parent.R
-        let parent_uri = Url::parse(&format!("file:///{}/{}/parent.R", workspace, parent_subdir)).unwrap();
-
-        // Create a metadata getter that ALWAYS returns None (simulating unavailable metadata)
-        let get_metadata = |_uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
-            None // Metadata unavailable
-        };
-
-        // Resolve parent's working directory
-        let parent_wd = resolve_parent_working_directory(
-            &parent_uri,
-            get_metadata,
-            Some(&workspace_uri),
-        );
-
-        // Should fall back to parent's directory
-        let expected_wd = format!("/{}/{}", workspace, parent_subdir);
-
-        prop_assert!(
-            parent_wd.is_some(),
-            "resolve_parent_working_directory should return Some even when metadata is unavailable \
-             (fallback to parent's directory)"
-        );
-
-        prop_assert_eq!(
-            parent_wd.as_ref().unwrap(),
-            &expected_wd,
-            "When metadata is unavailable, should fall back to parent's directory. \
-             expected='{}', got='{}'",
-            expected_wd, parent_wd.as_ref().unwrap()
-        );
-    }
 
     /// Feature: working-directory-inheritance, Property 5 extended: Fallback with nested parent directory
     /// **Validates: Requirements 5.3**
@@ -13546,50 +12090,6 @@ proptest! {
         );
     }
 
-    /// Feature: working-directory-inheritance, Property 5 extended: Fallback without workspace root
-    /// **Validates: Requirements 5.3**
-    ///
-    /// Test fallback behavior when workspace root is not available.
-    #[test]
-    fn prop_fallback_without_workspace_root(
-        parent_dir in path_component(),
-        child_dir in path_component(),
-    ) {
-        // Ensure directories are different
-        prop_assume!(parent_dir != child_dir);
-
-        // Create parent file URI: /parent_dir/parent.R (no workspace)
-        let parent_uri = Url::parse(&format!("file:///{}/parent.R", parent_dir)).unwrap();
-
-        // Create a metadata getter that ALWAYS returns None
-        let get_metadata = |_uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
-            None // Metadata unavailable
-        };
-
-        // Resolve parent's working directory without workspace root
-        let parent_wd = resolve_parent_working_directory(
-            &parent_uri,
-            get_metadata,
-            None, // No workspace root
-        );
-
-        // Should still fall back to parent's directory
-        let expected_wd = format!("/{}", parent_dir);
-
-        prop_assert!(
-            parent_wd.is_some(),
-            "resolve_parent_working_directory should return Some even without workspace root \
-             (fallback to parent's directory)"
-        );
-
-        prop_assert_eq!(
-            parent_wd.as_ref().unwrap(),
-            &expected_wd,
-            "Fallback should work without workspace root. \
-             expected='{}', got='{}'",
-            expected_wd, parent_wd.as_ref().unwrap()
-        );
-    }
 }
 
 // ============================================================================

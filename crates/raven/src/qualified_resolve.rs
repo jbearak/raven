@@ -1838,7 +1838,7 @@ mod tests {
     use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
 
     fn fresh_state() -> WorldState {
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.workspace_scan_complete = true;
         state
     }

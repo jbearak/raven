@@ -143,7 +143,7 @@ mod tests {
         project_config_path: &str,
         project: Option<serde_json::Value>,
     ) -> WorldState {
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.raw_client_settings = client;
         state.raw_project_settings = project;
         state.project_config_path = Some(PathBuf::from(project_config_path));

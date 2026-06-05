@@ -87,7 +87,7 @@ fn write_mixed(dir: &Path, leaves: usize, chain_depth: usize) {
 }
 
 fn build_state(workspace: &Path) -> WorldState {
-    let mut state = WorldState::new(vec![]);
+    let mut state = WorldState::new();
     let folder_url = Url::from_file_path(workspace).unwrap();
     state.workspace_folders.push(folder_url.clone());
     let mut entries: Vec<PathBuf> = std::fs::read_dir(workspace)

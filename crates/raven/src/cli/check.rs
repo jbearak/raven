@@ -415,7 +415,7 @@ fn build_indexed_state(
     let (project_settings, project_config_path) =
         resolve_project_config(no_config, config_path, root)?;
 
-    let mut state = crate::state::WorldState::new(crate::r_env::find_library_paths());
+    let mut state = crate::state::WorldState::new();
     state.workspace_folders = vec![workspace_url.clone()];
     state.raw_project_settings = project_settings;
     state.project_config_path = project_config_path;
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn missing_metadata_gate_respects_packages_disabled() {
-        let mut state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new();
         state.cross_file_config.packages_enabled = false;
         let diags = vec![(
             PathBuf::from("main.R"),
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn missing_metadata_gate_ignores_defined_later_diagnostics() {
-        let mut state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new();
         state.cross_file_config.packages_enabled = true;
         let defined_later = vec![(
             PathBuf::from("main.R"),
@@ -1501,7 +1501,7 @@ mod tests {
     async fn maybe_init_r_honors_additional_library_paths() {
         let workspace = TempDir::new().unwrap();
         let extra_lib = TempDir::new().unwrap();
-        let mut state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new();
         state.cross_file_config.packages_additional_library_paths =
             vec![extra_lib.path().to_path_buf()];
 
@@ -1529,7 +1529,7 @@ mod tests {
     async fn maybe_init_r_skips_when_packages_disabled() {
         let workspace = TempDir::new().unwrap();
         let extra_lib = TempDir::new().unwrap();
-        let mut state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new();
         state.cross_file_config.packages_enabled = false;
         state.cross_file_config.packages_additional_library_paths =
             vec![extra_lib.path().to_path_buf()];
@@ -1582,7 +1582,7 @@ mod tests {
 
         let workspace = TempDir::new().unwrap();
         let _db_env = crate::package_db::NamesDbEnvGuard::set(&db_path);
-        let mut state = crate::state::WorldState::new(vec![]);
+        let mut state = crate::state::WorldState::new();
         maybe_init_r(&mut state, workspace.path()).await;
 
         // The Tier 3 provider survived (library not dropped) and is marked ready,

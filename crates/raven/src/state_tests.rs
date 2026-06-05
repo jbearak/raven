@@ -573,7 +573,7 @@ mod package_testthat_visibility_tests {
         workspace_root_path: &str,
         r_files: Vec<(PathBuf, RFileKind, &str)>,
     ) -> WorldState {
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.package_inputs.workspace_root = Some(PathBuf::from(workspace_root_path));
         state.package_inputs.package_mode = PackageMode::Auto;
         state.package_inputs.description = Some(DescriptionInput {
@@ -806,7 +806,7 @@ mod package_testthat_visibility_tests {
         use crate::package_state::{DescriptionInput, PackageInputDelta};
 
         let root = "/work/pkg";
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.package_inputs.workspace_root = Some(PathBuf::from(root));
         state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
         state.package_inputs.description = Some(DescriptionInput {
@@ -880,7 +880,7 @@ mod package_testthat_visibility_tests {
         use crate::package_state::{DescriptionInput, PackageInputDelta};
 
         let root = "/work/pkg";
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state.package_inputs.workspace_root = Some(PathBuf::from(root));
         state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
         state.package_inputs.description = Some(DescriptionInput {

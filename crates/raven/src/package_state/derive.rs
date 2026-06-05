@@ -259,18 +259,15 @@ fn effective_workspace(inputs: &PackageInputs) -> Option<PackageWorkspace> {
         (PackageMode::Auto, Some(name)) => Some(PackageWorkspace {
             name: name.to_string(),
             root: root.clone(),
-            roxygen_managed: false,
         }),
         (PackageMode::Auto, None) => None,
         (PackageMode::Enabled, Some(name)) => Some(PackageWorkspace {
             name: name.to_string(),
             root: root.clone(),
-            roxygen_managed: false,
         }),
         (PackageMode::Enabled, None) => Some(PackageWorkspace {
             name: "unknown".to_string(),
             root: root.clone(),
-            roxygen_managed: false,
         }),
     }
 }

@@ -499,7 +499,7 @@ fn budget_single_file_completion() {
     let workspace_path = workspace.path();
 
     // Build a fully-populated WorldState (same pattern as lsp_operations bench)
-    let mut state = WorldState::new(vec![]);
+    let mut state = WorldState::new();
     let folder_url = Url::from_file_path(workspace_path).unwrap();
     state.workspace_folders.push(folder_url.clone());
 

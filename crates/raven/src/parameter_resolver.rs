@@ -1090,7 +1090,7 @@ mod tests {
         // follow whichever definition is in scope at the cursor. Hover calls
         // `resolve_user_only` directly, so its redefinition test does not cover
         // the `resolve()` path the other two consumers go through.
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         let uri = Url::parse("file:///redef.R").unwrap();
         let code = "\
 f <- function(alpha) alpha
@@ -1847,7 +1847,7 @@ mod property_tests {
         // returned RAW text paired with the masked tree, panicking on the
         // multibyte prose (or silently mis-slicing for ASCII prose).
         let uri = Url::parse("file:///doc.Rmd").unwrap();
-        let mut state = WorldState::new(vec![]);
+        let mut state = WorldState::new();
         state
             .document_store
             .open(uri.clone(), MULTIBYTE_RMD, 1)
@@ -1899,7 +1899,7 @@ mod property_tests {
             artifacts,
             indexed_at_version: 0,
         };
-        let state = WorldState::new(vec![]);
+        let state = WorldState::new();
         state.workspace_index_new.insert(uri.clone(), entry);
 
         let params = extract_params_via_get_text_and_tree(&state, &uri);

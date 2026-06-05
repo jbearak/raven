@@ -11,15 +11,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-#[cfg(test)]
-use std::path::Path;
-#[cfg(test)]
-use std::sync::LazyLock;
-
-#[cfg(test)]
-static ROXYGEN_EXPORT_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)#'\s*@export\b").expect("valid regex"));
-
 /// Metadata about the detected R package workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageWorkspace {
@@ -27,12 +18,6 @@ pub struct PackageWorkspace {
     pub name: String,
     /// Absolute path to the workspace root (where DESCRIPTION lives).
     pub root: PathBuf,
-    /// Legacy roxygen-management hint.
-    ///
-    /// The current derived package-state path merges roxygen tags with
-    /// NAMESPACE content unconditionally, so this flag is retained only for
-    /// compatibility with older test-only detection helpers in this module.
-    pub roxygen_managed: bool,
 }
 
 /// Unified namespace model for an R package.
@@ -51,57 +36,6 @@ pub struct PackageNamespaceModel {
     pub imports: Vec<(String, String)>,
     /// Packages imported wholesale via `import(pkg)` — all their exports are available.
     pub full_imports: Vec<String>,
-}
-
-/// Test-only legacy detector for DESCRIPTION-based package workspaces.
-///
-/// Returns `Some(PackageWorkspace)` if a valid DESCRIPTION file with a
-/// `Package:` field exists at `workspace_root`. The `roxygen_managed` flag
-/// is set by scanning `R/*.R` files for `#' @export`.
-///
-/// Production package-mode activation is handled by `package_state` and must
-/// not use this helper as a substitute for the `PackageMode`-aware criteria.
-#[cfg(test)]
-pub fn detect_package_workspace(workspace_root: &Path) -> Option<PackageWorkspace> {
-    let description_path = workspace_root.join("DESCRIPTION");
-    let content = std::fs::read_to_string(&description_path).ok()?;
-    let name = parse_dcf_field(&content, "Package")?;
-
-    let roxygen_managed = detect_roxygen_usage(workspace_root);
-
-    Some(PackageWorkspace {
-        name,
-        root: workspace_root.to_path_buf(),
-        roxygen_managed,
-    })
-}
-
-/// Check if any `R/*.R` file contains `#' @export`.
-#[cfg(test)]
-fn detect_roxygen_usage(workspace_root: &Path) -> bool {
-    let r_dir = workspace_root.join("R");
-    let Ok(entries) = std::fs::read_dir(&r_dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Some(ext) = path.extension() {
-            if !ext.eq_ignore_ascii_case("r") {
-                continue;
-            }
-        } else {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(&path)
-            && ROXYGEN_EXPORT_RE.is_match(&content)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 /// Parse NAMESPACE content into a `PackageNamespaceModel`.
@@ -427,45 +361,6 @@ fn unquote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    #[test]
-    fn detect_package_workspace_with_description() {
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("DESCRIPTION"),
-            "Package: mypkg\nVersion: 1.0.0\n",
-        )
-        .unwrap();
-        let ws = detect_package_workspace(dir.path());
-        assert!(ws.is_some());
-        let ws = ws.unwrap();
-        assert_eq!(ws.name, "mypkg");
-        assert!(!ws.roxygen_managed);
-    }
-
-    #[test]
-    fn detect_package_workspace_none_without_description() {
-        let dir = TempDir::new().unwrap();
-        let ws = detect_package_workspace(dir.path());
-        assert!(ws.is_none());
-    }
-
-    #[test]
-    fn detect_roxygen_managed() {
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("DESCRIPTION"),
-            "Package: mypkg\nVersion: 1.0.0\n",
-        )
-        .unwrap();
-        let r_dir = dir.path().join("R");
-        fs::create_dir(&r_dir).unwrap();
-        fs::write(r_dir.join("foo.R"), "#' @export\nfoo <- function() {}\n").unwrap();
-        let ws = detect_package_workspace(dir.path()).unwrap();
-        assert!(ws.roxygen_managed);
-    }
 
     #[test]
     fn namespace_model_from_content_basic() {

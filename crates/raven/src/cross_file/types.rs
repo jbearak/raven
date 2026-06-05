@@ -134,31 +134,6 @@ impl ForwardSource {
     }
 }
 
-/// Canonical key for edge deduplication
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ForwardSourceKey {
-    pub resolved_uri: Url,
-    pub call_site_line: u32,
-    pub call_site_column: u32,
-    pub local: bool,
-    pub chdir: bool,
-    pub is_sys_source: bool,
-}
-
-impl ForwardSource {
-    /// Create a canonical key for deduplication (requires resolved URI)
-    pub fn to_key(&self, resolved_uri: Url) -> ForwardSourceKey {
-        ForwardSourceKey {
-            resolved_uri,
-            call_site_line: self.line,
-            call_site_column: self.column,
-            local: self.local,
-            chdir: self.chdir,
-            is_sys_source: self.is_sys_source,
-        }
-    }
-}
-
 /// Call site specification for backward directives
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CallSiteSpec {
@@ -243,30 +218,6 @@ mod tests {
     #[test]
     fn test_call_site_spec_default() {
         assert_eq!(CallSiteSpec::default(), CallSiteSpec::Default);
-    }
-
-    #[test]
-    fn test_forward_source_to_key() {
-        let source = ForwardSource {
-            path: "test.R".to_string(),
-            line: 10,
-            column: 5,
-            is_directive: false,
-            local: true,
-            chdir: false,
-            is_sys_source: false,
-            sys_source_global_env: true,
-            ..Default::default()
-        };
-        let uri = Url::parse("file:///test.R").unwrap();
-        let key = source.to_key(uri.clone());
-
-        assert_eq!(key.resolved_uri, uri);
-        assert_eq!(key.call_site_line, 10);
-        assert_eq!(key.call_site_column, 5);
-        assert!(key.local);
-        assert!(!key.chdir);
-        assert!(!key.is_sys_source);
     }
 
     #[test]

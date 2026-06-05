@@ -26,7 +26,7 @@ use raven::test_utils::fixture_workspace::{
 /// runs `scan_workspace`, and applies the index — mirroring what the LSP
 /// server does on `initialize` + `initialized`.
 fn build_state_from_fixture(workspace_path: &std::path::Path) -> WorldState {
-    let mut state = WorldState::new(vec![]);
+    let mut state = WorldState::new();
     let folder_url = Url::from_file_path(workspace_path).unwrap();
     state.workspace_folders.push(folder_url.clone());
 

@@ -194,7 +194,7 @@ fn measure_scan_phases(workspace: &Path) -> ScanPhaseTimings {
 }
 
 fn make_state(workspace: &Path) -> WorldState {
-    let mut state = WorldState::new(vec![]);
+    let mut state = WorldState::new();
     let folder = Url::from_file_path(workspace).unwrap();
     state.workspace_folders.push(folder);
     state

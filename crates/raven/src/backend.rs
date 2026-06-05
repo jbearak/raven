@@ -1293,7 +1293,7 @@ impl Backend {
         let library_paths = r_env::find_library_paths();
         log::info!("Discovered R library paths: {:?}", library_paths);
 
-        let state = Arc::new(RwLock::new(WorldState::new(library_paths)));
+        let state = Arc::new(RwLock::new(WorldState::new()));
 
         Self {
             client,
@@ -7753,7 +7753,7 @@ mod tests {
         }
 
         fn make_state_with_open_pkg_docs(names: &[&str]) -> WorldState {
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             state
                 .workspace_folders
                 .push(Url::from_file_path(pkg_root()).unwrap());
@@ -7908,7 +7908,7 @@ mod tests {
             std::fs::write(&disk_only, "disk_only <- 1\n").unwrap();
             std::fs::write(&open_path, "open_value <- 'disk'\n").unwrap();
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let open_uri = Url::from_file_path(&open_path).unwrap();
             state
                 .documents
@@ -7931,7 +7931,7 @@ mod tests {
             let helper_path = r_dir.join("helper.R");
             std::fs::write(&helper_path, "helper <- function() 1\n").unwrap();
 
-            let mut state = WorldState::new(vec![]);
+            let mut state = WorldState::new();
             let disk_seed = collect_package_r_file_inputs_from_disk(root);
             initialize_package_inputs_from_state(
                 &mut state,
@@ -9449,7 +9449,7 @@ mod refresh_packages_tests {
         let t_old = tempdir().unwrap();
         let t_new = tempdir().unwrap();
 
-        let state = Arc::new(RwLock::new(WorldState::new(vec![])));
+        let state = Arc::new(RwLock::new(WorldState::new()));
 
         // Pretend the user started with only `t_old` on the path, then
         // changed `.libPaths()` mid-session so `t_new` is now also present.
@@ -9538,7 +9538,7 @@ mod refresh_packages_tests {
         use crate::state::WorldState;
         use tokio::sync::RwLock;
 
-        let state = Arc::new(RwLock::new(WorldState::new(vec![])));
+        let state = Arc::new(RwLock::new(WorldState::new()));
         {
             let mut s = state.write().await;
             s.cross_file_config.packages_enabled = false;
@@ -9558,7 +9558,7 @@ mod refresh_packages_tests {
         use crate::state::{Document, WorldState};
         use tokio::sync::RwLock;
 
-        let mut world = WorldState::new(vec![]);
+        let mut world = WorldState::new();
         let uri_a = Url::parse("file:///workspace/a.R").unwrap();
         let uri_b = Url::parse("file:///workspace/b.R").unwrap();
         world
@@ -9626,7 +9626,7 @@ mod refresh_packages_tests {
         let child_uri = Url::from_file_path(&child_path).unwrap();
         let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
 
-        let mut world = WorldState::new(vec![]);
+        let mut world = WorldState::new();
         world.workspace_folders.push(workspace_root.clone());
 
         // Parent is a CLOSED file in the workspace index with library(dplyr)
@@ -9771,7 +9771,7 @@ mod refresh_packages_tests {
 
         let root = PathBuf::from("/work/pkg");
         let uri = Url::from_file_path(root.join("R").join("main.R")).unwrap();
-        let mut world = WorldState::new(vec![]);
+        let mut world = WorldState::new();
         world
             .documents
             .insert(uri.clone(), Document::new("helper()\n", Some(1)));
@@ -9824,7 +9824,7 @@ mod refresh_packages_tests {
         let pkg_lib = Arc::new(lib);
 
         // Set up a WorldState with an open document that uses `library(stats)`.
-        let mut world = WorldState::new(vec![]);
+        let mut world = WorldState::new();
         world.package_library = pkg_lib.clone();
         world.package_library_ready = true;
         let uri = Url::parse("file:///workspace/test.R").unwrap();
@@ -9872,7 +9872,7 @@ mod refresh_packages_tests {
         };
 
         // 1. Set up state with an open document using library(MASS).
-        let mut world = WorldState::new(vec![]);
+        let mut world = WorldState::new();
         world.cross_file_config.packages_enabled = true;
         let uri = Url::parse("file:///workspace/analysis.R").unwrap();
         world.documents.insert(
@@ -9980,7 +9980,7 @@ mod refresh_packages_tests {
         let child_uri = Url::from_file_path(&child_path).unwrap();
         let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
 
-        let mut world = WorldState::new(vec![]);
+        let mut world = WorldState::new();
         world.workspace_folders.push(workspace_root);
         world.package_library = pkg_lib.clone();
         world.package_library_ready = true;

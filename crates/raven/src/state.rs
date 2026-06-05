@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::content_provider::ContentProvider;
 use crate::indentation::IndentationStyle;
@@ -423,191 +423,6 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     packages
 }
 
-/// Package metadata loaded from disk
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct Package {
-    pub name: String,
-    pub path: PathBuf,
-    pub exports: Vec<String>,
-    pub description: Option<String>,
-    pub version: Option<String>,
-}
-
-impl Package {
-    #[allow(dead_code)]
-    pub fn load(path: &Path) -> Option<Self> {
-        let description_path = path.join("DESCRIPTION");
-        if !description_path.exists() {
-            return None;
-        }
-
-        let description_text = fs::read_to_string(&description_path).ok()?;
-        let name = parse_dcf_field(&description_text, "Package")?;
-        let version = parse_dcf_field(&description_text, "Version");
-        let title = parse_dcf_field(&description_text, "Title");
-
-        // Parse NAMESPACE for exports
-        let exports = parse_namespace_exports(&path.join("NAMESPACE"));
-
-        // Also include symbols from INDEX file (for datasets)
-        let mut all_exports = exports;
-        if let Some(index_exports) = parse_index(&path.join("INDEX")) {
-            all_exports.extend(index_exports);
-            all_exports.sort();
-            all_exports.dedup();
-        }
-
-        Some(Self {
-            name,
-            path: path.to_path_buf(),
-            exports: all_exports,
-            description: title,
-            version,
-        })
-    }
-}
-
-#[allow(dead_code)]
-fn parse_dcf_field(text: &str, field: &str) -> Option<String> {
-    for line in text.lines() {
-        if line.starts_with(field) && line.contains(':') {
-            let value = line.split_once(':')?.1.trim();
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-#[allow(dead_code)]
-fn parse_namespace_exports(path: &PathBuf) -> Vec<String> {
-    let mut exports = Vec::new();
-
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return exports,
-    };
-
-    // Simple regex-free parsing of NAMESPACE export directives
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with("export(") {
-            // export(foo, bar, baz)
-            if let Some(args) = line
-                .strip_prefix("export(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                for arg in args.split(',') {
-                    let sym = arg.trim().trim_matches('"');
-                    if !sym.is_empty() {
-                        exports.push(sym.to_string());
-                    }
-                }
-            }
-        } else if line.starts_with("exportPattern(") {
-            // We can't expand patterns without R, skip
-        } else if line.starts_with("S3method(") {
-            // S3method(print, foo) exports print.foo
-            if let Some(args) = line
-                .strip_prefix("S3method(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 2 {
-                    let method = format!("{}.{}", parts[0], parts[1]);
-                    exports.push(method);
-                }
-            }
-        }
-    }
-
-    exports
-}
-
-#[allow(dead_code)]
-fn parse_index(path: &PathBuf) -> Option<Vec<String>> {
-    let text = fs::read_to_string(path).ok()?;
-    let mut symbols = Vec::new();
-
-    for line in text.lines() {
-        // INDEX format: symbol_name<whitespace>description
-        if let Some(sym) = line.split_whitespace().next()
-            && !sym.is_empty()
-            && sym
-                .chars()
-                .next()
-                .map(|c| c.is_alphabetic())
-                .unwrap_or(false)
-        {
-            symbols.push(sym.to_string());
-        }
-    }
-
-    Some(symbols)
-}
-
-/// Library of installed packages
-#[allow(dead_code)]
-pub struct Library {
-    paths: Vec<PathBuf>,
-    packages: RwLock<HashMap<String, Arc<Package>>>,
-}
-
-impl Library {
-    pub fn new(paths: Vec<PathBuf>) -> Self {
-        Self {
-            paths,
-            packages: RwLock::new(HashMap::new()),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn get(&self, name: &str) -> Option<Arc<Package>> {
-        if let Ok(packages) = self.packages.read()
-            && let Some(pkg) = packages.get(name)
-        {
-            return Some(pkg.clone());
-        }
-
-        // Try to load from library paths
-        for lib_path in &self.paths {
-            let pkg_path = lib_path.join(name);
-            if let Some(pkg) = Package::load(&pkg_path) {
-                let pkg = Arc::new(pkg);
-                if let Ok(mut packages) = self.packages.write() {
-                    packages.insert(name.to_string(), pkg.clone());
-                }
-                return Some(pkg);
-            }
-        }
-
-        None
-    }
-
-    /// List all installed package names
-    #[allow(dead_code)]
-    pub fn list_packages(&self) -> Vec<String> {
-        let mut names_set = HashSet::new();
-        let mut names = Vec::new();
-        for lib_path in &self.paths {
-            if let Ok(entries) = fs::read_dir(lib_path) {
-                for entry in entries.flatten() {
-                    if entry.path().join("DESCRIPTION").exists()
-                        && let Some(name) = entry.file_name().to_str()
-                    {
-                        let s = name.to_string();
-                        if names_set.insert(s.clone()) {
-                            names.push(s);
-                        }
-                    }
-                }
-            }
-        }
-        names.sort();
-        names
-    }
-}
-
 /// Global LSP state
 pub struct WorldState {
     // Document management (new architecture)
@@ -620,12 +435,6 @@ pub struct WorldState {
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
-    // Legacy package metadata store. Superseded by `package_library` below,
-    // but retained (gated by `#[allow(dead_code)]` here and on the struct)
-    // because an integration test still exercises it to verify R library
-    // discovery from `.libPaths()`.
-    #[allow(dead_code)]
-    pub library: Library,
 
     // Package function awareness
     // Manages installed packages, their exports, and caching for package-aware scope resolution
@@ -719,28 +528,32 @@ impl WorldState {
     }
 }
 
+impl Default for WorldState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorldState {
     /// Creates a new WorldState initialized with default cross-file configuration and empty caches.
     ///
     /// The returned state is populated with:
     /// - default CrossFileConfig (logged at initialization),
     /// - empty document and workspace indexes (legacy and new),
-    /// - a Library constructed from `library_paths`,
     /// - an empty, concurrently accessible PackageLibrary,
     /// - all cross-file caches and auxiliary structures in their default state.
     ///
     /// # Examples
     ///
     /// ```
-    /// use std::path::PathBuf;
     /// use raven::state::WorldState;
     ///
-    /// let ws = WorldState::new(vec![PathBuf::from("/usr/lib/R/library")]);
+    /// let ws = WorldState::new();
     /// // newly created state has no opened documents or workspace folders by default
     /// assert!(ws.documents.is_empty());
     /// assert!(ws.workspace_folders.is_empty());
     /// ```
-    pub fn new(library_paths: Vec<PathBuf>) -> Self {
+    pub fn new() -> Self {
         let config = CrossFileConfig::default();
 
         // Log default cross-file configuration at startup
@@ -782,7 +595,6 @@ impl WorldState {
 
             // Workspace configuration
             workspace_folders: Vec::new(),
-            library: Library::new(library_paths),
 
             // Package function awareness
             // Initialize with empty state - will be populated via initialize() or async initialization
@@ -971,7 +783,7 @@ impl WorldState {
             .resize(config.cache_workspace_index_max_entries);
     }
 
-    #[allow(dead_code)] // Retained for tests and compatibility with older call sites.
+    #[cfg(test)]
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
         self.documents
             .insert(uri.clone(), Document::new_with_uri(text, version, &uri));
@@ -2277,13 +2089,12 @@ mod tests {
         // many open files — defeating the PR's goal of finding inherited
         // packages from closed parents.
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        use std::path::PathBuf;
 
         const NUM_CHAINS: usize = 30;
         const CHAIN_LEN: usize = 10;
         const PER_SEED_BUDGET: usize = 200;
 
-        let mut state = WorldState::new(vec![PathBuf::from("/tmp/raven-test-libpath")]);
+        let mut state = WorldState::new();
         state.cross_file_config.max_transitive_dependents_visited = PER_SEED_BUDGET;
         // 30 × 10 = 300 nodes total; with an unscaled shared budget of 200
         // the BFS would truncate.

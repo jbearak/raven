@@ -198,7 +198,7 @@ impl FunctionScopeInterval {
     /// let start = Position::new(1, 0);
     /// let end = Position::new(10, 0);
     /// let interval = FunctionScopeInterval::new(start, end);
-    /// assert_eq!(interval.as_tuple(), (1, 0, 10, 0));
+    /// assert_eq!((interval.start, interval.end), (Position::new(1, 0), Position::new(10, 0)));
     /// ```
     pub fn new(start: Position, end: Position) -> Self {
         Self { start, end }
@@ -228,37 +228,15 @@ impl FunctionScopeInterval {
     /// # Examples
     ///
     /// ```
-    /// use raven::cross_file::FunctionScopeInterval;
+    /// use raven::cross_file::{Position, FunctionScopeInterval};
     /// let iv = FunctionScopeInterval::from_tuple((1, 2, 3, 4));
-    /// assert_eq!(iv.as_tuple(), (1, 2, 3, 4));
+    /// assert_eq!((iv.start, iv.end), (Position::new(1, 2), Position::new(3, 4)));
     /// ```
     pub fn from_tuple(tuple: (u32, u32, u32, u32)) -> Self {
         Self {
             start: Position::new(tuple.0, tuple.1),
             end: Position::new(tuple.2, tuple.3),
         }
-    }
-
-    /// Produce a 4-tuple representing the interval boundaries for backward compatibility.
-    ///
-    /// # Returns
-    ///
-    /// `(u32, u32, u32, u32)` where the elements are `(start_line, start_column, end_line, end_column)`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use raven::cross_file::{Position, FunctionScopeInterval};
-    /// let interval = FunctionScopeInterval::new(Position::new(1, 2), Position::new(3, 4));
-    /// assert_eq!(interval.as_tuple(), (1, 2, 3, 4));
-    /// ```
-    pub fn as_tuple(self) -> (u32, u32, u32, u32) {
-        (
-            self.start.line,
-            self.start.column,
-            self.end.line,
-            self.end.column,
-        )
     }
 }
 
@@ -515,7 +493,7 @@ impl FunctionScopeTree {
     /// ]);
     /// let pos = Position::new(3, 0);
     /// let innermost = tree.query_innermost(pos).unwrap();
-    /// assert_eq!(innermost.as_tuple(), (2, 0, 5, 0));
+    /// assert_eq!((innermost.start, innermost.end), (Position::new(2, 0), Position::new(5, 0)));
     /// ```
     pub fn query_innermost(&self, pos: Position) -> Option<FunctionScopeInterval> {
         if let Some(ref root) = self.root {
@@ -1546,7 +1524,8 @@ pub fn scope_at_position(
                 }
             }
             ScopeEvent::Source { .. } => {
-                // Source events are handled by scope_at_position_with_deps
+                // Source events are handled by the cross-file traversal in
+                // scope_at_position_with_graph
             }
             ScopeEvent::FunctionScope {
                 start_line,
@@ -1738,7 +1717,8 @@ where
                 }
             }
             ScopeEvent::Source { .. } => {
-                // Source events are handled by scope_at_position_with_deps
+                // Source events are handled by the cross-file traversal in
+                // scope_at_position_with_graph
             }
             ScopeEvent::FunctionScope {
                 start_line,
@@ -1860,35 +1840,6 @@ where
         }
     }
 
-    scope
-}
-
-/// Compute scope at a position with cross-file traversal.
-/// This is the main entry point for cross-file scope resolution.
-pub fn scope_at_position_with_deps<F>(
-    uri: &Url,
-    line: u32,
-    column: u32,
-    get_artifacts: &F,
-    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
-    max_depth: usize,
-) -> ScopeAtPosition
-where
-    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
-{
-    log::trace!("Resolving scope at {}:{}:{}", uri, line, column);
-    let mut visited = HashSet::new();
-    let scope = scope_at_position_recursive(
-        uri,
-        line,
-        column,
-        get_artifacts,
-        resolve_path,
-        max_depth,
-        0,
-        &mut visited,
-    );
-    log::trace!("Found {} symbols in scope", scope.symbols.len());
     scope
 }
 
@@ -6168,39 +6119,6 @@ mod tests {
 
         assert_eq!(source_events.len(), 1, "Should have one source event");
         assert!(source_events[0].local, "Source should have local=TRUE");
-
-        // But local=TRUE at top-level should not make child symbols available in global scope.
-        let parent_uri = Url::parse("file:///parent.R").unwrap();
-        let child_uri = Url::parse("file:///child.R").unwrap();
-
-        let child_code = "child_var <- 42";
-        let child_tree = parse_r(child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri {
-                Some(Arc::new(artifacts.clone()))
-            } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
-            } else {
-                None
-            }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        };
-
-        let scope =
-            scope_at_position_with_deps(&parent_uri, 10, 0, &get_artifacts, &resolve_path, 10);
-        assert!(
-            !scope.symbols.contains_key("child_var"),
-            "local=TRUE should not leak symbols to global scope"
-        );
     }
 
     #[test]
@@ -6863,69 +6781,6 @@ outside_var <- 2"#;
     }
 
     #[test]
-    fn test_max_depth_exceeded_forward() {
-        // Test that depth_exceeded is populated when max depth is hit on forward sources
-        let uri_a = Url::parse("file:///project/a.R").unwrap();
-        let uri_b = Url::parse("file:///project/b.R").unwrap();
-        let uri_c = Url::parse("file:///project/c.R").unwrap();
-
-        // a.R sources b.R, b.R sources c.R
-        let code_a = "source(\"b.R\")";
-        let code_b = "source(\"c.R\")";
-        let code_c = "x <- 1";
-
-        let tree_a = parse_r(code_a);
-        let tree_b = parse_r(code_b);
-        let tree_c = parse_r(code_c);
-
-        let artifacts_a = compute_artifacts(&uri_a, &tree_a, code_a);
-        let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
-        let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &uri_a {
-                Some(Arc::new(artifacts_a.clone()))
-            } else if uri == &uri_b {
-                Some(Arc::new(artifacts_b.clone()))
-            } else if uri == &uri_c {
-                Some(Arc::new(artifacts_c.clone()))
-            } else {
-                None
-            }
-        };
-
-        let resolve_path = |path: &str, from: &Url| -> Option<Url> {
-            if from == &uri_a && path == "b.R" {
-                Some(uri_b.clone())
-            } else if from == &uri_b && path == "c.R" {
-                Some(uri_c.clone())
-            } else {
-                None
-            }
-        };
-
-        // With max_depth=2, traversing a->b->c should exceed at b->c
-        let scope = scope_at_position_with_deps(
-            &uri_a,
-            u32::MAX,
-            u32::MAX,
-            &get_artifacts,
-            &resolve_path,
-            2,
-        );
-
-        // Should have depth_exceeded entry for b.R at the source("c.R") call
-        assert!(
-            !scope.depth_exceeded.is_empty(),
-            "depth_exceeded should not be empty"
-        );
-        assert!(
-            scope.depth_exceeded.iter().any(|(uri, _, _)| uri == &uri_b),
-            "depth_exceeded should contain b.R"
-        );
-    }
-
-    #[test]
     fn test_max_depth_exceeded_backward() {
         // Test that depth_exceeded is populated when max depth is hit on backward directives
         use super::super::types::{CrossFileMetadata, ForwardSource};
@@ -7026,90 +6881,6 @@ outside_var <- 2"#;
         assert!(
             !scope.depth_exceeded.is_empty(),
             "depth_exceeded should not be empty with max_depth=2"
-        );
-    }
-
-    #[test]
-    fn test_lsp_source_directive_in_scope() {
-        // Test that @lsp-source directives are treated as source call sites for scope resolution
-        use super::super::types::ForwardSource;
-
-        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
-        let child_uri = Url::parse("file:///project/child.R").unwrap();
-
-        // Parent file: has @lsp-source directive on line 2 (0-based: line 1)
-        // The directive is parsed into sources with is_directive=true
-        let parent_code = "x <- 1\n# @lsp-source child.R\ny <- 2";
-        let parent_tree = parse_r(parent_code);
-        let mut parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-
-        // Manually add the directive source (normally done by directive parsing)
-        parent_artifacts.timeline.push(ScopeEvent::Source {
-            line: 1,
-            column: 0,
-            source: ForwardSource {
-                path: "child.R".to_string(),
-                line: 1,
-                column: 0,
-                is_directive: true, // This is the key - it's a directive
-                local: false,
-                chdir: false,
-                is_sys_source: false,
-                sys_source_global_env: true,
-                ..Default::default()
-            },
-            function_scope: None,
-        });
-        parent_artifacts.timeline.sort_by_key(|e| match e {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                ..
-            } => (*start_line, *start_column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        });
-
-        // Child file: defines 'child_var'
-        let child_code = "child_var <- 42";
-        let child_tree = parse_r(child_code);
-        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-
-        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri {
-                Some(Arc::new(parent_artifacts.clone()))
-            } else if uri == &child_uri {
-                Some(Arc::new(child_artifacts.clone()))
-            } else {
-                None
-            }
-        };
-
-        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" {
-                Some(child_uri.clone())
-            } else {
-                None
-            }
-        };
-
-        // Before the @lsp-source directive (line 0), child_var should NOT be in scope
-        let scope_before =
-            scope_at_position_with_deps(&parent_uri, 0, 10, &get_artifacts, &resolve_path, 10);
-        assert!(
-            !scope_before.symbols.contains_key("child_var"),
-            "child_var should NOT be in scope before @lsp-source directive"
-        );
-
-        // After the @lsp-source directive (line 2), child_var SHOULD be in scope
-        let scope_after =
-            scope_at_position_with_deps(&parent_uri, 2, 0, &get_artifacts, &resolve_path, 10);
-        assert!(
-            scope_after.symbols.contains_key("child_var"),
-            "child_var SHOULD be in scope after @lsp-source directive"
         );
     }
 
@@ -9450,60 +9221,6 @@ outside_var <- 2"#;
         );
     }
 
-    #[test]
-    fn test_scope_with_deps_define_then_remove() {
-        // Test scope_at_position_with_deps with define-then-remove
-        // Validates: Requirements 7.3, 7.4
-        let code = "x <- 1\nrm(x)";
-        let tree = parse_r(code);
-        let uri = test_uri();
-        let artifacts = compute_artifacts(&uri, &tree, code);
-
-        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if u == &uri {
-                Some(Arc::new(artifacts.clone()))
-            } else {
-                None
-            }
-        };
-
-        let resolve_path = |_path: &str, _from: &Url| -> Option<Url> { None };
-
-        // After rm(), x should NOT be in scope
-        let scope = scope_at_position_with_deps(&uri, 1, 10, &get_artifacts, &resolve_path, 10);
-        assert!(
-            !scope.symbols.contains_key("x"),
-            "x should NOT be in scope after rm() via scope_at_position_with_deps"
-        );
-    }
-
-    #[test]
-    fn test_scope_with_deps_define_remove_define() {
-        // Test scope_at_position_with_deps with define-remove-define sequence
-        // Validates: Requirements 7.1
-        let code = "x <- 1\nrm(x)\nx <- 2";
-        let tree = parse_r(code);
-        let uri = test_uri();
-        let artifacts = compute_artifacts(&uri, &tree, code);
-
-        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if u == &uri {
-                Some(Arc::new(artifacts.clone()))
-            } else {
-                None
-            }
-        };
-
-        let resolve_path = |_path: &str, _from: &Url| -> Option<Url> { None };
-
-        // After second definition, x should be in scope
-        let scope = scope_at_position_with_deps(&uri, 2, 10, &get_artifacts, &resolve_path, 10);
-        assert!(
-            scope.symbols.contains_key("x"),
-            "x should be in scope after re-definition via scope_at_position_with_deps"
-        );
-    }
-
     // ============================================================================
     // Cross-file integration tests for removals (Task 7.2)
     // Validates: Requirements 6.1, 6.2
@@ -11264,14 +10981,11 @@ outside_var <- 2"#;
             "Should not contain position on later line"
         );
 
-        // Test from_tuple() and to_tuple() round-trip
+        // Test from_tuple() maps tuple elements to start/end positions
         let tuple = (10, 5, 20, 15);
         let from_tuple = FunctionScopeInterval::from_tuple(tuple);
         assert_eq!(from_tuple.start, Position::new(10, 5));
         assert_eq!(from_tuple.end, Position::new(20, 15));
-
-        let back_to_tuple = from_tuple.as_tuple();
-        assert_eq!(back_to_tuple, tuple, "Round-trip should preserve values");
     }
 
     #[test]
