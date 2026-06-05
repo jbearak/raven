@@ -13560,6 +13560,13 @@ fn extract_statement_from_tree(
 /// same path local variables take — rather than re-implementing the
 /// content/tree-acquisition and statement-extraction machinery. The synthetic
 /// `name` is unused by that path (which keys off `source_uri` + position).
+///
+/// This shares [`extract_definition_statement`]'s document-store coverage with
+/// the main cross-file-scope hover path. If go-to-definition can locate a
+/// member whose defining file is indexed-only (not in `documents` or the file
+/// cache), hover may resolve the location but find no statement to render and
+/// fall through to suppression — the same boundary that path already has, not a
+/// member-specific gap.
 fn member_definition_info(
     state: &WorldState,
     location: &tower_lsp::lsp_types::Location,

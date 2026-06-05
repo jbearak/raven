@@ -252,7 +252,7 @@ pub fn resolve(
     current_uri: &Url,
     position: tower_lsp::lsp_types::Position,
 ) -> Option<FunctionSignature> {
-    // --- Phase 0: Cache lookup ---
+    // --- Phase 1: Package cache (namespace-qualified calls) ---
 
     // For namespace-qualified calls (e.g., dplyr::filter), check package cache
     if let Some(ns) = namespace {
@@ -262,7 +262,7 @@ pub fn resolve(
         }
     }
 
-    // --- Phases 1 & 2: Local / cross-file (only for unqualified calls) ---
+    // --- Phases 2 & 3: Local / cross-file (only for unqualified calls) ---
     // Namespace-qualified calls (e.g., dplyr::filter) skip user-defined lookup
     // and go straight to package resolution.
     if namespace.is_none()
@@ -271,7 +271,7 @@ pub fn resolve(
         return Some(sig);
     }
 
-    // --- Phase 3: Package resolution ---
+    // --- Phase 4: Package resolution ---
     // For unqualified names, check package cache with all possible package keys
     // before attempting R subprocess
     let scope = get_scope(state, current_uri, position);
