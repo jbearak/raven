@@ -73,13 +73,11 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rPath`
 | `raven.crossFile.revalidationDebounceMs` | `200` | Debounce delay for dependent file diagnostics (ms) |
 | `raven.crossFile.editedFileDebounceMs` | `50` | Debounce delay for the actively-edited file (ms). *LSP init-only — not exposed in the VS Code Settings UI.* |
 
-### Background indexing
+### On-demand indexing
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.crossFile.onDemandIndexing.enabled` | `true` | Index files referenced by `source()` / directives that aren't currently open, so cross-file features work without opening every dependency |
-| `raven.crossFile.onDemandIndexing.maxTransitiveDepth` | `2` | How deep to follow transitive dependencies (files sourced by sourced files) when indexing in the background |
-| `raven.crossFile.onDemandIndexing.maxQueueSize` | `50` | Cap on files queued for background indexing at once |
+| `raven.crossFile.onDemandIndexing.enabled` | `true` | Index files referenced by `source()` / directives that aren't currently open, so cross-file features work without opening every dependency. Depth is bounded by `maxForwardDepth` / `maxBackwardDepth` |
 
 ### Cache sizes
 

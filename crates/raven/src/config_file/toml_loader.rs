@@ -180,12 +180,10 @@ lineLengthSeverity = "warning"
         let toml = r#"
 [crossFile.onDemandIndexing]
 enabled = true
-maxTransitiveDepth = 5
 "#;
         let out = load_str(toml, "test").unwrap();
         let on_demand = &out.settings["crossFile"]["onDemandIndexing"];
         assert_eq!(on_demand["enabled"], serde_json::json!(true));
-        assert_eq!(on_demand["maxTransitiveDepth"], serde_json::json!(5));
     }
 
     #[test]

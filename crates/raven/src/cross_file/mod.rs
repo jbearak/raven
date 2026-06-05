@@ -7,7 +7,6 @@
 // Allow dead code for infrastructure that's implemented for future use
 #![allow(dead_code)]
 
-pub mod background_indexer;
 pub mod cache;
 pub mod config;
 pub mod content_provider;
@@ -28,7 +27,6 @@ mod property_tests;
 #[cfg(test)]
 pub mod integration_tests;
 
-pub use background_indexer::*;
 pub use cache::*;
 pub use config::*;
 #[allow(unused_imports)]

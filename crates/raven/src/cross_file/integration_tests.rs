@@ -2284,7 +2284,7 @@ child_function <- function() {
 mod on_demand_indexing_tests {
     use super::*;
 
-    /// Test on-demand prioritized indexing for sourced files.
+    /// Test on-demand indexing for sourced files.
     ///
     /// This test verifies that when a file with source() calls is opened,
     /// the sourced files are immediately indexed on-demand, even if they
@@ -2427,11 +2427,10 @@ result2 <- helper_function(20)
         println!("  - utils.r would be indexed on-demand when main.r is opened");
         println!("  - Dependency graph correctly contains the edge");
         println!("  - Symbols from utils.r would be available immediately");
-        println!("\nOn-Demand Indexing Strategy:");
-        println!("  Priority 1: Files directly sourced by open documents");
-        println!("  Priority 2: Files referenced by backward directives");
-        println!("  Priority 3: Transitive dependencies (sources of sources)");
-        println!("  Priority 4: Remaining workspace files (background scan)");
+        println!("\nOn-Demand Indexing Strategy (synchronous, in did_open):");
+        println!("  - Files directly sourced by open documents");
+        println!("  - The forward source chain (transitive deps, bounded by maxForwardDepth)");
+        println!("  - Backward-directive targets (bounded by maxBackwardDepth)");
     }
 
     /// Test on-demand indexing for transitive dependencies.
@@ -2442,8 +2441,8 @@ result2 <- helper_function(20)
     /// **Scenario**:
     /// 1. Create main.r -> utils.r -> helpers.r chain
     /// 2. Open main.r
-    /// 3. Verify utils.r is indexed (Priority 1)
-    /// 4. Verify helpers.r is indexed (Priority 3 - transitive)
+    /// 3. Verify utils.r is indexed (directly sourced)
+    /// 4. Verify helpers.r is indexed (transitive, via the forward chain)
     ///
     /// **Requirements**: 2.1, 7.2, 7.4
     #[test]
@@ -2511,17 +2510,17 @@ result <- utility_function(5)
         let main_children = get_children(&graph, &main_uri);
         assert!(
             main_children.contains(&utils_uri),
-            "main.r should have utils.r as a dependency (Priority 1)"
+            "main.r should have utils.r as a dependency (directly sourced)"
         );
-        println!("  ✓ main.r -> utils.r (Priority 1: directly sourced)");
+        println!("  ✓ main.r -> utils.r (directly sourced)");
 
         // Verify utils.r -> helpers.r
         let utils_children = get_children(&graph, &utils_uri);
         assert!(
             utils_children.contains(&helpers_uri),
-            "utils.r should have helpers.r as a dependency (Priority 3: transitive)"
+            "utils.r should have helpers.r as a dependency (transitive)"
         );
-        println!("  ✓ utils.r -> helpers.r (Priority 3: transitive dependency)");
+        println!("  ✓ utils.r -> helpers.r (transitive dependency)");
 
         // Verify full chain
         println!("\nStep 6: Verifying full dependency chain");
@@ -2530,67 +2529,9 @@ result <- utility_function(5)
 
         // Test passed
         println!("\n✓ Transitive dependency indexing test passed");
-        println!("  - Priority 1: utils.r (directly sourced by main.r)");
-        println!("  - Priority 3: helpers.r (sourced by utils.r)");
+        println!("  - utils.r (directly sourced by main.r)");
+        println!("  - helpers.r (transitively sourced via utils.r)");
         println!("  - All symbols in chain would be available");
-    }
-
-    /// Test depth limiting for transitive dependencies.
-    ///
-    /// Verifies that transitive indexing respects the max_transitive_depth config.
-    ///
-    /// **Scenario**:
-    /// 1. Create chain: a.r -> b.r -> c.r -> d.r -> e.r
-    /// 2. With max_transitive_depth=2, only a, b, c should be indexed
-    /// 3. d.r and e.r should NOT be indexed
-    #[test]
-    fn test_on_demand_indexing_depth_limiting() {
-        println!("\n=== On-Demand Indexing Test: Depth Limiting ===\n");
-
-        let mut workspace = TestWorkspace::new().unwrap();
-
-        // Create a deep chain: a -> b -> c -> d -> e
-        workspace
-            .add_file("e.r", "e_func <- function() { 5 }")
-            .unwrap();
-        workspace
-            .add_file("d.r", "source('e.r')\nd_func <- function() { e_func() }")
-            .unwrap();
-        workspace
-            .add_file("c.r", "source('d.r')\nc_func <- function() { d_func() }")
-            .unwrap();
-        workspace
-            .add_file("b.r", "source('c.r')\nb_func <- function() { c_func() }")
-            .unwrap();
-        workspace
-            .add_file("a.r", "source('b.r')\na_func <- function() { b_func() }")
-            .unwrap();
-
-        println!("Created chain: a.r -> b.r -> c.r -> d.r -> e.r");
-
-        // Build dependency graph
-        let graph = build_dependency_graph(&workspace).unwrap();
-
-        // Verify the chain exists
-        let a_uri = workspace.get_uri("a.r");
-        let b_uri = workspace.get_uri("b.r");
-        let c_uri = workspace.get_uri("c.r");
-        let d_uri = workspace.get_uri("d.r");
-        let e_uri = workspace.get_uri("e.r");
-
-        // Verify edges exist
-        assert!(get_children(&graph, &a_uri).contains(&b_uri), "a.r -> b.r");
-        assert!(get_children(&graph, &b_uri).contains(&c_uri), "b.r -> c.r");
-        assert!(get_children(&graph, &c_uri).contains(&d_uri), "c.r -> d.r");
-        assert!(get_children(&graph, &d_uri).contains(&e_uri), "d.r -> e.r");
-
-        println!("✓ Full chain verified in dependency graph");
-        println!("  With max_transitive_depth=2:");
-        println!("  - a.r (opened) - depth 0");
-        println!("  - b.r (Priority 1) - depth 0");
-        println!("  - c.r (Priority 3) - depth 1");
-        println!("  - d.r (Priority 3) - depth 2 (at limit)");
-        println!("  - e.r - NOT indexed (exceeds depth limit)");
     }
 
     /// Test circular dependency handling.
@@ -2632,7 +2573,7 @@ result <- utility_function(5)
         println!("  - Cycle detected and handled gracefully");
     }
 
-    /// Test backward directive indexing (Priority 2).
+    /// Test backward directive indexing.
     ///
     /// Verifies that files referenced by backward directives are indexed.
     ///
@@ -2640,7 +2581,7 @@ result <- utility_function(5)
     /// 1. Create child.r with @lsp-run-by: parent.r directive
     /// 2. Create parent.r that sources child.r
     /// 3. Open child.r
-    /// 4. Verify parent.r is queued for Priority 2 indexing
+    /// 4. Verify parent.r is resolved as a backward-directive target
     #[test]
     fn test_on_demand_indexing_backward_directive() {
         println!("\n=== On-Demand Indexing Test: Backward Directive ===\n");
@@ -2686,7 +2627,7 @@ child_func <- function() { parent_func() }
         );
 
         println!("✓ Backward directive detected: @lsp-run-by: parent.r");
-        println!("  - parent.r would be queued for Priority 2 indexing");
+        println!("  - parent.r would be indexed via the backward chain");
         println!("  - Symbols from parent.r would be available after indexing");
     }
 }

@@ -62,8 +62,6 @@ export interface RavenInitializationOptions {
         redundantDirectiveSeverity?: SeverityLevel;
         onDemandIndexing?: {
             enabled?: boolean;
-            maxTransitiveDepth?: number;
-            maxQueueSize?: number;
         };
         cache?: {
             metadataMaxEntries?: number;
@@ -188,26 +186,7 @@ export function getInitializationOptions(
     const redundantDirectiveSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.redundantDirectiveSeverity');
 
     const onDemandEnabled = getExplicitSetting<boolean>(config, 'crossFile.onDemandIndexing.enabled');
-    const onDemandMaxTransitiveDepth = getExplicitSetting<number>(config, 'crossFile.onDemandIndexing.maxTransitiveDepth');
-    const onDemandMaxQueueSize = getExplicitSetting<number>(config, 'crossFile.onDemandIndexing.maxQueueSize');
-
-    let onDemandIndexing: {
-        enabled?: boolean;
-        maxTransitiveDepth?: number;
-        maxQueueSize?: number;
-    } | undefined = undefined;
-    if (onDemandEnabled !== undefined || onDemandMaxTransitiveDepth !== undefined || onDemandMaxQueueSize !== undefined) {
-        onDemandIndexing = {};
-        if (onDemandEnabled !== undefined) {
-            onDemandIndexing.enabled = onDemandEnabled;
-        }
-        if (onDemandMaxTransitiveDepth !== undefined) {
-            onDemandIndexing.maxTransitiveDepth = onDemandMaxTransitiveDepth;
-        }
-        if (onDemandMaxQueueSize !== undefined) {
-            onDemandIndexing.maxQueueSize = onDemandMaxQueueSize;
-        }
-    }
+    const onDemandIndexing = onDemandEnabled !== undefined ? { enabled: onDemandEnabled } : undefined;
 
     const cacheMetadataMaxEntries = getExplicitSetting<number>(config, 'crossFile.cache.metadataMaxEntries');
     const cacheFileContentMaxEntries = getExplicitSetting<number>(config, 'crossFile.cache.fileContentMaxEntries');

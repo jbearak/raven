@@ -139,7 +139,7 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
 ///         "maxBackwardDepth": 5,
 ///         "indexWorkspace": true,
 ///         "missingFileSeverity": "warning",
-///         "onDemandIndexing": { "enabled": true, "priority2Enabled": false }
+///         "onDemandIndexing": { "enabled": true }
 ///     },
 ///     "packages": {
 ///         "enabled": true,
@@ -301,16 +301,10 @@ pub(crate) fn parse_cross_file_config(
         }
 
         // Parse on-demand indexing settings
-        if let Some(on_demand) = cross_file.get("onDemandIndexing") {
-            if let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool()) {
-                config.on_demand_indexing_enabled = v;
-            }
-            if let Some(v) = on_demand.get("maxTransitiveDepth").and_then(|v| v.as_u64()) {
-                config.on_demand_indexing_max_transitive_depth = v as usize;
-            }
-            if let Some(v) = on_demand.get("maxQueueSize").and_then(|v| v.as_u64()) {
-                config.on_demand_indexing_max_queue_size = v as usize;
-            }
+        if let Some(on_demand) = cross_file.get("onDemandIndexing")
+            && let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool())
+        {
+            config.on_demand_indexing_enabled = v;
         }
 
         // Parse cache settings
@@ -427,14 +421,6 @@ pub(crate) fn parse_cross_file_config(
     );
     log::info!("  On-demand indexing:");
     log::info!("    enabled: {}", config.on_demand_indexing_enabled);
-    log::info!(
-        "    max_transitive_depth: {}",
-        config.on_demand_indexing_max_transitive_depth
-    );
-    log::info!(
-        "    max_queue_size: {}",
-        config.on_demand_indexing_max_queue_size
-    );
     log::info!("  Diagnostic severities:");
     log::info!(
         "    undefined_variable: {:?}",
@@ -1145,7 +1131,6 @@ where
 pub struct Backend {
     client: Client,
     state: Arc<RwLock<WorldState>>,
-    background_indexer: Arc<crate::cross_file::BackgroundIndexer>,
     request_cancellation: Arc<RequestCancellationRegistry>,
     traversal_truncation: Arc<TraversalTruncationState>,
 }
@@ -1309,12 +1294,10 @@ impl Backend {
         log::info!("Discovered R library paths: {:?}", library_paths);
 
         let state = Arc::new(RwLock::new(WorldState::new(library_paths)));
-        let background_indexer = Arc::new(crate::cross_file::BackgroundIndexer::new(state.clone()));
 
         Self {
             client,
             state,
-            background_indexer,
             request_cancellation,
             traversal_truncation: Arc::new(TraversalTruncationState::default()),
         }
@@ -2800,8 +2783,9 @@ impl LanguageServer for Backend {
     /// 2. **Lock release**: Write lock is released BEFORE any synchronous indexing or
     ///    async operations that might need state access.
     ///
-    /// 3. **Synchronous indexing**: Priority 1 files are indexed synchronously AFTER
-    ///    releasing the write lock. Each indexing operation acquires its own locks as needed.
+    /// 3. **Synchronous indexing**: Directly sourced files, the forward source chain, and
+    ///    backward-directive targets are indexed synchronously AFTER releasing the write lock.
+    ///    Each indexing operation acquires its own locks as needed.
     ///
     /// 4. **Async diagnostics**: Diagnostics are scheduled as separate async tasks that
     ///    acquire their own read locks independently.
@@ -4145,9 +4129,6 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
 
-        // Cancel pending background indexing for this URI
-        self.background_indexer.cancel_uri(uri);
-
         let (package_close_path, close_text): (bool, Option<Arc<str>>) = {
             let state = self.state.read().await;
             let package_close_path = state
@@ -4496,19 +4477,6 @@ impl LanguageServer for Backend {
         let params = DidChangeWatchedFilesParams {
             changes: remaining_changes,
         };
-
-        // Collect deleted URIs for batch cancellation
-        let deleted_uris: Vec<Url> = params
-            .changes
-            .iter()
-            .filter(|c| c.typ == FileChangeType::DELETED)
-            .map(|c| c.uri.clone())
-            .collect();
-
-        // Cancel pending background indexing for deleted files
-        if !deleted_uris.is_empty() {
-            self.background_indexer.cancel_uris(deleted_uris.iter());
-        }
 
         // Collect URIs to update and affected open documents
         let (uris_to_update, mut affected_open_docs, pkg_manifest_changes): (
@@ -9075,7 +9043,6 @@ mod tests {
             let mut files_to_index: Vec<(String, IndexCategory)> = Vec::new();
             let mut sourced_indexed = false;
             let mut backward_indexed = false;
-            let mut transitive_queued = false;
 
             // Simulate file collection (only if enabled)
             if on_demand_enabled {
@@ -9091,8 +9058,6 @@ mod tests {
                         sourced_indexed = true;
                     }
                 }
-                // Transitive queuing would happen here
-                transitive_queued = true;
                 // Backward directive files synchronous indexing
                 for (_, category) in &files_to_index {
                     if *category == IndexCategory::BackwardDirective {
@@ -9111,7 +9076,6 @@ mod tests {
                 !backward_indexed,
                 "Backward directive indexing should be skipped"
             );
-            assert!(!transitive_queued, "Transitive queuing should be skipped");
         }
 
         #[test]

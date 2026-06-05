@@ -96,8 +96,6 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.redundantDirectiveSeverity', jsonPath: ['crossFile', 'redundantDirectiveSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     // On-demand indexing settings
     { vsCodeKey: 'crossFile.onDemandIndexing.enabled', jsonPath: ['crossFile', 'onDemandIndexing', 'enabled'], type: 'boolean' },
-    { vsCodeKey: 'crossFile.onDemandIndexing.maxTransitiveDepth', jsonPath: ['crossFile', 'onDemandIndexing', 'maxTransitiveDepth'], type: 'number' },
-    { vsCodeKey: 'crossFile.onDemandIndexing.maxQueueSize', jsonPath: ['crossFile', 'onDemandIndexing', 'maxQueueSize'], type: 'number' },
     // Cache settings
     { vsCodeKey: 'crossFile.cache.metadataMaxEntries', jsonPath: ['crossFile', 'cache', 'metadataMaxEntries'], type: 'number' },
     { vsCodeKey: 'crossFile.cache.fileContentMaxEntries', jsonPath: ['crossFile', 'cache', 'fileContentMaxEntries'], type: 'number' },
@@ -162,7 +160,7 @@ const SETTINGS_MAPPING: Array<{
 function arbitraryForSetting(setting: typeof SETTINGS_MAPPING[number]): fc.Arbitrary<unknown> {
     switch (setting.type) {
         case 'number':
-            // Include 0 to align with package.json schema (minimum: 0 for revalidationDebounceMs, maxTransitiveDepth)
+            // Include 0 to align with package.json schema (minimum: 0 for revalidationDebounceMs)
             return fc.integer({ min: 0, max: 100 });
         case 'boolean':
             return fc.boolean();
@@ -507,21 +505,17 @@ suite('Settings Transmission Unit Tests', () => {
     });
 
     /**
-     * Unit test: Verify nested onDemandIndexing settings transmission.
+     * Unit test: Verify the nested onDemandIndexing.enabled setting transmits.
      */
-    test('onDemandIndexing nested settings transmit correctly', () => {
+    test('onDemandIndexing nested setting transmits correctly', () => {
         const configuredSettings = new Map<string, unknown>([
             ['crossFile.onDemandIndexing.enabled', false],
-            ['crossFile.onDemandIndexing.maxTransitiveDepth', 5],
-            ['crossFile.onDemandIndexing.maxQueueSize', 100],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
         const options = getInitializationOptions(mockConfig);
 
         assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, false);
-        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxTransitiveDepth, 5);
-        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxQueueSize, 100);
     });
 
     test('maxTransitiveDependentsVisited transmits correctly', () => {
@@ -709,27 +703,6 @@ suite('Settings Transmission Unit Tests', () => {
     });
 
     /**
-     * Unit test: Nested onDemandIndexing with partial settings.
-     * Verifies that the nested structure is created correctly when only some
-     * onDemandIndexing settings are configured.
-     * **Validates: Requirements 10.2, 10.4**
-     */
-    test('onDemandIndexing partial nested settings create correct structure', () => {
-        // Only configure one nested setting
-        const configuredSettings = new Map<string, unknown>([
-            ['crossFile.onDemandIndexing.enabled', true],
-        ]);
-
-        const mockConfig = createMockConfig(configuredSettings);
-        const options = getInitializationOptions(mockConfig);
-
-        // The nested structure should exist with only the configured setting
-        assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, true);
-        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxTransitiveDepth, undefined);
-        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxQueueSize, undefined);
-    });
-
-    /**
      * Unit test: Parent object not created when no child settings configured.
      * Verifies that parent objects (crossFile, diagnostics, packages) are not
      * created when none of their child settings are configured.
@@ -861,7 +834,6 @@ suite('Settings Transmission Unit Tests', () => {
         const configuredSettings = new Map<string, unknown>([
             ['crossFile.maxBackwardDepth', 0],
             ['crossFile.revalidationDebounceMs', 0],
-            ['crossFile.onDemandIndexing.maxTransitiveDepth', 0],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
@@ -869,7 +841,6 @@ suite('Settings Transmission Unit Tests', () => {
 
         assert.strictEqual(options.crossFile?.maxBackwardDepth, 0);
         assert.strictEqual(options.crossFile?.revalidationDebounceMs, 0);
-        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxTransitiveDepth, 0);
     });
 
     /**
