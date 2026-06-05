@@ -94,6 +94,17 @@ jobs:
         with:
           toolchain: "1.96.0"
           targets: ${{ matrix.target }}
+          # Install the same components rust-toolchain.toml pins
+          # (components = ["rustfmt", "clippy"]) up front, in the same rustup
+          # pass that lays down the toolchain. Otherwise the first `cargo` call
+          # in "Build LSP" triggers a rust-toolchain.toml reconcile that tries to
+          # add rustfmt as `rustfmt-preview`, colliding with the `bin/cargo-fmt`
+          # this step already installed: "detected conflict: 'bin/cargo-fmt'".
+          # The gate workflows (integration.yml) dodge this by letting rustup do
+          # one clean install with no dtolnay step; the release build needs
+          # dtolnay for cross-compile `targets`, so it must request the
+          # components explicitly to keep the later reconcile a no-op.
+          components: rustfmt, clippy
 
       - name: Cache cargo registry & build artifacts
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
