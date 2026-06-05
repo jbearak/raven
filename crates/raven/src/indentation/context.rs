@@ -22,90 +22,6 @@ use crate::utf16::utf16_column_to_byte_offset;
 // AST Node Detection Functions
 // ============================================================================
 
-/// Checks if a node is a native pipe operator (`|>`).
-///
-/// In tree-sitter-r, the native pipe `|>` appears as a child node with
-/// kind `|>` inside a `binary_operator` parent.
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node to check
-///
-/// # Returns
-///
-/// `true` if the node is a `|>` node (native pipe operator).
-#[allow(dead_code)] // pub for property-based tests
-pub fn is_pipe_operator(node: Node) -> bool {
-    node.kind() == "|>"
-}
-
-/// Checks if a node is a special operator (`%>%`, `%in%`, `%word%`, etc.).
-///
-/// In tree-sitter-r, special operators like `%>%`, `%in%`, `%*%` appear
-/// as child nodes with kind `special` inside a `binary_operator` parent.
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node to check
-///
-/// # Returns
-///
-/// `true` if the node is a `special` node (magrittr pipe or custom infix).
-#[allow(dead_code)] // pub for property-based tests
-pub fn is_special_operator(node: Node) -> bool {
-    node.kind() == "special"
-}
-
-/// Checks if a node is a continuation binary operator (`+` or `~`).
-///
-/// These operators are commonly used for line continuation in R:
-/// - `+` is used in ggplot2 for layering
-/// - `~` is used in formulas
-///
-/// In tree-sitter-r, these appear as child nodes with kind `+` or `~`
-/// inside a `binary_operator` parent.
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node to check
-///
-/// # Returns
-///
-/// `true` if the node is a `+` or `~` operator node.
-#[allow(dead_code)] // pub for property-based tests
-pub fn is_continuation_binary_operator(node: Node, _source: &str) -> bool {
-    let kind = node.kind();
-    kind == "+" || kind == "~"
-}
-
-/// Checks if a node is a function call node.
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node to check
-///
-/// # Returns
-///
-/// `true` if the node is a `call` node.
-#[allow(dead_code)] // pub for property-based tests
-pub fn is_call_node(node: Node) -> bool {
-    node.kind() == "call"
-}
-
-/// Checks if a node is an arguments node (inside parentheses of a function call).
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node to check
-///
-/// # Returns
-///
-/// `true` if the node is an `arguments` node.
-#[allow(dead_code)] // pub for property-based tests
-pub fn is_arguments_node(node: Node) -> bool {
-    node.kind() == "arguments"
-}
-
 /// Checks if a node is a brace list node (code block inside `{}`).
 ///
 /// In tree-sitter-r, braced code blocks use `braced_expression` as the node kind.
@@ -119,59 +35,6 @@ pub fn is_arguments_node(node: Node) -> bool {
 /// `true` if the node is a `braced_expression` node.
 pub fn is_brace_list_node(node: Node) -> bool {
     node.kind() == "braced_expression"
-}
-
-/// Determines the operator type for a continuation operator node.
-///
-/// This function identifies what kind of continuation operator a node represents,
-/// which is used to determine indentation behavior.
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node to check
-/// * `source` - The source code text for extracting operator text
-///
-/// # Returns
-///
-/// `Some(OperatorType)` if the node is a recognized continuation operator,
-/// `None` otherwise.
-#[allow(dead_code)] // pub for property-based tests
-pub fn get_operator_type(node: Node, source: &str) -> Option<OperatorType> {
-    match node.kind() {
-        "|>" => Some(OperatorType::Pipe),
-        "special" => {
-            let text = node_text(node, source);
-            if text == "%>%" {
-                Some(OperatorType::MagrittrPipe)
-            } else {
-                // Any other %word% operator
-                Some(OperatorType::CustomInfix)
-            }
-        }
-        "+" => Some(OperatorType::Plus),
-        "~" => Some(OperatorType::Tilde),
-        _ => None,
-    }
-}
-
-/// Checks if a node is any kind of continuation operator.
-///
-/// Continuation operators are operators that indicate the expression continues
-/// on the next line: `|>`, `%>%`, `%word%`, `+`, `~`.
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node to check
-/// * `source` - The source code text for extracting operator text
-///
-/// # Returns
-///
-/// `true` if the node is a continuation operator.
-#[allow(dead_code)] // pub for property-based tests
-pub fn is_continuation_operator(node: Node, source: &str) -> bool {
-    is_pipe_operator(node)
-        || is_special_operator(node)
-        || is_continuation_binary_operator(node, source)
 }
 
 // ============================================================================
@@ -202,20 +65,6 @@ where
     None
 }
 
-/// Walks up the AST to find the nearest enclosing arguments node.
-///
-/// # Arguments
-///
-/// * `node` - The starting node
-///
-/// # Returns
-///
-/// The nearest `arguments` ancestor, or `None` if not inside arguments.
-#[allow(dead_code)] // pub for property-based tests
-pub fn find_enclosing_arguments(node: Node) -> Option<Node> {
-    find_parent(node, is_arguments_node)
-}
-
 /// Walks up the AST to find the nearest enclosing brace list node.
 ///
 /// # Arguments
@@ -227,132 +76,6 @@ pub fn find_enclosing_arguments(node: Node) -> Option<Node> {
 /// The nearest `brace_list` ancestor, or `None` if not inside braces.
 pub fn find_enclosing_brace_list(node: Node) -> Option<Node> {
     find_parent(node, is_brace_list_node)
-}
-
-/// Walks up the AST to find the nearest enclosing call node.
-///
-/// # Arguments
-///
-/// * `node` - The starting node
-///
-/// # Returns
-///
-/// The nearest `call` ancestor, or `None` if not inside a call.
-#[allow(dead_code)] // pub for property-based tests
-pub fn find_enclosing_call(node: Node) -> Option<Node> {
-    find_parent(node, is_call_node)
-}
-
-/// Finds the innermost relevant context node for indentation.
-///
-/// This walks up the AST and returns the first node that is relevant
-/// for indentation decisions: arguments, brace_list, or a continuation operator.
-///
-/// # Arguments
-///
-/// * `node` - The starting node
-/// * `source` - The source code text for operator detection
-///
-/// # Returns
-///
-/// The innermost relevant ancestor node, or `None` if none found.
-#[allow(dead_code)] // pub for property-based tests
-pub fn find_innermost_context_node<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
-    let mut current = node;
-    loop {
-        // Check if current node is a relevant context
-        if is_arguments_node(current)
-            || is_brace_list_node(current)
-            || is_continuation_operator(current, source)
-        {
-            return Some(current);
-        }
-
-        // Move to parent
-        current = current.parent()?;
-    }
-}
-
-/// Finds the matching opening delimiter for a closing delimiter.
-///
-/// Walks up the AST from the given node to find the matching opening
-/// delimiter (`(`, `[`, or `{`) for a closing delimiter (`)`, `]`, or `}`).
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node at or near the closing delimiter
-/// * `delimiter` - The closing delimiter character (`)`, `]`, or `}`)
-///
-/// # Returns
-///
-/// `Some(Node)` containing the AST node for the matching opening structure,
-/// or `None` if no matching opener is found (unclosed delimiter).
-///
-/// # Example
-///
-/// ```ignore
-/// // For code: "func(x, y)"
-/// // If node is at the closing ')', this returns the 'arguments' node
-/// // which starts at the opening '('
-/// ```
-#[allow(dead_code)] // pub for property-based tests
-pub fn find_matching_opener<'a>(node: Node<'a>, delimiter: char) -> Option<Node<'a>> {
-    let target_kind = match delimiter {
-        ')' => "arguments",
-        ']' => "subset", // or "subset2" for [[]]
-        '}' => "braced_expression",
-        _ => return None,
-    };
-
-    // Walk up to find the enclosing structure
-    let mut current = node;
-    loop {
-        if current.kind() == target_kind
-            || (delimiter == ']' && current.kind() == "subset2")
-            || (delimiter == ')' && current.kind() == "call")
-        {
-            // For call nodes, return the arguments child if it exists
-            if current.kind() == "call" {
-                for i in 0..current.child_count() {
-                    if let Some(child) = current.child(i as u32)
-                        && child.kind() == "arguments"
-                    {
-                        return Some(child);
-                    }
-                }
-            }
-
-            return Some(current);
-        }
-
-        current = current.parent()?;
-    }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Extracts the text content of a tree-sitter node.
-///
-/// # Arguments
-///
-/// * `node` - The tree-sitter node
-/// * `source` - The source code text
-///
-/// # Returns
-///
-/// The substring of source corresponding to the node's byte range.
-#[allow(dead_code)] // used in tests and by test-only pub fns
-fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
-    source.get(node.byte_range()).unwrap_or_else(|| {
-        log::warn!(
-            "node_text: byte range {:?} out of bounds for source len {}",
-            node.byte_range(),
-            source.len()
-        );
-        ""
-    })
 }
 
 // ============================================================================
@@ -1363,7 +1086,7 @@ fn detect_continuation_operator(
     // Try AST-based chain start detection first, fall back to text-based heuristic
     let (chain_start_line, chain_start_col) = find_chain_start_from_ast(tree, source, prev_line)
         .unwrap_or_else(|| {
-            let walker = ChainWalker::new(tree, source, tab_size);
+            let walker = ChainWalker::new(source, tab_size);
             walker.find_chain_start(position)
         });
 
@@ -1616,9 +1339,6 @@ fn get_enclosing_block_indent(tree: &Tree, source: &str, position: Position, tab
 ///
 /// When cursor is on line 2, chain start should be line 0, column 0 (start of "result").
 pub struct ChainWalker<'a> {
-    /// The tree-sitter parse tree (currently unused but available for future AST-based detection)
-    #[allow(dead_code)]
-    tree: &'a Tree,
     /// The source code text
     source: &'a str,
     /// Tab size for visual column calculation
@@ -1630,15 +1350,10 @@ impl<'a> ChainWalker<'a> {
     ///
     /// # Arguments
     ///
-    /// * `tree` - The tree-sitter parse tree
     /// * `source` - The source code text
     /// * `tab_size` - Tab size for visual column calculation
-    pub fn new(tree: &'a Tree, source: &'a str, tab_size: u32) -> Self {
-        Self {
-            tree,
-            source,
-            tab_size,
-        }
+    pub fn new(source: &'a str, tab_size: u32) -> Self {
+        Self { source, tab_size }
     }
 
     /// Finds the chain start by walking backward through operator-terminated lines.
@@ -1833,6 +1548,21 @@ fn strip_trailing_comment(line: &str) -> &str {
     }
 
     line
+}
+
+/// Extracts the text content of a tree-sitter node.
+///
+/// Test-only helper for locating nodes by their source text.
+#[cfg(test)]
+fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
+    source.get(node.byte_range()).unwrap_or_else(|| {
+        log::warn!(
+            "node_text: byte range {:?} out of bounds for source len {}",
+            node.byte_range(),
+            source.len()
+        );
+        ""
+    })
 }
 
 #[cfg(test)]
@@ -2327,11 +2057,6 @@ mod tests {
         })
     }
 
-    /// Generate a valid custom infix operator name (letters only, no reserved)
-    fn custom_infix_name() -> impl Strategy<Value = String> {
-        "[a-zA-Z]{2,6}"
-    }
-
     /// Enum representing continuation operator types for chain generation
     #[derive(Debug, Clone, Copy)]
     enum ChainOperator {
@@ -2400,386 +2125,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Enum representing the type of R code structure to generate
-    #[derive(Debug, Clone)]
-    enum RCodeStructure {
-        NativePipe,
-        MagrittrPipe,
-        PlusOperator,
-        TildeOperator,
-        CustomInfix(String),
-        FunctionCall,
-        BraceBlock,
-    }
-
-    /// Strategy to generate different R code structures
-    fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
-        prop_oneof![
-            Just(RCodeStructure::NativePipe),
-            Just(RCodeStructure::MagrittrPipe),
-            Just(RCodeStructure::PlusOperator),
-            Just(RCodeStructure::TildeOperator),
-            custom_infix_name().prop_map(RCodeStructure::CustomInfix),
-            Just(RCodeStructure::FunctionCall),
-            Just(RCodeStructure::BraceBlock),
-        ]
-    }
-
-    /// Generate R code containing the specified structure
-    fn generate_r_code(structure: &RCodeStructure, left_id: &str, right_id: &str) -> String {
-        match structure {
-            RCodeStructure::NativePipe => format!("{} |> {}()", left_id, right_id),
-            RCodeStructure::MagrittrPipe => format!("{} %>% {}()", left_id, right_id),
-            RCodeStructure::PlusOperator => format!("{} + {}", left_id, right_id),
-            RCodeStructure::TildeOperator => format!("{} ~ {}", left_id, right_id),
-            RCodeStructure::CustomInfix(name) => format!("{} %{}% {}", left_id, name, right_id),
-            RCodeStructure::FunctionCall => format!("{}({}, {})", left_id, right_id, right_id),
-            RCodeStructure::BraceBlock => format!("{{ {} <- {} }}", left_id, right_id),
-        }
-    }
-
-    /// Expected node kind for each structure type
-    fn expected_node_kind(structure: &RCodeStructure) -> &'static str {
-        match structure {
-            RCodeStructure::NativePipe => "|>",
-            RCodeStructure::MagrittrPipe => "special",
-            RCodeStructure::PlusOperator => "+",
-            RCodeStructure::TildeOperator => "~",
-            RCodeStructure::CustomInfix(_) => "special",
-            RCodeStructure::FunctionCall => "call",
-            RCodeStructure::BraceBlock => "braced_expression",
-        }
-    }
-
-    /// Check if the expected node kind is found in the AST
-    fn find_expected_node<'a>(
-        nodes: &[Node<'a>],
-        structure: &RCodeStructure,
-        source: &str,
-    ) -> bool {
-        let expected_kind = expected_node_kind(structure);
-
-        for node in nodes {
-            if node.kind() == expected_kind {
-                // For special operators, verify the text matches
-                if let RCodeStructure::MagrittrPipe = structure {
-                    if node_text(*node, source) == "%>%" {
-                        return true;
-                    }
-                } else if let RCodeStructure::CustomInfix(name) = structure {
-                    let text = node_text(*node, source);
-                    if text == format!("%{}%", name) {
-                        return true;
-                    }
-                } else {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Verify the detection function returns correct result for the structure
-    fn verify_detection_function(node: Node, structure: &RCodeStructure, source: &str) -> bool {
-        match structure {
-            RCodeStructure::NativePipe => {
-                if node.kind() == "|>" {
-                    return is_pipe_operator(node);
-                }
-            }
-            RCodeStructure::MagrittrPipe => {
-                if node.kind() == "special" && node_text(node, source) == "%>%" {
-                    return is_special_operator(node);
-                }
-            }
-            RCodeStructure::PlusOperator => {
-                if node.kind() == "+" {
-                    return is_continuation_binary_operator(node, source);
-                }
-            }
-            RCodeStructure::TildeOperator => {
-                if node.kind() == "~" {
-                    return is_continuation_binary_operator(node, source);
-                }
-            }
-            RCodeStructure::CustomInfix(name) => {
-                if node.kind() == "special" && node_text(node, source) == format!("%{}%", name) {
-                    return is_special_operator(node);
-                }
-            }
-            RCodeStructure::FunctionCall => {
-                if node.kind() == "call" {
-                    return is_call_node(node);
-                }
-            }
-            RCodeStructure::BraceBlock => {
-                if node.kind() == "braced_expression" {
-                    return is_brace_list_node(node);
-                }
-            }
-        }
-        // Node doesn't match the structure we're looking for
-        false
-    }
-
-    // ========================================================================
-    // Property 15: AST Node Detection
-    // Feature: r-smart-indentation, Property 15: AST Node Detection
-    // Validates: Requirements 9.1, 9.2, 9.3, 9.4, 9.5
-    // ========================================================================
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
-
-        /// Property 15: For any R code containing continuation operators (`|>`, `%>%`,
-        /// `+`, `~`, `%word%`), function calls, or brace blocks, the context detector
-        /// should correctly identify the corresponding tree-sitter nodes.
-        ///
-        /// **Validates: Requirements 9.1, 9.2, 9.3, 9.4, 9.5**
-        #[test]
-        fn property_ast_node_detection(
-            structure in r_code_structure(),
-            left_id in r_identifier(),
-            right_id in r_identifier(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            // Generate R code with the specified structure
-            let code = generate_r_code(&structure, &left_id, &right_id);
-
-            // Parse with tree-sitter
-            let tree = parse_r_code(&code);
-
-            // Collect all nodes
-            let nodes = collect_all_nodes(tree.root_node());
-
-            // Verify the expected node type is found in the AST
-            prop_assert!(
-                find_expected_node(&nodes, &structure, &code),
-                "Expected node kind '{}' not found in AST for code: {}",
-                expected_node_kind(&structure),
-                code
-            );
-
-            // Verify the detection function correctly identifies the node
-            let mut detection_verified = false;
-            for node in &nodes {
-                if verify_detection_function(*node, &structure, &code) {
-                    detection_verified = true;
-                    break;
-                }
-            }
-            prop_assert!(
-                detection_verified,
-                "Detection function failed for structure {:?} in code: {}",
-                structure,
-                code
-            );
-        }
-
-        /// Property 15 extended: Native pipe operator detection
-        /// Validates: Requirement 9.1
-        #[test]
-        fn property_native_pipe_detection(
-            left_id in r_identifier(),
-            right_id in r_identifier(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            let code = format!("{} |> {}()", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-
-            // Find the |> node
-            let pipe_node = nodes.iter().find(|n| n.kind() == "|>");
-            prop_assert!(pipe_node.is_some(), "Should find |> node in: {}", code);
-
-            // Verify is_pipe_operator returns true
-            prop_assert!(
-                is_pipe_operator(*pipe_node.unwrap()),
-                "is_pipe_operator should return true for |> node"
-            );
-
-            // Verify get_operator_type returns Pipe
-            prop_assert_eq!(
-                get_operator_type(*pipe_node.unwrap(), &code),
-                Some(OperatorType::Pipe),
-                "get_operator_type should return Pipe for |> node"
-            );
-        }
-
-        /// Property 15 extended: Magrittr pipe operator detection
-        /// Validates: Requirement 9.2
-        #[test]
-        fn property_magrittr_pipe_detection(
-            left_id in r_identifier(),
-            right_id in r_identifier(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            let code = format!("{} %>% {}()", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-
-            // Find the special node with %>%
-            let special_node = nodes.iter().find(|n| {
-                n.kind() == "special" && node_text(**n, &code) == "%>%"
-            });
-            prop_assert!(special_node.is_some(), "Should find %>% node in: {}", code);
-
-            // Verify is_special_operator returns true
-            prop_assert!(
-                is_special_operator(*special_node.unwrap()),
-                "is_special_operator should return true for %>% node"
-            );
-
-            // Verify get_operator_type returns MagrittrPipe
-            prop_assert_eq!(
-                get_operator_type(*special_node.unwrap(), &code),
-                Some(OperatorType::MagrittrPipe),
-                "get_operator_type should return MagrittrPipe for %>% node"
-            );
-        }
-
-        /// Property 15 extended: Custom infix operator detection
-        /// Validates: Requirement 9.2
-        #[test]
-        fn property_custom_infix_detection(
-            left_id in r_identifier(),
-            right_id in r_identifier(),
-            infix_name in custom_infix_name(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            let code = format!("{} %{}% {}", left_id, infix_name, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-
-            let expected_text = format!("%{}%", infix_name);
-
-            // Find the special node with the custom infix
-            let special_node = nodes.iter().find(|n| {
-                n.kind() == "special" && node_text(**n, &code) == expected_text
-            });
-            prop_assert!(
-                special_node.is_some(),
-                "Should find %{}% node in: {}",
-                infix_name,
-                code
-            );
-
-            // Verify is_special_operator returns true
-            prop_assert!(
-                is_special_operator(*special_node.unwrap()),
-                "is_special_operator should return true for %{}% node",
-                infix_name
-            );
-
-            // Verify get_operator_type returns CustomInfix
-            prop_assert_eq!(
-                get_operator_type(*special_node.unwrap(), &code),
-                Some(OperatorType::CustomInfix),
-                "get_operator_type should return CustomInfix for %{}% node",
-                infix_name
-            );
-        }
-
-        /// Property 15 extended: Plus operator detection
-        /// Validates: Requirement 9.3
-        #[test]
-        fn property_plus_operator_detection(
-            left_id in r_identifier(),
-            right_id in r_identifier(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            let code = format!("{} + {}", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-
-            // Find the + node
-            let plus_node = nodes.iter().find(|n| n.kind() == "+");
-            prop_assert!(plus_node.is_some(), "Should find + node in: {}", code);
-
-            // Verify is_continuation_binary_operator returns true
-            prop_assert!(
-                is_continuation_binary_operator(*plus_node.unwrap(), &code),
-                "is_continuation_binary_operator should return true for + node"
-            );
-
-            // Verify get_operator_type returns Plus
-            prop_assert_eq!(
-                get_operator_type(*plus_node.unwrap(), &code),
-                Some(OperatorType::Plus),
-                "get_operator_type should return Plus for + node"
-            );
-        }
-
-        /// Property 15 extended: Tilde operator detection
-        /// Validates: Requirement 9.3
-        #[test]
-        fn property_tilde_operator_detection(
-            left_id in r_identifier(),
-            right_id in r_identifier(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            let code = format!("{} ~ {}", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-
-            // Find the ~ node
-            let tilde_node = nodes.iter().find(|n| n.kind() == "~");
-            prop_assert!(tilde_node.is_some(), "Should find ~ node in: {}", code);
-
-            // Verify is_continuation_binary_operator returns true
-            prop_assert!(
-                is_continuation_binary_operator(*tilde_node.unwrap(), &code),
-                "is_continuation_binary_operator should return true for ~ node"
-            );
-
-            // Verify get_operator_type returns Tilde
-            prop_assert_eq!(
-                get_operator_type(*tilde_node.unwrap(), &code),
-                Some(OperatorType::Tilde),
-                "get_operator_type should return Tilde for ~ node"
-            );
-        }
-
-        /// Property 15 extended: Function call detection
-        /// Validates: Requirement 9.4
-        #[test]
-        fn property_function_call_detection(
-            func_name in r_identifier(),
-            arg1 in r_identifier(),
-            arg2 in r_identifier(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            let code = format!("{}({}, {})", func_name, arg1, arg2);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-
-            // Find the call node
-            let call_node = nodes.iter().find(|n| n.kind() == "call");
-            prop_assert!(call_node.is_some(), "Should find call node in: {}", code);
-
-            // Verify is_call_node returns true
-            prop_assert!(
-                is_call_node(*call_node.unwrap()),
-                "is_call_node should return true for call node"
-            );
-
-            // Find the arguments node
-            let args_node = nodes.iter().find(|n| n.kind() == "arguments");
-            prop_assert!(args_node.is_some(), "Should find arguments node in: {}", code);
-
-            // Verify is_arguments_node returns true
-            prop_assert!(
-                is_arguments_node(*args_node.unwrap()),
-                "is_arguments_node should return true for arguments node"
-            );
-        }
 
         /// Property 15 extended: Brace block detection
         /// Validates: Requirement 9.5
@@ -2805,48 +2152,6 @@ mod tests {
             );
         }
 
-        /// Property 15 extended: is_continuation_operator correctly identifies all types
-        /// Validates: Requirements 9.1, 9.2, 9.3
-        #[test]
-        fn property_is_continuation_operator_comprehensive(
-            left_id in r_identifier(),
-            right_id in r_identifier(),
-        ) {
-            // Feature: r-smart-indentation, Property 15: AST Node Detection
-
-            // Test native pipe
-            let code = format!("{} |> {}()", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-            let pipe_node = nodes.iter().find(|n| n.kind() == "|>");
-            prop_assert!(pipe_node.is_some());
-            prop_assert!(is_continuation_operator(*pipe_node.unwrap(), &code));
-
-            // Test magrittr pipe
-            let code = format!("{} %>% {}()", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-            let special_node = nodes.iter().find(|n| n.kind() == "special");
-            prop_assert!(special_node.is_some());
-            prop_assert!(is_continuation_operator(*special_node.unwrap(), &code));
-
-            // Test plus
-            let code = format!("{} + {}", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-            let plus_node = nodes.iter().find(|n| n.kind() == "+");
-            prop_assert!(plus_node.is_some());
-            prop_assert!(is_continuation_operator(*plus_node.unwrap(), &code));
-
-            // Test tilde
-            let code = format!("{} ~ {}", left_id, right_id);
-            let tree = parse_r_code(&code);
-            let nodes = collect_all_nodes(tree.root_node());
-            let tilde_node = nodes.iter().find(|n| n.kind() == "~");
-            prop_assert!(tilde_node.is_some());
-            prop_assert!(is_continuation_operator(*tilde_node.unwrap(), &code));
-        }
-
         // ========================================================================
         // Property 1: Chain Start Detection
         // Feature: r-smart-indentation, Property 1: Chain Start Detection
@@ -2870,8 +2175,6 @@ mod tests {
             // Generate R code with pipe chain of specified length
             let code = generate_pipe_chain(chain_length, operator, leading_spaces);
 
-            // Parse with tree-sitter
-            let tree = parse_r_code(&code);
 
             // Position cursor at the last line of the chain
             let last_line = chain_length as u32;
@@ -2881,7 +2184,7 @@ mod tests {
             };
 
             // Detect chain start using ChainWalker
-            let walker = ChainWalker::new(&tree, &code, 2);
+            let walker = ChainWalker::new(&code, 2);
             let (start_line, start_col) = walker.find_chain_start(end_position);
 
             // Verify: chain start should be line 0 (first line of chain)
@@ -2910,7 +2213,6 @@ mod tests {
             // Feature: r-smart-indentation, Property 1: Chain Start Detection
 
             let code = generate_pipe_chain(chain_length, ChainOperator::NativePipe, leading_spaces);
-            let tree = parse_r_code(&code);
 
             let last_line = chain_length as u32;
             let position = Position {
@@ -2918,7 +2220,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code, 2);
+            let walker = ChainWalker::new(&code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2935,7 +2237,6 @@ mod tests {
             // Feature: r-smart-indentation, Property 1: Chain Start Detection
 
             let code = generate_pipe_chain(chain_length, ChainOperator::MagrittrPipe, leading_spaces);
-            let tree = parse_r_code(&code);
 
             let last_line = chain_length as u32;
             let position = Position {
@@ -2943,7 +2244,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code, 2);
+            let walker = ChainWalker::new(&code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2960,7 +2261,6 @@ mod tests {
             // Feature: r-smart-indentation, Property 1: Chain Start Detection
 
             let code = generate_pipe_chain(chain_length, ChainOperator::Plus, leading_spaces);
-            let tree = parse_r_code(&code);
 
             let last_line = chain_length as u32;
             let position = Position {
@@ -2968,7 +2268,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code, 2);
+            let walker = ChainWalker::new(&code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -2985,7 +2285,6 @@ mod tests {
             // Feature: r-smart-indentation, Property 1: Chain Start Detection
 
             let code = generate_pipe_chain(chain_length, ChainOperator::Tilde, leading_spaces);
-            let tree = parse_r_code(&code);
 
             let last_line = chain_length as u32;
             let position = Position {
@@ -2993,7 +2292,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code, 2);
+            let walker = ChainWalker::new(&code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -3010,7 +2309,6 @@ mod tests {
             // Feature: r-smart-indentation, Property 1: Chain Start Detection
 
             let code = generate_pipe_chain(chain_length, ChainOperator::CustomInfix, leading_spaces);
-            let tree = parse_r_code(&code);
 
             let last_line = chain_length as u32;
             let position = Position {
@@ -3018,7 +2316,7 @@ mod tests {
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code, 2);
+            let walker = ChainWalker::new(&code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             prop_assert_eq!(start_line, 0);
@@ -3040,14 +2338,13 @@ mod tests {
             let cursor_line = (cursor_line % chain_length) + 1;
 
             let code = generate_pipe_chain(chain_length, operator, 0);
-            let tree = parse_r_code(&code);
 
             let position = Position {
                 line: cursor_line as u32,
                 character: 0,
             };
 
-            let walker = ChainWalker::new(&tree, &code, 2);
+            let walker = ChainWalker::new(&code, 2);
             let (start_line, start_col) = walker.find_chain_start(position);
 
             // Chain start should always be line 0 regardless of cursor position
@@ -3116,202 +2413,6 @@ mod tests {
     }
 
     // ========================================================================
-    // is_pipe_operator Tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_pipe_operator_native_pipe() {
-        let code = "x |> f()";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found_pipe = false;
-        for node in nodes {
-            if node.kind() == "|>" {
-                assert!(is_pipe_operator(node));
-                found_pipe = true;
-            }
-        }
-        assert!(found_pipe, "Should find a |> node");
-    }
-
-    #[test]
-    fn test_is_pipe_operator_not_pipe() {
-        let code = "x + y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        for node in nodes {
-            if node.kind() != "|>" {
-                assert!(!is_pipe_operator(node));
-            }
-        }
-    }
-
-    // ========================================================================
-    // is_special_operator Tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_special_operator_magrittr() {
-        let code = "x %>% f()";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found_special = false;
-        for node in nodes {
-            if node.kind() == "special" {
-                assert!(is_special_operator(node));
-                found_special = true;
-            }
-        }
-        assert!(found_special, "Should find a special node");
-    }
-
-    #[test]
-    fn test_is_special_operator_custom_infix() {
-        let code = "x %in% y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found_special = false;
-        for node in nodes {
-            if node.kind() == "special" {
-                assert!(is_special_operator(node));
-                found_special = true;
-            }
-        }
-        assert!(found_special, "Should find a special node for %in%");
-    }
-
-    // ========================================================================
-    // is_continuation_binary_operator Tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_continuation_binary_operator_plus() {
-        let code = "x + y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found_plus = false;
-        for node in nodes {
-            if node.kind() == "+" {
-                assert!(is_continuation_binary_operator(node, code));
-                found_plus = true;
-            }
-        }
-        assert!(found_plus, "Should find a + operator node");
-    }
-
-    #[test]
-    fn test_is_continuation_binary_operator_tilde() {
-        let code = "y ~ x";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found_tilde = false;
-        for node in nodes {
-            if node.kind() == "~" {
-                assert!(is_continuation_binary_operator(node, code));
-                found_tilde = true;
-            }
-        }
-        assert!(found_tilde, "Should find a ~ operator node");
-    }
-
-    #[test]
-    fn test_is_continuation_binary_operator_not_continuation() {
-        let code = "x <- y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        for node in nodes {
-            // Assignment operator <- is not a continuation operator
-            if node.kind() == "<-" {
-                assert!(!is_continuation_binary_operator(node, code));
-            }
-        }
-    }
-
-    #[test]
-    fn test_is_continuation_binary_operator_multiply() {
-        let code = "x * y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        for node in nodes {
-            // Multiplication operator * is not a continuation operator
-            if node.kind() == "*" {
-                assert!(!is_continuation_binary_operator(node, code));
-            }
-        }
-    }
-
-    // ========================================================================
-    // is_call_node Tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_call_node() {
-        let code = "f(x, y)";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found_call = false;
-        for node in nodes {
-            if node.kind() == "call" {
-                assert!(is_call_node(node));
-                found_call = true;
-            }
-        }
-        assert!(found_call, "Should find a call node");
-    }
-
-    #[test]
-    fn test_is_call_node_nested() {
-        let code = "f(g(x))";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let call_count = nodes.iter().filter(|n| is_call_node(**n)).count();
-        assert_eq!(call_count, 2, "Should find two call nodes");
-    }
-
-    // ========================================================================
-    // is_arguments_node Tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_arguments_node() {
-        let code = "f(x, y)";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found_args = false;
-        for node in nodes {
-            if node.kind() == "arguments" {
-                assert!(is_arguments_node(node));
-                found_args = true;
-            }
-        }
-        assert!(found_args, "Should find an arguments node");
-    }
-
-    #[test]
-    fn test_is_arguments_node_empty() {
-        let code = "f()";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let found_args = nodes.iter().any(|n| is_arguments_node(*n));
-        assert!(
-            found_args,
-            "Should find an arguments node even for empty args"
-        );
-    }
-
-    // ========================================================================
     // is_brace_list_node Tests
     // ========================================================================
 
@@ -3345,150 +2446,6 @@ mod tests {
     }
 
     // ========================================================================
-    // get_operator_type Tests
-    // ========================================================================
-
-    #[test]
-    fn test_get_operator_type_native_pipe() {
-        let code = "x |> f()";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "|>" {
-                assert_eq!(get_operator_type(node, code), Some(OperatorType::Pipe));
-                found = true;
-            }
-        }
-        assert!(found, "Should find pipe operator");
-    }
-
-    #[test]
-    fn test_get_operator_type_magrittr_pipe() {
-        let code = "x %>% f()";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "special" {
-                let text = node_text(node, code);
-                if text == "%>%" {
-                    assert_eq!(
-                        get_operator_type(node, code),
-                        Some(OperatorType::MagrittrPipe)
-                    );
-                    found = true;
-                }
-            }
-        }
-        assert!(found, "Should find magrittr pipe operator");
-    }
-
-    #[test]
-    fn test_get_operator_type_custom_infix() {
-        let code = "x %in% y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "special" {
-                let text = node_text(node, code);
-                if text == "%in%" {
-                    assert_eq!(
-                        get_operator_type(node, code),
-                        Some(OperatorType::CustomInfix)
-                    );
-                    found = true;
-                }
-            }
-        }
-        assert!(found, "Should find custom infix operator");
-    }
-
-    #[test]
-    fn test_get_operator_type_plus() {
-        let code = "x + y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "+" {
-                assert_eq!(get_operator_type(node, code), Some(OperatorType::Plus));
-                found = true;
-            }
-        }
-        assert!(found, "Should find plus operator");
-    }
-
-    #[test]
-    fn test_get_operator_type_tilde() {
-        let code = "y ~ x";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "~" {
-                assert_eq!(get_operator_type(node, code), Some(OperatorType::Tilde));
-                found = true;
-            }
-        }
-        assert!(found, "Should find tilde operator");
-    }
-
-    #[test]
-    fn test_get_operator_type_non_continuation() {
-        let code = "x <- y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        for node in nodes {
-            if node.kind() == "<-" {
-                // Assignment should return None
-                assert_eq!(get_operator_type(node, code), None);
-            }
-        }
-    }
-
-    // ========================================================================
-    // is_continuation_operator Tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_continuation_operator_all_types() {
-        // Test native pipe
-        let code = "x |> f()";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-        let found = nodes
-            .iter()
-            .any(|n| n.kind() == "|>" && is_continuation_operator(*n, code));
-        assert!(found, "Should find native pipe as continuation operator");
-
-        // Test magrittr pipe
-        let code = "x %>% f()";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-        let found = nodes
-            .iter()
-            .any(|n| n.kind() == "special" && is_continuation_operator(*n, code));
-        assert!(found, "Should find magrittr pipe as continuation operator");
-
-        // Test plus
-        let code = "x + y";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-        let found = nodes
-            .iter()
-            .any(|n| n.kind() == "+" && is_continuation_operator(*n, code));
-        assert!(found, "Should find plus as continuation operator");
-    }
-
-    // ========================================================================
     // find_parent Tests
     // ========================================================================
 
@@ -3503,7 +2460,7 @@ mod tests {
             if node.kind() == "identifier" {
                 let text = node_text(node, code);
                 if text == "x" || text == "y" {
-                    let args = find_parent(node, is_arguments_node);
+                    let args = find_parent(node, |n| n.kind() == "arguments");
                     assert!(args.is_some(), "Should find arguments parent");
                     found_test = true;
                 }
@@ -3520,7 +2477,7 @@ mod tests {
 
         for node in nodes {
             if node.kind() == "identifier" {
-                let args = find_parent(node, is_arguments_node);
+                let args = find_parent(node, |n| n.kind() == "arguments");
                 assert!(args.is_none(), "Should not find arguments parent");
             }
         }
@@ -3529,23 +2486,6 @@ mod tests {
     // ========================================================================
     // find_enclosing_* Tests
     // ========================================================================
-
-    #[test]
-    fn test_find_enclosing_arguments() {
-        let code = "f(x, y)";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "identifier" && node_text(node, code) == "x" {
-                let args = find_enclosing_arguments(node);
-                assert!(args.is_some());
-                found = true;
-            }
-        }
-        assert!(found);
-    }
 
     #[test]
     fn test_find_enclosing_brace_list() {
@@ -3564,206 +2504,6 @@ mod tests {
         assert!(found);
     }
 
-    #[test]
-    fn test_find_enclosing_call() {
-        let code = "f(x)";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "identifier" && node_text(node, code) == "x" {
-                let call = find_enclosing_call(node);
-                assert!(call.is_some());
-                found = true;
-            }
-        }
-        assert!(found);
-    }
-
-    // ========================================================================
-    // find_matching_opener Tests (Task 5.7)
-    // ========================================================================
-
-    #[test]
-    fn test_find_matching_opener_paren() {
-        let code = "func(x, y)";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        // Find the closing paren node (or a node near it)
-        let mut found = false;
-        for node in &nodes {
-            if node.kind() == "identifier" && node_text(*node, code) == "y" {
-                // From inside the arguments, find the matching opener for ')'
-                let opener = find_matching_opener(*node, ')');
-                assert!(opener.is_some(), "Should find matching opener for )");
-                let opener = opener.unwrap();
-                assert_eq!(opener.kind(), "arguments");
-                found = true;
-            }
-        }
-        assert!(found, "Should have found the test node");
-    }
-
-    #[test]
-    fn test_find_matching_opener_brace() {
-        let code = "{ x <- 1 }";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        // Find a node inside the braces
-        let mut found = false;
-        for node in &nodes {
-            if node.kind() == "identifier" && node_text(*node, code) == "x" {
-                let opener = find_matching_opener(*node, '}');
-                assert!(opener.is_some(), "Should find matching opener for }}");
-                let opener = opener.unwrap();
-                assert_eq!(opener.kind(), "braced_expression");
-                found = true;
-            }
-        }
-        assert!(found, "Should have found the test node");
-    }
-
-    #[test]
-    fn test_find_matching_opener_bracket() {
-        let code = "x[1, 2]";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        // Find a node inside the brackets
-        let mut found = false;
-        for node in &nodes {
-            if node.kind() == "float" || (node.kind() == "integer" && node_text(*node, code) == "1")
-            {
-                let opener = find_matching_opener(*node, ']');
-                assert!(opener.is_some(), "Should find matching opener for ]");
-                let opener = opener.unwrap();
-                assert!(
-                    opener.kind() == "subset" || opener.kind() == "subset2",
-                    "Expected subset or subset2, got {}",
-                    opener.kind()
-                );
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "Should have found the test node");
-    }
-
-    #[test]
-    fn test_find_matching_opener_not_found() {
-        let code = "x <- 1";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        // Try to find opener from a node not inside any delimiters
-        for node in &nodes {
-            if node.kind() == "identifier" && node_text(*node, code) == "x" {
-                let opener = find_matching_opener(*node, ')');
-                assert!(
-                    opener.is_none(),
-                    "Should not find opener when not inside parens"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_find_matching_opener_invalid_delimiter() {
-        let code = "func(x)";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        // Try with an invalid delimiter character
-        for node in &nodes {
-            if node.kind() == "identifier" && node_text(*node, code) == "x" {
-                let opener = find_matching_opener(*node, '@');
-                assert!(opener.is_none(), "Should return None for invalid delimiter");
-            }
-        }
-    }
-
-    #[test]
-    fn test_find_matching_opener_nested() {
-        let code = "outer(inner(x))";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        // From innermost x, should find the inner arguments first
-        let mut found = false;
-        for node in &nodes {
-            if node.kind() == "identifier" && node_text(*node, code) == "x" {
-                let opener = find_matching_opener(*node, ')');
-                assert!(opener.is_some(), "Should find matching opener");
-                // The innermost arguments node should be found
-                found = true;
-            }
-        }
-        assert!(found, "Should have found the test node");
-    }
-
-    // ========================================================================
-    // find_innermost_context_node Tests
-    // ========================================================================
-
-    #[test]
-    fn test_find_innermost_context_node_arguments() {
-        let code = "f(x, y)";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "identifier" && node_text(node, code) == "x" {
-                let ctx = find_innermost_context_node(node, code);
-                assert!(ctx.is_some());
-                assert!(is_arguments_node(ctx.unwrap()));
-                found = true;
-            }
-        }
-        assert!(found);
-    }
-
-    #[test]
-    fn test_find_innermost_context_node_braces() {
-        let code = "{ x <- 1 }";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "identifier" && node_text(node, code) == "x" {
-                let ctx = find_innermost_context_node(node, code);
-                assert!(ctx.is_some());
-                assert!(is_brace_list_node(ctx.unwrap()));
-                found = true;
-            }
-        }
-        assert!(found);
-    }
-
-    #[test]
-    fn test_find_innermost_context_nested() {
-        // Arguments inside braces - should find arguments first
-        let code = "{ f(x) }";
-        let tree = parse_r_code(code);
-        let nodes = collect_all_nodes(tree.root_node());
-
-        let mut found = false;
-        for node in nodes {
-            if node.kind() == "identifier" && node_text(node, code) == "x" {
-                let ctx = find_innermost_context_node(node, code);
-                assert!(ctx.is_some());
-                // Should find arguments (innermost) not brace_list
-                assert!(is_arguments_node(ctx.unwrap()));
-                found = true;
-            }
-        }
-        assert!(found);
-    }
-
     // ========================================================================
     // ChainWalker Tests
     // ========================================================================
@@ -3771,8 +2511,7 @@ mod tests {
     #[test]
     fn test_chain_walker_simple_pipe() {
         let code = "result <- data %>%\n  filter(x > 0) %>%\n  select(y)";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         // Cursor on line 2 (select line)
         let position = Position {
@@ -3789,8 +2528,7 @@ mod tests {
     #[test]
     fn test_chain_walker_native_pipe() {
         let code = "data |>\n  filter(x) |>\n  select(y)";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 2,
@@ -3805,8 +2543,7 @@ mod tests {
     #[test]
     fn test_chain_walker_plus_operator() {
         let code = "ggplot(data) +\n  geom_point() +\n  theme_minimal()";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 2,
@@ -3821,8 +2558,7 @@ mod tests {
     #[test]
     fn test_chain_walker_tilde_operator() {
         let code = "y ~\n  x1 +\n  x2";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 2,
@@ -3837,8 +2573,7 @@ mod tests {
     #[test]
     fn test_chain_walker_custom_infix() {
         let code = "x %myop%\n  y %myop%\n  z";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 2,
@@ -3853,8 +2588,7 @@ mod tests {
     #[test]
     fn test_chain_walker_with_comments() {
         let code = "data %>%  # comment\n  filter(x) %>%  # another comment\n  select(y)";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 2,
@@ -3869,8 +2603,7 @@ mod tests {
     #[test]
     fn test_chain_walker_indented_start() {
         let code = "  result <- data %>%\n    filter(x) %>%\n    select(y)";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 2,
@@ -3885,8 +2618,7 @@ mod tests {
     #[test]
     fn test_chain_walker_no_chain() {
         let code = "x <- 1\ny <- 2\nz <- 3";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         // Cursor on line 2
         let position = Position {
@@ -3903,8 +2635,7 @@ mod tests {
     #[test]
     fn test_chain_walker_single_line() {
         let code = "data %>% filter(x)";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 0,
@@ -3920,8 +2651,7 @@ mod tests {
     #[test]
     fn test_chain_walker_middle_of_chain() {
         let code = "data %>%\n  step1() %>%\n  step2() %>%\n  step3()";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         // Cursor on line 1 (step1 line)
         let position = Position {
@@ -3939,8 +2669,7 @@ mod tests {
     fn test_chain_walker_in_percent() {
         // Test %in% operator
         let code = "x %in%\n  y";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 1,
@@ -3956,8 +2685,7 @@ mod tests {
     fn test_chain_walker_mixed_operators() {
         // Mix of different continuation operators
         let code = "data %>%\n  filter(x) |>\n  mutate(y = y + 1)";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 2);
+        let walker = ChainWalker::new(code, 2);
 
         let position = Position {
             line: 2,
@@ -3973,8 +2701,7 @@ mod tests {
     fn test_chain_walker_tab_indented() {
         // Tab-indented chain start should report visual column, not char count
         let code = "\tresult <- data %>%\n\t\tfilter(x)";
-        let tree = parse_r_code(code);
-        let walker = ChainWalker::new(&tree, code, 4);
+        let walker = ChainWalker::new(code, 4);
 
         let position = Position {
             line: 1,

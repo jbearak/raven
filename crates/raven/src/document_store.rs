@@ -262,12 +262,6 @@ impl UpdateTracker {
     fn is_in_flight(&self) -> bool {
         self.in_flight.load(Ordering::Acquire)
     }
-
-    /// Wait for the next update to complete (revision to change)
-    async fn wait_for_next(&mut self) {
-        // Wait for the revision to change
-        let _ = self.receiver.changed().await;
-    }
 }
 
 /// Store for open documents with LRU eviction
@@ -769,55 +763,6 @@ impl DocumentStore {
     // ========================================================================
     // Private Methods
     // ========================================================================
-
-    /// Evict documents if needed to stay within limits
-    ///
-    /// Evicts least-recently-accessed documents until:
-    /// - Document count is below max_documents
-    /// - Memory usage is below max_memory_bytes
-    ///
-    /// **Validates: Requirements 2.1, 2.2, 2.3**
-    #[allow(dead_code)]
-    fn evict_if_needed(&mut self, incoming_bytes: usize) {
-        // Check document count limit
-        while self.documents.len() >= self.config.max_documents {
-            if !self.evict_lru() {
-                break;
-            }
-        }
-
-        // Check memory limit
-        let mut current_memory = self.estimate_memory_usage();
-        while current_memory + incoming_bytes > self.config.max_memory_bytes {
-            if !self.evict_lru() {
-                break;
-            }
-            current_memory = self.estimate_memory_usage();
-        }
-    }
-
-    /// Evict the least recently used unpinned document
-    ///
-    /// # Returns
-    /// true if a document was evicted, false if no eligible (unpinned) documents
-    fn evict_lru(&mut self) -> bool {
-        let uri_to_evict = self
-            .access_order
-            .iter()
-            .find(|uri| !self.pinned_uris.contains(*uri))
-            .cloned();
-
-        if let Some(uri) = uri_to_evict {
-            log::trace!("Evicting LRU document: {}", uri);
-            self.documents.remove(&uri);
-            self.access_order.shift_remove(&uri);
-            self.update_trackers.remove(&uri);
-            self.metrics.evictions += 1;
-            true
-        } else {
-            false
-        }
-    }
 
     /// Evict the least recently used document, excluding a specific URI and
     /// any URI in the pinned set.

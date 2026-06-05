@@ -1393,87 +1393,6 @@ impl PackageLibrary {
         self.get_cached_package(name).await
     }
 
-    /// Load package exports and depends from filesystem (NAMESPACE/DESCRIPTION files)
-    ///
-    /// This is the fallback when R subprocess is unavailable.
-    /// Searches lib_paths for the package directory and parses NAMESPACE/DESCRIPTION files.
-    ///
-    /// Requirement 3.2: IF R subprocess is unavailable, THE Package_Resolver SHALL fall back
-    /// to parsing the package's NAMESPACE file directly
-    fn load_package_from_filesystem(&self, name: &str) -> (Vec<String>, Vec<String>) {
-        // Find the package directory in lib_paths
-        let package_dir = self.find_package_directory(name);
-
-        match package_dir {
-            Some(dir) => {
-                log::trace!("Found package '{}' at {:?}", name, dir);
-
-                // Parse NAMESPACE file for exports
-                let namespace_path = dir.join("NAMESPACE");
-                let exports = if namespace_path.exists() {
-                    match crate::namespace_parser::parse_namespace_exports(&namespace_path) {
-                        Ok(exports) => {
-                            // Filter out pattern markers - we can't expand patterns without R
-                            let filtered: Vec<String> = exports
-                                .into_iter()
-                                .filter(|e| !e.starts_with("__PATTERN__:"))
-                                .collect();
-                            log::trace!(
-                                "Parsed {} exports from NAMESPACE for package '{}'",
-                                filtered.len(),
-                                name
-                            );
-                            filtered
-                        }
-                        Err(e) => {
-                            log::trace!("Failed to parse NAMESPACE for package '{}': {}", name, e);
-                            Vec::new()
-                        }
-                    }
-                } else {
-                    log::trace!("No NAMESPACE file found for package '{}'", name);
-                    Vec::new()
-                };
-
-                // Parse DESCRIPTION file for depends
-                let description_path = dir.join("DESCRIPTION");
-                let depends = if description_path.exists() {
-                    match crate::namespace_parser::parse_description_depends(&description_path) {
-                        Ok(depends) => {
-                            log::trace!(
-                                "Parsed {} depends from DESCRIPTION for package '{}'",
-                                depends.len(),
-                                name
-                            );
-                            depends
-                        }
-                        Err(e) => {
-                            log::trace!(
-                                "Failed to parse DESCRIPTION for package '{}': {}",
-                                name,
-                                e
-                            );
-                            Vec::new()
-                        }
-                    }
-                } else {
-                    log::trace!("No DESCRIPTION file found for package '{}'", name);
-                    Vec::new()
-                };
-
-                (exports, depends)
-            }
-            None => {
-                log::trace!(
-                    "Package '{}' not found in any library path: {:?}",
-                    name,
-                    self.lib_paths
-                );
-                (Vec::new(), Vec::new())
-            }
-        }
-    }
-
     /// Find the package directory in lib_paths
     ///
     /// Searches each library path for a directory with the package name
@@ -3170,27 +3089,6 @@ mod tests {
 
         let result = lib.find_package_directory("__nonexistent_package_xyz__");
         assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_load_package_from_filesystem() {
-        // Test the filesystem fallback loading
-        // Skip if R is not available (we need lib_paths)
-        let r_subprocess = match RSubprocess::new(None) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let lib = PackageLibrary::new(Some(r_subprocess)).await;
-
-        // Load stats package from filesystem (it has a standard NAMESPACE)
-        let (exports, _depends) = lib.load_package_from_filesystem("stats");
-
-        // stats package should have exports from NAMESPACE
-        assert!(
-            !exports.is_empty(),
-            "stats should have exports from NAMESPACE"
-        );
     }
 
     // ============================================================================

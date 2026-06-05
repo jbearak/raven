@@ -1497,19 +1497,6 @@ fn normalize_path_separators(path: &str) -> String {
     path.replace("\\\\", "/").replace('\\', "/")
 }
 
-/// Check if a resolved path is within the workspace boundary
-///
-/// # Arguments
-/// * `resolved_path` - The resolved absolute path
-/// * `workspace_root` - The workspace root path
-///
-/// # Returns
-/// true if the path is within the workspace, false otherwise
-#[allow(dead_code)] // Reserved for future use in workspace boundary validation
-fn is_within_workspace(resolved_path: &Path, workspace_root: &Path) -> bool {
-    resolved_path.starts_with(workspace_root)
-}
-
 // ============================================================================
 // Regex Patterns for Directive Detection
 // ============================================================================
@@ -3169,20 +3156,6 @@ mod tests {
                 Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) => Some(&edit.new_text),
                 _ => None,
             }
-        }
-
-        /// Helper to create a completion item with a directory prefix for property tests
-        #[allow(dead_code)] // Reserved for future tests that need directory prefixes
-        fn create_test_completion_item_with_prefix(
-            name: &str,
-            is_directory: bool,
-            dir_prefix: &str,
-        ) -> CompletionItem {
-            let default_pos = Position {
-                line: 0,
-                character: 0,
-            };
-            create_path_completion_item(name, is_directory, dir_prefix, default_pos, default_pos)
         }
 
         // ====================================================================

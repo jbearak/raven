@@ -8566,39 +8566,6 @@ fn linear_scan_containing(
         .collect()
 }
 
-/// Selects the innermost interval that contains the given position using a linear scan.
-///
-/// Intervals are tuples (start_line, start_col, end_line, end_col) and are treated as
-/// inclusive: start <= position <= end. If multiple intervals share the same maximum
-/// start position, one of them (the last encountered in iteration order) is returned.
-/// Returns `None` if no interval contains the position.
-///
-/// # Examples
-///
-/// ```
-/// let scopes = vec![(1, 0, 3, 0), (2, 0, 2, 5)]; // second interval is nested inside the first
-/// let found = crate::linear_scan_innermost(&scopes, 2, 1).unwrap();
-/// assert_eq!(found, (2, 0, 2, 5));
-/// ```
-#[allow(dead_code)]
-fn linear_scan_innermost(
-    scopes: &[(u32, u32, u32, u32)],
-    line: u32,
-    column: u32,
-) -> Option<(u32, u32, u32, u32)> {
-    scopes
-        .iter()
-        .filter(|(sl, sc, el, ec)| {
-            // Only include valid intervals (start <= end)
-            (*sl, *sc) <= (*el, *ec)
-                // Check containment: start <= point <= end
-                && (*sl, *sc) <= (line, column)
-                && (line, column) <= (*el, *ec)
-        })
-        .max_by_key(|(sl, sc, _, _)| (*sl, *sc))
-        .copied()
-}
-
 /// Finds the start position (line, column) of the containing interval with the greatest start.
 ///
 /// Scans `scopes` for intervals that contain the point `(line, column)` and returns the start
@@ -9200,7 +9167,6 @@ fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
                 let library_packages = prop::collection::vec(pkg_name(), num_library_calls);
 
                 (
-                    Just(num_statements),
                     Just(include_function),
                     Just(include_library),
                     statements,
@@ -9212,7 +9178,6 @@ fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
         )
         .prop_map(
             |(
-                num_statements,
                 include_function,
                 include_library,
                 statements,
@@ -9221,7 +9186,6 @@ fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
                 library_packages,
             )| {
                 RCodeStructure {
-                    num_statements,
                     include_function,
                     include_library,
                     statements,
@@ -9236,7 +9200,6 @@ fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
 /// Structure representing generated R code for testing
 #[derive(Debug, Clone)]
 struct RCodeStructure {
-    num_statements: usize,
     include_function: bool,
     include_library: bool,
     statements: Vec<String>,
@@ -16718,17 +16681,6 @@ proptest! {
 // Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9
 // ============================================================================
 
-/// Generate a valid path that may contain spaces (for quoted paths)
-fn path_with_optional_spaces() -> impl Strategy<Value = String> {
-    prop_oneof![
-        // Simple path without spaces
-        relative_path(),
-        // Path with spaces (requires quoting)
-        (path_component(), path_component())
-            .prop_map(|(dir, file)| { format!("{} folder/{}.R", dir, file) }),
-    ]
-}
-
 /// Generate a forward directive synonym
 fn forward_directive_synonym() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just("lsp-source"), Just("lsp-run"), Just("lsp-include"),]
@@ -21025,21 +20977,6 @@ proptest! {
 // Feature: lsp-source-directive
 // Validates: Requirements 7.1, 7.2, 7.3
 // ============================================================================
-
-/// Enum representing the type of directive change operation
-#[derive(Debug, Clone)]
-enum DirectiveChangeOp {
-    /// Add a new forward directive
-    Add { target: String, line: u32 },
-    /// Remove an existing forward directive
-    Remove { target: String },
-    /// Modify an existing forward directive's target
-    Modify {
-        old_target: String,
-        new_target: String,
-        line: u32,
-    },
-}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
