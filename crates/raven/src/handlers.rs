@@ -13127,13 +13127,18 @@ fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
     let meta = crate::namespace_parser::parse_description_metadata(&pkg_dir.join("DESCRIPTION"))
         .unwrap_or_default();
 
+    // `pkg` is a validated package name (`[A-Za-z][A-Za-z0-9.]*`, no Markdown
+    // metacharacters), so the `**{pkg}**` heading is safe unescaped. The Title
+    // and Description are free DESCRIPTION prose rendered *outside* a code fence,
+    // so they must be escaped or `_`, backticks, `*`, `[...]`, `<doi:…>` etc.
+    // would italicize, open stray code spans, or form broken links.
     let mut value = match meta.title {
-        Some(title) => format!("**{}** — {}", pkg, title),
+        Some(title) => format!("**{}** — {}", pkg, escape_markdown(&title)),
         None => format!("**{}**", pkg),
     };
     if let Some(description) = meta.description {
         value.push_str("\n\n");
-        value.push_str(&description);
+        value.push_str(&escape_markdown(&description));
     }
     value
 }
@@ -15911,11 +15916,11 @@ fn compute_relative_path(target_uri: &Url, workspace_root: Option<&Url>) -> Stri
     }
 }
 
-// Note: escape_markdown is only used in tests now.
-// Code blocks (```r ... ```) don't need escaping - markdown doesn't interpret special chars inside them.
-#[cfg(test)]
-/// Escape markdown special characters in text.
-/// Characters to escape: * _ [ ] ( ) # ` \
+/// Escape Markdown special characters (`* _ [ ] ( ) # ` \`) so free text renders
+/// literally instead of being interpreted. Used for prose rendered *outside* a
+/// code fence — e.g. a package's DESCRIPTION Title/Description in hover
+/// ([`package_metadata_hover`]). Code blocks (```r … ```) don't need this, since
+/// Markdown doesn't interpret their contents.
 fn escape_markdown(text: &str) -> String {
     text.chars()
         .map(|c| match c {
@@ -38433,6 +38438,60 @@ result <- my_func(1, 2)"#;
             hover_blocking(&state, &uri, position).expect("package-side hover even when missing");
         if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
             assert_eq!(value, "Package `nosuchpkg` is not installed.");
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_namespace_package_side_escapes_markdown() {
+        // DESCRIPTION Title/Description are free prose rendered outside a code
+        // fence, so Markdown metacharacters must be escaped or they distort the
+        // hover (stray italics from `_`, code spans from backticks, broken links
+        // from `[...]`).
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let pkg_dir = tmp.path().join("mdpkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("NAMESPACE"), "export(foo)\n").unwrap();
+        fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: mdpkg\nTitle: Tools for _tidy_ data\nDescription: Uses `backticks` and [refs].\n",
+        )
+        .unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "mdpkg::foo()";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let position = Position::new(0, 2);
+        let hover = hover_blocking(&state, &uri, position).expect("package-side hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            // Metacharacters in the prose are backslash-escaped; the text is intact.
+            assert!(value.contains("Tools for"), "title text missing: {value}");
+            assert!(
+                value.contains(r"\_tidy\_"),
+                "underscores in the title must be escaped: {value}"
+            );
+            assert!(
+                value.contains(r"\`backticks\`"),
+                "backticks in the description must be escaped: {value}"
+            );
+            assert!(
+                value.contains(r"\[refs\]"),
+                "brackets in the description must be escaped: {value}"
+            );
+            // The package-name heading stays bold (validated identifier, no metachars).
+            assert!(value.contains("**mdpkg**"), "pkg heading missing: {value}");
         } else {
             panic!("expected markup content");
         }
