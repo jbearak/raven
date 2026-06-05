@@ -65,7 +65,6 @@ pub trait ContentProvider: Send + Sync {
     /// Returns true if the document is currently open in the editor.
     /// Open documents are authoritative and take precedence over
     /// indexed data.
-    #[allow(dead_code)]
     fn is_open(&self, uri: &Url) -> bool;
 }
 
@@ -75,7 +74,6 @@ pub trait ContentProvider: Send + Sync {
 /// file existence checking that don't block the LSP main thread.
 ///
 /// **Validates: Requirements 14.1, 14.2, 14.3, 14.4**
-#[allow(dead_code)]
 #[async_trait]
 pub trait AsyncContentProvider: ContentProvider {
     /// Check if URIs exist on disk (batched, non-blocking)
@@ -132,7 +130,6 @@ impl<'a> DefaultContentProvider<'a> {
     /// * `document_store` - Reference to the DocumentStore for open documents
     /// * `workspace_index` - Reference to the WorkspaceIndex for closed files
     /// * `file_cache` - Reference to the CrossFileFileCache for disk file caching
-    #[allow(dead_code)]
     pub fn new(
         document_store: &'a DocumentStore,
         workspace_index: &'a WorkspaceIndex,

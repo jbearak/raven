@@ -51,7 +51,6 @@ impl TimingGuard {
     }
 
     /// Get the elapsed time without consuming the guard
-    #[allow(dead_code)] // Part of the public perf API for benchmarks/diagnostics
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
     }
@@ -60,7 +59,6 @@ impl TimingGuard {
     ///
     /// This consumes the guard without logging (useful when you want to handle
     /// the duration yourself).
-    #[allow(dead_code)] // Part of the public perf API for benchmarks/diagnostics
     pub fn finish(self) -> Duration {
         let elapsed = self.start.elapsed();
         std::mem::forget(self); // Prevent Drop from running

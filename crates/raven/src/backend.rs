@@ -28,7 +28,6 @@ use tower_lsp::lsp_types::*;
 
 use crate::handlers;
 use crate::indentation;
-use crate::r_env;
 use crate::state::{IndentationSettings, SymbolConfig, WorldState, scan_workspace};
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
@@ -1281,7 +1280,6 @@ impl Backend {
         .await;
     }
 
-    #[allow(dead_code)]
     pub fn new(client: Client) -> Self {
         Self::new_with_request_cancellation(client, Arc::new(RequestCancellationRegistry::new()))
     }
@@ -1290,9 +1288,6 @@ impl Backend {
         client: Client,
         request_cancellation: Arc<RequestCancellationRegistry>,
     ) -> Self {
-        let library_paths = r_env::find_library_paths();
-        log::info!("Discovered R library paths: {:?}", library_paths);
-
         let state = Arc::new(RwLock::new(WorldState::new()));
 
         Self {

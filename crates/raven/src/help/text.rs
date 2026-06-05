@@ -479,7 +479,6 @@ fn get_help_inner(
 ///
 /// assert_eq!(extract_signature_from_help(help), Some("mean(x, ...)".to_string()));
 /// ```
-#[allow(dead_code)] // Used in tests, may be useful in the future
 pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
     let lines: Vec<&str> = help_text.lines().collect();
 
@@ -569,7 +568,6 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
 ///     println!("{}", s);
 /// }
 /// ```
-#[allow(dead_code)] // Used in tests, may be useful in the future
 pub fn get_function_signature(
     topic: &str,
     package: &str,

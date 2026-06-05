@@ -50,7 +50,6 @@ impl LibpathEvent {
     /// to assert post-event package deltas without re-implementing the union locally;
     /// the production consumer destructures the event directly so it does not call
     /// this from within the lib crate.
-    #[allow(dead_code)]
     pub fn affected_packages(&self) -> HashSet<String> {
         match self {
             LibpathEvent::Changed {

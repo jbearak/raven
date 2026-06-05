@@ -4275,7 +4275,6 @@ fn collect_workspace_symbols_from_artifacts(
 /// any future call site — `#[deprecated]` would generate dozens of
 /// warnings on the existing in-module test fleet, which would defeat
 /// its visibility for genuinely new callers.
-#[allow(dead_code)]
 pub fn diagnostics_via_snapshot(
     state: &WorldState,
     uri: &Url,
@@ -4297,7 +4296,6 @@ pub fn diagnostics_via_snapshot(
 /// `DiagnosticsSnapshot::build` returns `None` — i.e. the document is missing
 /// or its tree failed to parse — and the outcome is `None` in that case too.
 #[cfg(feature = "test-support")]
-#[allow(dead_code)]
 pub fn diagnostics_via_snapshot_profile(
     state: &WorldState,
     uri: &Url,
@@ -4371,7 +4369,6 @@ pub fn diagnostics_via_snapshot_profile(
 /// `#[deprecated]` would emit dozens of warnings against the existing
 /// in-module test fleet, defeating its visibility for genuinely new
 /// production callers.
-#[allow(dead_code)]
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
@@ -11255,7 +11252,6 @@ fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> 
     }
 }
 
-#[allow(dead_code)]
 fn document_file_type(state: &WorldState, uri: &Url) -> FileType {
     state
         .get_document(uri)
@@ -14789,7 +14785,6 @@ fn build_fallback_signature(
 /// let result = goto_definition(&state, &uri, pos);
 /// // `result` will be `Some(...)` when a navigable definition exists, otherwise `None`.
 /// ```
-#[allow(dead_code)]
 pub fn goto_definition(
     state: &WorldState,
     uri: &Url,
@@ -46670,7 +46665,6 @@ result <- undefined_var
     ///     inspect_ast("data <- list(a=1)", Some("list creation"));
     /// }
     /// ```
-    #[allow(dead_code)]
     pub fn inspect_ast(code: &str, description: Option<&str>) {
         use tree_sitter::Parser;
 

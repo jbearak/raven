@@ -20,7 +20,6 @@ pub const HELP_HTML_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HELP_HTML_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Returns the effective timeout, overridable by `RAVEN_HELP_TIMEOUT_MS` for tests.
-#[allow(dead_code)] // used transitively from get_help_html; whole module wired in Tasks 14-17
 fn timeout_from_env() -> Duration {
     match std::env::var("RAVEN_HELP_TIMEOUT_MS")
         .ok()
@@ -32,7 +31,6 @@ fn timeout_from_env() -> Duration {
 }
 
 /// Returns the effective stdout cap, overridable by `RAVEN_HELP_HTML_MAX_BYTES` for tests.
-#[allow(dead_code)] // used transitively from get_help_html; whole module wired in Tasks 14-17
 fn max_bytes_from_env() -> usize {
     match std::env::var("RAVEN_HELP_HTML_MAX_BYTES")
         .ok()
@@ -60,7 +58,6 @@ pub fn get_help_html(
 /// The optional `pid_capture` parameter, when provided, receives the spawned child's
 /// PID immediately after a successful `spawn()`. This is used only in tests to verify
 /// that the watchdog reaps the child process after a timeout.
-#[allow(dead_code)] // used transitively from get_help_html; whole module wired in Tasks 14-17
 fn get_help_html_inner(
     topic: &str,
     package: Option<&str>,

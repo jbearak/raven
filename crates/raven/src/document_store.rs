@@ -4,9 +4,6 @@
 // Document store for open documents with LRU eviction and memory limits
 //
 
-// Allow dead code for infrastructure that's implemented for future use
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

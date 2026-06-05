@@ -7,10 +7,6 @@
 // Requirement 13.1: THE Package_Cache SHALL store parsed exports per package
 // Requirement 13.4: THE Package_Cache SHALL support concurrent read access from multiple LSP handlers
 
-// Allow dead code during incremental development - this module will be
-// integrated into WorldState in task 7.1
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -227,7 +223,6 @@ pub struct PackageLibrary {
     /// diagnostic batch.
     base_exports: Arc<HashSet<String>>,
     /// R subprocess interface (None if R is unavailable)
-    #[allow(dead_code)] // Will be used in task 3.3
     r_subprocess: Option<RSubprocess>,
     /// Ordered fallback metadata providers (Tier 2 repo DB, then Tier 3 shipped
     /// DB), consulted only when the installed (Tier 1) path does not resolve a

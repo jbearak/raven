@@ -19,10 +19,6 @@
 //    `help(topic, package = (pkg))`. Without the parens R reads the symbol
 //    literally and a user-supplied package name silently fails to resolve.
 
-// Allow dead code during incremental development - this module will be
-// integrated into WorldState in task 7.1
-#![allow(dead_code)]
-
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -680,6 +676,7 @@ fn parse_multi_exports_output(
 /// A `Vec<String>` containing valid package names extracted from `depends_str`, or an empty
 /// vector if there are no valid package names.
 ///
+#[cfg(test)]
 fn parse_depends_field(depends_str: &str) -> Vec<String> {
     let trimmed = depends_str.trim();
     if trimmed.is_empty() {

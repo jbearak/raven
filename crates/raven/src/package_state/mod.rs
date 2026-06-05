@@ -52,7 +52,6 @@ impl PackageState {
         self.namespace_model.as_ref()
     }
 
-    #[allow(dead_code)]
     pub fn r_file_facts(&self) -> &BTreeMap<PathBuf, RFileFacts> {
         &self.r_file_facts
     }

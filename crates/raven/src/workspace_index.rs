@@ -4,9 +4,6 @@
 // Unified workspace index for closed files with debounced updates
 //
 
-// Allow dead code for infrastructure that's implemented for future use
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -7,10 +7,6 @@
 // Requirement 3.2: IF R subprocess is unavailable, THE Package_Resolver SHALL
 // fall back to parsing the package's NAMESPACE file directly
 
-// Allow dead code during incremental development - this module will be
-// integrated into PackageLibrary in task 3.3
-#![allow(dead_code)]
-
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use std::fs;

@@ -18,7 +18,6 @@ mod context;
 mod formatter;
 
 pub use calculator::{IndentationConfig, IndentationStyle, calculate_indentation};
-#[allow(unused_imports)] // Used by integration tests
 pub use context::{IndentContext, OperatorType, detect_context};
 pub use formatter::format_indentation;
 
