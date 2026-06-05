@@ -37008,8 +37008,6 @@ mod integration_tests {
     #[test]
     fn test_base_package_functions() {
         // Test that base R functions are recognized
-        let _state = WorldState::new();
-
         let code = "library(stats)\nx <- rnorm(100)\ny <- mean(x)";
         let doc = Document::new(code, None);
 
@@ -37137,8 +37135,6 @@ mod integration_tests {
 
     #[test]
     fn test_hover_same_file_location_format() {
-        let _state = WorldState::new();
-
         let uri = Url::parse("file:///test.R").unwrap();
         let def_info = DefinitionInfo {
             statement: "my_var <- 42".to_string(),
