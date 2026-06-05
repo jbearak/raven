@@ -37,6 +37,9 @@ done
 
 # Default to a temp work dir and clean it up on exit; a caller-supplied --work is left intact.
 if [ -z "$WORK" ]; then WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT; fi
+# Ensure the work dir exists before any `curl -o "$WORK/..."` (mktemp -d already
+# created the default; a caller-supplied --work may name a not-yet-existing dir).
+mkdir -p "$WORK"
 
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
 

@@ -141,10 +141,20 @@ pub fn parse_build_shipped_db_args(
     let mut snapshot_date = String::new();
     let mut source = "reference-R ∪ r-universe".to_string();
     let parse_min = |argv: &mut dyn Iterator<Item = String>, flag: &str| {
-        argv.next()
+        let n = argv
+            .next()
             .ok_or_else(|| format!("{flag} needs a count"))?
             .parse::<usize>()
-            .map_err(|e| format!("{flag} needs a non-negative integer: {e}"))
+            .map_err(|e| format!("{flag} needs a non-negative integer: {e}"))?;
+        // A floor of 0 is satisfied by any distinct count, silently disabling the
+        // coverage gate — refuse it so a direct CLI invocation can't bypass the
+        // truncation guard the shell wrapper already enforces.
+        if n == 0 {
+            return Err(format!(
+                "{flag} must be a positive integer (a floor of 0 disables the coverage gate)"
+            ));
+        }
+        Ok(n)
     };
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -1645,6 +1655,28 @@ mod tests {
             .unwrap_err();
             assert_eq!(err, format!("{min_flag} requires {path_flag}"));
         }
+    }
+
+    #[test]
+    fn parse_build_shipped_db_rejects_zero_min() {
+        // A floor of 0 is met by any distinct count, silently disabling the
+        // coverage gate — the parser must refuse it even on a direct invocation.
+        let err = super::parse_build_shipped_db_args(
+            [
+                "--runiverse-cran".to_string(),
+                "cran".to_string(),
+                "--runiverse-cran-min".to_string(),
+                "0".to_string(),
+                "--output".to_string(),
+                "out.db".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--runiverse-cran-min") && err.contains("positive"),
+            "expected a positive-integer error, got: {err}"
+        );
     }
 
     #[test]
