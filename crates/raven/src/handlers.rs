@@ -13160,9 +13160,22 @@ fn is_parameter_name(node: Node) -> bool {
 
 /// If `param_node` (a parameter name) sits inside a *named* function definition
 /// (`name <- function(...)`, `name = function(...)`, or `function(...) -> name`),
-/// return the definition's start line (0-based) for roxygen lookup. Anonymous
-/// functions (arguments, IIFEs, list values) yield `None`, so hover never
-/// attributes a stray comment block to an unnamed function's parameter.
+/// return the **assignment line** (0-based) to anchor roxygen lookup from.
+/// Anonymous functions (arguments, IIFEs, list values) yield `None`, so hover
+/// never attributes a stray comment block to an unnamed function's parameter.
+///
+/// The anchor is the assignment's start line, not the `function` keyword line.
+/// For a multi-line definition —
+///
+/// ```r
+/// #' @param x the tuning knob
+/// f <-
+///   function(x) x
+/// ```
+///
+/// — the roxygen block attaches above `f <-`, so anchoring at the `function`
+/// keyword would scan up from `f <-`, miss the block, and suppress a documented
+/// parameter. This matches how cross-file `defined_line` anchors the same block.
 fn enclosing_named_function_line(param_node: Node) -> Option<u32> {
     // The parameter list is a direct child of its function_definition, so the
     // nearest function_definition ancestor is the one that owns this parameter.
@@ -13177,10 +13190,11 @@ fn enclosing_named_function_line(param_node: Node) -> Option<u32> {
 
     // A function carries roxygen only when bound to a name: it must be the
     // *value* side of an assignment. Since `func_def` is a direct operand of its
-    // parent, being the value side is exactly "not the written target".
+    // parent, being the value side is exactly "not the written target". Anchor
+    // roxygen at the assignment's start (the `f <-` line), where the block sits.
     let assign = func_def.parent()?;
     let target = assignment_target_node(assign)?;
-    (target.id() != func_def.id()).then(|| func_def.start_position().row as u32)
+    (target.id() != func_def.id()).then(|| assign.start_position().row as u32)
 }
 
 /// Render a hover body for a function parameter: a code block with the
@@ -14054,16 +14068,12 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         // no R-subprocess call, so it is safe in this async context.
         if let Some(func_node) = named_arg_call_function(node) {
             let funcname = node_text(func_node, &text);
-            if let Some(signature) = crate::parameter_resolver::resolve_user_only(
-                state,
-                &state.signature_cache,
-                funcname,
-                uri,
-                position,
-            ) && let Some(param) = signature
-                .parameters
-                .iter()
-                .find(|p| p.name == name && !p.is_dots)
+            if let Some(signature) =
+                crate::parameter_resolver::resolve_user_only(state, funcname, uri, position)
+                && let Some(param) = signature
+                    .parameters
+                    .iter()
+                    .find(|p| p.name == name && !p.is_dots)
             {
                 let decl = match &param.default_value {
                     Some(default) => format!("{} = {}", name, default),
@@ -38523,6 +38533,34 @@ add <- function(a, b) a + b
         );
     }
 
+    #[test]
+    fn test_hover_parameter_def_multiline_assignment_shows_param_doc() {
+        // Regression: a documented function split across lines attaches its
+        // roxygen above the *assignment* (`f <-`), not the `function` keyword.
+        // Anchoring the @param lookup at the keyword line scans up from `f <-`,
+        // misses the block, and wrongly suppresses a documented parameter.
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "\
+#' @param x the tuning knob
+f <-
+  function(x) x
+";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // The parameter `x` is on line 2: `  function(x) x` (column 11).
+        let position = Position::new(2, 11);
+        let hover = hover_blocking(&state, &uri, position)
+            .expect("multi-line param-def hover must resolve the @param doc");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(value.contains("the tuning knob"), "got: {value}");
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
     // ------------------------------------------------------------------
     // #382 step 2: named-arg label -> enclosing function's formal
     // (gating & guardrails — don't reintroduce #379)
@@ -38582,6 +38620,82 @@ f(param = 5)
             assert!(
                 value.contains("the tuning knob"),
                 "should show the @param doc: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_named_arg_multiline_assignment_shows_param_doc() {
+        // Regression (companion to the step-3 multi-line test): the named-arg
+        // formal lookup anchors its roxygen at the assignment line, so a
+        // function split across lines still surfaces its @param doc.
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "\
+#' @param param the tuning knob
+f <-
+  function(x, param = 10) x + param
+f(param = 5)
+";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // `param` in `f(param = 5)` is on line 3, column 2.
+        let position = Position::new(3, 2);
+        let hover = hover_blocking(&state, &uri, position).expect("multi-line named-arg hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("param = 10"),
+                "should show the default: {value}"
+            );
+            assert!(
+                value.contains("the tuning knob"),
+                "should show the @param doc across a multi-line definition: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_named_arg_redefined_function_uses_position_scoped_signature() {
+        // Regression: hovering the named arg of a *later* redefinition must
+        // resolve against that later definition, not a stale signature carried
+        // over from the earlier one. Both hovers run against the same
+        // WorldState, so a position-insensitive `uri#name` signature cache
+        // (since removed) would serve the first definition's formals to the
+        // second hover and suppress the label (`alpha` has no `beta` formal).
+        let mut state = WorldState::new(Vec::new());
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "\
+f <- function(alpha) alpha
+f(alpha = 1)
+f <- function(beta) beta
+f(beta = 2)
+";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Resolve the earlier call first to populate any caching layer.
+        let early = hover_blocking(&state, &uri, Position::new(1, 2))
+            .expect("earlier named-arg `alpha` must resolve");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = early.contents {
+            assert!(value.contains("parameter of `f`"), "early: {value}");
+        } else {
+            panic!("expected markup content");
+        }
+
+        // The later call must resolve against the `beta` redefinition.
+        let late = hover_blocking(&state, &uri, Position::new(3, 2))
+            .expect("later named-arg `beta` must resolve against the redefinition");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = late.contents {
+            assert!(
+                value.contains("parameter of `f`"),
+                "later hover must resolve `beta` against the redefinition, got: {value}"
             );
         } else {
             panic!("expected markup content");
