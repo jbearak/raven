@@ -562,55 +562,11 @@ pub struct CycleDetection {
     pub closing_edge: DependencyEdge,
 }
 
-/// Information about an unresolved forward directive path
-#[derive(Debug, Clone)]
-pub struct UnresolvedForwardPath {
-    /// The original path string from the directive
-    pub path: String,
-    /// 0-based line where the directive appears
-    pub line: u32,
-    /// 0-based column where the directive appears
-    pub column: u32,
-    /// Reason the path couldn't be resolved
-    pub reason: UnresolvedReason,
-}
-
-/// Reason why a forward directive path couldn't be resolved
-#[derive(Debug, Clone)]
-pub enum UnresolvedReason {
-    /// Path resolution failed (e.g., invalid path syntax)
-    ResolutionFailed,
-    /// Path resolved but file doesn't exist
-    FileNotFound,
-}
-
-/// Information about a redundant forward directive
-/// (when @lsp-source without line= targets same file as earlier source() call)
-/// _Requirements: 6.2_
-#[derive(Debug, Clone)]
-pub struct RedundantDirective {
-    /// 0-based line where the directive appears
-    pub directive_line: u32,
-    /// The target file name (for display in diagnostic message)
-    pub target_filename: String,
-    /// 0-based line where the earlier source() call exists
-    pub source_call_line: u32,
-}
-
 /// Result of updating a file in the dependency graph
 #[derive(Debug, Default)]
 pub struct UpdateResult {
     /// Diagnostics to emit (e.g., directive-vs-AST conflict warnings)
     pub diagnostics: Vec<Diagnostic>,
-    /// Forward directive paths that couldn't be resolved or don't exist.
-    /// These are stored for diagnostic emission in handlers.rs.
-    /// _Requirements: 3.3_
-    pub unresolved_forward_paths: Vec<UnresolvedForwardPath>,
-    /// Redundant forward directives (when @lsp-source without line= targets
-    /// same file as earlier source() call).
-    /// These are stored for diagnostic emission with configurable severity.
-    /// _Requirements: 6.2_
-    pub redundant_directives: Vec<RedundantDirective>,
     /// True if forward edges from this file changed (added/removed targets).
     /// Used to trigger revalidation of dependents even when interface hash
     /// doesn't change (e.g., commenting out a source() call breaks a cycle).
@@ -876,18 +832,15 @@ impl DependencyGraph {
                         directive_edges.push(edge);
                     }
                     None => {
-                        // Path resolution failed - store for diagnostic emission
+                        // Path resolution failed - skip edge creation. The
+                        // user-facing missing/unresolved diagnostics are
+                        // recomputed from the snapshot graph by a separate
+                        // collector path, not from this result.
                         log::trace!(
                             "Forward directive @lsp-source '{}' at line {} could not be resolved, skipping edge creation",
                             source.path,
                             source.line
                         );
-                        result.unresolved_forward_paths.push(UnresolvedForwardPath {
-                            path: source.path.clone(),
-                            line: source.line,
-                            column: source.column,
-                            reason: UnresolvedReason::ResolutionFailed,
-                        });
                     }
                 }
             }
@@ -1021,21 +974,12 @@ impl DependencyGraph {
                             };
 
                             if ast_is_earlier {
-                                // Case 3: Directive without line=, AST at earlier line
-                                // Keep AST edge (earliest call site wins), store redundancy info
-                                // for optional diagnostic emission with configurable severity
-                                // (Requirement 4.5, 6.2)
-                                let diag_line = directive_line.unwrap_or(0);
-                                let target_filename = to_uri
-                                    .path_segments()
-                                    .and_then(|mut s| s.next_back())
-                                    .unwrap_or("")
-                                    .to_string();
-                                result.redundant_directives.push(RedundantDirective {
-                                    directive_line: diag_line,
-                                    target_filename,
-                                    source_call_line: source.line,
-                                });
+                                // Case 3: Directive without line=, AST at earlier line.
+                                // Keep AST edge (earliest call site wins). The
+                                // redundant-directive diagnostic is recomputed from
+                                // the snapshot graph by
+                                // `collect_redundant_directive_diagnostics_from_snapshot`,
+                                // not stored on this result. (Requirement 4.5, 6.2)
                                 ast_edges.push(edge);
                                 continue;
                             } else {
@@ -2971,18 +2915,11 @@ mod tests {
             ..Default::default()
         };
 
-        let result = graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
+        graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
 
         // Edge is created optimistically; existence is validated during file operations
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 1, "Edge should be created optimistically");
-
-        // No unresolved paths since path resolution succeeded
-        assert_eq!(
-            result.unresolved_forward_paths.len(),
-            0,
-            "Path resolved successfully, no unresolved paths"
-        );
     }
 
     /// Test that AST-detected source() calls still create edges even for non-existent files
@@ -3013,7 +2950,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
+        graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
 
         // AST edges are still created even for non-existent files
         // (diagnostics are handled separately in handlers.rs)
@@ -3022,12 +2959,6 @@ mod tests {
             deps.len(),
             1,
             "AST edge should be created even for non-existent file"
-        );
-
-        // No unresolved paths tracked for AST sources
-        assert!(
-            result.unresolved_forward_paths.is_empty(),
-            "AST sources should not be tracked in unresolved_forward_paths"
         );
     }
 
@@ -3059,16 +2990,13 @@ mod tests {
             ..Default::default()
         };
 
-        let result = graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
+        graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
 
         // Should create edge for existing file
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 1, "Edge should be created for existing file");
         assert_eq!(deps[0].to, utils);
         assert!(deps[0].is_directive);
-
-        // No unresolved paths
-        assert!(result.unresolved_forward_paths.is_empty());
     }
 
     #[test]

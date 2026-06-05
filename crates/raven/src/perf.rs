@@ -4,8 +4,7 @@
 // and performance issues. Controlled via RAVEN_PERF environment variable.
 //
 // Usage:
-//   RAVEN_PERF=1 raven --stdio      # Enable basic timing logs
-//   RAVEN_PERF=verbose raven --stdio # Enable detailed timing with thresholds
+//   RAVEN_PERF=1 raven --stdio      # Enable timing logs (any non-empty, non-"0"/"false" value)
 
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
@@ -14,23 +13,11 @@ use std::time::{Duration, Instant};
 /// Global flag indicating whether performance timing is enabled
 static PERF_ENABLED: OnceLock<bool> = OnceLock::new();
 
-/// Global flag indicating verbose mode (includes threshold warnings)
-static PERF_VERBOSE: OnceLock<bool> = OnceLock::new();
-
 /// Check if performance timing is enabled
 pub fn is_enabled() -> bool {
     *PERF_ENABLED.get_or_init(|| {
         std::env::var("RAVEN_PERF")
             .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(false)
-    })
-}
-
-/// Check if verbose mode is enabled
-pub fn is_verbose() -> bool {
-    *PERF_VERBOSE.get_or_init(|| {
-        std::env::var("RAVEN_PERF")
-            .map(|v| v.to_lowercase() == "verbose")
             .unwrap_or(false)
     })
 }
@@ -48,7 +35,6 @@ pub fn is_verbose() -> bool {
 pub struct TimingGuard {
     start: Instant,
     name: &'static str,
-    threshold_warn_ms: Option<u64>,
     enabled: bool,
 }
 
@@ -60,20 +46,6 @@ impl TimingGuard {
         Self {
             start: Instant::now(),
             name,
-            threshold_warn_ms: None,
-            enabled: is_enabled(),
-        }
-    }
-
-    /// Create a timing guard with a warning threshold
-    ///
-    /// If the operation takes longer than `threshold_ms`, a warning will be logged.
-    #[allow(dead_code)] // Part of the public perf API for benchmarks/diagnostics
-    pub fn with_threshold(name: &'static str, threshold_ms: u64) -> Self {
-        Self {
-            start: Instant::now(),
-            name,
-            threshold_warn_ms: Some(threshold_ms),
             enabled: is_enabled(),
         }
     }
@@ -104,18 +76,6 @@ impl Drop for TimingGuard {
 
         let elapsed = self.start.elapsed();
         log::info!("[PERF] {} completed in {:?}", self.name, elapsed);
-
-        if let Some(threshold) = self.threshold_warn_ms
-            && elapsed.as_millis() > threshold as u128
-            && is_verbose()
-        {
-            log::warn!(
-                "[PERF] {} exceeded threshold ({}ms > {}ms)",
-                self.name,
-                elapsed.as_millis(),
-                threshold
-            );
-        }
     }
 }
 
@@ -126,8 +86,6 @@ pub struct PerfMetrics {
     pub workspace_scan_duration: Option<Duration>,
     /// Duration of PackageLibrary initialization
     pub package_init_duration: Option<Duration>,
-    /// Duration until first diagnostic is published
-    pub first_diagnostic_duration: Option<Duration>,
     /// Number of files scanned during workspace initialization
     pub files_scanned: usize,
     /// Number of R subprocess calls made
@@ -169,10 +127,6 @@ impl PerfMetrics {
         if let Some(d) = self.r_subprocess_total_duration {
             log::info!("[PERF] R subprocess total: {:?}", d);
         }
-
-        if let Some(d) = self.first_diagnostic_duration {
-            log::info!("[PERF] First diagnostic: {:?}", d);
-        }
     }
 }
 
@@ -203,19 +157,6 @@ pub fn record_package_init(duration: Duration, r_calls: usize) {
     if let Ok(mut metrics) = startup_metrics().lock() {
         metrics.package_init_duration = Some(duration);
         metrics.r_subprocess_calls = r_calls;
-    }
-}
-
-/// Record first diagnostic publish
-#[allow(dead_code)] // Part of the public perf API; will be wired in when diagnostic timing is added
-pub fn record_first_diagnostic(duration: Duration) {
-    if !is_enabled() {
-        return;
-    }
-    if let Ok(mut metrics) = startup_metrics().lock()
-        && metrics.first_diagnostic_duration.is_none()
-    {
-        metrics.first_diagnostic_duration = Some(duration);
     }
 }
 

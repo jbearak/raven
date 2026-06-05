@@ -4401,60 +4401,6 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     diagnostics_via_snapshot(state, uri, cancel)
 }
 
-/// Async version of diagnostics that uses batched existence checks for missing files
-///
-/// This function performs the same diagnostics as `diagnostics()` but uses
-/// `collect_missing_file_diagnostics_async` for non-blocking disk I/O when
-/// checking file existence.
-///
-/// The function is designed to minimize lock hold time:
-/// 1. Extract needed data from state (caller holds lock briefly)
-/// 2. Release lock before async I/O
-/// 3. Perform async existence checks
-///
-/// **Validates: Requirement 14 (async batched existence checks)**
-#[allow(dead_code)]
-pub async fn diagnostics_async(
-    content_provider: &impl crate::content_provider::AsyncContentProvider,
-    uri: &Url,
-    sync_diagnostics: Vec<Diagnostic>,
-    directive_meta: &crate::cross_file::CrossFileMetadata,
-    workspace_folders: Option<&Url>,
-    missing_file_severity: Option<DiagnosticSeverity>,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = sync_diagnostics;
-
-    // Replace sync missing-file diagnostics with async batched checks.
-    // Remove any diagnostics produced by the sync missing-file collector to avoid
-    // duplicates when we extend with the async results.
-    // Include both source() call messages and @lsp-source directive messages.
-    diagnostics.retain(|d| {
-        !d.message.starts_with("File not found:")
-            && !d.message.starts_with("Parent file not found:")
-            && !d.message.starts_with("Cannot resolve path:")
-            && !d.message.starts_with("Cannot resolve parent path:")
-            && !d.message.starts_with("Path is outside workspace:")
-            // @lsp-source directive specific messages
-            && !d.message.contains("referenced by @lsp-source directive")
-            && !d.message.contains("in @lsp-source directive")
-    });
-
-    // Now add async-checked missing file diagnostics (skip if severity is disabled)
-    if let Some(severity) = missing_file_severity {
-        let missing_file_diags = collect_missing_file_diagnostics_async(
-            content_provider,
-            uri,
-            directive_meta,
-            workspace_folders,
-            severity,
-        )
-        .await;
-        diagnostics.extend(missing_file_diags);
-    }
-
-    diagnostics
-}
-
 /// Standalone async version that performs disk existence checks without ContentProvider
 ///
 /// This version is used when we can't hold a reference to ContentProvider across await points.
@@ -4709,198 +4655,6 @@ pub async fn collect_missing_file_diagnostics_standalone_for_test(
 ) -> Vec<Diagnostic> {
     collect_missing_file_diagnostics_standalone(uri, meta, workspace_folders, missing_file_severity)
         .await
-}
-
-/// Async version of missing file diagnostics that checks disk existence
-///
-/// This version uses `AsyncContentProvider::check_existence_batch` to perform
-/// non-blocking disk I/O for files not found in cache.
-///
-/// Path resolution follows the forward-vs-backward invariant documented in
-/// `crates/raven/src/cross_file/path_resolve.rs` (and user-facing `docs/cross-file.md`):
-/// - Forward sources (source() calls): use PathContext::from_metadata (respects @lsp-cd)
-/// - Backward directives (@lsp-sourced-by): use PathContext::new (ignores @lsp-cd)
-///
-/// **Validates: Requirements 14.2, 14.5**
-/// _Requirements: 6.1, 6.3_ (for @lsp-source directive missing file diagnostics)
-#[allow(dead_code)]
-pub async fn collect_missing_file_diagnostics_async(
-    content_provider: &impl crate::content_provider::AsyncContentProvider,
-    uri: &Url,
-    meta: &crate::cross_file::CrossFileMetadata,
-    workspace_folders: Option<&Url>,
-    missing_file_severity: DiagnosticSeverity,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    // Forward sources use @lsp-cd for path resolution
-    let forward_ctx =
-        crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_folders);
-    // Backward directives IGNORE @lsp-cd - always resolve relative to file's directory
-    let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_folders);
-
-    let workspace_root = workspace_folders.and_then(|w| w.to_file_path().ok());
-
-    // Collect all URIs to check: (uri, path, line, col, is_backward, is_directive)
-    let mut uris_to_check: Vec<(Url, String, u32, u32, bool, bool)> = Vec::new();
-
-    // Workspace-root fallback applies to AST source() calls AND forward
-    // directives (`@lsp-source`, `@lsp-run`, `@lsp-include`). Forward
-    // directives are semantically equivalent to source() calls (see
-    // .kiro/specs/lsp-source-directive/requirements.md Req 3.4 and
-    // dependency.rs::do_resolve), so all four user-facing surfaces —
-    // graph edges, scope resolution, missing-file diagnostics, and file
-    // path intellisense — must agree.
-    for source in &meta.sources {
-        let resolved_path = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
-        });
-        if let Some(path) = resolved_path {
-            // Guard against paths outside workspace
-            // Uses missing_file_severity since the file is effectively inaccessible
-            if let Some(root) = &workspace_root
-                && !path.starts_with(root)
-            {
-                let message = if source.is_directive {
-                    format!(
-                        "File '{}' referenced by @lsp-source directive is outside workspace",
-                        source.path
-                    )
-                } else {
-                    format!("Path is outside workspace: '{}'", source.path)
-                };
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(source.line, source.column),
-                        end: Position::new(
-                            source.line,
-                            source
-                                .column
-                                .saturating_add(source.path.len() as u32)
-                                .saturating_add(10),
-                        ),
-                    },
-                    severity: Some(missing_file_severity),
-                    message,
-                    ..Default::default()
-                });
-                continue;
-            }
-            if let Some(target_uri) = crate::cross_file::path_resolve::path_to_uri(&path) {
-                uris_to_check.push((
-                    target_uri,
-                    source.path.clone(),
-                    source.line,
-                    source.column,
-                    false,
-                    source.is_directive,
-                ));
-            }
-        } else {
-            let message = if source.is_directive {
-                format!(
-                    "Cannot resolve path '{}' in @lsp-source directive",
-                    source.path
-                )
-            } else {
-                format!("Cannot resolve path: '{}'", source.path)
-            };
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(source.line, source.column),
-                    end: Position::new(
-                        source.line,
-                        source
-                            .column
-                            .saturating_add(source.path.len() as u32)
-                            .saturating_add(10),
-                    ),
-                },
-                severity: Some(missing_file_severity),
-                message,
-                ..Default::default()
-            });
-        }
-    }
-
-    for directive in &meta.sourced_by {
-        let resolved = backward_ctx.as_ref().and_then(|ctx| {
-            let path = crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)?;
-            crate::cross_file::path_resolve::path_to_uri(&path)
-        });
-        if let Some(target_uri) = resolved {
-            uris_to_check.push((
-                target_uri,
-                directive.path.clone(),
-                directive.directive_line,
-                0,
-                true,
-                false, // is_directive is false here because we use is_backward to distinguish
-            ));
-        } else {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(directive.directive_line, 0),
-                    end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
-                },
-                severity: Some(missing_file_severity),
-                message: format!("Cannot resolve parent path: '{}'", directive.path),
-                ..Default::default()
-            });
-        }
-    }
-
-    if uris_to_check.is_empty() {
-        return diagnostics;
-    }
-
-    // Batch check existence (non-blocking)
-    let uris: Vec<Url> = uris_to_check
-        .iter()
-        .map(|(u, _, _, _, _, _)| u.clone())
-        .collect();
-    let existence = content_provider.check_existence_batch(&uris).await;
-
-    // Generate diagnostics for missing files
-    for (target_uri, path, line, col, is_backward, is_directive) in uris_to_check {
-        if !existence.get(&target_uri).copied().unwrap_or(false) {
-            if is_backward {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(line, 0),
-                        end: Position::new(line, LSP_EOL_CHARACTER),
-                    },
-                    severity: Some(missing_file_severity),
-                    message: format!("Parent file not found: '{}'", path),
-                    ..Default::default()
-                });
-            } else {
-                // Use specific message for @lsp-source directives (Requirement 6.1)
-                let message = if is_directive {
-                    format!(
-                        "File '{}' referenced by @lsp-source directive not found",
-                        path
-                    )
-                } else {
-                    format!("File not found: '{}'", path)
-                };
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(line, col),
-                        end: Position::new(
-                            line,
-                            col.saturating_add(path.len() as u32).saturating_add(10),
-                        ),
-                    },
-                    severity: Some(missing_file_severity),
-                    message,
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    diagnostics
 }
 
 /// Emit diagnostics for forward directives with invalid `line=0` parameter.
@@ -13467,8 +13221,6 @@ pub struct DefinitionInfo {
     pub statement: String,
     pub source_uri: Url,
     pub line: u32,
-    #[allow(dead_code)]
-    pub column: u32,
 }
 
 pub fn extract_definition_statement(
@@ -13552,7 +13304,6 @@ fn extract_statement_from_tree(
         statement,
         source_uri: symbol.source_uri.clone(),
         line: symbol.defined_line,
-        column: symbol.defined_column,
     })
 }
 
@@ -29215,7 +28966,6 @@ mod proptests {
                 statement: "test_var <- 42".to_string(),
                 source_uri: uri.clone(),
                 line: line_num,
-                column: 0,
             };
 
             let mut value = String::new();
@@ -29243,7 +28993,6 @@ mod proptests {
                 statement: "helper_func <- function() {}".to_string(),
                 source_uri: def_uri.clone(),
                 line: line_num,
-                column: 0,
             };
 
             let mut value = String::new();
@@ -29271,7 +29020,6 @@ mod proptests {
                 statement: statement.clone(),
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 line: line_num,
-                column: 0,
             };
 
             let escaped_statement = escape_markdown(&def_info.statement);
@@ -29506,7 +29254,6 @@ mod proptests {
                 statement: "test_var <- 42".to_string(),
                 source_uri: uri.clone(),
                 line: 0,
-                column: 0,
             };
 
             let current_uri = Url::parse("file:///workspace/main.R").unwrap();
@@ -37436,7 +37183,6 @@ mod integration_tests {
             statement: "my_var <- 42".to_string(),
             source_uri: uri.clone(),
             line: 0, // 0-based
-            column: 0,
         };
 
         // Test same-file location formatting
@@ -37466,7 +37212,6 @@ mod integration_tests {
             statement: "helper_func <- function(x) { x + 1 }".to_string(),
             source_uri: def_uri.clone(),
             line: 5, // 0-based
-            column: 0,
         };
 
         // Test cross-file location formatting
@@ -37509,7 +37254,6 @@ mod integration_tests {
             statement: "test_func <- function() {}".to_string(),
             source_uri: Url::parse("file:///test.R").unwrap(),
             line: 0,
-            column: 0,
         };
 
         let escaped_statement = escape_markdown(&def_info.statement);

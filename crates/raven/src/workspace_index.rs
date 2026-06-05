@@ -210,11 +210,6 @@ impl WorkspaceIndex {
         }
     }
 
-    /// Returns true if the URI is currently pinned.
-    pub fn is_pinned(&self, uri: &Url) -> bool {
-        self.pinned.read().map(|p| p.contains(uri)).unwrap_or(false)
-    }
-
     // ========================================================================
     // Read Operations
     // ========================================================================

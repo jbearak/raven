@@ -179,19 +179,6 @@ pub enum CallSiteSpec {
 /// (non-boundary byte offsets, surrogate pairs, etc.).
 pub use crate::utf16::byte_offset_to_utf16_column;
 
-/// Convert a tree-sitter Point to LSP Position with correct UTF-16 column.
-/// Ensures proper handling of multi-byte characters in LSP protocol communication.
-pub fn tree_sitter_point_to_lsp_position(
-    point: tree_sitter::Point,
-    line_text: &str,
-) -> tower_lsp::lsp_types::Position {
-    let column = byte_offset_to_utf16_column(line_text, point.column);
-    tower_lsp::lsp_types::Position {
-        line: point.row as u32,
-        character: column,
-    }
-}
-
 /// Enrich metadata with inherited working directory from parent files.
 ///
 /// Only sets `inherited_working_directory` when:

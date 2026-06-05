@@ -848,14 +848,6 @@ impl PackageLibrary {
         }
     }
 
-    /// Get combined exports for a package from cache (synchronous)
-    ///
-    /// Returns the cached combined exports if available, None otherwise.
-    /// This is useful for hover to check package exports without blocking.
-    pub fn get_cached_combined_exports(&self, name: &str) -> Option<Arc<HashSet<String>>> {
-        self.combined_exports.try_read().ok()?.get(name).cloned()
-    }
-
     /// Find which package exports a symbol (synchronous, cached-only)
     ///
     /// Searches through loaded packages to find which one exports the given symbol.

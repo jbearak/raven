@@ -308,11 +308,6 @@ impl Document {
         self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);
     }
 
-    #[allow(dead_code)]
-    pub fn contents_hash(&self) -> u64 {
-        self.revision
-    }
-
     pub fn text(&self) -> String {
         self.contents.to_string()
     }
@@ -1089,19 +1084,6 @@ impl WorldState {
             })
     }
 
-    #[allow(dead_code)]
-    pub fn index_workspace(&mut self) {
-        let folders = self.workspace_folders.clone();
-        log::info!("Indexing {} workspace folders", folders.len());
-        for folder in &folders {
-            log::info!("Indexing folder: {}", folder);
-            if let Ok(path) = folder.to_file_path() {
-                self.index_directory(&path);
-            }
-        }
-        log::info!("Indexed {} workspace files", self.workspace_index.len());
-    }
-
     /// Apply pre-scanned workspace index results (for non-blocking initialization).
     ///
     /// Package-mode state is *not* set from parameters: this function
@@ -1218,36 +1200,6 @@ impl WorldState {
             "Built dependency graph from {} workspace files",
             entries.len()
         );
-    }
-
-    #[allow(dead_code)]
-    fn index_directory(&mut self, dir: &std::path::Path) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-
-            if path.is_dir() {
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
-                    && should_skip_directory(dir_name)
-                {
-                    continue;
-                }
-                self.index_directory(&path);
-            } else if is_stat_model_extension(&path) {
-                // Route through the shared BOM-aware seam; an undecodable file
-                // is left unindexed. See `read_source` for the decode policy.
-                if let Ok(text) = read_source(&path)
-                    && let Ok(uri) = Url::from_file_path(&path)
-                {
-                    log::trace!("Indexing file: {}", uri);
-                    self.workspace_index
-                        .insert(uri.clone(), Document::new_with_uri(&text, None, &uri));
-                }
-            }
-        }
     }
 }
 

@@ -126,11 +126,6 @@ impl CrossFileWorkspaceIndex {
         }
     }
 
-    /// Returns true if the URI is currently pinned.
-    pub fn is_pinned(&self, uri: &Url) -> bool {
-        self.pinned.read().map(|p| p.contains(uri)).unwrap_or(false)
-    }
-
     /// Get current version
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
@@ -249,34 +244,6 @@ impl CrossFileWorkspaceIndex {
     /// overflow has forced the underlying LRU to grow.
     pub fn cap(&self) -> usize {
         self.inner.read().ok().map(|g| g.cap().get()).unwrap_or(0)
-    }
-
-    /// Collect exported symbol names from entries whose URI path starts with `prefix`,
-    /// excluding any URIs in `exclude` (typically open documents whose workspace index
-    /// entries may be stale). Iterates in-place under a read lock without materializing
-    /// a Vec of all URIs.
-    pub fn collect_exported_symbols(
-        &self,
-        prefix: &std::path::Path,
-        exclude: &HashSet<Url>,
-    ) -> HashSet<String> {
-        let mut symbols = HashSet::new();
-        let Ok(guard) = self.inner.read() else {
-            return symbols;
-        };
-        for (uri, entry) in guard.iter() {
-            if exclude.contains(uri) {
-                continue;
-            }
-            if let Ok(p) = uri.to_file_path()
-                && p.starts_with(prefix)
-            {
-                for name in entry.artifacts.exported_interface.keys() {
-                    symbols.insert(name.to_string());
-                }
-            }
-        }
-        symbols
     }
 
     /// Resize the cache capacity. If shrinking, LRU entries are evicted.

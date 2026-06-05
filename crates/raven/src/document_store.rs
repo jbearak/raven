@@ -325,16 +325,6 @@ impl DocumentStore {
         self.pinned_uris = uris;
     }
 
-    /// Returns true if the URI is currently pinned.
-    pub fn is_pinned(&self, uri: &Url) -> bool {
-        self.pinned_uris.contains(uri)
-    }
-
-    /// Number of currently pinned URIs.
-    pub fn pinned_len(&self) -> usize {
-        self.pinned_uris.len()
-    }
-
     /// Open a document (evicts if needed)
     ///
     /// Parses the content and computes all derived data (tree, packages, metadata, artifacts).
@@ -753,11 +743,6 @@ impl DocumentStore {
     /// Get current metrics
     pub fn metrics(&self) -> &DocumentStoreMetrics {
         &self.metrics
-    }
-
-    /// Get current configuration
-    pub fn config(&self) -> &DocumentStoreConfig {
-        &self.config
     }
 
     // ========================================================================
