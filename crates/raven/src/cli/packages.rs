@@ -6,8 +6,11 @@
 //! `build-shipped-db` is the maintainer-only Tier 3 builder. It merges, **append-only
 //! and version-monotonic**, three sources into `names.db`: the prior DB (the seed),
 //! an authoritative reference-R capture of the build machine's installed library,
-//! and CRAN + Bioc r-universe JSON. The shipped binary never fetches from the
-//! network; a build job supplies the r-universe JSON directories with `curl`.
+//! and CRAN + Bioc r-universe metadata. The shipped binary never fetches from the
+//! network; a build job (`scripts/build-names-db.sh`) supplies the r-universe data
+//! with `curl` — one bulk `/api/dbdump` BSON file per universe (`--runiverse-cran`
+//! / `--runiverse-bioc` accept that file, or a legacy per-package JSON directory).
+//! `--runiverse-{cran,bioc}-min` carry the `/api/ls` floor that gates coverage.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,7 +24,7 @@ use crate::package_db::json_db::{
 use crate::package_db::merge::merge_append_only;
 use crate::package_db::model::PackageRecord;
 use crate::package_db::renv_lock::read_renv_lock_package_names;
-use crate::package_db::runiverse::ingest_runiverse_dir;
+use crate::package_db::runiverse::ingest_runiverse_path;
 use crate::r_subprocess::is_valid_package_name;
 
 const DEFAULT_NAMES_DB_RELEASE_BASE: &str =
@@ -108,10 +111,16 @@ pub fn parse_update_args(mut argv: impl Iterator<Item = String>) -> Result<Updat
     Ok(UpdateArgs { base_url, dest_dir })
 }
 
+#[derive(Debug)]
 pub struct BuildShippedDbArgs {
     pub capture_reference: bool,
     pub runiverse_cran: Option<PathBuf>,
     pub runiverse_bioc: Option<PathBuf>,
+    /// Minimum distinct packages the CRAN source must yield, or the build aborts
+    /// (the authoritative coverage gate — the build script passes the `/api/ls`
+    /// count less a small tolerance). `None` skips the check.
+    pub runiverse_cran_min: Option<usize>,
+    pub runiverse_bioc_min: Option<usize>,
     pub fresh: bool,
     pub seed: Option<PathBuf>,
     pub output: PathBuf,
@@ -124,11 +133,19 @@ pub fn parse_build_shipped_db_args(
 ) -> Result<BuildShippedDbArgs, String> {
     let mut runiverse_cran = None;
     let mut runiverse_bioc = None;
+    let mut runiverse_cran_min = None;
+    let mut runiverse_bioc_min = None;
     let mut fresh = false;
     let mut seed = None;
     let mut output = None;
     let mut snapshot_date = String::new();
     let mut source = "reference-R ∪ r-universe".to_string();
+    let parse_min = |argv: &mut dyn Iterator<Item = String>, flag: &str| {
+        argv.next()
+            .ok_or_else(|| format!("{flag} needs a count"))?
+            .parse::<usize>()
+            .map_err(|e| format!("{flag} needs a non-negative integer: {e}"))
+    };
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--runiverse-cran" => {
@@ -140,6 +157,12 @@ pub fn parse_build_shipped_db_args(
                 runiverse_bioc = Some(PathBuf::from(
                     argv.next().ok_or("--runiverse-bioc needs a path")?,
                 ))
+            }
+            "--runiverse-cran-min" => {
+                runiverse_cran_min = Some(parse_min(&mut argv, "--runiverse-cran-min")?)
+            }
+            "--runiverse-bioc-min" => {
+                runiverse_bioc_min = Some(parse_min(&mut argv, "--runiverse-bioc-min")?)
             }
             "--fresh" | "--no-seed" => fresh = true,
             "--seed" => seed = Some(PathBuf::from(argv.next().ok_or("--seed needs a path")?)),
@@ -156,6 +179,8 @@ pub fn parse_build_shipped_db_args(
         capture_reference: true,
         runiverse_cran,
         runiverse_bioc,
+        runiverse_cran_min,
+        runiverse_bioc_min,
         fresh,
         seed,
         output: output.ok_or("--output is required")?,
@@ -781,11 +806,31 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
     };
 
     let mut runiverse: Vec<PackageRecord> = Vec::new();
-    for dir in [args.runiverse_cran.as_ref(), args.runiverse_bioc.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        runiverse.extend(ingest_runiverse_dir(dir).map_err(|e| e.to_string())?);
+    for (path, min, min_flag) in [
+        (
+            args.runiverse_cran.as_ref(),
+            args.runiverse_cran_min,
+            "--runiverse-cran-min",
+        ),
+        (
+            args.runiverse_bioc.as_ref(),
+            args.runiverse_bioc_min,
+            "--runiverse-bioc-min",
+        ),
+    ] {
+        if let Some(path) = path {
+            // A bulk dbdump file is the unverified single artifact; refuse to
+            // ingest one without a coverage floor rather than risk shipping a
+            // silently-truncated names.db. (A directory is the legacy per-package
+            // fixture layout, which carries no such risk and needs no floor.)
+            if min.is_none() && !path.is_dir() {
+                return Err(format!(
+                    "{}: a dbdump file requires a coverage floor; pass {min_flag} (the /api/ls count)",
+                    path.display()
+                ));
+            }
+            runiverse.extend(ingest_runiverse_path(path, min).map_err(|e| e.to_string())?);
+        }
     }
 
     let mut reference_r: Vec<PackageRecord> = Vec::new();
@@ -1458,8 +1503,8 @@ pub fn print_help() {
 [--workspace DIR] [--base-urls URL[,URL]]\n  \
          raven packages freeze [--used|--installed|--all] [--output PATH] [--workspace DIR]\n  \
          raven packages update [YYYY-MM-DD | --base-url URL] [--dest-dir DIR]\n  \
-         raven packages build-shipped-db [--runiverse-cran DIR] \
-[--runiverse-bioc DIR] [--seed names.db | --fresh] --output names.db \
+         raven packages build-shipped-db [--runiverse-cran DIR|dbdump.bson [--runiverse-cran-min N]] \
+[--runiverse-bioc DIR|dbdump.bson [--runiverse-bioc-min N]] [--seed names.db | --fresh] --output names.db \
 [--snapshot-date S] [--source S]\n  \
          raven packages build-embedded-base --reference-lib DIR [--output PATH]\n  \
          raven packages validate-shipped-db names.db\n"
@@ -1533,6 +1578,8 @@ mod tests {
             [
                 "--runiverse-cran".to_string(),
                 "cran".to_string(),
+                "--runiverse-cran-min".to_string(),
+                "24000".to_string(),
                 "--runiverse-bioc".to_string(),
                 "bioc".to_string(),
                 "--output".to_string(),
@@ -1546,11 +1593,32 @@ mod tests {
         .unwrap();
         assert_eq!(args.runiverse_cran, Some(std::path::PathBuf::from("cran")));
         assert_eq!(args.runiverse_bioc, Some(std::path::PathBuf::from("bioc")));
+        assert_eq!(args.runiverse_cran_min, Some(24000));
+        // A min is optional per universe: bioc was given a path but no floor.
+        assert_eq!(args.runiverse_bioc_min, None);
         assert_eq!(args.output, std::path::PathBuf::from("out.db"));
         assert!(args.fresh, "--fresh skips the default prior-DB seed");
         assert_eq!(args.snapshot_date, "2026-05-30");
         assert!(args.capture_reference);
         assert_eq!(args.seed, None);
+    }
+
+    #[test]
+    fn parse_build_shipped_db_rejects_non_integer_min() {
+        let err = super::parse_build_shipped_db_args(
+            [
+                "--runiverse-cran-min".to_string(),
+                "lots".to_string(),
+                "--output".to_string(),
+                "out.db".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--runiverse-cran-min") && err.contains("integer"),
+            "expected an integer-parse error, got: {err}"
+        );
     }
 
     #[test]
@@ -1671,6 +1739,8 @@ mod tests {
             capture_reference: false,
             runiverse_cran: None,
             runiverse_bioc: None,
+            runiverse_cran_min: None,
+            runiverse_bioc_min: None,
             fresh: false,
             seed: Some(seed),
             output: out.clone(),
@@ -1690,6 +1760,38 @@ mod tests {
         assert!(
             !names.contains(&"grid".to_string()),
             "non-attached base-priority package must also be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_shipped_db_rejects_floorless_dbdump() {
+        // A dbdump *file* source without a coverage floor must hard-fail before
+        // any ingest — shipping an unguarded (possibly truncated) single artifact
+        // is the degraded-names.db outcome the gate exists to prevent. The check
+        // fires on the path being a non-directory, so a not-yet-existing .bson
+        // path exercises it without needing a real dump or R.
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::run_build_shipped_db(super::BuildShippedDbArgs {
+            capture_reference: false,
+            runiverse_cran: Some(dir.path().join("cran.bson")),
+            runiverse_bioc: None,
+            runiverse_cran_min: None, // no floor → must be rejected
+            runiverse_bioc_min: None,
+            fresh: true,
+            seed: None,
+            output: dir.path().join("names.db"),
+            snapshot_date: "2026-06-01".into(),
+            source: "t".into(),
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("coverage floor") && err.contains("--runiverse-cran-min"),
+            "expected a floor-required error, got: {err}"
+        );
+        assert!(
+            !dir.path().join("names.db").exists(),
+            "must not write a DB when the source is rejected"
         );
     }
 

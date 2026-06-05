@@ -423,9 +423,19 @@ can build a private `names.db` from their own library for richer in-house
 coverage.
 
 - **Entry point:** `raven packages build-shipped-db` (maintainer/CI-only — the
-  shipped binary itself is **network-free**; the workflow uses `curl` to fetch
-  r-universe JSON into a directory that the command then transforms). Code:
-  `cli/packages.rs`, `package_db/{merge,runiverse}.rs`.
+  shipped binary itself is **network-free**; `scripts/build-names-db.sh` uses
+  `curl` to download the r-universe metadata that the command then transforms).
+  **Fetch is one bulk `/api/dbdump` per universe — 2 requests, not ~24k
+  per-package (issue #371).** The per-package crawl ran 1h+ and needed a 5% skip
+  tolerance; the BSON dump is the full-coverage single artifact (crates.io
+  `db-dump` analogue) and runs in seconds. `cran.r-universe.dev`'s
+  array/stream `/api/packages` endpoint is **not** usable — on that meta-universe
+  it silently returns only the ~13% directly-hosted subset, so the dump is the
+  only complete bulk source. `--runiverse-cran`/`--runiverse-bioc` accept either
+  a `.bson` dump file (parsed by `parse_runiverse_dbdump`) or a directory of
+  per-package JSON (the legacy fixture layout); `ingest_runiverse_path`
+  dispatches on file-vs-dir. The script's `/api/ls`-count sanity gate aborts on a
+  truncated dump. Code: `cli/packages.rs`, `package_db/{merge,runiverse}.rs`.
 - **Embedded base packages (ADR 1):** all 14 of R's base-priority packages
   (`installed.packages(priority="base")`) are compiled into the binary as a
   `// @generated` per-package table in

@@ -45,6 +45,9 @@ jobs:
             --output dist/names.db \
             ${SEED:+--seed "$SEED"}
 
+      - name: Validate the built database before publishing
+        run: ./target/release/raven packages validate-shipped-db dist/names.db
+
       - name: Record checksums
         run: |
           ( cd dist && sha256sum names.db > checksums.sha256 )

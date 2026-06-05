@@ -23,6 +23,7 @@ path = "src/main.rs"
 [dependencies]
 ammonia = "4"
 blake3 = "1"
+bson = "2"
 memmap2 = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 anyhow = "1.0.80"
