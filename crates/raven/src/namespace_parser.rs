@@ -289,14 +289,7 @@ fn parse_s3method_args(args: &str) -> Option<String> {
 /// assert!(deps.iter().all(|s: &String| !s.contains('(')));
 /// ```
 pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>> {
-    let content = fs::read_to_string(description_path).map_err(|e| {
-        anyhow!(
-            "Failed to read DESCRIPTION file {:?}: {}",
-            description_path,
-            e
-        )
-    })?;
-
+    let content = read_description(description_path)?;
     Ok(parse_description_field(&content, "Depends"))
 }
 
@@ -310,35 +303,62 @@ pub fn parse_description_field_pub(content: &str, field_name: &str) -> Vec<Strin
 
 /// Extracts the value of a named field from DESCRIPTION (DCF) content and parses it into package names.
 ///
-/// The function locates `field_name:` at the start of a line, accumulates its value including continuation
-/// lines that begin with whitespace, and stops when a new field or a non-continuation line is encountered.
-/// The collected field value is then parsed into package names (version constraints are stripped and the
-/// `R` entry is excluded).
+/// Reads the raw field value via the shared DCF parser
+/// [`crate::package_namespace::parse_dcf_field_pub`] and then parses it into
+/// package names (version constraints are stripped and the `R` entry is excluded).
 fn parse_description_field(content: &str, field_name: &str) -> Vec<String> {
-    let mut field_value = String::new();
-    let mut in_field = false;
-    let field_prefix = format!("{}:", field_name);
-
-    for line in content.lines() {
-        if line.starts_with(&field_prefix) {
-            // Found the field, extract the value after the colon
-            in_field = true;
-            if let Some(value) = line.strip_prefix(&field_prefix) {
-                field_value.push_str(value.trim());
-            }
-        } else if in_field {
-            // Check if this is a continuation line (starts with whitespace)
-            if line.starts_with(' ') || line.starts_with('\t') {
-                field_value.push(' ');
-                field_value.push_str(line.trim());
-            } else {
-                // New field or blank line, stop reading
-                break;
-            }
-        }
+    match crate::package_namespace::parse_dcf_field_pub(content, field_name) {
+        Some(value) => parse_depends_value(&value),
+        None => Vec::new(),
     }
+}
 
-    parse_depends_value(&field_value)
+/// Free-text metadata fields from a package's DESCRIPTION (DCF) file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageDescription {
+    /// The one-line `Title:` field.
+    pub title: Option<String>,
+    /// The prose `Description:` field (continuation lines folded to one line).
+    pub description: Option<String>,
+}
+
+/// Parses the `Title` and `Description` free-text fields from DESCRIPTION content.
+///
+/// Unlike [`parse_description_depends`], these are prose fields, so each value is
+/// returned verbatim (via the shared [`crate::package_namespace::parse_dcf_field_pub`],
+/// which folds continuation lines and skips DCF blank-paragraph `.` separators)
+/// without the comma-splitting / version-stripping / `R`-filtering applied to
+/// dependency fields. Missing or blank fields yield `None`.
+pub fn parse_description_metadata_str(content: &str) -> PackageDescription {
+    PackageDescription {
+        title: crate::package_namespace::parse_dcf_field_pub(content, "Title"),
+        description: crate::package_namespace::parse_dcf_field_pub(content, "Description"),
+    }
+}
+
+/// Reads and parses the `Title`/`Description` fields from a DESCRIPTION file.
+///
+/// Sibling to [`parse_description_depends`]; used by hover to attribute the
+/// package side of `pkg::name` (issue #382 step 1). Returns an `Err` only if the
+/// file cannot be read — a present-but-fieldless DESCRIPTION yields a
+/// `PackageDescription` with `None` fields.
+pub fn parse_description_metadata(description_path: &Path) -> Result<PackageDescription> {
+    Ok(parse_description_metadata_str(&read_description(
+        description_path,
+    )?))
+}
+
+/// Reads a DESCRIPTION (DCF) file to a string, mapping any I/O error to a
+/// consistent message. Shared by [`parse_description_depends`] and
+/// [`parse_description_metadata`].
+fn read_description(description_path: &Path) -> Result<String> {
+    fs::read_to_string(description_path).map_err(|e| {
+        anyhow!(
+            "Failed to read DESCRIPTION file {:?}: {}",
+            description_path,
+            e
+        )
+    })
 }
 
 /// Extracts package names from a DESCRIPTION "Depends" field value.
@@ -1002,6 +1022,42 @@ Version: 1.0.0"#;
         let content = "Package: mypackage\nSuggests: testthat, knitr\nVersion: 1.0.0";
         let suggests = parse_description_field(content, "Suggests");
         assert_eq!(suggests, vec!["testthat", "knitr"]);
+    }
+
+    // Tests for parse_description_metadata (Title/Description free-text fields)
+
+    #[test]
+    fn test_parse_description_metadata_title_and_description() {
+        let content = "\
+Package: dplyr
+Title: A Grammar of Data Manipulation
+Version: 1.1.4
+Description: A fast, consistent tool for working with data frame like
+    objects, both in memory and out of memory.
+License: MIT
+";
+        let meta = parse_description_metadata_str(content);
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("A Grammar of Data Manipulation")
+        );
+        // Continuation line is folded into a single line with one space.
+        assert_eq!(
+            meta.description.as_deref(),
+            Some(
+                "A fast, consistent tool for working with data frame like objects, both in memory and out of memory."
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_description_metadata_missing_fields() {
+        // Free-text fields are NOT comma-split or version-stripped, so a Title
+        // containing a comma stays intact; a missing Description yields None.
+        let content = "Package: tools\nTitle: Tools, Helpers, and Utilities\n";
+        let meta = parse_description_metadata_str(content);
+        assert_eq!(meta.title.as_deref(), Some("Tools, Helpers, and Utilities"));
+        assert_eq!(meta.description, None);
     }
 
     // Tests for helper functions

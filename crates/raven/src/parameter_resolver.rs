@@ -34,6 +34,19 @@ pub struct ParameterInfo {
     pub is_dots: bool,
 }
 
+impl ParameterInfo {
+    /// Render the parameter as it appears in a signature: `name = default` when
+    /// a default is present, otherwise the bare `name` (which is `...` for the
+    /// dots parameter, since it carries no default). Single source of truth for
+    /// signature-help labels, parameter-completion labels, and hover.
+    pub fn label(&self) -> String {
+        match &self.default_value {
+            Some(default) => format!("{} = {}", self.name, default),
+            None => self.name.clone(),
+        }
+    }
+}
+
 /// Where a function signature was obtained from.
 #[derive(Debug, Clone)]
 pub enum SignatureSource {
@@ -61,12 +74,16 @@ pub struct FunctionSignature {
 // Signature cache
 // ---------------------------------------------------------------------------
 
-/// Thread-safe LRU signature cache with separate stores for package and user
-/// function signatures.
+/// Thread-safe LRU cache for **package** function signatures (the expensive
+/// `formals()` results fetched via the R subprocess).
 ///
-/// Cache key formats:
-/// - Package functions: `"package::function"` (e.g., `"dplyr::filter"`)
-/// - User functions: `"file:///path/to/file.R#my_func"` (URI + function name)
+/// Cache key format: `"package::function"` (e.g., `"dplyr::filter"`). User-defined
+/// signatures are intentionally *not* cached: they resolve from the current file's
+/// AST and the position-aware cross-file scope, both of which depend on the cursor
+/// position. A position-insensitive `uri#name` cache returned stale signatures when
+/// a file redefined a function (hovering a later `f(b = ...)` reused the earlier
+/// `f`'s formals), so that path was removed — user resolution now always runs
+/// position-aware, matching how hover/completion/go-to-definition resolve scope.
 ///
 /// Uses `RwLock` with `peek()` for reads (no LRU promotion under read lock)
 /// and `push()` for writes under write lock, consistent with existing Raven
@@ -74,8 +91,6 @@ pub struct FunctionSignature {
 pub struct SignatureCache {
     /// Package function signatures ("package::function" -> signature)
     package_signatures: RwLock<LruCache<String, FunctionSignature>>,
-    /// User-defined function signatures ("file:///path#func" -> signature)
-    user_signatures: RwLock<LruCache<String, FunctionSignature>>,
 }
 
 // LruCache doesn't derive Debug; implement manually using finish_non_exhaustive()
@@ -86,13 +101,11 @@ impl fmt::Debug for SignatureCache {
 }
 
 impl SignatureCache {
-    /// Create a new signature cache with the given capacities.
-    pub fn new(max_package: usize, max_user: usize) -> Self {
+    /// Create a new package-signature cache with the given capacity.
+    pub fn new(max_package: usize) -> Self {
         let pkg_cap = NonZeroUsize::new(max_package).unwrap_or(NonZeroUsize::new(500).unwrap());
-        let user_cap = NonZeroUsize::new(max_user).unwrap_or(NonZeroUsize::new(200).unwrap());
         Self {
             package_signatures: RwLock::new(LruCache::new(pkg_cap)),
-            user_signatures: RwLock::new(LruCache::new(user_cap)),
         }
     }
 
@@ -102,56 +115,10 @@ impl SignatureCache {
         cache.peek(key).cloned()
     }
 
-    /// Look up a user-defined function signature (read-only, no LRU promotion).
-    pub fn get_user(&self, key: &str) -> Option<FunctionSignature> {
-        let cache = self.user_signatures.read().ok()?;
-        cache.peek(key).cloned()
-    }
-
     /// Insert a package function signature (promotes/evicts under write lock).
     pub fn insert_package(&self, key: String, sig: FunctionSignature) {
         if let Ok(mut cache) = self.package_signatures.write() {
             cache.push(key, sig);
-        }
-    }
-
-    /// Insert a user-defined function signature (promotes/evicts under write lock).
-    pub fn insert_user(&self, key: String, sig: FunctionSignature) {
-        if let Ok(mut cache) = self.user_signatures.write() {
-            cache.push(key, sig);
-        }
-    }
-
-    /// Invalidate all user-defined signatures from a specific file.
-    ///
-    /// Iterates the user LRU cache and removes keys whose URI prefix matches
-    /// the given URI. This is O(n) in cache size but acceptable given the
-    /// small capacity (200 entries).
-    pub fn invalidate_file(&self, uri: &Url) {
-        let prefix = format!("{}#", uri.as_str());
-        if let Ok(mut cache) = self.user_signatures.write() {
-            // Collect keys to remove: entries keyed by this file's URI prefix,
-            // OR entries whose source URI matches this file (cross-file signatures
-            // cached under the caller's URI).
-            let keys_to_remove: Vec<String> = cache
-                .iter()
-                .filter_map(|(k, v)| {
-                    let key_match = k.starts_with(&prefix);
-                    let source_match = match &v.source {
-                        SignatureSource::CurrentFile { uri: src, .. }
-                        | SignatureSource::CrossFile { uri: src, .. } => src == uri,
-                        SignatureSource::RSubprocess { .. } => false,
-                    };
-                    if key_match || source_match {
-                        Some(k.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for key in keys_to_remove {
-                cache.pop(&key);
-            }
         }
     }
 }
@@ -232,16 +199,47 @@ fn node_text<'a>(node: Node<'a>, text: &'a str) -> &'a str {
 // Parameter resolution
 // ---------------------------------------------------------------------------
 
+/// Resolve a function signature using ONLY user-defined sources: the current
+/// file's AST, then cross-file scope.
+///
+/// Both phases are position-aware, and the result is intentionally *not* cached:
+/// the in-scope definition depends on the cursor position (a file may redefine a
+/// function, or `source()` a later one), so a position-insensitive `uri#name`
+/// cache would return stale formals. See [`SignatureCache`].
+///
+/// Unlike [`resolve`], this never performs package resolution or an R subprocess
+/// (no `block_on`), so it is safe to call from an async context such as `hover`.
+/// Returns `None` for package / built-in / unknown callees. [`resolve`] delegates
+/// its unqualified Phase 1/2 path here so the two cannot drift.
+pub fn resolve_user_only(
+    state: &WorldState,
+    function_name: &str,
+    current_uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+) -> Option<FunctionSignature> {
+    // Phase 1: Local AST search (current file)
+    if let Some(sig) = resolve_from_current_file(state, function_name, current_uri, position) {
+        return Some(sig);
+    }
+
+    // Phase 2: Cross-file scope
+    resolve_from_cross_file(state, function_name, current_uri, position)
+}
+
 /// Resolve function parameters with multi-phase resolution.
 ///
 /// Resolution priority:
-/// 1. **Cache**: Check signature cache first (both package and user caches)
+/// 1. **Package cache**: For namespace-qualified calls, check the package cache
 /// 2. **Local AST**: Search the current file for the nearest in-scope function
 ///    definition before the cursor position (works for untitled/unsaved docs)
 /// 3. **Cross-file scope**: Search sourced files for function definitions
 /// 4. **Package**: Determine which package exports the function using the scope
 ///    resolver's position-aware `loaded_packages` + `inherited_packages`, then
-///    query R subprocess (stub for now — Task 4.1 adds `get_function_formals`)
+///    query R subprocess for its formals
+///
+/// Phases 2-3 (the user-defined path, for unqualified names) are delegated to
+/// [`resolve_user_only`]; phases 1 and 4 are the package path unique to this
+/// entry point.
 ///
 /// This function is synchronous and may block on R subprocess for package
 /// functions. The backend wraps it in `spawn_blocking`.
@@ -254,7 +252,7 @@ pub fn resolve(
     current_uri: &Url,
     position: tower_lsp::lsp_types::Position,
 ) -> Option<FunctionSignature> {
-    // --- Phase 0: Cache lookup ---
+    // --- Phase 1: Package cache (namespace-qualified calls) ---
 
     // For namespace-qualified calls (e.g., dplyr::filter), check package cache
     if let Some(ns) = namespace {
@@ -264,32 +262,16 @@ pub fn resolve(
         }
     }
 
-    // --- Phases 1 & 2: Local / cross-file (only for unqualified calls) ---
+    // --- Phases 2 & 3: Local / cross-file (only for unqualified calls) ---
     // Namespace-qualified calls (e.g., dplyr::filter) skip user-defined lookup
     // and go straight to package resolution.
-    if namespace.is_none() {
-        // Check user cache (current file + cross-file)
-        let user_cache_key = format!("{}#{}", current_uri.as_str(), function_name);
-        if let Some(sig) = cache.get_user(&user_cache_key) {
-            return Some(sig);
-        }
-
-        // Phase 1: Local AST search (current file)
-        if let Some(sig) =
-            resolve_from_current_file(state, cache, function_name, current_uri, position)
-        {
-            return Some(sig);
-        }
-
-        // Phase 2: Cross-file scope
-        if let Some(sig) =
-            resolve_from_cross_file(state, cache, function_name, current_uri, position)
-        {
-            return Some(sig);
-        }
+    if namespace.is_none()
+        && let Some(sig) = resolve_user_only(state, function_name, current_uri, position)
+    {
+        return Some(sig);
     }
 
-    // --- Phase 3: Package resolution ---
+    // --- Phase 4: Package resolution ---
     // For unqualified names, check package cache with all possible package keys
     // before attempting R subprocess
     let scope = get_scope(state, current_uri, position);
@@ -477,7 +459,6 @@ pub(crate) fn get_text_and_tree(
 /// since it uses in-memory content.
 fn resolve_from_current_file(
     state: &WorldState,
-    cache: &SignatureCache,
     function_name: &str,
     uri: &Url,
     position: tower_lsp::lsp_types::Position,
@@ -499,22 +480,27 @@ fn resolve_from_current_file(
         .find(|c| c.kind() == "parameters")?;
 
     let parameters = extract_from_ast(params_node, &text);
-    let def_line = func_node.start_position().row as u32;
+    // Anchor roxygen at the assignment-expression start (the `f <-` line), not
+    // the `function` keyword line: for a multi-line definition the block attaches
+    // above the assignment, so the keyword line would scan past it and drop the
+    // docs. The parent of a matched `function_definition` is always its
+    // assignment — `find_function_definition_before_position` only returns
+    // assigned functions — and its start row is the LHS for `<-`/`=` (the value
+    // for `->`), which coincides with cross-file `defined_line` for `<-`/`=`
+    // (multi-line right-assignment is the rare exception).
+    let def_line = func_node
+        .parent()
+        .map_or(func_node.start_position().row, |p| p.start_position().row)
+        as u32;
 
-    let sig = FunctionSignature {
+    Some(FunctionSignature {
         name: function_name.to_string(),
         parameters,
         source: SignatureSource::CurrentFile {
             uri: uri.clone(),
             line: def_line,
         },
-    };
-
-    // Cache the result
-    let cache_key = format!("{}#{}", uri.as_str(), function_name);
-    cache.insert_user(cache_key, sig.clone());
-
-    Some(sig)
+    })
 }
 
 /// Search cross-file scope for a function definition.
@@ -522,7 +508,6 @@ fn resolve_from_current_file(
 /// Uses the cross-file scope resolver to find function definitions in sourced files.
 fn resolve_from_cross_file(
     state: &WorldState,
-    cache: &SignatureCache,
     function_name: &str,
     uri: &Url,
     position: tower_lsp::lsp_types::Position,
@@ -566,22 +551,14 @@ fn resolve_from_cross_file(
 
     let parameters = extract_from_ast(params_node, &source_text);
 
-    let sig = FunctionSignature {
+    Some(FunctionSignature {
         name: function_name.to_string(),
         parameters,
         source: SignatureSource::CrossFile {
             uri: symbol.source_uri.clone(),
             line: symbol.defined_line,
         },
-    };
-
-    // Cache under the caller's URI so the lookup in resolve() (which uses
-    // current_uri) gets a cache hit. Invalidation by source file is handled
-    // by invalidate_file() which checks SignatureSource for source URI matches.
-    let cache_key = format!("{}#{}", uri.as_str(), function_name);
-    cache.insert_user(cache_key, sig.clone());
-
-    Some(sig)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -902,14 +879,13 @@ mod tests {
 
     #[test]
     fn test_cache_new_default_capacities() {
-        let cache = SignatureCache::new(500, 200);
+        let cache = SignatureCache::new(500);
         assert!(cache.get_package("nonexistent").is_none());
-        assert!(cache.get_user("nonexistent").is_none());
     }
 
     #[test]
     fn test_cache_insert_and_get_package() {
-        let cache = SignatureCache::new(10, 10);
+        let cache = SignatureCache::new(10);
         let sig = FunctionSignature {
             name: "filter".to_string(),
             parameters: vec![ParameterInfo {
@@ -928,103 +904,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_insert_and_get_user() {
-        let cache = SignatureCache::new(10, 10);
-        let sig = FunctionSignature {
-            name: "my_func".to_string(),
-            parameters: vec![],
-            source: SignatureSource::CurrentFile {
-                uri: Url::parse("file:///test.R").unwrap(),
-                line: 0,
-            },
-        };
-        cache.insert_user("file:///test.R#my_func".to_string(), sig.clone());
-        let cached = cache.get_user("file:///test.R#my_func");
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().name, "my_func");
-    }
-
-    #[test]
-    fn test_cache_invalidate_file() {
-        let cache = SignatureCache::new(10, 10);
-        let uri = Url::parse("file:///project/utils.R").unwrap();
-
-        // Insert two signatures from the same file
-        let sig1 = FunctionSignature {
-            name: "func_a".to_string(),
-            parameters: vec![],
-            source: SignatureSource::CurrentFile {
-                uri: uri.clone(),
-                line: 0,
-            },
-        };
-        let sig2 = FunctionSignature {
-            name: "func_b".to_string(),
-            parameters: vec![],
-            source: SignatureSource::CurrentFile {
-                uri: uri.clone(),
-                line: 5,
-            },
-        };
-        cache.insert_user(format!("{}#func_a", uri.as_str()), sig1);
-        cache.insert_user(format!("{}#func_b", uri.as_str()), sig2);
-
-        // Insert a signature from a different file
-        let other_uri = Url::parse("file:///project/other.R").unwrap();
-        let sig3 = FunctionSignature {
-            name: "func_c".to_string(),
-            parameters: vec![],
-            source: SignatureSource::CurrentFile {
-                uri: other_uri.clone(),
-                line: 0,
-            },
-        };
-        cache.insert_user(format!("{}#func_c", other_uri.as_str()), sig3);
-
-        // Verify all are present
-        assert!(
-            cache
-                .get_user(&format!("{}#func_a", uri.as_str()))
-                .is_some()
-        );
-        assert!(
-            cache
-                .get_user(&format!("{}#func_b", uri.as_str()))
-                .is_some()
-        );
-        assert!(
-            cache
-                .get_user(&format!("{}#func_c", other_uri.as_str()))
-                .is_some()
-        );
-
-        // Invalidate the first file
-        cache.invalidate_file(&uri);
-
-        // Signatures from the invalidated file should be gone
-        assert!(
-            cache
-                .get_user(&format!("{}#func_a", uri.as_str()))
-                .is_none()
-        );
-        assert!(
-            cache
-                .get_user(&format!("{}#func_b", uri.as_str()))
-                .is_none()
-        );
-
-        // Signature from the other file should still be present
-        assert!(
-            cache
-                .get_user(&format!("{}#func_c", other_uri.as_str()))
-                .is_some()
-        );
-    }
-
-    #[test]
     fn test_cache_lru_eviction() {
         // Create a cache with capacity 2
-        let cache = SignatureCache::new(2, 2);
+        let cache = SignatureCache::new(2);
 
         for i in 0..3 {
             let sig = FunctionSignature {
@@ -1199,6 +1081,62 @@ mod tests {
         assert_eq!(params.len(), 2); // Second definition has 2 params
     }
 
+    #[test]
+    fn test_resolve_redefined_function_is_position_scoped() {
+        // The user-signature cache was removed because a position-insensitive
+        // `uri#name` key served stale formals when a file redefined a function.
+        // This guards the `resolve()` entry point (used by signature-help and
+        // completion) against re-introducing such a cache: resolution must
+        // follow whichever definition is in scope at the cursor. Hover calls
+        // `resolve_user_only` directly, so its redefinition test does not cover
+        // the `resolve()` path the other two consumers go through.
+        let mut state = WorldState::new(vec![]);
+        let uri = Url::parse("file:///redef.R").unwrap();
+        let code = "\
+f <- function(alpha) alpha
+f(alpha = 1)
+f <- function(beta) beta
+f(beta = 2)
+";
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let cache = SignatureCache::new(10);
+
+        let names = |sig: FunctionSignature| {
+            sig.parameters
+                .into_iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+        };
+
+        // At the earlier call (line 1) only the `alpha` definition is in scope.
+        let early = resolve(
+            &state,
+            &cache,
+            "f",
+            None,
+            false,
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 2),
+        )
+        .expect("earlier call resolves to a user signature");
+        assert_eq!(names(early), vec!["alpha"]);
+
+        // At the later call (line 3) the `beta` redefinition shadows it.
+        let late = resolve(
+            &state,
+            &cache,
+            "f",
+            None,
+            false,
+            &uri,
+            tower_lsp::lsp_types::Position::new(3, 2),
+        )
+        .expect("later call resolves to a user signature");
+        assert_eq!(names(late), vec!["beta"]);
+    }
+
     // -- Comment between assignment and function definition --
 
     #[test]
@@ -1279,7 +1217,7 @@ mod tests {
 
     #[test]
     fn test_cache_debug_format() {
-        let cache = SignatureCache::new(10, 10);
+        let cache = SignatureCache::new(10);
         let debug_str = format!("{:?}", cache);
         assert!(debug_str.contains("SignatureCache"));
     }
@@ -1660,16 +1598,14 @@ mod property_tests {
         // **Validates: Requirements 2.5, 3.5**
         // ============================================================================
 
-        /// Insert a signature into cache, then look it up; verify the cached
-        /// signature is returned with all fields preserved (parameter names,
-        /// default values, is_dots flags). Tests both package and user caches.
+        /// Insert a signature into the package cache, then look it up; verify the
+        /// cached signature is returned with all fields preserved (parameter
+        /// names, default values, is_dots flags).
         #[test]
         fn prop_cache_consistency(
             func_name in "[a-z][a-z0-9._]{0,7}",
             params in r_param_list(0, 6),
             include_dots in proptest::bool::ANY,
-            // Whether to test package cache (true) or user cache (false)
-            use_package_cache in proptest::bool::ANY,
         ) {
             // Build parameter list from generated params
             let mut parameters: Vec<ParameterInfo> = params
@@ -1690,60 +1626,33 @@ mod property_tests {
             }
 
             // Build the signature to insert
-            let signature = if use_package_cache {
-                FunctionSignature {
-                    name: func_name.clone(),
-                    parameters: parameters.clone(),
-                    source: SignatureSource::RSubprocess {
-                        package: Some("testpkg".to_string()),
-                    },
-                }
-            } else {
-                FunctionSignature {
-                    name: func_name.clone(),
-                    parameters: parameters.clone(),
-                    source: SignatureSource::CurrentFile {
-                        uri: Url::parse("file:///test/file.R").unwrap(),
-                        line: 1,
-                    },
-                }
+            let signature = FunctionSignature {
+                name: func_name.clone(),
+                parameters: parameters.clone(),
+                source: SignatureSource::RSubprocess {
+                    package: Some("testpkg".to_string()),
+                },
             };
 
             // Create a fresh cache for each test case
-            let cache = SignatureCache::new(500, 200);
+            let cache = SignatureCache::new(500);
 
             // Build the cache key
-            let key = if use_package_cache {
-                format!("testpkg::{}", func_name)
-            } else {
-                format!("file:///test/file.R#{}", func_name)
-            };
+            let key = format!("testpkg::{}", func_name);
 
             // Verify the key is not in cache before insertion
-            let before = if use_package_cache {
-                cache.get_package(&key)
-            } else {
-                cache.get_user(&key)
-            };
+            let before = cache.get_package(&key);
             prop_assert!(
                 before.is_none(),
                 "Cache should be empty before insertion for key: {}",
                 key
             );
 
-            // Insert the signature into the appropriate cache
-            if use_package_cache {
-                cache.insert_package(key.clone(), signature.clone());
-            } else {
-                cache.insert_user(key.clone(), signature.clone());
-            }
+            // Insert the signature into the cache
+            cache.insert_package(key.clone(), signature.clone());
 
             // Look up the signature from cache
-            let cached = if use_package_cache {
-                cache.get_package(&key)
-            } else {
-                cache.get_user(&key)
-            };
+            let cached = cache.get_package(&key);
 
             // Verify the cached signature is returned (not None)
             prop_assert!(
@@ -1796,24 +1705,8 @@ mod property_tests {
                 );
             }
 
-            // Verify the wrong cache type does NOT return the signature
-            let wrong_cache = if use_package_cache {
-                cache.get_user(&key)
-            } else {
-                cache.get_package(&key)
-            };
-            prop_assert!(
-                wrong_cache.is_none(),
-                "Signature should not be found in the wrong cache type for key: {}",
-                key
-            );
-
             // Verify a second lookup also returns the same signature (cache is stable)
-            let second_lookup = if use_package_cache {
-                cache.get_package(&key)
-            } else {
-                cache.get_user(&key)
-            };
+            let second_lookup = cache.get_package(&key);
             prop_assert!(
                 second_lookup.is_some(),
                 "Second cache lookup should also return Some for key: {}",
@@ -1911,125 +1804,6 @@ mod property_tests {
                     code
                 );
             }
-        }
-
-        // ============================================================================
-        // Feature: function-parameter-completions, Property 13: Cache Invalidation on File Change
-        //
-        // For any user-defined function signature in the cache, invalidating the
-        // file that defines it SHALL remove the signature from the cache so
-        // subsequent lookups return None.
-        //
-        // **Validates: Requirements 9.2**
-        // ============================================================================
-
-        /// Insert user-defined signatures for a file, invalidate that file, verify
-        /// subsequent lookups return None. Tests that invalidation only affects
-        /// signatures from the specified file, not other files.
-        #[test]
-        fn prop_cache_invalidation_on_file_change(
-            func_names in prop::collection::vec("[a-z][a-z0-9._]{0,7}", 1..=5),
-            params in r_param_list(0, 4),
-        ) {
-            // Create a fresh cache for each test case
-            let cache = SignatureCache::new(500, 200);
-
-            // Build parameter list from generated params
-            let parameters: Vec<ParameterInfo> = params
-                .iter()
-                .map(|(name, default)| ParameterInfo {
-                    name: name.clone(),
-                    default_value: default.clone(),
-                    is_dots: false,
-                })
-                .collect();
-
-            // Test file URIs
-            let test_uri = Url::parse("file:///test/file.R").unwrap();
-            let other_uri = Url::parse("file:///test/other.R").unwrap();
-
-            // Insert signatures for the test file
-            let mut test_keys = Vec::new();
-            for func_name in &func_names {
-                let key = format!("{}#{}", test_uri, func_name);
-                let signature = FunctionSignature {
-                    name: func_name.clone(),
-                    parameters: parameters.clone(),
-                    source: SignatureSource::CurrentFile {
-                        uri: test_uri.clone(),
-                        line: 1,
-                    },
-                };
-                cache.insert_user(key.clone(), signature);
-                test_keys.push(key);
-            }
-
-            // Insert a signature for a different file (should not be affected)
-            let other_key = format!("{}#other_func", other_uri);
-            let other_signature = FunctionSignature {
-                name: "other_func".to_string(),
-                parameters: parameters.clone(),
-                source: SignatureSource::CurrentFile {
-                    uri: other_uri.clone(),
-                    line: 1,
-                },
-            };
-            cache.insert_user(other_key.clone(), other_signature);
-
-            // Verify all signatures are in cache before invalidation
-            for key in &test_keys {
-                let before = cache.get_user(key);
-                prop_assert!(
-                    before.is_some(),
-                    "Signature should be in cache before invalidation for key: {}",
-                    key
-                );
-            }
-            let other_before = cache.get_user(&other_key);
-            prop_assert!(
-                other_before.is_some(),
-                "Other file signature should be in cache before invalidation"
-            );
-
-            // Invalidate the test file
-            cache.invalidate_file(&test_uri);
-
-            // Verify all test file signatures are removed
-            for key in &test_keys {
-                let after = cache.get_user(key);
-                prop_assert!(
-                    after.is_none(),
-                    "Signature should be removed from cache after invalidation for key: {}",
-                    key
-                );
-            }
-
-            // Verify the other file's signature is NOT affected
-            let other_after = cache.get_user(&other_key);
-            prop_assert!(
-                other_after.is_some(),
-                "Other file signature should remain in cache after invalidating different file"
-            );
-
-            // Verify re-insertion works after invalidation
-            let first_key = &test_keys[0];
-            let first_name = &func_names[0];
-            let re_signature = FunctionSignature {
-                name: first_name.clone(),
-                parameters: parameters.clone(),
-                source: SignatureSource::CurrentFile {
-                    uri: test_uri.clone(),
-                    line: 1,
-                },
-            };
-            cache.insert_user(first_key.clone(), re_signature);
-
-            let re_lookup = cache.get_user(first_key);
-            prop_assert!(
-                re_lookup.is_some(),
-                "Re-inserted signature should be retrievable after invalidation for key: {}",
-                first_key
-            );
         }
     }
 

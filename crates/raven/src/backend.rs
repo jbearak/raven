@@ -3685,9 +3685,6 @@ impl LanguageServer for Backend {
             // Record as recently changed for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
-            // Invalidate signature cache for this file (Requirement 9.2)
-            state.signature_cache.invalidate_file(&uri);
-
             // Capture package settings for background prefetch
             let packages_enabled = state.cross_file_config.packages_enabled;
             let package_library = state.package_library.clone();

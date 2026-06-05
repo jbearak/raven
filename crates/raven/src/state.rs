@@ -797,7 +797,7 @@ impl WorldState {
             // Caches
             help_cache: crate::help::HelpCache::new(),
             html_help_cache: crate::help::HtmlHelpCache::new(),
-            signature_cache: Arc::new(SignatureCache::new(500, 200)),
+            signature_cache: Arc::new(SignatureCache::new(500)),
             cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
 
