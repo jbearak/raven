@@ -25,7 +25,7 @@ Key code entry points:
 - Scope artifacts + interface hash: `crates/raven/src/cross_file/scope.rs`
 - Path resolution: `crates/raven/src/cross_file/path_resolve.rs`
 - Real-time updates / diagnostics gating: `crates/raven/src/cross_file/revalidation.rs`
-- On-demand background indexing: `crates/raven/src/cross_file/background_indexer.rs`
+- On-demand indexing (synchronous, in `did_open`): `crates/raven/src/backend.rs` (`index_file_on_demand`, `index_forward_chain`, `index_backward_chain`)
 - Package loading: `crates/raven/src/package_library.rs`
 - Package state: `crates/raven/src/package_state/` (`PackageState`, `derive_package_state()`)
 - Package namespace: `crates/raven/src/package_namespace.rs` (workspace detection, namespace model)
@@ -161,7 +161,6 @@ Key files under `crates/raven/src/cross_file/`:
 - `scope.rs` — Scope artifacts, interface hash, scope-at-position resolution
 - `path_resolve.rs` — Path resolution (forward vs backward invariant)
 - `revalidation.rs` — Real-time updates, diagnostics gating, debounce
-- `background_indexer.rs` — On-demand background indexing
 - `source_detect.rs` — AST-based detection of `source()`, `sys.source()`, and related calls
 - `directive.rs` — Parsing of `@lsp-*` directive comments
 - `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
@@ -252,14 +251,17 @@ Interactive handlers that can spend noticeable time in cross-file scope resoluti
 
 Raven advertises full-document semantic tokens for R documents and currently emits the standard LSP `function` token type for function-definition names and call heads. The token legend order is part of the LSP contract: keep `SemanticTokenType::FUNCTION` at index 0 unless all encoded token-type indexes are updated together.
 
-### On-demand background indexing
+### On-demand indexing
 
-On-demand indexing is used to index files that are not currently open in the editor, prioritizing:
+On-demand indexing pulls in files that are not currently open in the editor so their
+symbols are available before diagnostics run. It happens **synchronously** in `did_open`
+(gated by `raven.crossFile.onDemandIndexing.enabled`), covering, in order:
 - direct sourced files
-- backward-directive targets
-- then transitive dependencies (bounded depth + bounded queue)
+- the forward source chain (bounded by `maxForwardDepth`)
+- backward-directive targets (bounded by `maxBackwardDepth`)
 
-See `crates/raven/src/cross_file/background_indexer.rs`.
+See `index_file_on_demand` / `index_forward_chain` / `index_backward_chain` in
+`crates/raven/src/backend.rs`.
 
 ### Rmd/Quarto raw-content vs masked-analysis split (#343)
 

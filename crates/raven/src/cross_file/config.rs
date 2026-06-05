@@ -66,10 +66,6 @@ pub struct CrossFileConfig {
     pub max_chain_depth_severity: Option<DiagnosticSeverity>,
     /// Whether on-demand indexing is enabled
     pub on_demand_indexing_enabled: bool,
-    /// Maximum transitive depth for on-demand indexing
-    pub on_demand_indexing_max_transitive_depth: usize,
-    /// Maximum queue size for background indexing
-    pub on_demand_indexing_max_queue_size: usize,
     /// Whether package function awareness is enabled
     pub packages_enabled: bool,
     /// Additional R library paths for package discovery
@@ -173,8 +169,6 @@ impl Default for CrossFileConfig {
             out_of_scope_severity: Some(DiagnosticSeverity::WARNING),
             max_chain_depth_severity: Some(DiagnosticSeverity::WARNING),
             on_demand_indexing_enabled: true,
-            on_demand_indexing_max_transitive_depth: 2,
-            on_demand_indexing_max_queue_size: 50,
             packages_enabled: true,
             packages_additional_library_paths: Vec::new(),
             packages_r_path: None,
@@ -231,8 +225,6 @@ mod tests {
         );
         // On-demand indexing defaults
         assert!(config.on_demand_indexing_enabled);
-        assert_eq!(config.on_demand_indexing_max_transitive_depth, 2);
-        assert_eq!(config.on_demand_indexing_max_queue_size, 50);
         // Package awareness defaults
         assert!(config.packages_enabled);
         assert!(config.packages_additional_library_paths.is_empty());

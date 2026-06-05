@@ -23737,7 +23737,7 @@ proptest! {
         let metadata = parse_directives(&code);
 
         // Simulate workspace indexer behavior: compute artifacts with metadata
-        // This is what background_indexer.rs does when indexing a closed file
+        // This is what the on-demand indexing path does when indexing a closed file
         let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
 
         // Skip cases where the generated symbol name conflicts with real definitions

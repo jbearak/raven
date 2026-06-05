@@ -1131,19 +1131,7 @@
         "raven.crossFile.onDemandIndexing.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Enable on-demand background indexing of files not currently open in the editor. When enabled, files referenced by source() calls and LSP directives are automatically indexed to provide cross-file symbol resolution."
-        },
-        "raven.crossFile.onDemandIndexing.maxTransitiveDepth": {
-          "type": "number",
-          "default": 2,
-          "minimum": 0,
-          "description": "Maximum depth for transitive dependency indexing. Controls how many levels of indirect dependencies (files sourced by sourced files) are indexed in the background. Higher values provide more complete cross-file awareness but increase indexing workload."
-        },
-        "raven.crossFile.onDemandIndexing.maxQueueSize": {
-          "type": "number",
-          "default": 50,
-          "minimum": 1,
-          "description": "Maximum number of files that can be queued for background indexing. Limits memory usage and prevents excessive background work in projects with many transitive dependencies."
+          "description": "Enable on-demand indexing of files not currently open in the editor. When enabled, files referenced by source() calls and LSP directives are automatically indexed to provide cross-file symbol resolution."
         },
         "raven.crossFile.cache.metadataMaxEntries": {
           "type": "number",
