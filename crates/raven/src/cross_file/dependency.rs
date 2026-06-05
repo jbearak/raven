@@ -201,8 +201,10 @@ where
 /// * `max_depth` - Maximum depth for inheritance chain traversal (prevents infinite loops)
 ///
 /// # Returns
-/// * `Some(String)` - The inherited working directory from the parent
-/// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, etc.)
+/// * `Some(String)` - The inherited working directory from the parent. When the parent's
+///   own metadata is unavailable, this is the parent file's directory (the fallback in
+///   `resolve_parent_working_directory_with_visited`), not `None`.
+/// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, cycle detected, or the parent path cannot be resolved)
 ///
 /// # Behavior
 /// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
@@ -245,8 +247,10 @@ where
 ///
 /// Uses the first backward directive's parent to determine inheritance.
 /// Returns None if no backward directives exist, if the child has an explicit working
-/// directory, if parent metadata is unavailable, if max_depth is exceeded, or if a cycle
-/// is detected.
+/// directory, if max_depth is exceeded, if a cycle is detected, or if the parent path
+/// cannot be resolved. Note: when the parent's own metadata is unavailable, this does NOT
+/// return None — `resolve_parent_working_directory_with_visited` falls back to the parent
+/// file's directory (returning `Some`).
 ///
 /// # Arguments
 /// * `uri` - The URI of the child file
@@ -257,8 +261,10 @@ where
 /// * `visited` - Set of URIs already visited during this inheritance resolution (for cycle detection)
 ///
 /// # Returns
-/// * `Some(String)` - The inherited working directory from the parent
-/// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, cycle detected, etc.)
+/// * `Some(String)` - The inherited working directory from the parent. When the parent's
+///   own metadata is unavailable, this is the parent file's directory (the fallback in
+///   `resolve_parent_working_directory_with_visited`), not `None`.
+/// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, cycle detected, or the parent path cannot be resolved)
 ///
 /// # Behavior
 /// - Skips inheritance if the child file has an explicit `@lsp-cd` directive

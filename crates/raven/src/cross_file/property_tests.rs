@@ -2976,9 +2976,11 @@ proptest! {
         prop_assert!(cache.get(&uri).is_none(),
             "Cache should be empty after invalidation");
 
-        // Insert new content with different snapshot
+        // Insert new content with a different, deterministic snapshot.
+        // Fixed time strictly after snapshot1's UNIX_EPOCH so snapshot1 != snapshot2
+        // without depending on the wall clock.
         let snapshot2 = FileSnapshot {
-            mtime: SystemTime::now(),
+            mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
             size: content2.len() as u64,
             content_hash: None,
         };
