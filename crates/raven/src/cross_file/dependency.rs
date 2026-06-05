@@ -164,7 +164,7 @@ pub const DEFAULT_MAX_INHERITANCE_DEPTH: usize = 10;
 /// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
 /// - Uses the first backward directive (document order) to determine the parent
 /// - Resolves the parent path using file-relative resolution (not affected by @lsp-cd)
-/// - Calls `resolve_parent_working_directory` to get the parent's effective working directory
+/// - Calls `resolve_parent_working_directory_with_visited` to get the parent's effective working directory
 /// - Uses default max depth of 10 to prevent infinite chains
 ///
 /// _Requirements: 1.1, 2.1, 7.1_
@@ -3239,7 +3239,7 @@ z <- 3
         };
 
         // The parent path resolves but metadata is unavailable
-        // In this case, resolve_parent_working_directory falls back to parent's directory
+        // In this case, resolve_parent_working_directory_with_visited falls back to parent's directory
         let result = compute_inherited_working_directory(
             &child_uri,
             &child_meta,
