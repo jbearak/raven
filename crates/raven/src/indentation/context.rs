@@ -477,9 +477,9 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
 
         if let Some(op_type) = classify_continuation_operator(trimmed) {
             // `position.line - 1` is the operator-terminated line just checked;
-            // pass the cursor `position` per `find_chain_start`'s contract.
+            // pass the cursor line per `find_chain_start`'s contract.
             let (chain_start_line, chain_start_col) =
-                ChainWalker::new(source, tab_size).find_chain_start(position);
+                ChainWalker::new(source, tab_size).find_chain_start(position.line);
             return IndentContext::AfterContinuationOperator {
                 chain_start_line,
                 chain_start_col,
@@ -1036,7 +1036,7 @@ fn detect_continuation_operator(
     let (chain_start_line, chain_start_col) = find_chain_start_from_ast(tree, source, prev_line)
         .unwrap_or_else(|| {
             let walker = ChainWalker::new(source, tab_size);
-            walker.find_chain_start(position)
+            walker.find_chain_start(position.line)
         });
 
     Some(IndentContext::AfterContinuationOperator {
@@ -1307,25 +1307,23 @@ impl<'a> ChainWalker<'a> {
 
     /// Finds the chain start by walking backward through operator-terminated lines.
     ///
-    /// Starting from `start_position`, walks backward through lines that end with
+    /// Starting from `cursor_line`, walks backward through lines that end with
     /// continuation operators (`|>`, `%>%`, `+`, `~`, `%word%`) until finding a line
     /// that does NOT end with such an operator.
     ///
     /// # Arguments
     ///
-    /// * `start_position` - The cursor position. The walk begins at the line
-    ///   immediately above it (`start_position.line - 1`) and proceeds upward.
-    ///   Callers pass the cursor position after confirming that line ends with a
-    ///   continuation operator; a `start_position` whose previous line does not
-    ///   end in one yields `start_position.line` back unchanged.
+    /// * `cursor_line` - The cursor's line. The walk begins one line above it
+    ///   (`cursor_line - 1`) and proceeds upward, so callers pass the cursor line
+    ///   after confirming that the line above ends with a continuation operator.
     ///
     /// # Returns
     ///
     /// A tuple `(line, column)` representing the chain start position:
     /// - `line`: The line number of the chain start
     /// - `column`: The column of the first non-whitespace character on that line
-    pub fn find_chain_start(&self, start_position: Position) -> (u32, u32) {
-        let mut current_line = start_position.line;
+    pub fn find_chain_start(&self, cursor_line: u32) -> (u32, u32) {
+        let mut current_line = cursor_line;
         let max_iterations = 1000;
         let mut iterations = 0;
 
@@ -2084,14 +2082,10 @@ mod tests {
 
             // Position cursor at the last line of the chain
             let last_line = chain_length as u32;
-            let end_position = Position {
-                line: last_line,
-                character: 0,
-            };
 
             // Detect chain start using ChainWalker
             let walker = ChainWalker::new(&code, 2);
-            let (start_line, start_col) = walker.find_chain_start(end_position);
+            let (start_line, start_col) = walker.find_chain_start(last_line);
 
             // Verify: chain start should be line 0 (first line of chain)
             prop_assert_eq!(
@@ -2121,13 +2115,9 @@ mod tests {
             let code = generate_pipe_chain(chain_length, ChainOperator::NativePipe, leading_spaces);
 
             let last_line = chain_length as u32;
-            let position = Position {
-                line: last_line,
-                character: 0,
-            };
 
             let walker = ChainWalker::new(&code, 2);
-            let (start_line, start_col) = walker.find_chain_start(position);
+            let (start_line, start_col) = walker.find_chain_start(last_line);
 
             prop_assert_eq!(start_line, 0);
             prop_assert_eq!(start_col, leading_spaces as u32);
@@ -2145,13 +2135,9 @@ mod tests {
             let code = generate_pipe_chain(chain_length, ChainOperator::MagrittrPipe, leading_spaces);
 
             let last_line = chain_length as u32;
-            let position = Position {
-                line: last_line,
-                character: 0,
-            };
 
             let walker = ChainWalker::new(&code, 2);
-            let (start_line, start_col) = walker.find_chain_start(position);
+            let (start_line, start_col) = walker.find_chain_start(last_line);
 
             prop_assert_eq!(start_line, 0);
             prop_assert_eq!(start_col, leading_spaces as u32);
@@ -2169,13 +2155,9 @@ mod tests {
             let code = generate_pipe_chain(chain_length, ChainOperator::Plus, leading_spaces);
 
             let last_line = chain_length as u32;
-            let position = Position {
-                line: last_line,
-                character: 0,
-            };
 
             let walker = ChainWalker::new(&code, 2);
-            let (start_line, start_col) = walker.find_chain_start(position);
+            let (start_line, start_col) = walker.find_chain_start(last_line);
 
             prop_assert_eq!(start_line, 0);
             prop_assert_eq!(start_col, leading_spaces as u32);
@@ -2193,13 +2175,9 @@ mod tests {
             let code = generate_pipe_chain(chain_length, ChainOperator::Tilde, leading_spaces);
 
             let last_line = chain_length as u32;
-            let position = Position {
-                line: last_line,
-                character: 0,
-            };
 
             let walker = ChainWalker::new(&code, 2);
-            let (start_line, start_col) = walker.find_chain_start(position);
+            let (start_line, start_col) = walker.find_chain_start(last_line);
 
             prop_assert_eq!(start_line, 0);
             prop_assert_eq!(start_col, leading_spaces as u32);
@@ -2217,13 +2195,9 @@ mod tests {
             let code = generate_pipe_chain(chain_length, ChainOperator::CustomInfix, leading_spaces);
 
             let last_line = chain_length as u32;
-            let position = Position {
-                line: last_line,
-                character: 0,
-            };
 
             let walker = ChainWalker::new(&code, 2);
-            let (start_line, start_col) = walker.find_chain_start(position);
+            let (start_line, start_col) = walker.find_chain_start(last_line);
 
             prop_assert_eq!(start_line, 0);
             prop_assert_eq!(start_col, leading_spaces as u32);
@@ -2245,13 +2219,8 @@ mod tests {
 
             let code = generate_pipe_chain(chain_length, operator, 0);
 
-            let position = Position {
-                line: cursor_line as u32,
-                character: 0,
-            };
-
             let walker = ChainWalker::new(&code, 2);
-            let (start_line, start_col) = walker.find_chain_start(position);
+            let (start_line, start_col) = walker.find_chain_start(cursor_line as u32);
 
             // Chain start should always be line 0 regardless of cursor position
             prop_assert_eq!(
@@ -2419,10 +2388,7 @@ mod tests {
         // Cursor on line 1; the walk steps back over the `%>%` line to line 0.
         let source = "data %>%\n  step1()";
         let walker = ChainWalker::new(source, 2);
-        let (line, col) = walker.find_chain_start(Position {
-            line: 1,
-            character: 0,
-        });
+        let (line, col) = walker.find_chain_start(1);
         assert_eq!(line, 0);
         assert_eq!(col, 0);
     }
@@ -2432,10 +2398,7 @@ mod tests {
         // Cursor on line 2; the walk steps back over two `%>%` lines to line 0.
         let source = "data %>%\n  step1() %>%\n  step2()";
         let walker = ChainWalker::new(source, 2);
-        let (line, col) = walker.find_chain_start(Position {
-            line: 2,
-            character: 0,
-        });
+        let (line, col) = walker.find_chain_start(2);
         assert_eq!(line, 0);
         assert_eq!(col, 0);
     }
@@ -2445,10 +2408,7 @@ mod tests {
         // Cursor on line 1; the walk steps back to the indented chain-start line.
         let source = "  data %>%\n    step1()";
         let walker = ChainWalker::new(source, 2);
-        let (line, col) = walker.find_chain_start(Position {
-            line: 1,
-            character: 0,
-        });
+        let (line, col) = walker.find_chain_start(1);
         assert_eq!(line, 0);
         assert_eq!(col, 2);
     }
@@ -2459,11 +2419,7 @@ mod tests {
         let walker = ChainWalker::new(code, 2);
 
         // Cursor on line 2 (select line)
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         // Chain start should be line 0 (result <- data %>%)
         assert_eq!(start_line, 0);
@@ -2475,11 +2431,7 @@ mod tests {
         let code = "data |>\n  filter(x) |>\n  select(y)";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
@@ -2490,11 +2442,7 @@ mod tests {
         let code = "ggplot(data) +\n  geom_point() +\n  theme_minimal()";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
@@ -2505,11 +2453,7 @@ mod tests {
         let code = "y ~\n  x1 +\n  x2";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
@@ -2520,11 +2464,7 @@ mod tests {
         let code = "x %myop%\n  y %myop%\n  z";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
@@ -2535,11 +2475,7 @@ mod tests {
         let code = "data %>%  # comment\n  filter(x) %>%  # another comment\n  select(y)";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
@@ -2550,11 +2486,7 @@ mod tests {
         let code = "  result <- data %>%\n    filter(x) %>%\n    select(y)";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 2); // "result" starts at column 2 (after 2 spaces)
@@ -2566,11 +2498,7 @@ mod tests {
         let walker = ChainWalker::new(code, 2);
 
         // Cursor on line 2
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         // No chain, so start should be line 2 itself
         assert_eq!(start_line, 2);
@@ -2582,11 +2510,7 @@ mod tests {
         let code = "data %>% filter(x)";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(0);
 
         // Single line, chain start is line 0
         assert_eq!(start_line, 0);
@@ -2599,11 +2523,7 @@ mod tests {
         let walker = ChainWalker::new(code, 2);
 
         // Cursor on line 1 (step1 line)
-        let position = Position {
-            line: 1,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(1);
 
         // Chain start should still be line 0
         assert_eq!(start_line, 0);
@@ -2616,11 +2536,7 @@ mod tests {
         let code = "x %in%\n  y";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 1,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(1);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
@@ -2632,11 +2548,7 @@ mod tests {
         let code = "data %>%\n  filter(x) |>\n  mutate(y = y + 1)";
         let walker = ChainWalker::new(code, 2);
 
-        let position = Position {
-            line: 2,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(2);
 
         assert_eq!(start_line, 0);
         assert_eq!(start_col, 0);
@@ -2648,11 +2560,7 @@ mod tests {
         let code = "\tresult <- data %>%\n\t\tfilter(x)";
         let walker = ChainWalker::new(code, 4);
 
-        let position = Position {
-            line: 1,
-            character: 0,
-        };
-        let (start_line, start_col) = walker.find_chain_start(position);
+        let (start_line, start_col) = walker.find_chain_start(1);
 
         assert_eq!(start_line, 0);
         // One tab with tab_size=4 → visual column 4
