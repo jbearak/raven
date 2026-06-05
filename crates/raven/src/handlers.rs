@@ -14069,14 +14069,18 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     Some(default) => format!("{} = {}", name, default),
                     None => name.to_string(),
                 };
+                // `line` is in the masked-analysis-text coordinate system (the
+                // source's `doc.tree` is parsed from `analysis_text()`), so extract
+                // roxygen from the analysis text — using raw `text()` could misread
+                // an Rmd prose `#` heading above a chunk as a comment. Matches
+                // step 3's use of the analysis text.
                 let param_doc = match &signature.source {
-                    crate::parameter_resolver::SignatureSource::CurrentFile { uri, line }
-                    | crate::parameter_resolver::SignatureSource::CrossFile { uri, line } => {
-                        // `line` is in the masked-analysis-text coordinate system
-                        // (the source's `doc.tree` is parsed from `analysis_text()`),
-                        // so extract roxygen from the same text — using raw `text()`
-                        // could misread an Rmd prose `#` heading above a chunk as a
-                        // comment. Matches step 3's use of the analysis text.
+                    // Same document as the hover: reuse the analysis text already in
+                    // hand rather than re-fetching and re-cloning it.
+                    crate::parameter_resolver::SignatureSource::CurrentFile { line, .. } => {
+                        crate::roxygen::user_function_param_doc(&text, *line, name)
+                    }
+                    crate::parameter_resolver::SignatureSource::CrossFile { uri, line } => {
                         state.get_document(uri).and_then(|doc| {
                             crate::roxygen::user_function_param_doc(
                                 &doc.analysis_text(),

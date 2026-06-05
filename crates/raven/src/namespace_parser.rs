@@ -310,52 +310,13 @@ pub fn parse_description_field_pub(content: &str, field_name: &str) -> Vec<Strin
 
 /// Extracts the value of a named field from DESCRIPTION (DCF) content and parses it into package names.
 ///
-/// Reads the raw field value via [`extract_raw_field`] and then parses it into
+/// Reads the raw field value via the shared DCF parser
+/// [`crate::package_namespace::parse_dcf_field_pub`] and then parses it into
 /// package names (version constraints are stripped and the `R` entry is excluded).
 fn parse_description_field(content: &str, field_name: &str) -> Vec<String> {
-    match extract_raw_field(content, field_name) {
+    match crate::package_namespace::parse_dcf_field_pub(content, field_name) {
         Some(value) => parse_depends_value(&value),
         None => Vec::new(),
-    }
-}
-
-/// Extracts a single DCF field's raw value from DESCRIPTION content.
-///
-/// Locates `field_name:` at the start of a line, then folds the inline value and
-/// any continuation lines (those beginning with whitespace) into one string with
-/// single-space separators, stopping at the next non-continuation line. Returns
-/// `None` if the field is absent or empty after trimming. This is the shared
-/// field-location/continuation machinery behind both [`parse_description_field`]
-/// (dependency lists) and [`parse_description_metadata_str`] (free-text fields).
-fn extract_raw_field(content: &str, field_name: &str) -> Option<String> {
-    let field_prefix = format!("{}:", field_name);
-    let mut field_value = String::new();
-    let mut in_field = false;
-
-    for line in content.lines() {
-        if let Some(value) = line.strip_prefix(&field_prefix) {
-            // Found the field, extract the value after the colon
-            in_field = true;
-            field_value.push_str(value.trim());
-        } else if in_field {
-            // Check if this is a continuation line (starts with whitespace)
-            if line.starts_with(' ') || line.starts_with('\t') {
-                if !field_value.is_empty() {
-                    field_value.push(' ');
-                }
-                field_value.push_str(line.trim());
-            } else {
-                // New field or blank line, stop reading
-                break;
-            }
-        }
-    }
-
-    let trimmed = field_value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
     }
 }
 
@@ -371,13 +332,14 @@ pub struct PackageDescription {
 /// Parses the `Title` and `Description` free-text fields from DESCRIPTION content.
 ///
 /// Unlike [`parse_description_depends`], these are prose fields, so each value is
-/// returned verbatim (continuation lines folded with single spaces) without the
-/// comma-splitting / version-stripping / `R`-filtering applied to dependency
-/// fields. Missing or blank fields yield `None`.
+/// returned verbatim (via the shared [`crate::package_namespace::parse_dcf_field_pub`],
+/// which folds continuation lines and skips DCF blank-paragraph `.` separators)
+/// without the comma-splitting / version-stripping / `R`-filtering applied to
+/// dependency fields. Missing or blank fields yield `None`.
 pub fn parse_description_metadata_str(content: &str) -> PackageDescription {
     PackageDescription {
-        title: extract_raw_field(content, "Title"),
-        description: extract_raw_field(content, "Description"),
+        title: crate::package_namespace::parse_dcf_field_pub(content, "Title"),
+        description: crate::package_namespace::parse_dcf_field_pub(content, "Description"),
     }
 }
 
