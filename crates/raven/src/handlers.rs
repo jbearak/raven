@@ -14070,7 +14070,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     None => name.to_string(),
                 };
                 // `line` is in the masked-analysis-text coordinate system (the
-                // source's `doc.tree` is parsed from `analysis_text()`), so extract
+                // source's tree is parsed from `analysis_text()`), so extract
                 // roxygen from the analysis text — using raw `text()` could misread
                 // an Rmd prose `#` heading above a chunk as a comment. Matches
                 // step 3's use of the analysis text.
@@ -14080,14 +14080,17 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     crate::parameter_resolver::SignatureSource::CurrentFile { line, .. } => {
                         crate::roxygen::user_function_param_doc(&text, *line, name)
                     }
+                    // A sourced file may be indexed/cached but not open. Read its
+                    // analysis text via the same multi-store path the signature
+                    // resolved through (`get_text_and_tree`), not open documents
+                    // only — otherwise `@param` docs silently vanish for the common
+                    // closed-helper-file case.
                     crate::parameter_resolver::SignatureSource::CrossFile { uri, line } => {
-                        state.get_document(uri).and_then(|doc| {
-                            crate::roxygen::user_function_param_doc(
-                                &doc.analysis_text(),
-                                *line,
-                                name,
-                            )
-                        })
+                        crate::parameter_resolver::get_text_and_tree(state, uri).and_then(
+                            |(src_text, _)| {
+                                crate::roxygen::user_function_param_doc(&src_text, *line, name)
+                            },
+                        )
                     }
                     crate::parameter_resolver::SignatureSource::RSubprocess { .. } => None,
                 };
@@ -38684,37 +38687,56 @@ f(param = 5)
     }
 
     #[test]
-    fn test_hover_named_arg_cross_file_param_doc() {
-        // A named-arg label that resolves to a function defined in a *sourced*
-        // file shows the formal + default + the @param doc read from that other
-        // document (exercises the CrossFile arm of the step-2 @param lookup).
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let workspace_path = temp_dir.path();
-        let main_path = workspace_path.join("main.R");
-        let helpers_path = workspace_path.join("helpers.R");
-
-        let helpers_code =
-            "#' @param param the tuning knob\nf <- function(x, param = 10) x + param\n";
-        let main_code = "source(\"helpers.R\")\nf(param = 5)\n";
-        std::fs::write(&helpers_path, helpers_code).unwrap();
-        std::fs::write(&main_path, main_code).unwrap();
-
-        let workspace_url = Url::from_file_path(workspace_path).unwrap();
-        let main_url = Url::from_file_path(&main_path).unwrap();
-        let helpers_url = Url::from_file_path(&helpers_path).unwrap();
+    fn test_hover_named_arg_cross_file_param_doc_closed_helper() {
+        // A named-arg label that resolves to a function in a *sourced* file shows
+        // the formal + default + the @param doc read from that file — even when
+        // the helper is INDEXED but NOT open. Regression: the @param doc was read
+        // from open documents only, so it silently vanished for closed helpers.
+        // Here helpers.R is registered in the workspace index, never in
+        // `state.documents`, so the lookup must go through the multi-store
+        // `get_text_and_tree` path.
+        use std::sync::Arc;
 
         let mut state = WorldState::new(Vec::new());
-        state.workspace_folders = vec![workspace_url];
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
         state.workspace_scan_complete = true;
 
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_url = Url::parse("file:///workspace/helpers.R").unwrap();
+
+        let main_code = "source(\"helpers.R\")\nf(param = 5)\n";
+        let helpers_code =
+            "#' @param param the tuning knob\nf <- function(x, param = 10) x + param\n";
+
+        // main.R is open; helpers.R is only indexed (closed).
         state
             .documents
             .insert(main_url.clone(), Document::new(main_code, None));
-        state
-            .documents
-            .insert(helpers_url.clone(), Document::new(helpers_code, None));
+
+        let helpers_doc = Document::new_with_uri(helpers_code, None, &helpers_url);
+        let helpers_metadata = Arc::new(crate::cross_file::extract_metadata(helpers_code));
+        let helpers_artifacts =
+            Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                &helpers_url,
+                helpers_doc.tree.as_ref().expect("helpers parse tree"),
+                helpers_code,
+                Some(&helpers_metadata),
+            ));
+        let entry = crate::workspace_index::IndexEntry {
+            contents: helpers_doc.contents.clone(),
+            tree: helpers_doc.tree.clone(),
+            loaded_packages: helpers_doc.loaded_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: helpers_code.len() as u64,
+                content_hash: None,
+            },
+            metadata: helpers_metadata,
+            artifacts: helpers_artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(helpers_url.clone(), entry));
+
         state.cross_file_graph.update_file(
             &main_url,
             &crate::cross_file::extract_metadata(main_code),
@@ -38728,14 +38750,20 @@ f(param = 5)
             |_| None,
         );
 
+        // Precondition: the helper is genuinely closed (open-document lookup misses).
+        assert!(
+            state.get_document(&helpers_url).is_none(),
+            "helper must be closed (indexed only) for this regression test"
+        );
+
         // `param` in `f(param = 5)` (line 1 of main.R) starts at column 2.
         let position = Position::new(1, 2);
-        let hover =
-            hover_blocking(&state, &main_url, position).expect("cross-file named-arg hover");
+        let hover = hover_blocking(&state, &main_url, position)
+            .expect("cross-file named-arg hover (closed helper)");
         if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
             assert!(
                 value.contains("param = 10"),
-                "should show the default from the cross-file definition: {value}"
+                "should show the default from the closed cross-file definition: {value}"
             );
             assert!(
                 value.contains("parameter of `f`"),
@@ -38743,7 +38771,7 @@ f(param = 5)
             );
             assert!(
                 value.contains("the tuning knob"),
-                "should show the @param doc read from the sourced file: {value}"
+                "should show the @param doc read from the INDEXED (closed) helper: {value}"
             );
         } else {
             panic!("expected markup content");
