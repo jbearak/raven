@@ -71,13 +71,23 @@ fetch() {
 # `--runiverse-{cran,bioc}-min` makes the Rust ingester abort unless the parsed
 # *distinct* package count meets a floor derived from that universe's `/api/ls`
 # count — the real guard against shipping a degraded names.db. (No byte-level
-# preflight here: a grep can't tell a top-level `Package` key from a nested one,
-# and the Rust parser already reads the whole dump and errors on a truncated or
-# corrupt stream, so the floor it enforces is the only check worth keeping.)
-# DUMP_TOLERANCE is tight (1%): the dump normally has slightly MORE docs than
-# `/api/ls` (duplicate/meta docs), so the only legitimate shortfall is brief
-# build-vs-listing skew of a handful of packages.
-DUMP_TOLERANCE="${DUMP_TOLERANCE:-0.01}"
+# preflight here: a grep can't tell a top-level `Package` key from a nested one.
+# Note the Rust parser only errors on *framing* corruption: a dump truncated
+# exactly at a BSON document boundary parses cleanly at EOF, so the distinct-count
+# floor is the ONLY thing between a short download and a published-but-incomplete
+# names.db.)
+#
+# The floor is `/api/ls` minus a small ABSOLUTE slack, not a percentage. A
+# truncated download drops an absolute number of packages, and so does genuine
+# build-vs-listing skew — neither scales with universe size, so a percentage
+# tolerance just grows the blind spot on big universes (1% of CRAN's ~24k is
+# ~240 packages a clean-prefix truncation could hide). Empirically the dump's
+# distinct count equals `/api/ls` exactly, so DUMP_MAX_SHORTFALL only needs to
+# absorb the rare handful of packages added/removed between the two snapshots.
+DUMP_MAX_SHORTFALL="${DUMP_MAX_SHORTFALL:-25}"
+case "$DUMP_MAX_SHORTFALL" in
+  '' | *[!0-9]*) echo "error: DUMP_MAX_SHORTFALL must be a non-negative integer (got '$DUMP_MAX_SHORTFALL')" >&2; exit 2 ;;
+esac
 args=( packages build-shipped-db
   --output "$OUT"
   --snapshot-date "$(date -u +%Y-%m-%d)"
@@ -98,14 +108,14 @@ for host in cran.r-universe.dev bioc.r-universe.dev; do
   [ "$ls_count" -gt 0 ] \
     || { echo "error: ${host}/api/ls did not return a non-empty package array; aborting" >&2; exit 1; }
 
-  # Floor passed to the authoritative Rust gate. LC_ALL=C pins the decimal point
-  # (a comma-decimal locale would misparse the tolerance); %d truncates.
-  min="$(LC_ALL=C awk "BEGIN{printf \"%d\", $ls_count * (1 - $DUMP_TOLERANCE)}")"
-  # A non-positive floor is meaningless here (e.g. DUMP_TOLERANCE>=1 or
-  # non-numeric). Refuse it early with a clear message; Rust also rejects
-  # --runiverse-*-min 0, but failing here keeps the error actionable.
+  # Floor passed to the authoritative Rust gate: the distinct count must be
+  # within DUMP_MAX_SHORTFALL of the listing. Pure integer math — no awk/locale.
+  min=$(( ls_count - DUMP_MAX_SHORTFALL ))
+  # A non-positive floor is meaningless (DUMP_MAX_SHORTFALL >= ls_count). Refuse
+  # it early with a clear message; Rust also rejects --runiverse-*-min 0, but
+  # failing here keeps the error actionable.
   [ "${min:-0}" -ge 1 ] 2>/dev/null \
-    || { echo "error: coverage floor computed as '${min}' (check DUMP_TOLERANCE='${DUMP_TOLERANCE}'); aborting" >&2; exit 1; }
+    || { echo "error: coverage floor computed as '${min}' (check DUMP_MAX_SHORTFALL='${DUMP_MAX_SHORTFALL}'); aborting" >&2; exit 1; }
   echo "${host}: /api/ls lists ${ls_count} packages (coverage floor ${min})"
   args+=( "--runiverse-${short}" "$dump" "--runiverse-${short}-min" "$min" )
 done
