@@ -175,6 +175,12 @@ pub fn parse_build_shipped_db_args(
             s => return Err(format!("unknown flag: {s}")),
         }
     }
+    if runiverse_cran_min.is_some() && runiverse_cran.is_none() {
+        return Err("--runiverse-cran-min requires --runiverse-cran".into());
+    }
+    if runiverse_bioc_min.is_some() && runiverse_bioc.is_none() {
+        return Err("--runiverse-bioc-min requires --runiverse-bioc".into());
+    }
     Ok(BuildShippedDbArgs {
         capture_reference: true,
         runiverse_cran,
@@ -1619,6 +1625,26 @@ mod tests {
             err.contains("--runiverse-cran-min") && err.contains("integer"),
             "expected an integer-parse error, got: {err}"
         );
+    }
+
+    #[test]
+    fn parse_build_shipped_db_rejects_orphaned_runiverse_min() {
+        for (min_flag, path_flag) in [
+            ("--runiverse-cran-min", "--runiverse-cran"),
+            ("--runiverse-bioc-min", "--runiverse-bioc"),
+        ] {
+            let err = super::parse_build_shipped_db_args(
+                [
+                    min_flag.to_string(),
+                    "1".to_string(),
+                    "--output".to_string(),
+                    "out.db".to_string(),
+                ]
+                .into_iter(),
+            )
+            .unwrap_err();
+            assert_eq!(err, format!("{min_flag} requires {path_flag}"));
+        }
     }
 
     #[test]
