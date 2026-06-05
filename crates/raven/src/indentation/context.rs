@@ -145,6 +145,33 @@ pub enum OperatorType {
     CustomInfix,
 }
 
+/// Classifies the continuation operator a line ends with, if any.
+///
+/// `trimmed` must already have its trailing whitespace and comment stripped
+/// (e.g. via `strip_trailing_comment(line).trim_end()`).
+///
+/// This is the single source of truth for "does this line end in a
+/// continuation operator, and which one." Both the operator-context detectors
+/// (which need the [`OperatorType`]) and [`ChainWalker`]'s backward walk (which
+/// needs only `.is_some()`) route through it, so the two cannot drift. The
+/// `%>%` arm is tested before the generic `%word%` arm so magrittr pipes
+/// classify as [`OperatorType::MagrittrPipe`], not [`OperatorType::CustomInfix`].
+fn classify_continuation_operator(trimmed: &str) -> Option<OperatorType> {
+    if trimmed.ends_with("|>") {
+        Some(OperatorType::Pipe)
+    } else if trimmed.ends_with("%>%") {
+        Some(OperatorType::MagrittrPipe)
+    } else if trimmed.ends_with('+') {
+        Some(OperatorType::Plus)
+    } else if trimmed.ends_with('~') {
+        Some(OperatorType::Tilde)
+    } else if trimmed.ends_with('%') && is_custom_infix_ending(trimmed) {
+        Some(OperatorType::CustomInfix)
+    } else {
+        None
+    }
+}
+
 /// Detects the syntactic context at the given position for indentation.
 ///
 /// This function analyzes the tree-sitter AST to determine what kind of
@@ -448,25 +475,11 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
     {
         let trimmed = strip_trailing_comment(prev_line).trim_end();
 
-        // Check for continuation operators
-        let operator_type = if trimmed.ends_with("|>") {
-            Some(OperatorType::Pipe)
-        } else if trimmed.ends_with("%>%") {
-            Some(OperatorType::MagrittrPipe)
-        } else if trimmed.ends_with('+') {
-            Some(OperatorType::Plus)
-        } else if trimmed.ends_with('~') {
-            Some(OperatorType::Tilde)
-        } else if trimmed.ends_with('%') && is_custom_infix_ending(trimmed) {
-            Some(OperatorType::CustomInfix)
-        } else {
-            None
-        };
-
-        if let Some(op_type) = operator_type {
-            // Find chain start using simple backward walk
+        if let Some(op_type) = classify_continuation_operator(trimmed) {
+            // `position.line - 1` is the operator-terminated line just checked;
+            // pass the cursor `position` per `find_chain_start`'s contract.
             let (chain_start_line, chain_start_col) =
-                find_chain_start_heuristic(source, position.line - 1, tab_size);
+                ChainWalker::new(source, tab_size).find_chain_start(position);
             return IndentContext::AfterContinuationOperator {
                 chain_start_line,
                 chain_start_col,
@@ -583,53 +596,6 @@ fn find_matching_opener_heuristic(
     }
 
     None
-}
-
-/// Finds the chain start using simple backward line walking.
-///
-/// # Arguments
-///
-/// * `source` - The source code text
-/// * `start_line` - The line to start walking backward from
-///
-/// # Returns
-///
-/// `(line, col)` of the chain start.
-fn find_chain_start_heuristic(source: &str, start_line: u32, tab_size: u32) -> (u32, u32) {
-    let mut current_line = start_line;
-    let max_iterations = 1000;
-    let mut iterations = 0;
-
-    while current_line > 0 && iterations < max_iterations {
-        if let Some(prev_line_text) = source.lines().nth((current_line - 1) as usize) {
-            let trimmed = strip_trailing_comment(prev_line_text).trim_end();
-
-            // Check if previous line ends with continuation operator
-            let ends_with_op = trimmed.ends_with("|>")
-                || trimmed.ends_with("%>%")
-                || trimmed.ends_with('+')
-                || trimmed.ends_with('~')
-                || (trimmed.ends_with('%') && is_custom_infix_ending(trimmed));
-
-            if !ends_with_op {
-                break;
-            }
-        } else {
-            break;
-        }
-
-        current_line -= 1;
-        iterations += 1;
-    }
-
-    if iterations >= max_iterations {
-        log::warn!("find_chain_start_heuristic: exceeded max iterations");
-    }
-
-    // Get the visual column of first non-whitespace on chain start line
-    let col = get_line_indent(source, current_line, tab_size);
-
-    (current_line, col)
 }
 
 /// Finds an unclosed delimiter using bracket counting.
@@ -1060,28 +1026,11 @@ fn detect_continuation_operator(
     let prev_line = position.line - 1;
     let line_text = source.lines().nth(prev_line as usize)?;
 
-    // Strip trailing whitespace and comments
+    // Strip trailing whitespace and comments, then classify the line ending.
+    // An empty/whitespace-only line classifies as `None`, so no separate guard.
     let trimmed = strip_trailing_comment(line_text);
     let trimmed = trimmed.trim_end();
-
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    // Determine operator type from line ending
-    let operator_type = if trimmed.ends_with("|>") {
-        Some(OperatorType::Pipe)
-    } else if trimmed.ends_with("%>%") {
-        Some(OperatorType::MagrittrPipe)
-    } else if trimmed.ends_with('+') {
-        Some(OperatorType::Plus)
-    } else if trimmed.ends_with('~') {
-        Some(OperatorType::Tilde)
-    } else if trimmed.ends_with('%') && is_custom_infix_ending(trimmed) {
-        Some(OperatorType::CustomInfix)
-    } else {
-        None
-    }?;
+    let operator_type = classify_continuation_operator(trimmed)?;
 
     // Try AST-based chain start detection first, fall back to text-based heuristic
     let (chain_start_line, chain_start_col) = find_chain_start_from_ast(tree, source, prev_line)
@@ -1364,7 +1313,11 @@ impl<'a> ChainWalker<'a> {
     ///
     /// # Arguments
     ///
-    /// * `start_position` - The position to start walking backward from
+    /// * `start_position` - The cursor position. The walk begins at the line
+    ///   immediately above it (`start_position.line - 1`) and proceeds upward.
+    ///   Callers pass the cursor position after confirming that line ends with a
+    ///   continuation operator; a `start_position` whose previous line does not
+    ///   end in one yields `start_position.line` back unchanged.
     ///
     /// # Returns
     ///
@@ -1393,8 +1346,9 @@ impl<'a> ChainWalker<'a> {
 
     /// Checks if a line ends with a continuation operator.
     ///
-    /// Continuation operators are: `|>`, `%>%`, `+`, `~`, and custom infix `%word%`.
-    /// The check ignores trailing whitespace and comments.
+    /// Delegates the operator vocabulary to [`classify_continuation_operator`]
+    /// (the single source of truth); trailing whitespace and comments are
+    /// stripped before the check.
     ///
     /// # Arguments
     ///
@@ -1412,31 +1366,7 @@ impl<'a> ChainWalker<'a> {
         let trimmed = strip_trailing_comment(line_text);
         let trimmed = trimmed.trim_end();
 
-        if trimmed.is_empty() {
-            return false;
-        }
-
-        // Check for native pipe |>
-        if trimmed.ends_with("|>") {
-            return true;
-        }
-
-        // Check for magrittr pipe %>% and custom infix %word%
-        if trimmed.ends_with('%') && is_custom_infix_ending(trimmed) {
-            return true;
-        }
-
-        // Check for + operator at end
-        if trimmed.ends_with('+') {
-            return true;
-        }
-
-        // Check for ~ operator at end
-        if trimmed.ends_with('~') {
-            return true;
-        }
-
-        false
+        classify_continuation_operator(trimmed).is_some()
     }
 
     /// Gets the column of the first non-whitespace character on a line.
@@ -1920,30 +1850,6 @@ mod tests {
         let source = "x <- 1\n)"; // Unmatched closing paren
         let result = find_matching_opener_heuristic(source, 1, ')');
         assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_find_chain_start_heuristic_simple() {
-        let source = "data %>%\n  step1()";
-        let (line, col) = find_chain_start_heuristic(source, 0, 2);
-        assert_eq!(line, 0);
-        assert_eq!(col, 0);
-    }
-
-    #[test]
-    fn test_find_chain_start_heuristic_multi_line() {
-        let source = "data %>%\n  step1() %>%\n  step2()";
-        let (line, col) = find_chain_start_heuristic(source, 1, 2);
-        assert_eq!(line, 0);
-        assert_eq!(col, 0);
-    }
-
-    #[test]
-    fn test_find_chain_start_heuristic_indented() {
-        let source = "  data %>%\n    step1()";
-        let (line, col) = find_chain_start_heuristic(source, 0, 2);
-        assert_eq!(line, 0);
-        assert_eq!(col, 2); // First non-whitespace at column 2
     }
 
     #[test]
@@ -2507,6 +2413,45 @@ mod tests {
     // ========================================================================
     // ChainWalker Tests
     // ========================================================================
+
+    #[test]
+    fn test_chain_walker_find_chain_start_simple() {
+        // Cursor on line 1; the walk steps back over the `%>%` line to line 0.
+        let source = "data %>%\n  step1()";
+        let walker = ChainWalker::new(source, 2);
+        let (line, col) = walker.find_chain_start(Position {
+            line: 1,
+            character: 0,
+        });
+        assert_eq!(line, 0);
+        assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn test_chain_walker_find_chain_start_multi_line() {
+        // Cursor on line 2; the walk steps back over two `%>%` lines to line 0.
+        let source = "data %>%\n  step1() %>%\n  step2()";
+        let walker = ChainWalker::new(source, 2);
+        let (line, col) = walker.find_chain_start(Position {
+            line: 2,
+            character: 0,
+        });
+        assert_eq!(line, 0);
+        assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn test_chain_walker_find_chain_start_indented() {
+        // Cursor on line 1; the walk steps back to the indented chain-start line.
+        let source = "  data %>%\n    step1()";
+        let walker = ChainWalker::new(source, 2);
+        let (line, col) = walker.find_chain_start(Position {
+            line: 1,
+            character: 0,
+        });
+        assert_eq!(line, 0);
+        assert_eq!(col, 2);
+    }
 
     #[test]
     fn test_chain_walker_simple_pipe() {
