@@ -101,9 +101,9 @@ for host in cran.r-universe.dev bioc.r-universe.dev; do
   # Floor passed to the authoritative Rust gate. LC_ALL=C pins the decimal point
   # (a comma-decimal locale would misparse the tolerance); %d truncates.
   min="$(LC_ALL=C awk "BEGIN{printf \"%d\", $ls_count * (1 - $DUMP_TOLERANCE)}")"
-  # A non-positive floor would silently disable the gate (e.g. DUMP_TOLERANCE>=1
-  # or non-numeric). Refuse it: passing --runiverse-*-min 0 to Rust accepts any
-  # coverage, defeating the whole guard.
+  # A non-positive floor is meaningless here (e.g. DUMP_TOLERANCE>=1 or
+  # non-numeric). Refuse it early with a clear message; Rust also rejects
+  # --runiverse-*-min 0, but failing here keeps the error actionable.
   [ "${min:-0}" -ge 1 ] 2>/dev/null \
     || { echo "error: coverage floor computed as '${min}' (check DUMP_TOLERANCE='${DUMP_TOLERANCE}'); aborting" >&2; exit 1; }
   echo "${host}: /api/ls lists ${ls_count} packages (coverage floor ${min})"
