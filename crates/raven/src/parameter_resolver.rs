@@ -1068,6 +1068,62 @@ mod tests {
         assert_eq!(params.len(), 2); // Second definition has 2 params
     }
 
+    #[test]
+    fn test_resolve_redefined_function_is_position_scoped() {
+        // The user-signature cache was removed because a position-insensitive
+        // `uri#name` key served stale formals when a file redefined a function.
+        // This guards the `resolve()` entry point (used by signature-help and
+        // completion) against re-introducing such a cache: resolution must
+        // follow whichever definition is in scope at the cursor. Hover calls
+        // `resolve_user_only` directly, so its redefinition test does not cover
+        // the `resolve()` path the other two consumers go through.
+        let mut state = WorldState::new(vec![]);
+        let uri = Url::parse("file:///redef.R").unwrap();
+        let code = "\
+f <- function(alpha) alpha
+f(alpha = 1)
+f <- function(beta) beta
+f(beta = 2)
+";
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let cache = SignatureCache::new(10);
+
+        let names = |sig: FunctionSignature| {
+            sig.parameters
+                .into_iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+        };
+
+        // At the earlier call (line 1) only the `alpha` definition is in scope.
+        let early = resolve(
+            &state,
+            &cache,
+            "f",
+            None,
+            false,
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 2),
+        )
+        .expect("earlier call resolves to a user signature");
+        assert_eq!(names(early), vec!["alpha"]);
+
+        // At the later call (line 3) the `beta` redefinition shadows it.
+        let late = resolve(
+            &state,
+            &cache,
+            "f",
+            None,
+            false,
+            &uri,
+            tower_lsp::lsp_types::Position::new(3, 2),
+        )
+        .expect("later call resolves to a user signature");
+        assert_eq!(names(late), vec!["beta"]);
+    }
+
     // -- Comment between assignment and function definition --
 
     #[test]

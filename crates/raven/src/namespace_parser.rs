@@ -289,14 +289,7 @@ fn parse_s3method_args(args: &str) -> Option<String> {
 /// assert!(deps.iter().all(|s: &String| !s.contains('(')));
 /// ```
 pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>> {
-    let content = fs::read_to_string(description_path).map_err(|e| {
-        anyhow!(
-            "Failed to read DESCRIPTION file {:?}: {}",
-            description_path,
-            e
-        )
-    })?;
-
+    let content = read_description(description_path)?;
     Ok(parse_description_field(&content, "Depends"))
 }
 
@@ -350,15 +343,22 @@ pub fn parse_description_metadata_str(content: &str) -> PackageDescription {
 /// file cannot be read — a present-but-fieldless DESCRIPTION yields a
 /// `PackageDescription` with `None` fields.
 pub fn parse_description_metadata(description_path: &Path) -> Result<PackageDescription> {
-    let content = fs::read_to_string(description_path).map_err(|e| {
+    Ok(parse_description_metadata_str(&read_description(
+        description_path,
+    )?))
+}
+
+/// Reads a DESCRIPTION (DCF) file to a string, mapping any I/O error to a
+/// consistent message. Shared by [`parse_description_depends`] and
+/// [`parse_description_metadata`].
+fn read_description(description_path: &Path) -> Result<String> {
+    fs::read_to_string(description_path).map_err(|e| {
         anyhow!(
             "Failed to read DESCRIPTION file {:?}: {}",
             description_path,
             e
         )
-    })?;
-
-    Ok(parse_description_metadata_str(&content))
+    })
 }
 
 /// Extracts package names from a DESCRIPTION "Depends" field value.
