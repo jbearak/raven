@@ -38683,6 +38683,73 @@ f(param = 5)
         );
     }
 
+    #[test]
+    fn test_hover_named_arg_cross_file_param_doc() {
+        // A named-arg label that resolves to a function defined in a *sourced*
+        // file shows the formal + default + the @param doc read from that other
+        // document (exercises the CrossFile arm of the step-2 @param lookup).
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helpers_path = workspace_path.join("helpers.R");
+
+        let helpers_code =
+            "#' @param param the tuning knob\nf <- function(x, param = 10) x + param\n";
+        let main_code = "source(\"helpers.R\")\nf(param = 5)\n";
+        std::fs::write(&helpers_path, helpers_code).unwrap();
+        std::fs::write(&main_path, main_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helpers_url = Url::from_file_path(&helpers_path).unwrap();
+
+        let mut state = WorldState::new(Vec::new());
+        state.workspace_folders = vec![workspace_url];
+        state.workspace_scan_complete = true;
+
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state
+            .documents
+            .insert(helpers_url.clone(), Document::new(helpers_code, None));
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            None,
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &helpers_url,
+            &crate::cross_file::extract_metadata(helpers_code),
+            None,
+            |_| None,
+        );
+
+        // `param` in `f(param = 5)` (line 1 of main.R) starts at column 2.
+        let position = Position::new(1, 2);
+        let hover =
+            hover_blocking(&state, &main_url, position).expect("cross-file named-arg hover");
+        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
+            assert!(
+                value.contains("param = 10"),
+                "should show the default from the cross-file definition: {value}"
+            );
+            assert!(
+                value.contains("parameter of `f`"),
+                "should attribute to f: {value}"
+            );
+            assert!(
+                value.contains("the tuning knob"),
+                "should show the @param doc read from the sourced file: {value}"
+            );
+        } else {
+            panic!("expected markup content");
+        }
+    }
+
     // ------------------------------------------------------------------
     // #382 step 4: obj$name / obj@slot members with a local definition
     // (parity with go-to-definition via qualified_resolve)
