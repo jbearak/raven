@@ -34,6 +34,19 @@ pub struct ParameterInfo {
     pub is_dots: bool,
 }
 
+impl ParameterInfo {
+    /// Render the parameter as it appears in a signature: `name = default` when
+    /// a default is present, otherwise the bare `name` (which is `...` for the
+    /// dots parameter, since it carries no default). Single source of truth for
+    /// signature-help labels, parameter-completion labels, and hover.
+    pub fn label(&self) -> String {
+        match &self.default_value {
+            Some(default) => format!("{} = {}", self.name, default),
+            None => self.name.clone(),
+        }
+    }
+}
+
 /// Where a function signature was obtained from.
 #[derive(Debug, Clone)]
 pub enum SignatureSource {

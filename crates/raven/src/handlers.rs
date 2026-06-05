@@ -14071,10 +14071,9 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     .iter()
                     .find(|p| p.name == name && !p.is_dots)
             {
-                let decl = match &param.default_value {
-                    Some(default) => format!("{} = {}", name, default),
-                    None => name.to_string(),
-                };
+                // `param.name == name` (matched above), so `label()` renders the
+                // hovered formal as `name = default` / bare `name`.
+                let decl = param.label();
                 // `line` is in the masked-analysis-text coordinate system (the
                 // source's tree is parsed from `analysis_text()`), so extract
                 // roxygen from the analysis text — using raw `text()` could misread
@@ -14336,16 +14335,7 @@ fn format_signature_label(
         return format!("{}()", name);
     }
 
-    let param_strs: Vec<String> = params
-        .iter()
-        .map(|p| {
-            if let Some(default) = &p.default_value {
-                format!("{} = {}", p.name, default)
-            } else {
-                p.name.clone()
-            }
-        })
-        .collect();
+    let param_strs: Vec<String> = params.iter().map(|p| p.label()).collect();
 
     format!("{}({})", name, param_strs.join(", "))
 }
@@ -14366,14 +14356,8 @@ fn build_parameter_information(
     param: &crate::parameter_resolver::ParameterInfo,
     param_doc: Option<&str>,
 ) -> ParameterInformation {
-    let label = if let Some(default) = &param.default_value {
-        format!("{} = {}", param.name, default)
-    } else {
-        param.name.clone()
-    };
-
     ParameterInformation {
-        label: ParameterLabel::Simple(label),
+        label: ParameterLabel::Simple(param.label()),
         documentation: param_doc.map(|doc| {
             Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
