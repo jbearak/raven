@@ -473,7 +473,8 @@ fn resolve_from_current_file(
     // docs. The parent of a matched `function_definition` is always its
     // assignment — `find_function_definition_before_position` only returns
     // assigned functions — and its start row is the LHS for `<-`/`=` (the value
-    // for `->`), matching cross-file `defined_line`'s anchor.
+    // for `->`), which coincides with cross-file `defined_line` for `<-`/`=`
+    // (multi-line right-assignment is the rare exception).
     let def_line = func_node
         .parent()
         .map_or(func_node.start_position().row, |p| p.start_position().row)

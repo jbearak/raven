@@ -14027,13 +14027,10 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         // Title/Description instead of a `pkg::pkg` help artifact (#382 step 1).
         // The member (RHS) side keeps the qualified help-topic behavior below.
         if node.kind() == "identifier" && is_namespace_package_side(node) {
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: package_metadata_hover(state, name),
-                }),
-                range: Some(node_range),
-            });
+            return Some(markdown_hover(
+                package_metadata_hover(state, name),
+                node_range,
+            ));
         }
 
         let pkg_owned = qualifier_pkg.to_string();
@@ -14049,13 +14046,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             value.push_str(&format!("```r\n{}\n```\n", name));
             value.push_str(&format!("\nfrom {{{}}}", pkg_owned));
         }
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value,
-            }),
-            range: Some(node_range),
-        });
+        return Some(markdown_hover(value, node_range));
     }
 
     // #382 steps 2-4: structural labels that hover can now *resolve* rather than
@@ -14109,13 +14100,10 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     }
                     crate::parameter_resolver::SignatureSource::RSubprocess { .. } => None,
                 };
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: parameter_hover(&decl, Some(funcname), param_doc.as_deref()),
-                    }),
-                    range: Some(node_range),
-                });
+                return Some(markdown_hover(
+                    parameter_hover(&decl, Some(funcname), param_doc.as_deref()),
+                    node_range,
+                ));
             }
         }
 
@@ -14126,13 +14114,10 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             && let Some(func_line) = enclosing_named_function_line(node)
             && let Some(doc) = crate::roxygen::user_function_param_doc(&text, func_line, name)
         {
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: parameter_hover(name, None, Some(&doc)),
-                }),
-                range: Some(node_range),
-            });
+            return Some(markdown_hover(
+                parameter_hover(name, None, Some(&doc)),
+                node_range,
+            ));
         }
 
         // Step 4: an `obj$name` / `obj@slot` member whose container has a *local*
@@ -14147,13 +14132,10 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             )
             && let Some(def_info) = member_definition_info(state, &location)
         {
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: local_definition_hover(state, &def_info, uri),
-                }),
-                range: Some(node_range),
-            });
+            return Some(markdown_hover(
+                local_definition_hover(state, &def_info, uri),
+                node_range,
+            ));
         }
     }
 
@@ -14206,13 +14188,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 value.push_str(&format!("\n\n*Defined in {}*", relative_path));
             }
 
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: Some(node_range),
-            });
+            return Some(markdown_hover(value, node_range));
         }
 
         // Check if this is a package export (source_uri starts with "package:")
@@ -14270,13 +14246,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             }
         };
 
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value,
-            }),
-            range: Some(node_range),
-        });
+        return Some(markdown_hover(value, node_range));
     }
 
     // Check package exports from combined_exports cache (if packages enabled)
@@ -14313,28 +14283,33 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 value.push_str(&format!("\nfrom {{{}}}", pkg_name));
             }
 
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: Some(node_range),
-            });
+            return Some(markdown_hover(value, node_range));
         }
     }
 
     // Fallback to R help system for built-ins and undefined symbols
     if let Some(help_text) = get_help_cached(&state.help_cache, name, None, r_path).await {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: format!("```\n{}\n```", help_text),
-            }),
-            range: Some(node_range),
-        });
+        return Some(markdown_hover(
+            format!("```\n{}\n```", help_text),
+            node_range,
+        ));
     }
     None
 }
+
+/// Build a Markdown-content `Hover` anchored to `range`. Centralizes the
+/// `Hover { Markup(Markdown, value), range: Some(range) }` construction every
+/// branch of [`hover`] shares.
+fn markdown_hover(value: String, range: Range) -> Hover {
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: Some(range),
+    }
+}
+
 // Signature Help
 // ============================================================================
 
