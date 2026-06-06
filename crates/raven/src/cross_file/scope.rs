@@ -1136,6 +1136,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // Must be pushed before the function-scope tree is built below.
     push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
 
+    // Issue #404: model `foreach(...) %do%/%dopar% expr` iterator variables as
+    // synthetic RHS-only scopes. Must be pushed before the function-scope tree
+    // is built below so RHS-local definitions are tagged with this scope.
+    push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
+
     // Sort timeline by *effect* position so the resolver iterates events in
     // execution order. `event_effect_position` uses `visible_from` for Def
     // events, so the binding from `x <- { rm(x); 1 }` is processed after the
@@ -1367,6 +1372,11 @@ pub fn compute_artifacts_with_metadata(
     // their local definitions do not leak into the surrounding server function.
     // Must be pushed before the function-scope tree is built below.
     push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
+
+    // Issue #404: model `foreach(...) %do%/%dopar% expr` iterator variables as
+    // synthetic RHS-only scopes. Must be pushed before the function-scope tree
+    // is built below so RHS-local definitions are tagged with this scope.
+    push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
 
     // Sort timeline by *effect* position so the resolver iterates events in
     // execution order. See `event_effect_position` for why this differs from
@@ -2161,6 +2171,138 @@ fn call_is_shiny_deferred(
         }
         _ => false,
     }
+}
+
+/// Issue #404: model `foreach(...) %do%/%dopar% expr` iterator variables as a
+/// synthetic RHS-only scope.
+///
+/// The named, non-dot arguments of the `foreach(...)` call become parameters
+/// visible only inside the executed expression. This mirrors the useful part of
+/// a `FunctionScope`: outer bindings stay visible, iterator symbols are visible
+/// while the RHS is active, and RHS-local definitions do not leak into the
+/// surrounding scope (they are tagged with this scope by
+/// `annotate_event_function_scopes`). We deliberately do **not** emit normal
+/// `Def` events for the iterators, which would make them visible after the
+/// foreach expression — outside the #404 scope.
+fn push_foreach_iterator_scopes(
+    artifacts: &mut ScopeArtifacts,
+    root: Node,
+    content: &str,
+    line_index: &LineIndex,
+    uri: &Url,
+) {
+    // Cheap pre-filter: `%do%` and `%dopar%` both start with `%do`, so one
+    // substring check covers both (and any future `%do`-family operator) without
+    // duplicating the exact token list that `recognize_foreach_execution` owns.
+    if !content.contains("%do") {
+        return;
+    }
+    collect_foreach_iterator_scopes(root, content, line_index, uri, &mut artifacts.timeline);
+}
+
+/// Walk `node`, appending a `FunctionScope` event for each recognized foreach
+/// execution expression. The event carries the iterator symbols as parameters.
+fn collect_foreach_iterator_scopes(
+    node: Node,
+    text: &str,
+    line_index: &LineIndex,
+    uri: &Url,
+    events: &mut Vec<ScopeEvent>,
+) {
+    if let Some(exec) = crate::foreach::recognize_foreach_execution(node, text) {
+        events.push(foreach_execution_scope_event(node, &exec, line_index, uri));
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_foreach_iterator_scopes(child, text, line_index, uri, events);
+    }
+}
+
+/// Build the synthetic RHS-only `FunctionScope` event for a recognized foreach
+/// execution. The interval spans from the start of the executed expression to
+/// the end of the loop body (see [`foreach_body_end_node`] for why that is not
+/// always the `%do%` operator's immediate `rhs`).
+fn foreach_execution_scope_event(
+    exec_node: Node,
+    exec: &crate::foreach::ForeachExecution,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> ScopeEvent {
+    let (start_line, start_column) = node_start_position_utf16(exec.rhs, line_index);
+    let (end_line, end_column) =
+        node_end_position_utf16(foreach_body_end_node(exec_node), line_index);
+
+    let parameters = exec
+        .iterators
+        .iter()
+        .map(|name_node| foreach_iterator_symbol(*name_node, line_index, uri))
+        .collect();
+
+    ScopeEvent::FunctionScope {
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+        parameters,
+    }
+}
+
+/// Determine the node whose end position bounds the foreach loop body.
+///
+/// `%do%`/`%dopar%` are `%any%` special operators, which bind *tighter* than
+/// `+ - * /` and the comparison operators. So an unbraced body like
+/// `foreach(...) %do% i + j` parses as `(foreach(...) %do% i) + j`: the trailing
+/// `+ j` is a *sibling* of the execution node, not part of its `rhs`. The user
+/// nonetheless means the whole post-operator expression as the body, so we
+/// extend the body to the end of the outermost expression in which the
+/// execution node is the left operand of a *strictly looser* binary operator.
+///
+/// We stop climbing at operators that are **not** strictly looser than `%do%`:
+/// - assignments (`<- = <<- -> ->> :=`): `x <- foreach(...) %do% i` and
+///   `foreach(...) %do% i -> x` capture the loop *result*, so the body ends at
+///   the execution node;
+/// - other special `%...%` operators (kind `special`) and the pipe `|>`, which
+///   share `%do%`'s precedence and are left-associative, so they chain the loop
+///   *result* onward (`foreach(...) %do% x %>% f` is `(foreach %do% x) %>% f`) —
+///   `f` is not the body.
+///
+/// Everything we do climb across (`+ - * / == < > & | ...`) binds strictly
+/// looser than `%do%`, so it is part of the body the user wrote after `%do%`.
+fn foreach_body_end_node(exec_node: Node) -> Node {
+    let mut node = exec_node;
+    while let Some(parent) = node.parent() {
+        if parent.kind() != "binary_operator" {
+            break;
+        }
+        // Only extend when the execution node is the *left* operand; a foreach
+        // execution on the right (`x + foreach(...) %do% i`) already contains
+        // its whole body in `rhs`.
+        if parent.child_by_field_name("lhs").map(|n| n.id()) != Some(node.id()) {
+            break;
+        }
+        if let Some(op) = parent.child_by_field_name("operator")
+            && matches!(
+                op.kind(),
+                "<-" | "<<-" | "=" | "->" | "->>" | ":=" | "special" | "|>"
+            )
+        {
+            break;
+        }
+        node = parent;
+    }
+    node
+}
+
+/// Build the iterator `ScopedSymbol` for a `foreach(i = ...)` argument. The
+/// symbol's definition site is the `i` name node, so go-to-definition and hover
+/// can point back to the iterator declaration if they consume these symbols.
+///
+/// An iterator name is a bare `identifier`, so we reuse [`extract_parameter_symbol`]
+/// — foreach iterators are then constructed identically to function parameters
+/// (same `SymbolKind`, position, and definition-site semantics) and cannot drift
+/// from how every other parameter in the codebase is built.
+fn foreach_iterator_symbol(name_node: Node, line_index: &LineIndex, uri: &Url) -> ScopedSymbol {
+    extract_parameter_symbol(name_node, line_index, uri)
+        .expect("foreach iterator name node is an identifier")
 }
 
 /// Build a parameterless `FunctionScope` event spanning a `braced_expression`
@@ -5547,6 +5689,167 @@ mod tests {
 
     fn test_uri() -> Url {
         Url::parse("file:///test.R").unwrap()
+    }
+
+    /// Collect the parameter-name sets of every `FunctionScope` event in the
+    /// timeline. Used by the foreach iterator-scope tests below.
+    fn function_scope_param_sets(artifacts: &ScopeArtifacts) -> Vec<Vec<String>> {
+        artifacts
+            .timeline
+            .iter()
+            .filter_map(|e| {
+                if let ScopeEvent::FunctionScope { parameters, .. } = e {
+                    Some(parameters.iter().map(|p| p.name.to_string()).collect())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn foreach_iterator_visible_inside_rhs_body() {
+        // Columns: `{` at 23, the `i` inside `print(i)` at 31.
+        let code = "foreach(i = 1:10) %do% { print(i) }";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 0, 31, false);
+        assert!(
+            scope.symbols.contains_key("i"),
+            "iterator `i` should be visible inside the foreach RHS body"
+        );
+    }
+
+    #[test]
+    fn foreach_iterator_absent_after_rhs() {
+        // Line 0: `foreach(i = 1:3) %do% i`; line 1: `print(i)` (i at col 6).
+        let code = "foreach(i = 1:3) %do% i\nprint(i)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // RHS `i` is at column 22 on line 0 — visible there.
+        let inside = scope_at_position(&artifacts, 0, 22, false);
+        assert!(
+            inside.symbols.contains_key("i"),
+            "iterator `i` should be visible at the bare RHS expression"
+        );
+
+        // The `i` in `print(i)` on the next line is outside the RHS scope.
+        let after = scope_at_position(&artifacts, 1, 6, false);
+        assert!(
+            !after.symbols.contains_key("i"),
+            "iterator `i` must not leak past the foreach execution expression"
+        );
+    }
+
+    #[test]
+    fn foreach_multiple_iterators_become_parameters() {
+        let code = "foreach(i = 1:3, j = 4:6) %do% i + j";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let mut params: Vec<String> = function_scope_param_sets(&artifacts)
+            .into_iter()
+            .flatten()
+            .collect();
+        params.sort();
+        assert_eq!(params, vec!["i".to_string(), "j".to_string()]);
+    }
+
+    #[test]
+    fn foreach_iterator_scope_stops_at_walrus_assignment() {
+        // `:=` is a left-assignment (looser than `%do%`), so
+        // `foreach(i = 1:3) %do% x := i` parses as `(foreach %do% x) := i`. Like
+        // the other assignments, `:=` captures the loop result, so the body ends
+        // at `x` and the `i` after `:=` is outside the iterator scope.
+        let code = "foreach(i = 1:3) %do% x := i";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // `x` (the %do% rhs) starts at column 22 — inside the iterator scope.
+        let inside = scope_at_position(&artifacts, 0, 22, false);
+        assert!(
+            inside.symbols.contains_key("i"),
+            "iterator `i` should be visible in the foreach body"
+        );
+
+        // `i` after `:=` starts at column 27 — outside the scope.
+        let after_assign = scope_at_position(&artifacts, 0, 27, false);
+        assert!(
+            !after_assign.symbols.contains_key("i"),
+            "iterator `i` must not leak across the `:=` assignment"
+        );
+    }
+
+    #[test]
+    fn foreach_iterator_scope_stops_at_pipe() {
+        // `%do%` and `%>%` share precedence and are left-associative, so
+        // `foreach(i = 1:3) %do% aa %>% bb` parses as
+        // `(foreach(i = 1:3) %do% aa) %>% bb`. The iterator scope must cover the
+        // body `aa` but not the piped `bb`, which operates on the loop result.
+        let code = "foreach(i = 1:3) %do% aa %>% bb";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // `aa` (the %do% rhs) starts at column 22 — inside the iterator scope.
+        let inside = scope_at_position(&artifacts, 0, 22, false);
+        assert!(
+            inside.symbols.contains_key("i"),
+            "iterator `i` should be visible in the foreach body"
+        );
+
+        // `bb` (after the pipe) starts at column 29 — outside the scope.
+        let after_pipe = scope_at_position(&artifacts, 0, 29, false);
+        assert!(
+            !after_pipe.symbols.contains_key("i"),
+            "iterator `i` must not leak across the pipe onto the loop result"
+        );
+    }
+
+    #[test]
+    fn foreach_iterator_scope_stops_at_native_pipe() {
+        // The native pipe `|>` binds looser than `%do%`, so
+        // `foreach(i = 1:3) %do% aa |> bb` parses as
+        // `(foreach(i = 1:3) %do% aa) |> bb`. As with `%>%`, the iterator scope
+        // must cover the body `aa` but not the piped `bb`, which operates on the
+        // loop result.
+        let code = "foreach(i = 1:3) %do% aa |> bb";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // `aa` (the %do% rhs) starts at column 22 — inside the iterator scope.
+        let inside = scope_at_position(&artifacts, 0, 22, false);
+        assert!(
+            inside.symbols.contains_key("i"),
+            "iterator `i` should be visible in the foreach body"
+        );
+
+        // `bb` (after the `|>` pipe) starts at column 28 — outside the scope.
+        let after_pipe = scope_at_position(&artifacts, 0, 28, false);
+        assert!(
+            !after_pipe.symbols.contains_key("i"),
+            "iterator `i` must not leak across the native pipe onto the loop result"
+        );
+    }
+
+    #[test]
+    fn foreach_dot_controls_produce_no_parameters() {
+        let code = "foreach(.combine = c) %do% 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // A foreach execution scope is still emitted (it isolates RHS-local
+        // definitions), but it carries no iterator parameters.
+        let sets = function_scope_param_sets(&artifacts);
+        assert!(
+            sets.iter().any(|s| s.is_empty()),
+            "a recognized foreach with only dot-controls emits an empty-parameter scope"
+        );
+        assert!(
+            sets.iter().all(|s| s.is_empty()),
+            "dot-prefixed controls must not become iterator parameters"
+        );
     }
 
     #[test]
