@@ -339,6 +339,20 @@ pub(crate) fn parse_cross_file_config(
         {
             config.undefined_variable_severity = parse_severity(sev);
         }
+        // Parse diagnostics.undefinedVariableInCallArguments (issue #398)
+        if let Some(v) = diag
+            .get("undefinedVariableInCallArguments")
+            .and_then(|v| v.as_bool())
+        {
+            config.undefined_variable_in_call_arguments = v;
+        }
+        // Parse diagnostics.undefinedVariableInBracketIndices (issue #398)
+        if let Some(v) = diag
+            .get("undefinedVariableInBracketIndices")
+            .and_then(|v| v.as_bool())
+        {
+            config.undefined_variable_in_bracket_indices = v;
+        }
         // Parse diagnostics.mixedLogicalSeverity
         if let Some(sev) = diag.get("mixedLogicalSeverity").and_then(|v| v.as_str()) {
             config.mixed_logical_severity = parse_severity(sev);
@@ -8282,6 +8296,29 @@ mod tests {
                 Some(DiagnosticSeverity::WARNING),
                 "absent key should retain the default warning severity"
             );
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_undefined_variable_scope_booleans() {
+            // Issue #398: both default on; explicit false disables collection.
+            let default_config = crate::backend::parse_cross_file_config(&json!({
+                "diagnostics": { "enabled": true }
+            }))
+            .unwrap()
+            .unwrap();
+            assert!(default_config.undefined_variable_in_call_arguments);
+            assert!(default_config.undefined_variable_in_bracket_indices);
+
+            let off_config = crate::backend::parse_cross_file_config(&json!({
+                "diagnostics": {
+                    "undefinedVariableInCallArguments": false,
+                    "undefinedVariableInBracketIndices": false,
+                }
+            }))
+            .unwrap()
+            .unwrap();
+            assert!(!off_config.undefined_variable_in_call_arguments);
+            assert!(!off_config.undefined_variable_in_bracket_indices);
         }
 
         /// Test that missing `diagnostics.enabled` results in `true` (default)

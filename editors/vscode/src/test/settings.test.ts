@@ -104,6 +104,8 @@ const SETTINGS_MAPPING: Array<{
     // Diagnostics settings
     { vsCodeKey: 'diagnostics.enabled', jsonPath: ['diagnostics', 'enabled'], type: 'boolean', defaultWhenUnconfigured: true },
     { vsCodeKey: 'diagnostics.undefinedVariableSeverity', jsonPath: ['diagnostics', 'undefinedVariableSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'diagnostics.undefinedVariableInCallArguments', jsonPath: ['diagnostics', 'undefinedVariableInCallArguments'], type: 'boolean' },
+    { vsCodeKey: 'diagnostics.undefinedVariableInBracketIndices', jsonPath: ['diagnostics', 'undefinedVariableInBracketIndices'], type: 'boolean' },
     // Package settings
     { vsCodeKey: 'packages.enabled', jsonPath: ['packages', 'enabled'], type: 'boolean' },
     { vsCodeKey: 'packages.additionalLibraryPaths', jsonPath: ['packages', 'additionalLibraryPaths'], type: 'array' },
@@ -608,6 +610,8 @@ suite('Settings Transmission Unit Tests', () => {
         const configuredSettings = new Map<string, unknown>([
             ['diagnostics.enabled', false],
             ['diagnostics.undefinedVariableSeverity', 'error'],
+            ['diagnostics.undefinedVariableInCallArguments', false],
+            ['diagnostics.undefinedVariableInBracketIndices', false],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
@@ -615,6 +619,20 @@ suite('Settings Transmission Unit Tests', () => {
 
         assert.strictEqual(options.diagnostics?.enabled, false);
         assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, 'error');
+        assert.strictEqual(options.diagnostics?.undefinedVariableInCallArguments, false);
+        assert.strictEqual(options.diagnostics?.undefinedVariableInBracketIndices, false);
+    });
+
+    /**
+     * Unit test: the new issue #398 booleans are only emitted when explicitly
+     * configured (no default leakage), mirroring the other opt-out booleans.
+     */
+    test('undefined-variable scope booleans are omitted when unset', () => {
+        const mockConfig = createMockConfig(new Map<string, unknown>());
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.diagnostics?.undefinedVariableInCallArguments, undefined);
+        assert.strictEqual(options.diagnostics?.undefinedVariableInBracketIndices, undefined);
     });
 
     /**

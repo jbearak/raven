@@ -51,7 +51,25 @@ If the symbol is defined later in the same file at top level, the message also r
 - A declaration directive (`@lsp-var`, `@lsp-func`)
 - An `@lsp-ignore` on the line
 
-**Not checked:** Symbols on the RHS of `$` or `@` (member access), function parameters, formula variables, NSE contexts (e.g., `dplyr::select(df, col)`).
+**Never checked:** Symbols on the RHS of `$` or `@` (member access), function parameters, named-argument labels, and formula variables (`y ~ x`).
+
+#### Call arguments and bracket indices
+
+Raven checks identifiers inside ordinary call arguments and `[` / `[[` indices by default, so real bugs like `paste(undefined_var)`, `df[undefined_var, ]`, and `lst[[typo]]` are flagged. To avoid false positives in non-standard-evaluation (NSE) code, it resolves each call's callee to its source and applies a per-call argument policy:
+
+- A standard-eval callee (e.g. `paste`, `print`, `stats::filter`) has its arguments checked.
+- A callee with a known NSE policy suppresses only the captured / data-masked / tidy-selected arguments. For example `with(df, col + 1)` and `dplyr::filter(df, col)` still check `df` but suppress `col`; `substitute(expr, env)` suppresses `expr` but checks `env`; `aes(x, y)` and the rlang plural capture helpers suppress every argument.
+- Local definitions shadow packages, so `filter <- function(x) x; filter(undefined_var)` checks `undefined_var` (it is not `dplyr::filter`). For a local helper, Raven also infers which formals are captured — if the body calls `substitute()` / `enquo()` / `enexpr()` / `ensym()` on a formal, only the argument bound to that formal is suppressed.
+- An **unresolved** callee (not local, not a builtin, not a known export of an in-play package) suppresses its arguments rather than guess — `unknown_fn(typo)` still flags `unknown_fn`, but not `typo`.
+
+For `[`, base subscripting is standard-eval, so indices are checked unless the indexed object is data.table-like: a known `data.table()` / `as.data.table()` / `fread()` object, or an unresolved object when data.table is detectably in play (a `library(data.table)` call, a `data.table::` reference, or a package `Imports:`/`importFrom`). `[[` is always checked — `DT[[x]]` references `x` as a real variable.
+
+Two opt-out settings turn off this descent and restore blanket suppression for highly dynamic or data.table-heavy code (the `undefinedVariableSeverity` master switch still controls severity):
+
+- `raven.diagnostics.undefinedVariableInCallArguments` (default `true`)
+- `raven.diagnostics.undefinedVariableInBracketIndices` (default `true`)
+
+**Limitations:** The NSE policy table covers the common, slow-moving surface (base/utils metaprogramming and object-name helpers, default-attached `stats` model-fitting `subset`/`weights` data-masking, `dplyr`/`tidyr` data-masking and tidy-select verbs, `tibble`/`targets` constructors and target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes` step/role column captures, ggplot2 mapping helpers, rlang capture helpers, a few DSLs) but is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive. In data.table projects, an unresolved non-data.table object such as `df[typo, ]` may be silently skipped. In-place `setDT()` conversions are not detected. Use `# nolint`, `@lsp-ignore`, or the opt-out settings as escape hatches.
 
 ### Package Diagnostics
 

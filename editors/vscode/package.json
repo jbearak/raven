@@ -1181,6 +1181,16 @@
           "default": "warning",
           "description": "Severity level for diagnostics when a variable is used but not defined in the current scope, sourced files, or loaded packages. Set to \"off\" to suppress undefined variable diagnostics if they produce too many false positives in your workflow."
         },
+        "raven.diagnostics.undefinedVariableInCallArguments": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether undefined-variable diagnostics descend into ordinary function-call arguments (e.g. `paste(x)`). When enabled, Raven resolves each call's callee and applies a per-call non-standard-evaluation (NSE) argument policy, so genuine bugs are flagged while data-masked / captured arguments (e.g. `with(df, col + 1)`, `dplyr::filter(df, col)`) stay suppressed. Disable to blanket-suppress all call arguments (an escape hatch for highly dynamic code). The `undefinedVariableSeverity` setting still controls the severity. Does not affect `[` / `[[`; see `undefinedVariableInBracketIndices`."
+        },
+        "raven.diagnostics.undefinedVariableInBracketIndices": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether undefined-variable diagnostics descend into bracket index expressions (e.g. `df[i, ]`, `lst[[k]]`). When enabled, base `[` / `[[` indices are checked, except for data.table-style `[` cases (a known data.table object, or an unresolved object with data.table detectably in play). Disable to blanket-suppress all bracket indices (an escape hatch for data.table-heavy code). The `undefinedVariableSeverity` setting still controls the severity."
+        },
         "raven.diagnostics.mixedLogicalSeverity": {
           "type": "string",
           "enum": [

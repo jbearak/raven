@@ -56,6 +56,22 @@ pub struct CrossFileConfig {
     pub edited_file_debounce_ms: u64,
     /// Severity for undefined variable diagnostics (None = disabled)
     pub undefined_variable_severity: Option<DiagnosticSeverity>,
+    /// Whether undefined-variable diagnostics descend into ordinary function-call
+    /// arguments (`f(...)`). When true (default), the collector resolves each
+    /// call's callee and applies a per-call NSE argument policy, so real bugs
+    /// like `paste(undefined_var)` are flagged while genuine NSE arguments
+    /// (`with(df, col + 1)`, `dplyr::filter(df, col)`) stay suppressed. When
+    /// false, every ordinary call argument is blanket-suppressed (an escape
+    /// hatch for highly dynamic code). Does NOT affect `[` / `[[`; see
+    /// `undefined_variable_in_bracket_indices`.
+    pub undefined_variable_in_call_arguments: bool,
+    /// Whether undefined-variable diagnostics descend into bracket index
+    /// expressions (`df[i, ]`, `lst[[k]]`). When true (default), base `[` / `[[`
+    /// indices are checked, except for data.table-style `[` cases (a known
+    /// data.table object, or an unresolved object with data.table detectably in
+    /// play). When false, every bracket index is blanket-suppressed (an escape
+    /// hatch for data.table-heavy code).
+    pub undefined_variable_in_bracket_indices: bool,
     /// Severity for missing file diagnostics (None = disabled)
     pub missing_file_severity: Option<DiagnosticSeverity>,
     /// Severity for circular dependency diagnostics (None = disabled)
@@ -164,6 +180,8 @@ impl Default for CrossFileConfig {
             revalidation_debounce_ms: 200,
             edited_file_debounce_ms: 50,
             undefined_variable_severity: Some(DiagnosticSeverity::WARNING),
+            undefined_variable_in_call_arguments: true,
+            undefined_variable_in_bracket_indices: true,
             missing_file_severity: Some(DiagnosticSeverity::WARNING),
             circular_dependency_severity: Some(DiagnosticSeverity::ERROR),
             out_of_scope_severity: Some(DiagnosticSeverity::WARNING),
@@ -223,6 +241,9 @@ mod tests {
             config.undefined_variable_severity,
             Some(DiagnosticSeverity::WARNING)
         );
+        // Issue #398: call-argument and bracket-index checking default on.
+        assert!(config.undefined_variable_in_call_arguments);
+        assert!(config.undefined_variable_in_bracket_indices);
         // On-demand indexing defaults
         assert!(config.on_demand_indexing_enabled);
         // Package awareness defaults

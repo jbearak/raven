@@ -5200,6 +5200,46 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     }
 }
 
+/// File/workspace-level set of packages detectably in play for NSE callee
+/// classification (issue #398): `library()` / `require()` calls, DESCRIPTION
+/// `Imports` (`full_imports`), `importFrom` packages, and test-attached
+/// packages. Deliberately file-level rather than position-aware — the
+/// conservative "unresolved callee suppresses its arguments" fallback keeps the
+/// approximation safe.
+fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
+    let mut packages: HashSet<String> = HashSet::new();
+    for call in &snapshot.directive_meta.library_calls {
+        if !call.package.is_empty() {
+            packages.insert(call.package.clone());
+        }
+    }
+    for pkg in snapshot.scope_contribution.full_imports.iter() {
+        packages.insert(pkg.clone());
+    }
+    // `imported_symbols` is keyed by imported SYMBOL with the source PACKAGE(s)
+    // in the values (`importFrom(dplyr, filter)` -> {"filter": {"dplyr"}}), so
+    // the package names live in the values, not the keys.
+    for pkgs in snapshot.scope_contribution.imported_symbols.values() {
+        packages.extend(pkgs.iter().cloned());
+    }
+    for pkg in snapshot.scope_contribution.test_attached_packages.iter() {
+        packages.insert(pkg.clone());
+    }
+    // Expand known meta-packages (e.g. `library(tidyverse)`) to their members so
+    // a bare verb still resolves to the member package's NSE policy.
+    let members: Vec<String> = packages
+        .iter()
+        .flat_map(|p| crate::nse::meta_package_members(p))
+        .map(|m| m.to_string())
+        .collect();
+    packages.extend(members);
+    // Sorted for deterministic resolution when two in-play packages define a
+    // policy for the same verb name (first match wins in the resolver).
+    let mut packages: Vec<String> = packages.into_iter().collect();
+    packages.sort();
+    packages
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
@@ -5228,8 +5268,32 @@ fn collect_undefined_variables_from_snapshot(
         return;
     }
 
+    // Issue #398: resolve which call/bracket argument subtrees are NSE (and so
+    // should be skipped) instead of blanket-suppressing every call-like
+    // argument. Built once from the file's local definitions and the file/
+    // workspace package context.
+    let in_play_packages = collect_in_play_packages(snapshot);
+    let nse_analysis = NseAnalysis::build(
+        node,
+        text,
+        snapshot
+            .cross_file_config
+            .undefined_variable_in_call_arguments,
+        snapshot
+            .cross_file_config
+            .undefined_variable_in_bracket_indices,
+        in_play_packages,
+        Some(snapshot.package_library.as_ref()),
+        Some(snapshot.base_exports.as_ref()),
+    );
     let mut used: Vec<(String, Node)> = Vec::new();
-    collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
+    collect_usages_with_analysis(
+        node,
+        text,
+        &nse_analysis,
+        &UsageContext::default(),
+        &mut used,
+    );
 
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(text.match_indices('\n').map(|(i, _)| i + 1))
@@ -5653,13 +5717,13 @@ fn assignment_target_node(binop: Node) -> Option<Node> {
 /// hover cannot resolve still falls through to suppression here (resolve-or-
 /// suppress, never resolve-or-attribute).
 ///
-/// Note on the named-argument branch: within the diagnostics pipelines it is
-/// only observable from `collect_identifier_usages_utf16` (the use-before-source
-/// pipeline). The undefined-variable pipeline (`collect_usages_with_context`)
-/// already early-returns on every identifier inside call arguments via its
-/// `in_call_like_arguments` context flag, so the named-arg check here never
-/// fires for that consumer. The branch is still load-bearing — removing it
-/// would re-introduce the named-arg false positive in the utf16 pipeline.
+/// Note on the named-argument branch: both diagnostics pipelines now rely on
+/// it. The use-before-source pipeline (`collect_identifier_usages_utf16`) has
+/// always observed it. Since issue #398 the undefined-variable pipeline no
+/// longer blanket-suppresses call arguments, so this is also what keeps a
+/// named-argument *label* (`title` in `labs(title = ...)`) from surfacing as a
+/// usage when the callee is standard-eval. Removing the branch would
+/// re-introduce the named-arg false positive in both pipelines.
 fn is_structural_label(node: Node) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
 
@@ -11032,59 +11096,485 @@ fn package_exists_memoized(
     v
 }
 
-/// Context for tracking NSE-related state during AST traversal
+/// Context for tracking NSE-related state during AST traversal (issue #398).
 #[derive(Clone, Default)]
 struct UsageContext {
-    /// True when inside a formula expression (~ operator)
+    /// True when inside a formula expression (`~`), whose contents are never
+    /// free-variable references.
     in_formula: bool,
-    /// True when inside the arguments of a call-like node (call, subset, subset2)
-    in_call_like_arguments: bool,
+    /// True when inside a subtree that an NSE argument policy decided to
+    /// suppress — a captured / data-masked / tidy-selected argument, a
+    /// whole-call NSE form, or a suppressed bracket index. Per issue #398 the
+    /// bool means "suppress identifiers in this subtree", *not* "this node is
+    /// syntactically call-like".
+    suppressed: bool,
 }
 
-/// Collects identifier usages while tracking NSE-related state during AST traversal.
-/// Skips undefined-variable checks in contexts where R uses non-standard evaluation
-/// (formula `~`, call-like arguments), plus formal references inside
-/// default-parameter expressions. Universal structural skips that apply
-/// regardless of pipeline are delegated to `is_structural_non_reference`.
-fn collect_usages_with_context<'a>(
+/// How an indexed object's class is known for data.table `[` suppression.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DataTableClass {
+    /// Defining expression is a data.table constructor/converter.
+    DataTable,
+    /// Defining expression is a known data.frame-family constructor.
+    NonDataTable,
+    /// Not resolvable from the file's top-level definitions.
+    Unknown,
+}
+
+/// Pre-computed inputs the undefined-variable collector needs to decide, per
+/// `call` / `subset` / `subset2`, which argument subtrees are NSE and should be
+/// suppressed (issue #398). All AST-derived facts are owned, so this carries no
+/// tree lifetime; only the package-library / base-export references borrow.
+///
+/// Built once per diagnostic pass by [`NseAnalysis::build`]. The production
+/// path fills `package_library` / `base_exports` / `in_play_packages`; unit
+/// tests construct lighter instances via the test-only collector shim.
+pub(crate) struct NseAnalysis<'a> {
+    /// `diagnostics.undefinedVariableInCallArguments`. When false, ordinary
+    /// `call` arguments are blanket-suppressed (escape hatch).
+    call_args_enabled: bool,
+    /// `diagnostics.undefinedVariableInBracketIndices`. When false, `[` / `[[`
+    /// indices are blanket-suppressed (escape hatch).
+    bracket_indices_enabled: bool,
+    /// File-local `name <- function(...)` definitions, mapping the bound name
+    /// to the argument policy inferred from that function's captured formals
+    /// (Phase 2.5). A local definition shadows any package / base policy.
+    local_function_policies: HashMap<String, crate::nse::ArgPolicy>,
+    /// Packages detectably in play across the file/workspace: `library()` /
+    /// `require()` calls, DESCRIPTION `Imports`, `importFrom`, and test-attached
+    /// packages. A loaded package shadows base when classifying a bare callee.
+    in_play_packages: Vec<String>,
+    /// Whether data.table is detectably in play (Phase 3).
+    data_table_in_play: bool,
+    /// Variable names whose defining RHS is a data.table constructor/converter.
+    data_table_objects: HashSet<String>,
+    /// Variable names whose defining RHS is a known data.frame-family
+    /// constructor (so `[` indices are checked even when data.table is loaded).
+    non_data_table_objects: HashSet<String>,
+    /// Package library, for confirming whether a bare callee is an in-play
+    /// package export (standard-eval) rather than an unresolved name.
+    package_library: Option<&'a crate::package_library::PackageLibrary>,
+    /// Live base/builtin exports, consulted alongside `is_builtin`.
+    base_exports: Option<&'a HashSet<String>>,
+}
+
+impl<'a> NseAnalysis<'a> {
+    /// Walk `root` once to gather the file-local facts (local function policies,
+    /// data.table-like objects, `data.table::` qualified usage) and bundle them
+    /// with the supplied config flags and package context.
+    fn build(
+        root: Node,
+        text: &str,
+        call_args_enabled: bool,
+        bracket_indices_enabled: bool,
+        in_play_packages: Vec<String>,
+        package_library: Option<&'a crate::package_library::PackageLibrary>,
+        base_exports: Option<&'a HashSet<String>>,
+    ) -> Self {
+        let mut local_function_policies = HashMap::new();
+        let mut data_table_objects = HashSet::new();
+        let mut non_data_table_objects = HashSet::new();
+        let mut data_table_qualifier_seen = false;
+        collect_nse_facts(
+            root,
+            text,
+            &mut local_function_policies,
+            &mut data_table_objects,
+            &mut non_data_table_objects,
+            &mut data_table_qualifier_seen,
+            false,
+        );
+        // data.table is "in play" if it is an in-play package (library()/import)
+        // or the file uses a `data.table::` qualified reference (Phase 3).
+        let data_table_in_play =
+            in_play_packages.iter().any(|p| p == "data.table") || data_table_qualifier_seen;
+        Self {
+            call_args_enabled,
+            bracket_indices_enabled,
+            local_function_policies,
+            in_play_packages,
+            data_table_in_play,
+            data_table_objects,
+            non_data_table_objects,
+            package_library,
+            base_exports,
+        }
+    }
+}
+
+/// Walk the tree gathering the facts [`NseAnalysis`] needs: top-level function
+/// definitions (with their inferred capture policy), top-level data.table-like
+/// object bindings, and whether `data.table::` is used anywhere in the file.
+///
+/// Only **top-level** bindings are recorded (`in_function` is false): with
+/// global hoisting, top-level functions are visible everywhere, whereas a
+/// nested helper is scope-local and would otherwise contaminate the file-level
+/// maps and mis-shadow a sibling callee of the same name. A nested NSE helper
+/// simply falls to the conservative unresolved-callee path. The `data.table::`
+/// qualifier scan stays file-wide because data.table-in-play is a file fact.
+fn collect_nse_facts(
+    node: Node,
+    text: &str,
+    local_function_policies: &mut HashMap<String, crate::nse::ArgPolicy>,
+    data_table_objects: &mut HashSet<String>,
+    non_data_table_objects: &mut HashSet<String>,
+    data_table_qualifier_seen: &mut bool,
+    in_function: bool,
+) {
+    if node.kind() == "namespace_operator"
+        && node
+            .child_by_field_name("lhs")
+            .is_some_and(|lhs| node_text(lhs, text) == "data.table")
+    {
+        *data_table_qualifier_seen = true;
+    }
+
+    if !in_function
+        && let Some(target) = assignment_target_node(node)
+        && target.kind() == "identifier"
+        && let Some(value) = assignment_value_node(node)
+    {
+        let name = node_text(target, text);
+        let value = unwrap_parenthesized(value);
+        if value.kind() == "function_definition" {
+            local_function_policies.insert(name.to_string(), user_defined_call_policy(value, text));
+        } else {
+            match constructor_data_table_class(value, text) {
+                DataTableClass::DataTable => {
+                    non_data_table_objects.remove(name);
+                    data_table_objects.insert(name.to_string());
+                }
+                DataTableClass::NonDataTable => {
+                    data_table_objects.remove(name);
+                    non_data_table_objects.insert(name.to_string());
+                }
+                DataTableClass::Unknown => {}
+            }
+        }
+    }
+
+    let child_in_function = in_function || node.kind() == "function_definition";
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_nse_facts(
+            child,
+            text,
+            local_function_policies,
+            data_table_objects,
+            non_data_table_objects,
+            data_table_qualifier_seen,
+            child_in_function,
+        );
+    }
+}
+
+/// The operand an assignment *reads* — the `rhs` for `<-` / `=` / `<<-`, the
+/// `lhs` for `->` / `->>` — mirroring [`assignment_target_node`]'s direction
+/// table. `None` when `binop` is not an assignment.
+fn assignment_value_node(binop: Node) -> Option<Node> {
+    if binop.kind() != "binary_operator" {
+        return None;
+    }
+    match binop.child_by_field_name("operator")?.kind() {
+        "<-" | "=" | "<<-" => binop.child_by_field_name("rhs"),
+        "->" | "->>" => binop.child_by_field_name("lhs"),
+        _ => None,
+    }
+}
+
+/// Strip `parenthesized_expression` wrappers; `(expr)` and `expr` are the same
+/// value in R.
+fn unwrap_parenthesized(node: Node) -> Node {
+    let mut current = node;
+    while current.kind() == "parenthesized_expression" {
+        let mut cursor = current.walk();
+        match current
+            .children(&mut cursor)
+            .find(|c| c.is_named() && c.kind() != "comment")
+        {
+            Some(inner) => current = inner,
+            None => break,
+        }
+    }
+    current
+}
+
+/// Classify an assignment's defining call as a data.table constructor, a known
+/// data.frame-family constructor, or unknown (Phase 3 object-class facts). The
+/// leaf callee name is distinctive enough to classify without resolving the
+/// package — `data.table::fread` and bare `fread` both count.
+fn constructor_data_table_class(node: Node, text: &str) -> DataTableClass {
+    if node.kind() != "call" {
+        return DataTableClass::Unknown;
+    }
+    let Some(leaf) = node
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+    else {
+        return DataTableClass::Unknown;
+    };
+    match leaf {
+        "data.table" | "as.data.table" | "fread" => DataTableClass::DataTable,
+        "data.frame" | "as.data.frame" | "tibble" | "as_tibble" | "tribble" | "read.csv"
+        | "read.csv2" | "read.table" | "read_csv" | "read_csv2" | "read_tsv" | "read_delim"
+        | "read_excel" => DataTableClass::NonDataTable,
+        _ => DataTableClass::Unknown,
+    }
+}
+
+/// Infer the argument policy for a user-defined function (Phase 2.5): a formal
+/// is captured when the body calls `substitute` / `enquo` / `enexpr` / `ensym`
+/// with that formal as its first argument. With no captured formals the
+/// function is treated as standard-eval (so a local `filter <- function(x) x`
+/// recovers checking of `filter(undefined_var)`). Nested function definitions
+/// are not descended into — their captures bind their own formals.
+fn user_defined_call_policy(fn_def: Node, text: &str) -> crate::nse::ArgPolicy {
+    let formals = function_formal_names(fn_def, text);
+    if formals.is_empty() {
+        return crate::nse::ArgPolicy::Standard;
+    }
+    let mut captured: Vec<String> = Vec::new();
+    if let Some(body) = function_body_node(fn_def) {
+        collect_captured_formals(body, text, &formals, &mut captured);
+    }
+    if captured.is_empty() {
+        crate::nse::ArgPolicy::Standard
+    } else {
+        crate::nse::ArgPolicy::PerFormal {
+            formals,
+            captured,
+            captured_dots: false,
+        }
+    }
+}
+
+/// Ordered formal-parameter names of a `function_definition`, robust to the
+/// tree-sitter-r field/kind variations the scope engine also handles.
+fn function_formal_names(fn_def: Node, text: &str) -> Vec<String> {
+    let Some(params) = fn_def.child_by_field_name("parameters").or_else(|| {
+        let mut cursor = fn_def.walk();
+        fn_def
+            .children(&mut cursor)
+            .find(|c| c.is_named() && c.kind() == "parameters")
+    }) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        if child.is_named()
+            && let Some(name) = parameter_node_name(child, text)
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The body node of a `function_definition`, robust to tree-sitter-r variants.
+fn function_body_node(fn_def: Node) -> Option<Node> {
+    fn_def.child_by_field_name("body").or_else(|| {
+        let mut cursor = fn_def.walk();
+        fn_def
+            .children(&mut cursor)
+            .find(|c| c.is_named() && c.kind() == "braced_expression")
+    })
+}
+
+/// Recursively scan a function body for capture helpers
+/// (`substitute` / `enquo` / `enexpr` / `ensym`) whose first argument is a
+/// direct reference to one of `formals`, appending each such formal to
+/// `captured`.
+fn collect_captured_formals(
+    node: Node,
+    text: &str,
+    formals: &[String],
+    captured: &mut Vec<String>,
+) {
+    // A nested function has its own formals; its capture calls do not bind ours.
+    if node.kind() == "function_definition" {
+        return;
+    }
+    if node.kind() == "call"
+        && let Some(func) = node.child_by_field_name("function")
+        && let Some(helper) = callee_leaf_name(func, text)
+        && crate::nse::is_capture_helper(helper)
+        && let Some(args) = node.child_by_field_name("arguments")
+        && let Some(value) = first_positional_arg_value(args)
+        && value.kind() == "identifier"
+    {
+        let name = node_text(value, text);
+        if formals.iter().any(|f| f == name) && !captured.iter().any(|c| c == name) {
+            captured.push(name.to_string());
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_captured_formals(child, text, formals, captured);
+    }
+}
+
+/// The leaf callee name of a call's `function` field — the identifier itself,
+/// or the member (`rhs`) of a `pkg::name` namespace operator. `None` for a
+/// computed callee (`fns[[1]]`, `(function(x) x)`). Shared so capture inference
+/// and data.table-constructor classification treat `enquo`/`rlang::enquo` and
+/// `data.table`/`data.table::data.table` consistently.
+fn callee_leaf_name<'t>(func: Node<'t>, text: &'t str) -> Option<&'t str> {
+    match func.kind() {
+        "identifier" => Some(node_text(func, text)),
+        "namespace_operator" => func
+            .child_by_field_name("rhs")
+            .map(|rhs| node_text(rhs, text)),
+        _ => None,
+    }
+}
+
+/// The value node of a call's first positional argument, if any.
+fn first_positional_arg_value(args: Node) -> Option<Node> {
+    let mut cursor = args.walk();
+    args.children(&mut cursor).find_map(|child| {
+        (child.kind() == "argument" && child.child_by_field_name("name").is_none())
+            .then(|| child.child_by_field_name("value"))
+            .flatten()
+    })
+}
+
+/// Resolve a `call` node's argument policy by classifying its callee against
+/// scope and package context (issue #398 Phases 1–2.5). Resolution mirrors R's
+/// search path — local definition, then a loaded/imported package, then base —
+/// and an unresolved callee suppresses its arguments (the quiet failure mode).
+fn resolve_call_arg_policy(
+    call_node: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> crate::nse::ArgPolicy {
+    use crate::nse::ArgPolicy;
+    let Some(func) = call_node.child_by_field_name("function") else {
+        return ArgPolicy::WholeCall;
+    };
+
+    // Namespace-qualified `pkg::name` resolves purely from syntax.
+    if func.kind() == "namespace_operator" {
+        let qualified = func
+            .child_by_field_name("lhs")
+            .zip(func.child_by_field_name("rhs"))
+            .and_then(|(pkg, name)| {
+                crate::nse::package_policy(node_text(pkg, text), node_text(name, text))
+            });
+        // A qualified call with no NSE policy is a resolved standard-eval call.
+        return qualified.unwrap_or(ArgPolicy::Standard);
+    }
+
+    if func.kind() != "identifier" {
+        // Computed callee (`fns[[1]](x)`, `(function(x) x)(y)`): unresolved.
+        return ArgPolicy::WholeCall;
+    }
+    let name = node_text(func, text);
+
+    // 1. A local definition shadows any package / base policy.
+    if let Some(policy) = analysis.local_function_policies.get(name) {
+        return policy.clone();
+    }
+    // 2. A loaded/imported package's NSE policy shadows base.
+    for pkg in &analysis.in_play_packages {
+        if let Some(policy) = crate::nse::package_policy(pkg, name) {
+            return policy;
+        }
+    }
+    // 3. Base / builtin NSE policy.
+    if let Some(policy) = crate::nse::base_policy(name) {
+        return policy;
+    }
+    // 4. Resolvable standard-eval: builtin, base export, or a confirmed in-play
+    //    package export -> check arguments.
+    if is_builtin(name)
+        || analysis
+            .base_exports
+            .is_some_and(|exports| exports.contains(name))
+        || analysis
+            .package_library
+            .is_some_and(|lib| lib.is_symbol_from_loaded_packages(name, &analysis.in_play_packages))
+    {
+        return ArgPolicy::Standard;
+    }
+    // 5. Unresolved: suppress arguments.
+    ArgPolicy::WholeCall
+}
+
+/// Resolve a `subset` (`[`) / `subset2` (`[[`) node's index policy (issue #398
+/// Phases 0 & 3). `[[` is always standard-eval; `[` is suppressed only for
+/// data.table-style indexing.
+fn resolve_subset_arg_policy(
+    node: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> crate::nse::ArgPolicy {
+    use crate::nse::ArgPolicy;
+    if node.kind() == "subset2" {
+        // `[[` is standard-eval: `DT[[x]]` references `x`.
+        return ArgPolicy::Standard;
+    }
+    match subset_object_data_table_class(node, text, analysis) {
+        DataTableClass::DataTable => ArgPolicy::WholeCall,
+        DataTableClass::NonDataTable => ArgPolicy::Standard,
+        // Unresolved object: prefer silence only when data.table is in play.
+        DataTableClass::Unknown if analysis.data_table_in_play => ArgPolicy::WholeCall,
+        DataTableClass::Unknown => ArgPolicy::Standard,
+    }
+}
+
+/// Classify the object being indexed by a `[` node using the file's data.table
+/// object facts. Non-identifier objects (`df$a[i]`, `x[a][b]`) are unknown.
+fn subset_object_data_table_class(
+    node: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> DataTableClass {
+    let Some(obj) = node.child_by_field_name("function") else {
+        return DataTableClass::Unknown;
+    };
+    if obj.kind() == "identifier" {
+        let name = node_text(obj, text);
+        if analysis.data_table_objects.contains(name) {
+            return DataTableClass::DataTable;
+        }
+        if analysis.non_data_table_objects.contains(name) {
+            return DataTableClass::NonDataTable;
+        }
+    }
+    DataTableClass::Unknown
+}
+
+/// Collects identifier usages while tracking NSE state during AST traversal
+/// (issue #398). Skips formula contents and structural non-references
+/// unconditionally; for `call` / `subset` / `subset2` nodes it consults
+/// `analysis` to suppress only the genuinely NSE argument subtrees.
+fn collect_usages_with_analysis<'a>(
     node: Node<'a>,
     text: &str,
+    analysis: &NseAnalysis,
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
-    // Skip ERROR nodes entirely — identifiers inside them lack reliable
-    // semantic context (e.g., an assignment LHS won't be inside a
-    // binary_operator node), so we'd produce false "Undefined variable"
-    // diagnostics. The syntax error diagnostic already covers these.
-    if node.is_error() {
-        return;
-    }
-
-    // Skip MISSING nodes — these are synthetic placeholders inserted by
-    // tree-sitter for error recovery (e.g., the absent RHS in `x <-`).
-    // They have no actual text content and should not be treated as usages.
-    if node.is_missing() {
+    // Skip ERROR nodes (identifiers inside them lack reliable semantic context)
+    // and MISSING nodes (synthetic error-recovery placeholders with no text).
+    if node.is_error() || node.is_missing() {
         return;
     }
 
     if node.kind() == "identifier" {
-        // Skip if we're in a formula or call-like arguments context
-        if context.in_formula || context.in_call_like_arguments {
+        if context.in_formula || context.suppressed {
             return;
         }
-
         if is_structural_non_reference(node) {
             return;
         }
-
         if references_formal_from_default_expression(node, text) {
             return;
         }
-
-        // Pipeline-specific skip: an identifier that follows an ERROR node
-        // containing a right-assignment operator (e.g., `-> x` or `->> x` where
-        // the parser couldn't find a LHS value). This handles broken-tree
-        // recovery that the structural predicate can't see.
+        // Pipeline-specific skip: an identifier following an ERROR node that
+        // holds a right-assignment operator (`-> x` / `->> x` with no LHS
+        // value), which the structural predicate cannot see in a broken tree.
         if let Some(prev) = node.prev_sibling()
             && prev.is_error()
         {
@@ -11093,41 +11583,28 @@ fn collect_usages_with_context<'a>(
                 return;
             }
         }
-
         used.push((node_text(node, text).to_string(), node));
+        return;
     }
 
-    // Check if we're entering a formula expression (~ operator)
-    // Tree-sitter-r represents formulas as:
-    // - `~ x` is a `unary_operator` node with `~` as the operator
-    // - `y ~ x` is a `binary_operator` node with `~` as the operator
+    // Formula detection: `~ x` is a `unary_operator` and `y ~ x` a
+    // `binary_operator` whose operator token is `~`; their contents are never
+    // free-variable references.
     let is_formula_node = match node.kind() {
         "unary_operator" => {
-            // For unary operator, check if the operator is ~
-            // The first child is typically the operator
             let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-            children
-                .first()
-                .is_some_and(|op| node_text(*op, text) == "~")
+            node.children(&mut cursor)
+                .next()
+                .is_some_and(|op| node_text(op, text) == "~")
         }
         "binary_operator" => {
-            // For binary operator, check if the operator (second child) is ~
             let mut cursor = node.walk();
-            let children: Vec<_> = node.children(&mut cursor).collect();
-            children
-                .get(1)
-                .is_some_and(|op| node_text(*op, text) == "~")
+            node.children(&mut cursor)
+                .nth(1)
+                .is_some_and(|op| node_text(op, text) == "~")
         }
         _ => false,
     };
-
-    // Check if this is a call-like node (call, subset, subset2)
-    // These nodes have `function` and `arguments` fields
-    // We only set in_call_like_arguments when entering the `arguments` field
-    let is_call_like_node = matches!(node.kind(), "call" | "subset" | "subset2");
-
-    // Create updated context if entering a formula
     let base_context = if is_formula_node {
         UsageContext {
             in_formula: true,
@@ -11137,31 +11614,134 @@ fn collect_usages_with_context<'a>(
         context.clone()
     };
 
-    // Recurse into children with the (possibly updated) context
-    // For call-like nodes, we need to handle the `arguments` field specially
-    if is_call_like_node {
-        // For call-like nodes, recurse into children but set in_call_like_arguments
-        // only for the `arguments` field, not for the `function` field
-        if let Some(function_node) = node.child_by_field_name("function") {
-            // The function field should NOT have in_call_like_arguments set
-            // We still want to check if the function name is defined
-            collect_usages_with_context(function_node, text, &base_context, used);
-        }
-        if let Some(arguments_node) = node.child_by_field_name("arguments") {
-            // The arguments field SHOULD have in_call_like_arguments set
-            let args_context = UsageContext {
-                in_call_like_arguments: true,
-                ..base_context.clone()
-            };
-            collect_usages_with_context(arguments_node, text, &args_context, used);
-        }
-    } else {
-        // For non-call-like nodes, recurse normally
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            collect_usages_with_context(child, text, &base_context, used);
+    match node.kind() {
+        "call" => collect_call_usages(node, text, analysis, &base_context, used),
+        "subset" | "subset2" => collect_subset_usages(node, text, analysis, &base_context, used),
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_usages_with_analysis(child, text, analysis, &base_context, used);
+            }
         }
     }
+}
+
+/// Visit a `call` node: the callee is checked, and the arguments are suppressed
+/// according to the resolved NSE policy (or blanket-suppressed when the
+/// call-argument feature is off or we are already inside a suppressed subtree).
+fn collect_call_usages<'a>(
+    node: Node<'a>,
+    text: &str,
+    analysis: &NseAnalysis,
+    context: &UsageContext,
+    used: &mut Vec<(String, Node<'a>)>,
+) {
+    let policy = if context.suppressed || !analysis.call_args_enabled {
+        crate::nse::ArgPolicy::WholeCall
+    } else {
+        resolve_call_arg_policy(node, text, analysis)
+    };
+    // A pipe (`df %>% f(...)` / `df |> f(...)`) supplies the first formal, so
+    // the syntactic positional arguments bind starting one formal later.
+    let pipe_fed = call_is_pipe_fed(node, text);
+    if let Some(func) = node.child_by_field_name("function") {
+        collect_usages_with_analysis(func, text, analysis, context, used);
+    }
+    if let Some(args) = node.child_by_field_name("arguments") {
+        apply_arg_policy(args, text, analysis, context, &policy, pipe_fed, used);
+    }
+}
+
+/// True when `call_node` is the right-hand side of a pipe operator
+/// (`%>%` magrittr or `|>` native), so its first formal is supplied implicitly.
+fn call_is_pipe_fed(call_node: Node, text: &str) -> bool {
+    let Some(parent) = call_node.parent() else {
+        return false;
+    };
+    if parent.kind() != "binary_operator"
+        || parent.child_by_field_name("rhs").map(|r| r.id()) != Some(call_node.id())
+    {
+        return false;
+    }
+    // tree-sitter-r exposes the native pipe as a `|>` operator node and the
+    // magrittr pipe as a `special` token whose text is `%>%`.
+    let mut cursor = parent.walk();
+    parent.children(&mut cursor).any(|child| {
+        child.kind() == "|>" || (child.kind() == "special" && node_text(child, text) == "%>%")
+    })
+}
+
+/// Visit a `subset` / `subset2` node: the indexed object is checked, and the
+/// index arguments are suppressed according to the bracket policy (or
+/// blanket-suppressed when the bracket feature is off or we are already inside
+/// a suppressed subtree).
+fn collect_subset_usages<'a>(
+    node: Node<'a>,
+    text: &str,
+    analysis: &NseAnalysis,
+    context: &UsageContext,
+    used: &mut Vec<(String, Node<'a>)>,
+) {
+    let policy = if context.suppressed || !analysis.bracket_indices_enabled {
+        crate::nse::ArgPolicy::WholeCall
+    } else {
+        resolve_subset_arg_policy(node, text, analysis)
+    };
+    if let Some(func) = node.child_by_field_name("function") {
+        collect_usages_with_analysis(func, text, analysis, context, used);
+    }
+    if let Some(args) = node.child_by_field_name("arguments") {
+        // Bracket indices are never pipe-fed (their policies are uniform anyway).
+        apply_arg_policy(args, text, analysis, context, &policy, false, used);
+    }
+}
+
+/// Recurse into a call/subset `arguments` node, suppressing each argument's
+/// value subtree according to `policy`. Argument *labels* (named-argument
+/// names) are skipped by `is_structural_non_reference` regardless of the mask,
+/// so named-argument labels remain suppressed independent of the callee.
+/// `pipe_fed` shifts per-formal matching past the pipe-supplied first formal.
+fn apply_arg_policy<'a>(
+    args_node: Node<'a>,
+    text: &str,
+    analysis: &NseAnalysis,
+    context: &UsageContext,
+    policy: &crate::nse::ArgPolicy,
+    pipe_fed: bool,
+    used: &mut Vec<(String, Node<'a>)>,
+) {
+    let mut cursor = args_node.walk();
+    let arg_nodes: Vec<Node> = args_node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "argument")
+        .collect();
+    let labels: Vec<Option<&str>> = arg_nodes
+        .iter()
+        .map(|a| a.child_by_field_name("name").map(|n| node_text(n, text)))
+        .collect();
+    let mask = crate::nse::suppressed_arguments(policy, &labels, pipe_fed);
+    for (arg, suppress) in arg_nodes.iter().zip(mask) {
+        let arg_context = UsageContext {
+            in_formula: context.in_formula,
+            suppressed: context.suppressed || suppress,
+        };
+        collect_usages_with_analysis(*arg, text, analysis, &arg_context, used);
+    }
+}
+
+/// Test-only entry point preserving the pre-#398 collector call shape. Builds a
+/// default [`NseAnalysis`] (both features on, no package/local context) so the
+/// many existing collector tests exercise the new pipeline without each
+/// constructing an analysis; behavior-dependent tests build their own.
+#[cfg(test)]
+fn collect_usages_with_context<'a>(
+    node: Node<'a>,
+    text: &str,
+    context: &UsageContext,
+    used: &mut Vec<(String, Node<'a>)>,
+) {
+    let analysis = NseAnalysis::build(node, text, true, true, Vec::new(), None, None);
+    collect_usages_with_analysis(node, text, &analysis, context, used);
 }
 
 /// Returns true if a symbol from cross-file scope is a forward reference within the same file.
@@ -16297,86 +16877,69 @@ mod tests {
         );
     }
 
-    // ==================== Call-Like Argument Tests ====================
-    // These tests verify that identifiers inside call-like arguments are skipped
-    // (Requirements 2.1, 2.2, 2.3, 2.4)
+    // ==================== Call / bracket argument tests (issue #398) ====================
+    // Identifiers inside call/bracket arguments are no longer blanket-suppressed.
+    // The collector resolves each callee/object and suppresses only NSE subtrees.
+    // (Was: test_call_arguments_skipped / test_subset_arguments_skipped /
+    // test_subset2_arguments_skipped, which asserted unconditional suppression.)
 
-    /// Test that subset(df, x > 5) does not produce a diagnostic for 'x'
-    /// Validates: Requirement 2.1 - Identifiers inside function call arguments should be skipped
+    /// `subset(df, x > 5)`: base `subset` is per-formal NSE — the data argument
+    /// `df` is checked while the data-masked `subset` expression is suppressed.
     #[test]
-    fn test_call_arguments_skipped() {
+    fn test_base_nse_call_checks_data_suppresses_masked() {
         let code = "subset(df, x > 5)";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
-        // 'subset' should be collected as a usage (function name is checked)
-        let subset_used = used.iter().any(|(name, _)| name == "subset");
         assert!(
-            subset_used,
-            "Function name 'subset' should be collected as usage"
+            used.iter().any(|(name, _)| name == "subset"),
+            "callee 'subset' should be collected"
         );
-
-        // 'df' should NOT be collected as a usage (inside call arguments)
-        let df_used = used.iter().any(|(name, _)| name == "df");
         assert!(
-            !df_used,
-            "'df' inside call arguments should NOT be collected as usage"
+            used.iter().any(|(name, _)| name == "df"),
+            "data argument 'df' should be collected (checked)"
         );
-
-        // 'x' should NOT be collected as a usage (inside call arguments)
-        let x_used = used.iter().any(|(name, _)| name == "x");
         assert!(
-            !x_used,
-            "'x' inside call arguments should NOT be collected as usage"
+            !used.iter().any(|(name, _)| name == "x"),
+            "'x' inside the data-masked `subset` expression should be suppressed"
         );
     }
 
-    /// Test that df[x > 5, ] does not produce a diagnostic for 'x'
-    /// Validates: Requirement 2.2 - Identifiers inside subset ([) arguments should be skipped
+    /// Phase 0: `df[x > 5, ]` checks the bracket index `x` (base `[` is
+    /// standard-eval) as well as the indexed object `df`.
     #[test]
-    fn test_subset_arguments_skipped() {
+    fn test_bracket_index_checked() {
         let code = "df[x > 5, ]";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
-        // 'df' should be collected as a usage (the object being subsetted is checked)
-        let df_used = used.iter().any(|(name, _)| name == "df");
         assert!(
-            df_used,
-            "'df' (object being subsetted) should be collected as usage"
+            used.iter().any(|(name, _)| name == "df"),
+            "indexed object 'df' should be collected"
         );
-
-        // 'x' should NOT be collected as a usage (inside subset arguments)
-        let x_used = used.iter().any(|(name, _)| name == "x");
         assert!(
-            !x_used,
-            "'x' inside subset arguments should NOT be collected as usage"
+            used.iter().any(|(name, _)| name == "x"),
+            "bracket index 'x' should be collected (checked)"
         );
     }
 
-    /// Test that df[[x]] does not produce a diagnostic for 'x'
-    /// Validates: Requirement 2.3 - Identifiers inside subset2 ([[) arguments should be skipped
+    /// Phase 0: `df[[x]]` checks the `[[` index `x`; `[[` is never data.table NSE.
     #[test]
-    fn test_subset2_arguments_skipped() {
+    fn test_bracket2_index_checked() {
         let code = "df[[x]]";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
-        // 'df' should be collected as a usage (the object being subsetted is checked)
-        let df_used = used.iter().any(|(name, _)| name == "df");
         assert!(
-            df_used,
-            "'df' (object being subsetted) should be collected as usage"
+            used.iter().any(|(name, _)| name == "df"),
+            "indexed object 'df' should be collected"
         );
-
-        // 'x' should NOT be collected as a usage (inside subset2 arguments)
-        let x_used = used.iter().any(|(name, _)| name == "x");
         assert!(
-            !x_used,
-            "'x' inside subset2 arguments should NOT be collected as usage"
+            used.iter().any(|(name, _)| name == "x"),
+            "'[[' index 'x' should be collected (checked)"
         );
     }
 
@@ -16456,38 +17019,31 @@ mod tests {
         );
     }
 
-    /// Test that lm(y ~ x, data = df) does not produce diagnostics for 'y', 'x'
-    /// Validates: Requirement 3.4 - Formulas nested inside call arguments should have both contexts apply
+    /// `lm(y ~ x, data = df)`: formula contents `y` / `x` stay suppressed
+    /// (Requirement 3.4), but the `data` argument value `df` is now checked —
+    /// `lm` is standard-eval, so its non-formula arguments are real references.
     #[test]
-    fn test_formula_inside_call_arguments_skipped() {
+    fn test_formula_inside_call_suppressed_data_checked() {
         let code = "lm(y ~ x, data = df)";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
-        // 'lm' should be collected as a usage (function name is checked)
-        let lm_used = used.iter().any(|(name, _)| name == "lm");
-        assert!(lm_used, "Function name 'lm' should be collected as usage");
-
-        // 'y' should NOT be collected as a usage (inside formula inside call arguments)
-        let y_used = used.iter().any(|(name, _)| name == "y");
         assert!(
-            !y_used,
-            "'y' inside formula in call arguments should NOT be collected as usage"
+            used.iter().any(|(name, _)| name == "lm"),
+            "callee 'lm' should be collected"
         );
-
-        // 'x' should NOT be collected as a usage (inside formula inside call arguments)
-        let x_used = used.iter().any(|(name, _)| name == "x");
         assert!(
-            !x_used,
-            "'x' inside formula in call arguments should NOT be collected as usage"
+            !used.iter().any(|(name, _)| name == "y"),
+            "formula LHS 'y' should be suppressed"
         );
-
-        // 'df' should NOT be collected as a usage (inside call arguments)
-        let df_used = used.iter().any(|(name, _)| name == "df");
         assert!(
-            !df_used,
-            "'df' inside call arguments should NOT be collected as usage"
+            !used.iter().any(|(name, _)| name == "x"),
+            "formula RHS 'x' should be suppressed"
+        );
+        assert!(
+            used.iter().any(|(name, _)| name == "df"),
+            "data-argument value 'df' should be collected (checked)"
         );
     }
 
@@ -16560,8 +17116,9 @@ mod tests {
         );
     }
 
-    /// Test mixed contexts: df$col[x > 5] - 'col' skipped (extract RHS), 'x' skipped (subset arguments), 'df' checked
-    /// Validates: Requirements 1.1, 1.2, 2.1 - Extract RHS and subset arguments should be skipped
+    /// Mixed contexts `df$col[x > 5]`: `df` checked (extract LHS), `col`
+    /// suppressed (extract RHS), and the bracket index `x` now checked (Phase 0;
+    /// the indexed object `df$col` is not a plain data.table-classified name).
     #[test]
     fn test_mixed_contexts() {
         let code = "df$col[x > 5]";
@@ -16569,32 +17126,17 @@ mod tests {
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
 
-        // 'df' should be collected as a usage (LHS of extract operator is checked)
-        let df_used = used.iter().any(|(name, _)| name == "df");
         assert!(
-            df_used,
-            "'df' (LHS of extract operator) should be collected as usage"
+            used.iter().any(|(name, _)| name == "df"),
+            "'df' (LHS of extract operator) should be collected"
         );
-
-        // 'col' should NOT be collected as a usage (RHS of extract operator)
-        let col_used = used.iter().any(|(name, _)| name == "col");
         assert!(
-            !col_used,
-            "'col' (RHS of extract operator) should NOT be collected as usage"
+            !used.iter().any(|(name, _)| name == "col"),
+            "'col' (RHS of extract operator) should NOT be collected"
         );
-
-        // 'x' should NOT be collected as a usage (inside subset arguments)
-        let x_used = used.iter().any(|(name, _)| name == "x");
         assert!(
-            !x_used,
-            "'x' inside subset arguments should NOT be collected as usage"
-        );
-
-        // Only 'df' should be collected
-        assert_eq!(
-            used.len(),
-            1,
-            "Only 'df' should be collected in mixed context"
+            used.iter().any(|(name, _)| name == "x"),
+            "bracket index 'x' should be collected (checked)"
         );
     }
 
@@ -16689,7 +17231,6 @@ mod tests {
     /// Test that arguments to namespace-qualified calls are still checked.
     #[test]
     fn test_namespace_call_arguments_still_checked() {
-        // Use a non-call context so x is not suppressed by in_call_like_arguments.
         // This verifies that namespace-qualified references don't suppress
         // surrounding non-qualified identifiers.
         let code = "y <- stats::median + x";
@@ -16702,6 +17243,463 @@ mod tests {
         assert!(!used.iter().any(|(name, _)| name == "median"));
         // 'x' should still be collected
         assert!(used.iter().any(|(name, _)| name == "x"));
+    }
+
+    // ========================================================================
+    // Issue #398: untangled call-argument / bracket-index NSE policies.
+    // These collector-level tests assert which argument candidates are
+    // collected (checked) vs suppressed (NSE). The downstream scope/package
+    // resolution in `collect_undefined_variables_from_snapshot` decides whether
+    // a *collected* candidate is actually undefined.
+    // ========================================================================
+
+    /// Run the collector with the given in-play packages (data.table-in-play is
+    /// derived from the list, matching production wiring).
+    fn collect_with_packages<'a>(
+        root: Node<'a>,
+        text: &str,
+        packages: &[&str],
+        used: &mut Vec<(String, Node<'a>)>,
+    ) {
+        let in_play: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
+        let analysis = NseAnalysis::build(root, text, true, true, in_play, None, None);
+        collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
+    }
+
+    /// Run the collector with the two #398 feature flags toggled.
+    fn collect_with_flags<'a>(
+        root: Node<'a>,
+        text: &str,
+        call_args: bool,
+        brackets: bool,
+        used: &mut Vec<(String, Node<'a>)>,
+    ) {
+        let analysis = NseAnalysis::build(root, text, call_args, brackets, Vec::new(), None, None);
+        collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
+    }
+
+    /// True iff `name` was collected as a usage candidate.
+    fn was_collected(used: &[(String, tree_sitter::Node)], name: &str) -> bool {
+        used.iter().any(|(n, _)| n == name)
+    }
+
+    // ---- Phase 1: default-on call-argument policies ----
+
+    /// `paste(undefined_var)` is standard-eval, so the argument is checked.
+    #[test]
+    fn nse_phase1_standard_call_checks_arg() {
+        let code = "paste(undefined_var)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "undefined_var"));
+    }
+
+    /// With the call-argument feature off, ordinary call arguments are blanket
+    /// suppressed (escape hatch).
+    #[test]
+    fn nse_phase1_call_feature_off_suppresses_args() {
+        let code = "paste(undefined_var)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_flags(tree.root_node(), code, false, true, &mut used);
+        assert!(!was_collected(&used, "undefined_var"));
+    }
+
+    /// `with(df, col + 1)`: per-formal NSE suppresses the data-masked `col` but
+    /// still checks `df`.
+    #[test]
+    fn nse_phase1_with_suppresses_masked_checks_data() {
+        let code = "with(df, col + 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    /// `substitute(expr, env = typo_env)`: the captured `expr` is suppressed but
+    /// the environment argument `typo_env` is checked.
+    #[test]
+    fn nse_phase1_substitute_checks_env() {
+        let code = "substitute(expr, env = typo_env)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "expr"));
+        assert!(was_collected(&used, "typo_env"));
+    }
+
+    /// `aes(x, y)`: whole-call NSE suppresses every mapping identifier.
+    #[test]
+    fn nse_phase1_aes_whole_call_suppressed() {
+        let code = "aes(x, y)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["ggplot2"], &mut used);
+        assert!(!was_collected(&used, "x"));
+        assert!(!was_collected(&used, "y"));
+    }
+
+    /// Nested call policy is per-node: `print(subset(df, col))` checks `df`
+    /// (the inner `subset`'s data argument) and suppresses `col`.
+    #[test]
+    fn nse_phase1_nested_call_policy_per_node() {
+        let code = "print(subset(df, col))";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    /// Named-argument labels remain suppressed independent of the callee, while
+    /// the value is checked for a standard-eval call: `paste(collapse = x)`.
+    #[test]
+    fn nse_phase1_named_label_suppressed_value_checked() {
+        let code = "paste(collapse = x)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "collapse"));
+        assert!(was_collected(&used, "x"));
+    }
+
+    /// `library(dplyr)` does not flag the bare package name.
+    #[test]
+    fn nse_phase1_library_does_not_flag_package() {
+        let code = "library(dplyr)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "dplyr"));
+    }
+
+    // ---- Phase 2: source-resolved callee classification ----
+
+    /// Local shadowing recovers diagnostics: a local `filter` is standard-eval,
+    /// so `filter(undefined_var)` checks its argument.
+    #[test]
+    fn nse_phase2_local_shadowing_checks_arg() {
+        let code = "filter <- function(x) x\nfilter(undefined_var)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "undefined_var"));
+    }
+
+    /// `dplyr::filter(df, col)`: the resolved package policy checks `.data` and
+    /// suppresses the data-masked `col`.
+    #[test]
+    fn nse_phase2_qualified_package_policy() {
+        let code = "dplyr::filter(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    /// Namespace distinction: `stats::filter(x, typo)` is not suppressed by
+    /// dplyr's policy entry — both arguments are checked.
+    #[test]
+    fn nse_phase2_namespace_distinction() {
+        let code = "stats::filter(x, typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "typo"));
+    }
+
+    /// A bare in-play `dplyr` verb resolves to dplyr's policy (shadowing base):
+    /// `filter(df, col)` with dplyr loaded checks `df` and suppresses `col`.
+    #[test]
+    fn nse_phase2_in_play_package_shadows_base() {
+        let code = "filter(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    /// An unresolved callee suppresses its arguments while flagging the callee:
+    /// `unknown_fn(typo)` collects `unknown_fn` but not `typo`.
+    #[test]
+    fn nse_phase2_unresolved_callee_suppresses_args() {
+        let code = "unknown_fn(typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "unknown_fn"));
+        assert!(!was_collected(&used, "typo"));
+    }
+
+    /// Piped data-masking calls: the pipe supplies `.data`, so the masked
+    /// column binds `...` and is suppressed (magrittr and native pipe).
+    #[test]
+    fn nse_pipe_magrittr_suppresses_masked_column() {
+        let code = "df %>% filter(col > 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "col"),
+            "piped filter column suppressed"
+        );
+    }
+
+    #[test]
+    fn nse_pipe_native_suppresses_masked_column() {
+        let code = "df |> mutate(newcol = col + 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "col"),
+            "piped mutate column suppressed"
+        );
+    }
+
+    /// A qualified capture helper (`rlang::enquo`) in a local body still marks
+    /// the formal captured (Phase 2.5).
+    #[test]
+    fn nse_phase25_qualified_capture_helper() {
+        let code = "my_q <- function(arg) rlang::enquo(arg)\nmy_q(col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "col"));
+    }
+
+    /// A nested helper definition does not leak into file-level resolution: a
+    /// sibling top-level `paste` call still checks its argument even though an
+    /// inner function defines a same-named local.
+    #[test]
+    fn nse_nested_definition_does_not_leak() {
+        let code = "outer <- function() {\n  helper <- function(x) substitute(x)\n  helper(inner_arg)\n}\nhelper(top_arg)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        // The inner `helper` is scope-local, so the top-level `helper(top_arg)`
+        // sees an unresolved callee and suppresses its argument (rather than
+        // applying the nested NSE policy). The key property: no leak/panic.
+        assert!(was_collected(&used, "helper"));
+    }
+
+    // ---- Phase 2.5: user-defined captured formals ----
+
+    /// A formal captured via `substitute` is suppressed; the data argument is
+    /// checked: `my_filter(df, col > 1)`.
+    #[test]
+    fn nse_phase25_captured_formal_suppressed() {
+        let code = "my_filter <- function(data, expr) subset(data, substitute(expr))\n\
+                    my_filter(df, col > 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    /// Only the captured formal is suppressed; a sibling evaluated argument is
+    /// checked: `f(col, typo_env)` with `f <- function(expr, env) eval(substitute(expr), env)`.
+    #[test]
+    fn nse_phase25_sibling_arg_checked() {
+        let code = "f <- function(expr, env) eval(substitute(expr), env)\nf(col, typo_env)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "col"));
+        assert!(was_collected(&used, "typo_env"));
+    }
+
+    /// Named arguments map to formals correctly: `f(env = typo_env, expr = col)`
+    /// suppresses only the captured `expr`.
+    #[test]
+    fn nse_phase25_named_args_map_to_formals() {
+        let code = "f <- function(expr, env) eval(substitute(expr), env)\n\
+                    f(env = typo_env, expr = col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "typo_env"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    /// A capture target that is not a formal does not suppress any argument:
+    /// `g <- function(x) substitute(y); g(typo)` checks `typo`.
+    #[test]
+    fn nse_phase25_non_formal_capture_no_suppression() {
+        let code = "g <- function(x) substitute(y)\ng(typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "typo"));
+    }
+
+    /// Every capture helper recognized by `crate::nse::is_capture_helper`
+    /// (`substitute` / `enquo` / `enexpr` / `ensym`) marks the referenced formal
+    /// captured, so the call argument is suppressed. Guards against one helper
+    /// regressing while the others keep working.
+    #[test]
+    fn nse_phase25_all_capture_helpers_suppress_formal() {
+        for helper in ["substitute", "enquo", "enexpr", "ensym"] {
+            let code = format!("cap <- function(arg) {helper}(arg)\ncap(masked_col)");
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
+            assert!(
+                !was_collected(&used, "masked_col"),
+                "helper {helper} should capture the formal"
+            );
+        }
+    }
+
+    /// Multiple formals captured in one body are each suppressed, while a
+    /// non-captured sibling formal is still checked: `f <- function(a, b, c) {
+    /// substitute(a); substitute(b) }; f(x, y, z)` suppresses `x`/`y`, checks `z`.
+    #[test]
+    fn nse_phase25_multiple_captures_in_one_function() {
+        let code = "f <- function(a, b, c) {\n  substitute(a)\n  substitute(b)\n}\nf(x, y, z)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+        assert!(!was_collected(&used, "y"));
+        assert!(was_collected(&used, "z"));
+    }
+
+    /// `pkg:::name` (internal triple-colon) resolves to the same package policy
+    /// as `pkg::name`: `dplyr:::filter(df, col)` checks `df`, suppresses `col`.
+    #[test]
+    fn nse_phase2_triple_colon_namespace_resolves_policy() {
+        let code = "dplyr:::filter(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    // ---- Phase 3: conditional bracket suppression ----
+
+    /// Known data.table object suppresses `[` indices.
+    #[test]
+    fn nse_phase3_known_data_table_suppresses_bracket() {
+        let code = "dt <- data.table::data.table(value = 1, grp = 1)\ndt[, mean(value), by = grp]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "value"));
+        assert!(!was_collected(&used, "grp"));
+    }
+
+    /// Known non-data.table object checks `[` indices.
+    #[test]
+    fn nse_phase3_known_non_data_table_checks_bracket() {
+        let code = "df <- data.frame(x = 1)\ndf[undefined_var, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "undefined_var"));
+    }
+
+    /// Unresolved object with data.table in play suppresses `[` indices.
+    #[test]
+    fn nse_phase3_unresolved_with_data_table_suppresses() {
+        let code = "f <- function(dt) dt[, mean(value), by = grp]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["data.table"], &mut used);
+        assert!(!was_collected(&used, "value"));
+        assert!(!was_collected(&used, "grp"));
+    }
+
+    /// Unresolved object with no data.table signal checks `[` indices.
+    #[test]
+    fn nse_phase3_unresolved_without_data_table_checks() {
+        let code = "f <- function(d) d[undefined_var, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "undefined_var"));
+    }
+
+    /// `[[` is never treated as data.table NSE: `dt[[x]]` checks `x` even when
+    /// `dt` is a known data.table.
+    #[test]
+    fn nse_phase3_double_bracket_checked_for_data_table() {
+        let code = "dt <- data.table::data.table(value = 1)\ndt[[x]]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "x"));
+    }
+
+    /// With the bracket feature off, all bracket indices are blanket suppressed.
+    #[test]
+    fn nse_phase3_bracket_feature_off_suppresses() {
+        let code = "df[undefined_var, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_flags(tree.root_node(), code, true, false, &mut used);
+        assert!(!was_collected(&used, "undefined_var"));
+    }
+
+    /// Every data.table-yielding constructor recognized by
+    /// `constructor_data_table_class` classifies the assignee as a data.table,
+    /// so `[` indices on it are suppressed (Phase 3). Pins each constructor arm.
+    #[test]
+    fn nse_phase3_data_table_constructors_suppress_bracket() {
+        for ctor in ["data.table(a = 1)", "as.data.table(1)", "fread(\"f.csv\")"] {
+            let code = format!("dt <- {ctor}\ndt[undefined_idx, ]");
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
+            assert!(
+                !was_collected(&used, "undefined_idx"),
+                "constructor {ctor} should classify as data.table"
+            );
+        }
+    }
+
+    /// Every non-data.table constructor recognized by
+    /// `constructor_data_table_class` classifies the assignee as standard, so
+    /// `[` indices on it are checked (Phase 3). Pins each constructor arm.
+    #[test]
+    fn nse_phase3_non_data_table_constructors_check_bracket() {
+        for ctor in [
+            "tibble(x = 1)",
+            "as_tibble(x)",
+            "read.csv(\"f.csv\")",
+            "read_csv(\"f.csv\")",
+            "read.table(\"f.txt\")",
+        ] {
+            let code = format!("dt <- {ctor}\ndt[undefined_idx, ]");
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
+            assert!(
+                was_collected(&used, "undefined_idx"),
+                "constructor {ctor} should classify as non-data.table"
+            );
+        }
     }
 
     // ========================================================================
@@ -18206,6 +19204,170 @@ clean_data <- function(x) {
                 .iter()
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #398 end-to-end: data.table visibility derived from package
+    /// metadata — modeled via `full_imports` (NAMESPACE `import(data.table)` /
+    /// DESCRIPTION `Imports: data.table`), NOT a directly-injected package
+    /// list — must flow through `collect_in_play_packages`, put data.table in
+    /// play, and so suppress the column-name indices of an unresolved-object
+    /// `[` for an `R/*.R` file under the package. `dt` is a bound parameter so
+    /// it isn't itself flagged; the baseline undefined symbol is the positive
+    /// control. The `nse_phase3_*` collector tests only exercise this via
+    /// `collect_with_packages(&["data.table"])` (direct injection).
+    #[tokio::test]
+    async fn nse_data_table_namespace_import_suppresses_index_in_package_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // Model `import(data.table)` / `Imports: data.table` via full_imports.
+        let mut full_imports = BTreeSet::new();
+        full_imports.insert("data.table".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: std::sync::Arc::new(full_imports),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "f <- function(dt) dt[, value, by = grp]\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        // Baseline proves the collector ran (otherwise the test is vacuous).
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("value") || m.contains("grp")),
+            "import(data.table) must put data.table in play and suppress the \
+             column-name indices `value`/`grp`; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: a resolved export of a loaded package that has no
+    /// NSE policy is standard-eval, so its argument IS checked. The `nse_phase*`
+    /// collector tests cannot reach this branch — they build `NseAnalysis` with
+    /// `package_library = None` — so this is the only test that pins
+    /// `resolve_call_arg_policy` step 4 (the `is_symbol_from_loaded_packages`
+    /// path). The contrast call pins the boundary: an *unresolved* callee falls
+    /// back to `WholeCall` and suppresses its argument. A synthetic package
+    /// keeps the test immune to future base-export / policy-table additions.
+    #[tokio::test]
+    async fn nse_resolved_package_export_without_policy_checks_arg_end_to_end() {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        let mut exports = std::collections::HashSet::new();
+        exports.insert("my_fn".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("mypkg".to_string(), exports))
+            .await;
+
+        let code = "library(mypkg)\nmy_fn(undefined_var)\nunknown_unresolved_fn(other_var)\n";
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        // Resolved export, no policy -> standard-eval -> argument checked.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: undefined_var"),
+            "argument of a resolved no-policy export must be checked; messages: {messages:?}"
+        );
+        // The resolved export itself must not be flagged.
+        assert!(
+            !messages.iter().any(|m| m.contains("my_fn")),
+            "resolved package export `my_fn` must not be flagged; messages: {messages:?}"
+        );
+        // Contrast: an unresolved callee falls back to WholeCall, suppressing
+        // its argument...
+        assert!(
+            !messages.iter().any(|m| m.contains("other_var")),
+            "argument of an unresolved callee must be suppressed (WholeCall \
+             fallback); messages: {messages:?}"
+        );
+        // ...while the unresolved callee itself is flagged (proves the contrast
+        // is live, not silently empty).
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: unknown_unresolved_fn"),
+            "unresolved callee must be flagged; messages: {messages:?}"
         );
     }
 
@@ -28759,9 +29921,9 @@ mod proptests {
     #[test]
     fn test_readlines_named_arg() {
         // Pattern from collate.r line 13: a named-argument `n = 1` must not
-        // surface as a usage. `collect_usages_with_context` excludes it via
-        // the `in_call_like_arguments` early-return; the assertion below is
-        // the user-visible contract regardless of which code path enforces it.
+        // surface as a usage. The collector excludes the named-argument label
+        // via `is_structural_non_reference` (the value `1` is a literal); the
+        // assertion below is the user-visible contract regardless of path.
         let code = r#"readLines("output/oos/latest_hash.txt", n = 1)"#;
         let tree = parse_r_code(code);
 
@@ -29421,31 +30583,50 @@ mod proptests {
         }
 
         #[test]
-        /// Feature: skip-nse-undefined-checks, Property 3: Call-Like Arguments Skipped
-        /// For any R code containing a call-like node (call, subset, subset2), identifiers
-        /// inside the arguments field SHALL NOT be collected as usages.
-        fn prop_skip_nse_call_like_arguments_skipped(
-            func in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+        /// Issue #398, Phase 1: an *unresolved* bare callee suppresses its
+        /// arguments (the quiet failure mode), so a random `func(arg)` does not
+        /// collect `arg`. (Brackets are covered by `prop_bracket_indices_checked`;
+        /// since #398 they are no longer blanket-suppressed.)
+        fn prop_unresolved_call_arguments_suppressed(
+            // Exclude builtins: a builtin callee is *resolved* (standard-eval or
+            // base NSE), so it would not exhibit the unresolved fallback.
+            func in "[a-z][a-z0-9_]{2,8}"
+                .prop_filter("Not reserved or builtin", |s| !is_r_reserved(s) && !is_builtin(s)),
             arg in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
-            call_type in prop::sample::select(vec!["call", "subset", "subset2"])
         ) {
-            let code = match call_type {
-                "call" => format!("{}({})", func, arg),
-                "subset" => format!("{}[{}]", func, arg),
-                "subset2" => format!("{}[[{}]]", func, arg),
+            let code = format!("{}({})", func, arg);
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
+
+            let arg_used = usage_contains_span(&used, &arg, func.len() + 1);
+            prop_assert!(!arg_used, "Argument '{}' of an unresolved call should NOT be collected", arg);
+        }
+
+        #[test]
+        /// Issue #398, Phase 0: bracket indices on a plain (non-data.table)
+        /// object are checked, so `obj[arg]` / `obj[[arg]]` collect `arg`.
+        fn prop_bracket_indices_checked(
+            obj in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            arg in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            bracket in prop::sample::select(vec!["subset", "subset2"])
+        ) {
+            let code = match bracket {
+                "subset" => format!("{}[{}]", obj, arg),
+                "subset2" => format!("{}[[{}]]", obj, arg),
                 _ => unreachable!(),
             };
             let tree = parse_r_code(&code);
             let mut used = Vec::new();
             collect_usages_with_context(tree.root_node(), &code, &UsageContext::default(), &mut used);
 
-            let arg_start = match call_type {
-                "call" | "subset" => func.len() + 1,
-                "subset2" => func.len() + 2,
+            let arg_start = match bracket {
+                "subset" => obj.len() + 1,
+                "subset2" => obj.len() + 2,
                 _ => unreachable!(),
             };
             let arg_used = usage_contains_span(&used, &arg, arg_start);
-            prop_assert!(!arg_used, "Argument '{}' inside {} should NOT be collected", arg, call_type);
+            prop_assert!(arg_used, "Bracket index '{}' inside {} should be collected", arg, bracket);
         }
 
         #[test]
@@ -46242,7 +47423,10 @@ my_func <- function(a = default_value) {
             ),
             ("x <- 1\nx[i <-]", "incomplete assignment in subscript"),
             (
-                "tryCatch(\n  expr,\n  error =\n)",
+                // `expr` is defined so this exercises only the incomplete named
+                // argument `error =`; since #398, tryCatch is standard-eval and
+                // its first argument is checked.
+                "expr <- 1\ntryCatch(\n  expr,\n  error =\n)",
                 "incomplete named argument",
             ),
             (
@@ -46286,6 +47470,352 @@ my_func <- function(a = default_value) {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Issue #398 regression: idiomatic tidyverse must not flag data-masked
+    /// columns end-to-end. Each case pairs a data-masked column (must NOT be
+    /// flagged) with a genuinely undefined top-level symbol (must BE flagged),
+    /// so the test fails loudly if the collector silently produced nothing.
+    #[test]
+    fn nse_tidyverse_idioms_no_false_positive_end_to_end() {
+        let cases: &[&str] = &[
+            // Meta-package: library(tidyverse) brings dplyr in play.
+            "library(tidyverse)\ndf <- data.frame(x = 1)\nfilter(df, masked_col)\nreally_undefined_xyz",
+            // Magrittr pipe supplies .data; masked_col binds `...`.
+            "library(dplyr)\ndf <- data.frame(x = 1)\ndf %>% filter(masked_col > 1)\nreally_undefined_xyz",
+            // Native pipe.
+            "library(dplyr)\ndf <- data.frame(x = 1)\ndf |> mutate(new = masked_col + 1)\nreally_undefined_xyz",
+        ];
+        for code in cases {
+            let mut state = create_test_state();
+            let uri = add_document(&mut state, "file:///test.R", code);
+            let tree = parse_r_code(code);
+            let root = tree.root_node();
+
+            let mut diagnostics = Vec::new();
+            let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &snapshot,
+                &uri,
+                root,
+                code,
+                DiagnosticSeverity::WARNING,
+                &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
+            );
+            let messages: Vec<&String> = diagnostics.iter().map(|d| &d.message).collect();
+
+            assert!(
+                !messages.iter().any(|m| m.contains("masked_col")),
+                "data-masked column should not be flagged for {code:?}; got {messages:?}"
+            );
+            // Positive control: proves the collector actually ran.
+            assert!(
+                messages.iter().any(|m| m.contains("really_undefined_xyz")),
+                "positive control should be flagged for {code:?}; got {messages:?}"
+            );
+        }
+    }
+
+    /// Run the undefined-variable collector end-to-end and return the published
+    /// diagnostic messages. Mirrors
+    /// `nse_tidyverse_idioms_no_false_positive_end_to_end`'s setup so the issue
+    /// #398 positive cases are pinned at the *published-diagnostic* level — the
+    /// `nse_phase*` tests only pin them at the collector-candidate level
+    /// (`was_collected`), which does not prove a candidate survives scope
+    /// resolution and reaches a real "Undefined variable" diagnostic.
+    fn collect_undefined_messages(code: &str) -> Vec<String> {
+        let mut state = create_test_state();
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    /// Issue #398 end-to-end: a standard-eval call argument (`paste` is a
+    /// builtin callee, so its argument is checked) that is undefined reaches a
+    /// published diagnostic.
+    #[test]
+    fn nse_call_arg_undefined_flagged_end_to_end() {
+        let messages = collect_undefined_messages("paste(undefined_var)");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_var")),
+            "standard-eval call argument should be flagged end-to-end; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: a `[` index on a known non-data.table object is
+    /// standard-eval, so an undefined index is flagged. `df` is defined so the
+    /// assertion isolates the index.
+    #[test]
+    fn nse_single_bracket_index_undefined_flagged_end_to_end() {
+        let messages = collect_undefined_messages("df <- data.frame(x = 1)\ndf[undefined_var, ]");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_var")),
+            "single-bracket index on a non-data.table should be flagged end-to-end; \
+             got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `[[` is always standard-eval, so an undefined
+    /// index is flagged.
+    #[test]
+    fn nse_double_bracket_index_undefined_flagged_end_to_end() {
+        let messages = collect_undefined_messages("lst <- list(a = 1)\nlst[[typo]]");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: typo")),
+            "double-bracket index should be flagged end-to-end; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `library(data.table)` — not a directly-injected
+    /// package list — must flow through `collect_in_play_packages` and put
+    /// data.table in play, so an unresolved-object `[` suppresses the
+    /// column-name indices. `dt` is a bound parameter (so it isn't itself a
+    /// false positive); a genuinely undefined symbol is the positive control.
+    #[test]
+    fn nse_data_table_library_suppresses_index_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(data.table)\nf <- function(dt) dt[, mean(value), by = grp]\nreally_undefined_xyz",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("value")),
+            "data.table column `value` should not be flagged; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("grp")),
+            "data.table column `grp` should not be flagged; got {messages:?}"
+        );
+        // Positive control: proves the collector actually ran.
+        assert!(
+            messages.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: a namespace-qualified base call (`base::rm`) is
+    /// the same function as bare `rm`, so it must route through the base NSE
+    /// policy — the bare object name in `...` is suppressed, but the `list`
+    /// value expression is evaluated and checked. The checked argument doubles
+    /// as the positive control proving the collector ran.
+    #[test]
+    fn nse_base_namespace_rm_delegates_to_base_policy_end_to_end() {
+        let messages = collect_undefined_messages("base::rm(suppressed_obj, list = checked_vec)");
+        assert!(
+            !messages.iter().any(|m| m.contains("suppressed_obj")),
+            "bare object name passed to base::rm should be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_vec")),
+            "base::rm(list = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end regression: delegation covers *all* base NSE
+    /// policies, not just `rm`. `base::substitute` captures `expr` (suppressed)
+    /// but checks `env`. Without `package_policy("base", _)` delegating to
+    /// `base_policy`, the captured expression would be a false positive.
+    #[test]
+    fn nse_base_namespace_substitute_delegates_to_base_policy_end_to_end() {
+        let messages =
+            collect_undefined_messages("base::substitute(captured_expr, env = checked_env)");
+        assert!(
+            !messages.iter().any(|m| m.contains("captured_expr")),
+            "base::substitute expr should be captured/suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_env")),
+            "base::substitute env value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `data` lives in `utils`, not `base`, so the
+    /// correctly-qualified `utils::data` must route to the builtin NSE policy —
+    /// suppressing the bare dataset name in `...` while still checking
+    /// `lib.loc`. A `base::*`-only delegation would miss this and flag the
+    /// dataset name (the same false positive `base::rm` had).
+    #[test]
+    fn nse_utils_namespace_data_suppresses_dataset_name_end_to_end() {
+        let messages =
+            collect_undefined_messages("utils::data(suppressed_dataset, lib.loc = checked_path)");
+        assert!(
+            !messages.iter().any(|m| m.contains("suppressed_dataset")),
+            "bare dataset name passed to utils::data should be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_path")),
+            "utils::data(lib.loc = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `curve` lives in `graphics`, so `graphics::curve`
+    /// must capture the plotted expression (suppressed) while checking the
+    /// numeric range arguments.
+    #[test]
+    fn nse_graphics_namespace_curve_captures_expr_end_to_end() {
+        let messages =
+            collect_undefined_messages("graphics::curve(captured_expr, from = checked_from)");
+        assert!(
+            !messages.iter().any(|m| m.contains("captured_expr")),
+            "graphics::curve expr should be captured/suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_from")),
+            "graphics::curve(from = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `utils::example` captures the bare help `topic`
+    /// (NSE) but evaluates `package`, so a typo'd package is still flagged.
+    #[test]
+    fn nse_utils_namespace_example_captures_topic_checks_package_end_to_end() {
+        let messages =
+            collect_undefined_messages("utils::example(captured_topic, package = checked_pkg)");
+        assert!(
+            !messages.iter().any(|m| m.contains("captured_topic")),
+            "utils::example topic should be captured/suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_pkg")),
+            "utils::example(package = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Sweep addition (2026-06-06) end-to-end: a BARE `lm(...)` — no
+    /// `library(stats)` — resolves via `base_policy` because stats is
+    /// default-attached. `subset`/`weights` are data-masked (suppressed) while
+    /// `data` is checked. Pins that the stats helpers live in `base_policy`, not
+    /// `package_policy` (which would require stats to be in-play).
+    #[test]
+    fn nse_stats_lm_bare_call_suppresses_subset_checks_data_end_to_end() {
+        let messages = collect_undefined_messages(
+            "lm(y ~ x, data = undefined_df_xyz, subset = masked_grp, weights = masked_w)",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("masked_grp")),
+            "lm subset is data-masked and should be suppressed; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("masked_w")),
+            "lm weights is data-masked and should be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_df_xyz")),
+            "lm `data` is evaluated and should be checked; got {messages:?}"
+        );
+    }
+
+    /// Sweep addition end-to-end: `library(dplyr); join_by(a == b)` suppresses
+    /// its column-name arguments (WholeCall). `tibble`/`tar_read` likewise need
+    /// their package in play; a genuinely undefined symbol is the positive control.
+    #[test]
+    fn nse_ecosystem_nse_helpers_suppress_with_package_in_play_end_to_end() {
+        let join = collect_undefined_messages(
+            "library(dplyr)\njoin_by(left_col == right_col)\nreally_undefined_xyz",
+        );
+        assert!(
+            !join
+                .iter()
+                .any(|m| m.contains("left_col") || m.contains("right_col")),
+            "join_by columns should be suppressed; got {join:?}"
+        );
+        assert!(
+            join.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {join:?}"
+        );
+
+        let tib = collect_undefined_messages(
+            "library(tibble)\ntibble(col_a = 1, col_b = col_a * 2)\nreally_undefined_xyz",
+        );
+        assert!(
+            !tib.iter()
+                .any(|m| m.contains("col_a") || m.contains("col_b")),
+            "tibble columns should be suppressed; got {tib:?}"
+        );
+        assert!(
+            tib.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {tib:?}"
+        );
+
+        let tar = collect_undefined_messages(
+            "library(targets)\ntar_read(my_target)\nreally_undefined_xyz",
+        );
+        assert!(
+            !tar.iter().any(|m| m.contains("my_target")),
+            "tar_read target name should be suppressed; got {tar:?}"
+        );
+        assert!(
+            tar.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {tar:?}"
+        );
+    }
+
+    /// Sweep addition end-to-end (corrected entry): `dplyr::rename_with`'s
+    /// trailing dots are EVALUATED (forwarded to `.fn`), so `dots_captured=false`
+    /// — only `.cols` is suppressed; an undefined extra argument is still flagged.
+    #[test]
+    fn nse_dplyr_rename_with_checks_dots_end_to_end() {
+        let messages = collect_undefined_messages(
+            "df <- data.frame(x = 1)\nlibrary(dplyr)\nrename_with(df, toupper, starts_with(\"x\"), undefined_extra_arg)",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_extra_arg")),
+            "rename_with trailing dots are evaluated and should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `vignette` and `citation` evaluate their
+    /// arguments (verified against R 4.6.0), so they are deliberately *not* in
+    /// the NSE suppress table — a bare undefined argument must still be flagged.
+    /// Guards against "completing the set" and silencing real bugs.
+    #[test]
+    fn nse_standard_eval_utils_helpers_still_flag_undefined_args_end_to_end() {
+        let vignette = collect_undefined_messages("utils::vignette(undefined_topic)");
+        assert!(
+            vignette
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_topic")),
+            "vignette is standard-eval; its argument should be flagged; got {vignette:?}"
+        );
+        let citation = collect_undefined_messages("utils::citation(undefined_pkg)");
+        assert!(
+            citation
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_pkg")),
+            "citation is standard-eval; its argument should be flagged; got {citation:?}"
+        );
     }
 }
 
