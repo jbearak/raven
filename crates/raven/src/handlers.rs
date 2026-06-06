@@ -19207,6 +19207,170 @@ clean_data <- function(x) {
         );
     }
 
+    /// Issue #398 end-to-end: data.table visibility derived from package
+    /// metadata — modeled via `full_imports` (NAMESPACE `import(data.table)` /
+    /// DESCRIPTION `Imports: data.table`), NOT a directly-injected package
+    /// list — must flow through `collect_in_play_packages`, put data.table in
+    /// play, and so suppress the column-name indices of an unresolved-object
+    /// `[` for an `R/*.R` file under the package. `dt` is a bound parameter so
+    /// it isn't itself flagged; the baseline undefined symbol is the positive
+    /// control. The `nse_phase3_*` collector tests only exercise this via
+    /// `collect_with_packages(&["data.table"])` (direct injection).
+    #[tokio::test]
+    async fn nse_data_table_namespace_import_suppresses_index_in_package_file() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // Model `import(data.table)` / `Imports: data.table` via full_imports.
+        let mut full_imports = BTreeSet::new();
+        full_imports.insert("data.table".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: std::sync::Arc::new(full_imports),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "f <- function(dt) dt[, value, by = grp]\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        // Baseline proves the collector ran (otherwise the test is vacuous).
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("value") || m.contains("grp")),
+            "import(data.table) must put data.table in play and suppress the \
+             column-name indices `value`/`grp`; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: a resolved export of a loaded package that has no
+    /// NSE policy is standard-eval, so its argument IS checked. The `nse_phase*`
+    /// collector tests cannot reach this branch — they build `NseAnalysis` with
+    /// `package_library = None` — so this is the only test that pins
+    /// `resolve_call_arg_policy` step 4 (the `is_symbol_from_loaded_packages`
+    /// path). The contrast call pins the boundary: an *unresolved* callee falls
+    /// back to `WholeCall` and suppresses its argument. A synthetic package
+    /// keeps the test immune to future base-export / policy-table additions.
+    #[tokio::test]
+    async fn nse_resolved_package_export_without_policy_checks_arg_end_to_end() {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        let mut exports = std::collections::HashSet::new();
+        exports.insert("my_fn".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("mypkg".to_string(), exports))
+            .await;
+
+        let code = "library(mypkg)\nmy_fn(undefined_var)\nunknown_unresolved_fn(other_var)\n";
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        // Resolved export, no policy -> standard-eval -> argument checked.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: undefined_var"),
+            "argument of a resolved no-policy export must be checked; messages: {messages:?}"
+        );
+        // The resolved export itself must not be flagged.
+        assert!(
+            !messages.iter().any(|m| m.contains("my_fn")),
+            "resolved package export `my_fn` must not be flagged; messages: {messages:?}"
+        );
+        // Contrast: an unresolved callee falls back to WholeCall, suppressing
+        // its argument...
+        assert!(
+            !messages.iter().any(|m| m.contains("other_var")),
+            "argument of an unresolved callee must be suppressed (WholeCall \
+             fallback); messages: {messages:?}"
+        );
+        // ...while the unresolved callee itself is flagged (proves the contrast
+        // is live, not silently empty).
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: unknown_unresolved_fn"),
+            "unresolved callee must be flagged; messages: {messages:?}"
+        );
+    }
+
     /// Regression: tree-sitter-r parses `return` as a plain identifier (not a
     /// keyword node), so `return(x)` is an ordinary `call`. The
     /// undefined-variable collector must not flag `return`, because it is a
@@ -47352,6 +47516,99 @@ my_func <- function(a = default_value) {
                 "positive control should be flagged for {code:?}; got {messages:?}"
             );
         }
+    }
+
+    /// Run the undefined-variable collector end-to-end and return the published
+    /// diagnostic messages. Mirrors
+    /// `nse_tidyverse_idioms_no_false_positive_end_to_end`'s setup so the issue
+    /// #398 positive cases are pinned at the *published-diagnostic* level — the
+    /// `nse_phase*` tests only pin them at the collector-candidate level
+    /// (`was_collected`), which does not prove a candidate survives scope
+    /// resolution and reaches a real "Undefined variable" diagnostic.
+    fn collect_undefined_messages(code: &str) -> Vec<String> {
+        let mut state = create_test_state();
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    /// Issue #398 end-to-end: a standard-eval call argument (`paste` is a
+    /// builtin callee, so its argument is checked) that is undefined reaches a
+    /// published diagnostic.
+    #[test]
+    fn nse_call_arg_undefined_flagged_end_to_end() {
+        let messages = collect_undefined_messages("paste(undefined_var)");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_var")),
+            "standard-eval call argument should be flagged end-to-end; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: a `[` index on a known non-data.table object is
+    /// standard-eval, so an undefined index is flagged. `df` is defined so the
+    /// assertion isolates the index.
+    #[test]
+    fn nse_single_bracket_index_undefined_flagged_end_to_end() {
+        let messages = collect_undefined_messages("df <- data.frame(x = 1)\ndf[undefined_var, ]");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_var")),
+            "single-bracket index on a non-data.table should be flagged end-to-end; \
+             got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `[[` is always standard-eval, so an undefined
+    /// index is flagged.
+    #[test]
+    fn nse_double_bracket_index_undefined_flagged_end_to_end() {
+        let messages = collect_undefined_messages("lst <- list(a = 1)\nlst[[typo]]");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: typo")),
+            "double-bracket index should be flagged end-to-end; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `library(data.table)` — not a directly-injected
+    /// package list — must flow through `collect_in_play_packages` and put
+    /// data.table in play, so an unresolved-object `[` suppresses the
+    /// column-name indices. `dt` is a bound parameter (so it isn't itself a
+    /// false positive); a genuinely undefined symbol is the positive control.
+    #[test]
+    fn nse_data_table_library_suppresses_index_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(data.table)\nf <- function(dt) dt[, mean(value), by = grp]\nreally_undefined_xyz",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("value")),
+            "data.table column `value` should not be flagged; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("grp")),
+            "data.table column `grp` should not be flagged; got {messages:?}"
+        );
+        // Positive control: proves the collector actually ran.
+        assert!(
+            messages.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {messages:?}"
+        );
     }
 }
 
