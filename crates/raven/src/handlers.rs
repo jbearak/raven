@@ -46416,6 +46416,106 @@ mod function_parameter_tests {
         assert!(names.contains(&"i".to_string()), "got: {names:?}");
     }
 
+    // Issue #406: nested foreach composition with `%:%` and `when()` filters.
+    // `when()` is also a `foreach` export, so the composition tests define it
+    // alongside the shared `foreach` stub (a real user gets both from
+    // `library(foreach)`).
+    fn foreach_compose_undefined_names(body: &str) -> Vec<String> {
+        undefined_variable_names(&format!(
+            "{FOREACH_PREAMBLE}when <- function(...) NULL\n{body}"
+        ))
+    }
+
+    #[test]
+    fn foreach_nested_composition_iterators_not_flagged() {
+        let names =
+            foreach_compose_undefined_names("foreach(i = 1:3) %:% foreach(j = 1:3) %do% i + j");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_when_filter_sees_left_iterator() {
+        // The iterator `i` must be visible inside the `when(...)` filter on the
+        // left of `%do%`, not only in the executed body.
+        let names =
+            foreach_compose_undefined_names("foreach(i = 1:3) %:% when(i %% 2 == 0) %do% i");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_when_and_nested_composition_iterators_not_flagged() {
+        let names = foreach_compose_undefined_names(
+            "foreach(i = 1:3) %:% when(i %% 2 == 0) %:% foreach(j = 1:3) %do% i + j",
+        );
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_dopar_composition_iterators_not_flagged() {
+        let names =
+            foreach_compose_undefined_names("foreach(i = 1:3) %:% foreach(j = 1:3) %dopar% i + j");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_composition_body_typo_still_flagged() {
+        let names = foreach_compose_undefined_names(
+            "foreach(i = 1:3) %:% foreach(j = 1:3) %do% i + j + typo",
+        );
+        assert!(names.contains(&"typo".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_composition_iterators_do_not_leak() {
+        let names = foreach_compose_undefined_names(
+            "foreach(i = 1:3) %:% foreach(j = 1:3) %do% i + j\nprint(i)\nprint(j)",
+        );
+        // After the composed expression neither iterator has an outer binding.
+        assert!(names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_composition_inner_iterator_value_sees_outer_iterator() {
+        // The realistic cross-reference idiom: an inner loop's range depends on
+        // the outer iterator. `i` inside `foreach(j = seq_len(i))` must resolve
+        // to the outer iterator, not be flagged undefined. This is why the
+        // composition scope spans the whole left-hand side, not just the body.
+        let names = foreach_compose_undefined_names(
+            "foreach(i = 1:3) %:% foreach(j = seq_len(i)) %do% i + j",
+        );
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_composition_iterator_value_expression_still_checked() {
+        // The composition scope now spans the iterator-value expressions, but a
+        // genuinely-undefined symbol there (not an iterator) must still be
+        // flagged — the #404 guarantee, carried over to compositions.
+        let names = foreach_compose_undefined_names(
+            "foreach(i = missing_vec) %:% foreach(j = 1:3) %do% i + j",
+        );
+        assert!(names.contains(&"missing_vec".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_composition_body_local_definition_does_not_leak() {
+        // A definition made in the composed loop body is scope-local, exactly as
+        // in the simple `%do%` case (parallels `foreach_rhs_local_definition_*`).
+        let names = foreach_compose_undefined_names(
+            "foreach(i = 1:3) %:% foreach(j = 1:3) %do% {\n  inner <- i + j\n  inner\n}\nprint(inner)",
+        );
+        assert!(names.contains(&"inner".to_string()), "got: {names:?}");
+    }
+
     #[test]
     fn test_function_parameters_not_flagged_as_undefined() {
         let mut state = create_test_state();
