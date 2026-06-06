@@ -46508,6 +46508,19 @@ mod function_parameter_tests {
     }
 
     #[test]
+    fn foreach_composition_inner_iterator_shadows_outer() {
+        // Same-named iterators across composition levels. The body `i` binds to
+        // the inner foreach; after the composed expression `i` does not leak, so
+        // `print(i)` is flagged. The outer binding `outer_val`, referenced in the
+        // first foreach's value expression, stays visible and is not flagged.
+        let names = foreach_compose_undefined_names(
+            "outer_val <- 1\nforeach(i = outer_val) %:% foreach(i = 4:6) %do% i\nprint(i)",
+        );
+        assert!(names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"outer_val".to_string()), "got: {names:?}");
+    }
+
+    #[test]
     fn foreach_composition_body_local_definition_does_not_leak() {
         // A definition made in the composed loop body is scope-local, exactly as
         // in the simple `%do%` case (parallels `foreach_rhs_local_definition_*`).

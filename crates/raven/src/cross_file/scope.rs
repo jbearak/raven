@@ -5880,19 +5880,27 @@ mod tests {
     #[test]
     fn foreach_composition_iterators_visible_in_body() {
         // `foreach(i) %:% foreach(j) %do% i + j` exposes both iterators in the
-        // executed body. The `i` of `i + j` is at column 39.
+        // executed body. Query each iterator at its own body token (`i` at
+        // column 43, `j` at column 47) rather than at the `%do%`/body boundary,
+        // so the assertions verify visibility at a real body token.
         let code = "foreach(i = 1:3) %:% foreach(j = 1:3) %do% i + j";
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        let scope = scope_at_position(&artifacts, 0, 43, false);
+        let at_i = scope_at_position(&artifacts, 0, 43, false);
         assert!(
-            scope.symbols.contains_key("i"),
-            "iterator `i` visible in body"
+            at_i.symbols.contains_key("i"),
+            "iterator `i` visible at its body token"
         );
+        let at_j = scope_at_position(&artifacts, 0, 47, false);
         assert!(
-            scope.symbols.contains_key("j"),
-            "iterator `j` visible in body"
+            at_j.symbols.contains_key("j"),
+            "iterator `j` visible at its body token"
+        );
+        // Both iterators are visible together at the last body token.
+        assert!(
+            at_j.symbols.contains_key("i"),
+            "iterator `i` still visible at the `j` body token"
         );
     }
 
