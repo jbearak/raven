@@ -2123,6 +2123,12 @@ fn collect_shiny_deferred_scopes(
 /// `<helper>` requires Shiny in play and must not be shadowed by a top-level
 /// definition (`local_defs`).
 ///
+/// Shadow detection is deliberately **top-level only** (matching the diagnostics
+/// side's `handlers::collect_nse_facts`, which records only top-level bindings to
+/// avoid mis-shadowing sibling callees under global hoisting). A helper redefined
+/// inside a function is therefore still treated as Shiny's — a rare boundary
+/// noted in `docs/diagnostics.md`, not an oversight.
+///
 /// This is the *scope* side of Shiny deferred recognition (it isolates the
 /// body's definitions). Its twin is the *diagnostics* side in
 /// `handlers::resolve_call_arg_policy` (step 5, which descends the body to check
