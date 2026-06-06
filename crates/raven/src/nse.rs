@@ -32,8 +32,12 @@
 //! (base/utils metaprogramming and object-name helpers, default-attached
 //! `stats` model-fitting `subset`/`weights` data-masking, dplyr/tidyr
 //! data-masking and tidy-select verbs, `tibble`/`targets` constructors and
-//! target-name helpers, ggplot2 mapping helpers, rlang capture helpers, and a
-//! few established DSLs); it is intentionally extensible rather than exhaustive.
+//! target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes`
+//! step/role column captures, ggplot2 mapping helpers, rlang capture helpers,
+//! and a few established DSLs); it is intentionally extensible rather than
+//! exhaustive. A handful of large, uniform export families (`recipes::step_*`,
+//! `gt::fmt_*`/`sub_*`/`cells_*`) are matched by name prefix rather than
+//! enumerated, since every member shares one empirically verified contract.
 
 /// What to do with the arguments of a resolved call when collecting
 /// undefined-variable candidates.
@@ -275,6 +279,17 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             _ => return None,
         },
         "targets" => targets_policy(name)?,
+        "gt" => gt_policy(name)?,
+        "gtsummary" => gtsummary_policy(name)?,
+        "recipes" => recipes_policy(name)?,
+        "dbplyr" => match name {
+            // window_order(.data, ...): the ordering columns in `...` are
+            // data-masked (a bare undefined symbol there errors "not found");
+            // `window_frame`/`sql`/`build_sql` take numerics/strings and stay
+            // checked. Verified against dbplyr 2.5.2 + R 4.6.0.
+            "window_order" => ArgPolicy::per_formal(&[".data", "..."], &[], true),
+            _ => return None,
+        },
         _ => return None,
     };
     Some(policy)
@@ -536,6 +551,224 @@ fn targets_policy(name: &str) -> Option<ArgPolicy> {
     Some(policy)
 }
 
+/// NSE policy for `gt` table-construction verbs. `gt` selects table columns with
+/// tidyselect (`columns =`, also `after`/`hide_columns`/`target_columns`/
+/// `spanners`/`groups`) and filters rows with a data mask (`rows =`), so those
+/// are suppressed while `data` and the literal formatting controls (`decimals`,
+/// `locale`, …) stay checked.
+///
+/// Two families are matched by prefix because every export shares an identical,
+/// empirically verified contract: the `fmt_*` formatters (31 exports) and the
+/// `sub_*` value substituters (5 exports) are all `(data, columns, rows, …)`,
+/// and the `cells_*` location helpers (14 exports) take only column/row/group
+/// selectors or string keywords, so they are whole-call suppressed. The
+/// `cols_*` family is NOT uniform (label/width/merge variants differ), so its
+/// column-selecting members are enumerated. Verified against gt + R 4.6.0.
+fn gt_policy(name: &str) -> Option<ArgPolicy> {
+    // fmt_*/sub_*: uniform `(data, columns, rows, …)`. Modeled without `...` and
+    // with captured_dots=false so the trailing literal controls (`decimals`,
+    // `locale`, …) — which evaluate in the caller's environment — stay checked.
+    if name.starts_with("fmt_") || name.starts_with("sub_") {
+        return Some(ArgPolicy::per_formal(
+            &["data", "columns", "rows"],
+            &["columns", "rows"],
+            false,
+        ));
+    }
+    // cells_*: location helpers; every argument is a column/row/group selector
+    // (or a harmless string keyword), so suppress the whole call.
+    if name.starts_with("cells_") {
+        return Some(ArgPolicy::WholeCall);
+    }
+    let policy = match name {
+        "cols_hide" | "cols_unhide" | "cols_move_to_start" | "cols_move_to_end" => {
+            ArgPolicy::per_formal(&["data", "columns"], &["columns"], false)
+        }
+        // `after` names the column to move past.
+        "cols_move" => {
+            ArgPolicy::per_formal(&["data", "columns", "after"], &["columns", "after"], false)
+        }
+        "cols_label_with" => ArgPolicy::per_formal(&["data", "columns", "fn"], &["columns"], false),
+        "cols_align" => ArgPolicy::per_formal(&["data", "align", "columns"], &["columns"], false),
+        "cols_merge" => ArgPolicy::per_formal(
+            &["data", "columns", "hide_columns", "rows", "pattern"],
+            &["columns", "hide_columns", "rows"],
+            false,
+        ),
+        "cols_merge_n_pct" => ArgPolicy::per_formal(
+            &["data", "col_n", "col_pct", "rows", "autohide"],
+            &["col_n", "col_pct", "rows"],
+            false,
+        ),
+        "cols_merge_range" => ArgPolicy::per_formal(
+            &[
+                "data",
+                "col_begin",
+                "col_end",
+                "rows",
+                "autohide",
+                "sep",
+                "locale",
+            ],
+            &["col_begin", "col_end", "rows"],
+            false,
+        ),
+        "cols_merge_uncert" => ArgPolicy::per_formal(
+            &["data", "col_val", "col_uncert", "rows", "sep", "autohide"],
+            &["col_val", "col_uncert", "rows"],
+            false,
+        ),
+        "tab_spanner" => ArgPolicy::per_formal(
+            &[
+                "data", "label", "columns", "spanners", "level", "id", "gather", "replace",
+            ],
+            &["columns", "spanners"],
+            false,
+        ),
+        "data_color" => ArgPolicy::per_formal(
+            &["data", "columns", "rows", "direction", "target_columns"],
+            &["columns", "rows", "target_columns"],
+            false,
+        ),
+        "summary_rows" => ArgPolicy::per_formal(
+            &[
+                "data",
+                "groups",
+                "columns",
+                "fns",
+                "fmt",
+                "side",
+                "missing_text",
+                "formatter",
+                "...",
+            ],
+            &["groups", "columns"],
+            false,
+        ),
+        "grand_summary_rows" => ArgPolicy::per_formal(
+            &[
+                "data",
+                "columns",
+                "fns",
+                "fmt",
+                "side",
+                "missing_text",
+                "formatter",
+                "...",
+            ],
+            &["columns"],
+            false,
+        ),
+        "row_group_order" => ArgPolicy::per_formal(&["data", "groups"], &["groups"], false),
+        _ => return None,
+    };
+    Some(policy)
+}
+
+/// NSE policy for `gtsummary` table builders. The variable-selection arguments
+/// (`by`, `include`, `variable`, `row`, `col`) are tidyselect/data-masked and
+/// suppressed; the `label`/`type`/`statistic`/`digits`/`value` arguments take
+/// `column ~ "spec"` formula lists whose LHS is handled by raven's separate `~`
+/// path, so they are left CHECKED. `modify_header`/`tbl_uvregression` evaluate
+/// their selectors in the caller's environment (a bare undefined symbol is
+/// looked up, not captured) and so are deliberately omitted. Verified against
+/// gtsummary + R 4.6.0.
+fn gtsummary_policy(name: &str) -> Option<ArgPolicy> {
+    let policy = match name {
+        "tbl_summary" => ArgPolicy::per_formal(
+            &[
+                "data",
+                "by",
+                "label",
+                "statistic",
+                "digits",
+                "type",
+                "value",
+                "missing",
+                "missing_text",
+                "missing_stat",
+                "sort",
+                "percent",
+                "include",
+            ],
+            &["by", "include"],
+            false,
+        ),
+        "tbl_continuous" => ArgPolicy::per_formal(
+            &[
+                "data",
+                "variable",
+                "include",
+                "digits",
+                "by",
+                "statistic",
+                "label",
+                "value",
+            ],
+            &["variable", "include", "by"],
+            false,
+        ),
+        "tbl_cross" => ArgPolicy::per_formal(
+            &[
+                "data",
+                "row",
+                "col",
+                "label",
+                "statistic",
+                "digits",
+                "percent",
+                "margin",
+                "missing",
+                "missing_text",
+                "margin_text",
+            ],
+            &["row", "col"],
+            false,
+        ),
+        _ => return None,
+    };
+    Some(policy)
+}
+
+/// NSE policy for `recipes` steps and role helpers. Every `step_*` constructor
+/// (98 exports) shares the contract `step_x(recipe, <columns/data-mask in …>,
+/// <literal controls>)`: the `...` is suppressed (bare column names, tidyselect
+/// helpers, and `step_mutate`'s `name = expr` data masks) while `recipe` stays
+/// checked. This is the same minimal model as `dplyr::select`/`transmute`
+/// (`[".data", "..."]`, captured_dots).
+///
+/// TRADEOFF: a named scalar control passed past `...` (e.g. `num_comp = k`) is
+/// absorbed by the dots and suppressed, so a genuinely undefined symbol there is
+/// not flagged. This is the data-mask tradeoff already accepted for
+/// `mutate`/`lm(subset=)`; it suppresses the far more common false positive of
+/// flagging every selected column. The role helpers list their `new_role`/
+/// `old_role`/`new_type` controls explicitly so those values stay checked.
+///
+/// `check_*` is NOT prefix-matched: four recipes `check_*` exports
+/// (`check_name`/`check_new_data`/`check_options`/`check_type`) are internal
+/// helpers with a different first formal, so only the five user-facing column
+/// checks are enumerated. Verified against recipes + R 4.6.0.
+fn recipes_policy(name: &str) -> Option<ArgPolicy> {
+    // All step_* constructors take tidyselect/data-mask columns in `...`.
+    if name.starts_with("step_") {
+        return Some(ArgPolicy::per_formal(&["recipe", "..."], &[], true));
+    }
+    let policy = match name {
+        "update_role" => {
+            ArgPolicy::per_formal(&["recipe", "...", "new_role", "old_role"], &[], true)
+        }
+        "add_role" => ArgPolicy::per_formal(&["recipe", "...", "new_role", "new_type"], &[], true),
+        "remove_role" => ArgPolicy::per_formal(&["recipe", "...", "old_role"], &[], true),
+        // The user-facing column checks share the step contract; the remaining
+        // `check_*` exports are internal helpers and must stay None.
+        "check_class" | "check_cols" | "check_missing" | "check_new_values" | "check_range" => {
+            ArgPolicy::per_formal(&["recipe", "..."], &[], true)
+        }
+        _ => return None,
+    };
+    Some(policy)
+}
+
 fn tidyr_policy(name: &str) -> Option<ArgPolicy> {
     let policy = match name {
         "pivot_longer" => ArgPolicy::per_formal(
@@ -657,7 +890,7 @@ pub(crate) fn meta_package_members(name: &str) -> &'static [&'static str] {
             "forcats",
             "lubridate",
         ],
-        "tidymodels" => &["dplyr", "tidyr", "ggplot2", "purrr", "rlang"],
+        "tidymodels" => &["dplyr", "tidyr", "ggplot2", "purrr", "rlang", "recipes"],
         _ => &[],
     }
 }
@@ -955,6 +1188,9 @@ mod tests {
         assert!(meta_package_members("tidyverse").contains(&"dplyr"));
         assert!(meta_package_members("tidyverse").contains(&"ggplot2"));
         assert!(meta_package_members("tidymodels").contains(&"dplyr"));
+        // recipes carries NSE policies, so it must be a tidymodels member for a
+        // bare `step_*` to resolve under `library(tidymodels)` alone.
+        assert!(meta_package_members("tidymodels").contains(&"recipes"));
         assert!(meta_package_members("dplyr").is_empty());
     }
 
@@ -1503,6 +1739,147 @@ mod tests {
             ("dplyr", "tibble", PerFormal),
             // Unknown package -> always None.
             ("nonesuch", "filter", None),
+        ];
+        for (pkg, name, want) in cases {
+            assert_eq!(
+                shape(package_policy(pkg, name)),
+                *want,
+                "package_policy({pkg:?}, {name:?})"
+            );
+        }
+    }
+
+    // --- §5 attached-package sweep: gt / gtsummary / recipes / dbplyr -----
+
+    #[test]
+    fn gt_fmt_suppresses_columns_and_rows_checks_decimals() {
+        // fmt_number(data, columns = aa, rows = aa > 1, decimals = n): columns
+        // and rows are NSE; `decimals` evaluates in the caller's env, so it is
+        // checked (absorbed by dots, captured_dots=false).
+        let p = package_policy("gt", "fmt_number").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, Some("columns"), Some("rows"), Some("decimals")]),
+            false,
+        );
+        assert_eq!(mask, vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn gt_data_color_suppresses_target_columns() {
+        // data_color(data, columns = aa, target_columns = bb): both column
+        // selectors are suppressed; `data` checked.
+        let p = package_policy("gt", "data_color").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, Some("columns"), Some("target_columns")]),
+            false,
+        );
+        assert_eq!(mask, vec![false, true, true]);
+    }
+
+    #[test]
+    fn gtsummary_tbl_summary_suppresses_by_include_checks_label() {
+        // tbl_summary(data, by = grp, label = age ~ "Age", include = c(age)):
+        // by/include are tidyselect (suppressed); `label` is a `~` formula list
+        // left checked for raven's formula path; `data` checked.
+        let p = package_policy("gtsummary", "tbl_summary").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, Some("by"), Some("label"), Some("include")]),
+            false,
+        );
+        assert_eq!(mask, vec![false, true, false, true]);
+        // (positional order: data, by, label) -> by suppressed, label checked.
+        let mask = suppressed_arguments(&p, &labels(&[None, None, None]), false);
+        assert_eq!(mask, vec![false, true, false]);
+    }
+
+    #[test]
+    fn recipes_step_suppresses_columns_checks_recipe() {
+        // step_center(rec, aa, bb): recipe checked, selected columns suppressed.
+        let p = package_policy("recipes", "step_center").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, None, None]), false);
+        assert_eq!(mask, vec![false, true, true]);
+        // Prefix match also covers steps not individually enumerated.
+        assert!(package_policy("recipes", "step_zzz_future").is_some());
+        // Pipe-fed: `rec %>% step_center(aa)` -> the single positional is a
+        // selected column, suppressed (the pipe supplies `recipe`).
+        let mask = suppressed_arguments(&p, &labels(&[None]), true);
+        assert_eq!(mask, vec![true]);
+    }
+
+    #[test]
+    fn recipes_update_role_checks_new_role() {
+        // update_role(rec, aa, new_role = "predictor"): the selected column is
+        // suppressed; `new_role` binds its named formal and stays checked.
+        let p = package_policy("recipes", "update_role").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, None, Some("new_role")]), false);
+        assert_eq!(mask, vec![false, true, false]);
+    }
+
+    #[test]
+    fn dbplyr_window_order_suppresses_order_columns() {
+        // window_order(.data, aa): the ordering column is data-masked.
+        let p = package_policy("dbplyr", "window_order").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
+        assert_eq!(mask, vec![false, true]);
+    }
+
+    #[test]
+    fn section5_package_policy_arm_shapes() {
+        use Shape::*;
+        let cases: &[(&str, &str, Shape)] = &[
+            // gt: fmt_*/sub_* prefix, cells_* whole-call, enumerated cols_*.
+            ("gt", "fmt_number", PerFormal),
+            ("gt", "fmt_currency", PerFormal),
+            ("gt", "sub_missing", PerFormal),
+            ("gt", "cells_body", WholeCall),
+            ("gt", "cells_title", WholeCall),
+            ("gt", "cols_hide", PerFormal),
+            ("gt", "cols_move", PerFormal),
+            ("gt", "cols_merge", PerFormal),
+            ("gt", "tab_spanner", PerFormal),
+            ("gt", "data_color", PerFormal),
+            ("gt", "summary_rows", PerFormal),
+            ("gt", "row_group_order", PerFormal),
+            // tab_style nests cells_* helpers (which carry their own policy);
+            // its own args are evaluated -> None.
+            ("gt", "tab_style", None),
+            ("gt", "gt", None),
+            // gtsummary: only the tidyselect builders.
+            ("gtsummary", "tbl_summary", PerFormal),
+            ("gtsummary", "tbl_continuous", PerFormal),
+            ("gtsummary", "tbl_cross", PerFormal),
+            ("gtsummary", "modify_header", None),
+            ("gtsummary", "add_p", None),
+            // recipes: step_* prefix, enumerated role + user-facing checks.
+            ("recipes", "step_center", PerFormal),
+            ("recipes", "step_dummy", PerFormal),
+            ("recipes", "step_mutate", PerFormal),
+            ("recipes", "update_role", PerFormal),
+            ("recipes", "add_role", PerFormal),
+            ("recipes", "remove_role", PerFormal),
+            ("recipes", "check_missing", PerFormal),
+            ("recipes", "check_range", PerFormal),
+            // Internal check_* helpers and non-step exports stay None.
+            ("recipes", "check_type", None),
+            ("recipes", "check_options", None),
+            ("recipes", "recipe", None),
+            ("recipes", "bake", None),
+            // dbplyr: only window_order; SQL/string helpers stay checked.
+            ("dbplyr", "window_order", PerFormal),
+            ("dbplyr", "window_frame", None),
+            ("dbplyr", "sql", None),
+            // Surveyed-but-no-additions families (standard-eval / lexical scope).
+            ("shiny", "reactive", None),
+            ("shiny", "observe", None),
+            ("shiny", "renderPlot", None),
+            ("shiny", "isolate", None),
+            ("parsnip", "fit", None),
+            ("parsnip", "set_engine", None),
+            ("DBI", "dbGetQuery", None),
+            ("DBI", "dbExecute", None),
         ];
         for (pkg, name, want) in cases {
             assert_eq!(
