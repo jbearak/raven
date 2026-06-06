@@ -46292,6 +46292,130 @@ mod function_parameter_tests {
         uri
     }
 
+    /// Collect the names reported as "Undefined variable: <name>" for `code`.
+    fn undefined_variable_names(code: &str) -> Vec<String> {
+        let mut state = create_test_state();
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        diagnostics
+            .iter()
+            .filter_map(|d| {
+                d.message
+                    .strip_prefix("Undefined variable: ")
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    // Issue #404: `foreach(...) %do%/%dopar% expr` iterator scope.
+    //
+    // `foreach()` and `%do%`/`%dopar%` live in the foreach package. The unit
+    // test package DB is empty, so each test defines `foreach` locally. This is
+    // faithful on two counts: #404 intentionally treats a user-defined
+    // `foreach` as the real one, and it makes `foreach` a *resolvable* callee so
+    // its argument values are NSE-checked — raven conservatively skips the
+    // arguments of unknown callees, exactly as it would if `foreach` were not in
+    // scope. A real user reaches the same state via `library(foreach)`.
+    const FOREACH_PREAMBLE: &str = "foreach <- function(...) NULL\n";
+
+    fn foreach_undefined_names(body: &str) -> Vec<String> {
+        undefined_variable_names(&format!("{FOREACH_PREAMBLE}{body}"))
+    }
+
+    #[test]
+    fn foreach_do_braced_body_iterator_not_flagged() {
+        let names = foreach_undefined_names("foreach(i = 1:10) %do% { print(i) }");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_dopar_braced_body_iterator_not_flagged() {
+        let names = foreach_undefined_names("foreach(i = 1:10) %dopar% { print(i) }");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_multiple_iterators_not_flagged() {
+        let names = foreach_undefined_names("foreach(i = 1:3, j = 4:6) %do% i + j");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_body_typo_still_flagged() {
+        let names = foreach_undefined_names("foreach(i = 1:3) %do% i + typo");
+        assert!(names.contains(&"typo".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_iterator_value_expression_still_checked() {
+        let names = foreach_undefined_names("foreach(i = missing_vec) %do% i");
+        assert!(names.contains(&"missing_vec".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_control_argument_value_still_checked() {
+        let names = foreach_undefined_names("foreach(i = 1:3, .combine = missing_combine) %do% i");
+        assert!(
+            names.contains(&"missing_combine".to_string()),
+            "got: {names:?}"
+        );
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_iterator_does_not_leak_after_expression() {
+        let names = foreach_undefined_names("foreach(i = 1:3) %do% i\nprint(i)");
+        // The `i` in `print(i)` on the trailing line has no outer binding.
+        assert!(names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_rhs_local_definition_does_not_leak() {
+        let names = foreach_undefined_names(
+            "foreach(i = 1:3) %do% {\n  inner <- i\n  inner\n}\nprint(inner)",
+        );
+        assert!(names.contains(&"inner".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_outer_bindings_remain_visible_in_rhs() {
+        let names = foreach_undefined_names("outer <- 1\nforeach(i = 1:3) %do% outer + i");
+        assert!(names.is_empty(), "expected no diagnostics, got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_namespace_qualified_iterator_not_flagged() {
+        let names = foreach_undefined_names("foreach::foreach(i = 1:3) %do% i");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_lookalike_is_not_special() {
+        // `other_foreach` is not recognized, so the RHS `i` gets no iterator
+        // scope and is reported. (The preamble defines `foreach`, not
+        // `other_foreach`, so the lookalike remains an unknown callee.)
+        let names = foreach_undefined_names("other_foreach(i = 1:3) %do% i");
+        assert!(names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
     #[test]
     fn test_function_parameters_not_flagged_as_undefined() {
         let mut state = create_test_state();
