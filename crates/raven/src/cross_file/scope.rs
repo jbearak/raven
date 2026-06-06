@@ -2122,6 +2122,13 @@ fn collect_shiny_deferred_scopes(
 /// helper. `shiny::<helper>` qualified calls are always recognized; a bare
 /// `<helper>` requires Shiny in play and must not be shadowed by a top-level
 /// definition (`local_defs`).
+///
+/// This is the *scope* side of Shiny deferred recognition (it isolates the
+/// body's definitions). Its twin is the *diagnostics* side in
+/// `handlers::resolve_call_arg_policy` (step 5, which descends the body to check
+/// references). The two pipelines differ, so they share only the leaf predicate
+/// [`crate::nse::is_shiny_deferred_helper`] rather than a common classifier —
+/// keep their recognition rules in sync when either changes.
 fn call_is_shiny_deferred(
     func: Node,
     text: &str,

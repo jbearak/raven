@@ -11507,7 +11507,10 @@ fn resolve_call_arg_policy(
     //    export metadata is unavailable (issue #402, Gap 1). Local shadowing was
     //    already resolved by `local_function_policies` above. The `shiny::`
     //    qualified form needs no handling here — it returned `Standard` from the
-    //    namespace branch at the top of this function.
+    //    namespace branch at the top of this function. This is the diagnostics
+    //    side of Shiny deferred recognition; its scope-side twin,
+    //    `cross_file::scope::call_is_shiny_deferred`, isolates the same body's
+    //    definitions — keep the two recognition rules in sync.
     if crate::nse::is_shiny_deferred_helper(name)
         && analysis.in_play_packages.iter().any(|p| p == "shiny")
     {
