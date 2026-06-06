@@ -73,6 +73,8 @@ export interface RavenInitializationOptions {
     diagnostics?: {
         enabled?: boolean;
         undefinedVariableSeverity?: SeverityLevel;
+        undefinedVariableInCallArguments?: boolean;
+        undefinedVariableInBracketIndices?: boolean;
         mixedLogicalSeverity?: SeverityLevel;
         conditionAssignmentSeverity?: SeverityLevel;
     };
@@ -291,6 +293,8 @@ export function getInitializationOptions(
 
     const diagnosticsEnabled = config.get<boolean>('diagnostics.enabled', true);
     const undefinedVariableSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.undefinedVariableSeverity');
+    const undefinedVariableInCallArguments = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariableInCallArguments');
+    const undefinedVariableInBracketIndices = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariableInBracketIndices');
     const mixedLogicalSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.mixedLogicalSeverity');
     const conditionAssignmentSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.conditionAssignmentSeverity');
 
@@ -299,6 +303,12 @@ export function getInitializationOptions(
     };
     if (undefinedVariableSeverity !== undefined) {
         options.diagnostics.undefinedVariableSeverity = undefinedVariableSeverity;
+    }
+    if (undefinedVariableInCallArguments !== undefined) {
+        options.diagnostics.undefinedVariableInCallArguments = undefinedVariableInCallArguments;
+    }
+    if (undefinedVariableInBracketIndices !== undefined) {
+        options.diagnostics.undefinedVariableInBracketIndices = undefinedVariableInBracketIndices;
     }
     if (mixedLogicalSeverity !== undefined) {
         options.diagnostics.mixedLogicalSeverity = mixedLogicalSeverity;

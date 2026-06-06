@@ -245,6 +245,20 @@ visible to diagnostics and completions even before you run
 `devtools::document()` to regenerate `NAMESPACE`, and NAMESPACE-only
 imports remain visible if some `R/*.R` files don't carry roxygen tags.
 
+### data.table `[` detection in package mode
+
+When your package depends on data.table — via DESCRIPTION `Imports:` /
+`Depends:`, a NAMESPACE `import(data.table)` / `importFrom(data.table, ...)`,
+or the equivalent roxygen `@import` / `@importFrom` — Raven treats data.table as
+"detectably in play." Undefined-variable checking of `[` index expressions then
+suppresses indices on **unresolved** objects (such as a function parameter
+`dt`), so an idiomatic helper like `f <- function(dt) dt[, mean(value), by = grp]`
+does not flag the column names `value` / `grp`. Objects you construct locally
+with `data.frame()` / `tibble()` / `read.csv()` are still treated as
+non-data.table, so `df[undefined_var, ]` is flagged. `[[` is always checked.
+See [Diagnostics](diagnostics.md#call-arguments-and-bracket-indices) for the
+full rules and the `undefinedVariableInBracketIndices` opt-out.
+
 ### Live Updates
 
 Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running `devtools::document()` or editing these files directly, diagnostics update automatically without restarting the editor.
