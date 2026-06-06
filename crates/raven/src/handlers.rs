@@ -5209,6 +5209,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
     let mut packages: HashSet<String> = HashSet::new();
     for call in &snapshot.directive_meta.library_calls {
+        // Note: `loadNamespace` calls are intentionally included here. Unlike a
+        // bare *function* call (e.g. Shiny's `reactive`/`render*`, which require
+        // an attach — see `LibraryCall::attaches`), the NSE surfaces gated by
+        // this set are dispatched on the object/namespace (e.g. data.table's S3
+        // `[.data.table`), which a merely-loaded namespace already enables.
         if !call.package.is_empty() {
             packages.insert(call.package.clone());
         }
@@ -11502,7 +11507,10 @@ fn resolve_call_arg_policy(
     //    export metadata is unavailable (issue #402, Gap 1). Local shadowing was
     //    already resolved by `local_function_policies` above. The `shiny::`
     //    qualified form needs no handling here — it returned `Standard` from the
-    //    namespace branch at the top of this function.
+    //    namespace branch at the top of this function. This is the diagnostics
+    //    side of Shiny deferred recognition; its scope-side twin,
+    //    `cross_file::scope::call_is_shiny_deferred`, isolates the same body's
+    //    definitions — keep the two recognition rules in sync.
     if crate::nse::is_shiny_deferred_helper(name)
         && analysis.in_play_packages.iter().any(|p| p == "shiny")
     {
@@ -47776,6 +47784,28 @@ my_func <- function(a = default_value) {
         assert!(
             !messages.iter().any(|m| m.contains("inner")),
             "local renderPlot must not get Shiny nested-scope semantics; got {messages:?}"
+        );
+    }
+
+    /// Issue #402 exclusion: `loadNamespace("shiny")` loads the namespace for
+    /// qualified `shiny::` access but does *not* attach Shiny, so a bare
+    /// `renderPlot` is not a recognized deferred helper and its body block is not
+    /// isolated. The contrast case `nse_shiny_deferred_body_definition_does_not_leak_end_to_end`
+    /// uses `library(shiny)` and *does* isolate the body — there `inner` is
+    /// flagged at `print(inner)`; here `inner` leaks, so it is not flagged.
+    #[test]
+    fn nse_shiny_loadnamespace_does_not_enable_deferred_scope_end_to_end() {
+        let messages = collect_undefined_messages(
+            "loadNamespace(\"shiny\")\n\
+             server <- function(input, output, session) {\n\
+               renderPlot({ inner <- 1 })\n\
+               print(inner)\n\
+             }\n",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("inner")),
+            "loadNamespace(shiny) must not enable Shiny deferred-scope isolation; \
+             got {messages:?}"
         );
     }
 

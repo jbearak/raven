@@ -2049,7 +2049,13 @@ fn push_shiny_deferred_scopes(
     line_index: &LineIndex,
     library_calls: &[super::source_detect::LibraryCall],
 ) {
-    let shiny_in_play = library_calls.iter().any(|c| c.package == "shiny");
+    // Only an *attach* (`library(shiny)` / `require(shiny)`) brings the bare
+    // helpers (`reactive`, `render*`, …) into scope. `loadNamespace("shiny")`
+    // loads the namespace for qualified `shiny::` access only, so it must not
+    // enable bare-helper semantics — see `LibraryCall::attaches`.
+    let shiny_in_play = library_calls
+        .iter()
+        .any(|c| c.package == "shiny" && c.attaches);
     // Cheap pre-filter: skip the walk only when the file cannot contain a
     // trigger. Any `library(shiny)`/`require(shiny)` sets `shiny_in_play`; a
     // `shiny::`-qualified call must contain the substring "shiny". A bare
@@ -2059,17 +2065,16 @@ fn push_shiny_deferred_scopes(
         return;
     }
     // `exported_interface` is read for shadow detection while `timeline` is
-    // appended to; split the borrow by collecting into a local buffer first.
-    let mut events = Vec::new();
+    // appended to; these are disjoint fields, so borrow each directly rather
+    // than buffering events in a temporary Vec.
     collect_shiny_deferred_scopes(
         root,
         content,
         line_index,
         shiny_in_play,
         &artifacts.exported_interface,
-        &mut events,
+        &mut artifacts.timeline,
     );
-    artifacts.timeline.extend(events);
 }
 
 /// Walk `node`, appending a parameterless `FunctionScope` event for each
@@ -2117,6 +2122,23 @@ fn collect_shiny_deferred_scopes(
 /// helper. `shiny::<helper>` qualified calls are always recognized; a bare
 /// `<helper>` requires Shiny in play and must not be shadowed by a top-level
 /// definition (`local_defs`).
+///
+/// Shadow detection is deliberately **top-level only**, like the diagnostics
+/// side (`handlers::collect_nse_facts`), which also excludes nested definitions
+/// to avoid mis-shadowing sibling callees under global hoisting. A helper
+/// redefined inside a function is therefore still treated as Shiny's — a rare
+/// boundary noted in `docs/diagnostics.md`, not an oversight. (The two top-level
+/// sets are not identical — this consults every top-level binding via
+/// `exported_interface`, whereas `collect_nse_facts` tracks only top-level
+/// function definitions — but they diverge only for a non-function binding that
+/// collides with a helper name, and never toward a false positive.)
+///
+/// This is the *scope* side of Shiny deferred recognition (it isolates the
+/// body's definitions). Its twin is the *diagnostics* side in
+/// `handlers::resolve_call_arg_policy` (step 5, which descends the body to check
+/// references). The two pipelines differ, so they share only the leaf predicate
+/// [`crate::nse::is_shiny_deferred_helper`] rather than a common classifier —
+/// keep their recognition rules in sync when either changes.
 fn call_is_shiny_deferred(
     func: Node,
     text: &str,
