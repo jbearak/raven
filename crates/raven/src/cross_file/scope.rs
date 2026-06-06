@@ -2257,7 +2257,7 @@ fn foreach_execution_scope_event(
 /// execution node is the left operand of a *strictly looser* binary operator.
 ///
 /// We stop climbing at operators that are **not** strictly looser than `%do%`:
-/// - assignments (`<- = <<- -> ->>`): `x <- foreach(...) %do% i` and
+/// - assignments (`<- = <<- -> ->> :=`): `x <- foreach(...) %do% i` and
 ///   `foreach(...) %do% i -> x` capture the loop *result*, so the body ends at
 ///   the execution node;
 /// - other special `%...%` operators (kind `special`) and the pipe `|>`, which
@@ -2282,7 +2282,7 @@ fn foreach_body_end_node(exec_node: Node) -> Node {
         if let Some(op) = parent.child_by_field_name("operator")
             && matches!(
                 op.kind(),
-                "<-" | "<<-" | "=" | "->" | "->>" | "special" | "|>"
+                "<-" | "<<-" | "=" | "->" | "->>" | ":=" | "special" | "|>"
             )
         {
             break;
@@ -5755,6 +5755,31 @@ mod tests {
             .collect();
         params.sort();
         assert_eq!(params, vec!["i".to_string(), "j".to_string()]);
+    }
+
+    #[test]
+    fn foreach_iterator_scope_stops_at_walrus_assignment() {
+        // `:=` is a left-assignment (looser than `%do%`), so
+        // `foreach(i = 1:3) %do% x := i` parses as `(foreach %do% x) := i`. Like
+        // the other assignments, `:=` captures the loop result, so the body ends
+        // at `x` and the `i` after `:=` is outside the iterator scope.
+        let code = "foreach(i = 1:3) %do% x := i";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // `x` (the %do% rhs) starts at column 22 — inside the iterator scope.
+        let inside = scope_at_position(&artifacts, 0, 22, false);
+        assert!(
+            inside.symbols.contains_key("i"),
+            "iterator `i` should be visible in the foreach body"
+        );
+
+        // `i` after `:=` starts at column 27 — outside the scope.
+        let after_assign = scope_at_position(&artifacts, 0, 27, false);
+        assert!(
+            !after_assign.symbols.contains_key("i"),
+            "iterator `i` must not leak across the `:=` assignment"
+        );
     }
 
     #[test]
