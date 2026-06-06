@@ -47610,6 +47610,126 @@ my_func <- function(a = default_value) {
             "positive control should be flagged; got {messages:?}"
         );
     }
+
+    /// Issue #398 end-to-end: a namespace-qualified base call (`base::rm`) is
+    /// the same function as bare `rm`, so it must route through the base NSE
+    /// policy — the bare object name in `...` is suppressed, but the `list`
+    /// value expression is evaluated and checked. The checked argument doubles
+    /// as the positive control proving the collector ran.
+    #[test]
+    fn nse_base_namespace_rm_delegates_to_base_policy_end_to_end() {
+        let messages = collect_undefined_messages("base::rm(suppressed_obj, list = checked_vec)");
+        assert!(
+            !messages.iter().any(|m| m.contains("suppressed_obj")),
+            "bare object name passed to base::rm should be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_vec")),
+            "base::rm(list = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end regression: delegation covers *all* base NSE
+    /// policies, not just `rm`. `base::substitute` captures `expr` (suppressed)
+    /// but checks `env`. Without `package_policy("base", _)` delegating to
+    /// `base_policy`, the captured expression would be a false positive.
+    #[test]
+    fn nse_base_namespace_substitute_delegates_to_base_policy_end_to_end() {
+        let messages =
+            collect_undefined_messages("base::substitute(captured_expr, env = checked_env)");
+        assert!(
+            !messages.iter().any(|m| m.contains("captured_expr")),
+            "base::substitute expr should be captured/suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_env")),
+            "base::substitute env value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `data` lives in `utils`, not `base`, so the
+    /// correctly-qualified `utils::data` must route to the builtin NSE policy —
+    /// suppressing the bare dataset name in `...` while still checking
+    /// `lib.loc`. A `base::*`-only delegation would miss this and flag the
+    /// dataset name (the same false positive `base::rm` had).
+    #[test]
+    fn nse_utils_namespace_data_suppresses_dataset_name_end_to_end() {
+        let messages =
+            collect_undefined_messages("utils::data(suppressed_dataset, lib.loc = checked_path)");
+        assert!(
+            !messages.iter().any(|m| m.contains("suppressed_dataset")),
+            "bare dataset name passed to utils::data should be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_path")),
+            "utils::data(lib.loc = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `curve` lives in `graphics`, so `graphics::curve`
+    /// must capture the plotted expression (suppressed) while checking the
+    /// numeric range arguments.
+    #[test]
+    fn nse_graphics_namespace_curve_captures_expr_end_to_end() {
+        let messages =
+            collect_undefined_messages("graphics::curve(captured_expr, from = checked_from)");
+        assert!(
+            !messages.iter().any(|m| m.contains("captured_expr")),
+            "graphics::curve expr should be captured/suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_from")),
+            "graphics::curve(from = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `utils::example` captures the bare help `topic`
+    /// (NSE) but evaluates `package`, so a typo'd package is still flagged.
+    #[test]
+    fn nse_utils_namespace_example_captures_topic_checks_package_end_to_end() {
+        let messages =
+            collect_undefined_messages("utils::example(captured_topic, package = checked_pkg)");
+        assert!(
+            !messages.iter().any(|m| m.contains("captured_topic")),
+            "utils::example topic should be captured/suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: checked_pkg")),
+            "utils::example(package = ...) value should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #398 end-to-end: `vignette` and `citation` evaluate their
+    /// arguments (verified against R 4.6.0), so they are deliberately *not* in
+    /// the NSE suppress table — a bare undefined argument must still be flagged.
+    /// Guards against "completing the set" and silencing real bugs.
+    #[test]
+    fn nse_standard_eval_utils_helpers_still_flag_undefined_args_end_to_end() {
+        let vignette = collect_undefined_messages("utils::vignette(undefined_topic)");
+        assert!(
+            vignette
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_topic")),
+            "vignette is standard-eval; its argument should be flagged; got {vignette:?}"
+        );
+        let citation = collect_undefined_messages("utils::citation(undefined_pkg)");
+        assert!(
+            citation
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_pkg")),
+            "citation is standard-eval; its argument should be flagged; got {citation:?}"
+        );
+    }
 }
 
 // ============================================================================

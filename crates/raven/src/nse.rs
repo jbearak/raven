@@ -163,10 +163,33 @@ pub(crate) fn base_policy(name: &str) -> Option<ArgPolicy> {
             &["topic", "package"],
             false,
         ),
+        // utils::example captures the bare help `topic` (like `help`) but
+        // evaluates `package`/`lib.loc` — verified against R 4.6.0.
+        "example" => ArgPolicy::per_formal(
+            &["topic", "package", "lib.loc", "character.only"],
+            &["topic"],
+            false,
+        ),
 
         _ => return None,
     };
     Some(policy)
+}
+
+/// The package each builtin NSE helper in [`base_policy`] is actually exported
+/// from. Almost all are `base`; the attached-by-default exceptions live in
+/// `utils` (`data`, `help`, `example`) or `graphics` (`curve`). Lets [`package_policy`]
+/// route a `pkg::name` call to the builtin policy only when `pkg` is the true
+/// home, so `utils::data` resolves while the invalid `base::data` does not.
+///
+/// Keep in sync with [`base_policy`]: any entry added there that is **not** in
+/// `base` must be listed here, or its correctly-qualified form will be missed.
+fn builtin_nse_home(name: &str) -> &'static str {
+    match name {
+        "data" | "help" | "example" => "utils",
+        "curve" => "graphics",
+        _ => "base",
+    }
 }
 
 /// Built-in NSE policy for a `package::name` callee, or `None` when that
@@ -179,6 +202,12 @@ pub(crate) fn base_policy(name: &str) -> Option<ArgPolicy> {
 /// subset of the common data-masking / tidy-select / capture surface.
 pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
     let policy = match package {
+        // Builtin NSE helpers are attached by default but live in different
+        // packages (`data`/`help` in utils, `curve` in graphics, the rest in
+        // base). Resolve a `pkg::name` call to the builtin policy only when
+        // `pkg` is the function's true home, so `base::rm` and `utils::data`
+        // resolve while the invalid `base::data` does not falsely suppress.
+        "base" | "utils" | "graphics" if builtin_nse_home(name) == package => base_policy(name)?,
         "dplyr" => dplyr_policy(name)?,
         "tidyr" => tidyr_policy(name)?,
         "ggplot2" => match name {
@@ -623,6 +652,79 @@ mod tests {
         assert!(package_policy("dplyr", "coalesce").is_none());
         assert!(package_policy("stats", "filter").is_none());
         assert!(package_policy("nonexistent", "filter").is_none());
+    }
+
+    #[test]
+    fn base_namespace_delegates_to_base_policy() {
+        // `base::rm`, `base::substitute`, etc. are the same functions as their
+        // bare forms, so a namespace-qualified base call must resolve to the
+        // identical NSE policy — not be silently downgraded to standard-eval by
+        // `resolve_call_arg_policy`'s namespace-qualified branch.
+        for name in [
+            "rm",
+            "remove",
+            "substitute",
+            "quote",
+            "with",
+            "subset",
+            "transform",
+            "library",
+            "save",
+        ] {
+            assert_eq!(
+                package_policy("base", name),
+                base_policy(name),
+                "package_policy(\"base\", {name:?}) should delegate to base_policy"
+            );
+        }
+        // A base function with no NSE policy stays standard-eval (both `None`).
+        assert_eq!(package_policy("base", "paste"), None);
+        assert_eq!(package_policy("base", "paste"), base_policy("paste"));
+    }
+
+    #[test]
+    fn builtin_nse_qualified_routing_respects_home_package() {
+        // `data`/`help` live in utils and `curve` in graphics, not base — so the
+        // correct qualified form must resolve to the builtin policy, while
+        // `base::data` (invalid R) must not falsely suppress.
+        assert_eq!(package_policy("utils", "data"), base_policy("data"));
+        assert_eq!(package_policy("utils", "help"), base_policy("help"));
+        assert_eq!(package_policy("graphics", "curve"), base_policy("curve"));
+        assert!(package_policy("utils", "data").is_some());
+        assert!(package_policy("graphics", "curve").is_some());
+
+        // Wrong home -> no policy (the resolver then treats it as standard-eval).
+        assert_eq!(package_policy("base", "data"), None);
+        assert_eq!(package_policy("base", "help"), None);
+        assert_eq!(package_policy("base", "curve"), None);
+        assert_eq!(package_policy("graphics", "data"), None);
+
+        // `subset` genuinely lives in base, so `base::subset` resolves and
+        // `utils::subset` does not — the contrast that makes the routing real.
+        assert_eq!(package_policy("base", "subset"), base_policy("subset"));
+        assert!(package_policy("base", "subset").is_some());
+        assert_eq!(package_policy("utils", "subset"), None);
+    }
+
+    #[test]
+    fn example_captures_topic_but_checks_package_unlike_help() {
+        // Verified against R 4.6.0: utils::example captures the bare `topic`
+        // (NSE) but *evaluates* `package` (unlike help, which also captures
+        // package). vignette/citation evaluate their arguments entirely, so
+        // they are deliberately standard-eval (no policy).
+        let p = base_policy("example").expect("example has an NSE policy");
+        let mask = suppressed_arguments(&p, &labels(&[None, Some("package")]), false);
+        assert_eq!(mask, vec![true, false], "topic captured, package checked");
+
+        // Routed under its true home (utils), not base.
+        assert_eq!(package_policy("utils", "example"), base_policy("example"));
+        assert_eq!(package_policy("base", "example"), None);
+
+        // vignette/citation are standard-eval: no NSE policy at any spelling.
+        assert_eq!(base_policy("vignette"), None);
+        assert_eq!(base_policy("citation"), None);
+        assert_eq!(package_policy("utils", "vignette"), None);
+        assert_eq!(package_policy("utils", "citation"), None);
     }
 
     #[test]
