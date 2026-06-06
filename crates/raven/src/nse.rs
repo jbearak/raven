@@ -903,6 +903,34 @@ pub(crate) fn is_capture_helper(name: &str) -> bool {
     matches!(name, "substitute" | "enquo" | "enexpr" | "ensym")
 }
 
+/// True for Shiny deferred-expression helpers whose expression body is
+/// evaluated later in a child lexical environment: `reactive`, `observe`,
+/// `observeEvent`, `eventReactive`, and the `render*()` family (e.g.
+/// `renderPlot`, `renderText`, `renderUI`).
+///
+/// These are not NSE: identifiers inside the body are real references and must
+/// be checked. Recognition lets the undefined-variable machinery (issue #402)
+/// descend into a bare deferred body even when Shiny export metadata is
+/// unavailable, and model the body as a nested scope so its local definitions
+/// do not leak into the surrounding server function. Callers gate this on Shiny
+/// being in play (or a `shiny::` qualifier) and on the name not being shadowed
+/// by a local definition.
+pub(crate) fn is_shiny_deferred_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "reactive" | "observe" | "observeEvent" | "eventReactive"
+    ) || is_shiny_render_helper(name)
+}
+
+/// True for the Shiny `render*()` family: a `render` prefix followed by an
+/// upper-case letter (`renderPlot`, `renderUI`, …), excluding a bare `render`
+/// and lower-case continuations that are not part of the convention.
+fn is_shiny_render_helper(name: &str) -> bool {
+    name.strip_prefix("render")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_uppercase())
+}
+
 /// Compute the per-argument suppression mask for a call.
 ///
 /// `arg_labels[i]` is `Some(name)` for a named argument (`name = value`) and
@@ -1011,6 +1039,40 @@ mod tests {
     /// Convenience: build the `arg_labels` slice from a list of optional names.
     fn labels(names: &[Option<&'static str>]) -> Vec<Option<&'static str>> {
         names.to_vec()
+    }
+
+    /// Issue #402: the recognized Shiny deferred-expression helpers, including
+    /// the `render*()` family by prefix, but not unrelated or `render`-only names.
+    #[test]
+    fn shiny_deferred_helper_recognition() {
+        for name in [
+            "reactive",
+            "observe",
+            "observeEvent",
+            "eventReactive",
+            "renderPlot",
+            "renderText",
+            "renderUI",
+            "renderDataTable",
+        ] {
+            assert!(
+                is_shiny_deferred_helper(name),
+                "{name} should be recognized"
+            );
+        }
+        for name in [
+            "render",
+            "rendering",
+            "isolate",
+            "req",
+            "reactiveValues",
+            "plot",
+        ] {
+            assert!(
+                !is_shiny_deferred_helper(name),
+                "{name} should not be recognized"
+            );
+        }
     }
 
     #[test]
