@@ -116,7 +116,7 @@ pub(crate) fn base_policy(name: &str) -> Option<ArgPolicy> {
             &["subset", "select"],
             false,
         ),
-        "transform" => ArgPolicy::per_formal(&["_data"], &[], true),
+        "transform" => ArgPolicy::per_formal(&["_data", "..."], &[], true),
 
         // Object-name helpers: suppress bare object names, check controls.
         "data" => ArgPolicy::per_formal(
