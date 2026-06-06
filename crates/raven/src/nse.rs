@@ -661,4 +661,174 @@ mod tests {
         let mask = suppressed_arguments(&p, &labels(&[Some("b"), None]), false);
         assert_eq!(mask, vec![false, true]);
     }
+
+    // --- Table-lock tests -------------------------------------------------
+    // The mask-derivation logic above is exhaustively tested on a few
+    // representative arms. The tests below instead pin the *variant shape*
+    // (None / WholeCall / PerFormal) of every remaining `base_policy` and
+    // `package_policy` arm so that a typo or accidental drop in those large
+    // match tables — which would silently fall through to "evaluated normally"
+    // — fails CI rather than regressing diagnostics quietly. They deliberately
+    // do not re-derive masks; that is the job of the tests above.
+
+    /// Coarse variant of a policy lookup: `None` (the table returned `None`,
+    /// i.e. arguments are evaluated normally) vs the two NSE shapes.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Shape {
+        None,
+        WholeCall,
+        PerFormal,
+    }
+
+    fn shape(policy: Option<ArgPolicy>) -> Shape {
+        match policy {
+            std::option::Option::None => Shape::None,
+            Some(ArgPolicy::Standard) => Shape::None,
+            Some(ArgPolicy::WholeCall) => Shape::WholeCall,
+            Some(ArgPolicy::PerFormal { .. }) => Shape::PerFormal,
+        }
+    }
+
+    #[test]
+    fn base_policy_arm_shapes() {
+        use Shape::*;
+        let cases: &[(&str, Shape)] = &[
+            ("library", PerFormal),
+            ("require", PerFormal),
+            ("substitute", PerFormal),
+            ("quote", PerFormal),
+            ("bquote", PerFormal),
+            ("expression", WholeCall),
+            ("evalq", PerFormal),
+            ("on.exit", PerFormal),
+            ("curve", PerFormal),
+            ("with", PerFormal),
+            ("within", PerFormal),
+            ("subset", PerFormal),
+            ("transform", PerFormal),
+            ("data", PerFormal),
+            ("rm", PerFormal),
+            ("remove", PerFormal),
+            ("save", PerFormal),
+            ("help", PerFormal),
+            // Standard-eval base functions must stay None.
+            ("paste", None),
+            ("c", None),
+            ("eval", None),
+            ("tryCatch", None),
+        ];
+        for (name, want) in cases {
+            assert_eq!(shape(base_policy(name)), *want, "base_policy({name:?})");
+        }
+    }
+
+    #[test]
+    fn dplyr_policy_arm_shapes() {
+        use Shape::*;
+        let cases: &[(&str, Shape)] = &[
+            ("filter", PerFormal),
+            ("slice", PerFormal),
+            ("mutate", PerFormal),
+            ("transmute", PerFormal),
+            ("select", PerFormal),
+            ("rename", PerFormal),
+            ("distinct", PerFormal),
+            ("summarise", PerFormal),
+            ("summarize", PerFormal),
+            ("reframe", PerFormal),
+            ("arrange", PerFormal),
+            ("group_by", PerFormal),
+            ("rowwise", PerFormal),
+            ("slice_max", PerFormal),
+            ("slice_min", PerFormal),
+            ("slice_head", PerFormal),
+            ("slice_tail", PerFormal),
+            ("slice_sample", PerFormal),
+            ("relocate", PerFormal),
+            ("count", PerFormal),
+            ("add_count", PerFormal),
+            ("pull", PerFormal),
+            ("case_when", WholeCall),
+            ("across", WholeCall),
+            ("c_across", WholeCall),
+            ("if_any", WholeCall),
+            ("if_all", WholeCall),
+            // Not in the curated table -> evaluated normally.
+            ("coalesce", None),
+            ("n", None),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                shape(package_policy("dplyr", name)),
+                *want,
+                "package_policy(dplyr, {name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn tidyr_policy_arm_shapes() {
+        use Shape::*;
+        let cases: &[(&str, Shape)] = &[
+            ("pivot_longer", PerFormal),
+            ("pivot_wider", PerFormal),
+            ("unite", PerFormal),
+            ("separate", PerFormal),
+            ("extract", PerFormal),
+            ("unnest", PerFormal),
+            ("unnest_wider", PerFormal),
+            ("unnest_longer", PerFormal),
+            ("hoist", PerFormal),
+            ("nest", PerFormal),
+            ("fill", PerFormal),
+            ("drop_na", PerFormal),
+            ("complete", PerFormal),
+            ("expand", PerFormal),
+            ("replace_na", None),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                shape(package_policy("tidyr", name)),
+                *want,
+                "package_policy(tidyr, {name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn other_package_policy_arm_shapes() {
+        use Shape::*;
+        let cases: &[(&str, &str, Shape)] = &[
+            ("ggplot2", "aes", WholeCall),
+            ("ggplot2", "vars", WholeCall),
+            ("ggplot2", "geom_point", None),
+            ("rlang", "enquo", PerFormal),
+            ("rlang", "enexpr", PerFormal),
+            ("rlang", "ensym", PerFormal),
+            ("rlang", "quo", PerFormal),
+            ("rlang", "expr", PerFormal),
+            ("rlang", "quos", WholeCall),
+            ("rlang", "exprs", WholeCall),
+            ("rlang", "enquos", WholeCall),
+            ("rlang", "enexprs", WholeCall),
+            ("rlang", "ensyms", WholeCall),
+            ("rlang", "abort", None),
+            ("data.table", "setkey", PerFormal),
+            ("data.table", "setorder", PerFormal),
+            ("data.table", "setindex", PerFormal),
+            ("data.table", "fread", None),
+            ("targets", "tar_target", PerFormal),
+            ("targets", "tar_read", None),
+            // Unknown package -> always None.
+            ("stats", "filter", None),
+            ("nonesuch", "filter", None),
+        ];
+        for (pkg, name, want) in cases {
+            assert_eq!(
+                shape(package_policy(pkg, name)),
+                *want,
+                "package_policy({pkg:?}, {name:?})"
+            );
+        }
+    }
 }

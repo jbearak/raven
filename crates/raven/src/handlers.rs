@@ -17538,6 +17538,55 @@ mod tests {
         assert!(was_collected(&used, "typo"));
     }
 
+    /// Every capture helper recognized by `crate::nse::is_capture_helper`
+    /// (`substitute` / `enquo` / `enexpr` / `ensym`) marks the referenced formal
+    /// captured, so the call argument is suppressed. Guards against one helper
+    /// regressing while the others keep working.
+    #[test]
+    fn nse_phase25_all_capture_helpers_suppress_formal() {
+        for helper in ["substitute", "enquo", "enexpr", "ensym"] {
+            let code = format!("cap <- function(arg) {helper}(arg)\ncap(masked_col)");
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
+            assert!(
+                !was_collected(&used, "masked_col"),
+                "helper {helper} should capture the formal"
+            );
+        }
+    }
+
+    /// Multiple formals captured in one body are each suppressed, while a
+    /// non-captured sibling formal is still checked: `f <- function(a, b, c) {
+    /// substitute(a); substitute(b) }; f(x, y, z)` suppresses `x`/`y`, checks `z`.
+    #[test]
+    fn nse_phase25_multiple_captures_in_one_function() {
+        let code = "f <- function(a, b, c) {\n  substitute(a)\n  substitute(b)\n}\nf(x, y, z)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+        assert!(!was_collected(&used, "y"));
+        assert!(was_collected(&used, "z"));
+    }
+
+    /// `pkg:::name` (internal triple-colon) resolves to the same package policy
+    /// as `pkg::name`: `dplyr:::filter(df, col)` checks `df`, suppresses `col`.
+    #[test]
+    fn nse_phase2_triple_colon_namespace_resolves_policy() {
+        let code = "dplyr:::filter(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
     // ---- Phase 3: conditional bracket suppression ----
 
     /// Known data.table object suppresses `[` indices.
@@ -17601,6 +17650,56 @@ mod tests {
         let mut used = Vec::new();
         collect_with_flags(tree.root_node(), code, true, false, &mut used);
         assert!(!was_collected(&used, "undefined_var"));
+    }
+
+    /// Every data.table-yielding constructor recognized by
+    /// `constructor_data_table_class` classifies the assignee as a data.table,
+    /// so `[` indices on it are suppressed (Phase 3). Pins each constructor arm.
+    #[test]
+    fn nse_phase3_data_table_constructors_suppress_bracket() {
+        for ctor in ["data.table(a = 1)", "as.data.table(1)", "fread(\"f.csv\")"] {
+            let code = format!("dt <- {ctor}\ndt[undefined_idx, ]");
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
+            assert!(
+                !was_collected(&used, "undefined_idx"),
+                "constructor {ctor} should classify as data.table"
+            );
+        }
+    }
+
+    /// Every non-data.table constructor recognized by
+    /// `constructor_data_table_class` classifies the assignee as standard, so
+    /// `[` indices on it are checked (Phase 3). Pins each constructor arm.
+    #[test]
+    fn nse_phase3_non_data_table_constructors_check_bracket() {
+        for ctor in [
+            "tibble(x = 1)",
+            "as_tibble(x)",
+            "read.csv(\"f.csv\")",
+            "read_csv(\"f.csv\")",
+            "read.table(\"f.txt\")",
+        ] {
+            let code = format!("dt <- {ctor}\ndt[undefined_idx, ]");
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_usages_with_context(
+                tree.root_node(),
+                &code,
+                &UsageContext::default(),
+                &mut used,
+            );
+            assert!(
+                was_collected(&used, "undefined_idx"),
+                "constructor {ctor} should classify as non-data.table"
+            );
+        }
     }
 
     // ========================================================================
