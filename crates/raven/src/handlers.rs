@@ -47709,6 +47709,93 @@ my_func <- function(a = default_value) {
         );
     }
 
+    /// Sweep addition (2026-06-06) end-to-end: a BARE `lm(...)` — no
+    /// `library(stats)` — resolves via `base_policy` because stats is
+    /// default-attached. `subset`/`weights` are data-masked (suppressed) while
+    /// `data` is checked. Pins that the stats helpers live in `base_policy`, not
+    /// `package_policy` (which would require stats to be in-play).
+    #[test]
+    fn nse_stats_lm_bare_call_suppresses_subset_checks_data_end_to_end() {
+        let messages = collect_undefined_messages(
+            "lm(y ~ x, data = undefined_df_xyz, subset = masked_grp, weights = masked_w)",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("masked_grp")),
+            "lm subset is data-masked and should be suppressed; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("masked_w")),
+            "lm weights is data-masked and should be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_df_xyz")),
+            "lm `data` is evaluated and should be checked; got {messages:?}"
+        );
+    }
+
+    /// Sweep addition end-to-end: `library(dplyr); join_by(a == b)` suppresses
+    /// its column-name arguments (WholeCall). `tibble`/`tar_read` likewise need
+    /// their package in play; a genuinely undefined symbol is the positive control.
+    #[test]
+    fn nse_ecosystem_nse_helpers_suppress_with_package_in_play_end_to_end() {
+        let join = collect_undefined_messages(
+            "library(dplyr)\njoin_by(left_col == right_col)\nreally_undefined_xyz",
+        );
+        assert!(
+            !join
+                .iter()
+                .any(|m| m.contains("left_col") || m.contains("right_col")),
+            "join_by columns should be suppressed; got {join:?}"
+        );
+        assert!(
+            join.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {join:?}"
+        );
+
+        let tib = collect_undefined_messages(
+            "library(tibble)\ntibble(col_a = 1, col_b = col_a * 2)\nreally_undefined_xyz",
+        );
+        assert!(
+            !tib.iter()
+                .any(|m| m.contains("col_a") || m.contains("col_b")),
+            "tibble columns should be suppressed; got {tib:?}"
+        );
+        assert!(
+            tib.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {tib:?}"
+        );
+
+        let tar = collect_undefined_messages(
+            "library(targets)\ntar_read(my_target)\nreally_undefined_xyz",
+        );
+        assert!(
+            !tar.iter().any(|m| m.contains("my_target")),
+            "tar_read target name should be suppressed; got {tar:?}"
+        );
+        assert!(
+            tar.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {tar:?}"
+        );
+    }
+
+    /// Sweep addition end-to-end (corrected entry): `dplyr::rename_with`'s
+    /// trailing dots are EVALUATED (forwarded to `.fn`), so `dots_captured=false`
+    /// — only `.cols` is suppressed; an undefined extra argument is still flagged.
+    #[test]
+    fn nse_dplyr_rename_with_checks_dots_end_to_end() {
+        let messages = collect_undefined_messages(
+            "df <- data.frame(x = 1)\nlibrary(dplyr)\nrename_with(df, toupper, starts_with(\"x\"), undefined_extra_arg)",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_extra_arg")),
+            "rename_with trailing dots are evaluated and should be checked; got {messages:?}"
+        );
+    }
+
     /// Issue #398 end-to-end: `vignette` and `citation` evaluate their
     /// arguments (verified against R 4.6.0), so they are deliberately *not* in
     /// the NSE suppress table — a bare undefined argument must still be flagged.
