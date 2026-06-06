@@ -46484,8 +46484,9 @@ mod function_parameter_tests {
     fn foreach_composition_inner_iterator_value_sees_outer_iterator() {
         // The realistic cross-reference idiom: an inner loop's range depends on
         // the outer iterator. `i` inside `foreach(j = seq_len(i))` must resolve
-        // to the outer iterator, not be flagged undefined. This is why the
-        // composition scope spans the whole left-hand side, not just the body.
+        // to the outer iterator, not be flagged undefined. The outer foreach's
+        // scope runs from the end of its call through the body, so it covers the
+        // inner call's value expression.
         let names = foreach_compose_undefined_names(
             "foreach(i = 1:3) %:% foreach(j = seq_len(i)) %do% i + j",
         );
