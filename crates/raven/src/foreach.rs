@@ -129,18 +129,23 @@ mod tests {
         parser.parse(code, None).unwrap()
     }
 
-    /// Find the first `binary_operator` node in document order.
-    fn first_binary_operator(node: Node) -> Option<Node> {
-        if node.kind() == "binary_operator" {
+    /// Find the first node (preorder) satisfying `pred`.
+    fn find_node<'tree>(node: Node<'tree>, pred: &impl Fn(Node) -> bool) -> Option<Node<'tree>> {
+        if pred(node) {
             return Some(node);
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if let Some(found) = first_binary_operator(child) {
+            if let Some(found) = find_node(child, pred) {
                 return Some(found);
             }
         }
         None
+    }
+
+    /// Find the first `binary_operator` node in document order.
+    fn first_binary_operator(node: Node) -> Option<Node> {
+        find_node(node, &|n| n.kind() == "binary_operator")
     }
 
     fn iterator_names(exec: &ForeachExecution, text: &str) -> Vec<String> {
@@ -221,15 +226,6 @@ mod tests {
 
     /// Walk the tree to find the first node recognized as a foreach execution.
     fn find_foreach_execution<'tree>(node: Node<'tree>, text: &str) -> Option<Node<'tree>> {
-        if recognize_foreach_execution(node, text).is_some() {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(found) = find_foreach_execution(child, text) {
-                return Some(found);
-            }
-        }
-        None
+        find_node(node, &|n| recognize_foreach_execution(n, text).is_some())
     }
 }

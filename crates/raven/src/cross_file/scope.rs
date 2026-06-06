@@ -2282,18 +2282,14 @@ fn foreach_body_end_node(exec_node: Node) -> Node {
 /// Build the iterator `ScopedSymbol` for a `foreach(i = ...)` argument. The
 /// symbol's definition site is the `i` name node, so go-to-definition and hover
 /// can point back to the iterator declaration if they consume these symbols.
+///
+/// An iterator name is a bare `identifier`, so we reuse [`extract_parameter_symbol`]
+/// — foreach iterators are then constructed identically to function parameters
+/// (same `SymbolKind`, position, and definition-site semantics) and cannot drift
+/// from how every other parameter in the codebase is built.
 fn foreach_iterator_symbol(name_node: Node, line_index: &LineIndex, uri: &Url) -> ScopedSymbol {
-    let name: Arc<str> = Arc::from(node_text(name_node, line_index.text));
-    let (defined_line, defined_column) = node_start_position_utf16(name_node, line_index);
-    ScopedSymbol {
-        name,
-        kind: SymbolKind::Parameter,
-        source_uri: uri.clone(),
-        defined_line,
-        defined_column,
-        signature: None,
-        is_declared: false,
-    }
+    extract_parameter_symbol(name_node, line_index, uri)
+        .expect("foreach iterator name node is an identifier")
 }
 
 /// Build a parameterless `FunctionScope` event spanning a `braced_expression`
