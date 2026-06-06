@@ -11497,7 +11497,18 @@ fn resolve_call_arg_policy(
     {
         return ArgPolicy::Standard;
     }
-    // 5. Unresolved: suppress arguments.
+    // 5. A known Shiny deferred-expression helper with Shiny in play evaluates
+    //    its body in a child environment; descend and check it even when Shiny
+    //    export metadata is unavailable (issue #402, Gap 1). Local shadowing was
+    //    already resolved by `local_function_policies` above. The `shiny::`
+    //    qualified form needs no handling here — it returned `Standard` from the
+    //    namespace branch at the top of this function.
+    if crate::nse::is_shiny_deferred_helper(name)
+        && analysis.in_play_packages.iter().any(|p| p == "shiny")
+    {
+        return ArgPolicy::Standard;
+    }
+    // 6. Unresolved: suppress arguments.
     ArgPolicy::WholeCall
 }
 
@@ -17433,6 +17444,20 @@ mod tests {
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
         assert!(was_collected(&used, "unknown_fn"));
         assert!(!was_collected(&used, "typo"));
+    }
+
+    // ---- Issue #402: Shiny deferred-expression bodies are checked ----
+
+    /// A bare Shiny deferred-expression call with Shiny in play descends into
+    /// its body even when export metadata is unavailable, so a typo inside the
+    /// deferred block is collected (Gap 1).
+    #[test]
+    fn nse_shiny_bare_deferred_checks_body_without_metadata() {
+        let code = "renderPlot({ typo_var })";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["shiny"], &mut used);
+        assert!(was_collected(&used, "typo_var"));
     }
 
     /// Piped data-masking calls: the pipe supplies `.data`, so the masked
@@ -47555,6 +47580,202 @@ my_func <- function(a = default_value) {
                 .iter()
                 .any(|m| m.contains("Undefined variable: undefined_var")),
             "standard-eval call argument should be flagged end-to-end; got {messages:?}"
+        );
+    }
+
+    /// Issue #402 Gap 2 end-to-end: a name assigned inside a Shiny deferred body
+    /// is visible inside that body but does not leak into the surrounding server
+    /// function, so the later `print(inner)` is flagged exactly once.
+    #[test]
+    fn nse_shiny_deferred_body_definition_does_not_leak_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             server <- function(input, output, session) {\n\
+               output$plot <- renderPlot({\n\
+                 inner <- 1\n\
+                 inner\n\
+               })\n\
+               print(inner)\n\
+             }\n",
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.as_str() == "Undefined variable: inner")
+                .count(),
+            1,
+            "inner is leak-free: defined in the deferred body, undefined at \
+             print(inner); got {messages:?}"
+        );
+    }
+
+    /// Issue #402 acceptance: the canonical server shape flags the typo inside a
+    /// bare `renderPlot` body and nothing else — `input`/`output`/`session` are
+    /// real parameters and `plot` is a builtin.
+    #[test]
+    fn nse_shiny_server_renderplot_flags_typo_only_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             server <- function(input, output, session) {\n\
+               output$plot <- renderPlot({\n\
+                 plot(input$x, typo_var)\n\
+               })\n\
+             }\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["Undefined variable: typo_var".to_string()],
+            "only typo_var should be flagged; got {messages:?}"
+        );
+    }
+
+    /// Issue #402 acceptance: a `shiny::`-qualified deferred call descends into
+    /// its body without any `library(shiny)` in play.
+    #[test]
+    fn nse_shiny_qualified_renderplot_flags_typo_only_end_to_end() {
+        let messages = collect_undefined_messages(
+            "server <- function(input, output, session) {\n\
+               output$plot <- shiny::renderPlot({\n\
+                 plot(input$x, typo_var)\n\
+               })\n\
+             }\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["Undefined variable: typo_var".to_string()],
+            "only typo_var should be flagged; got {messages:?}"
+        );
+    }
+
+    /// Issue #402: a `shiny::`-qualified deferred call with whitespace around
+    /// `::` is still recognized on the scope side (the AST recognizer, not the
+    /// cheap text pre-filter, is authoritative), so a definition in its body
+    /// does not leak.
+    #[test]
+    fn nse_shiny_qualified_whitespace_body_does_not_leak_end_to_end() {
+        let messages = collect_undefined_messages(
+            "server <- function(input, output, session) {\n\
+               output$plot <- shiny :: renderPlot({ inner <- 1 })\n\
+               print(inner)\n\
+             }\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["Undefined variable: inner".to_string()],
+            "whitespace-qualified deferred body must still isolate inner; got {messages:?}"
+        );
+    }
+
+    /// Issue #402 acceptance: outer locals (not just parameters) remain visible
+    /// inside a deferred body.
+    #[test]
+    fn nse_shiny_deferred_body_sees_outer_local_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             server <- function(input, output, session) {\n\
+               outer_local <- 1\n\
+               output$plot <- renderPlot({\n\
+                 plot(outer_local)\n\
+               })\n\
+             }\n",
+        );
+        assert!(
+            messages.is_empty(),
+            "outer_local must be visible inside the deferred body; got {messages:?}"
+        );
+    }
+
+    /// Issue #402 acceptance: `observeEvent`/`eventReactive`/`reactive` bodies
+    /// are nested scopes too — a name assigned in the (second) handler block does
+    /// not leak. `eventReactive`'s second argument is the deferred body.
+    #[test]
+    fn nse_shiny_observe_event_body_does_not_leak_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             server <- function(input, output, session) {\n\
+               observeEvent(input$go, {\n\
+                 handler_local <- 1\n\
+               })\n\
+               print(handler_local)\n\
+             }\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["Undefined variable: handler_local".to_string()],
+            "handler_local must not leak out of the observeEvent body; got {messages:?}"
+        );
+    }
+
+    /// Issue #402: a deferred body at top level (outside a server function) is
+    /// modeled as a nested scope too, so with global hoisting a forward-declared
+    /// top-level global resolves inside it (the body runs after the file is
+    /// sourced). Locks this intended behavior.
+    #[test]
+    fn nse_shiny_top_level_deferred_body_hoists_forward_global_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             observe({ helper() })\n\
+             helper <- function() {}\n",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("helper")),
+            "forward top-level global should hoist into the deferred body; got {messages:?}"
+        );
+    }
+
+    /// Issue #402: a `{ }` block passed to a *named* eager parameter of a Shiny
+    /// helper (e.g. `outputArgs`) is evaluated in the current environment, so it
+    /// is NOT isolated — only the positional deferred body is. A binding there
+    /// still leaks, so it must not be flagged afterward.
+    #[test]
+    fn nse_shiny_named_eager_braced_arg_is_not_isolated_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             server <- function(input, output, session) {\n\
+               output$t <- renderTable(mtcars, outputArgs = { cfg <- 1; list(cfg) })\n\
+               print(cfg)\n\
+             }\n",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("cfg")),
+            "named eager arg block must not be isolated; got {messages:?}"
+        );
+    }
+
+    /// Issue #402 exclusion: `isolate({ ... })` evaluates in the current
+    /// environment, so an assignment inside it stays visible afterward — it must
+    /// NOT receive synthetic nested-scope treatment.
+    #[test]
+    fn nse_shiny_isolate_is_not_a_nested_scope_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             server <- function(input, output, session) {\n\
+               isolate({ inner <- 1 })\n\
+               print(inner)\n\
+             }\n",
+        );
+        assert!(
+            messages.is_empty(),
+            "isolate body assignments stay visible; got {messages:?}"
+        );
+    }
+
+    /// Issue #402 exclusion: a local `renderPlot` shadows Shiny and gets no
+    /// Shiny scope semantics, so a definition in its argument block is not
+    /// isolated (an ordinary call argument leaks per R semantics).
+    #[test]
+    fn nse_shiny_local_shadow_disables_deferred_scope_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(shiny)\n\
+             renderPlot <- function(x) x\n\
+             server <- function(input, output, session) {\n\
+               renderPlot({ inner <- 1 })\n\
+               print(inner)\n\
+             }\n",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("inner")),
+            "local renderPlot must not get Shiny nested-scope semantics; got {messages:?}"
         );
     }
 

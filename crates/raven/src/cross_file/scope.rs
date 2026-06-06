@@ -1131,6 +1131,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // (Requirements 14.2, 14.4)
     let library_calls = detect_library_calls(tree, content);
 
+    // Issue #402: model Shiny deferred-expression bodies as nested scopes so
+    // their local definitions do not leak into the surrounding server function.
+    // Must be pushed before the function-scope tree is built below.
+    push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
+
     // Sort timeline by *effect* position so the resolver iterates events in
     // execution order. `event_effect_position` uses `visible_from` for Def
     // events, so the binding from `x <- { rm(x); 1 }` is processed after the
@@ -1357,6 +1362,11 @@ pub fn compute_artifacts_with_metadata(
 
     // Collect library()/require()/loadNamespace() calls for later processing.
     let library_calls = detect_library_calls(tree, content);
+
+    // Issue #402: model Shiny deferred-expression bodies as nested scopes so
+    // their local definitions do not leak into the surrounding server function.
+    // Must be pushed before the function-scope tree is built below.
+    push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
 
     // Sort timeline by *effect* position so the resolver iterates events in
     // execution order. See `event_effect_position` for why this differs from
@@ -2015,6 +2025,134 @@ fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> 
         end_column,
         parameters,
     })
+}
+
+/// Issue #402: append nested `FunctionScope` events for Shiny deferred-
+/// expression bodies to `artifacts.timeline`.
+///
+/// Shiny helpers (`reactive`, `observe`, `observeEvent`, `eventReactive`,
+/// `render*`) evaluate their `{ ... }` body later, in a child lexical
+/// environment, so their local definitions must not leak into the surrounding
+/// server function while outer bindings stay visible — exactly the visibility a
+/// parameterless `FunctionScope` interval provides. The body is still *checked*
+/// for undefined variables elsewhere; this only isolates its definitions.
+///
+/// Recognition (in [`call_is_shiny_deferred`]) covers `shiny::<helper>` calls
+/// always and bare `<helper>` calls when Shiny is in play (a within-file
+/// `library(shiny)` / `require(shiny)`) and the name is not shadowed by a
+/// top-level definition. The whole-tree walk is skipped when neither trigger
+/// can be present, so non-Shiny files pay nothing.
+fn push_shiny_deferred_scopes(
+    artifacts: &mut ScopeArtifacts,
+    root: Node,
+    content: &str,
+    line_index: &LineIndex,
+    library_calls: &[super::source_detect::LibraryCall],
+) {
+    let shiny_in_play = library_calls.iter().any(|c| c.package == "shiny");
+    // Cheap pre-filter: skip the walk only when the file cannot contain a
+    // trigger. Any `library(shiny)`/`require(shiny)` sets `shiny_in_play`; a
+    // `shiny::`-qualified call must contain the substring "shiny". A bare
+    // "shiny" superset keeps this sound even with whitespace (`shiny :: f`),
+    // where the AST recognizer in `call_is_shiny_deferred` is the real gate.
+    if !shiny_in_play && !content.contains("shiny") {
+        return;
+    }
+    // `exported_interface` is read for shadow detection while `timeline` is
+    // appended to; split the borrow by collecting into a local buffer first.
+    let mut events = Vec::new();
+    collect_shiny_deferred_scopes(
+        root,
+        content,
+        line_index,
+        shiny_in_play,
+        &artifacts.exported_interface,
+        &mut events,
+    );
+    artifacts.timeline.extend(events);
+}
+
+/// Walk `node`, appending a parameterless `FunctionScope` event for each
+/// deferred `braced_expression` argument of a recognized Shiny deferred call.
+///
+/// Only *positional* braced arguments are wrapped. The deferred expression is
+/// always a positional argument (`renderPlot({…})`, `observeEvent(x, {…})`); a
+/// `{…}` block passed to a *named* eager parameter (e.g. `outputArgs = {…}`) is
+/// evaluated in the current environment, so isolating it would wrongly hide a
+/// binding that really leaks. A bare-expression argument (`reactive(x)`) is
+/// skipped too — it cannot introduce a leaking binding.
+fn collect_shiny_deferred_scopes(
+    node: Node,
+    text: &str,
+    line_index: &LineIndex,
+    shiny_in_play: bool,
+    local_defs: &HashMap<Arc<str>, ScopedSymbol>,
+    events: &mut Vec<ScopeEvent>,
+) {
+    if node.kind() == "call"
+        && let Some(func) = node.child_by_field_name("function")
+        && call_is_shiny_deferred(func, text, shiny_in_play, local_defs)
+        && let Some(args) = node.child_by_field_name("arguments")
+    {
+        let mut cursor = args.walk();
+        for arg in args
+            .children(&mut cursor)
+            .filter(|c| c.kind() == "argument")
+        {
+            if arg.child_by_field_name("name").is_none()
+                && let Some(value) = arg.child_by_field_name("value")
+                && value.kind() == "braced_expression"
+            {
+                events.push(braced_body_scope_event(value, line_index));
+            }
+        }
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_shiny_deferred_scopes(child, text, line_index, shiny_in_play, local_defs, events);
+    }
+}
+
+/// Whether a `call`'s callee node is a recognized Shiny deferred-expression
+/// helper. `shiny::<helper>` qualified calls are always recognized; a bare
+/// `<helper>` requires Shiny in play and must not be shadowed by a top-level
+/// definition (`local_defs`).
+fn call_is_shiny_deferred(
+    func: Node,
+    text: &str,
+    shiny_in_play: bool,
+    local_defs: &HashMap<Arc<str>, ScopedSymbol>,
+) -> bool {
+    match func.kind() {
+        "namespace_operator" => {
+            func.child_by_field_name("lhs")
+                .is_some_and(|pkg| node_text(pkg, text) == "shiny")
+                && func
+                    .child_by_field_name("rhs")
+                    .is_some_and(|name| crate::nse::is_shiny_deferred_helper(node_text(name, text)))
+        }
+        "identifier" => {
+            let name = node_text(func, text);
+            shiny_in_play
+                && crate::nse::is_shiny_deferred_helper(name)
+                && !local_defs.contains_key(name)
+        }
+        _ => false,
+    }
+}
+
+/// Build a parameterless `FunctionScope` event spanning a `braced_expression`
+/// body.
+fn braced_body_scope_event(body: Node, line_index: &LineIndex) -> ScopeEvent {
+    let (start_line, start_column) = node_start_position_utf16(body, line_index);
+    let (end_line, end_column) = node_end_position_utf16(body, line_index);
+    ScopeEvent::FunctionScope {
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+        parameters: Vec::new(),
+    }
 }
 
 /// Extract a parameter symbol from a parameter node
