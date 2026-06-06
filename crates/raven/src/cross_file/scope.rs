@@ -2252,11 +2252,19 @@ fn foreach_execution_scope_event(
 /// `+ j` is a *sibling* of the execution node, not part of its `rhs`. The user
 /// nonetheless means the whole post-operator expression as the body, so we
 /// extend the body to the end of the outermost expression in which the
-/// execution node is the left operand of a non-assignment binary operator.
+/// execution node is the left operand of a *strictly looser* binary operator.
 ///
-/// We never climb across an assignment (`<- = <<- -> ->>`): `x <- foreach(...)
-/// %do% i` and `foreach(...) %do% i -> x` capture the loop *result*, so the body
-/// ends at the execution node itself.
+/// We stop climbing at operators that are **not** strictly looser than `%do%`:
+/// - assignments (`<- = <<- -> ->>`): `x <- foreach(...) %do% i` and
+///   `foreach(...) %do% i -> x` capture the loop *result*, so the body ends at
+///   the execution node;
+/// - other special `%...%` operators (kind `special`) and the pipe `|>`, which
+///   share `%do%`'s precedence and are left-associative, so they chain the loop
+///   *result* onward (`foreach(...) %do% x %>% f` is `(foreach %do% x) %>% f`) —
+///   `f` is not the body.
+///
+/// Everything we do climb across (`+ - * / == < > & | ...`) binds strictly
+/// looser than `%do%`, so it is part of the body the user wrote after `%do%`.
 fn foreach_body_end_node(exec_node: Node) -> Node {
     let mut node = exec_node;
     while let Some(parent) = node.parent() {
@@ -2270,7 +2278,10 @@ fn foreach_body_end_node(exec_node: Node) -> Node {
             break;
         }
         if let Some(op) = parent.child_by_field_name("operator")
-            && matches!(op.kind(), "<-" | "<<-" | "=" | "->" | "->>")
+            && matches!(
+                op.kind(),
+                "<-" | "<<-" | "=" | "->" | "->>" | "special" | "|>"
+            )
         {
             break;
         }
@@ -5742,6 +5753,31 @@ mod tests {
             .collect();
         params.sort();
         assert_eq!(params, vec!["i".to_string(), "j".to_string()]);
+    }
+
+    #[test]
+    fn foreach_iterator_scope_stops_at_pipe() {
+        // `%do%` and `%>%` share precedence and are left-associative, so
+        // `foreach(i = 1:3) %do% aa %>% bb` parses as
+        // `(foreach(i = 1:3) %do% aa) %>% bb`. The iterator scope must cover the
+        // body `aa` but not the piped `bb`, which operates on the loop result.
+        let code = "foreach(i = 1:3) %do% aa %>% bb";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // `aa` (the %do% rhs) starts at column 22 — inside the iterator scope.
+        let inside = scope_at_position(&artifacts, 0, 22, false);
+        assert!(
+            inside.symbols.contains_key("i"),
+            "iterator `i` should be visible in the foreach body"
+        );
+
+        // `bb` (after the pipe) starts at column 29 — outside the scope.
+        let after_pipe = scope_at_position(&artifacts, 0, 29, false);
+        assert!(
+            !after_pipe.symbols.contains_key("i"),
+            "iterator `i` must not leak across the pipe onto the loop result"
+        );
     }
 
     #[test]
