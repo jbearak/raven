@@ -2191,8 +2191,10 @@ fn push_foreach_iterator_scopes(
     line_index: &LineIndex,
     uri: &Url,
 ) {
-    // Cheap pre-filter: the idiom always contains one of the operator tokens.
-    if !content.contains("%do%") && !content.contains("%dopar%") {
+    // Cheap pre-filter: `%do%` and `%dopar%` both start with `%do`, so one
+    // substring check covers both (and any future `%do`-family operator) without
+    // duplicating the exact token list that `recognize_foreach_execution` owns.
+    if !content.contains("%do") {
         return;
     }
     collect_foreach_iterator_scopes(root, content, line_index, uri, &mut artifacts.timeline);
