@@ -5808,6 +5808,32 @@ mod tests {
     }
 
     #[test]
+    fn foreach_iterator_scope_stops_at_native_pipe() {
+        // The native pipe `|>` binds looser than `%do%`, so
+        // `foreach(i = 1:3) %do% aa |> bb` parses as
+        // `(foreach(i = 1:3) %do% aa) |> bb`. As with `%>%`, the iterator scope
+        // must cover the body `aa` but not the piped `bb`, which operates on the
+        // loop result.
+        let code = "foreach(i = 1:3) %do% aa |> bb";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // `aa` (the %do% rhs) starts at column 22 — inside the iterator scope.
+        let inside = scope_at_position(&artifacts, 0, 22, false);
+        assert!(
+            inside.symbols.contains_key("i"),
+            "iterator `i` should be visible in the foreach body"
+        );
+
+        // `bb` (after the `|>` pipe) starts at column 28 — outside the scope.
+        let after_pipe = scope_at_position(&artifacts, 0, 28, false);
+        assert!(
+            !after_pipe.symbols.contains_key("i"),
+            "iterator `i` must not leak across the native pipe onto the loop result"
+        );
+    }
+
+    #[test]
     fn foreach_dot_controls_produce_no_parameters() {
         let code = "foreach(.combine = c) %do% 1";
         let tree = parse_r(code);
