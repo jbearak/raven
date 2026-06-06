@@ -34,6 +34,22 @@ pub struct LibraryCall {
     pub column: u32,
     /// Whether this is inside a function scope
     pub function_scope: Option<FunctionScopeInterval>,
+    /// Whether the call *attaches* the package to the search path so its exports
+    /// become available as bare names: `true` for `library()` / `require()`,
+    /// `false` for `loadNamespace()` (which loads the namespace for qualified
+    /// `pkg::fn` access only).
+    ///
+    /// Consumers must require `attaches` only when they gate on a *bare function*
+    /// being resolvable — e.g. Shiny deferred-helper recognition
+    /// (`push_shiny_deferred_scopes`), where `reactive`/`render*` are exported
+    /// functions called by bare name and so need an attach. Surfaces that
+    /// dispatch on the object or namespace rather than a bare name (e.g.
+    /// data.table's S3 `[.data.table` via `collect_in_play_packages`) are enabled
+    /// by a merely-loaded namespace and must *not* gate on `attaches`.
+    ///
+    /// Defaults to `false` for forward compatibility on deserialize.
+    #[serde(default)]
+    pub attaches: bool,
 }
 
 /// Locate all top-level `source()` and `sys.source()` calls in an R syntax tree and extract their static parameters.
@@ -636,6 +652,11 @@ fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
         column,
         // function_scope will be populated later in task 6.2
         function_scope: None,
+        // `library`/`require` attach; `loadNamespace` (the only other name this
+        // function admits) merely loads the namespace. Allowlist rather than
+        // `!= "loadNamespace"` so a future non-attaching loader admitted above
+        // is not silently classified as attaching.
+        attaches: func_text == "library" || func_text == "require",
     })
 }
 
@@ -1169,6 +1190,10 @@ fn try_parse_apply_library_call(
             line,
             column,
             function_scope: None,
+            // This path only fires for `library`/`require` applied via
+            // `sapply`/`lapply`/etc. (see the `fun_text` guard above), both of
+            // which attach.
+            attaches: true,
         })
         .collect()
 }
@@ -1911,6 +1936,28 @@ source("b.R")"#;
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 1);
         assert_eq!(lib_calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_attaches_flag_distinguishes_library_from_load_namespace() {
+        // `library`/`require` attach (bare names become available); `loadNamespace`
+        // only loads the namespace for qualified `pkg::` access. The `attaches`
+        // flag must reflect that distinction — see `LibraryCall::attaches`.
+        for (code, expected) in [
+            ("library(shiny)", true),
+            ("require(shiny)", true),
+            (r#"loadNamespace("shiny")"#, false),
+            ("loadNamespace(shiny)", false),
+        ] {
+            let tree = parse_r(code);
+            let lib_calls = detect_library_calls(&tree, code);
+            assert_eq!(lib_calls.len(), 1, "exactly one call detected for `{code}`");
+            assert_eq!(lib_calls[0].package, "shiny", "package name for `{code}`");
+            assert_eq!(
+                lib_calls[0].attaches, expected,
+                "attaches flag for `{code}`"
+            );
+        }
     }
 
     #[test]

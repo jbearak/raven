@@ -2049,7 +2049,13 @@ fn push_shiny_deferred_scopes(
     line_index: &LineIndex,
     library_calls: &[super::source_detect::LibraryCall],
 ) {
-    let shiny_in_play = library_calls.iter().any(|c| c.package == "shiny");
+    // Only an *attach* (`library(shiny)` / `require(shiny)`) brings the bare
+    // helpers (`reactive`, `render*`, …) into scope. `loadNamespace("shiny")`
+    // loads the namespace for qualified `shiny::` access only, so it must not
+    // enable bare-helper semantics — see `LibraryCall::attaches`.
+    let shiny_in_play = library_calls
+        .iter()
+        .any(|c| c.package == "shiny" && c.attaches);
     // Cheap pre-filter: skip the walk only when the file cannot contain a
     // trigger. Any `library(shiny)`/`require(shiny)` sets `shiny_in_play`; a
     // `shiny::`-qualified call must contain the substring "shiny". A bare
@@ -2059,17 +2065,16 @@ fn push_shiny_deferred_scopes(
         return;
     }
     // `exported_interface` is read for shadow detection while `timeline` is
-    // appended to; split the borrow by collecting into a local buffer first.
-    let mut events = Vec::new();
+    // appended to; these are disjoint fields, so borrow each directly rather
+    // than buffering events in a temporary Vec.
     collect_shiny_deferred_scopes(
         root,
         content,
         line_index,
         shiny_in_play,
         &artifacts.exported_interface,
-        &mut events,
+        &mut artifacts.timeline,
     );
-    artifacts.timeline.extend(events);
 }
 
 /// Walk `node`, appending a parameterless `FunctionScope` event for each
