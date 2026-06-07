@@ -825,9 +825,10 @@ impl PackageLibrary {
             }
         }
 
-        // Step 3: Populate combined_exports cache
+        // Step 3: Populate combined_exports cache without materializing owned
+        // aggregate sets that this warm-up path immediately discards.
         for pkg_name in &uncached_packages {
-            let _ = self.get_all_exports(pkg_name).await;
+            let _ = self.warm_all_exports(pkg_name).await;
         }
     }
 
@@ -1502,12 +1503,23 @@ impl PackageLibrary {
     /// Requirement 4.5: THE Package_Resolver SHALL handle circular dependencies in the
     /// `Depends` chain by tracking visited packages
     pub async fn get_all_exports(&self, name: &str) -> HashSet<String> {
+        self.warm_all_exports(name).await.as_ref().clone()
+    }
+
+    /// Build and cache the combined export set for `name`, returning the shared
+    /// cached snapshot.
+    ///
+    /// Unlike [`PackageLibrary::get_all_exports`], this does not materialize an
+    /// owned `HashSet`. It is the cache-warming path used by
+    /// [`PackageLibrary::prefetch_packages`], where callers only need the
+    /// aggregate to become available to synchronous cache probes.
+    async fn warm_all_exports(&self, name: &str) -> Arc<HashSet<String>> {
         // Check cache first
         {
             let cache = self.combined_exports.read().await;
             if let Some(cached) = cache.get(name) {
                 log::trace!("Using cached combined exports for package '{}'", name);
-                return cached.as_ref().clone();
+                return Arc::clone(cached);
             }
         }
 
@@ -1520,22 +1532,21 @@ impl PackageLibrary {
         // Cache the result
         {
             let mut cache = self.combined_exports.write().await;
-            cache.insert(name.to_string(), Arc::new(all_exports.clone()));
+            let cached = Arc::new(all_exports);
             log::trace!(
                 "Cached {} combined exports for package '{}'",
-                all_exports.len(),
+                cached.len(),
                 name
             );
+            if cached.is_empty() {
+                log::trace!(
+                    "No exports collected for package '{}' (may be missing or unreadable)",
+                    name
+                );
+            }
+            cache.insert(name.to_string(), Arc::clone(&cached));
+            cached
         }
-
-        if all_exports.is_empty() {
-            log::trace!(
-                "No exports collected for package '{}' (may be missing or unreadable)",
-                name
-            );
-        }
-
-        all_exports
     }
 
     /// Helper method to recursively collect exports from a package and its dependencies
@@ -3502,6 +3513,33 @@ mod tests {
             lib.is_symbol_from_loaded_packages("nycflights13", &loaded),
             "function export should still resolve after prefetch_packages"
         );
+    }
+
+    #[tokio::test]
+    async fn test_warm_all_exports_returns_cached_arc_without_owned_clone() {
+        let lib = PackageLibrary::new_empty();
+        let exports = HashSet::from(["foo".to_string(), "bar".to_string()]);
+        lib.insert_package(PackageInfo::new("pkg".to_string(), exports))
+            .await;
+
+        let warmed = lib.warm_all_exports("pkg").await;
+        assert!(warmed.contains("foo"));
+        assert!(warmed.contains("bar"));
+
+        let cached = {
+            let cache = lib.combined_exports.read().await;
+            cache
+                .get("pkg")
+                .cloned()
+                .expect("warm_all_exports should populate combined_exports")
+        };
+        assert!(
+            Arc::ptr_eq(&warmed, &cached),
+            "warm_all_exports should return the cached Arc instead of materializing an owned set"
+        );
+
+        let owned = lib.get_all_exports("pkg").await;
+        assert_eq!(owned, HashSet::from(["foo".to_string(), "bar".to_string()]));
     }
 
     #[tokio::test]
