@@ -695,9 +695,8 @@ impl PackageLibrary {
     /// Removes the package from the cache, forcing it to be reloaded
     /// on the next access.
     pub async fn invalidate(&self, name: &str) {
-        self.update_packages(|cache| {
-            cache.remove(name);
-        });
+        let names = HashSet::from([name.to_string()]);
+        let _ = self.invalidate_many(&names).await;
     }
 
     /// Invalidate a batch of packages, also dropping any `combined_entries`
@@ -2538,12 +2537,37 @@ mod tests {
 
         let info = PackageInfo::new("testpkg".to_string(), HashSet::new());
         lib.insert_package(info).await;
+        lib.insert_package(PackageInfo::with_details(
+            "dependent".to_string(),
+            HashSet::new(),
+            vec!["testpkg".to_string()],
+            Vec::new(),
+        ))
+        .await;
+        seed_combined_entry(
+            &lib,
+            "testpkg",
+            ["stale_export".to_string()].into_iter().collect(),
+            HashMap::new(),
+        )
+        .await;
+        seed_combined_entry(
+            &lib,
+            "dependent",
+            ["dependent_export".to_string()].into_iter().collect(),
+            HashMap::new(),
+        )
+        .await;
 
         assert!(lib.is_cached("testpkg").await);
+        assert!(lib.combined_entries.load().contains_key("testpkg"));
+        assert!(lib.combined_entries.load().contains_key("dependent"));
 
         lib.invalidate("testpkg").await;
 
         assert!(!lib.is_cached("testpkg").await);
+        assert!(!lib.combined_entries.load().contains_key("testpkg"));
+        assert!(!lib.combined_entries.load().contains_key("dependent"));
     }
 
     #[tokio::test]
