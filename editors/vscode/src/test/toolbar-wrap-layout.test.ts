@@ -152,6 +152,10 @@ function measureNeededPx(snap: LayoutSnapshot): number {
     return contentPx + gapsPx;
 }
 
+function hasRootWidth(snap: LayoutSnapshot, widthPx: number): boolean {
+    return Math.round(snap.rootRect.width) === widthPx;
+}
+
 suite('data-viewer toolbar chip wrapping (real layout)', function () {
     // Real-layout cases open a webview and await settled layout, so give
     // each case generous headroom over the snapshot polling.
@@ -294,14 +298,17 @@ suite('data-viewer toolbar chip wrapping (real layout)', function () {
 
         // Measure intrinsic widths at a width wide enough that nothing
         // wraps or overflows, with and without the badge.
-        await harness!.apply({ type: 'test:setWidth', widthPx: 2000 });
+        await harness!.apply(
+            { type: 'test:setWidth', widthPx: 2000 },
+            s => hasRootWidth(s, 2000),
+        );
         const noBadge = await harness!.apply(
             state({ sortChipCount: CHIPS, hiddenColCount: 0 }),
-            s => s.isWrapped === false,
+            s => s.isWrapped === false && s.chipsIntrinsicWidth > 0,
         );
         const withBadge = await harness!.apply(
             state({ sortChipCount: CHIPS, hiddenColCount: BADGE }),
-            s => s.isWrapped === false,
+            s => s.isWrapped === false && s.chipsIntrinsicWidth > 0,
         );
 
         // (a) The badge makes the actions region wider.
@@ -314,13 +321,21 @@ suite('data-viewer toolbar chip wrapping (real layout)', function () {
         // the decision.
         const neededNoBadge = measureNeededPx(noBadge);
         const neededWithBadge = measureNeededPx(withBadge);
-        const boundaryPx = Math.round((neededNoBadge + neededWithBadge) / 2);
+        const noBadgeFitMarginPx = 8;
+        const boundaryPx = Math.ceil(neededNoBadge + noBadgeFitMarginPx);
+        assert.ok(
+            boundaryPx < neededWithBadge,
+            `Columns badge must leave room to place the boundary between states (no=${neededNoBadge}, with=${neededWithBadge}, boundary=${boundaryPx})`,
+        );
 
         await harness!.reset();
-        await harness!.apply({ type: 'test:setWidth', widthPx: boundaryPx });
+        await harness!.apply(
+            { type: 'test:setWidth', widthPx: boundaryPx },
+            s => hasRootWidth(s, boundaryPx),
+        );
         const single = await harness!.apply(
             state({ sortChipCount: CHIPS, hiddenColCount: 0 }),
-            s => s.isWrapped === false,
+            s => s.isWrapped === false && s.chipsIntrinsicWidth > 0,
         );
         assertSingleRow(single, { chipsPresent: true });
 
