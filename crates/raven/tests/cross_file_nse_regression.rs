@@ -79,6 +79,26 @@ fn cross_file_filter_nse_via_tidyverse_meta_package() {
     );
 }
 
+/// Forward-source pattern: file sources a loader that has library(dplyr),
+/// then uses dplyr verbs. The library() in the sourced file must propagate
+/// NSE suppression back to the calling file.
+#[test]
+fn forward_source_library_propagates_nse() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("main.R"),
+        "source(\"loader.R\")\ndf <- data.frame(x = 1:10)\nresult <- df |> filter(x > 5)\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("loader.R"), "library(dplyr)\n").unwrap();
+
+    let output = run_check(dir.path());
+    assert!(
+        !output.contains("Undefined variable: x"),
+        "source(\"loader.R\") with library(dplyr) must propagate NSE. Output:\n{output}"
+    );
+}
+
 /// Magrittr dot pronoun in curly-brace pipe: `df %>% { .$col }`.
 #[test]
 fn magrittr_dot_curly_brace_pipe_not_flagged() {

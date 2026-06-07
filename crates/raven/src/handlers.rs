@@ -5228,6 +5228,9 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
     // Include packages loaded by ancestor files in the cross-file source chain.
     // Without this, a child file inheriting `dplyr` from a parent would not get
     // NSE suppression for verbs like `filter` that shadow base/stats exports.
+    // Also include packages loaded by forward-sourced files (files this file
+    // sources), since `source("loader.R")` where loader.R has `library(dplyr)`
+    // makes dplyr available in the calling file after the source() point.
     {
         let mut visited: HashSet<Url> = HashSet::new();
         let mut queue: Vec<Url> = vec![uri.clone()];
@@ -5235,6 +5238,7 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
             if !visited.insert(current.clone()) {
                 continue;
             }
+            // Backward edges: parent files that source this file
             for edge in snapshot.cross_file_graph.get_dependents(&current) {
                 if let Some(parent_meta) = snapshot.metadata_map.get(&edge.from) {
                     for call in &parent_meta.library_calls {
@@ -5249,6 +5253,22 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
                     }
                 }
                 queue.push(edge.from.clone());
+            }
+            // Forward edges: files sourced by this file
+            for edge in snapshot.cross_file_graph.get_dependencies(&current) {
+                if let Some(child_meta) = snapshot.metadata_map.get(&edge.to) {
+                    for call in &child_meta.library_calls {
+                        if call.package.is_empty() {
+                            continue;
+                        }
+                        let package = call.package.clone();
+                        if call.attaches {
+                            attached_packages_for_meta.insert(package.clone());
+                        }
+                        packages.insert(package);
+                    }
+                }
+                queue.push(edge.to.clone());
             }
         }
     }
