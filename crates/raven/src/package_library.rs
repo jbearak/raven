@@ -197,6 +197,25 @@ pub struct NamespaceParseResult {
     /// Dependencies from DESCRIPTION Depends field
     pub depends: Vec<String>,
 }
+/// Cached aggregate package view produced by `get_all_exports`.
+///
+/// `exports` answers availability: every symbol visible through the aggregate
+/// package key, including symbols contributed by `Depends` and meta-package
+/// attachments. `owners` answers attribution for the same snapshot:
+/// `symbol -> true owner package` (e.g. `mutate -> dplyr` under the
+/// `tidyverse` key). Keeping both projections in one entry makes publication,
+/// invalidation, and reads atomic at the aggregate-key level.
+#[derive(Debug)]
+struct CombinedEntry {
+    exports: HashSet<String>,
+    owners: HashMap<String, String>,
+}
+
+impl CombinedEntry {
+    fn new(exports: HashSet<String>, owners: HashMap<String, String>) -> Self {
+        Self { exports, owners }
+    }
+}
 
 /// Package library manager
 ///
@@ -211,21 +230,14 @@ pub struct PackageLibrary {
     /// Cached package information (lazy-loaded)
     /// Uses RwLock for thread-safe concurrent read access
     packages: RwLock<HashMap<String, Arc<PackageInfo>>>,
-    /// Combined exports cache (package name -> all exports including Depends/attached)
-    /// Populated by get_all_exports for efficient repeated lookups
-    combined_exports: RwLock<HashMap<String, Arc<HashSet<String>>>>,
-    /// Owner map cache (aggregate package name -> { symbol -> true owner package }).
+    /// Combined aggregate cache keyed by the loaded package name.
     ///
-    /// Built in lockstep with `combined_exports` by `get_all_exports`. Where
-    /// `combined_exports` answers "is this symbol visible through package X?",
-    /// this answers "which package actually contributed it?" — the documentation
-    /// and NSE-policy owner. For `library(tidyverse)`, `combined_exports`
-    /// aggregates `mutate` under the `tidyverse` key while this map records
-    /// `mutate -> dplyr`. First contributor in the depends-then-attached,
-    /// cycle-guarded traversal wins (the aggregate root is visited first, so it
-    /// owns its own exports). Must be invalidated whenever `combined_exports` is
-    /// (see `invalidate_many` / `clear_cache`). See issue #407.
-    combined_export_owners: RwLock<HashMap<String, Arc<HashMap<String, String>>>>,
+    /// Each entry stores availability (`exports`) and ownership (`owners`) in
+    /// one immutable snapshot. For `library(tidyverse)`, `exports` contains
+    /// `mutate` and `owners` records `mutate -> dplyr`. This single source of
+    /// truth prevents readers from seeing an aggregate export without its owner
+    /// attribution during cache warm-up or invalidation. See issue #407.
+    combined_entries: RwLock<HashMap<String, Arc<CombinedEntry>>>,
     /// Base packages (always available)
     base_packages: HashSet<String>,
     /// Base package exports (combined from all base packages).
@@ -254,8 +266,7 @@ impl PackageLibrary {
         Self {
             lib_paths: Vec::new(),
             packages: RwLock::new(HashMap::new()),
-            combined_exports: RwLock::new(HashMap::new()),
-            combined_export_owners: RwLock::new(HashMap::new()),
+            combined_entries: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess: None,
@@ -275,8 +286,7 @@ impl PackageLibrary {
         Self {
             lib_paths: Vec::new(),
             packages: RwLock::new(HashMap::new()),
-            combined_exports: RwLock::new(HashMap::new()),
-            combined_export_owners: RwLock::new(HashMap::new()),
+            combined_entries: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess,
@@ -347,7 +357,7 @@ impl PackageLibrary {
     ///
     /// This method returns a map of symbol name to package name for all exports
     /// from the given loaded packages. It uses cached package information,
-    /// preferring combined_exports cache (includes Depends/attached) when available.
+    /// preferring combined_entries cache (includes Depends/attached) when available.
     ///
     /// This is a synchronous method suitable for use in completion handlers where
     /// we cannot use async. It uses `try_read()` to avoid blocking.
@@ -369,8 +379,8 @@ impl PackageLibrary {
         let mut result: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
 
-        // Try combined_exports cache first (includes Depends/attached packages)
-        let combined_cache = self.combined_exports.try_read().ok();
+        // Try combined_entries cache first (includes Depends/attached packages)
+        let combined_cache = self.combined_entries.try_read().ok();
         let packages_cache = self.packages.try_read().ok();
 
         if combined_cache.is_none() && packages_cache.is_none() {
@@ -383,11 +393,11 @@ impl PackageLibrary {
         // Process packages in order (earlier packages appear first in the list)
         // Requirement 9.3: Show all packages that export the same symbol
         for pkg_name in loaded_packages {
-            // Try combined_exports first
+            // Try combined_entries first
             if let Some(ref cache) = combined_cache
-                && let Some(exports) = cache.get(pkg_name)
+                && let Some(entry) = cache.get(pkg_name)
             {
-                for export in exports.iter() {
+                for export in entry.exports.iter() {
                     result
                         .entry(export.clone())
                         .or_default()
@@ -418,10 +428,13 @@ impl PackageLibrary {
     /// (the documentation owner) so completion detail (`{dplyr}`) and the
     /// resolve `data.package` open the correct help topic. See issue #407.
     ///
-    /// Synchronous and cached-only (`try_read`). Falls back to the loaded
-    /// package when the owner map is not yet warmed, preserving the previous
-    /// attribution. Owners are de-duplicated per symbol (two loaded aggregates
-    /// can resolve to the same owner).
+    /// Synchronous and cached-only (`try_read`). A cached aggregate entry is a
+    /// single availability/ownership snapshot, so owner-sensitive completion
+    /// never falls back from a present aggregate entry to loaded-package
+    /// attribution. If no aggregate entry exists yet, it falls back to the
+    /// per-package cache, preserving the previous direct-package behavior.
+    /// Owners are de-duplicated per symbol (two loaded aggregates can resolve
+    /// to the same owner).
     pub fn get_owned_exports_for_completions(
         &self,
         loaded_packages: &[String],
@@ -429,11 +442,9 @@ impl PackageLibrary {
         let mut result: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
 
-        let owner_cache = self.combined_export_owners.try_read().ok();
-        let combined_cache = self.combined_exports.try_read().ok();
+        let combined_cache = self.combined_entries.try_read().ok();
         let packages_cache = self.packages.try_read().ok();
-
-        if owner_cache.is_none() && combined_cache.is_none() && packages_cache.is_none() {
+        if combined_cache.is_none() && packages_cache.is_none() {
             log::trace!(
                 "Could not acquire any package cache lock for owned completions, returning empty"
             );
@@ -448,28 +459,17 @@ impl PackageLibrary {
         };
 
         for pkg_name in loaded_packages {
-            // Prefer the owner map: it covers exactly the symbols in the
+            // Prefer the aggregate entry: it covers exactly the symbols in the
             // combined set and attributes each to its true contributor.
-            if let Some(ref cache) = owner_cache
-                && let Some(owners) = cache.get(pkg_name)
+            if let Some(ref cache) = combined_cache
+                && let Some(entry) = cache.get(pkg_name)
             {
-                for (symbol, owner) in owners.iter() {
+                for (symbol, owner) in entry.owners.iter() {
                     push_unique(symbol, owner);
                 }
                 continue;
             }
-
-            // Fall back to the combined set, attributing to the loaded package.
-            if let Some(ref cache) = combined_cache
-                && let Some(exports) = cache.get(pkg_name)
-            {
-                for export in exports.iter() {
-                    push_unique(export, pkg_name);
-                }
-                continue;
-            }
-
-            // Last resort: per-package exports, attributing to the loaded package.
+            // Fall back to per-package exports, attributing to the loaded package.
             if let Some(ref cache) = packages_cache
                 && let Some(info) = cache.get(pkg_name)
             {
@@ -486,7 +486,7 @@ impl PackageLibrary {
     ///
     /// This method checks if the symbol is exported by any of the loaded packages,
     /// using cached package information. It first checks base exports, then
-    /// checks combined_exports cache (includes Depends/attached), then falls back
+    /// checks combined_entries cache (includes Depends/attached), then falls back
     /// to per-package exports cache.
     ///
     /// This is a synchronous method suitable for use in diagnostic collection where
@@ -507,11 +507,11 @@ impl PackageLibrary {
             return true;
         }
 
-        // Try combined_exports cache first (includes Depends/attached packages)
-        if let Ok(combined_cache) = self.combined_exports.try_read() {
+        // Try combined_entries cache first (includes Depends/attached packages)
+        if let Ok(combined_cache) = self.combined_entries.try_read() {
             for pkg_name in loaded_packages {
-                if let Some(exports) = combined_cache.get(pkg_name)
-                    && exports.contains(symbol)
+                if let Some(entry) = combined_cache.get(pkg_name)
+                    && entry.exports.contains(symbol)
                 {
                     return true;
                 }
@@ -611,7 +611,7 @@ impl PackageLibrary {
         cache.remove(name);
     }
 
-    /// Invalidate a batch of packages, also dropping any `combined_exports`
+    /// Invalidate a batch of packages, also dropping any `combined_entries`
     /// entries whose aggregate export set depends on `names` — including:
     ///
     /// - direct key matches (invalidating `dplyr` drops combined entry for `dplyr`),
@@ -622,7 +622,7 @@ impl PackageLibrary {
     ///   `A` when `A` Depends: `B` Depends: `C`), since the aggregate rolled up
     ///   a now-stale transitive child.
     ///
-    /// Returns the set of `combined_exports` keys that were actually present and
+    /// Returns the set of `combined_entries` keys that were actually present and
     /// dropped. Callers use this to identify documents whose loaded packages
     /// include meta-aggregates that were invalidated even though the aggregate
     /// name itself is not in `names` (e.g. a document using `library(tidyverse)`
@@ -671,7 +671,7 @@ impl PackageLibrary {
         }
         let mut invalidated_combined: HashSet<String> = HashSet::new();
         {
-            let mut combined = self.combined_exports.write().await;
+            let mut combined = self.combined_entries.write().await;
             // Drop direct hits; record only the ones that were actually present.
             for n in names {
                 if combined.remove(n).is_some() {
@@ -699,16 +699,6 @@ impl PackageLibrary {
                 combined.remove(&m);
                 invalidated_combined.insert(m);
             }
-            // Drop the owner map in lockstep, while still holding the
-            // `combined_exports` write guard. `combined_export_owners` shares
-            // the same keys (see `get_all_exports`), so `invalidated_combined`
-            // is exactly the set of owner-map entries to drop. Holding both
-            // guards (order: combined -> owners) keeps the two caches consistent
-            // for readers across the removal, mirroring the publish path.
-            let mut owner_cache = self.combined_export_owners.write().await;
-            for k in &invalidated_combined {
-                owner_cache.remove(k);
-            }
         }
         invalidated_combined
     }
@@ -719,20 +709,14 @@ impl PackageLibrary {
         cache.keys().cloned().collect()
     }
 
-    /// Clear all cached packages, including aggregated `combined_exports` and
-    /// `combined_export_owners` entries.
+    /// Clear all cached packages, including aggregate `combined_entries`.
     pub async fn clear_cache(&self) {
         {
             let mut cache = self.packages.write().await;
             cache.clear();
         }
-        // Clear both aggregate caches under one critical section (order:
-        // combined -> owners), so a reader never sees one cleared without the
-        // other. Mirrors the publish/invalidate lock discipline.
-        let mut combined = self.combined_exports.write().await;
-        let mut owner_cache = self.combined_export_owners.write().await;
+        let mut combined = self.combined_entries.write().await;
         combined.clear();
-        owner_cache.clear();
     }
 
     /// Load pattern packages via the INDEX + explicit-exports fallback and
@@ -760,7 +744,7 @@ impl PackageLibrary {
     /// Prefetch packages by loading their exports into cache
     ///
     /// This method asynchronously loads package exports for the given package names,
-    /// populating both the per-package cache and combined_exports cache.
+    /// populating both the per-package cache and combined_entries cache.
     /// Used for background warm-up after detecting library() calls.
     ///
     /// # Performance - Tiered Prefetch Strategy
@@ -780,7 +764,7 @@ impl PackageLibrary {
 
         // Filter out packages we've already cached
         let uncached_packages: Vec<String> = {
-            let combined_cache = self.combined_exports.read().await;
+            let combined_cache = self.combined_entries.read().await;
             let packages_cache = self.packages.read().await;
             packages
                 .iter()
@@ -925,7 +909,7 @@ impl PackageLibrary {
             }
         }
 
-        // Step 3: Populate combined_exports cache
+        // Step 3: Populate combined_entries cache
         for pkg_name in &uncached_packages {
             let _ = self.get_all_exports(pkg_name).await;
         }
@@ -952,11 +936,11 @@ impl PackageLibrary {
         symbol: &str,
         loaded_packages: &[String],
     ) -> Option<String> {
-        // Check combined_exports cache first
-        if let Ok(cache) = self.combined_exports.try_read() {
+        // Check combined_entries cache first
+        if let Ok(cache) = self.combined_entries.try_read() {
             for pkg_name in loaded_packages {
-                if let Some(exports) = cache.get(pkg_name)
-                    && exports.contains(symbol)
+                if let Some(entry) = cache.get(pkg_name)
+                    && entry.exports.contains(symbol)
                 {
                     return Some(pkg_name.clone());
                 }
@@ -983,33 +967,47 @@ impl PackageLibrary {
     /// Distinct from [`find_package_for_symbol`], which answers "which loaded
     /// package made this visible?" and returns the aggregate key (e.g.
     /// `tidyverse`). This answers "which package actually contributed the
-    /// symbol?" — the documentation / NSE-policy owner (e.g. `dplyr`) — by
-    /// consulting the per-aggregate `combined_export_owners` map. Falls back to
-    /// [`find_package_for_symbol`] when no owner map entry exists (cache not yet
-    /// warmed), preserving the previous behavior. See issue #407.
+    /// symbol?\" — the documentation / NSE-policy owner (e.g. `dplyr`) — by
+    /// consulting the per-aggregate [`CombinedEntry`] snapshot. Falls back to
+    /// direct per-package exports when no aggregate entry exists yet, preserving
+    /// the previous behavior for unwarmed direct package caches. See issue #407.
     pub fn find_package_owner_for_symbol(
         &self,
         symbol: &str,
         loaded_packages: &[String],
     ) -> Option<String> {
-        // Consult the per-aggregate owner map first. For each loaded package,
-        // if the cached owner map for that aggregate records this symbol, the
-        // recorded value is the true contributor (e.g. `dplyr` for a `mutate`
-        // made visible through `tidyverse`).
-        if let Ok(owner_cache) = self.combined_export_owners.try_read() {
+        // Consult the per-aggregate snapshot first. For each loaded package, if
+        // the cached aggregate entry records this symbol's owner, that value is
+        // the true contributor (e.g. `dplyr` for a `mutate` made visible through
+        // `tidyverse`). If the entry says the symbol is available but lacks an
+        // owner, fail closed rather than falling back to aggregate attribution.
+        if let Ok(cache) = self.combined_entries.try_read() {
             for pkg_name in loaded_packages {
-                if let Some(owners) = owner_cache.get(pkg_name)
-                    && let Some(owner) = owners.get(symbol)
-                {
-                    return Some(owner.clone());
+                if let Some(entry) = cache.get(pkg_name) {
+                    if let Some(owner) = entry.owners.get(symbol) {
+                        return Some(owner.clone());
+                    }
+                    if entry.exports.contains(symbol) {
+                        return None;
+                    }
                 }
             }
         }
 
-        // Fall back to availability-based attribution when the owner map has no
-        // entry (combined cache not yet warmed). This preserves the previous
-        // behavior of returning the loaded package that made the symbol visible.
-        self.find_package_for_symbol(symbol, loaded_packages)
+        // Fall back only to direct per-package attribution. Re-reading aggregate
+        // availability here can combine an old owner miss with a newer combined
+        // hit and return the aggregate package as a false owner.
+        if let Ok(cache) = self.packages.try_read() {
+            for pkg_name in loaded_packages {
+                if let Some(info) = cache.get(pkg_name)
+                    && info.exports.contains(symbol)
+                {
+                    return Some(pkg_name.clone());
+                }
+            }
+        }
+
+        None
     }
 
     /// Set the library paths
@@ -1621,10 +1619,10 @@ impl PackageLibrary {
     /// and attached_packages for meta-packages), combining their exports into a single set.
     /// It tracks visited packages to handle circular dependencies.
     ///
-    /// Results are cached in combined_exports for efficient repeated lookups.
+    /// Results are cached in combined_entries for efficient repeated lookups.
     ///
     /// # Behavior
-    /// 1. Check combined_exports cache first
+    /// 1. Check combined_entries cache first
     /// 2. Load the main package using `get_package()`
     /// 3. Add the package's exports to the result set
     /// 4. Recursively load all packages in `depends` and `attached_packages`
@@ -1639,10 +1637,10 @@ impl PackageLibrary {
     pub async fn get_all_exports(&self, name: &str) -> HashSet<String> {
         // Check cache first
         {
-            let cache = self.combined_exports.read().await;
+            let cache = self.combined_entries.read().await;
             if let Some(cached) = cache.get(name) {
                 log::trace!("Using cached combined exports for package '{}'", name);
-                return cached.as_ref().clone();
+                return cached.exports.clone();
             }
         }
 
@@ -1656,22 +1654,15 @@ impl PackageLibrary {
         self.collect_exports_recursive(name, &mut visited, &mut all_exports, &mut owners)
             .await;
 
-        // Publish the combined set and its owner map in a single critical
-        // section: the `combined_exports` write guard is held across the
-        // `combined_export_owners` insert, so a key is only ever *readable* in
-        // `combined_exports` once it is also present in the owner map. Without
-        // this, a reader could observe `combined_exports` populated for `name`
-        // while the owner map still lacks it, making `find_package_owner_for_symbol`
-        // fall back to `find_package_for_symbol` and return the aggregate key
-        // (e.g. `tidyverse`) instead of the true owner (`dplyr`). The lock order
-        // is always `combined_exports` -> `combined_export_owners` (here and in
-        // `invalidate_many` / `clear_cache`) to avoid deadlock; readers use
-        // `try_read`, so they can never be part of a lock cycle.
+        // Publish availability and owner attribution as one immutable entry, so
+        // hot-path readers can never observe a combined export without the
+        // matching owner attribution.
         {
-            let mut cache = self.combined_exports.write().await;
-            let mut owner_cache = self.combined_export_owners.write().await;
-            cache.insert(name.to_string(), Arc::new(all_exports.clone()));
-            owner_cache.insert(name.to_string(), Arc::new(owners));
+            let mut cache = self.combined_entries.write().await;
+            cache.insert(
+                name.to_string(),
+                Arc::new(CombinedEntry::new(all_exports.clone(), owners)),
+            );
             log::trace!(
                 "Cached {} combined exports for package '{}'",
                 all_exports.len(),
@@ -2514,22 +2505,25 @@ mod tests {
             .await;
         lib.insert_package(PackageInfo::new("pkg2".to_string(), HashSet::new()))
             .await;
-        // Seed a combined_exports entry to verify it is also cleared.
+        // Seed a combined_entries entry to verify it is also cleared.
         {
-            let mut combined = lib.combined_exports.write().await;
+            let mut combined = lib.combined_entries.write().await;
             combined.insert(
                 "pkg1".into(),
-                std::sync::Arc::new(["foo".to_string()].into_iter().collect()),
+                std::sync::Arc::new(CombinedEntry::new(
+                    ["foo".to_string()].into_iter().collect(),
+                    HashMap::new(),
+                )),
             );
         }
 
         assert_eq!(lib.cached_count().await, 2);
-        assert!(lib.combined_exports.read().await.contains_key("pkg1"));
+        assert!(lib.combined_entries.read().await.contains_key("pkg1"));
 
         lib.clear_cache().await;
 
         assert_eq!(lib.cached_count().await, 0);
-        assert!(lib.combined_exports.read().await.is_empty());
+        assert!(lib.combined_entries.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -3672,19 +3666,45 @@ mod tests {
 
     #[tokio::test]
     async fn test_owner_falls_back_when_owner_map_absent() {
-        // When the owner map has no entry (combined cache never warmed), the
-        // lookup falls back to the per-package availability semantics of
-        // find_package_for_symbol.
+        // When no aggregate entry has been warmed, the lookup falls back to the
+        // per-package availability semantics of find_package_for_symbol.
         let lib = PackageLibrary::new_empty();
         let mut dplyr_exports = HashSet::new();
         dplyr_exports.insert("mutate".to_string());
         lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
             .await;
-        // Note: no get_all_exports() call, so combined_export_owners is empty.
+        // Note: no get_all_exports() call, so combined_entries is empty.
         let loaded = vec!["dplyr".to_string()];
         assert_eq!(
             lib.find_package_owner_for_symbol("mutate", &loaded),
             Some("dplyr".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owner_lookup_ignores_ownerless_combined_entry() {
+        // A combined availability hit without matching owner attribution is a
+        // partial snapshot. Owner-sensitive lookup must fail closed instead of
+        // attributing a transitive export to the aggregate package.
+        let lib = PackageLibrary::new_empty();
+        lib.insert_package(PackageInfo::new("tidyverse".to_string(), HashSet::new()))
+            .await;
+        {
+            let mut combined = lib.combined_entries.write().await;
+            combined.insert(
+                "tidyverse".to_string(),
+                Arc::new(CombinedEntry::new(
+                    ["mutate".to_string()].into_iter().collect(),
+                    HashMap::new(),
+                )),
+            );
+        }
+
+        let loaded = vec!["tidyverse".to_string()];
+        assert_eq!(
+            lib.find_package_owner_for_symbol("mutate", &loaded),
+            None,
+            "owner lookup must not fall back to aggregate attribution from ownerless combined availability"
         );
     }
 
@@ -3711,48 +3731,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_owned_exports_for_completions_falls_back_to_loaded_package() {
-        // When the owner map is not warmed, attribution falls back to the loaded
+        // When no aggregate entry is warmed, attribution falls back to the loaded
         // package (existing get_exports_for_completions behavior).
         let lib = PackageLibrary::new_empty();
         let mut dplyr_exports = HashSet::new();
         dplyr_exports.insert("mutate".to_string());
         lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
             .await;
-        // No get_all_exports(): owner map empty, per-package cache present.
+        // No get_all_exports(): aggregate entry absent, per-package cache present.
         let owned = lib.get_owned_exports_for_completions(&["dplyr".to_string()]);
         assert_eq!(owned.get("mutate"), Some(&vec!["dplyr".to_string()]));
     }
 
     #[tokio::test]
-    async fn test_clear_cache_drops_owner_map() {
-        // clear_cache() must drop combined_export_owners in lockstep with
-        // combined_exports, or a stale owner map could outlive its aggregate.
+    async fn test_clear_cache_drops_combined_entry() {
+        // clear_cache() must drop the unified aggregate entry containing both
+        // availability and ownership.
         let lib = PackageLibrary::new_empty();
         let mut dplyr_exports = HashSet::new();
         dplyr_exports.insert("mutate".to_string());
         lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
             .await;
         lib.get_all_exports("dplyr").await;
-        assert!(
-            lib.combined_export_owners
-                .read()
-                .await
-                .contains_key("dplyr")
-        );
+        assert!(lib.combined_entries.read().await.contains_key("dplyr"));
 
         lib.clear_cache().await;
 
         assert!(
-            lib.combined_export_owners.read().await.is_empty(),
-            "clear_cache must also clear the owner map"
+            lib.combined_entries.read().await.is_empty(),
+            "clear_cache must clear aggregate entries"
         );
     }
 
     #[tokio::test]
-    async fn test_invalidate_many_drops_owner_map_for_dependent_aggregate() {
-        // Invalidating an attached member (dplyr) must drop the cached owner map
-        // for the meta-package aggregate (tidyverse) that rolled it up, exactly
-        // as it drops the combined_exports aggregate.
+    async fn test_invalidate_many_drops_combined_entry_for_dependent_aggregate() {
+        // Invalidating an attached member (dplyr) must drop the cached unified
+        // aggregate entry (tidyverse) that rolled it up.
         let lib = PackageLibrary::new_empty();
         let mut dplyr_exports = HashSet::new();
         dplyr_exports.insert("mutate".to_string());
@@ -3761,23 +3775,15 @@ mod tests {
         lib.insert_package(PackageInfo::new("tidyverse".to_string(), HashSet::new()))
             .await;
         lib.get_all_exports("tidyverse").await;
-        assert!(
-            lib.combined_export_owners
-                .read()
-                .await
-                .contains_key("tidyverse")
-        );
+        assert!(lib.combined_entries.read().await.contains_key("tidyverse"));
 
         let mut names = HashSet::new();
         names.insert("dplyr".to_string());
         lib.invalidate_many(&names).await;
 
         assert!(
-            !lib.combined_export_owners
-                .read()
-                .await
-                .contains_key("tidyverse"),
-            "invalidating dplyr must drop the tidyverse owner map in lockstep"
+            !lib.combined_entries.read().await.contains_key("tidyverse"),
+            "invalidating dplyr must drop the tidyverse aggregate entry"
         );
     }
 
@@ -3839,7 +3845,7 @@ mod tests {
     #[tokio::test]
     async fn test_prefetch_static_package_resolves_dataset() {
         // The production LSP warm-up path is `prefetch_packages`, which inserts
-        // PackageInfo and combined_exports directly — bypassing `get_package`.
+        // PackageInfo and combined_entries directly — bypassing `get_package`.
         // A statically-loaded package's datasets must resolve through it too,
         // or `library(nycflights13); flights` stays a false positive in the
         // editor (issue #350).
@@ -4915,7 +4921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_many_clears_combined_exports_for_meta_packages() {
+    async fn invalidate_many_clears_combined_entries_for_meta_packages() {
         use std::collections::HashSet;
 
         let lib = PackageLibrary::new_empty();
@@ -4927,20 +4933,24 @@ mod tests {
             let mut packages = lib.packages.write().await;
             packages.insert("tidyverse".into(), std::sync::Arc::new(tidyverse_info));
         }
-        // Seed combined_exports as though tidyverse had been loaded.
+        // Seed combined_entries as though tidyverse had been loaded.
         {
-            let mut combined = lib.combined_exports.write().await;
+            let mut combined = lib.combined_entries.write().await;
             combined.insert(
                 "tidyverse".into(),
-                std::sync::Arc::new(
+                std::sync::Arc::new(CombinedEntry::new(
                     ["mutate".to_string(), "ggplot".to_string()]
                         .into_iter()
                         .collect(),
-                ),
+                    HashMap::new(),
+                )),
             );
             combined.insert(
                 "dplyr".into(),
-                std::sync::Arc::new(["mutate".to_string()].into_iter().collect()),
+                std::sync::Arc::new(CombinedEntry::new(
+                    ["mutate".to_string()].into_iter().collect(),
+                    HashMap::new(),
+                )),
             );
         }
 
@@ -4948,17 +4958,17 @@ mod tests {
         let set: HashSet<String> = ["dplyr".to_string()].into_iter().collect();
         let invalidated = lib.invalidate_many(&set).await;
 
-        let combined = lib.combined_exports.read().await;
+        let combined = lib.combined_entries.read().await;
         assert!(!combined.contains_key("tidyverse"));
         assert!(!combined.contains_key("dplyr"));
 
-        // Returned set surfaces which combined_exports keys were actually
+        // Returned set surfaces which combined_entries keys were actually
         // dropped so callers can revalidate documents that loaded tidyverse
         // (not dplyr) directly.
         assert!(invalidated.contains("tidyverse"));
         assert!(invalidated.contains("dplyr"));
 
-        // invalidate_many must drop combined_exports entries but preserve the
+        // invalidate_many must drop combined_entries entries but preserve the
         // per-package PackageInfo cache: the meta-package itself still exists
         // on disk, so its individual entry should remain available for
         // subsequent re-aggregation.
@@ -4971,7 +4981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_many_returns_empty_for_names_not_in_combined_exports() {
+    async fn invalidate_many_returns_empty_for_names_not_in_combined_entries() {
         use std::collections::HashSet;
         let lib = PackageLibrary::new_empty();
         lib.insert_package(PackageInfo::new(
@@ -4980,7 +4990,7 @@ mod tests {
         ))
         .await;
 
-        // combined_exports is empty for this package name — invalidate_many
+        // combined_entries is empty for this package name — invalidate_many
         // must not claim it was dropped.
         let set: HashSet<String> = ["uncached_meta_child".to_string()].into_iter().collect();
         let invalidated = lib.invalidate_many(&set).await;
@@ -4988,12 +4998,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_many_clears_combined_exports_for_transitive_depends() {
+    async fn invalidate_many_clears_combined_entries_for_transitive_depends() {
         use std::collections::HashSet;
 
         let lib = PackageLibrary::new_empty();
         // Package `A` Depends on `B`. Its PackageInfo is cached, and its
-        // combined_exports aggregate has been built.
+        // combined_entries aggregate has been built.
         let a_info = PackageInfo::with_details(
             "A".into(),
             ["a_fn".to_string()].into_iter().collect(),
@@ -5002,14 +5012,15 @@ mod tests {
         );
         lib.insert_package(a_info).await;
         {
-            let mut combined = lib.combined_exports.write().await;
+            let mut combined = lib.combined_entries.write().await;
             combined.insert(
                 "A".into(),
-                std::sync::Arc::new(
+                std::sync::Arc::new(CombinedEntry::new(
                     ["a_fn".to_string(), "b_fn".to_string()]
                         .into_iter()
                         .collect(),
-                ),
+                    HashMap::new(),
+                )),
             );
         }
 
@@ -5019,10 +5030,10 @@ mod tests {
         let set: HashSet<String> = ["B".to_string()].into_iter().collect();
         let invalidated = lib.invalidate_many(&set).await;
 
-        let combined = lib.combined_exports.read().await;
+        let combined = lib.combined_entries.read().await;
         assert!(
             !combined.contains_key("A"),
-            "A's combined_exports aggregate should be cleared when its dependency B is invalidated"
+            "A's combined_entries aggregate should be cleared when its dependency B is invalidated"
         );
         // Returned set surfaces A so consumers know documents using A need revalidation.
         assert!(invalidated.contains("A"));

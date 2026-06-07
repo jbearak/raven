@@ -14625,7 +14625,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         return Some(markdown_hover(value, node_range));
     }
 
-    // Check package exports from combined_exports cache (if packages enabled)
+    // Check package exports from the aggregate package cache (if packages enabled)
     // This surfaces package exports without blocking on R subprocess
     if state.cross_file_config.packages_enabled {
         let scope = get_cross_file_scope(
