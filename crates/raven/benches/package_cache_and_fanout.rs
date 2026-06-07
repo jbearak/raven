@@ -36,11 +36,19 @@ fn package_info(index: usize) -> PackageInfo {
     PackageInfo::with_details(format!("pkg_{index}"), exports, Vec::new(), Vec::new())
 }
 
-fn seeded_package_library(rt: &Runtime) -> (Arc<PackageLibrary>, Vec<String>, String) {
+fn seeded_package_library(
+    rt: &Runtime,
+    warm_combined_entries: bool,
+) -> (Arc<PackageLibrary>, Vec<String>, String) {
     let lib = Arc::new(PackageLibrary::new_empty());
     rt.block_on(async {
         for index in 0..PACKAGE_COUNT {
             lib.insert_package(package_info(index)).await;
+        }
+        if warm_combined_entries {
+            for index in 0..PACKAGE_COUNT {
+                let _ = lib.get_all_exports(&format!("pkg_{index}")).await;
+            }
         }
     });
 
@@ -92,7 +100,9 @@ impl PackageWriteContention {
 
 fn bench_package_cache(c: &mut Criterion) {
     let rt = runtime();
-    let (lib, loaded_packages, target_symbol) = seeded_package_library(&rt);
+    let (lib, loaded_packages, target_symbol) = seeded_package_library(&rt, false);
+    let (combined_lib, combined_loaded_packages, combined_target_symbol) =
+        seeded_package_library(&rt, true);
 
     let mut group = c.benchmark_group("package_cache");
 
@@ -110,6 +120,25 @@ fn bench_package_cache(c: &mut Criterion) {
             let owner = lib.find_package_owner_for_symbol(
                 black_box(&target_symbol),
                 black_box(&loaded_packages),
+            );
+            black_box(owner);
+        })
+    });
+
+    group.bench_function("uncontended_combined/is_symbol_hit_24_loaded", |b| {
+        b.iter(|| {
+            assert!(black_box(combined_lib.is_symbol_from_loaded_packages(
+                black_box(&combined_target_symbol),
+                black_box(&combined_loaded_packages),
+            )));
+        })
+    });
+
+    group.bench_function("uncontended_combined/find_owner_hit_24_loaded", |b| {
+        b.iter(|| {
+            let owner = combined_lib.find_package_owner_for_symbol(
+                black_box(&combined_target_symbol),
+                black_box(&combined_loaded_packages),
             );
             black_box(owner);
         })
@@ -187,7 +216,6 @@ fn bench_diagnostic_fanout(c: &mut Criterion) {
     let payload = diagnostic_payload();
 
     let mut group = c.benchmark_group("diagnostic_fanout");
-    group.sample_size(10);
 
     group.bench_function("serial_32_diagnostic_like_items", |b| {
         b.iter_batched(

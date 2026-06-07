@@ -294,7 +294,7 @@ Key ideas:
 - If R is unavailable, fall back to `INDEX` parsing (best-effort)
 - When merging `Depends` with meta-package `attached_packages`, keep a companion `HashSet` for dedupe; repeated `Vec::contains()` checks make recursive export expansion quadratic.
 
-`PackageLibrary` owns two in-memory side caches: `packages` for direct per-package metadata and `combined_entries` for aggregate availability/ownership snapshots. Both use `parking_lot::RwLock<HashMap<...>>`. Synchronous cache readers must take blocking read locks, not `try_read()`: lock contention is never semantic absence, so a contended cache must wait briefly rather than returning false/empty and producing transient diagnostics. Keep these guards small and never hold them across `.await`, R subprocess calls, disk/provider reads, or recursive package expansion. Completion readers should clone only the relevant `Arc<PackageInfo>` / `Arc<CombinedEntry>` handles under the guard and do string iteration/dedupe after dropping it. Writers should likewise keep write sections narrow and acquire the two maps sequentially rather than nesting locks.
+`PackageLibrary` owns two in-memory side caches: `packages` for direct per-package metadata and `combined_entries` for aggregate availability/ownership snapshots. Both use `parking_lot::RwLock<HashMap<...>>`. Synchronous cache readers use the `cache_read` helper: it takes the uncontended `try_read()` fast path, but falls back to a blocking `read()` on contention. Lock contention is never semantic absence, so a contended cache must wait briefly rather than returning false/empty and producing transient diagnostics. Keep these guards small and never hold them across `.await`, R subprocess calls, disk/provider reads, or recursive package expansion. Completion readers should clone only the relevant `Arc<PackageInfo>` / `Arc<CombinedEntry>` handles under the guard and do string iteration/dedupe after dropping it. Writers should likewise keep write sections narrow and acquire the two maps sequentially rather than nesting locks.
 
 ### Availability vs. ownership: unified aggregate entries (#407)
 
@@ -409,7 +409,7 @@ contaminated by Tier 2/3 guesses. Construction is split into
 ### Performance discipline (§12)
 
 The LSP hot path (diagnostic collection) reads the in-memory caches with short
-blocking `parking_lot` read guards and must not take a disk/page-fault stall. So:
+`parking_lot` read guards via `cache_read` and must not take a disk/page-fault stall. So:
 
 - the Tier 3 index is **preloaded at open**; per-package payloads decode lazily
   from the mmap on first lookup;

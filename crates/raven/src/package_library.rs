@@ -7,7 +7,7 @@
 // Requirement 13.1: THE Package_Cache SHALL store parsed exports per package
 // Requirement 13.4: THE Package_Cache SHALL support concurrent read access from multiple LSP handlers
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -97,6 +97,17 @@ fn meta_package_fields(name: &str) -> (bool, Vec<String>) {
 /// so it is negligible on the init / package-resolution path.
 fn is_readable_file(path: &Path) -> bool {
     path.is_file() && std::fs::File::open(path).is_ok()
+}
+
+/// Take a package-cache read guard, using the uncontended fast path but never
+/// treating contention as absence.
+///
+/// The pre-#414 bug was not `try_read()` itself; it was returning false/empty
+/// when `try_read()` failed. This helper preserves the blocking-read contract
+/// while avoiding the slower parking-lot blocking path when the lock is
+/// immediately available.
+fn cache_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.try_read().unwrap_or_else(|| lock.read())
 }
 
 /// Cached package information
@@ -380,21 +391,32 @@ impl PackageLibrary {
     /// Aggregate entries win over direct per-package entries, preserving the
     /// existing "combined first, package fallback" behavior.
     fn cached_completion_entries(&self, loaded_packages: &[String]) -> Vec<CachedCompletionEntry> {
-        let combined_cache = self.combined_entries.read();
-        let packages_cache = self.packages.read();
-        let mut entries = Vec::new();
+        let combined_cache = cache_read(&self.combined_entries);
+        let packages_cache = cache_read(&self.packages);
+        let mut entries = Vec::with_capacity(loaded_packages.len());
 
-        for pkg_name in loaded_packages {
-            if let Some(entry) = combined_cache.get(pkg_name) {
-                entries.push(CachedCompletionEntry::Combined {
-                    loaded_package: pkg_name.clone(),
-                    entry: Arc::clone(entry),
-                });
-            } else if let Some(info) = packages_cache.get(pkg_name) {
-                entries.push(CachedCompletionEntry::Package {
-                    loaded_package: pkg_name.clone(),
-                    info: Arc::clone(info),
-                });
+        if combined_cache.is_empty() {
+            for pkg_name in loaded_packages {
+                if let Some(info) = packages_cache.get(pkg_name) {
+                    entries.push(CachedCompletionEntry::Package {
+                        loaded_package: pkg_name.clone(),
+                        info: Arc::clone(info),
+                    });
+                }
+            }
+        } else {
+            for pkg_name in loaded_packages {
+                if let Some(entry) = combined_cache.get(pkg_name) {
+                    entries.push(CachedCompletionEntry::Combined {
+                        loaded_package: pkg_name.clone(),
+                        entry: Arc::clone(entry),
+                    });
+                } else if let Some(info) = packages_cache.get(pkg_name) {
+                    entries.push(CachedCompletionEntry::Package {
+                        loaded_package: pkg_name.clone(),
+                        info: Arc::clone(info),
+                    });
+                }
             }
         }
 
@@ -425,12 +447,20 @@ impl PackageLibrary {
         &self,
         loaded_packages: &[String],
     ) -> std::collections::HashMap<String, Vec<String>> {
+        let entries = self.cached_completion_entries(loaded_packages);
+        let capacity = entries
+            .iter()
+            .map(|entry| match entry {
+                CachedCompletionEntry::Combined { entry, .. } => entry.exports.len(),
+                CachedCompletionEntry::Package { info, .. } => info.exports.len(),
+            })
+            .sum();
         let mut result: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(capacity);
 
         // Process packages in order (earlier packages appear first in the list)
         // Requirement 9.3: Show all packages that export the same symbol
-        for entry in self.cached_completion_entries(loaded_packages) {
+        for entry in entries {
             match entry {
                 CachedCompletionEntry::Combined {
                     loaded_package,
@@ -478,8 +508,16 @@ impl PackageLibrary {
         &self,
         loaded_packages: &[String],
     ) -> std::collections::HashMap<String, Vec<String>> {
+        let entries = self.cached_completion_entries(loaded_packages);
+        let capacity = entries
+            .iter()
+            .map(|entry| match entry {
+                CachedCompletionEntry::Combined { entry, .. } => entry.owners.len(),
+                CachedCompletionEntry::Package { info, .. } => info.exports.len(),
+            })
+            .sum();
         let mut result: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(capacity);
 
         let mut push_unique = |symbol: &str, owner: &str| {
             let owners = result.entry(symbol.to_string()).or_default();
@@ -487,7 +525,7 @@ impl PackageLibrary {
                 owners.push(owner.to_string());
             }
         };
-        for entry in self.cached_completion_entries(loaded_packages) {
+        for entry in entries {
             match entry {
                 CachedCompletionEntry::Combined { entry, .. } => {
                     for (symbol, owner) in entry.owners.iter() {
@@ -535,18 +573,20 @@ impl PackageLibrary {
 
         // Check combined_entries cache first (includes Depends/attached packages)
         {
-            let combined_cache = self.combined_entries.read();
-            for pkg_name in loaded_packages {
-                if let Some(entry) = combined_cache.get(pkg_name)
-                    && entry.exports.contains(symbol)
-                {
-                    return true;
+            let combined_cache = cache_read(&self.combined_entries);
+            if !combined_cache.is_empty() {
+                for pkg_name in loaded_packages {
+                    if let Some(entry) = combined_cache.get(pkg_name)
+                        && entry.exports.contains(symbol)
+                    {
+                        return true;
+                    }
                 }
             }
         }
 
         // Fall back to per-package exports cache
-        let cache = self.packages.read();
+        let cache = cache_read(&self.packages);
 
         // Check each loaded package
         for pkg_name in loaded_packages {
@@ -565,13 +605,13 @@ impl PackageLibrary {
     /// This is a synchronous method that only checks the cache.
     /// For loading packages that aren't cached, use `get_package()`.
     pub async fn get_cached_package(&self, name: &str) -> Option<Arc<PackageInfo>> {
-        let cache = self.packages.read();
+        let cache = cache_read(&self.packages);
         cache.get(name).cloned()
     }
 
     /// Check if a package is cached
     pub async fn is_cached(&self, name: &str) -> bool {
-        let cache = self.packages.read();
+        let cache = cache_read(&self.packages);
         cache.contains_key(name)
     }
 
@@ -600,12 +640,12 @@ impl PackageLibrary {
     /// Returns true when package metadata is currently cached, false otherwise.
     /// Takes a brief blocking read lock so contention is never interpreted as absence.
     pub fn is_cached_sync(&self, name: &str) -> bool {
-        self.packages.read().contains_key(name)
+        cache_read(&self.packages).contains_key(name)
     }
 
     /// Get the number of cached packages
     pub async fn cached_count(&self) -> usize {
-        let cache = self.packages.read();
+        let cache = cache_read(&self.packages);
         cache.len()
     }
 
@@ -658,7 +698,7 @@ impl PackageLibrary {
         // mutating it so the dependent lookup sees the previous
         // `depends`/`attached_packages` graph.
         let dependent_combined_keys: HashSet<String> = {
-            let cache = self.packages.read();
+            let cache = cache_read(&self.packages);
             // Worklist: start with the directly invalidated names, then
             // transitively find every cached package that depends on them.
             let mut frontier: HashSet<String> = names.clone();
@@ -728,7 +768,7 @@ impl PackageLibrary {
 
     /// Snapshot of the keys currently in the per-package cache.
     pub async fn cached_package_names(&self) -> HashSet<String> {
-        let cache = self.packages.read();
+        let cache = cache_read(&self.packages);
         cache.keys().cloned().collect()
     }
 
@@ -787,8 +827,8 @@ impl PackageLibrary {
 
         // Filter out packages we've already cached
         let uncached_packages: Vec<String> = {
-            let combined_cache = self.combined_entries.read();
-            let packages_cache = self.packages.read();
+            let combined_cache = cache_read(&self.combined_entries);
+            let packages_cache = cache_read(&self.packages);
             packages
                 .iter()
                 .filter(|p| !combined_cache.contains_key(*p) && !packages_cache.contains_key(*p))
@@ -961,7 +1001,7 @@ impl PackageLibrary {
         symbol: &str,
         loaded_packages: &[String],
     ) -> Option<String> {
-        let cache = self.packages.read();
+        let cache = cache_read(&self.packages);
         for pkg_name in loaded_packages {
             if let Some(info) = cache.get(pkg_name)
                 && info.exports.contains(symbol)
@@ -983,12 +1023,14 @@ impl PackageLibrary {
     ) -> Option<String> {
         // Check combined_entries cache first
         {
-            let cache = self.combined_entries.read();
-            for pkg_name in loaded_packages {
-                if let Some(entry) = cache.get(pkg_name)
-                    && entry.exports.contains(symbol)
-                {
-                    return Some(pkg_name.clone());
+            let cache = cache_read(&self.combined_entries);
+            if !cache.is_empty() {
+                for pkg_name in loaded_packages {
+                    if let Some(entry) = cache.get(pkg_name)
+                        && entry.exports.contains(symbol)
+                    {
+                        return Some(pkg_name.clone());
+                    }
                 }
             }
         }
@@ -1018,14 +1060,16 @@ impl PackageLibrary {
         // `tidyverse`). If the entry says the symbol is available but lacks an
         // owner, fail closed rather than falling back to aggregate attribution.
         {
-            let cache = self.combined_entries.read();
-            for pkg_name in loaded_packages {
-                if let Some(entry) = cache.get(pkg_name) {
-                    if let Some(owner) = entry.owners.get(symbol) {
-                        return Some(owner.clone());
-                    }
-                    if entry.exports.contains(symbol) {
-                        return None;
+            let cache = cache_read(&self.combined_entries);
+            if !cache.is_empty() {
+                for pkg_name in loaded_packages {
+                    if let Some(entry) = cache.get(pkg_name) {
+                        if let Some(owner) = entry.owners.get(symbol) {
+                            return Some(owner.clone());
+                        }
+                        if entry.exports.contains(symbol) {
+                            return None;
+                        }
                     }
                 }
             }
@@ -1675,7 +1719,7 @@ impl PackageLibrary {
     async fn warm_all_exports(&self, name: &str) -> Arc<HashSet<String>> {
         // Check cache first
         {
-            let cache = self.combined_entries.read();
+            let cache = cache_read(&self.combined_entries);
             if let Some(cached) = cache.get(name) {
                 log::trace!("Using cached combined exports for package '{}'", name);
                 return Arc::clone(&cached.exports);
