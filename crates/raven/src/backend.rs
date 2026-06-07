@@ -42,6 +42,7 @@ enum IndexCategory {
     /// Files referenced by backward directives (@lsp-run-by, @lsp-sourced-by)
     BackwardDirective,
 }
+const DIAGNOSTIC_FANOUT_CONCURRENCY: usize = 8;
 
 use crate::r_subprocess::is_valid_package_name;
 
@@ -527,6 +528,54 @@ fn parse_lint_enabled(raw: Option<&serde_json::Value>) -> crate::linting::LintEn
     }
 }
 
+async fn run_bounded_fanout<T, MakeFuture, FutureOutput>(
+    items: Vec<T>,
+    limit: usize,
+    make_future: MakeFuture,
+) where
+    T: Send + 'static,
+    MakeFuture: Fn(T) -> FutureOutput + Send + Sync + 'static,
+    FutureOutput: Future<Output = ()> + Send + 'static,
+{
+    if items.is_empty() {
+        return;
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(limit.max(1)));
+    let make_future = Arc::new(make_future);
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for item in items {
+        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        let make_future = Arc::clone(&make_future);
+        join_set.spawn(async move {
+            let _permit = permit;
+            make_future(item).await;
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        if let Err(err) = result {
+            log::trace!("bounded diagnostic fan-out task failed: {err}");
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
+    items: Vec<T>,
+    limit: usize,
+    make_future: MakeFuture,
+) where
+    T: Send + 'static,
+    MakeFuture: Fn(T) -> FutureOutput + Send + Sync + 'static,
+    FutureOutput: Future<Output = ()> + Send + 'static,
+{
+    run_bounded_fanout(items, limit, make_future).await;
+}
 /// Parse linting configuration from merged client + project settings.
 ///
 /// Reads the `linting` section and constructs a [`LintConfig`]. The
@@ -2660,20 +2709,18 @@ impl LanguageServer for Backend {
                 // Route through the same debounced pipeline the watcher consumer
                 // uses, so refresh runs in parallel (not serial) and cooperates
                 // with revalidation cancellation/freshness gates.
-                for uri in open_uris {
-                    let state_arc = Arc::clone(&self.state);
-                    let client = self.client.clone();
-                    let traversal_truncation = self.traversal_truncation.clone();
-                    tokio::spawn(async move {
-                        Backend::publish_diagnostics_via_arc(
-                            state_arc,
-                            client,
-                            &uri,
-                            Some(traversal_truncation),
-                        )
-                        .await;
-                    });
-                }
+                let state_arc = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let traversal_truncation = self.traversal_truncation.clone();
+                tokio::spawn(async move {
+                    Backend::publish_diagnostics_for_uris_bounded(
+                        state_arc,
+                        client,
+                        open_uris,
+                        Some(traversal_truncation),
+                    )
+                    .await;
+                });
                 Ok(Some(serde_json::json!({ "cleared": cleared })))
             }
             "raven.getHelpHtml" => {
@@ -5083,15 +5130,13 @@ impl LanguageServer for Backend {
                         .diagnostics_gate
                         .mark_force_republish_many(affected_for_async.iter());
                 }
-                for uri in affected_for_async {
-                    Backend::publish_diagnostics_via_arc(
-                        state_arc.clone(),
-                        client.clone(),
-                        &uri,
-                        Some(traversal_truncation.clone()),
-                    )
-                    .await;
-                }
+                Backend::publish_diagnostics_for_uris_bounded(
+                    state_arc.clone(),
+                    client.clone(),
+                    affected_for_async,
+                    Some(traversal_truncation.clone()),
+                )
+                .await;
             });
         } else {
             // DELETED-only path: the sync block already mutated the graph
@@ -6502,7 +6547,7 @@ impl Backend {
     }
 
     /// Free-standing variant of `publish_diagnostics` usable from background tasks.
-    /// Delegates to the same debounced pipeline.
+    /// Runs the same debounced pipeline to completion.
     async fn publish_diagnostics_via_arc(
         state_arc: Arc<RwLock<WorldState>>,
         client: Client,
@@ -6516,7 +6561,7 @@ impl Backend {
             let r = doc.map(|d| d.revision);
             (state.cross_file_config.revalidation_debounce_ms, v, r)
         };
-        tokio::spawn(run_debounced_diagnostics(
+        run_debounced_diagnostics(
             state_arc,
             client,
             uri.clone(),
@@ -6524,7 +6569,29 @@ impl Backend {
             trigger_version,
             trigger_revision,
             traversal_truncation,
-        ));
+        )
+        .await;
+    }
+
+    /// Publish diagnostics for an already-computed affected-URI set with bounded
+    /// parallelism. Each worker runs the normal debounced pipeline, which
+    /// rebuilds its own snapshot and commits through the monotonic gate.
+    async fn publish_diagnostics_for_uris_bounded(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        uris: Vec<Url>,
+        traversal_truncation: Option<Arc<TraversalTruncationState>>,
+    ) {
+        run_bounded_fanout(uris, DIAGNOSTIC_FANOUT_CONCURRENCY, move |uri| {
+            let state_arc = Arc::clone(&state_arc);
+            let client = client.clone();
+            let traversal_truncation = traversal_truncation.clone();
+            async move {
+                Backend::publish_diagnostics_via_arc(state_arc, client, &uri, traversal_truncation)
+                    .await;
+            }
+        })
+        .await;
     }
 
     async fn publish_diagnostics(&self, uri: &Url) {
@@ -6633,15 +6700,18 @@ impl Backend {
             affected
         };
 
-        for uri in affected_uris {
-            Backend::publish_diagnostics_via_arc(
-                self.state.clone(),
-                self.client.clone(),
-                &uri,
-                Some(self.traversal_truncation.clone()),
+        let state_arc = self.state.clone();
+        let client = self.client.clone();
+        let traversal_truncation = self.traversal_truncation.clone();
+        tokio::spawn(async move {
+            Backend::publish_diagnostics_for_uris_bounded(
+                state_arc,
+                client,
+                affected_uris,
+                Some(traversal_truncation),
             )
             .await;
-        }
+        });
     }
 }
 
@@ -7261,15 +7331,13 @@ async fn run_libpath_consumer(
                         .diagnostics_gate
                         .mark_force_republish_many(affected_uris.iter());
                 }
-
-                // Schedule diagnostics for each affected open URI.
-                for uri in affected_uris {
-                    let state_arc2 = Arc::clone(&state_arc);
-                    let client2 = client.clone();
-                    tokio::spawn(async move {
-                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri, None).await;
-                    });
-                }
+                Backend::publish_diagnostics_for_uris_bounded(
+                    Arc::clone(&state_arc),
+                    client.clone(),
+                    affected_uris,
+                    None,
+                )
+                .await;
             }
             LibpathEvent::Dropped => {
                 log::warn!(
@@ -7283,13 +7351,13 @@ async fn run_libpath_consumer(
                 state_arc.read().await.clear_help_caches();
 
                 let open_uris = prepare_dropped_recovery(&state_arc).await;
-                for uri in open_uris {
-                    let state_arc2 = Arc::clone(&state_arc);
-                    let client2 = client.clone();
-                    tokio::spawn(async move {
-                        Backend::publish_diagnostics_via_arc(state_arc2, client2, &uri, None).await;
-                    });
-                }
+                Backend::publish_diagnostics_for_uris_bounded(
+                    Arc::clone(&state_arc),
+                    client.clone(),
+                    open_uris,
+                    None,
+                )
+                .await;
 
                 // Attempt a one-shot recovery. The replacement consumer runs
                 // with `allow_recovery = false` so a persistent failure cannot
@@ -7318,6 +7386,65 @@ mod tests {
             assert_eq!(super::super::normalize_document_indent_unit(0), 1);
             assert_eq!(super::super::normalize_document_indent_unit(4), 4);
             assert_eq!(super::super::normalize_document_indent_unit(99), 8);
+        }
+    }
+
+    mod bounded_fanout {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        fn record_max(max_seen: &AtomicUsize, current: usize) {
+            let mut observed = max_seen.load(Ordering::Acquire);
+            while current > observed {
+                match max_seen.compare_exchange_weak(
+                    observed,
+                    current,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn run_bounded_fanout_runs_all_items_without_exceeding_limit() {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let limit = 3;
+            let items: Vec<usize> = (0..24).collect();
+
+            super::super::run_bounded_fanout(items, limit, {
+                let active = Arc::clone(&active);
+                let max_seen = Arc::clone(&max_seen);
+                let completed = Arc::clone(&completed);
+                move |_| {
+                    let active = Arc::clone(&active);
+                    let max_seen = Arc::clone(&max_seen);
+                    let completed = Arc::clone(&completed);
+                    async move {
+                        let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        record_max(&max_seen, now);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        completed.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            })
+            .await;
+
+            assert_eq!(completed.load(Ordering::Acquire), 24);
+            assert!(
+                max_seen.load(Ordering::Acquire) <= limit,
+                "bounded fan-out exceeded concurrency limit"
+            );
+            assert!(
+                max_seen.load(Ordering::Acquire) > 1,
+                "test should exercise actual parallelism"
+            );
         }
     }
 

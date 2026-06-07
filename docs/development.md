@@ -251,6 +251,8 @@ A diagnostics gate enforces monotonic publishing:
 
 See `crates/raven/src/cross_file/revalidation.rs`.
 
+Raven intentionally keeps `tower-lsp` at `.concurrency_level(1)` so text-sync notifications remain ordered. Do not use global LSP concurrency to speed up diagnostics. Dependency-triggered fan-out is localized in `crates/raven/src/backend.rs`: `publish_diagnostics_for_uris_bounded` runs the normal debounced diagnostic pipeline for an already-computed URI set with a small fixed concurrency limit (`DIAGNOSTIC_FANOUT_CONCURRENCY`). Each worker rebuilds its own snapshot and commits through the monotonic gate.
+
 ### Interactive request cancellation
 
 Raven keeps `tower-lsp` at `.concurrency_level(1)` to preserve ordered text sync, which means tower-lsp's built-in `$/cancelRequest` notification can be delayed behind the in-flight request it is supposed to cancel. `start_lsp()` wraps the `LspService` in `RequestCancellationService`, which intercepts `$/cancelRequest` synchronously in `Service::call` and records cancellations in a request-id keyed registry before tower-lsp queues the notification.
@@ -292,6 +294,8 @@ Key ideas:
 - If R is unavailable, fall back to `INDEX` parsing (best-effort)
 - When merging `Depends` with meta-package `attached_packages`, keep a companion `HashSet` for dedupe; repeated `Vec::contains()` checks make recursive export expansion quadratic.
 
+`PackageLibrary` owns two in-memory side caches: `packages` for direct per-package metadata and `combined_entries` for aggregate availability/ownership snapshots. Both are atomic read-copy snapshots (`arc_swap::ArcSwap<HashMap<...>>`) with a small writer mutex per map to serialize copy-on-write publication. Synchronous cache readers load an immutable snapshot and do normal `HashMap` lookups, so an in-progress writer publication is never semantic absence and cannot produce transient diagnostics. Writers clone the current map, mutate the clone, and publish a new `Arc<HashMap<...>>`; keep those publication sections small and never hold a writer mutex across `.await`, R subprocess calls, disk/provider reads, or recursive package expansion. Multi-map operations such as invalidation publish the two maps sequentially rather than nesting writer gates. Completion readers should clone only the relevant `Arc<PackageInfo>` / `Arc<CombinedEntry>` handles from snapshots before doing string iteration/dedupe.
+
 ### Availability vs. ownership: unified aggregate entries (#407)
 
 `combined_entries[pkg]` is the aggregate cache built by `get_all_exports` / `collect_exports_recursive`. Each `CombinedEntry` stores two projections from the same traversal:
@@ -301,7 +305,7 @@ Key ideas:
 The entry is published and invalidated as one immutable snapshot so a reader cannot observe aggregate availability without matching ownership. As recursion visits each contributor it records `owners.entry(symbol).or_insert(contributing_pkg)`. **First contributor wins**, and because the aggregate root is visited before its `depends`/`attached` members, the root owns its own exports while a member owns only symbols the root does not export itself. A symbol the root genuinely re-exports in its own namespace is attributed to the root — an accepted limitation, since names alone cannot tell a re-export from an original export.
 
 Lookups:
-- `find_package_owner_for_symbol(symbol, loaded_packages)` consults the unified entry (`try_read`). If a present aggregate entry says the symbol is available but lacks ownership, it fails closed instead of falling back to aggregate attribution. If no aggregate entry is warmed, it falls back only to direct per-package exports. Used by hover, the help panel, signature help, the parameter resolver, and the NSE callee resolver (`resolve_call_arg_policy` step 3.5, before the standard-eval fallback).
+- `find_package_owner_for_symbol(symbol, loaded_packages)` consults the unified entry through the snapshot cache contract above. If a present aggregate entry says the symbol is available but lacks ownership, it fails closed instead of falling back to aggregate attribution. If no aggregate entry is warmed, it falls back only to direct per-package exports. Used by hover, the help panel, signature help, the parameter resolver, and the NSE callee resolver (`resolve_call_arg_policy` step 3.5, before the standard-eval fallback).
 - `get_owned_exports_for_completions(loaded_packages)` mirrors `get_exports_for_completions` but attributes each symbol to its owner for completion detail / resolve `data.package`.
 - `is_symbol_from_loaded_packages` reads `exports` only — availability stays a pure yes/no check.
 
@@ -404,8 +408,8 @@ contaminated by Tier 2/3 guesses. Construction is split into
 
 ### Performance discipline (§12)
 
-The LSP hot path (diagnostic collection) reads the in-memory cache `try_read`-only
-and must not take a disk/page-fault stall. So:
+The LSP hot path (diagnostic collection) reads the in-memory package caches from
+already-published snapshots and must not take a disk/page-fault stall. So:
 
 - the Tier 3 index is **preloaded at open**; per-package payloads decode lazily
   from the mmap on first lookup;
@@ -418,7 +422,7 @@ and must not take a disk/page-fault stall. So:
   (decision #13) — ~10–20 ms once during library init, off the async runtime —
   catching truncation/corruption/tampering;
 - provider results feed the existing per-package cache, so steady-state lookups
-  are lock-free reads with no provider call.
+  stay in-memory and make no provider call.
 
 ### Tier 3 build pipeline
 
