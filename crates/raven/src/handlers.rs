@@ -11642,6 +11642,12 @@ fn collect_usages_with_analysis<'a>(
         if references_formal_from_default_expression(node, text) {
             return;
         }
+        // Magrittr dot pronoun: `.` on the RHS of `%>%` is the piped value,
+        // not a free variable. Walk up to find a binary_operator parent whose
+        // operator is `%>%` and whose RHS contains this node.
+        if node_text(node, text) == "." && is_inside_magrittr_rhs(node, text) {
+            return;
+        }
         // Pipeline-specific skip: an identifier following an ERROR node that
         // holds a right-assignment operator (`-> x` / `->> x` with no LHS
         // value), which the structural predicate cannot see in a broken tree.
@@ -11739,6 +11745,32 @@ fn call_is_pipe_fed(call_node: Node, text: &str) -> bool {
     parent.children(&mut cursor).any(|child| {
         child.kind() == "|>" || (child.kind() == "special" && node_text(child, text) == "%>%")
     })
+}
+
+/// True when `node` (an identifier `.`) is inside the RHS of a magrittr `%>%`
+/// pipe operator. In magrittr, `.` on the RHS is the pronoun for the piped
+/// value — it is always defined and should not be flagged as undefined.
+fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "binary_operator" {
+            // Check if the operator is %> % and `current` is on the RHS.
+            let is_rhs = parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| rhs.byte_range().contains(&current.start_byte()));
+            if is_rhs {
+                let mut cursor = parent.walk();
+                let has_magrittr = parent.children(&mut cursor).any(|child| {
+                    child.kind() == "special" && node_text(child, text) == "%>%"
+                });
+                if has_magrittr {
+                    return true;
+                }
+            }
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Visit a `subset` / `subset2` node: the indexed object is checked, and the
