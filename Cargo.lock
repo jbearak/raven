@@ -1617,6 +1617,7 @@ dependencies = [
  "lru",
  "memmap2",
  "notify",
+ "parking_lot",
  "percent-encoding",
  "postcard",
  "proptest",
