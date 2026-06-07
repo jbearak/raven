@@ -17684,6 +17684,43 @@ mod tests {
         );
     }
 
+    /// Magrittr dot pronoun (`.`) on RHS of `%>%` is never a free variable.
+    #[test]
+    fn magrittr_dot_pronoun_curly_brace_pipe() {
+        let code = "df %>% { .$x }";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot pronoun inside curly-brace pipe must be suppressed"
+        );
+    }
+
+    #[test]
+    fn magrittr_dot_pronoun_explicit_arg() {
+        let code = "df %>% nrow(.)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot pronoun as explicit argument must be suppressed"
+        );
+    }
+
+    #[test]
+    fn dot_without_pipe_is_still_flagged() {
+        let code = "x <- .$field";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "."),
+            "dot without pipe context must still be collected as a usage"
+        );
+    }
+
     /// A qualified capture helper (`rlang::enquo`) in a local body still marks
     /// the formal captured (Phase 2.5).
     #[test]
