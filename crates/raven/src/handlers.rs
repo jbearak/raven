@@ -5206,7 +5206,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 /// packages. Deliberately file-level rather than position-aware — the
 /// conservative "unresolved callee suppresses its arguments" fallback keeps the
 /// approximation safe.
-fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
+fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
     let mut packages: HashSet<String> = HashSet::new();
     let mut attached_packages_for_meta: HashSet<String> = HashSet::new();
     for call in &snapshot.directive_meta.library_calls {
@@ -5224,6 +5224,33 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
             attached_packages_for_meta.insert(package.clone());
         }
         packages.insert(package);
+    }
+    // Include packages loaded by ancestor files in the cross-file source chain.
+    // Without this, a child file inheriting `dplyr` from a parent would not get
+    // NSE suppression for verbs like `filter` that shadow base/stats exports.
+    {
+        let mut visited: HashSet<Url> = HashSet::new();
+        let mut queue: Vec<Url> = vec![uri.clone()];
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            for edge in snapshot.cross_file_graph.get_dependents(&current) {
+                if let Some(parent_meta) = snapshot.metadata_map.get(&edge.from) {
+                    for call in &parent_meta.library_calls {
+                        if call.package.is_empty() {
+                            continue;
+                        }
+                        let package = call.package.clone();
+                        if call.attaches {
+                            attached_packages_for_meta.insert(package.clone());
+                        }
+                        packages.insert(package);
+                    }
+                }
+                queue.push(edge.from.clone());
+            }
+        }
     }
     for pkg in snapshot.scope_contribution.full_imports.iter() {
         packages.insert(pkg.clone());
@@ -5287,7 +5314,7 @@ fn collect_undefined_variables_from_snapshot(
     // should be skipped) instead of blanket-suppressing every call-like
     // argument. Built once from the file's local definitions and the file/
     // workspace package context.
-    let in_play_packages = collect_in_play_packages(snapshot);
+    let in_play_packages = collect_in_play_packages(snapshot, uri);
     let nse_analysis = NseAnalysis::build(
         node,
         text,
