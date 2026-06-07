@@ -1136,10 +1136,10 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // Must be pushed before the function-scope tree is built below.
     push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
 
-    // Issues #404 / #406: model `foreach(...) %do%/%dopar% expr` iterator
-    // variables (including nested `%:%` compositions) as synthetic iterator
-    // scopes. Must be pushed before the function-scope tree is built below so
-    // scope-local definitions are tagged with this scope.
+    // Issues #404 / #406 / #410: model `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
+    // iterator variables (including nested `%:%` compositions) as synthetic
+    // iterator scopes. Must be pushed before the function-scope tree is built
+    // below so scope-local definitions are tagged with this scope.
     push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
 
     // Sort timeline by *effect* position so the resolver iterates events in
@@ -1374,10 +1374,10 @@ pub fn compute_artifacts_with_metadata(
     // Must be pushed before the function-scope tree is built below.
     push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
 
-    // Issues #404 / #406: model `foreach(...) %do%/%dopar% expr` iterator
-    // variables (including nested `%:%` compositions) as synthetic iterator
-    // scopes. Must be pushed before the function-scope tree is built below so
-    // scope-local definitions are tagged with this scope.
+    // Issues #404 / #406 / #410: model `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
+    // iterator variables (including nested `%:%` compositions) as synthetic
+    // iterator scopes. Must be pushed before the function-scope tree is built
+    // below so scope-local definitions are tagged with this scope.
     push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
 
     // Sort timeline by *effect* position so the resolver iterates events in
@@ -2175,9 +2175,9 @@ fn call_is_shiny_deferred(
     }
 }
 
-/// Issues #404 / #406: model `foreach(...) %do%/%dopar% expr` iterator variables
-/// — including nested `%:%` compositions with `when()` filters — as a synthetic
-/// iterator scope.
+/// Issues #404 / #406 / #410: model `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
+/// iterator variables — including nested `%:%` compositions with `when()`
+/// filters — as a synthetic iterator scope.
 ///
 /// The named, non-dot arguments of every `foreach(...)` call become parameters
 /// of a synthetic `FunctionScope`. This mirrors the useful part of a real
@@ -2205,9 +2205,10 @@ fn push_foreach_iterator_scopes(
     line_index: &LineIndex,
     uri: &Url,
 ) {
-    // Cheap pre-filter: `%do%` and `%dopar%` both start with `%do`, so one
-    // substring check covers both (and any future `%do`-family operator) without
-    // duplicating the exact token list that `recognize_foreach_execution` owns.
+    // Cheap pre-filter: every recognized execution operator (`%do%`, `%dopar%`,
+    // `%dorng%`, `%dofuture%`) starts with `%do`, so one substring check covers
+    // them all (and any future `%do`-family operator) without duplicating the
+    // exact token list that `recognize_foreach_execution` owns.
     if !content.contains("%do") {
         return;
     }
@@ -2310,8 +2311,9 @@ fn foreach_group_scope_event(
 
 /// Determine the node whose end position bounds the foreach loop body.
 ///
-/// `%do%`/`%dopar%` are `%any%` special operators, which bind *tighter* than
-/// `+ - * /` and the comparison operators. So an unbraced body like
+/// The foreach execution operators are `%any%` special operators, which bind
+/// *tighter* than `+ - * /` and the comparison operators. So an unbraced body
+/// like
 /// `foreach(...) %do% i + j` parses as `(foreach(...) %do% i) + j`: the trailing
 /// `+ j` is a *sibling* of the execution node, not part of its `rhs`. The user
 /// nonetheless means the whole post-operator expression as the body, so we
