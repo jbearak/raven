@@ -699,12 +699,12 @@ impl PackageLibrary {
                 combined.remove(&m);
                 invalidated_combined.insert(m);
             }
-        }
-        // Drop the owner map in lockstep. `combined_export_owners` is always
-        // written together with `combined_exports` (see `get_all_exports`), so
-        // they share the same keys and `invalidated_combined` is exactly the set
-        // of owner-map entries to drop.
-        {
+            // Drop the owner map in lockstep, while still holding the
+            // `combined_exports` write guard. `combined_export_owners` shares
+            // the same keys (see `get_all_exports`), so `invalidated_combined`
+            // is exactly the set of owner-map entries to drop. Holding both
+            // guards (order: combined -> owners) keeps the two caches consistent
+            // for readers across the removal, mirroring the publish path.
             let mut owner_cache = self.combined_export_owners.write().await;
             for k in &invalidated_combined {
                 owner_cache.remove(k);
@@ -726,11 +726,12 @@ impl PackageLibrary {
             let mut cache = self.packages.write().await;
             cache.clear();
         }
-        {
-            let mut combined = self.combined_exports.write().await;
-            combined.clear();
-        }
+        // Clear both aggregate caches under one critical section (order:
+        // combined -> owners), so a reader never sees one cleared without the
+        // other. Mirrors the publish/invalidate lock discipline.
+        let mut combined = self.combined_exports.write().await;
         let mut owner_cache = self.combined_export_owners.write().await;
+        combined.clear();
         owner_cache.clear();
     }
 
@@ -1655,21 +1656,27 @@ impl PackageLibrary {
         self.collect_exports_recursive(name, &mut visited, &mut all_exports, &mut owners)
             .await;
 
-        // Cache the result. The combined set and its owner map are written under
-        // separate locks but always together, so they stay consistent for
-        // readers (and are invalidated together; see `invalidate_many`).
+        // Publish the combined set and its owner map in a single critical
+        // section: the `combined_exports` write guard is held across the
+        // `combined_export_owners` insert, so a key is only ever *readable* in
+        // `combined_exports` once it is also present in the owner map. Without
+        // this, a reader could observe `combined_exports` populated for `name`
+        // while the owner map still lacks it, making `find_package_owner_for_symbol`
+        // fall back to `find_package_for_symbol` and return the aggregate key
+        // (e.g. `tidyverse`) instead of the true owner (`dplyr`). The lock order
+        // is always `combined_exports` -> `combined_export_owners` (here and in
+        // `invalidate_many` / `clear_cache`) to avoid deadlock; readers use
+        // `try_read`, so they can never be part of a lock cycle.
         {
             let mut cache = self.combined_exports.write().await;
+            let mut owner_cache = self.combined_export_owners.write().await;
             cache.insert(name.to_string(), Arc::new(all_exports.clone()));
+            owner_cache.insert(name.to_string(), Arc::new(owners));
             log::trace!(
                 "Cached {} combined exports for package '{}'",
                 all_exports.len(),
                 name
             );
-        }
-        {
-            let mut owner_cache = self.combined_export_owners.write().await;
-            owner_cache.insert(name.to_string(), Arc::new(owners));
         }
 
         if all_exports.is_empty() {
