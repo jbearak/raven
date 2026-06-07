@@ -75,9 +75,9 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: target/criterion
-          key: criterion-baseline-${{ runner.os }}-main-${{ github.run_id }}
+          key: criterion-main-baseline-v2-${{ runner.os }}-main-${{ github.run_id }}
           restore-keys: |
-            criterion-baseline-${{ runner.os }}-
+            criterion-main-baseline-v2-${{ runner.os }}-main-
 
       - name: Install critcmp
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -108,7 +108,7 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: target/criterion
-          key: criterion-baseline-${{ runner.os }}-main-${{ github.run_id }}
+          key: criterion-main-baseline-v2-${{ runner.os }}-main-${{ github.run_id }}
 
       - name: Report cache status
         if: always()
