@@ -11490,6 +11490,20 @@ fn resolve_call_arg_policy(
     if let Some(policy) = crate::nse::base_policy(name) {
         return policy;
     }
+    // 3.5. Owner-preserving NSE resolution (issue #407). Step 2 only sees the
+    //      packages literally in play (plus hardcoded meta expansion). When a
+    //      callee is made visible through a non-hardcoded aggregate (a package
+    //      that `Depends` on / attaches dplyr, etc.), resolve the *true owner*
+    //      of the symbol and consult that owner's NSE policy before falling
+    //      through to the standard-eval classification below. This keeps a
+    //      data-masked column suppressed when the resolved owner (e.g. dplyr)
+    //      has a policy, rather than wrongly checking it as a standard-eval arg.
+    if let Some(lib) = analysis.package_library
+        && let Some(owner) = lib.find_package_owner_for_symbol(name, &analysis.in_play_packages)
+        && let Some(policy) = crate::nse::package_policy(&owner, name)
+    {
+        return policy;
+    }
     // 4. Resolvable standard-eval: builtin, base export, or a confirmed in-play
     //    package export -> check arguments.
     if is_builtin(name)
@@ -13181,9 +13195,14 @@ pub fn completion(
         // Add package exports (after local definitions, before cross-file symbols)
         // Requirement 9.4: Local definitions > package exports > cross-file symbols
         // Requirement 9.3: When multiple packages export same symbol, show all with attribution
+        //
+        // Attribute each export to its true owner (issue #407): under
+        // `library(tidyverse)`, `mutate` is detailed/resolved as `{dplyr}` so
+        // the resolve handler opens dplyr's help topic, not the empty
+        // `help("mutate", package = "tidyverse")`.
         let package_exports = state
             .package_library
-            .get_exports_for_completions(&all_packages);
+            .get_owned_exports_for_completions(&all_packages);
         for (export_name, package_names) in package_exports {
             if seen_names.contains(&export_name) {
                 continue; // Local definitions take precedence
@@ -14626,7 +14645,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 
         if let Some(pkg_name) = state
             .package_library
-            .find_package_for_symbol(name, &all_packages)
+            .find_package_owner_for_symbol(name, &all_packages)
         {
             let mut value = String::new();
 
@@ -15256,7 +15275,7 @@ pub fn prepare_signature_help(
 
         if let Some(pkg_name) = state
             .package_library
-            .find_package_for_symbol(func_name, &all_packages)
+            .find_package_owner_for_symbol(func_name, &all_packages)
         {
             SignatureResolution::Package {
                 help_cache: state.help_cache.clone(),
@@ -17440,6 +17459,108 @@ mod tests {
         collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
         assert!(was_collected(&used, "df"));
         assert!(!was_collected(&used, "col"));
+    }
+
+    /// Issue #407: a NON-hardcoded aggregate `myagg` that `Depends` on dplyr
+    /// makes `mutate` visible. NSE classification must resolve the true owner
+    /// (dplyr) and apply dplyr's policy, suppressing the data-masked column
+    /// instead of falling through to standard-eval.
+    #[tokio::test]
+    async fn nse_owner_resolved_aggregate_suppresses_masked_column() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        // myagg is NOT a known meta-package; it merely Depends on dplyr.
+        lib.insert_package(PackageInfo::with_details(
+            "myagg".to_string(),
+            HashSet::new(),
+            vec!["dplyr".to_string()],
+            Vec::new(),
+        ))
+        .await;
+        lib.get_all_exports("myagg").await;
+
+        let code = "mutate(df, new = masked_col + 1)";
+        let tree = parse_r_code(code);
+        let in_play = vec!["myagg".to_string()];
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            in_play,
+            Some(&lib),
+            None,
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+
+        assert!(
+            !was_collected(&used, "masked_col"),
+            "data-masked column should be suppressed via owner-resolved dplyr policy"
+        );
+        // Positive control: the `.data` argument is still checked.
+        assert!(was_collected(&used, "df"));
+    }
+
+    /// Issue #407: a standard-eval function visible only transitively through an
+    /// aggregate stays standard-eval (the owner has no NSE policy), so its
+    /// argument is still checked.
+    #[tokio::test]
+    async fn nse_owner_resolved_standard_eval_still_checks_args() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use std::collections::HashSet;
+
+        let lib = PackageLibrary::new_empty();
+        let mut helper_exports = HashSet::new();
+        helper_exports.insert("some_std_fn".to_string());
+        lib.insert_package(PackageInfo::new("helperpkg".to_string(), helper_exports))
+            .await;
+        lib.insert_package(PackageInfo::with_details(
+            "myagg2".to_string(),
+            HashSet::new(),
+            vec!["helperpkg".to_string()],
+            Vec::new(),
+        ))
+        .await;
+        lib.get_all_exports("myagg2").await;
+
+        let code = "some_std_fn(typo)";
+        let tree = parse_r_code(code);
+        let in_play = vec!["myagg2".to_string()];
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            in_play,
+            Some(&lib),
+            None,
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+
+        assert!(
+            was_collected(&used, "typo"),
+            "a standard-eval transitive export should still check its argument"
+        );
     }
 
     /// An unresolved callee suppresses its arguments while flagging the callee:

@@ -214,6 +214,18 @@ pub struct PackageLibrary {
     /// Combined exports cache (package name -> all exports including Depends/attached)
     /// Populated by get_all_exports for efficient repeated lookups
     combined_exports: RwLock<HashMap<String, Arc<HashSet<String>>>>,
+    /// Owner map cache (aggregate package name -> { symbol -> true owner package }).
+    ///
+    /// Built in lockstep with `combined_exports` by `get_all_exports`. Where
+    /// `combined_exports` answers "is this symbol visible through package X?",
+    /// this answers "which package actually contributed it?" — the documentation
+    /// and NSE-policy owner. For `library(tidyverse)`, `combined_exports`
+    /// aggregates `mutate` under the `tidyverse` key while this map records
+    /// `mutate -> dplyr`. First contributor in the depends-then-attached,
+    /// cycle-guarded traversal wins (the aggregate root is visited first, so it
+    /// owns its own exports). Must be invalidated whenever `combined_exports` is
+    /// (see `invalidate_many` / `clear_cache`). See issue #407.
+    combined_export_owners: RwLock<HashMap<String, Arc<HashMap<String, String>>>>,
     /// Base packages (always available)
     base_packages: HashSet<String>,
     /// Base package exports (combined from all base packages).
@@ -243,6 +255,7 @@ impl PackageLibrary {
             lib_paths: Vec::new(),
             packages: RwLock::new(HashMap::new()),
             combined_exports: RwLock::new(HashMap::new()),
+            combined_export_owners: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess: None,
@@ -263,6 +276,7 @@ impl PackageLibrary {
             lib_paths: Vec::new(),
             packages: RwLock::new(HashMap::new()),
             combined_exports: RwLock::new(HashMap::new()),
+            combined_export_owners: RwLock::new(HashMap::new()),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess,
@@ -391,6 +405,76 @@ impl PackageLibrary {
                         .entry(export.clone())
                         .or_default()
                         .push(pkg_name.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Like [`get_exports_for_completions`], but attributes each symbol to its
+    /// true **owner** package rather than the loaded/aggregate package that made
+    /// it visible. For `library(tidyverse)`, `mutate` is attributed to `dplyr`
+    /// (the documentation owner) so completion detail (`{dplyr}`) and the
+    /// resolve `data.package` open the correct help topic. See issue #407.
+    ///
+    /// Synchronous and cached-only (`try_read`). Falls back to the loaded
+    /// package when the owner map is not yet warmed, preserving the previous
+    /// attribution. Owners are de-duplicated per symbol (two loaded aggregates
+    /// can resolve to the same owner).
+    pub fn get_owned_exports_for_completions(
+        &self,
+        loaded_packages: &[String],
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        let mut result: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
+        let owner_cache = self.combined_export_owners.try_read().ok();
+        let combined_cache = self.combined_exports.try_read().ok();
+        let packages_cache = self.packages.try_read().ok();
+
+        if owner_cache.is_none() && combined_cache.is_none() && packages_cache.is_none() {
+            log::trace!(
+                "Could not acquire any package cache lock for owned completions, returning empty"
+            );
+            return result;
+        }
+
+        let mut push_unique = |symbol: &str, owner: &str| {
+            let owners = result.entry(symbol.to_string()).or_default();
+            if !owners.iter().any(|o| o == owner) {
+                owners.push(owner.to_string());
+            }
+        };
+
+        for pkg_name in loaded_packages {
+            // Prefer the owner map: it covers exactly the symbols in the
+            // combined set and attributes each to its true contributor.
+            if let Some(ref cache) = owner_cache
+                && let Some(owners) = cache.get(pkg_name)
+            {
+                for (symbol, owner) in owners.iter() {
+                    push_unique(symbol, owner);
+                }
+                continue;
+            }
+
+            // Fall back to the combined set, attributing to the loaded package.
+            if let Some(ref cache) = combined_cache
+                && let Some(exports) = cache.get(pkg_name)
+            {
+                for export in exports.iter() {
+                    push_unique(export, pkg_name);
+                }
+                continue;
+            }
+
+            // Last resort: per-package exports, attributing to the loaded package.
+            if let Some(ref cache) = packages_cache
+                && let Some(info) = cache.get(pkg_name)
+            {
+                for export in &info.exports {
+                    push_unique(export, pkg_name);
                 }
             }
         }
@@ -616,6 +700,16 @@ impl PackageLibrary {
                 invalidated_combined.insert(m);
             }
         }
+        // Drop the owner map in lockstep. `combined_export_owners` is always
+        // written together with `combined_exports` (see `get_all_exports`), so
+        // they share the same keys and `invalidated_combined` is exactly the set
+        // of owner-map entries to drop.
+        {
+            let mut owner_cache = self.combined_export_owners.write().await;
+            for k in &invalidated_combined {
+                owner_cache.remove(k);
+            }
+        }
         invalidated_combined
     }
 
@@ -625,14 +719,19 @@ impl PackageLibrary {
         cache.keys().cloned().collect()
     }
 
-    /// Clear all cached packages, including aggregated `combined_exports` entries.
+    /// Clear all cached packages, including aggregated `combined_exports` and
+    /// `combined_export_owners` entries.
     pub async fn clear_cache(&self) {
         {
             let mut cache = self.packages.write().await;
             cache.clear();
         }
-        let mut combined = self.combined_exports.write().await;
-        combined.clear();
+        {
+            let mut combined = self.combined_exports.write().await;
+            combined.clear();
+        }
+        let mut owner_cache = self.combined_export_owners.write().await;
+        owner_cache.clear();
     }
 
     /// Load pattern packages via the INDEX + explicit-exports fallback and
@@ -875,6 +974,41 @@ impl PackageLibrary {
         }
 
         None
+    }
+
+    /// Find the true owner package of a symbol made visible by `loaded_packages`
+    /// (synchronous, cached-only).
+    ///
+    /// Distinct from [`find_package_for_symbol`], which answers "which loaded
+    /// package made this visible?" and returns the aggregate key (e.g.
+    /// `tidyverse`). This answers "which package actually contributed the
+    /// symbol?" — the documentation / NSE-policy owner (e.g. `dplyr`) — by
+    /// consulting the per-aggregate `combined_export_owners` map. Falls back to
+    /// [`find_package_for_symbol`] when no owner map entry exists (cache not yet
+    /// warmed), preserving the previous behavior. See issue #407.
+    pub fn find_package_owner_for_symbol(
+        &self,
+        symbol: &str,
+        loaded_packages: &[String],
+    ) -> Option<String> {
+        // Consult the per-aggregate owner map first. For each loaded package,
+        // if the cached owner map for that aggregate records this symbol, the
+        // recorded value is the true contributor (e.g. `dplyr` for a `mutate`
+        // made visible through `tidyverse`).
+        if let Ok(owner_cache) = self.combined_export_owners.try_read() {
+            for pkg_name in loaded_packages {
+                if let Some(owners) = owner_cache.get(pkg_name)
+                    && let Some(owner) = owners.get(symbol)
+                {
+                    return Some(owner.clone());
+                }
+            }
+        }
+
+        // Fall back to availability-based attribution when the owner map has no
+        // entry (combined cache not yet warmed). This preserves the previous
+        // behavior of returning the loaded package that made the symbol visible.
+        self.find_package_for_symbol(symbol, loaded_packages)
     }
 
     /// Set the library paths
@@ -1511,13 +1645,19 @@ impl PackageLibrary {
             }
         }
 
-        // Compute exports
+        // Compute exports + owner attribution. `owners` records, for each
+        // symbol, the package that actually contributed it (the documentation /
+        // NSE-policy owner) so consumers can distinguish ownership from mere
+        // availability through an aggregate. See issue #407.
         let mut visited = HashSet::new();
         let mut all_exports = HashSet::new();
-        self.collect_exports_recursive(name, &mut visited, &mut all_exports)
+        let mut owners: HashMap<String, String> = HashMap::new();
+        self.collect_exports_recursive(name, &mut visited, &mut all_exports, &mut owners)
             .await;
 
-        // Cache the result
+        // Cache the result. The combined set and its owner map are written under
+        // separate locks but always together, so they stay consistent for
+        // readers (and are invalidated together; see `invalidate_many`).
         {
             let mut cache = self.combined_exports.write().await;
             cache.insert(name.to_string(), Arc::new(all_exports.clone()));
@@ -1526,6 +1666,10 @@ impl PackageLibrary {
                 all_exports.len(),
                 name
             );
+        }
+        {
+            let mut owner_cache = self.combined_export_owners.write().await;
+            owner_cache.insert(name.to_string(), Arc::new(owners));
         }
 
         if all_exports.is_empty() {
@@ -1548,11 +1692,16 @@ impl PackageLibrary {
     /// * `name` - The package name to load
     /// * `visited` - Set of already-visited package names (for cycle detection)
     /// * `all_exports` - Accumulator for all collected exports
+    /// * `owners` - Accumulator mapping each symbol to its contributing package.
+    ///   First contributor wins: because the aggregate root is visited before
+    ///   its `depends`/`attached` members, the root owns its own exports and a
+    ///   member only owns symbols the root does not export itself (issue #407).
     async fn collect_exports_recursive(
         &self,
         name: &str,
         visited: &mut HashSet<String>,
         all_exports: &mut HashSet<String>,
+        owners: &mut HashMap<String, String>,
     ) {
         // Check if we've already visited this package (circular dependency detection)
         if visited.contains(name) {
@@ -1584,6 +1733,19 @@ impl PackageLibrary {
         all_exports.extend(package_info.exports.iter().cloned());
         all_exports.extend(package_info.lazy_data.iter().cloned());
 
+        // Record owner attribution. `or_insert_with` makes the first contributor
+        // win, so the aggregate root (visited first) owns symbols it exports
+        // itself, while members own only the symbols the root does not.
+        for symbol in package_info
+            .exports
+            .iter()
+            .chain(package_info.lazy_data.iter())
+        {
+            owners
+                .entry(symbol.clone())
+                .or_insert_with(|| name.to_string());
+        }
+
         log::trace!(
             "Added {} exports + {} datasets from package '{}' (total: {})",
             package_info.exports.len(),
@@ -1614,7 +1776,7 @@ impl PackageLibrary {
         // Recursively process all dependency packages
         // Use Box::pin for recursive async calls
         for dep_name in packages_to_process {
-            Box::pin(self.collect_exports_recursive(&dep_name, visited, all_exports)).await;
+            Box::pin(self.collect_exports_recursive(&dep_name, visited, all_exports, owners)).await;
         }
     }
 }
@@ -3413,6 +3575,202 @@ mod tests {
         assert!(
             all_exports.contains("diamonds"),
             "dataset from an attached meta-package member should resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owner_for_meta_attached_export_is_member() {
+        // library(tidyverse); mutate -> documentation / NSE owner is dplyr, not
+        // tidyverse. tidyverse makes `mutate` visible only by attaching dplyr;
+        // its own namespace does not export the verb (issue #407).
+        let lib = PackageLibrary::new_empty();
+
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        // tidyverse is a meta-package that attaches dplyr.
+        lib.insert_package(PackageInfo::new("tidyverse".to_string(), HashSet::new()))
+            .await;
+
+        // Warm the combined caches the way the diagnostic prefetch does.
+        lib.get_all_exports("tidyverse").await;
+
+        let loaded = vec!["tidyverse".to_string()];
+        // Availability is unchanged: the symbol is still visible.
+        assert!(lib.is_symbol_from_loaded_packages("mutate", &loaded));
+        // But ownership resolves to the true contributor.
+        assert_eq!(
+            lib.find_package_owner_for_symbol("mutate", &loaded),
+            Some("dplyr".to_string()),
+            "owner of mutate under library(tidyverse) should be dplyr"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owner_for_direct_package_is_the_package() {
+        // library(dplyr); mutate -> owner is dplyr (root owns its own export).
+        let lib = PackageLibrary::new_empty();
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        lib.get_all_exports("dplyr").await;
+
+        let loaded = vec!["dplyr".to_string()];
+        assert_eq!(
+            lib.find_package_owner_for_symbol("mutate", &loaded),
+            Some("dplyr".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owner_root_export_wins_over_dependency() {
+        // A Depends on B, and BOTH export `foo`. A genuine root export wins over
+        // a dependency that also happens to export the name (it is not a
+        // re-export). The aggregate root is visited first, so it owns `foo`.
+        let lib = PackageLibrary::new_empty();
+
+        let mut b_exports = HashSet::new();
+        b_exports.insert("foo".to_string());
+        b_exports.insert("only_b".to_string());
+        lib.insert_package(PackageInfo::new("pkgB".to_string(), b_exports))
+            .await;
+
+        let mut a_exports = HashSet::new();
+        a_exports.insert("foo".to_string());
+        lib.insert_package(PackageInfo::with_details(
+            "pkgA".to_string(),
+            a_exports,
+            vec!["pkgB".to_string()],
+            Vec::new(),
+        ))
+        .await;
+
+        lib.get_all_exports("pkgA").await;
+
+        let loaded = vec!["pkgA".to_string()];
+        assert_eq!(
+            lib.find_package_owner_for_symbol("foo", &loaded),
+            Some("pkgA".to_string()),
+            "a genuine root export should be owned by the root"
+        );
+        // A symbol that only the dependency exports is owned by the dependency.
+        assert_eq!(
+            lib.find_package_owner_for_symbol("only_b", &loaded),
+            Some("pkgB".to_string()),
+            "a dependency-only export should be owned by the dependency"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owner_falls_back_when_owner_map_absent() {
+        // When the owner map has no entry (combined cache never warmed), the
+        // lookup falls back to the per-package availability semantics of
+        // find_package_for_symbol.
+        let lib = PackageLibrary::new_empty();
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        // Note: no get_all_exports() call, so combined_export_owners is empty.
+        let loaded = vec!["dplyr".to_string()];
+        assert_eq!(
+            lib.find_package_owner_for_symbol("mutate", &loaded),
+            Some("dplyr".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owned_exports_for_completions_attributes_owner() {
+        // Completion attribution must use the true owner: under library(tidyverse)
+        // the `mutate` completion is detailed/resolved as {dplyr}, not {tidyverse}.
+        let lib = PackageLibrary::new_empty();
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        lib.insert_package(PackageInfo::new("tidyverse".to_string(), HashSet::new()))
+            .await;
+        lib.get_all_exports("tidyverse").await;
+
+        let owned = lib.get_owned_exports_for_completions(&["tidyverse".to_string()]);
+        assert_eq!(
+            owned.get("mutate"),
+            Some(&vec!["dplyr".to_string()]),
+            "completion owner of mutate under tidyverse should be dplyr"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owned_exports_for_completions_falls_back_to_loaded_package() {
+        // When the owner map is not warmed, attribution falls back to the loaded
+        // package (existing get_exports_for_completions behavior).
+        let lib = PackageLibrary::new_empty();
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        // No get_all_exports(): owner map empty, per-package cache present.
+        let owned = lib.get_owned_exports_for_completions(&["dplyr".to_string()]);
+        assert_eq!(owned.get("mutate"), Some(&vec!["dplyr".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_clear_cache_drops_owner_map() {
+        // clear_cache() must drop combined_export_owners in lockstep with
+        // combined_exports, or a stale owner map could outlive its aggregate.
+        let lib = PackageLibrary::new_empty();
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        lib.get_all_exports("dplyr").await;
+        assert!(
+            lib.combined_export_owners
+                .read()
+                .await
+                .contains_key("dplyr")
+        );
+
+        lib.clear_cache().await;
+
+        assert!(
+            lib.combined_export_owners.read().await.is_empty(),
+            "clear_cache must also clear the owner map"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_many_drops_owner_map_for_dependent_aggregate() {
+        // Invalidating an attached member (dplyr) must drop the cached owner map
+        // for the meta-package aggregate (tidyverse) that rolled it up, exactly
+        // as it drops the combined_exports aggregate.
+        let lib = PackageLibrary::new_empty();
+        let mut dplyr_exports = HashSet::new();
+        dplyr_exports.insert("mutate".to_string());
+        lib.insert_package(PackageInfo::new("dplyr".to_string(), dplyr_exports))
+            .await;
+        lib.insert_package(PackageInfo::new("tidyverse".to_string(), HashSet::new()))
+            .await;
+        lib.get_all_exports("tidyverse").await;
+        assert!(
+            lib.combined_export_owners
+                .read()
+                .await
+                .contains_key("tidyverse")
+        );
+
+        let mut names = HashSet::new();
+        names.insert("dplyr".to_string());
+        lib.invalidate_many(&names).await;
+
+        assert!(
+            !lib.combined_export_owners
+                .read()
+                .await
+                .contains_key("tidyverse"),
+            "invalidating dplyr must drop the tidyverse owner map in lockstep"
         );
     }
 

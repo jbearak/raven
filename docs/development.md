@@ -282,6 +282,17 @@ Key ideas:
 - If R is unavailable, fall back to `INDEX` parsing (best-effort)
 - When merging `Depends` with meta-package `attached_packages`, keep a companion `HashSet` for dedupe; repeated `Vec::contains()` checks make recursive export expansion quadratic.
 
+### Availability vs. ownership: the owner map (#407)
+
+`combined_exports[pkg]` answers *availability* ("is this symbol visible through `pkg`?") and is the flat aggregate used to suppress undefined-variable diagnostics. It deliberately loses the contributing package, so it cannot answer *ownership* ("which package owns the help topic / NSE policy?"). For `library(tidyverse)` it aggregates `mutate` under the `tidyverse` key even though `dplyr` owns it.
+
+A sibling cache `combined_export_owners[aggregate] -> { symbol -> owner_pkg }` is built in lockstep by `get_all_exports` / `collect_exports_recursive`: as the recursion visits each contributor it records `owners.entry(symbol).or_insert(contributing_pkg)`. **First contributor wins**, and because the aggregate root is visited before its `depends`/`attached` members, the root owns its own exports while a member owns only symbols the root does not export itself. A symbol the root genuinely re-exports in its own namespace is attributed to the root — an accepted limitation, since names alone cannot tell a re-export from an original export. The two caches share identical keys and are always written and invalidated together (`invalidate_many`, `clear_cache`).
+
+Lookups:
+- `find_package_owner_for_symbol(symbol, loaded_packages)` consults the owner map (`try_read`) and falls back to `find_package_for_symbol` when the map is not yet warmed. Used by hover, the help panel, signature help, the parameter resolver, and the NSE callee resolver (`resolve_call_arg_policy` step 3.5, before the standard-eval fallback).
+- `get_owned_exports_for_completions(loaded_packages)` mirrors `get_exports_for_completions` but attributes each symbol to its owner for completion detail / resolve `data.package`.
+- `is_symbol_from_loaded_packages` is unchanged — availability stays a pure yes/no check.
+
 All R subprocess calls must:
 - validate user-controlled inputs (package names, paths)
 - use timeouts to avoid hangs
