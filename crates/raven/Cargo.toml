@@ -91,6 +91,10 @@ required-features = ["test-support"]
 name = "edit_to_publish"
 harness = false
 required-features = ["test-support"]
+[[bench]]
+name = "package_cache_and_fanout"
+harness = false
+required-features = ["test-support"]
 
 [[example]]
 name = "profile_diagnostics"

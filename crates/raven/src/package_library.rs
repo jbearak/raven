@@ -616,6 +616,14 @@ impl PackageLibrary {
         let mut cache = self.packages.write();
         cache.insert(info.name.clone(), Arc::new(info));
     }
+    /// Test-support hook for benchmarks that need deterministic package-cache
+    /// write contention. Kept behind `test-support` so production code cannot
+    /// hold the cache lock through arbitrary work.
+    #[cfg(feature = "test-support")]
+    pub fn with_packages_write_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.packages.write();
+        f()
+    }
 
     /// Invalidate cache for a package
     ///

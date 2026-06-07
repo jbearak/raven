@@ -564,6 +564,18 @@ async fn run_bounded_fanout<T, MakeFuture, FutureOutput>(
     }
 }
 
+#[cfg(feature = "test-support")]
+pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
+    items: Vec<T>,
+    limit: usize,
+    make_future: MakeFuture,
+) where
+    T: Send + 'static,
+    MakeFuture: Fn(T) -> FutureOutput + Send + Sync + 'static,
+    FutureOutput: Future<Output = ()> + Send + 'static,
+{
+    run_bounded_fanout(items, limit, make_future).await;
+}
 /// Parse linting configuration from merged client + project settings.
 ///
 /// Reads the `linting` section and constructs a [`LintConfig`]. The
