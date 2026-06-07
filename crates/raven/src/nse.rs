@@ -872,6 +872,8 @@ fn tidyr_policy(name: &str) -> Option<ArgPolicy> {
     Some(policy)
 }
 
+const BIOC_TIDY_OMICS_META_MEMBERS: &[&str] = &["dplyr", "tidyr", "ggplot2"];
+
 /// Core member packages of a known meta-package, or an empty slice. A file that
 /// only does `library(tidyverse)` should still resolve `filter` / `mutate` to
 /// the member package's NSE policy, so the resolver treats the meta-package as
@@ -891,6 +893,11 @@ pub(crate) fn meta_package_members(name: &str) -> &'static [&'static str] {
             "lubridate",
         ],
         "tidymodels" => &["dplyr", "tidyr", "ggplot2", "purrr", "rlang", "recipes"],
+        // Bioconductor tidy-omics packages attach dplyr/tidyr generics and add
+        // object-specific S3 methods. Route bare verbs to the generic owner's
+        // policy; the packages do not export qualified `pkg::filter` verbs.
+        "plyranges" => &["dplyr"],
+        "tidySummarizedExperiment" | "tidySingleCellExperiment" => BIOC_TIDY_OMICS_META_MEMBERS,
         _ => &[],
     }
 }
@@ -1253,7 +1260,33 @@ mod tests {
         // recipes carries NSE policies, so it must be a tidymodels member for a
         // bare `step_*` to resolve under `library(tidymodels)` alone.
         assert!(meta_package_members("tidymodels").contains(&"recipes"));
+        // Bioconductor tidy-omics packages attach dplyr/tidyr generics whose S3
+        // methods provide the object-specific data masks. The packages do not
+        // export `pkg::filter` / `pkg::pivot_longer`; only bare calls should route
+        // to the attached generic's NSE policy.
+        assert_eq!(meta_package_members("plyranges"), &["dplyr"]);
+        for package in ["tidySummarizedExperiment", "tidySingleCellExperiment"] {
+            assert_eq!(meta_package_members(package), BIOC_TIDY_OMICS_META_MEMBERS);
+        }
+        assert!(meta_package_members("tidybulk").is_empty());
         assert!(meta_package_members("dplyr").is_empty());
+    }
+
+    #[test]
+    fn bioc_tidy_omics_qualified_verbs_are_not_policy_aliases() {
+        // Current Bioconductor releases attach dplyr/tidyr generics and register
+        // S3 methods; they do not export qualified `pkg::filter` /
+        // `pkg::pivot_longer` aliases. Keep those namespace-qualified spellings
+        // standard-eval instead of inventing package-local policies.
+        for (package, function) in [
+            ("plyranges", "filter"),
+            ("tidySummarizedExperiment", "filter"),
+            ("tidySingleCellExperiment", "mutate"),
+            ("tidySummarizedExperiment", "pivot_longer"),
+            ("tidybulk", "filter"),
+        ] {
+            assert_eq!(package_policy(package, function), None);
+        }
     }
 
     #[test]
