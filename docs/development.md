@@ -82,6 +82,14 @@ All benchmarks except `startup` require `--features test-support`. Set `RAVEN_BE
 - `cargo bench --bench libpath_capture --features test-support`
 - `cargo bench --bench edit_to_publish --features test-support`
 
+The `Performance` GitHub Actions workflow uses the `startup` benchmark for PR
+comparison comments. Criterion's `main` baseline is cached from push-to-`main`
+runs only; PR runs restore that cache and save their results as a local `pr`
+baseline, but must not write the `target/criterion` cache. Allowing PRs to
+save the cache can create branch-scoped entries that contain only `pr`, which
+then shadow the default-branch cache and make future PRs report "No `main`
+baseline found".
+
 ## Profiling startup
 
 Python scripts under `scripts/` measure LSP startup latency:
