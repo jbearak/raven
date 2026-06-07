@@ -1,15 +1,17 @@
 //! Syntax-based recognition of `foreach(...) %do% expr` and
-//! `foreach(...) %dopar% expr` execution expressions (issue #404), including
-//! nested compositions joined by the `%:%` operator and `when(...)` filters
-//! (issue #406).
+//! `foreach(...) %dopar% expr` execution expressions (issue #404) — and the
+//! drop-in operators other packages register to drive `foreach(...)`: doRNG's
+//! `%dorng%` and doFuture's `%dofuture%` (issue #410) — including nested
+//! compositions joined by the `%:%` operator and `when(...)` filters (issue
+//! #406).
 //!
 //! `foreach` is not a language construct: it parses as a `call` to `foreach`
-//! whose result is fed to the special infix operator `%do%`/`%dopar%`. The
-//! iterator variables are the *named* arguments of the `foreach(...)` call
-//! (`foreach(i = 1:10)`), and they must be visible only inside the executed
-//! right-hand-side expression.
+//! whose result is fed to a special infix execution operator (`%do%`, `%dopar%`,
+//! `%dorng%`, or `%dofuture%`). The iterator variables are the *named* arguments
+//! of the `foreach(...)` call (`foreach(i = 1:10)`), and they must be visible
+//! only inside the executed right-hand-side expression.
 //!
-//! The left side of `%do%`/`%dopar%` may also be a *composition*: a `%:%` chain
+//! The left side of the execution operator may also be a *composition*: a `%:%` chain
 //! of `foreach(...)` calls and `when(...)` filters
 //! (`foreach(i = 1:3) %:% when(i %% 2 == 0) %:% foreach(j = 1:3) %do% i + j`).
 //! Every foreach call in the chain contributes iterators. Binding is
@@ -32,7 +34,8 @@
 
 use tree_sitter::Node;
 
-/// A recognized `foreach(...) %do%/%dopar% rhs` execution expression.
+/// A recognized `foreach(...) %do%/%dopar%/%dorng%/%dofuture% rhs` execution
+/// expression.
 pub struct ForeachExecution<'tree> {
     /// One group per `foreach(...)` call in the composition, in left-to-right
     /// source order. A simple `foreach(...) %do% body` has exactly one group;
@@ -64,8 +67,10 @@ pub struct ForeachIteratorGroup<'tree> {
 
 /// Recognize whether `node` is a foreach execution expression.
 ///
-/// Returns the per-call iterator groups when `node` is a `binary_operator` with
-/// operator text `%do%` or `%dopar%` whose left side is a foreach *composition*:
+/// Returns the per-call iterator groups when `node` is a `binary_operator` whose
+/// operator is one of the foreach execution operators — `%do%`, `%dopar%`,
+/// `%dorng%` (doRNG), or `%dofuture%` (doFuture) — and whose left side is a
+/// foreach *composition*:
 ///
 /// - a single call to bare `foreach(...)` or namespace-qualified
 ///   `foreach::foreach(...)` / `foreach:::foreach(...)` (issue #404);
@@ -83,11 +88,12 @@ pub fn recognize_foreach_execution<'tree>(
         return None;
     }
 
-    // The infix operator token has kind `special`; its *text* distinguishes
-    // `%do%`/`%dopar%` from every other `%...%` operator, so match on the text.
+    // The infix operator token has kind `special`; its *text* distinguishes the
+    // foreach execution operators (enumerated in the `matches!` below) from every
+    // other `%...%` operator, so match on the text.
     let operator = node.child_by_field_name("operator")?;
     let op_text = &text[operator.byte_range()];
-    if op_text != "%do%" && op_text != "%dopar%" {
+    if !matches!(op_text, "%do%" | "%dopar%" | "%dorng%" | "%dofuture%") {
         return None;
     }
 
@@ -258,6 +264,27 @@ mod tests {
         let tree = parse(code);
         let binop = first_binary_operator(tree.root_node()).unwrap();
         let exec = recognize_foreach_execution(binop, code).expect("should recognize %dopar%");
+        assert_eq!(iterator_names(&exec, code), vec!["i"]);
+    }
+
+    #[test]
+    fn recognizes_dorng() {
+        // doRNG's `%dorng%` drives foreach the same way `%dopar%` does
+        // (reproducible parallel RNG); issue #410.
+        let code = "foreach(i = 1:10) %dorng% sqrt(i)";
+        let tree = parse(code);
+        let binop = first_binary_operator(tree.root_node()).unwrap();
+        let exec = recognize_foreach_execution(binop, code).expect("should recognize %dorng%");
+        assert_eq!(iterator_names(&exec, code), vec!["i"]);
+    }
+
+    #[test]
+    fn recognizes_dofuture() {
+        // doFuture's `%dofuture%` drives foreach via a future plan; issue #410.
+        let code = "foreach(i = 1:10) %dofuture% sqrt(i)";
+        let tree = parse(code);
+        let binop = first_binary_operator(tree.root_node()).unwrap();
+        let exec = recognize_foreach_execution(binop, code).expect("should recognize %dofuture%");
         assert_eq!(iterator_names(&exec, code), vec!["i"]);
     }
 

@@ -46322,15 +46322,18 @@ mod function_parameter_tests {
             .collect()
     }
 
-    // Issue #404: `foreach(...) %do%/%dopar% expr` iterator scope.
+    // Issues #404 / #410: `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
+    // iterator scope.
     //
-    // `foreach()` and `%do%`/`%dopar%` live in the foreach package. The unit
-    // test package DB is empty, so each test defines `foreach` locally. This is
-    // faithful on two counts: #404 intentionally treats a user-defined
-    // `foreach` as the real one, and it makes `foreach` a *resolvable* callee so
-    // its argument values are NSE-checked — raven conservatively skips the
-    // arguments of unknown callees, exactly as it would if `foreach` were not in
-    // scope. A real user reaches the same state via `library(foreach)`.
+    // `foreach()`, `%do%`, and `%dopar%` live in the foreach package; doRNG's
+    // `%dorng%` and doFuture's `%dofuture%` are recognized purely by operator
+    // text, so they need nothing defined. The unit test package DB is
+    // empty, so each test defines `foreach` locally. This is faithful on two
+    // counts: #404 intentionally treats a user-defined `foreach` as the real one,
+    // and it makes `foreach` a *resolvable* callee so its argument values are
+    // NSE-checked — raven conservatively skips the arguments of unknown callees,
+    // exactly as it would if `foreach` were not in scope. A real user reaches the
+    // same state via `library(foreach)`.
     const FOREACH_PREAMBLE: &str = "foreach <- function(...) NULL\n";
 
     fn foreach_undefined_names(body: &str) -> Vec<String> {
@@ -46346,6 +46349,20 @@ mod function_parameter_tests {
     #[test]
     fn foreach_dopar_braced_body_iterator_not_flagged() {
         let names = foreach_undefined_names("foreach(i = 1:10) %dopar% { print(i) }");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_dorng_braced_body_iterator_not_flagged() {
+        // doRNG's `%dorng%` is recognized like `%dopar%` (issue #410).
+        let names = foreach_undefined_names("foreach(i = 1:10) %dorng% { print(i) }");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_dofuture_braced_body_iterator_not_flagged() {
+        // doFuture's `%dofuture%` is recognized like `%dopar%` (issue #410).
+        let names = foreach_undefined_names("foreach(i = 1:10) %dofuture% { print(i) }");
         assert!(!names.contains(&"i".to_string()), "got: {names:?}");
     }
 
@@ -46456,6 +46473,25 @@ mod function_parameter_tests {
     fn foreach_dopar_composition_iterators_not_flagged() {
         let names =
             foreach_compose_undefined_names("foreach(i = 1:3) %:% foreach(j = 1:3) %dopar% i + j");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_dorng_composition_iterators_not_flagged() {
+        // `%dorng%` drives `%:%` compositions like `%dopar%` (issue #410).
+        let names =
+            foreach_compose_undefined_names("foreach(i = 1:3) %:% foreach(j = 1:3) %dorng% i + j");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_dofuture_composition_iterators_not_flagged() {
+        // `%dofuture%` drives `%:%` compositions like `%dopar%` (issue #410).
+        let names = foreach_compose_undefined_names(
+            "foreach(i = 1:3) %:% foreach(j = 1:3) %dofuture% i + j",
+        );
         assert!(!names.contains(&"i".to_string()), "got: {names:?}");
         assert!(!names.contains(&"j".to_string()), "got: {names:?}");
     }
