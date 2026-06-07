@@ -68,9 +68,11 @@ jobs:
         run: sccache --zero-stats
 
       # Criterion baselines are stored under target/criterion/.
-      # We cache them so PR runs can compare against the main baseline.
+      # PR runs restore the main-branch baseline but must not save their
+      # branch-local `pr` baseline, or future PR runs can shadow the default
+      # branch cache with a cache that contains no `main` baseline.
       - name: Restore Criterion baseline cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: target/criterion
           key: criterion-baseline-${{ runner.os }}-main-${{ github.run_id }}
@@ -100,6 +102,13 @@ jobs:
       - name: Run benchmarks (PR — compare against main)
         if: github.event_name == 'pull_request'
         run: cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
+
+      - name: Save Criterion baseline cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ runner.os }}-main-${{ github.run_id }}
 
       - name: Report cache status
         if: always()
