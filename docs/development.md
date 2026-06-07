@@ -282,6 +282,19 @@ Key ideas:
 - If R is unavailable, fall back to `INDEX` parsing (best-effort)
 - When merging `Depends` with meta-package `attached_packages`, keep a companion `HashSet` for dedupe; repeated `Vec::contains()` checks make recursive export expansion quadratic.
 
+### Availability vs. ownership: unified aggregate entries (#407)
+
+`combined_entries[pkg]` is the aggregate cache built by `get_all_exports` / `collect_exports_recursive`. Each `CombinedEntry` stores two projections from the same traversal:
+- `exports`: *availability* — "is this symbol visible through `pkg`?" This flat aggregate suppresses undefined-variable diagnostics.
+- `owners`: *ownership* — "which package owns the help topic / NSE policy?" For `library(tidyverse)`, `exports` contains `mutate` under the `tidyverse` key while `owners` records `mutate -> dplyr`.
+
+The entry is published and invalidated as one immutable snapshot so a reader cannot observe aggregate availability without matching ownership. As recursion visits each contributor it records `owners.entry(symbol).or_insert(contributing_pkg)`. **First contributor wins**, and because the aggregate root is visited before its `depends`/`attached` members, the root owns its own exports while a member owns only symbols the root does not export itself. A symbol the root genuinely re-exports in its own namespace is attributed to the root — an accepted limitation, since names alone cannot tell a re-export from an original export.
+
+Lookups:
+- `find_package_owner_for_symbol(symbol, loaded_packages)` consults the unified entry (`try_read`). If a present aggregate entry says the symbol is available but lacks ownership, it fails closed instead of falling back to aggregate attribution. If no aggregate entry is warmed, it falls back only to direct per-package exports. Used by hover, the help panel, signature help, the parameter resolver, and the NSE callee resolver (`resolve_call_arg_policy` step 3.5, before the standard-eval fallback).
+- `get_owned_exports_for_completions(loaded_packages)` mirrors `get_exports_for_completions` but attributes each symbol to its owner for completion detail / resolve `data.package`.
+- `is_symbol_from_loaded_packages` reads `exports` only — availability stays a pure yes/no check.
+
 All R subprocess calls must:
 - validate user-controlled inputs (package names, paths)
 - use timeouts to avoid hangs

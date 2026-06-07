@@ -281,11 +281,14 @@ pub fn resolve(
     let resolved_package = if let Some(ns) = namespace {
         Some(ns.to_string())
     } else {
-        // Use find_package_for_symbol to determine which package exports this function
+        // Resolve the true owner package (issue #407) so formals come from the
+        // package that actually defines the function (e.g. `dplyr` for a
+        // `mutate` made visible through `library(tidyverse)`), not the
+        // aggregate that merely made it visible.
         let pkg_list: Vec<String> = all_packages.to_vec();
         state
             .package_library
-            .find_package_for_symbol(function_name, &pkg_list)
+            .find_package_owner_for_symbol(function_name, &pkg_list)
     };
 
     if let Some(ref pkg_name) = resolved_package {

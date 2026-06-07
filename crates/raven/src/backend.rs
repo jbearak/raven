@@ -7139,8 +7139,8 @@ async fn run_libpath_consumer(
                 // re-fetch from R rather than returning stale HTML or text help.
                 state_arc.read().await.clear_help_caches();
 
-                // Invalidate the package cache and learn which combined_exports
-                // aggregates were dropped as a side effect. A document loading
+                // Invalidate the package cache and learn which combined
+                // aggregate entries were dropped as a side effect. A document loading
                 // a meta-package like `tidyverse` needs revalidation when
                 // `dplyr` changes — `tidyverse` is not in `affected` but its
                 // aggregate was invalidated, so it's in `invalidated_combined`.
