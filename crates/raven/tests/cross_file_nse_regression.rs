@@ -147,3 +147,33 @@ fn cross_file_genuine_undefined_still_flagged() {
         "genuine undefined must still be flagged. Output:\n{output}"
     );
 }
+
+/// Native pipe placeholder `_` in `df |> lm(data = _)` must not be flagged.
+#[test]
+fn native_pipe_placeholder_not_flagged() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("test.R"),
+        "df <- data.frame(x = 1:10, y = 11:20)\nresult <- df |> lm(y ~ x, data = _)\n",
+    )
+    .unwrap();
+
+    let output = run_check(dir.path());
+    assert!(
+        !output.contains("Undefined variable: _"),
+        "_ placeholder in native pipe must not be flagged. Output:\n{output}"
+    );
+}
+
+/// Bare `_` outside a pipe IS still flagged.
+#[test]
+fn underscore_without_pipe_still_flagged() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("test.R"), "x <- _\n").unwrap();
+
+    let output = run_check(dir.path());
+    assert!(
+        output.contains("Undefined variable: _"),
+        "bare _ without pipe context must still be flagged. Output:\n{output}"
+    );
+}

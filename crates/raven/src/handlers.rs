@@ -11648,6 +11648,11 @@ fn collect_usages_with_analysis<'a>(
         if node_text(node, text) == "." && is_inside_magrittr_rhs(node, text) {
             return;
         }
+        // Native pipe placeholder: `_` on the RHS of `|>` (R 4.2+) is the
+        // placeholder for the piped value, not a free variable.
+        if node_text(node, text) == "_" && is_inside_native_pipe_rhs(node, text) {
+            return;
+        }
         // Pipeline-specific skip: an identifier following an ERROR node that
         // holds a right-assignment operator (`-> x` / `->> x` with no LHS
         // value), which the structural predicate cannot see in a broken tree.
@@ -11764,6 +11769,31 @@ fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
                     child.kind() == "special" && node_text(child, text) == "%>%"
                 });
                 if has_magrittr {
+                    return true;
+                }
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+/// True when `node` (an identifier `_`) is inside the RHS of a native `|>`
+/// pipe operator. In R 4.2+, `_` on the RHS is the placeholder for the piped
+/// value — it is always defined and should not be flagged as undefined.
+fn is_inside_native_pipe_rhs(node: Node, text: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "binary_operator" {
+            let is_rhs = parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| rhs.byte_range().contains(&current.start_byte()));
+            if is_rhs {
+                let mut cursor = parent.walk();
+                let has_native_pipe = parent
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "|>");
+                if has_native_pipe {
                     return true;
                 }
             }
@@ -17718,6 +17748,31 @@ mod tests {
         assert!(
             was_collected(&used, "."),
             "dot without pipe context must still be collected as a usage"
+        );
+    }
+
+    /// Native pipe placeholder `_` on RHS of `|>` is never a free variable.
+    #[test]
+    fn native_pipe_placeholder_in_named_arg() {
+        let code = "df |> lm(y ~ x, data = _)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "_"),
+            "_ placeholder in native pipe named arg must be suppressed"
+        );
+    }
+
+    #[test]
+    fn native_pipe_placeholder_without_pipe_still_flagged() {
+        let code = "x <- _";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "_"),
+            "_ without pipe context must still be collected as a usage"
         );
     }
 
