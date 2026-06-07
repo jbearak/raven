@@ -11871,7 +11871,16 @@ fn apply_arg_policy<'a>(
         .iter()
         .map(|a| a.child_by_field_name("name").map(|n| node_text(n, text)))
         .collect();
-    let mask = crate::nse::suppressed_arguments(policy, &labels, pipe_fed);
+    let mut mask = crate::nse::suppressed_arguments(policy, &labels, pipe_fed);
+    // Universal suppression: any argument named `subset` is data-masked by
+    // convention across virtually all R modeling functions (lm, glm, svyglm,
+    // survival::coxph, etc.). Suppress it regardless of whether the callee has
+    // an explicit NSE policy.
+    for (i, label) in labels.iter().enumerate() {
+        if matches!(label, Some("subset")) {
+            mask[i] = true;
+        }
+    }
     for (arg, suppress) in arg_nodes.iter().zip(mask) {
         let arg_context = UsageContext {
             in_formula: context.in_formula,
@@ -17793,6 +17802,22 @@ mod tests {
         assert!(
             was_collected(&used, "_"),
             "_ without pipe context must still be collected as a usage"
+        );
+    }
+
+    /// Any argument named `subset` is universally suppressed (data-masked by
+    /// convention across R modeling functions).
+    #[test]
+    fn subset_arg_universally_suppressed() {
+        // Use lm (a known base function) but imagine it didn't have an explicit
+        // subset policy — the universal override still suppresses it.
+        let code = "unknown_model(y ~ x, subset = at_risk == 1, data = df)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(
+            !was_collected(&used, "at_risk"),
+            "subset arg contents must be suppressed regardless of callee"
         );
     }
 
