@@ -121,7 +121,7 @@ jobs:
         if: github.event_name == 'pull_request'
         id: critcmp
         run: |
-          if ! critcmp --list 2>/dev/null | grep -q '^main$'; then
+          if ! critcmp --baselines 2>/dev/null | grep -q '^main$'; then
             echo "No main baseline found — skipping comparison."
             echo "has_diff=false" >> "$GITHUB_OUTPUT"
             echo "no_baseline=true" >> "$GITHUB_OUTPUT"
