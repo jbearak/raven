@@ -88,7 +88,9 @@ runs only; PR runs restore that cache and save their results as a local `pr`
 baseline, but must not write the `target/criterion` cache. Allowing PRs to
 save the cache can create branch-scoped entries that contain only `pr`, which
 then shadow the default-branch cache and make future PRs report "No `main`
-baseline found".
+baseline found". The PR comparison guard must use `critcmp --baselines` to
+detect saved baseline names; `critcmp --list` formats comparison output and
+does not prove that a restored `main` baseline exists.
 
 ## Profiling startup
 

@@ -45,4 +45,10 @@ describe("perf workflow criterion baseline cache", () => {
     const baselineStep = stepNamed("Restore Criterion baseline cache");
     expect(baselineStep).not.toContain("uses: actions/cache@");
   });
+
+  test("PR comparison checks critcmp baseline names with the baseline listing command", () => {
+    const compare = stepNamed("Compare benchmarks against main baseline");
+    expect(compare).toContain("critcmp --baselines");
+    expect(compare).not.toContain("critcmp --list");
+  });
 });
