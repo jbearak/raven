@@ -21,6 +21,7 @@ name = "raven"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap = "1"
 ammonia = "4"
 blake3 = "1"
 bson = "2"

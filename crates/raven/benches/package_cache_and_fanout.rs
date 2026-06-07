@@ -13,7 +13,7 @@ use raven::package_library::{PackageInfo, PackageLibrary};
 use std::collections::HashSet;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
 
 const PACKAGE_COUNT: usize = 24;
@@ -67,34 +67,53 @@ fn seeded_package_library(
 struct HoldRequest {
     duration: Duration,
     acquired: mpsc::Sender<()>,
+    released: mpsc::Sender<()>,
 }
 
-struct PackageWriteContention {
+struct HoldLease {
+    released: mpsc::Receiver<()>,
+}
+
+impl HoldLease {
+    fn wait(self) {
+        self.released
+            .recv()
+            .expect("publication gate worker should release the hold");
+    }
+}
+
+struct PackagePublishGate {
     requests: mpsc::Sender<HoldRequest>,
 }
-
-impl PackageWriteContention {
+impl PackagePublishGate {
     fn start(lib: Arc<PackageLibrary>) -> Self {
         let (requests, receiver) = mpsc::channel::<HoldRequest>();
         let _ = thread::spawn(move || {
             while let Ok(request) = receiver.recv() {
-                lib.with_packages_write_lock_for_test(|| {
+                lib.with_packages_publish_gate_for_test(|| {
                     let _ = request.acquired.send(());
                     thread::sleep(request.duration);
                 });
+                let _ = request.released.send(());
             }
         });
         Self { requests }
     }
 
-    fn hold_for(&self, duration: Duration) {
+    fn hold_for(&self, duration: Duration) -> HoldLease {
         let (acquired, ready) = mpsc::channel();
+        let (released, done) = mpsc::channel();
         self.requests
-            .send(HoldRequest { duration, acquired })
+            .send(HoldRequest {
+                duration,
+                acquired,
+                released,
+            })
             .expect("contention worker should be alive");
         ready
             .recv()
             .expect("contention worker should acquire the write lock");
+        HoldLease { released: done }
     }
 }
 
@@ -152,29 +171,35 @@ fn bench_package_cache(c: &mut Criterion) {
         })
     });
 
-    // Measures time-to-correct-answer while an unrelated writer holds the same
-    // package-cache write lock. On the pre-refactor try_read implementation, a
-    // single read during this window returned a false cache miss; this benchmark
-    // loops until the correct hit is observed so both main and PR can be compared
-    // without failing the benchmark. The attempt count is black-boxed: old code
-    // spins/yields through repeated false misses, while the refactored reader
-    // blocks once and returns the correct hit when the writer releases the lock.
-    let contention = PackageWriteContention::start(Arc::clone(&lib));
-    group.bench_function("contention/time_to_correct_symbol_read", |b| {
-        b.iter(|| {
-            contention.hold_for(Duration::from_micros(100));
-            let mut attempts = 0usize;
-            loop {
-                attempts += 1;
-                if lib.is_symbol_from_loaded_packages(
-                    black_box(&target_symbol),
-                    black_box(&loaded_packages),
-                ) {
-                    break;
+    // Measures time-to-correct-answer while a package-cache publication is in
+    // progress. On the old try_read/RwLock implementation, a read during this
+    // window returned a false cache miss; on the snapshot implementation,
+    // readers keep using the last published map and should answer immediately.
+    // The attempt count is black-boxed so both implementations can be compared
+    // without failing the benchmark.
+    let publication_gate = PackagePublishGate::start(Arc::clone(&lib));
+    group.bench_function("publication_gate/time_to_correct_symbol_read", |b| {
+        b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iters {
+                let lease = publication_gate.hold_for(Duration::from_micros(100));
+                let start = Instant::now();
+                let mut attempts = 0usize;
+                loop {
+                    attempts += 1;
+                    if lib.is_symbol_from_loaded_packages(
+                        black_box(&target_symbol),
+                        black_box(&loaded_packages),
+                    ) {
+                        break;
+                    }
+                    thread::yield_now();
                 }
-                thread::yield_now();
+                elapsed += start.elapsed();
+                black_box(attempts);
+                lease.wait();
             }
-            black_box(attempts);
+            elapsed
         })
     });
 
