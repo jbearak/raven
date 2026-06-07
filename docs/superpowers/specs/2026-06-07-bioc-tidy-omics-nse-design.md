@@ -7,7 +7,7 @@ Issue: #403
 
 Survey the tidy-omics / grammar-of-genomics Bioconductor packages named in #403 and add NSE policy-table entries only for behavior verified against installed R packages. The target packages are `plyranges`, `tidybulk`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`.
 
-The change should reduce undefined-variable false positives for dplyr/tidyr-style data-masking over Bioconductor objects, especially examples like `plyranges::filter(gr, start > 100 & seqnames == "chr1")`, without suppressing evaluated arguments that should still report real undefined-variable bugs.
+The change should reduce undefined-variable false positives for dplyr/tidyr-style data-masking over Bioconductor objects, especially attached-generic examples like `library(plyranges); filter(gr, start > 100 & seqnames == "chr1")`, without suppressing evaluated arguments that should still report real undefined-variable bugs.
 
 ## Non-Goals
 

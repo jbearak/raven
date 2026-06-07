@@ -5208,6 +5208,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 /// approximation safe.
 fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
     let mut packages: HashSet<String> = HashSet::new();
+    let mut attached_packages_for_meta: HashSet<String> = HashSet::new();
     for call in &snapshot.directive_meta.library_calls {
         // Note: `loadNamespace` calls are intentionally included here. Unlike a
         // bare *function* call (e.g. Shiny's `reactive`/`render*`, which require
@@ -5216,6 +5217,9 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
         // `[.data.table`), which a merely-loaded namespace already enables.
         if !call.package.is_empty() {
             packages.insert(call.package.clone());
+            if call.attaches {
+                attached_packages_for_meta.insert(call.package.clone());
+            }
         }
     }
     for pkg in snapshot.scope_contribution.full_imports.iter() {
@@ -5229,11 +5233,16 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
     }
     for pkg in snapshot.scope_contribution.test_attached_packages.iter() {
         packages.insert(pkg.clone());
+        attached_packages_for_meta.insert(pkg.clone());
     }
-    // Expand known meta-packages (e.g. `library(tidyverse)`) to their members so
-    // a bare verb still resolves to the member package's NSE policy.
+    // Expand known meta/attacher packages (e.g. `library(tidyverse)`) to their
+    // members so a bare verb still resolves to the member package's NSE policy.
+    // This must be limited to true attach contexts: `loadNamespace("pkg")`
+    // enables namespace/object-dispatch surfaces for `pkg`, but it does not put
+    // member exports such as `dplyr::filter` on the bare search path.
     let members: Vec<String> = packages
         .iter()
+        .filter(|p| attached_packages_for_meta.contains(*p))
         .flat_map(|p| crate::nse::meta_package_members(p))
         .map(|m| m.to_string())
         .collect();
@@ -47970,6 +47979,35 @@ my_func <- function(a = default_value) {
                 "positive control should be flagged for {code:?}; got {messages:?}"
             );
         }
+    }
+
+    #[test]
+    fn nse_bioc_tidy_omics_attach_expands_generics_but_load_namespace_does_not() {
+        let attach_messages = collect_undefined_messages(
+            "library(plyranges)\ndf <- data.frame(x = 1)\nfilter(df, masked_col)\nreally_undefined_xyz",
+        );
+        assert!(
+            !attach_messages.iter().any(|m| m.contains("masked_col")),
+            "library(plyranges) should route bare filter to dplyr's data-mask policy; \
+             got {attach_messages:?}"
+        );
+        assert!(
+            attach_messages
+                .iter()
+                .any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged for library(plyranges); got {attach_messages:?}"
+        );
+
+        let load_namespace_messages = collect_undefined_messages(
+            "loadNamespace(\"plyranges\")\ndf <- data.frame(x = 1)\nfilter(df, masked_col)",
+        );
+        assert!(
+            load_namespace_messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: masked_col")),
+            "loadNamespace(plyranges) must not attach dplyr's data-mask policy; \
+             got {load_namespace_messages:?}"
+        );
     }
 
     /// Run the undefined-variable collector end-to-end and return the published

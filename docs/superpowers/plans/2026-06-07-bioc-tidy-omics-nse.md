@@ -122,43 +122,44 @@ Stop: any package install/load/probe failure under the full selected scope.
 
 - [ ] **Step 1: Add representative failing tests before policy code**
 
-Add tests near the existing sweep tests in `mod tests` after `tier3_data_masker_additions()`:
+Add tests near `meta_packages_expand_to_members()` and the end-to-end NSE tests:
 
 ```rust
     #[test]
-    fn bioc_plyranges_verbs_mask_range_accessors_and_metadata() {
-        // filter(gr, start > 100, .preserve = flag): x checked, predicate
-        // suppressed, control checked. `start`/`seqnames` are GRanges accessors
-        // in plyranges' data mask.
-        let p = package_policy("plyranges", "filter").unwrap();
-        let mask = suppressed_arguments(&p, &labels(&[None, None, Some(".preserve")]), false);
-        assert_eq!(mask, vec![false, true, false]);
-
-        // mutate(gr, end2 = end + score): x checked, mutation expression suppressed.
-        let p = package_policy("plyranges", "mutate").unwrap();
-        let mask = suppressed_arguments(&p, &labels(&[None, Some("end2")]), false);
-        assert_eq!(mask, vec![false, true]);
-
-        // select(gr, score): x checked, selected metadata/range columns suppressed.
-        let p = package_policy("plyranges", "select").unwrap();
-        let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
-        assert_eq!(mask, vec![false, true]);
+    fn meta_packages_expand_to_members() {
+        assert_eq!(meta_package_members("plyranges"), &["dplyr"]);
+        assert_eq!(
+            meta_package_members("tidySummarizedExperiment"),
+            &["dplyr", "tidyr", "ggplot2"]
+        );
+        assert_eq!(
+            meta_package_members("tidySingleCellExperiment"),
+            &["dplyr", "tidyr", "ggplot2"]
+        );
+        assert!(meta_package_members("tidybulk").is_empty());
     }
 
     #[test]
-    fn bioc_tidy_omics_reexported_verbs_share_existing_policies() {
-        assert_eq!(
-            package_policy("tidySummarizedExperiment", "filter"),
-            package_policy("dplyr", "filter")
+    fn bioc_tidy_omics_qualified_verbs_are_not_policy_aliases() {
+        assert_eq!(package_policy("plyranges", "filter"), None);
+        assert_eq!(package_policy("tidySummarizedExperiment", "filter"), None);
+        assert_eq!(package_policy("tidySingleCellExperiment", "mutate"), None);
+        assert_eq!(package_policy("tidybulk", "filter"), None);
+    }
+
+    #[test]
+    fn nse_bioc_tidy_omics_attach_expands_generics_but_load_namespace_does_not() {
+        let attach_messages = collect_undefined_messages(
+            "library(plyranges)\ndf <- data.frame(x = 1)\nfilter(df, masked_col)\nreally_undefined_xyz",
         );
-        assert_eq!(
-            package_policy("tidySingleCellExperiment", "mutate"),
-            package_policy("dplyr", "mutate")
+        assert!(!attach_messages.iter().any(|m| m.contains("masked_col")));
+
+        let load_namespace_messages = collect_undefined_messages(
+            "loadNamespace(\"plyranges\")\ndf <- data.frame(x = 1)\nfilter(df, masked_col)",
         );
-        assert_eq!(
-            package_policy("tidybulk", "pivot_longer"),
-            package_policy("tidyr", "pivot_longer")
-        );
+        assert!(load_namespace_messages
+            .iter()
+            .any(|m| m.contains("Undefined variable: masked_col")));
     }
 ```
 
@@ -166,67 +167,42 @@ If Task 1 shows different verified policies, adjust this exact test content to m
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test -p raven nse::tests::bioc_ -- --nocapture`
+Run: `cargo test -p raven nse::tests::meta_packages_expand_to_members -- --nocapture`
 
-Expected: FAIL because `package_policy` has no Bioconductor arms yet.
+Expected: FAIL because `meta_package_members` has no Bioconductor attached-generic entries yet.
 
-## Task 3: Implement Verified Policies
+## Task 3: Implement Verified Attached-Generic Routing
 
 **Files:**
 - Modify: `crates/raven/src/nse.rs`
 
-- [ ] **Step 1: Wire package arms**
+- [ ] **Step 1: Add meta-package members**
 
-In `package_policy`, add arms for packages that Task 1 verified. If all full-scope packages are verified as expected, add:
+In `meta_package_members`, add only packages that Task 1 verified as attaching dplyr/tidyr generics:
 
 ```rust
-        "plyranges" => plyranges_policy(name)?,
-        "tidybulk" => tidy_omics_policy(name)?,
-        "tidySummarizedExperiment" => tidy_omics_policy(name)?,
-        "tidySingleCellExperiment" => tidy_omics_policy(name)?,
+        "plyranges" => &["dplyr"],
+        "tidySummarizedExperiment" | "tidySingleCellExperiment" => &["dplyr", "tidyr", "ggplot2"],
 ```
 
-- [ ] **Step 2: Add helper functions**
+- [ ] **Step 2: Gate meta expansion on attach semantics**
 
-Add helper functions near `dplyr_policy` only for verified behavior. Start from this shape and edit to match Task 1 evidence:
+In `collect_in_play_packages`, keep raw package names from `loadNamespace()` in play for namespace/object-dispatch surfaces, but expand `meta_package_members` only for `LibraryCall { attaches: true, .. }` and `test_attached_packages`:
 
 ```rust
-/// NSE policy for Bioconductor's grammar-of-genomics verbs. Verified against
-/// installed Bioconductor packages for issue #403.
-fn plyranges_policy(name: &str) -> Option<ArgPolicy> {
-    let policy = match name {
-        "filter" | "slice" => {
-            ArgPolicy::per_formal(&[".data", "...", ".by", ".preserve"], &[".by"], true)
-        }
-        "mutate" => ArgPolicy::per_formal(
-            &[".data", "...", ".by", ".keep", ".before", ".after"],
-            &[".by", ".before", ".after"],
-            true,
-        ),
-        "transmute" | "select" | "rename" | "distinct" => {
-            ArgPolicy::per_formal(&[".data", "..."], &[], true)
-        }
-        "summarise" | "summarize" => {
-            ArgPolicy::per_formal(&[".data", "...", ".by", ".groups"], &[".by"], true)
-        }
-        "arrange" => ArgPolicy::per_formal(&[".data", "...", ".by_group"], &[], true),
-        "group_by" => ArgPolicy::per_formal(&[".data", "...", ".add", ".drop"], &[], true),
-        _ => return None,
-    };
-    Some(policy)
-}
-
-/// NSE policy for tidy-omics packages that re-export dplyr/tidyr verbs with the
-/// same argument semantics. Verified against installed Bioconductor packages for
-/// issue #403.
-fn tidy_omics_policy(name: &str) -> Option<ArgPolicy> {
-    dplyr_policy(name).or_else(|| tidyr_policy(name))
-}
+let mut attached_packages_for_meta: HashSet<String> = HashSet::new();
+// Insert into attached_packages_for_meta only when call.attaches is true.
+let members: Vec<String> = packages
+    .iter()
+    .filter(|p| attached_packages_for_meta.contains(*p))
+    .flat_map(|p| crate::nse::meta_package_members(p))
+    .map(|m| m.to_string())
+    .collect();
 ```
 
 - [ ] **Step 3: Run targeted tests**
 
-Run: `cargo test -p raven nse::tests::bioc_ -- --nocapture`
+Run: `cargo test -p raven handlers::function_parameter_tests::nse_bioc_tidy_omics_attach_expands_generics_but_load_namespace_does_not -- --nocapture`
 
 Expected: PASS.
 
@@ -238,19 +214,16 @@ Expected: PASS.
 
 - [ ] **Step 1: Extend shape tests**
 
-Add verified Bioconductor cases to `section5_package_policy_arm_shapes()` or a new nearby shape test:
+Add verified negative qualified-policy cases near `meta_packages_expand_to_members()`:
 
 ```rust
-            ("plyranges", "filter", PerFormal),
-            ("plyranges", "mutate", PerFormal),
-            ("plyranges", "select", PerFormal),
-            ("plyranges", "coalesce", None),
-            ("tidybulk", "filter", PerFormal),
-            ("tidySummarizedExperiment", "filter", PerFormal),
-            ("tidySingleCellExperiment", "mutate", PerFormal),
+        assert_eq!(package_policy("plyranges", "filter"), None);
+        assert_eq!(package_policy("tidySummarizedExperiment", "filter"), None);
+        assert_eq!(package_policy("tidySingleCellExperiment", "mutate"), None);
+        assert_eq!(package_policy("tidybulk", "filter"), None);
 ```
 
-Adjust names to match Task 1 evidence.
+These tests pin that invalid namespace-qualified spellings remain standard-eval.
 
 - [ ] **Step 2: Update diagnostics docs**
 
