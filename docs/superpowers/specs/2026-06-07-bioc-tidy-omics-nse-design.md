@@ -18,9 +18,14 @@ The change should reduce undefined-variable false positives for dplyr/tidyr-styl
 
 ## Architecture
 
-Keep `crates/raven/src/nse.rs` as the single source of truth for built-in NSE argument policies. Add explicit package handling through `package_policy(package, name)`, using small helper functions when a package has more than one verified entry.
+Keep `crates/raven/src/nse.rs` as the single source of truth for built-in NSE argument policies. The empirical result determines the representation:
 
-Existing helpers such as `dplyr_policy`, `tidyr_policy`, and `tibble_policy` remain unchanged unless probing proves a Bioconductor export is a true re-export whose formals and behavior are safely identical. Otherwise, model each Bioconductor package under its own package key because the resolver classifies NSE by `(package, name)`.
+- If a Bioconductor package exports its own NSE verb, add explicit handling through `package_policy(package, name)`.
+- If a Bioconductor package instead attaches existing dplyr/tidyr generics and contributes object-specific S3 methods, route bare calls to the attached generic owner's existing policy through `meta_package_members`.
+
+Do not add `package_policy` aliases for namespace-qualified spellings that R does not export.
+
+Existing helpers such as `dplyr_policy`, `tidyr_policy`, and `tibble_policy` remain unchanged unless probing proves a Bioconductor export is a true re-export whose formals and behavior are safely identical. Current verified packages use attached dplyr/tidyr generics rather than package-qualified exports, so bare calls under `library(plyranges)`, `library(tidySummarizedExperiment)`, and `library(tidySingleCellExperiment)` route to the existing generic-owner policies. `loadNamespace("pkg")` must not trigger that attached-generic routing because it does not attach bare names to the search path.
 
 Policies stay conservative:
 
@@ -37,7 +42,7 @@ R is the source of truth for this work.
 2. For each candidate verb, record `formals()`, the exported owner, and whether `pkg::name` is a package-local wrapper or a re-export/imported function.
 3. Probe captured-vs-evaluated formals with unique sentinels.
 4. For data-mask cases, verify representative bare columns or accessors resolve inside an appropriate object. For `plyranges`, this must include range accessors such as `seqnames`, `start`, `end`, `width`, or `strand` where exported behavior supports them.
-5. Translate only confirmed behavior into `ArgPolicy::per_formal` or `ArgPolicy::WholeCall`.
+5. Translate only confirmed behavior into either `ArgPolicy::per_formal` / `ArgPolicy::WholeCall` entries for real package exports, or attach-gated `meta_package_members` expansion for packages that attach existing NSE generics.
 6. Record excluded cases in comments or the PR summary when they look NSE-like but evaluate normally.
 
 If installation or probing fails for any of the four requested packages, stop rather than landing partial guessed policy. The selected scope is the full issue scope.
@@ -46,10 +51,10 @@ If installation or probing fails for any of the four requested packages, stop ra
 
 Add Rust unit tests in `crates/raven/src/nse.rs` that pin representative behavior:
 
-- Mask tests for confirmed Bioconductor data-masking / tidy-select policies.
-- Pipe-fed masks where the first syntactic positional argument changes meaning because `.data` is supplied by the pipe.
-- Table-lock shape tests so accidental package-policy drops fail CI.
-- Negative shape tests for surveyed functions that should remain standard-eval when useful.
+- Meta-member tests for packages that attach existing dplyr/tidyr generic owners.
+- End-to-end tests showing `library(pkg)` suppresses masked columns through the attached generic policy.
+- End-to-end tests showing `loadNamespace("pkg")` does not attach the generic policy.
+- Negative package-policy tests for invalid namespace-qualified spellings such as `plyranges::filter`.
 
 The tests should exercise policy-table behavior, not R subprocess probing. The empirical R probe is a development input; the checked-in behavior is the resulting curated policy table.
 
