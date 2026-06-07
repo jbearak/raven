@@ -1,5 +1,7 @@
 //! Syntax-based recognition of `foreach(...) %do% expr` and
-//! `foreach(...) %dopar% expr` execution expressions (issue #404).
+//! `foreach(...) %dopar% expr` execution expressions (issue #404), including
+//! nested compositions joined by the `%:%` operator and `when(...)` filters
+//! (issue #406).
 //!
 //! `foreach` is not a language construct: it parses as a `call` to `foreach`
 //! whose result is fed to the special infix operator `%do%`/`%dopar%`. The
@@ -7,35 +9,70 @@
 //! (`foreach(i = 1:10)`), and they must be visible only inside the executed
 //! right-hand-side expression.
 //!
+//! The left side of `%do%`/`%dopar%` may also be a *composition*: a `%:%` chain
+//! of `foreach(...)` calls and `when(...)` filters
+//! (`foreach(i = 1:3) %:% when(i %% 2 == 0) %:% foreach(j = 1:3) %do% i + j`).
+//! Every foreach call in the chain contributes iterators. Binding is
+//! left-to-right, matching R: each iterator is visible from *its own*
+//! `foreach(...)` call onward — inside later `when(...)` filters, later iterator
+//! value expressions (the realistic `foreach(j = seq_len(i))` cross-reference),
+//! and the executed body — but not in anything to its left, where R itself
+//! raises "object not found". `when(...)` is a filter, not an iterator source,
+//! so it contributes no iterators of its own.
+//!
 //! This recognizer is deliberately **syntax-only**: it never consults live
 //! package metadata, so it works the same in the editor and the CLI. It is
-//! shared by scope construction (`cross_file::scope`, which turns a recognized
-//! execution into a synthetic RHS-only scope) and is available to diagnostic
-//! collection if a collector-only gap ever appears. A user-defined function
-//! also named `foreach` is treated as the real one; that lookalike can be
-//! revisited if it causes real-world false positives, but #404 is a regression
-//! in the standard idiom.
+//! shared by scope construction (`cross_file::scope`, which turns each
+//! `foreach(...)` call into a synthetic iterator scope spanning from the end of
+//! that call through the executed body; see [`ForeachExecution`]) and is
+//! available to diagnostic collection if a collector-only gap ever appears. A
+//! user-defined function also named `foreach` (or `when`) is treated as the
+//! real one; that lookalike can be revisited if it causes real-world false
+//! positives, but #404 is a regression in the standard idiom.
 
 use tree_sitter::Node;
 
 /// A recognized `foreach(...) %do%/%dopar% rhs` execution expression.
 pub struct ForeachExecution<'tree> {
-    /// The executed right-hand-side expression — the immediate `rhs` field of
-    /// the `%do%`/`%dopar%` `binary_operator`. Often a `braced_expression`, but
-    /// may be any expression (e.g. `sqrt(i)`).
-    pub rhs: Node<'tree>,
-    /// The `name`-field identifier nodes of the iterator arguments — the named,
-    /// non-dot arguments of the `foreach(...)` call. Each node's position is the
-    /// `i` in `foreach(i = ...)`, suitable as the iterator's definition site.
+    /// One group per `foreach(...)` call in the composition, in left-to-right
+    /// source order. A simple `foreach(...) %do% body` has exactly one group;
+    /// a `%:%` chain (issue #406) has one per foreach call. `when(...)` filters
+    /// are not iterator sources and produce no group.
+    ///
+    /// Each group's iterators are scoped from the end of *its own* `foreach(...)`
+    /// call through the executed body. Modeling per-call (rather than one scope
+    /// over the whole composition) reproduces foreach's left-to-right binding
+    /// order: an iterator is visible in later `when(...)` filters, later iterator
+    /// value expressions (the realistic `foreach(j = seq_len(i))` cross-reference
+    /// idiom), and the body — but not in anything to its left, where R itself
+    /// raises "object not found".
+    pub iterator_groups: Vec<ForeachIteratorGroup<'tree>>,
+}
+
+/// The iterators contributed by a single `foreach(...)` call in a composition.
+pub struct ForeachIteratorGroup<'tree> {
+    /// The `foreach(...)` call node. Its *end* is where these iterators start
+    /// being visible — so they do not leak into the call's own value expressions
+    /// (`foreach(i = 1:i)` does not see `i`) nor anything to its left.
+    pub call: Node<'tree>,
+    /// The `name`-field identifier nodes of this call's iterator arguments — its
+    /// named, non-dot arguments. Each node's position is the `i` in
+    /// `foreach(i = ...)`, suitable as the iterator's definition site. Empty for
+    /// a foreach call carrying only dot-control arguments.
     pub iterators: Vec<Node<'tree>>,
 }
 
 /// Recognize whether `node` is a foreach execution expression.
 ///
-/// Returns the executed RHS node and the iterator name nodes when `node` is a
-/// `binary_operator` with operator text `%do%` or `%dopar%` whose left side is a
-/// call to bare `foreach(...)` or namespace-qualified
-/// `foreach::foreach(...)` / `foreach:::foreach(...)`. Otherwise `None`.
+/// Returns the per-call iterator groups when `node` is a `binary_operator` with
+/// operator text `%do%` or `%dopar%` whose left side is a foreach *composition*:
+///
+/// - a single call to bare `foreach(...)` or namespace-qualified
+///   `foreach::foreach(...)` / `foreach:::foreach(...)` (issue #404);
+/// - a `%:%` chain of `foreach(...)` calls and `when(...)` filters, with at
+///   least one `foreach(...)` call (issue #406).
+///
+/// Otherwise `None`.
 ///
 /// `text` is the full document text; tree-sitter byte ranges index into it.
 pub fn recognize_foreach_execution<'tree>(
@@ -55,28 +92,77 @@ pub fn recognize_foreach_execution<'tree>(
     }
 
     let lhs = node.child_by_field_name("lhs")?;
-    let rhs = node.child_by_field_name("rhs")?;
-    if !lhs_is_foreach_call(lhs, text) {
+
+    let mut iterator_groups = Vec::new();
+    if !collect_composition_groups(lhs, text, &mut iterator_groups)? {
+        // A valid composition that contains no `foreach(...)` call (e.g. a bare
+        // `when(...) %do% body`) is not a foreach execution.
         return None;
     }
 
-    Some(ForeachExecution {
-        rhs,
-        iterators: iterator_name_nodes(lhs, text),
-    })
+    Some(ForeachExecution { iterator_groups })
 }
 
-/// Whether `lhs` is a `call` to bare `foreach(...)` or namespace-qualified
-/// `foreach::foreach(...)` / `foreach:::foreach(...)`.
-fn lhs_is_foreach_call(lhs: Node, text: &str) -> bool {
-    if lhs.kind() != "call" {
+/// Walk a foreach *composition* on the left of `%do%`/`%dopar%`, appending a
+/// [`ForeachIteratorGroup`] for every `foreach(...)` call to `groups` in
+/// left-to-right source order.
+///
+/// A composition is a single `foreach(...)` call, a `when(...)` filter, or a
+/// `%:%` chain of such. Returns `Some(saw_foreach)` — whether at least one
+/// `foreach(...)` call was found — or `None` if `node` is not a valid
+/// composition (an operand that is neither `foreach`, `when`, nor a `%:%` chain
+/// rejects the whole left side). A `when(...)` filter is valid but yields no
+/// group.
+fn collect_composition_groups<'tree>(
+    node: Node<'tree>,
+    text: &str,
+    groups: &mut Vec<ForeachIteratorGroup<'tree>>,
+) -> Option<bool> {
+    if is_foreach_package_call(node, text, "foreach") {
+        groups.push(ForeachIteratorGroup {
+            call: node,
+            iterators: iterator_name_nodes(node, text),
+        });
+        return Some(true);
+    }
+    if is_foreach_package_call(node, text, "when") {
+        return Some(false);
+    }
+    if is_colon_chain(node, text) {
+        // `%:%` is left-associative, so recursing lhs before rhs appends groups
+        // in source order.
+        let lhs = node.child_by_field_name("lhs")?;
+        let rhs = node.child_by_field_name("rhs")?;
+        let left = collect_composition_groups(lhs, text, groups)?;
+        let right = collect_composition_groups(rhs, text, groups)?;
+        return Some(left || right);
+    }
+    None
+}
+
+/// Whether `node` is a `binary_operator` whose operator is the foreach nesting
+/// operator `%:%` — the single source of truth for "this is a `%:%` composition
+/// node".
+fn is_colon_chain(node: Node, text: &str) -> bool {
+    node.kind() == "binary_operator"
+        && node
+            .child_by_field_name("operator")
+            .map(|op| &text[op.byte_range()])
+            == Some("%:%")
+}
+
+/// Whether `node` is a `call` to the bare function `name` or its
+/// namespace-qualified `foreach::name` / `foreach:::name` form — both
+/// `foreach(...)` and `when(...)` are exports of the `foreach` package.
+fn is_foreach_package_call(node: Node, text: &str, name: &str) -> bool {
+    if node.kind() != "call" {
         return false;
     }
-    let Some(func) = lhs.child_by_field_name("function") else {
+    let Some(func) = node.child_by_field_name("function") else {
         return false;
     };
     match func.kind() {
-        "identifier" => &text[func.byte_range()] == "foreach",
+        "identifier" => &text[func.byte_range()] == name,
         // `pkg::name` and `pkg:::name` share the `namespace_operator` shape; we
         // do not distinguish `::` from `:::` because both name the same export.
         "namespace_operator" => {
@@ -86,7 +172,7 @@ fn lhs_is_foreach_call(lhs: Node, text: &str) -> bool {
                 && func
                     .child_by_field_name("rhs")
                     .map(|n| &text[n.byte_range()])
-                    == Some("foreach")
+                    == Some(name)
         }
         _ => false,
     }
@@ -148,9 +234,11 @@ mod tests {
         find_node(node, &|n| n.kind() == "binary_operator")
     }
 
+    /// All iterator names across every group, in source order.
     fn iterator_names(exec: &ForeachExecution, text: &str) -> Vec<String> {
-        exec.iterators
+        exec.iterator_groups
             .iter()
+            .flat_map(|g| g.iterators.iter())
             .map(|n| text[n.byte_range()].to_string())
             .collect()
     }
@@ -162,7 +250,6 @@ mod tests {
         let binop = first_binary_operator(tree.root_node()).unwrap();
         let exec = recognize_foreach_execution(binop, code).expect("should recognize %do%");
         assert_eq!(iterator_names(&exec, code), vec!["i"]);
-        assert_eq!(exec.rhs.kind(), "braced_expression");
     }
 
     #[test]
@@ -221,11 +308,111 @@ mod tests {
         let tree = parse(code);
         let binop = first_binary_operator(tree.root_node()).unwrap();
         let exec = recognize_foreach_execution(binop, code).unwrap();
-        assert!(exec.iterators.is_empty());
+        // One group (the foreach call) carrying no iterators.
+        assert_eq!(exec.iterator_groups.len(), 1);
+        assert!(exec.iterator_groups[0].iterators.is_empty());
     }
 
     /// Walk the tree to find the first node recognized as a foreach execution.
     fn find_foreach_execution<'tree>(node: Node<'tree>, text: &str) -> Option<Node<'tree>> {
         find_node(node, &|n| recognize_foreach_execution(n, text).is_some())
+    }
+
+    // Issue #406: nested foreach composition with `%:%` and `when()` filters.
+
+    #[test]
+    fn recognizes_nested_foreach_composition() {
+        // `foreach(i) %:% foreach(j) %do% i + j` parses as
+        // `((foreach %:% foreach) %do% i) + j`, so the execution is the inner
+        // `%do%` binary_operator.
+        let code = "foreach(i = 1:3) %:% foreach(j = 1:3) %do% i + j";
+        let tree = parse(code);
+        let exec_node = find_foreach_execution(tree.root_node(), code).unwrap();
+        let exec = recognize_foreach_execution(exec_node, code).unwrap();
+        assert_eq!(iterator_names(&exec, code), vec!["i", "j"]);
+    }
+
+    #[test]
+    fn recognizes_when_filter_composition() {
+        let code = "foreach(i = 1:3) %:% when(i %% 2 == 0) %do% i";
+        let tree = parse(code);
+        let exec_node = find_foreach_execution(tree.root_node(), code).unwrap();
+        let exec = recognize_foreach_execution(exec_node, code).unwrap();
+        // `when(...)` contributes no iterators; only the foreach call does.
+        assert_eq!(iterator_names(&exec, code), vec!["i"]);
+    }
+
+    #[test]
+    fn collects_iterators_across_when_and_multiple_foreach() {
+        let code = "foreach(i = 1:3) %:% when(i %% 2 == 0) %:% foreach(j = 1:3) %do% i + j";
+        let tree = parse(code);
+        let exec_node = find_foreach_execution(tree.root_node(), code).unwrap();
+        let exec = recognize_foreach_execution(exec_node, code).unwrap();
+        assert_eq!(iterator_names(&exec, code), vec!["i", "j"]);
+    }
+
+    #[test]
+    fn rejects_when_only_composition_without_foreach() {
+        // `when(...)` alone on the left of `%do%` is not a foreach execution.
+        let code = "when(i %% 2 == 0) %do% i";
+        let tree = parse(code);
+        let binop = first_binary_operator(tree.root_node()).unwrap();
+        assert!(recognize_foreach_execution(binop, code).is_none());
+    }
+
+    #[test]
+    fn rejects_non_foreach_operand_in_colon_chain() {
+        // A `%:%` chain whose left side is neither foreach, when, nor another
+        // `%:%` chain is not a recognized composition.
+        let code = "other(i = 1:3) %:% foreach(j = 1:3) %do% i + j";
+        let tree = parse(code);
+        let exec_node = find_node(tree.root_node(), &|n| {
+            n.kind() == "binary_operator"
+                && n.child_by_field_name("operator")
+                    .map(|o| &code[o.byte_range()])
+                    == Some("%do%")
+        })
+        .unwrap();
+        assert!(recognize_foreach_execution(exec_node, code).is_none());
+    }
+
+    #[test]
+    fn groups_are_per_foreach_call_in_source_order() {
+        // Each `foreach(...)` call is its own group, in left-to-right order;
+        // `when(...)` produces no group.
+        let code = "foreach(i = 1:3) %:% when(i %% 2 == 0) %:% foreach(j = 1:3) %do% i + j";
+        let tree = parse(code);
+        let exec_node = find_foreach_execution(tree.root_node(), code).unwrap();
+        let exec = recognize_foreach_execution(exec_node, code).unwrap();
+
+        assert_eq!(exec.iterator_groups.len(), 2);
+        // First group is the left foreach (its call starts at byte 0).
+        assert_eq!(exec.iterator_groups[0].call.start_byte(), 0);
+        let g0: Vec<_> = exec.iterator_groups[0]
+            .iterators
+            .iter()
+            .map(|n| &code[n.byte_range()])
+            .collect();
+        let g1: Vec<_> = exec.iterator_groups[1]
+            .iterators
+            .iter()
+            .map(|n| &code[n.byte_range()])
+            .collect();
+        assert_eq!(g0, vec!["i"]);
+        assert_eq!(g1, vec!["j"]);
+        // The second group's call begins after the first (source order).
+        assert!(
+            exec.iterator_groups[1].call.start_byte() > exec.iterator_groups[0].call.start_byte()
+        );
+    }
+
+    #[test]
+    fn simple_execution_has_single_group() {
+        let code = "foreach(i = 1:10) %do% { print(i) }";
+        let tree = parse(code);
+        let binop = first_binary_operator(tree.root_node()).unwrap();
+        let exec = recognize_foreach_execution(binop, code).unwrap();
+        assert_eq!(exec.iterator_groups.len(), 1);
+        assert_eq!(iterator_names(&exec, code), vec!["i"]);
     }
 }

@@ -1136,9 +1136,10 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // Must be pushed before the function-scope tree is built below.
     push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
 
-    // Issue #404: model `foreach(...) %do%/%dopar% expr` iterator variables as
-    // synthetic RHS-only scopes. Must be pushed before the function-scope tree
-    // is built below so RHS-local definitions are tagged with this scope.
+    // Issues #404 / #406: model `foreach(...) %do%/%dopar% expr` iterator
+    // variables (including nested `%:%` compositions) as synthetic iterator
+    // scopes. Must be pushed before the function-scope tree is built below so
+    // scope-local definitions are tagged with this scope.
     push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
 
     // Sort timeline by *effect* position so the resolver iterates events in
@@ -1373,9 +1374,10 @@ pub fn compute_artifacts_with_metadata(
     // Must be pushed before the function-scope tree is built below.
     push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
 
-    // Issue #404: model `foreach(...) %do%/%dopar% expr` iterator variables as
-    // synthetic RHS-only scopes. Must be pushed before the function-scope tree
-    // is built below so RHS-local definitions are tagged with this scope.
+    // Issues #404 / #406: model `foreach(...) %do%/%dopar% expr` iterator
+    // variables (including nested `%:%` compositions) as synthetic iterator
+    // scopes. Must be pushed before the function-scope tree is built below so
+    // scope-local definitions are tagged with this scope.
     push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
 
     // Sort timeline by *effect* position so the resolver iterates events in
@@ -2173,17 +2175,29 @@ fn call_is_shiny_deferred(
     }
 }
 
-/// Issue #404: model `foreach(...) %do%/%dopar% expr` iterator variables as a
-/// synthetic RHS-only scope.
+/// Issues #404 / #406: model `foreach(...) %do%/%dopar% expr` iterator variables
+/// — including nested `%:%` compositions with `when()` filters — as a synthetic
+/// iterator scope.
 ///
-/// The named, non-dot arguments of the `foreach(...)` call become parameters
-/// visible only inside the executed expression. This mirrors the useful part of
-/// a `FunctionScope`: outer bindings stay visible, iterator symbols are visible
-/// while the RHS is active, and RHS-local definitions do not leak into the
+/// The named, non-dot arguments of every `foreach(...)` call become parameters
+/// of a synthetic `FunctionScope`. This mirrors the useful part of a real
+/// function scope: outer bindings stay visible, iterator symbols are visible
+/// while the scope is active, and scope-local definitions do not leak into the
 /// surrounding scope (they are tagged with this scope by
 /// `annotate_event_function_scopes`). We deliberately do **not** emit normal
 /// `Def` events for the iterators, which would make them visible after the
-/// foreach expression — outside the #404 scope.
+/// foreach expression — outside the scope.
+///
+/// Each `foreach(...)` call gets *two* scopes. The visibility scope spans from
+/// the end of that call through the executed body and carries the iterators as
+/// parameters. In a `%:%` chain these visibility scopes are nested (a later
+/// call's is contained in every earlier call's), which reproduces foreach's
+/// left-to-right binding: an iterator is visible in later filters, later
+/// iterator value expressions, and the body, but not to its left — see
+/// [`crate::foreach::ForeachExecution::iterator_groups`]. The capture scope
+/// spans the call itself and carries no parameters; it isolates assignments
+/// made in the iterator value expressions, which foreach evaluates in its own
+/// environment and so never leak — see [`foreach_arg_capture_scope_event`].
 fn push_foreach_iterator_scopes(
     artifacts: &mut ScopeArtifacts,
     root: Node,
@@ -2200,8 +2214,9 @@ fn push_foreach_iterator_scopes(
     collect_foreach_iterator_scopes(root, content, line_index, uri, &mut artifacts.timeline);
 }
 
-/// Walk `node`, appending a `FunctionScope` event for each recognized foreach
-/// execution expression. The event carries the iterator symbols as parameters.
+/// Walk `node`, appending a `FunctionScope` event for each `foreach(...)` call
+/// of every recognized foreach execution expression. Each event carries that
+/// call's iterator symbols as parameters.
 fn collect_foreach_iterator_scopes(
     node: Node,
     text: &str,
@@ -2210,28 +2225,75 @@ fn collect_foreach_iterator_scopes(
     events: &mut Vec<ScopeEvent>,
 ) {
     if let Some(exec) = crate::foreach::recognize_foreach_execution(node, text) {
-        events.push(foreach_execution_scope_event(node, &exec, line_index, uri));
+        // All groups share the same body end; each starts at the end of its own
+        // `foreach(...)` call. The resulting scopes are nested (a later call's
+        // scope is contained in every earlier call's), which gives foreach's
+        // left-to-right binding: outer iterators stay visible inside inner ones,
+        // and same-named inner iterators shadow outer ones.
+        let body_end = foreach_body_end_node(node);
+        let (end_line, end_column) = node_end_position_utf16(body_end, line_index);
+        for group in &exec.iterator_groups {
+            // Two scopes per `foreach(...)` call, with disjoint, adjacent
+            // intervals:
+            //   1. the call itself — captures assignments made in the iterator
+            //      value expressions so they do not leak (see
+            //      `foreach_arg_capture_scope_event`);
+            //   2. from the end of the call through the body — makes the
+            //      iterators visible (see `foreach_group_scope_event`).
+            events.push(foreach_arg_capture_scope_event(group, line_index));
+            events.push(foreach_group_scope_event(
+                group, end_line, end_column, line_index, uri,
+            ));
+        }
     }
     for child in node.children(&mut node.walk()) {
         collect_foreach_iterator_scopes(child, text, line_index, uri, events);
     }
 }
 
-/// Build the synthetic RHS-only `FunctionScope` event for a recognized foreach
-/// execution. The interval spans from the start of the executed expression to
-/// the end of the loop body (see [`foreach_body_end_node`] for why that is not
+/// Build the synthetic capture-only `FunctionScope` event for one
+/// `foreach(...)` call. Its interval is the call itself and it exposes **no**
+/// parameters: its sole purpose is to tag any assignments made inside the
+/// iterator value expressions as scope-local so they do not leak.
+///
+/// foreach evaluates the iterator arguments in its own environment, so such an
+/// assignment is visible neither in the loop body nor after the expression.
+/// Verified against real R: `foreach(i = { x <- 1; 1:1 }) %do% { x }` errors
+/// with "object 'x' not found", and `exists("x")` is `FALSE` afterwards. The
+/// companion [`foreach_group_scope_event`] models iterator *visibility*; this
+/// models value-expression *capture*. The two intervals are adjacent and
+/// disjoint (this ends where that begins, at the end of the call).
+fn foreach_arg_capture_scope_event(
+    group: &crate::foreach::ForeachIteratorGroup,
+    line_index: &LineIndex,
+) -> ScopeEvent {
+    let (start_line, start_column) = node_start_position_utf16(group.call, line_index);
+    let (end_line, end_column) = node_end_position_utf16(group.call, line_index);
+    ScopeEvent::FunctionScope {
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+        parameters: Vec::new(),
+    }
+}
+
+/// Build the synthetic `FunctionScope` event for one `foreach(...)` call of a
+/// composition. The interval spans from the *end* of the call (so the iterators
+/// are visible in later filters, later iterator value expressions, and the body,
+/// but not in the call's own value expressions or anything to its left) to the
+/// supplied body end (see [`foreach_body_end_node`] for why the body end is not
 /// always the `%do%` operator's immediate `rhs`).
-fn foreach_execution_scope_event(
-    exec_node: Node,
-    exec: &crate::foreach::ForeachExecution,
+fn foreach_group_scope_event(
+    group: &crate::foreach::ForeachIteratorGroup,
+    end_line: u32,
+    end_column: u32,
     line_index: &LineIndex,
     uri: &Url,
 ) -> ScopeEvent {
-    let (start_line, start_column) = node_start_position_utf16(exec.rhs, line_index);
-    let (end_line, end_column) =
-        node_end_position_utf16(foreach_body_end_node(exec_node), line_index);
+    let (start_line, start_column) = node_end_position_utf16(group.call, line_index);
 
-    let parameters = exec
+    let parameters = group
         .iterators
         .iter()
         .map(|name_node| foreach_iterator_symbol(*name_node, line_index, uri))
@@ -5849,6 +5911,128 @@ mod tests {
         assert!(
             sets.iter().all(|s| s.is_empty()),
             "dot-prefixed controls must not become iterator parameters"
+        );
+    }
+
+    // Issue #406: nested foreach composition with `%:%` and `when()` filters.
+
+    #[test]
+    fn foreach_composition_iterators_visible_in_body() {
+        // `foreach(i) %:% foreach(j) %do% i + j` exposes both iterators in the
+        // executed body. Query each iterator at its own body token (`i` at
+        // column 43, `j` at column 47) rather than at the `%do%`/body boundary,
+        // so the assertions verify visibility at a real body token.
+        let code = "foreach(i = 1:3) %:% foreach(j = 1:3) %do% i + j";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let at_i = scope_at_position(&artifacts, 0, 43, false);
+        assert!(
+            at_i.symbols.contains_key("i"),
+            "iterator `i` visible at its body token"
+        );
+        let at_j = scope_at_position(&artifacts, 0, 47, false);
+        assert!(
+            at_j.symbols.contains_key("j"),
+            "iterator `j` visible at its body token"
+        );
+        // Both iterators are visible together at the last body token.
+        assert!(
+            at_j.symbols.contains_key("i"),
+            "iterator `i` still visible at the `j` body token"
+        );
+    }
+
+    #[test]
+    fn foreach_composition_iterator_visible_in_when_filter() {
+        // `foreach(i = 1:3) %:% when(i %% 2 == 0) %do% i`: the iterator scope
+        // must reach back to cover the `when(...)` filter, where `i` (column 26)
+        // is referenced before the `%do%` body.
+        let code = "foreach(i = 1:3) %:% when(i %% 2 == 0) %do% i";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let in_when = scope_at_position(&artifacts, 0, 26, false);
+        assert!(
+            in_when.symbols.contains_key("i"),
+            "iterator `i` should be visible inside the when() filter"
+        );
+    }
+
+    #[test]
+    fn foreach_composition_iterators_absent_after_body() {
+        // No composition iterator may leak past the executed body. Line 1
+        // `print(i)` has `i` at column 6.
+        let code = "foreach(i = 1:3) %:% foreach(j = 1:3) %do% i + j\nprint(i)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let after = scope_at_position(&artifacts, 1, 6, false);
+        assert!(
+            !after.symbols.contains_key("i"),
+            "iterator `i` must not leak past the composed foreach expression"
+        );
+        assert!(
+            !after.symbols.contains_key("j"),
+            "iterator `j` must not leak past the composed foreach expression"
+        );
+    }
+
+    #[test]
+    fn foreach_composition_later_iterator_not_visible_in_earlier_value() {
+        // Left-to-right binding: `j` is bound by the SECOND foreach, so it is
+        // not in scope inside the FIRST foreach's value expression. In real R
+        // `foreach(i = seq_len(j)) %:% foreach(j = 1:3)` errors with
+        // "object 'j' not found". The `j` of `seq_len(j)` is at column 19.
+        let code = "foreach(i = seq_len(j)) %:% foreach(j = 1:3) %do% i + j";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let in_first_value = scope_at_position(&artifacts, 0, 19, false);
+        assert!(
+            !in_first_value.symbols.contains_key("j"),
+            "iterator `j` (bound later) must not be visible in an earlier value expression"
+        );
+    }
+
+    #[test]
+    fn foreach_composition_filter_resolves_to_left_iterator_when_shadowed() {
+        // `foreach(i = 1:3) %:% when(i > 1) %:% foreach(i = 4:6) %do% i`: the
+        // `i` inside `when(...)` (column 26) is bound by the LEFT foreach (its
+        // `i` name node is at column 8), not the later inner foreach (column 45).
+        let code = "foreach(i = 1:3) %:% when(i > 1) %:% foreach(i = 4:6) %do% i";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let in_when = scope_at_position(&artifacts, 0, 26, false);
+        let sym = in_when
+            .symbols
+            .get("i")
+            .expect("iterator `i` should be visible in the when() filter");
+        assert_eq!(
+            (sym.defined_line, sym.defined_column),
+            (0, 8),
+            "the filter's `i` must resolve to the left-hand foreach, not the later inner one"
+        );
+    }
+
+    #[test]
+    fn foreach_composition_body_resolves_to_innermost_shadowing_iterator() {
+        // In the same shadowing chain, the body `i` (column 58) is bound by the
+        // INNERMOST (rightmost) foreach (`i` name node at column 45).
+        let code = "foreach(i = 1:3) %:% when(i > 1) %:% foreach(i = 4:6) %do% i";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let in_body = scope_at_position(&artifacts, 0, 58, false);
+        let sym = in_body
+            .symbols
+            .get("i")
+            .expect("iterator `i` should be visible in the body");
+        assert_eq!(
+            (sym.defined_line, sym.defined_column),
+            (0, 45),
+            "the body's `i` must resolve to the innermost foreach"
         );
     }
 
