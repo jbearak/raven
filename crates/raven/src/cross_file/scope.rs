@@ -2188,12 +2188,16 @@ fn call_is_shiny_deferred(
 /// `Def` events for the iterators, which would make them visible after the
 /// foreach expression — outside the scope.
 ///
-/// Each `foreach(...)` call gets its *own* scope, spanning from the end of that
-/// call through the executed body. In a `%:%` chain these scopes are nested (a
-/// later call's scope is contained in every earlier call's), which reproduces
-/// foreach's left-to-right binding: an iterator is visible in later filters,
-/// later iterator value expressions, and the body, but not to its left — see
-/// [`crate::foreach::ForeachExecution::iterator_groups`].
+/// Each `foreach(...)` call gets *two* scopes. The visibility scope spans from
+/// the end of that call through the executed body and carries the iterators as
+/// parameters. In a `%:%` chain these visibility scopes are nested (a later
+/// call's is contained in every earlier call's), which reproduces foreach's
+/// left-to-right binding: an iterator is visible in later filters, later
+/// iterator value expressions, and the body, but not to its left — see
+/// [`crate::foreach::ForeachExecution::iterator_groups`]. The capture scope
+/// spans the call itself and carries no parameters; it isolates assignments
+/// made in the iterator value expressions, which foreach evaluates in its own
+/// environment and so never leak — see [`foreach_arg_capture_scope_event`].
 fn push_foreach_iterator_scopes(
     artifacts: &mut ScopeArtifacts,
     root: Node,
@@ -2229,6 +2233,14 @@ fn collect_foreach_iterator_scopes(
         let body_end = foreach_body_end_node(node);
         let (end_line, end_column) = node_end_position_utf16(body_end, line_index);
         for group in &exec.iterator_groups {
+            // Two scopes per `foreach(...)` call, with disjoint, adjacent
+            // intervals:
+            //   1. the call itself — captures assignments made in the iterator
+            //      value expressions so they do not leak (see
+            //      `foreach_arg_capture_scope_event`);
+            //   2. from the end of the call through the body — makes the
+            //      iterators visible (see `foreach_group_scope_event`).
+            events.push(foreach_arg_capture_scope_event(group, line_index));
             events.push(foreach_group_scope_event(
                 group, end_line, end_column, line_index, uri,
             ));
@@ -2236,6 +2248,33 @@ fn collect_foreach_iterator_scopes(
     }
     for child in node.children(&mut node.walk()) {
         collect_foreach_iterator_scopes(child, text, line_index, uri, events);
+    }
+}
+
+/// Build the synthetic capture-only `FunctionScope` event for one
+/// `foreach(...)` call. Its interval is the call itself and it exposes **no**
+/// parameters: its sole purpose is to tag any assignments made inside the
+/// iterator value expressions as scope-local so they do not leak.
+///
+/// foreach evaluates the iterator arguments in its own environment, so such an
+/// assignment is visible neither in the loop body nor after the expression.
+/// Verified against real R: `foreach(i = { x <- 1; 1:1 }) %do% { x }` errors
+/// with "object 'x' not found", and `exists("x")` is `FALSE` afterwards. The
+/// companion [`foreach_group_scope_event`] models iterator *visibility*; this
+/// models value-expression *capture*. The two intervals are adjacent and
+/// disjoint (this ends where that begins, at the end of the call).
+fn foreach_arg_capture_scope_event(
+    group: &crate::foreach::ForeachIteratorGroup,
+    line_index: &LineIndex,
+) -> ScopeEvent {
+    let (start_line, start_column) = node_start_position_utf16(group.call, line_index);
+    let (end_line, end_column) = node_end_position_utf16(group.call, line_index);
+    ScopeEvent::FunctionScope {
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+        parameters: Vec::new(),
     }
 }
 

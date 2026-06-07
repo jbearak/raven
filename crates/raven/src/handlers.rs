@@ -46508,6 +46508,32 @@ mod function_parameter_tests {
     }
 
     #[test]
+    fn foreach_composition_value_expression_assignment_does_not_leak() {
+        // Issue #406 leak behavior: an assignment inside an iterator value
+        // expression is evaluated in foreach's own environment, so it never
+        // leaks past the composed expression. Verified against real R:
+        // `foreach(i = { x <- 1; 1:1 }) %:% foreach(j = 1:1) %do% { i + j }`
+        // leaves `exists("x") == FALSE`. The trailing `print(x)` must be flagged.
+        let names = foreach_compose_undefined_names(
+            "foreach(i = { x <- 1\n1:3 }) %:% foreach(j = 1:3) %do% i + j\nprint(x)",
+        );
+        assert!(names.contains(&"x".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"i".to_string()), "got: {names:?}");
+        assert!(!names.contains(&"j".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    fn foreach_value_expression_assignment_not_visible_in_body() {
+        // The same isolation also holds toward the body: foreach evaluates the
+        // iterator arguments in its own environment, so the body cannot see a
+        // value-expression assignment. Verified against real R:
+        // `foreach(i = { x <- 1; 1:1 }) %do% { x }` errors with
+        // "object 'x' not found". The body reference must be flagged.
+        let names = foreach_undefined_names("foreach(i = { x <- 1\n1:3 }) %do% x");
+        assert!(names.contains(&"x".to_string()), "got: {names:?}");
+    }
+
+    #[test]
     fn foreach_composition_inner_iterator_shadows_outer() {
         // Same-named iterators across composition levels. The body `i` binds to
         // the inner foreach; after the composed expression `i` does not leak, so
