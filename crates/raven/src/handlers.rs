@@ -5215,12 +5215,15 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
         // an attach — see `LibraryCall::attaches`), the NSE surfaces gated by
         // this set are dispatched on the object/namespace (e.g. data.table's S3
         // `[.data.table`), which a merely-loaded namespace already enables.
-        if !call.package.is_empty() {
-            packages.insert(call.package.clone());
-            if call.attaches {
-                attached_packages_for_meta.insert(call.package.clone());
-            }
+        if call.package.is_empty() {
+            continue;
         }
+
+        let package = call.package.clone();
+        if call.attaches {
+            attached_packages_for_meta.insert(package.clone());
+        }
+        packages.insert(package);
     }
     for pkg in snapshot.scope_contribution.full_imports.iter() {
         packages.insert(pkg.clone());
@@ -5240,12 +5243,10 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
     // This must be limited to true attach contexts: `loadNamespace("pkg")`
     // enables namespace/object-dispatch surfaces for `pkg`, but it does not put
     // member exports such as `dplyr::filter` on the bare search path.
-    let members: Vec<String> = packages
+    let members = attached_packages_for_meta
         .iter()
-        .filter(|p| attached_packages_for_meta.contains(*p))
         .flat_map(|p| crate::nse::meta_package_members(p))
-        .map(|m| m.to_string())
-        .collect();
+        .map(|m| m.to_string());
     packages.extend(members);
     // Sorted for deterministic resolution when two in-play packages define a
     // policy for the same verb name (first match wins in the resolver).

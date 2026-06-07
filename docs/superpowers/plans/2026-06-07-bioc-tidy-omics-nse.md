@@ -4,7 +4,7 @@
 
 **Goal:** Add empirically verified NSE policies for the Bioconductor tidy-omics packages in #403.
 
-**Architecture:** Keep `crates/raven/src/nse.rs` as the single policy-table entry point. Add package-specific helper functions only for verified Bioconductor packages, model re-exports only when R proves they share formals and behavior, and update `docs/diagnostics.md` only for implemented coverage.
+**Architecture:** Keep `crates/raven/src/nse.rs` as the source of built-in NSE package-member mappings and `crates/raven/src/handlers.rs` as the attach/loadNamespace boundary for bare-name resolution. Current verified Bioconductor packages attach existing dplyr/tidyr generics rather than exporting package-qualified verb aliases, so route bare calls through attach-gated `meta_package_members` expansion and keep invalid `pkg::filter` spellings standard-eval. Update `docs/diagnostics.md` only for implemented coverage.
 
 **Tech Stack:** Rust, Cargo, R 4.6.x, BiocManager/Bioconductor packages, GitHub CLI.
 
@@ -16,7 +16,8 @@ The empirical survey found that current installed Bioconductor releases do not e
 
 ## File Structure
 
-- Modify `crates/raven/src/nse.rs`: add verified Bioconductor policy helpers, wire them into `package_policy`, and add unit tests for masks and shape-locking.
+- Modify `crates/raven/src/nse.rs`: add verified Bioconductor attached-generic member mappings in `meta_package_members`, and add unit tests for the member mapping plus negative package-qualified policy cases.
+- Modify `crates/raven/src/handlers.rs`: gate `meta_package_members` expansion on true attach contexts so `library()` / `require()` expand attached generic owners but `loadNamespace()` does not.
 - Modify `docs/diagnostics.md`: update the NSE coverage limitation sentence if verified package policies land.
 - Create or update a temporary probe script outside the repo, under `/tmp/opencode/issue403-bioc-nse-probe.R`, to collect R evidence. Do not commit the probe script.
 - Modify `docs/superpowers/specs/2026-06-07-bioc-tidy-omics-nse-design.md` only if implementation discoveries contradict the approved design.

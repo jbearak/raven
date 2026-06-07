@@ -872,6 +872,8 @@ fn tidyr_policy(name: &str) -> Option<ArgPolicy> {
     Some(policy)
 }
 
+const BIOC_TIDY_OMICS_META_MEMBERS: &[&str] = &["dplyr", "tidyr", "ggplot2"];
+
 /// Core member packages of a known meta-package, or an empty slice. A file that
 /// only does `library(tidyverse)` should still resolve `filter` / `mutate` to
 /// the member package's NSE policy, so the resolver treats the meta-package as
@@ -895,7 +897,7 @@ pub(crate) fn meta_package_members(name: &str) -> &'static [&'static str] {
         // object-specific S3 methods. Route bare verbs to the generic owner's
         // policy; the packages do not export qualified `pkg::filter` verbs.
         "plyranges" => &["dplyr"],
-        "tidySummarizedExperiment" | "tidySingleCellExperiment" => &["dplyr", "tidyr", "ggplot2"],
+        "tidySummarizedExperiment" | "tidySingleCellExperiment" => BIOC_TIDY_OMICS_META_MEMBERS,
         _ => &[],
     }
 }
@@ -1263,14 +1265,9 @@ mod tests {
         // export `pkg::filter` / `pkg::pivot_longer`; only bare calls should route
         // to the attached generic's NSE policy.
         assert_eq!(meta_package_members("plyranges"), &["dplyr"]);
-        assert_eq!(
-            meta_package_members("tidySummarizedExperiment"),
-            &["dplyr", "tidyr", "ggplot2"]
-        );
-        assert_eq!(
-            meta_package_members("tidySingleCellExperiment"),
-            &["dplyr", "tidyr", "ggplot2"]
-        );
+        for package in ["tidySummarizedExperiment", "tidySingleCellExperiment"] {
+            assert_eq!(meta_package_members(package), BIOC_TIDY_OMICS_META_MEMBERS);
+        }
         assert!(meta_package_members("tidybulk").is_empty());
         assert!(meta_package_members("dplyr").is_empty());
     }
@@ -1281,14 +1278,15 @@ mod tests {
         // S3 methods; they do not export qualified `pkg::filter` /
         // `pkg::pivot_longer` aliases. Keep those namespace-qualified spellings
         // standard-eval instead of inventing package-local policies.
-        assert_eq!(package_policy("plyranges", "filter"), None);
-        assert_eq!(package_policy("tidySummarizedExperiment", "filter"), None);
-        assert_eq!(package_policy("tidySingleCellExperiment", "mutate"), None);
-        assert_eq!(
-            package_policy("tidySummarizedExperiment", "pivot_longer"),
-            None
-        );
-        assert_eq!(package_policy("tidybulk", "filter"), None);
+        for (package, function) in [
+            ("plyranges", "filter"),
+            ("tidySummarizedExperiment", "filter"),
+            ("tidySingleCellExperiment", "mutate"),
+            ("tidySummarizedExperiment", "pivot_longer"),
+            ("tidybulk", "filter"),
+        ] {
+            assert_eq!(package_policy(package, function), None);
+        }
     }
 
     #[test]
