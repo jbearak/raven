@@ -891,6 +891,11 @@ pub(crate) fn meta_package_members(name: &str) -> &'static [&'static str] {
             "lubridate",
         ],
         "tidymodels" => &["dplyr", "tidyr", "ggplot2", "purrr", "rlang", "recipes"],
+        // Bioconductor tidy-omics packages attach dplyr/tidyr generics and add
+        // object-specific S3 methods. Route bare verbs to the generic owner's
+        // policy; the packages do not export qualified `pkg::filter` verbs.
+        "plyranges" => &["dplyr"],
+        "tidySummarizedExperiment" | "tidySingleCellExperiment" => &["dplyr", "tidyr", "ggplot2"],
         _ => &[],
     }
 }
@@ -1253,7 +1258,37 @@ mod tests {
         // recipes carries NSE policies, so it must be a tidymodels member for a
         // bare `step_*` to resolve under `library(tidymodels)` alone.
         assert!(meta_package_members("tidymodels").contains(&"recipes"));
+        // Bioconductor tidy-omics packages attach dplyr/tidyr generics whose S3
+        // methods provide the object-specific data masks. The packages do not
+        // export `pkg::filter` / `pkg::pivot_longer`; only bare calls should route
+        // to the attached generic's NSE policy.
+        assert_eq!(meta_package_members("plyranges"), &["dplyr"]);
+        assert_eq!(
+            meta_package_members("tidySummarizedExperiment"),
+            &["dplyr", "tidyr", "ggplot2"]
+        );
+        assert_eq!(
+            meta_package_members("tidySingleCellExperiment"),
+            &["dplyr", "tidyr", "ggplot2"]
+        );
+        assert!(meta_package_members("tidybulk").is_empty());
         assert!(meta_package_members("dplyr").is_empty());
+    }
+
+    #[test]
+    fn bioc_tidy_omics_qualified_verbs_are_not_policy_aliases() {
+        // Current Bioconductor releases attach dplyr/tidyr generics and register
+        // S3 methods; they do not export qualified `pkg::filter` /
+        // `pkg::pivot_longer` aliases. Keep those namespace-qualified spellings
+        // standard-eval instead of inventing package-local policies.
+        assert_eq!(package_policy("plyranges", "filter"), None);
+        assert_eq!(package_policy("tidySummarizedExperiment", "filter"), None);
+        assert_eq!(package_policy("tidySingleCellExperiment", "mutate"), None);
+        assert_eq!(
+            package_policy("tidySummarizedExperiment", "pivot_longer"),
+            None
+        );
+        assert_eq!(package_policy("tidybulk", "filter"), None);
     }
 
     #[test]
