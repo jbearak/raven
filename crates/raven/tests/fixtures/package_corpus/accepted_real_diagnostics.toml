@@ -2422,3 +2422,212 @@ start_line = 78
 start_character = 0
 end_line = 78
 end_character = 11
+[[diagnostic]]
+package = "methods"
+path = "R/SClasses.R"
+message = "Undefined variable: fields"
+evidence = "inferProperties() has parameter `props` but error message references `fields` (should be `class(props)`)"
+
+[diagnostic.range]
+start_line = 1011
+start_character = 49
+end_line = 1011
+end_character = 55
+[[diagnostic]]
+package = "stats"
+path = "demo/smooth.R"
+message = "Undefined variable: x1"
+evidence = "x1 referenced at line 36 in for-loop argument, never defined anywhere in demo/smooth.R"
+
+[diagnostic.range]
+start_line = 35
+start_character = 14
+end_line = 35
+end_character = 16
+[[diagnostic]]
+package = "survival"
+path = "R/residuals.survfitcox.R"
+message = "Undefined variable: mf"
+evidence = "model.extract(mf, ...) called but `mf` is never computed in residuals.survfitcox()"
+
+[diagnostic.range]
+start_line = 130
+start_character = 37
+end_line = 130
+end_character = 39
+[[diagnostic]]
+package = "survival"
+path = "R/summary.survfit.R"
+message = "Undefined variable: newdata"
+evidence = "names(newdata) used but function has no `newdata` param; should be `names(fit$newdata)`"
+
+[diagnostic.range]
+start_line = 219
+start_character = 22
+end_line = 219
+end_character = 29
+[[diagnostic]]
+package = "survival"
+path = "R/summary.survfit.R"
+message = "Undefined variable: newdata"
+evidence = "second `newdata` reference on same line; should be `fit$newdata`"
+
+[diagnostic.range]
+start_line = 219
+start_character = 47
+end_line = 219
+end_character = 54
+[[diagnostic]]
+package = "survival"
+path = "R/survcallback.R"
+message = "Undefined variable: pcol"
+evidence = "Same pcol/pcols typo as survpenal.fit.R; entire file is dead code wrapped in if(FALSE)"
+
+[diagnostic.range]
+start_line = 63
+start_character = 22
+end_line = 63
+end_character = 26
+[[diagnostic]]
+package = "survival"
+path = "R/survcallback.R"
+message = "Undefined variable: nstrat2"
+evidence = "nstrat2 defined in survpenal.fit.R but not in this extracted stub; dead code wrapped in if(FALSE)"
+
+[diagnostic.range]
+start_line = 123
+start_character = 20
+end_line = 123
+end_character = 27
+[[diagnostic]]
+package = "survival"
+path = "R/survdiff.R"
+message = "Undefined variable: Call"
+evidence = "Line 2 defines `call` (lowercase) but line 13 references `Call` (uppercase); R is case-sensitive"
+
+[diagnostic.range]
+start_line = 12
+start_character = 29
+end_line = 12
+end_character = 33
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 276
+start_character = 13
+end_line = 276
+end_character = 23
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 281
+start_character = 16
+end_line = 281
+end_character = 26
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 332
+start_character = 8
+end_line = 332
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 392
+start_character = 8
+end_line = 392
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "R/survpenal.fit.R"
+message = "Undefined variable: pcol"
+evidence = "Line 165 reads `pcols[[i]]` (function param) but line 166 writes to `pcol[[i]]` - typo for `pcols`"
+
+[diagnostic.range]
+start_line = 165
+start_character = 22
+end_line = 165
+end_character = 26
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx1"
+evidence = "Typo for `sindx1`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 101
+start_character = 13
+end_line = 101
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx2"
+evidence = "Typo for `sindx2`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 102
+start_character = 13
+end_line = 102
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx3"
+evidence = "Typo for `sindx3`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 103
+start_character = 13
+end_line = 103
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx1"
+evidence = "Typo for `sindx1`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 104
+start_character = 13
+end_line = 104
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx2"
+evidence = "Typo for `sindx2`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 105
+start_character = 13
+end_line = 105
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx3"
+evidence = "Typo for `sindx3`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 106
+start_character = 13
+end_line = 106
+end_character = 18
