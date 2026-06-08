@@ -30478,17 +30478,6 @@ end_line = 105
 end_character = 33
 
 [[false_positive]]
-package = "hms"
-path = ".github/workflows/versions-matrix/action.R"
-message = "File not found: '.github/versions-matrix.R'"
-reason = "GitHub Actions script references file relative to runtime CWD, not workspace root"
-[false_positive.range]
-start_line = 31
-start_character = 12
-end_line = 31
-end_character = 47
-
-[[false_positive]]
 package = "httr"
 path = "R/oauth-token.r"
 message = "Undefined variable: self"
@@ -31095,28 +31084,6 @@ end_character = 8
 
 [[false_positive]]
 package = "lubridate"
-path = "R/ops-compare.r"
-message = "Undefined variable: .Generic"
-reason = "S3/S4 dispatch-provided variable"
-[false_positive.range]
-start_line = 19
-start_character = 63
-end_line = 19
-end_character = 71
-
-[[false_positive]]
-package = "lubridate"
-path = "R/ops-compare.r"
-message = "Undefined variable: .Generic"
-reason = "S3/S4 dispatch-provided variable"
-[false_positive.range]
-start_line = 54
-start_character = 13
-end_line = 54
-end_character = 21
-
-[[false_positive]]
-package = "lubridate"
 path = "R/vctrs.R"
 message = "Undefined variable: lubridate_shared_empty_period"
 reason = ".onLoad-populated package environment binding"
@@ -31719,17 +31686,6 @@ start_line = 111
 start_character = 47
 end_line = 111
 end_character = 49
-
-[[false_positive]]
-package = "pillar"
-path = ".github/workflows/versions-matrix/action.R"
-message = "File not found: '.github/versions-matrix.R'"
-reason = "GitHub Actions script references file relative to runtime CWD, not workspace root"
-[false_positive.range]
-start_line = 31
-start_character = 12
-end_line = 31
-end_character = 47
 
 [[false_positive]]
 package = "pillar"
@@ -35822,17 +35778,6 @@ start_line = 258
 start_character = 0
 end_line = 258
 end_character = 5
-
-[[false_positive]]
-package = "tibble"
-path = ".github/workflows/versions-matrix/action.R"
-message = "File not found: '.github/versions-matrix.R'"
-reason = "GitHub Actions script references file relative to runtime CWD, not workspace root"
-[false_positive.range]
-start_line = 31
-start_character = 12
-end_line = 31
-end_character = 47
 
 [[false_positive]]
 package = "tibble"

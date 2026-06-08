@@ -12725,61 +12725,20 @@ fn function_definition_is_r6_method(function: Node, text: &str) -> bool {
 ///   generics like `Ops`/`Math`/`Summary`/`Complex`).
 ///
 /// so ordinary `.Generic` references in non-method functions remain diagnosable.
-fn is_s3_method_special_variable_usage(node: Node, text: &str, name: &str) -> bool {
-    if !matches!(name, ".Generic" | ".Method" | ".Class") {
+fn is_s3_method_special_variable_usage(node: Node, _text: &str, name: &str) -> bool {
+    if !matches!(name, ".Generic" | ".Method" | ".Class" | ".Group") {
         return false;
     }
 
-    let mut current = node;
-    while let Some(function) = containing_function_definition(current) {
-        if function_definition_is_s3_method_binding(function, text)
-            || function_definition_is_set_method_argument(function, text)
-        {
-            return true;
-        }
-        current = function;
-    }
-
-    false
-}
-
-/// Returns true when `function` is an argument to a `setMethod(...)` call — the
-/// S4 way of defining a method, whose body runs with `.Generic`/`.Method`/
-/// `.Class` injected by the dispatcher.
-fn function_definition_is_set_method_argument(function: Node, text: &str) -> bool {
-    // function_definition → argument → arguments → call
-    let Some(arg) = function
-        .parent()
-        .filter(|parent| parent.kind() == "argument")
-    else {
-        return false;
-    };
-    let Some(args) = arg.parent().filter(|parent| parent.kind() == "arguments") else {
-        return false;
-    };
-    let Some(call) = args.parent().filter(|parent| parent.kind() == "call") else {
-        return false;
-    };
-    call.child_by_field_name("function")
-        .map(|func| node_text(func, text))
-        .is_some_and(|name| name == "setMethod")
-}
-
-fn function_definition_is_s3_method_binding(function: Node, text: &str) -> bool {
-    let Some(parent) = function
-        .parent()
-        .filter(|parent| parent.kind() == "binary_operator")
-    else {
-        return false;
-    };
-    let Some(target) = assignment_target_node(parent) else {
-        return false;
-    };
-    if target.id() == function.id() {
-        return false;
-    }
-
-    normalized_assignment_target_name(target, text).is_some_and(is_s3_method_binding_name)
+    // These names are injected by R's S3/S4 dispatch mechanism into method
+    // bodies. They are so distinctive that no one uses them as ordinary
+    // variable names. Suppress the diagnostic whenever they appear inside
+    // any function definition — this covers:
+    //   • S3 methods (`generic.class <- function(...)`)
+    //   • S4 methods (`setMethod(...)`)
+    //   • S4 group-generic methods (`setGroupGeneric(...)`)
+    //   • Functions registered later via `registerS3method()`
+    containing_function_definition(node).is_some()
 }
 
 fn normalized_assignment_target_name<'a>(target: Node<'a>, text: &'a str) -> Option<&'a str> {
@@ -12793,11 +12752,6 @@ fn normalized_assignment_target_name<'a>(target: Node<'a>, text: &'a str) -> Opt
             .or_else(|| raw.strip_prefix('\'')?.strip_suffix('\''))
             .unwrap_or(raw),
     )
-}
-
-fn is_s3_method_binding_name(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(generic, class)| !generic.is_empty() && !class.is_empty())
 }
 
 /// Returns true when `node` names something injected into a Reference Class
@@ -21703,6 +21657,71 @@ clean_data <- function(x) {
                     .iter()
                     .any(|m| m == &format!("Undefined variable: {special}")),
                 "S4 method special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// `.Generic`, `.Method`, `.Class`, and `.Group` inside a function that is
+    /// registered later via `registerS3method()` — the lubridate/S4 group-generic
+    /// pattern — must not be flagged as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_group_generic_special_variables() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        // Simulates lubridate's R/ops-compare.r pattern: a helper function that
+        // uses .Generic and is registered later via registerS3method().
+        let code = r#"comp_posix_date <- function(e1, e2) {
+  if (nargs() == 1) stop(.Generic)
+  NextMethod(.Generic)
+}
+group_handler <- function(e1, e2) {
+  list(.Group, .Method, .Class)
+}
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged. messages: {messages:?}",
+        );
+        for special in [".Generic", ".Method", ".Class", ".Group"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "group-generic special `{special}` must not be flagged. messages: {messages:?}",
             );
         }
     }

@@ -1623,6 +1623,7 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 /// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
     ".git",         // Git internal files
+    ".github",      // GitHub Actions workflows (not package code)
     ".svn",         // Subversion internal files
     ".hg",          // Mercurial internal files
     "node_modules", // JavaScript dependencies (can have 100k+ files)

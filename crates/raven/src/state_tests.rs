@@ -140,6 +140,25 @@ my_func <- function(x) { x + 1 }
         assert!(!is_stat_model_extension(Path::new("notes.txt")));
         assert!(!is_stat_model_extension(Path::new("README")));
     }
+
+    #[test]
+    fn test_scan_workspace_excludes_github_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let github_dir = temp_dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&github_dir).unwrap();
+        fs::write(github_dir.join("action.R"), "source('versions-matrix.R')").unwrap();
+        // A normal R file at root should still be found
+        fs::write(temp_dir.path().join("main.R"), "x <- 1").unwrap();
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let (index, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+
+        assert_eq!(index.len(), 1, "Only root main.R should be indexed, not .github/");
+        let uris: Vec<String> = index.keys().map(|u| u.to_string()).collect();
+        assert!(uris.iter().any(|u| u.contains("main.R")));
+        assert!(!uris.iter().any(|u| u.contains(".github")),
+            ".github/ R files must not be scanned");
+    }
 }
 
 
