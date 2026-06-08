@@ -108,21 +108,22 @@ fn parse_namespace_content(content: &str) -> Vec<String> {
 
 /// Collapse NAMESPACE directives that span multiple lines into single logical lines.
 ///
-/// Preserves comment-only lines (lines starting with `#`) as separate lines when they are
-/// not inside a parenthesized directive. If a directive's parentheses never close, the
-/// accumulated line is emitted as-is at the end.
+/// Drops comments outside quoted strings before joining, so comments inside a
+/// parenthesized directive do not become part of the next argument token. If a
+/// directive's parentheses never close, the accumulated line is emitted as-is at
+/// the end.
 fn normalize_multiline_directives(content: &str) -> String {
     let mut result = String::new();
     let mut current_line = String::new();
     let mut paren_depth: i32 = 0;
 
     for line in content.lines() {
-        let trimmed = line.trim();
+        let trimmed = strip_comment_outside_quotes(line).trim();
 
-        // Skip comment-only lines when not inside a directive
-        if paren_depth == 0 && trimmed.starts_with('#') {
-            result.push_str(trimmed);
-            result.push('\n');
+        // Skip blank and comment-only lines. Inside a directive, comments are
+        // not arguments; keeping them would glue the comment text to the next
+        // export token (e.g. `# Listing` + `"grid.ls"`).
+        if trimmed.is_empty() {
             continue;
         }
 
@@ -160,6 +161,33 @@ fn normalize_multiline_directives(content: &str) -> String {
     result
 }
 
+/// Strip an R-style comment from a NAMESPACE line, preserving `#` characters
+/// that occur inside single- or double-quoted strings.
+fn strip_comment_outside_quotes(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in line.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '#' => return &line[..idx],
+            _ => {}
+        }
+    }
+
+    line
+}
 /// Extracts the argument text for a directive like `export(arg1, arg2)`.
 ///
 /// Returns the string between the directive's outer parentheses if the given line
@@ -775,6 +803,24 @@ export(
 "#;
         let exports = parse_namespace_content(content);
         assert_eq!(exports, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn test_parse_namespace_export_multiline_with_comments() {
+        let content = r##"
+export(
+    "as.mask",
+    # Listing grobs and viewports
+    "grid.ls",
+    "grid.grep",
+    "literal#hash"
+)
+"##;
+        let exports = parse_namespace_content(content);
+        assert_eq!(
+            exports,
+            vec!["as.mask", "grid.ls", "grid.grep", "literal#hash"]
+        );
     }
 
     #[test]

@@ -113,6 +113,17 @@ pub(crate) fn base_policy(name: &str) -> Option<ArgPolicy> {
         "alist" => ArgPolicy::WholeCall,
         "evalq" => ArgPolicy::per_formal(&["expr", "envir", "enclos"], &["expr"], false),
         "on.exit" => ArgPolicy::per_formal(&["expr", "add", "after"], &["expr"], false),
+        // Native-code interfaces: the first argument is a native routine name
+        // or string, not a normal R variable reference; later arguments are
+        // evaluated and passed through to the routine.
+        ".Call" | ".Call.graphics" | ".External" | ".External2" | ".External.graphics" => {
+            ArgPolicy::per_formal(&[".NAME", "...", "PACKAGE"], &[".NAME"], false)
+        }
+        ".C" | ".Fortran" => ArgPolicy::per_formal(
+            &[".NAME", "...", "NAOK", "DUP", "PACKAGE", "ENCODING"],
+            &[".NAME"],
+            false,
+        ),
         // `curve(sin(x), 0, 1)`: the expression is evaluated against an implicit
         // `x`, so capture it but check the numeric range/control arguments.
         "curve" => ArgPolicy::per_formal(&["expr", "from", "to", "n"], &["expr"], false),
@@ -282,6 +293,16 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
         "gt" => gt_policy(name)?,
         "gtsummary" => gtsummary_policy(name)?,
         "recipes" => recipes_policy(name)?,
+        "htmltools" => match name {
+            "withTags" => ArgPolicy::per_formal(&["code"], &["code"], false),
+            _ => return None,
+        },
+        "grid" => match name {
+            "grid.Call" | "grid.Call.graphics" => {
+                ArgPolicy::per_formal(&["fnname", "..."], &["fnname"], false)
+            }
+            _ => return None,
+        },
         "dbplyr" => match name {
             // window_order(.data, ...): the ordering columns in `...` are
             // data-masked (a bare undefined symbol there errors "not found");
@@ -1237,6 +1258,12 @@ mod tests {
         let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
         assert_eq!(mask, vec![true, true]);
     }
+    #[test]
+    fn htmltools_with_tags_captures_tag_expression() {
+        let p = package_policy("htmltools", "withTags").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None]), false);
+        assert_eq!(mask, vec![true]);
+    }
 
     #[test]
     fn rlang_enquo_captures_single_arg() {
@@ -1304,6 +1331,36 @@ mod tests {
                 base_policy(name).is_none(),
                 "{name} should be standard-eval"
             );
+        }
+    }
+    #[test]
+    fn native_interfaces_capture_routine_name_only() {
+        for name in [
+            ".Call",
+            ".Call.graphics",
+            ".C",
+            ".Fortran",
+            ".External",
+            ".External2",
+            ".External.graphics",
+        ] {
+            let policy = base_policy(name).unwrap_or_else(|| panic!("{name} should have a policy"));
+            // .Call(C_symbol, evaluated_arg, PACKAGE = "pkg"): the native
+            // routine name is special; regular arguments remain standard-eval.
+            let mask =
+                suppressed_arguments(&policy, &labels(&[None, None, Some("PACKAGE")]), false);
+            assert_eq!(mask, vec![true, false, false], "{name}");
+            assert_eq!(package_policy("base", name), base_policy(name));
+        }
+    }
+
+    #[test]
+    fn grid_native_wrappers_capture_routine_name_only() {
+        for name in ["grid.Call", "grid.Call.graphics"] {
+            let policy = package_policy("grid", name)
+                .unwrap_or_else(|| panic!("{name} should have a policy"));
+            let mask = suppressed_arguments(&policy, &labels(&[None, None]), false);
+            assert_eq!(mask, vec![true, false], "{name}");
         }
     }
 

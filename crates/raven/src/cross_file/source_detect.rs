@@ -313,6 +313,9 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
     if func_text != "rm" && func_text != "remove" {
         return None;
     }
+    if call_is_internal_routine_argument(node, content) {
+        return None;
+    }
 
     let args_node = node.child_by_field_name("arguments")?;
 
@@ -342,6 +345,63 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
         line: start.row as u32,
         column,
         symbols,
+    })
+}
+
+/// True for the routine call nested as `.Internal(<routine>(...))`.
+///
+/// The nested call head names a hidden C entry point, not an R binding. For
+/// rm/remove detection that means `.Internal(remove(list, envir, inherits))`
+/// is the implementation of `rm()`/`remove()`, not a user-level removal call.
+fn call_is_internal_routine_argument(call_node: Node, content: &str) -> bool {
+    if call_node.kind() != "call" {
+        return false;
+    }
+    let Some(arg) = call_node.parent().filter(|node| node.kind() == "argument") else {
+        return false;
+    };
+    if arg.child_by_field_name("name").is_some() {
+        return false;
+    }
+    if !arg
+        .child_by_field_name("value")
+        .is_some_and(|value| value.id() == call_node.id())
+    {
+        return false;
+    }
+    let Some(args) = arg.parent().filter(|node| node.kind() == "arguments") else {
+        return false;
+    };
+    if !first_positional_arg_value(args).is_some_and(|value| value.id() == call_node.id()) {
+        return false;
+    }
+    let Some(outer_call) = args.parent().filter(|node| node.kind() == "call") else {
+        return false;
+    };
+    outer_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, content))
+        == Some(".Internal")
+}
+
+/// The leaf callee name of a call's `function` field.
+fn callee_leaf_name<'t>(func: Node<'t>, content: &'t str) -> Option<&'t str> {
+    match func.kind() {
+        "identifier" => Some(node_text(func, content)),
+        "namespace_operator" => func
+            .child_by_field_name("rhs")
+            .map(|rhs| node_text(rhs, content)),
+        _ => None,
+    }
+}
+
+/// The value node of a call's first positional argument, if any.
+fn first_positional_arg_value(args: Node) -> Option<Node> {
+    let mut cursor = args.walk();
+    args.children(&mut cursor).find_map(|child| {
+        (child.kind() == "argument" && child.child_by_field_name("name").is_none())
+            .then(|| child.child_by_field_name("value"))
+            .flatten()
     })
 }
 
@@ -1434,6 +1494,17 @@ source("b.R")"#;
         let rm_calls = detect_rm_calls(&tree, code);
         assert_eq!(rm_calls.len(), 1);
         assert_eq!(rm_calls[0].symbols, vec!["a", "b", "c"]);
+    }
+    #[test]
+    fn test_internal_remove_routine_call_ignored() {
+        // In base/R/rm.R, `.Internal(remove(list, envir, inherits))`
+        // names the C entry point used to implement rm()/remove(); it is
+        // not an R-level `remove()` call and must not remove `envir` from
+        // the surrounding function scope.
+        let code = ".Internal(remove(list, envir, inherits))";
+        let tree = parse_r(code);
+        let rm_calls = detect_rm_calls(&tree, code);
+        assert_eq!(rm_calls.len(), 0);
     }
 
     #[test]

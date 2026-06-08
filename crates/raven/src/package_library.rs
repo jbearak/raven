@@ -1284,9 +1284,16 @@ impl PackageLibrary {
             log::trace!("Warning: No library paths found, package loading will fail");
         }
 
-        // Step 2: Use hardcoded base packages list (always reliable)
-        let base_packages_list = crate::r_subprocess::get_fallback_base_packages();
-        self.base_packages = base_packages_list.iter().cloned().collect();
+        // Step 2: Use hardcoded base packages list (always reliable). Only
+        // the default-attached seven seed `base_exports`; the full
+        // base-priority set still needs per-package cache entries so
+        // `library(grid)` / `library(tools)` resolve synchronously.
+        let attached_base_packages: HashSet<String> =
+            crate::r_subprocess::get_fallback_base_packages()
+                .into_iter()
+                .collect();
+        self.base_packages = attached_base_packages.clone();
+        let base_priority_packages = crate::r_subprocess::get_base_priority_packages();
 
         // Step 3: Load base package exports statically with INDEX fallback
         // Base packages use exportPattern, but INDEX file provides documented exports
@@ -1296,10 +1303,11 @@ impl PackageLibrary {
         let mut per_package_depends: HashMap<String, Vec<String>> = HashMap::new();
         let mut pattern_packages: Vec<String> = Vec::new();
 
-        for package in &base_packages_list {
+        for package in &base_priority_packages {
             if let Some(pkg_dir) = self.find_package_directory(package)
                 && let Some(parse_result) = self.parse_package_static(&pkg_dir)
             {
+                let is_attached_base = attached_base_packages.contains(package);
                 let pkg_exports = per_package_exports.entry(package.clone()).or_default();
                 // Preserve depends from DESCRIPTION for transitive dependency resolution
                 if !parse_result.depends.is_empty() {
@@ -1307,7 +1315,9 @@ impl PackageLibrary {
                 }
                 // Add explicit exports
                 for export in &parse_result.explicit_exports {
-                    all_base_exports.insert(export.clone());
+                    if is_attached_base {
+                        all_base_exports.insert(export.clone());
+                    }
                     pkg_exports.insert(export.clone());
                 }
 
@@ -1316,7 +1326,9 @@ impl PackageLibrary {
                     let index_exports =
                         self.load_with_index_fallback(&pkg_dir, &parse_result).await;
                     for export in &index_exports {
-                        all_base_exports.insert(export.clone());
+                        if is_attached_base {
+                            all_base_exports.insert(export.clone());
+                        }
                         pkg_exports.insert(export.clone());
                     }
                     pattern_packages.push(package.clone());
@@ -1337,7 +1349,9 @@ impl PackageLibrary {
                     .unwrap_or(false);
                 if has_real_data_dir {
                     for sym in parse_data_symbols(&pkg_dir).await {
-                        all_base_exports.insert(sym.clone());
+                        if is_attached_base {
+                            all_base_exports.insert(sym.clone());
+                        }
                         pkg_exports.insert(sym);
                     }
                     // INDEX entries are documented topic names — for
@@ -1349,7 +1363,9 @@ impl PackageLibrary {
                         && let Ok(index_exports) = parse_index_exports(&pkg_dir).await
                     {
                         for export in &index_exports {
-                            all_base_exports.insert(export.clone());
+                            if is_attached_base {
+                                all_base_exports.insert(export.clone());
+                            }
                             pkg_exports.insert(export.clone());
                         }
                     }
@@ -1372,9 +1388,12 @@ impl PackageLibrary {
             {
                 Ok(exports_map) => {
                     for (pkg_name, exports) in exports_map {
+                        let is_attached_base = attached_base_packages.contains(&pkg_name);
                         let pkg_exports = per_package_exports.entry(pkg_name).or_default();
                         for export in exports {
-                            all_base_exports.insert(export.clone());
+                            if is_attached_base {
+                                all_base_exports.insert(export.clone());
+                            }
                             pkg_exports.insert(export);
                         }
                     }
@@ -5459,6 +5478,52 @@ mod tests {
         assert!(
             tidyr.exports.contains("pivot_longer"),
             "Tier-3-only package still resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_caches_library_only_base_priority_packages_from_disk() {
+        let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lib_root = dir.path().join("lib");
+        std::fs::create_dir_all(&lib_root).unwrap();
+        let _user_data_guard =
+            crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
+
+        let base_dir = lib_root.join("base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("DESCRIPTION"),
+            "Package: base\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base_dir.join("INDEX"),
+            "print                   Print Values\n",
+        )
+        .unwrap();
+
+        let grid_dir = lib_root.join("grid");
+        std::fs::create_dir_all(&grid_dir).unwrap();
+        std::fs::write(
+            grid_dir.join("DESCRIPTION"),
+            "Package: grid\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(grid_dir.join("NAMESPACE"), "export(grid.ls)\n").unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root]);
+        lib.initialize().await.unwrap();
+
+        assert!(lib.is_base_export("print"));
+        assert!(
+            !lib.is_base_export("grid.ls"),
+            "grid exports require library(grid); they must not be globally in scope"
+        );
+        assert!(
+            lib.is_symbol_from_loaded_packages("grid.ls", &["grid".to_string()]),
+            "library(grid) should resolve grid.ls from the initialized cache"
         );
     }
 

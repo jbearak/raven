@@ -1943,6 +1943,29 @@ fn collect_definitions(
             .insert(symbol.name.clone(), symbol);
     }
 
+    // Check for load("name.rda") calls. R's load() restores objects into the
+    // current environment; many package tests use the convention that the RData
+    // file stem is the restored object name. Model only that narrow, static
+    // shape so common fixtures like load("anorexia.rda"); anorexia resolve
+    // without broadly suppressing unknown post-load names.
+    if node.kind() == "call"
+        && let Some((symbol, visible_line, visible_column)) =
+            try_extract_literal_load_call_definition(node, line_index, uri)
+    {
+        let event = ScopeEvent::Def {
+            line: symbol.defined_line,
+            column: symbol.defined_column,
+            visible_from_line: visible_line,
+            visible_from_column: visible_column,
+            symbol: symbol.clone(),
+            function_scope: None,
+        };
+        artifacts.timeline.push(event);
+        artifacts
+            .exported_interface
+            .insert(symbol.name.clone(), symbol);
+    }
+
     // Check for for loop iterators.
     //
     // For-loop iterators are bound *before* the body executes, and the
@@ -2530,6 +2553,113 @@ fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Opt
     })
 }
 
+/// Extract the conventional object name restored by a literal `load()` call.
+///
+/// This intentionally models only the common, statically-safe shape where the
+/// first argument (or named `file=` argument) is a string literal and no
+/// explicit `envir=` redirects the load target. The inferred object name is the
+/// file stem when that stem is a valid unquoted R identifier.
+fn try_extract_literal_load_call_definition(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Option<(ScopedSymbol, u32, u32)> {
+    let func_node = node.child_by_field_name("function")?;
+    if node_text(func_node, line_index.text) != "load" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    let mut file_arg = None;
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            let arg_name = node_text(name_node, line_index.text);
+            if arg_name == "envir" {
+                return None;
+            }
+            if arg_name == "file" {
+                file_arg = child.child_by_field_name("value");
+            }
+        } else if file_arg.is_none() {
+            file_arg = child.child_by_field_name("value");
+        }
+    }
+
+    let file_node = file_arg?;
+    if file_node.kind() != "string" {
+        return None;
+    }
+    let file_literal = string_literal_content(file_node, line_index.text)?;
+    let stem = file_stem_from_literal(file_literal)?;
+    if !is_valid_unquoted_r_identifier(stem) || crate::reserved_words::is_reserved_word(stem) {
+        return None;
+    }
+
+    let (line, column) = node_start_position_utf16(node, line_index);
+    let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+    let symbol = ScopedSymbol {
+        name: Arc::from(stem),
+        kind: SymbolKind::Variable,
+        source_uri: uri.clone(),
+        defined_line: line,
+        defined_column: column,
+        signature: None,
+        is_declared: false,
+    };
+
+    Some((symbol, visible_line, visible_column))
+}
+
+fn string_literal_content<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str> {
+    let raw = node_text(node, content).trim();
+    raw.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+}
+
+fn file_stem_from_literal(path: &str) -> Option<&str> {
+    let file_name = path.rsplit(['/', '\\']).next()?.trim();
+    if file_name.is_empty() {
+        return None;
+    }
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    (!stem.is_empty()).then_some(stem)
+}
+
+fn assignment_identifier_name<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str> {
+    let raw = node_text(node, content).trim();
+    if let Some(unquoted) = raw.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+        return (!unquoted.is_empty()).then_some(unquoted);
+    }
+    if node.kind() == "string" {
+        return string_literal_content(node, content).filter(|name| !name.is_empty());
+    }
+    (node.kind() == "identifier").then_some(raw)
+}
+
+fn is_valid_unquoted_r_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '.' {
+        return false;
+    }
+    if first == '.'
+        && let Some(second) = chars.clone().next()
+        && second.is_ascii_digit()
+    {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_')
+}
+
 /// Extract loop iterator from for_statement nodes.
 /// In R, loop iterators persist after the loop completes.
 fn try_extract_for_loop_iterator(
@@ -2581,10 +2711,7 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
 
     // Handle -> and ->> operators: RHS is the name, LHS is the value
     if matches!(op_text, "->" | "->>") {
-        if rhs.kind() != "identifier" {
-            return None;
-        }
-        let name_str = node_text(rhs, line_index.text);
+        let name_str = assignment_identifier_name(rhs, line_index.text)?;
 
         // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
         if crate::reserved_words::is_reserved_word(name_str) {
@@ -2624,10 +2751,7 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
     }
 
     // Get the left-hand side (name)
-    if lhs.kind() != "identifier" {
-        return None;
-    }
-    let name_str = node_text(lhs, line_index.text);
+    let name_str = assignment_identifier_name(lhs, line_index.text)?;
 
     // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
     if crate::reserved_words::is_reserved_word(name_str) {
@@ -11620,6 +11744,24 @@ outside_var <- 2"#;
         assert_eq!(package_load_events[0], "dplyr");
     }
 
+    #[test]
+    fn test_literal_load_rda_declares_file_stem_after_call() {
+        let code = "load(\"anorexia.rda\")\nfit <- lm(y ~ x, data = anorexia)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let before = scope_at_position(&artifacts, 0, 0, false);
+        assert!(
+            !before.symbols.contains_key("anorexia"),
+            "load() should not declare the object before the call executes"
+        );
+
+        let after = scope_at_position(&artifacts, 1, 27, false);
+        assert!(
+            after.symbols.contains_key("anorexia"),
+            "literal load(\"anorexia.rda\") should declare the common RData object name"
+        );
+    }
     #[test]
     fn test_package_load_timeline_sorted() {
         // Test that PackageLoad events are sorted correctly in the timeline with other events

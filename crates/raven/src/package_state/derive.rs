@@ -254,10 +254,19 @@ fn effective_workspace(inputs: &PackageInputs) -> Option<PackageWorkspace> {
         .as_ref()
         .and_then(|d| parse_dcf_field_pub(&d.text, "Package"))
         .filter(|s| !s.is_empty());
+    let has_namespace_and_sources = inputs.namespace.is_some()
+        && inputs
+            .r_files
+            .values()
+            .any(|file| file.kind == RFileKind::Source);
     match (inputs.package_mode, parsed_name.as_deref()) {
         (PackageMode::Disabled, _) => None,
         (PackageMode::Auto, Some(name)) => Some(PackageWorkspace {
             name: name.to_string(),
+            root: root.clone(),
+        }),
+        (PackageMode::Auto, None) if has_namespace_and_sources => Some(PackageWorkspace {
+            name: "unknown".to_string(),
             root: root.clone(),
         }),
         (PackageMode::Auto, None) => None,
@@ -310,6 +319,30 @@ mod tests {
             &PackageInputDelta::Initial,
         );
         assert!(s.workspace.is_none());
+    }
+    #[test]
+    fn auto_with_namespace_and_source_yields_workspace() {
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.namespace = Some(NamespaceInput {
+            text: "export(foo)\n".into(),
+        });
+        let text: Arc<str> = "foo <- function() 1\n".into();
+        inputs.r_files.insert(
+            "/work/pkg/R/foo.R".into(),
+            RFileInput {
+                kind: RFileKind::Source,
+                content_digest: ContentDigest::of(&text),
+                text,
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
     }
 
     #[test]

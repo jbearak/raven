@@ -1,0 +1,135 @@
+# Accepted real diagnostics observed in the real-package corpus.
+#
+# False positives do not belong here. Add a TDD Raven regression and fix them
+# instead. For a real diagnostic, first make a minimal edit in the temp package
+# checkout that removes the diagnostic, then record that evidence in this file.
+
+[[diagnostic]]
+package = "base"
+path = "R/RNG.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around the right-hand `&&` clause: `vnum[1L] == 0 || (vnum[1L] == 1 && vnum[2L] <= 6)`."
+[diagnostic.range]
+start_line = 131
+start_character = 27
+end_line = 131
+end_character = 29
+
+[[diagnostic]]
+package = "base"
+path = "R/RNG.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around the right-hand `&&` clause: `vnum[1L] <= 2 || (vnum[1L] == 3 && vnum[2L] <= 5)`."
+[diagnostic.range]
+start_line = 133
+start_character = 27
+end_line = 133
+end_character = 29
+
+[[diagnostic]]
+package = "base"
+path = "R/all.equal.R"
+message = "Assigning to string literal \"__all.eq.E__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__all.eq.E__` <- environment() ``."
+[diagnostic.range]
+start_line = 268
+start_character = 1
+end_line = 268
+end_character = 15
+
+[[diagnostic]]
+package = "base"
+path = "R/character.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around `li$codepage >= 1250L && li$codepage <= 1258L` before the `|| li$codepage == 874L` branch."
+[diagnostic.range]
+start_line = 137
+start_character = 19
+end_line = 137
+end_character = 21
+
+[[diagnostic]]
+package = "base"
+path = "R/character.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around `li$codepage >= 1250L && li$codepage <= 1258L` before the `|| li$codepage == 874L` branch."
+[diagnostic.range]
+start_line = 169
+start_character = 20
+end_line = 169
+end_character = 22
+
+[[diagnostic]]
+package = "base"
+path = "R/dataframe.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around both mixed operands: `(char.i && nextra) || (all(i >= 0L) && (nn <- max(i)) > nrows)`."
+[diagnostic.range]
+start_line = 864
+start_character = 23
+end_line = 864
+end_character = 25
+
+[[diagnostic]]
+package = "base"
+path = "R/library.R"
+message = "Assigning to string literal \"__library_can_mask__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__library_can_mask__` <- canMaskEnv ``."
+[diagnostic.range]
+start_line = 342
+start_character = 20
+end_line = 342
+end_character = 42
+
+[[diagnostic]]
+package = "base"
+path = "R/match.fun.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around the character/function disjunction: `((is.character(FUN) && length(FUN) == 1L) || is.symbol(FUN))`."
+[diagnostic.range]
+start_line = 25
+start_character = 49
+end_line = 25
+end_character = 51
+
+[[diagnostic]]
+package = "base"
+path = "R/namespace.R"
+message = "Assigning to string literal \"__NameSpacesLoading__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__NameSpacesLoading__` <- c(package, loading) ``."
+[diagnostic.range]
+start_line = 194
+start_character = 4
+end_line = 194
+end_character = 27
+
+[[diagnostic]]
+package = "base"
+path = "R/namespace.R"
+message = "Assigning to string literal \"__LoadingNamespaceInfo__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__LoadingNamespaceInfo__` <- list(...) ``."
+[diagnostic.range]
+start_line = 558
+start_character = 8
+end_line = 558
+end_character = 34

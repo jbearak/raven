@@ -1107,6 +1107,64 @@ mod tests {
         // A clean cross-file reference must not trip any diagnostic.
         assert_eq!(run_blocking(args), EXIT_OK);
     }
+    #[test]
+    fn namespace_only_package_root_gets_package_internal_scope() {
+        // R's base-priority package sources use package-like roots with
+        // NAMESPACE and R/ but no generated DESCRIPTION. Auto package mode must
+        // still inject package-internal symbols for those workspaces, otherwise
+        // sibling helpers in R/*.R are reported as undefined throughout the
+        // corpus.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(tmp.path().join("NAMESPACE"), "export(helper_fn)\n").unwrap();
+        fs::write(
+            tmp.path().join("R/helper.R"),
+            "helper_fn <- function(x) x + 1\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("R/main.R"), "result <- helper_fn(41)\n").unwrap();
+
+        let args = base_args(tmp.path());
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message.contains("Undefined variable: helper_fn")),
+            "NAMESPACE + R/ without DESCRIPTION should still enable package-internal \
+             scope. Diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn base_priority_attached_package_exports_resolve_in_check() {
+        // `grid` is a base-priority package shipped with R but not attached by
+        // default. `raven check` must still resolve its exports after an
+        // explicit `library(grid)` call; otherwise package tests that use
+        // grid helpers like `grid.ls()` produce false undefined-variable
+        // diagnostics.
+        let Some(_) = crate::r_subprocess::RSubprocess::new(None) else {
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("main.R"), "library(grid)\ngrid.ls()\n").unwrap();
+
+        let args = base_args(tmp.path());
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message == "Undefined variable: grid.ls"),
+            "`library(grid)` must make `grid.ls` available to `raven check`. Diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn clean_file_exits_ok() {

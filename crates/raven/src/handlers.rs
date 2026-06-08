@@ -66,6 +66,15 @@ impl DiagCancelToken {
     }
 }
 
+fn reference_class_field_accessor_matches(field: &str, name: &str) -> bool {
+    let mut chars = field.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let suffix = format!("{}{}", first.to_ascii_uppercase(), chars.as_str());
+    name == format!("get{suffix}") || name == format!("set{suffix}")
+}
+
 // ============================================================================
 // Diagnostics Snapshot
 // ============================================================================
@@ -5422,6 +5431,38 @@ fn collect_undefined_variables_from_snapshot(
             map
         })
         .unwrap_or_default();
+    // Precompute function-local definitions by name for the nested-closure
+    // late-binding check. A closure body can textually reference a binding that
+    // is installed later in an enclosing function before the closure is called
+    // (base::tryCatch's `tryCatchList` -> `tryCatchOne` is the motivating
+    // package-corpus case). Same-function forward uses remain diagnostics.
+    let function_defs_by_name: HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> =
+        snapshot
+            .artifacts_map
+            .get(uri)
+            .map(|artifacts| {
+                let mut map: HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> =
+                    HashMap::new();
+                for event in &artifacts.timeline {
+                    if let scope::ScopeEvent::Def {
+                        symbol,
+                        function_scope: Some(function_scope),
+                        ..
+                    } = event
+                    {
+                        map.entry(symbol.name.to_string()).or_default().push((
+                            *function_scope,
+                            symbol.defined_line,
+                            symbol.defined_column,
+                        ));
+                    }
+                }
+                for defs in map.values_mut() {
+                    defs.sort_by_key(|(_, line, col)| (*line, *col));
+                }
+                map
+            })
+            .unwrap_or_default();
 
     let parent_symbol_names: HashSet<String> = {
         scope_cache
@@ -5516,8 +5557,23 @@ fn collect_undefined_variables_from_snapshot(
         if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, usage_line) {
             continue;
         }
+        let unquoted_usage_name = unquote_backtick_name(&name).map(str::to_string);
+        let replacement_function_name = replacement_function_name_for_lhs_call(&name, usage_node);
+        if replacement_function_name.as_deref().is_some_and(is_builtin) {
+            continue;
+        }
 
         if is_builtin(&name) {
+            continue;
+        }
+        if is_implicit_search_path_binding(&name) {
+            continue;
+        }
+        if is_s3_method_special_variable_usage(usage_node, text, &name) {
+            continue;
+        }
+        if is_reference_class_method_special_variable_usage(usage_node, text, &name, &nse_analysis)
+        {
             continue;
         }
 
@@ -5550,6 +5606,34 @@ fn collect_undefined_variables_from_snapshot(
         if parent_symbol_names.contains(name.as_str()) {
             continue;
         }
+        if unquoted_usage_name
+            .as_deref()
+            .is_some_and(|unquoted| parent_symbol_names.contains(unquoted))
+        {
+            continue;
+        }
+
+        if default_expression_resolves_lazily(
+            usage_node,
+            text,
+            &name,
+            usage_line,
+            usage_col_utf16,
+            &top_level_defs_by_name,
+        ) {
+            continue;
+        }
+        if let Some((_, function_scope_tree)) = &local_opt
+            && nested_closure_late_binding_resolves(
+                &name,
+                usage_line,
+                usage_col_utf16,
+                function_scope_tree,
+                &function_defs_by_name,
+            )
+        {
+            continue;
+        }
 
         // Advance the stream cursor and query visibility. Fall back to
         // the legacy snapshot.get_scope path if stream construction
@@ -5561,7 +5645,12 @@ fn collect_undefined_variables_from_snapshot(
             // `symbol_for` walk is cheaper than materializing a full
             // ScopeAtPosition because it short-circuits on the first
             // matching frame.
-            if let Some(sym) = stream.symbol_for(&name)
+            let stream_symbol = stream.symbol_for(&name).or_else(|| {
+                unquoted_usage_name
+                    .as_deref()
+                    .and_then(|unquoted| stream.symbol_for(unquoted))
+            });
+            if let Some(sym) = stream_symbol
                 && !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16)
             {
                 continue;
@@ -5588,6 +5677,30 @@ fn collect_undefined_variables_from_snapshot(
         // before the snapshot materialization).
         if stream_opt.is_none()
             && let Some(sym) = scope.symbols.get(name.as_str())
+            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+        {
+            continue;
+        }
+        if stream_opt.is_none()
+            && let Some(sym) = unquoted_usage_name
+                .as_deref()
+                .and_then(|unquoted| scope.symbols.get(unquoted))
+            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+        {
+            continue;
+        }
+        let replacement_backtick_name = replacement_function_name
+            .as_ref()
+            .map(|name| format!("`{name}`"));
+        let replacement_symbol = replacement_function_name
+            .as_deref()
+            .and_then(|name| scope.symbols.get(name))
+            .or_else(|| {
+                replacement_backtick_name
+                    .as_deref()
+                    .and_then(|name| scope.symbols.get(name))
+            });
+        if let Some(sym) = replacement_symbol
             && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
         {
             continue;
@@ -5755,6 +5868,27 @@ fn assignment_target_node(binop: Node) -> Option<Node> {
     }
 }
 
+/// If `name` is the call head in replacement syntax (`name(x) <- value`),
+/// return the actual binding R resolves (`name<-`).
+fn replacement_function_name_for_lhs_call(name: &str, node: Node) -> Option<String> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let call = node.parent().filter(|parent| parent.kind() == "call")?;
+    if call
+        .child_by_field_name("function")
+        .is_none_or(|function| function.id() != node.id())
+    {
+        return None;
+    }
+    let parent = call
+        .parent()
+        .filter(|parent| parent.kind() == "binary_operator")?;
+    assignment_target_node(parent)
+        .is_some_and(|target| target.id() == call.id())
+        .then(|| format!("{name}<-"))
+}
+
 /// Returns true for the *non-definition* structural non-references: identifiers
 /// that name an argument, parameter, member, or namespace rather than binding or
 /// plainly referencing a value — named-argument labels (`n` in `f(n = 1)`),
@@ -5918,6 +6052,127 @@ fn containing_default_parameter(node: Node) -> Option<Node> {
         current = parent;
     }
     None
+}
+
+/// True when a default-expression identifier can be resolved only through R's
+/// lazy default-argument semantics, rather than by ordinary source-order scope.
+///
+/// Defaults are promises evaluated in the eventual call frame, not when the
+/// function is defined. That means two otherwise-forward references are valid:
+/// a top-level helper declared later in the same file, and a binding created in
+/// the containing function body before the promise is forced. This is still
+/// evidence-based: a genuinely missing default name remains diagnosable.
+fn default_expression_resolves_lazily(
+    node: Node,
+    text: &str,
+    name: &str,
+    usage_line: u32,
+    usage_col_utf16: u32,
+    top_level_defs_by_name: &HashMap<String, Vec<(u32, u32)>>,
+) -> bool {
+    if containing_default_parameter(node).is_none() {
+        return false;
+    }
+
+    if top_level_defs_by_name.get(name).is_some_and(|positions| {
+        positions
+            .iter()
+            .any(|&(line, col)| (line, col) > (usage_line, usage_col_utf16))
+    }) {
+        return true;
+    }
+
+    containing_function_definition(node)
+        .and_then(function_body_node)
+        .is_some_and(|body| function_body_binds_name(body, text, name))
+}
+
+/// True when a usage inside a nested closure can resolve `name` from a later
+/// binding in an active enclosing function scope.
+///
+/// This intentionally excludes same-function forward uses: `f <- function() {
+/// later(); later <- function() 1 }` still runs `later()` before the binding is
+/// installed. It only covers nested closures whose body is textually before a
+/// sibling binding in an enclosing function, because R resolves closure free
+/// variables at call time through that enclosing environment.
+fn nested_closure_late_binding_resolves(
+    name: &str,
+    usage_line: u32,
+    usage_col_utf16: u32,
+    function_scope_tree: &scope::FunctionScopeTree,
+    function_defs_by_name: &HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>>,
+) -> bool {
+    let active_scopes =
+        function_scope_tree.query_point(scope::Position::new(usage_line, usage_col_utf16));
+    if active_scopes.len() < 2 {
+        return false;
+    }
+    let Some(innermost) = innermost_function_scope(&active_scopes) else {
+        return false;
+    };
+    function_defs_by_name.get(name).is_some_and(|defs| {
+        defs.iter().any(|(def_scope, def_line, def_col)| {
+            (*def_line, *def_col) > (usage_line, usage_col_utf16)
+                && *def_scope != innermost
+                && function_scope_contains(*def_scope, innermost)
+        })
+    })
+}
+
+fn innermost_function_scope(
+    scopes: &[scope::FunctionScopeInterval],
+) -> Option<scope::FunctionScopeInterval> {
+    scopes.iter().copied().find(|candidate| {
+        !scopes
+            .iter()
+            .any(|other| *other != *candidate && function_scope_contains(*candidate, *other))
+    })
+}
+
+fn function_scope_contains(
+    ancestor: scope::FunctionScopeInterval,
+    descendant: scope::FunctionScopeInterval,
+) -> bool {
+    ancestor.start <= descendant.start && descendant.end <= ancestor.end
+}
+
+fn containing_function_definition(node: Node) -> Option<Node> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
+fn function_body_binds_name(node: Node, text: &str, name: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "function_definition" {
+            continue;
+        }
+
+        if assignment_target_node(child)
+            .is_some_and(|target| target.kind() == "identifier" && node_text(target, text) == name)
+        {
+            return true;
+        }
+
+        if child.kind() == "for_statement"
+            && child
+                .child_by_field_name("variable")
+                .is_some_and(|var| var.kind() == "identifier" && node_text(var, text) == name)
+        {
+            return true;
+        }
+
+        if function_body_binds_name(child, text, name) {
+            return true;
+        }
+    }
+    false
 }
 
 fn parameter_node_name<'a>(node: Node<'a>, text: &'a str) -> Option<&'a str> {
@@ -11183,6 +11438,14 @@ enum DataTableClass {
     Unknown,
 }
 
+#[derive(Clone, Default)]
+struct ReferenceClassInfo {
+    class_name: Option<String>,
+    contains: Vec<String>,
+    fields: HashSet<String>,
+    methods: HashSet<String>,
+}
+
 /// Pre-computed inputs the undefined-variable collector needs to decide, per
 /// `call` / `subset` / `subset2`, which argument subtrees are NSE and should be
 /// suppressed (issue #398). All AST-derived facts are owned, so this carries no
@@ -11213,6 +11476,15 @@ pub(crate) struct NseAnalysis<'a> {
     /// Variable names whose defining RHS is a known data.frame-family
     /// constructor (so `[` indices are checked even when data.table is loaded).
     non_data_table_objects: HashSet<String>,
+    /// Reference Class generator variables assigned from `setRefClass(...)`.
+    reference_class_generators: HashMap<String, ReferenceClassInfo>,
+    /// Class name to generator-variable name for same-file `contains = ...`
+    /// inheritance links.
+    reference_class_by_class: HashMap<String, String>,
+    /// Top-level helper functions later registered as Reference Class methods
+    /// via `Generator$methods(name = helper)`, mapped to the generator(s) that
+    /// registered each helper.
+    reference_class_method_functions: HashMap<String, HashSet<String>>,
     /// Package library, for confirming whether a bare callee is an in-play
     /// package export (standard-eval) rather than an unresolved name.
     package_library: Option<&'a crate::package_library::PackageLibrary>,
@@ -11236,6 +11508,9 @@ impl<'a> NseAnalysis<'a> {
         let mut local_function_policies = HashMap::new();
         let mut data_table_objects = HashSet::new();
         let mut non_data_table_objects = HashSet::new();
+        let mut reference_class_generators = HashMap::new();
+        let mut reference_class_by_class = HashMap::new();
+        let mut reference_class_method_functions = HashMap::new();
         let mut data_table_qualifier_seen = false;
         collect_nse_facts(
             root,
@@ -11243,6 +11518,9 @@ impl<'a> NseAnalysis<'a> {
             &mut local_function_policies,
             &mut data_table_objects,
             &mut non_data_table_objects,
+            &mut reference_class_generators,
+            &mut reference_class_by_class,
+            &mut reference_class_method_functions,
             &mut data_table_qualifier_seen,
             false,
         );
@@ -11258,9 +11536,53 @@ impl<'a> NseAnalysis<'a> {
             data_table_in_play,
             data_table_objects,
             non_data_table_objects,
+            reference_class_generators,
+            reference_class_by_class,
+            reference_class_method_functions,
             package_library,
             base_exports,
         }
+    }
+
+    fn reference_class_generator_has_member(
+        &self,
+        generator: &str,
+        name: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if !visited.insert(generator.to_string()) {
+            return false;
+        }
+
+        let Some(info) = self.reference_class_generators.get(generator) else {
+            return false;
+        };
+        self.reference_class_info_has_member(info, name, visited)
+    }
+
+    fn reference_class_info_has_member(
+        &self,
+        info: &ReferenceClassInfo,
+        name: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if info.methods.contains(name)
+            || info.fields.contains(name)
+            || info
+                .fields
+                .iter()
+                .any(|field| reference_class_field_accessor_matches(field, name))
+        {
+            return true;
+        }
+
+        info.contains.iter().any(|class_name| {
+            self.reference_class_by_class
+                .get(class_name)
+                .is_some_and(|parent_generator| {
+                    self.reference_class_generator_has_member(parent_generator, name, visited)
+                })
+        })
     }
 }
 
@@ -11280,6 +11602,9 @@ fn collect_nse_facts(
     local_function_policies: &mut HashMap<String, crate::nse::ArgPolicy>,
     data_table_objects: &mut HashSet<String>,
     non_data_table_objects: &mut HashSet<String>,
+    reference_class_generators: &mut HashMap<String, ReferenceClassInfo>,
+    reference_class_by_class: &mut HashMap<String, String>,
+    reference_class_method_functions: &mut HashMap<String, HashSet<String>>,
     data_table_qualifier_seen: &mut bool,
     in_function: bool,
 ) {
@@ -11290,6 +11615,12 @@ fn collect_nse_facts(
     {
         *data_table_qualifier_seen = true;
     }
+    collect_reference_class_method_registrations(
+        node,
+        text,
+        reference_class_generators,
+        reference_class_method_functions,
+    );
 
     if !in_function
         && let Some(target) = assignment_target_node(node)
@@ -11298,7 +11629,13 @@ fn collect_nse_facts(
     {
         let name = node_text(target, text);
         let value = unwrap_parenthesized(value);
-        if value.kind() == "function_definition" {
+        if let Some(info) = reference_class_info_from_set_ref_class(value, text) {
+            let generator = name.to_string();
+            if let Some(class_name) = info.class_name.clone() {
+                reference_class_by_class.insert(class_name, generator.clone());
+            }
+            reference_class_generators.insert(generator, info);
+        } else if value.kind() == "function_definition" {
             local_function_policies.insert(name.to_string(), user_defined_call_policy(value, text));
         } else {
             match constructor_data_table_class(value, text) {
@@ -11324,10 +11661,218 @@ fn collect_nse_facts(
             local_function_policies,
             data_table_objects,
             non_data_table_objects,
+            reference_class_generators,
+            reference_class_by_class,
+            reference_class_method_functions,
             data_table_qualifier_seen,
             child_in_function,
         );
     }
+}
+
+/// Gather helper names from `Generator$methods(name = helper)` registrations.
+/// Direct `function(...)` values are recognized from their syntax later; only
+/// identifier-valued helpers need this file-level pre-pass.
+fn collect_reference_class_method_registrations(
+    node: Node,
+    text: &str,
+    reference_class_generators: &mut HashMap<String, ReferenceClassInfo>,
+    reference_class_method_functions: &mut HashMap<String, HashSet<String>>,
+) {
+    if node.kind() != "call" || !call_is_reference_class_methods_registration(node, text) {
+        return;
+    }
+    let Some(generator) = reference_class_methods_registration_generator(node, text) else {
+        return;
+    };
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(method_name) = argument_name(arg, text) {
+            reference_class_generators
+                .entry(generator.clone())
+                .or_default()
+                .methods
+                .insert(method_name);
+        }
+        let Some(value) = arg.child_by_field_name("value") else {
+            continue;
+        };
+        let value = unwrap_parenthesized(value);
+        if value.kind() == "identifier" {
+            reference_class_method_functions
+                .entry(node_text(value, text).to_string())
+                .or_default()
+                .insert(generator.clone());
+        }
+    }
+}
+
+fn reference_class_info_from_set_ref_class(call: Node, text: &str) -> Option<ReferenceClassInfo> {
+    if call.kind() != "call"
+        || call
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            != Some("setRefClass")
+    {
+        return None;
+    }
+
+    let args = call.child_by_field_name("arguments")?;
+    let mut info = ReferenceClassInfo::default();
+    let mut positional_index = 0usize;
+
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        let Some(value) = arg.child_by_field_name("value") else {
+            continue;
+        };
+        let value = unwrap_parenthesized(value);
+        match argument_name(arg, text).as_deref() {
+            Some("Class") => {
+                info.class_name = literal_string_value(value, text);
+            }
+            Some("fields") => {
+                collect_reference_class_fields(value, text, &mut info.fields);
+            }
+            Some("contains") => {
+                collect_string_values(value, text, &mut info.contains);
+            }
+            Some("methods" | "refMethods") => {
+                collect_reference_class_method_names(value, text, &mut info.methods);
+            }
+            Some(_) => {}
+            None => {
+                match positional_index {
+                    0 => info.class_name = literal_string_value(value, text),
+                    1 => collect_reference_class_fields(value, text, &mut info.fields),
+                    _ => {}
+                }
+                positional_index += 1;
+            }
+        }
+    }
+
+    Some(info)
+}
+
+fn collect_reference_class_fields(node: Node, text: &str, fields: &mut HashSet<String>) {
+    if let Some(value) = literal_string_value(node, text) {
+        fields.insert(value);
+        return;
+    }
+
+    if node.kind() != "call" {
+        return;
+    }
+    let Some(callee) = node
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+    else {
+        return;
+    };
+    if !matches!(callee, "c" | "list") {
+        return;
+    }
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(name) = argument_name(arg, text) {
+            fields.insert(name);
+        } else if let Some(value) = arg
+            .child_by_field_name("value")
+            .and_then(|value| literal_string_value(unwrap_parenthesized(value), text))
+        {
+            fields.insert(value);
+        }
+    }
+}
+
+fn collect_reference_class_method_names(node: Node, text: &str, methods: &mut HashSet<String>) {
+    if node.kind() != "call"
+        || node
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            != Some("list")
+    {
+        return;
+    }
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(name) = argument_name(arg, text) {
+            methods.insert(name);
+        }
+    }
+}
+
+fn collect_string_values(node: Node, text: &str, values: &mut Vec<String>) {
+    if let Some(value) = literal_string_value(node, text) {
+        values.push(value);
+        return;
+    }
+
+    if node.kind() != "call"
+        || node
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            != Some("c")
+    {
+        return;
+    }
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(value) = arg
+            .child_by_field_name("value")
+            .and_then(|value| literal_string_value(unwrap_parenthesized(value), text))
+        {
+            values.push(value);
+        }
+    }
+}
+
+fn argument_name(arg: Node, text: &str) -> Option<String> {
+    let name = arg.child_by_field_name("name")?;
+    normalized_assignment_target_name(name, text).map(|s| s.to_string())
+}
+
+fn literal_string_value(node: Node, text: &str) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(node, text);
+    raw.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .map(|s| s.to_string())
 }
 
 /// The operand an assignment *reads* — the `rhs` for `<-` / `=` / `<<-`, the
@@ -11386,7 +11931,8 @@ fn constructor_data_table_class(node: Node, text: &str) -> DataTableClass {
 
 /// Infer the argument policy for a user-defined function (Phase 2.5): a formal
 /// is captured when the body calls `substitute` / `enquo` / `enexpr` / `ensym`
-/// with that formal as its first argument. With no captured formals the
+/// with that formal as its first argument, or forwards it as a native routine
+/// name through `.Call`-family interfaces. With no captured formals the
 /// function is treated as standard-eval (so a local `filter <- function(x) x`
 /// recovers checking of `filter(undefined_var)`). Nested function definitions
 /// are not descended into — their captures bind their own formals.
@@ -11443,10 +11989,8 @@ fn function_body_node(fn_def: Node) -> Option<Node> {
     })
 }
 
-/// Recursively scan a function body for capture helpers
-/// (`substitute` / `enquo` / `enexpr` / `ensym`) whose first argument is a
-/// direct reference to one of `formals`, appending each such formal to
-/// `captured`.
+/// Recursively scan a function body for calls whose first argument captures one
+/// of `formals`, appending each such formal to `captured`.
 fn collect_captured_formals(
     node: Node,
     text: &str,
@@ -11460,13 +12004,11 @@ fn collect_captured_formals(
     if node.kind() == "call"
         && let Some(func) = node.child_by_field_name("function")
         && let Some(helper) = callee_leaf_name(func, text)
-        && crate::nse::is_capture_helper(helper)
         && let Some(args) = node.child_by_field_name("arguments")
         && let Some(value) = first_positional_arg_value(args)
-        && value.kind() == "identifier"
+        && let Some(name) = captured_formal_for_first_arg(helper, value, text, formals)
     {
-        let name = node_text(value, text);
-        if formals.iter().any(|f| f == name) && !captured.iter().any(|c| c == name) {
+        if !captured.iter().any(|c| c == name) {
             captured.push(name.to_string());
         }
     }
@@ -11474,6 +12016,57 @@ fn collect_captured_formals(
     for child in node.children(&mut cursor) {
         collect_captured_formals(child, text, formals, captured);
     }
+}
+
+fn captured_formal_for_first_arg<'t>(
+    helper: &str,
+    value: Node<'t>,
+    text: &'t str,
+    formals: &[String],
+) -> Option<&'t str> {
+    if crate::nse::is_capture_helper(helper) && value.kind() == "identifier" {
+        let name = node_text(value, text);
+        return formals.iter().any(|f| f == name).then_some(name);
+    }
+
+    if is_native_interface_callee(helper) {
+        return native_routine_formal_value(value, text, formals);
+    }
+
+    None
+}
+
+fn is_native_interface_callee(name: &str) -> bool {
+    matches!(
+        name,
+        ".Call" | ".Call.graphics" | ".External" | ".External2" | ".C" | ".Fortran"
+    )
+}
+
+fn native_routine_formal_value<'t>(
+    value: Node<'t>,
+    text: &'t str,
+    formals: &[String],
+) -> Option<&'t str> {
+    if value.kind() == "identifier" {
+        let name = node_text(value, text);
+        return formals.iter().any(|f| f == name).then_some(name);
+    }
+
+    if value.kind() == "call"
+        && value
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            == Some("dontCheck")
+        && let Some(args) = value.child_by_field_name("arguments")
+        && let Some(inner) = first_positional_arg_value(args)
+        && inner.kind() == "identifier"
+    {
+        let name = node_text(inner, text);
+        return formals.iter().any(|f| f == name).then_some(name);
+    }
+
+    None
 }
 
 /// The leaf callee name of a call's `function` field — the identifier itself,
@@ -11737,7 +12330,10 @@ fn collect_call_usages<'a>(
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
-    let policy = if context.suppressed || !analysis.call_args_enabled {
+    let internal_routine_call = call_is_internal_routine_argument(node, text);
+    let policy = if internal_routine_call {
+        crate::nse::ArgPolicy::Standard
+    } else if context.suppressed || !analysis.call_args_enabled {
         crate::nse::ArgPolicy::WholeCall
     } else {
         resolve_call_arg_policy(node, text, analysis)
@@ -11746,11 +12342,50 @@ fn collect_call_usages<'a>(
     // the syntactic positional arguments bind starting one formal later.
     let pipe_fed = call_is_pipe_fed(node, text);
     if let Some(func) = node.child_by_field_name("function") {
-        collect_usages_with_analysis(func, text, analysis, context, used);
+        if !internal_routine_call {
+            collect_usages_with_analysis(func, text, analysis, context, used);
+        }
     }
     if let Some(args) = node.child_by_field_name("arguments") {
         apply_arg_policy(args, text, analysis, context, &policy, pipe_fed, used);
     }
+}
+
+/// True for the routine call nested as `.Internal(<routine>(...))`.
+///
+/// The nested call head names a hidden C entry point (for example
+/// `getRegisteredNamespace` or `.addCondHands`), not an R binding. Its
+/// arguments still follow the routine's normal evaluation rules, so the caller
+/// skips only the nested callee and walks the argument list as standard-eval.
+fn call_is_internal_routine_argument(call_node: Node, text: &str) -> bool {
+    if call_node.kind() != "call" {
+        return false;
+    }
+    let Some(arg) = call_node.parent().filter(|node| node.kind() == "argument") else {
+        return false;
+    };
+    if arg.child_by_field_name("name").is_some() {
+        return false;
+    }
+    if !arg
+        .child_by_field_name("value")
+        .is_some_and(|value| value.id() == call_node.id())
+    {
+        return false;
+    }
+    let Some(args) = arg.parent().filter(|node| node.kind() == "arguments") else {
+        return false;
+    };
+    if !first_positional_arg_value(args).is_some_and(|value| value.id() == call_node.id()) {
+        return false;
+    }
+    let Some(outer_call) = args.parent().filter(|node| node.kind() == "call") else {
+        return false;
+    };
+    outer_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        == Some(".Internal")
 }
 
 /// True when `call_node` is the right-hand side of a pipe operator
@@ -11785,9 +12420,9 @@ fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
                 .is_some_and(|rhs| rhs.byte_range().contains(&current.start_byte()));
             if is_rhs {
                 let mut cursor = parent.walk();
-                let has_magrittr = parent.children(&mut cursor).any(|child| {
-                    child.kind() == "special" && node_text(child, text) == "%>%"
-                });
+                let has_magrittr = parent
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "special" && node_text(child, text) == "%>%");
                 if has_magrittr {
                     return true;
                 }
@@ -11801,7 +12436,7 @@ fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
 /// True when `node` (an identifier `_`) is inside the RHS of a native `|>`
 /// pipe operator. In R 4.2+, `_` on the RHS is the placeholder for the piped
 /// value — it is always defined and should not be flagged as undefined.
-fn is_inside_native_pipe_rhs(node: Node, text: &str) -> bool {
+fn is_inside_native_pipe_rhs(node: Node, _text: &str) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.kind() == "binary_operator" {
@@ -11935,6 +12570,295 @@ fn is_builtin(name: &str) -> bool {
     }
     // Check comprehensive builtin list
     builtins::is_builtin(name)
+        || unquote_backtick_name(name).is_some_and(|unquoted| is_builtin(unquoted))
+}
+
+fn unquote_backtick_name(name: &str) -> Option<&str> {
+    name.strip_prefix('`')?.strip_suffix('`')
+}
+
+/// Returns true for names R exposes through startup search-path environments
+/// rather than ordinary package exports.
+///
+/// `.Autoloaded` lives in the default `Autoloads` environment (`.AutoloadEnv`),
+/// which is on the search path in normal R sessions. Base's `autoload()`
+/// legitimately reads it as a bare name even though it is not a binding in the
+/// base package environment.
+fn is_implicit_search_path_binding(name: &str) -> bool {
+    let normalized = unquote_backtick_name(name).unwrap_or(name);
+    matches!(normalized, ".Autoloaded")
+}
+
+/// Returns true when `node` is one of R's S3 method-frame special variables.
+///
+/// R injects `.Generic`, `.Method`, and `.Class` when an S3 method runs. Treat
+/// them as implicit locals only when the use is inside a function assigned to an
+/// S3 method-shaped name (`generic.class`), so ordinary `.Generic` references in
+/// non-method functions remain diagnosable.
+fn is_s3_method_special_variable_usage(node: Node, text: &str, name: &str) -> bool {
+    if !matches!(name, ".Generic" | ".Method" | ".Class") {
+        return false;
+    }
+
+    let mut current = node;
+    while let Some(function) = containing_function_definition(current) {
+        if function_definition_is_s3_method_binding(function, text) {
+            return true;
+        }
+        current = function;
+    }
+
+    false
+}
+
+fn function_definition_is_s3_method_binding(function: Node, text: &str) -> bool {
+    let Some(parent) = function
+        .parent()
+        .filter(|parent| parent.kind() == "binary_operator")
+    else {
+        return false;
+    };
+    let Some(target) = assignment_target_node(parent) else {
+        return false;
+    };
+    if target.id() == function.id() {
+        return false;
+    }
+
+    normalized_assignment_target_name(target, text).is_some_and(is_s3_method_binding_name)
+}
+
+fn normalized_assignment_target_name<'a>(target: Node<'a>, text: &'a str) -> Option<&'a str> {
+    let raw = node_text(target, text).trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        unquote_backtick_name(raw)
+            .or_else(|| raw.strip_prefix('\"')?.strip_suffix('\"'))
+            .or_else(|| raw.strip_prefix('\'')?.strip_suffix('\''))
+            .unwrap_or(raw),
+    )
+}
+
+fn is_s3_method_binding_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(generic, class)| !generic.is_empty() && !class.is_empty())
+}
+
+/// Returns true when `node` names something injected into a Reference Class
+/// method environment.
+///
+/// Reference Class methods are ordinary R functions installed into a generated
+/// method environment, where `.self`, `.refClassDef`, and `callSuper` are
+/// injected by the methods package and fields / methods are visible as bare
+/// names. Keep this contextual: ordinary functions using the same names should
+/// still get undefined-variable diagnostics.
+fn is_reference_class_method_special_variable_usage(
+    node: Node,
+    text: &str,
+    name: &str,
+    analysis: &NseAnalysis,
+) -> bool {
+    let is_special = matches!(name, ".self" | ".refClassDef" | "callSuper");
+
+    let mut current = node;
+    while let Some(function) = containing_function_definition(current) {
+        if let Some(generators) = reference_class_method_generators(function, text, analysis) {
+            if is_special {
+                return true;
+            }
+            if generators.iter().any(|generator| {
+                analysis.reference_class_generator_has_member(generator, name, &mut HashSet::new())
+            }) {
+                return true;
+            }
+        }
+        if let Some(info) = direct_set_ref_class_method_info(function, text) {
+            if is_special {
+                return true;
+            }
+            if analysis.reference_class_info_has_member(&info, name, &mut HashSet::new()) {
+                return true;
+            }
+        }
+        current = function;
+    }
+
+    false
+}
+
+fn reference_class_method_generators(
+    function: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> Option<Vec<String>> {
+    if let Some(generators) =
+        function_definition_registered_reference_class_generators(function, text, analysis)
+    {
+        return Some(generators);
+    }
+
+    function_definition_direct_reference_class_generators(function, text)
+}
+
+fn function_definition_registered_reference_class_generators(
+    function: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> Option<Vec<String>> {
+    let parent = function
+        .parent()
+        .filter(|parent| parent.kind() == "binary_operator")?;
+    let target = assignment_target_node(parent)?;
+    if target.id() == function.id() {
+        return None;
+    }
+
+    let name = normalized_assignment_target_name(target, text)?;
+    analysis
+        .reference_class_method_functions
+        .get(name)
+        .map(|generators| generators.iter().cloned().collect())
+}
+
+fn function_definition_direct_reference_class_generators(
+    function: Node,
+    text: &str,
+) -> Option<Vec<String>> {
+    let arg = containing_argument_value(function)?;
+    let args = arg.parent().filter(|parent| parent.kind() == "arguments")?;
+    let call = args.parent().filter(|parent| parent.kind() == "call")?;
+
+    if call_is_reference_class_methods_registration(call, text) {
+        return Some(
+            reference_class_methods_registration_generator(call, text)
+                .into_iter()
+                .collect(),
+        );
+    }
+    if let Some(set_ref_class_call) = set_ref_class_call_for_methods_list(call, text) {
+        return Some(
+            set_ref_class_call_generator(set_ref_class_call, text)
+                .into_iter()
+                .collect(),
+        );
+    }
+    if list_call_is_env_ref_methods_table(call, text) {
+        return Some(Vec::new());
+    }
+
+    None
+}
+
+fn direct_set_ref_class_method_info(function: Node, text: &str) -> Option<ReferenceClassInfo> {
+    let arg = containing_argument_value(function)?;
+    let args = arg.parent().filter(|parent| parent.kind() == "arguments")?;
+    let call = args.parent().filter(|parent| parent.kind() == "call")?;
+    let set_ref_class_call = set_ref_class_call_for_methods_list(call, text)?;
+    reference_class_info_from_set_ref_class(set_ref_class_call, text)
+}
+
+fn containing_argument_value(node: Node) -> Option<Node> {
+    let parent = node.parent()?;
+    if parent.kind() != "argument" {
+        return None;
+    }
+    parent
+        .child_by_field_name("value")
+        .is_some_and(|value| unwrap_parenthesized(value).id() == node.id())
+        .then_some(parent)
+}
+
+fn set_ref_class_call_for_methods_list<'a>(list_call: Node<'a>, text: &str) -> Option<Node<'a>> {
+    if list_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        != Some("list")
+    {
+        return None;
+    }
+
+    let arg = containing_argument_value(list_call)?;
+    if arg
+        .child_by_field_name("name")
+        .is_none_or(|name| !matches!(node_text(name, text), "methods" | "refMethods"))
+    {
+        return None;
+    }
+    let args = arg.parent().filter(|parent| parent.kind() == "arguments")?;
+    let parent_call = args.parent().filter(|parent| parent.kind() == "call")?;
+    (parent_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        == Some("setRefClass"))
+    .then_some(parent_call)
+}
+
+fn set_ref_class_call_generator(call: Node, text: &str) -> Option<String> {
+    let mut value = call;
+    let mut parent = value.parent()?;
+    while parent.kind() == "parenthesized_expression" {
+        value = parent;
+        parent = value.parent()?;
+    }
+
+    if parent.kind() != "binary_operator" {
+        return None;
+    }
+    if assignment_value_node(parent).is_none_or(|rhs| unwrap_parenthesized(rhs).id() != value.id())
+    {
+        return None;
+    }
+    assignment_target_node(parent)
+        .and_then(|target| normalized_assignment_target_name(target, text))
+        .map(|name| name.to_string())
+}
+
+fn reference_class_methods_registration_generator(call: Node, text: &str) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "extract_operator" {
+        return None;
+    }
+    let rhs = func.child_by_field_name("rhs")?;
+    let op = func.child_by_field_name("operator")?;
+    if crate::extract_op::op_from_node(op) != Some(crate::extract_op::ExtractOp::Dollar)
+        || rhs.kind() != "identifier"
+        || node_text(rhs, text) != "methods"
+    {
+        return None;
+    }
+    let lhs = func.child_by_field_name("lhs")?;
+    (lhs.kind() == "identifier").then(|| node_text(lhs, text).to_string())
+}
+
+fn list_call_is_env_ref_methods_table(call: Node, text: &str) -> bool {
+    if call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        != Some("list")
+    {
+        return false;
+    }
+
+    let Some(parent) = call
+        .parent()
+        .filter(|parent| parent.kind() == "binary_operator")
+    else {
+        return false;
+    };
+    if assignment_value_node(parent)
+        .is_none_or(|value| unwrap_parenthesized(value).id() != call.id())
+    {
+        return false;
+    }
+    assignment_target_node(parent)
+        .and_then(|target| normalized_assignment_target_name(target, text))
+        == Some(".envRefMethods")
+}
+
+fn call_is_reference_class_methods_registration(call: Node, text: &str) -> bool {
+    reference_class_methods_registration_generator(call, text).is_some()
 }
 
 /// Determines whether an identifier is exported by any of the currently loaded packages.
@@ -17832,6 +18756,61 @@ mod tests {
         assert!(!was_collected(&used, "col"));
     }
 
+    /// grid's native wrappers pass their routine-name formal through
+    /// `.Call(dontCheck(fnname), ...)`; that formal is captured like `.Call`'s
+    /// own `.NAME`, while later arguments remain evaluated.
+    #[test]
+    fn nse_phase25_native_dontcheck_wrapper_captures_formal() {
+        let code = "grid.Call <- function(fnname, ...) .Call(dontCheck(fnname), ...)\n\
+                    grid.Call(C_getGPar, evaluated_arg)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            !was_collected(&used, "C_getGPar"),
+            "native routine name passed through dontCheck(fnname) must be captured"
+        );
+        assert!(
+            was_collected(&used, "evaluated_arg"),
+            "non-routine wrapper arguments must remain standard-eval"
+        );
+    }
+    /// `.Internal(getRegisteredNamespace(name))` names a hidden base C entry
+    /// point in the nested call head; that routine name is not an R variable,
+    /// but its ordinary arguments are still evaluated and should be checked.
+    #[test]
+    fn nse_internal_call_suppresses_routine_callee_only() {
+        use std::collections::HashSet;
+        let code = ".Internal(getRegisteredNamespace(name))";
+        let tree = parse_r_code(code);
+        let base_exports = HashSet::from([".Internal".to_string()]);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            Vec::new(),
+            None,
+            Some(&base_exports),
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            !was_collected(&used, "getRegisteredNamespace"),
+            ".Internal routine callee must not be collected as an R variable"
+        );
+        assert!(
+            was_collected(&used, "name"),
+            ".Internal routine arguments must remain standard-eval"
+        );
+    }
+
     /// A nested helper definition does not leak into file-level resolution: a
     /// sibling top-level `paste` call still checks its argument even though an
     /// inner function defines a same-named local.
@@ -19795,6 +20774,662 @@ clean_data <- function(x) {
         );
     }
 
+    /// A nested closure can refer to a binding installed later in its enclosing
+    /// function before the closure is called. R resolves that name at call time
+    /// through the enclosing function environment, so this is not a true
+    /// forward-reference error.
+    #[test]
+    fn test_diagnostic_suppresses_later_enclosing_function_binding_in_nested_closure() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "outer <- function() {\n  inner <- function() later()\n  later <- function() 1\n  inner()\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("later")),
+            "nested closure should late-bind later enclosing function binding; messages: {messages:?}"
+        );
+    }
+
+    /// The nested-closure late-binding carve-out must not hide a direct use
+    /// before definition in the same function body: `later()` runs before
+    /// `later <- ...` installs the binding.
+    #[test]
+    fn test_diagnostic_flags_same_function_use_before_later_binding() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "outer <- function() {\n  later()\n  later <- function() 1\n}\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: later"),
+            "direct same-function use before binding must remain diagnostic; messages: {messages:?}"
+        );
+    }
+
+    /// `mostattributes(x) <- value` dispatches to the replacement binding
+    /// `mostattributes<-`; the syntactic call head `mostattributes` is not a
+    /// separate variable lookup.
+    #[test]
+    fn test_diagnostic_suppresses_base_replacement_function_call_head() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "f <- function(x, value) {\n  mostattributes(x) <- value\n  x\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("mostattributes")),
+            "replacement call head must resolve via `mostattributes<-`; messages: {messages:?}"
+        );
+    }
+
+    /// User-defined replacement functions use the same `name(x) <- value`
+    /// syntax and should resolve against the `name<-` binding in scope.
+    #[test]
+    fn test_diagnostic_suppresses_user_defined_replacement_function_call_head() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "`foo<-` <- function(x, value) x\nbar <- function(x) {\n  foo(x) <- 1\n  x\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("foo")),
+            "replacement call head must resolve via the in-scope `foo<-` binding; messages: {messages:?}"
+        );
+    }
+
+    /// R accepts string-literal assignment targets (`"foo<-" <- function(...)`)
+    /// and binds the value to that name. Raven should still warn about the
+    /// unusual assignment syntax, but scope resolution must treat it as a real
+    /// binding so later replacement-call syntax resolves.
+    #[test]
+    fn test_diagnostic_suppresses_string_literal_replacement_function_binding() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "\"foo<-\" <- function(x, value) x\nbar <- function(x) {\n  foo(x) <- 1\n  x\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("string literal")),
+            "string-literal assignment should still be warned about; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: foo"),
+            "string-literal assignment target `foo<-` must define the replacement binding; messages: {messages:?}"
+        );
+    }
+
+    /// Formals after `...` are still ordinary parameters. The base `rm`
+    /// implementation uses this shape and must not report `envir` as
+    /// undefined inside the body.
+    #[test]
+    fn test_diagnostic_suppresses_formal_after_dots() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "rm2 <-\n    function (..., list = character(), pos = -1, envir = as.environment(pos),\n              inherits = FALSE)\n{\n    .Internal(remove(list, envir, inherits))\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("envir")),
+            "formal after `...` must be visible in function body; messages: {messages:?}"
+        );
+    }
+
+    /// `.Internal(remove(...))` is how base implements rm()/remove(); the
+    /// nested `remove` is a C routine name, not an R-level scope-removal call.
+    #[test]
+    fn test_diagnostic_internal_remove_routine_does_not_remove_formals() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "rm <- function(..., list = character(), pos = -1, envir = as.environment(pos),\n              inherits = FALSE) {\n  if (missing(list)) {\n    list <- vapply(substitute(list(...))[-1L], deparse, \"\")\n  }\n  .Internal(remove(list, envir, inherits))\n}\nremove <- rm\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: envir"),
+            "`.Internal(remove(...))` must not remove the formal `envir`; messages: {messages:?}"
+        );
+    }
+
+    /// `.Autoloaded` is provided by R's startup `Autoloads` search-path
+    /// environment, so base's `autoload()` can read it as a bare name.
+    #[test]
+    fn test_diagnostic_suppresses_autoloaded_search_path_binding() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "autoload <- function(name, package, reset = FALSE, ...) {\n  if (is.na(match(package, .Autoloaded)))\n    assign(\".Autoloaded\", c(package, .Autoloaded), envir = .AutoloadEnv)\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains(".Autoloaded")),
+            "`.Autoloaded` should resolve from R's default Autoloads environment; messages: {messages:?}"
+        );
+    }
+
+    /// R injects `.Generic`, `.Method`, and `.Class` into S3 method frames. They
+    /// are not ordinary top-level variables, so `Ops.raster`-style method bodies
+    /// must not report them as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_s3_method_special_variables() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "Ops.raster <- function(e1, e2) {\n  list(.Generic, .Method, .Class)\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in [".Generic", ".Method", ".Class"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "S3 method special variable `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// Reference Class method bodies run with injected method-frame helpers.
+    /// Direct methods supplied through `setRefClass(..., methods = list(...))`
+    /// must not report `.self`, `.refClassDef`, or `callSuper` as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_refclass_method_specials_in_setrefclass_methods() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "Foo <- setRefClass(\"Foo\", methods = list(\
+            initialize = function(...) {\
+                callSuper(...);\
+                .self$initFields(...);\
+                .refClassDef@className\
+            }))\n\
+            y <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in ["callSuper", ".self", ".refClassDef"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "Reference Class method special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// The `methods` package defines the shared Reference Class default-method
+    /// table as `.envRefMethods <- list(...)`; entries in that table are also
+    /// Reference Class method bodies with the same implicit method-frame names.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_refclass_specials_in_env_ref_methods_table() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = ".envRefMethods <- list(\
+            copy = function() {\
+                value <- .self;\
+                .refClassDef@className\
+            })\n\
+            y <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in [".self", ".refClassDef"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "Reference Class table special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// Helper functions registered through `Generator$methods(name = helper)`
+    /// become Reference Class methods, so their bodies may also use the injected
+    /// method-frame names.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_refclass_specials_in_registered_method_helper() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "changeAllFields <- function(replacement) {\
+                fields <- names(.refClassDef@fieldClasses);\
+                .self$field <- replacement$field\
+            }\n\
+            Foo$methods(change = changeAllFields)\n\
+            y <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in [".self", ".refClassDef"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "registered Reference Class method helper special `{special}` must not be flagged. \
+                 messages: {messages:?}",
+            );
+        }
+    }
+
+    /// The same names remain diagnosable in ordinary functions; the Reference
+    /// Class suppression must be tied to method registration contexts.
+    #[tokio::test]
+    async fn test_diagnostic_flags_refclass_specials_in_ordinary_function() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "ordinary <- function() list(.self, .refClassDef, callSuper)\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        for special in [".self", ".refClassDef", "callSuper"] {
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "ordinary function special `{special}` should still be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    fn undefined_messages_for_code(code: &str) -> Vec<String> {
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root];
+        state.workspace_scan_complete = true;
+
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    #[test]
+    fn test_diagnostic_suppresses_refclass_fields_in_setrefclass_methods() {
+        let code = "Foo <- setRefClass(\"Foo\", fields = list(bar = \"numeric\"),\
+            methods = list(addToBar = function(incr) {\
+                bar <<- bar + incr\
+            }))\n\
+            y <- totally_undefined_baseline()\n";
+        let messages = undefined_messages_for_code(code);
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: bar"),
+            "Reference Class field `bar` must not be flagged inside its method. messages: {messages:?}",
+        );
+    }
+
+    #[test]
+    fn test_diagnostic_suppresses_refclass_inherited_members_and_accessors() {
+        let code = "Foo <- setRefClass(\"Foo\", fields = list(bar = \"numeric\"),\
+            methods = list(addToBar = function(incr) { bar <<- bar + incr }))\n\
+            Foo2 <- setRefClass(\"Foo2\", fields = list(b2 = \"numeric\"), contains = \"Foo\",\
+            methods = list(addBoth = function(incr) {\
+                addToBar(incr);\
+                b2 <<- b2 + incr;\
+                setB2(getB2() + incr)\
+            }))\n\
+            y <- totally_undefined_baseline()\n";
+        let messages = undefined_messages_for_code(code);
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}",
+        );
+        for name in ["addToBar", "b2", "setB2", "getB2"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {name}")),
+                "Reference Class inherited/member name `{name}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_diagnostic_suppresses_refclass_fields_in_generator_methods_call() {
+        let code = "Foo <- setRefClass(\"Foo\", c(\"bar\", \"flag\"))\n\
+            Foo$methods(showAll = function() c(bar, flag))\n\
+            y <- totally_undefined_baseline()\n";
+        let messages = undefined_messages_for_code(code);
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}",
+        );
+        for name in ["bar", "flag"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {name}")),
+                "Reference Class field `{name}` must not be flagged in `$methods(...)`. messages: {messages:?}",
+            );
+        }
+    }
     /// Package-internal symbols from `r_internal_symbols` must also suppress
     /// the undefined-variable diagnostic in the hot ScopeStream path.
     #[tokio::test]
@@ -47088,6 +48723,113 @@ my_func <- function(a = undefined_var) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: undefined_var"),
             "Undefined variable 'undefined_var' in default expression should be flagged"
+        );
+    }
+    #[test]
+    fn test_default_parameter_can_reference_later_top_level_helper() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(x = make_default()) {
+  x
+}
+make_default <- function() 42
+
+other_func <- function(y = still_missing) {
+  y
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message.contains("make_default")),
+            "Default expression should resolve a top-level helper declared later, \
+             because the promise is evaluated after the function is called. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+        assert!(
+            undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: still_missing"),
+            "A genuinely missing default expression symbol must still be flagged. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_body_local_binding() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(x = local_default) {
+  local_default <- 42
+  x
+}
+
+other_func <- function(y = still_missing) {
+  local_default <- 42
+  y
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: local_default"),
+            "Default expression should resolve a binding created in the function \
+             body before the default is forced. Diagnostics: {:?}",
+            undefined_var_diags
+        );
+        assert!(
+            undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: still_missing"),
+            "A genuinely missing default expression symbol must still be flagged. \
+             Diagnostics: {:?}",
+            undefined_var_diags
         );
     }
 

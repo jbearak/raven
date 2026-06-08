@@ -197,3 +197,26 @@ fn underscore_without_pipe_still_flagged() {
         "bare _ without pipe context must still be flagged. Output:\n{output}"
     );
 }
+
+/// Backtick-quoted base operators can be used as first-class function values
+/// (e.g. `Reduce(`|`, xs)` or `switch(..., AND = `&`)`). They are base
+/// builtins, not undefined variables.
+#[test]
+fn backtick_quoted_base_operators_as_values_not_flagged() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("test.R"),
+        "a <- Reduce(`|`, list(TRUE, FALSE))\n\
+         b <- switch(\"AND\", AND = `&`, OR = `|`)\n\
+         c <- (if (TRUE) identity else `-`)(1)\n",
+    )
+    .unwrap();
+
+    let output = run_check(dir.path());
+    for name in ["`|`", "`&`", "`-`"] {
+        assert!(
+            !output.contains(&format!("Undefined variable: {name}")),
+            "{name} is a base operator and should not be flagged. Output:\n{output}"
+        );
+    }
+}
