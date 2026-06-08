@@ -11,12 +11,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Add parentheses around the right-hand `&&` clause: `vnum[1L] == 0 || (vnum[1L] == 1 && vnum[2L] <= 6)`."
+
 [diagnostic.range]
 start_line = 131
 start_character = 27
 end_line = 131
 end_character = 29
-
 [[diagnostic]]
 package = "base"
 path = "R/RNG.R"
@@ -24,12 +24,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Add parentheses around the right-hand `&&` clause: `vnum[1L] <= 2 || (vnum[1L] == 3 && vnum[2L] <= 5)`."
+
 [diagnostic.range]
 start_line = 133
 start_character = 27
 end_line = 133
 end_character = 29
-
 [[diagnostic]]
 package = "base"
 path = "R/all.equal.R"
@@ -37,12 +37,12 @@ message = "Assigning to string literal \"__all.eq.E__\"; R will bind the value t
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__all.eq.E__` <- environment() ``."
+
 [diagnostic.range]
 start_line = 268
 start_character = 1
 end_line = 268
 end_character = 15
-
 [[diagnostic]]
 package = "base"
 path = "R/character.R"
@@ -50,12 +50,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Add parentheses around `li$codepage >= 1250L && li$codepage <= 1258L` before the `|| li$codepage == 874L` branch."
+
 [diagnostic.range]
 start_line = 137
 start_character = 19
 end_line = 137
 end_character = 21
-
 [[diagnostic]]
 package = "base"
 path = "R/character.R"
@@ -63,12 +63,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Add parentheses around `li$codepage >= 1250L && li$codepage <= 1258L` before the `|| li$codepage == 874L` branch."
+
 [diagnostic.range]
 start_line = 169
 start_character = 20
 end_line = 169
 end_character = 22
-
 [[diagnostic]]
 package = "base"
 path = "R/dataframe.R"
@@ -76,12 +76,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Add parentheses around both mixed operands: `(char.i && nextra) || (all(i >= 0L) && (nn <- max(i)) > nrows)`."
+
 [diagnostic.range]
 start_line = 864
 start_character = 23
 end_line = 864
 end_character = 25
-
 [[diagnostic]]
 package = "base"
 path = "R/library.R"
@@ -89,12 +89,12 @@ message = "Assigning to string literal \"__library_can_mask__\"; R will bind the
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__library_can_mask__` <- canMaskEnv ``."
+
 [diagnostic.range]
 start_line = 342
 start_character = 20
 end_line = 342
 end_character = 42
-
 [[diagnostic]]
 package = "base"
 path = "R/match.fun.R"
@@ -102,12 +102,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Add parentheses around the character/function disjunction: `((is.character(FUN) && length(FUN) == 1L) || is.symbol(FUN))`."
+
 [diagnostic.range]
 start_line = 25
 start_character = 49
 end_line = 25
 end_character = 51
-
 [[diagnostic]]
 package = "base"
 path = "R/namespace.R"
@@ -115,12 +115,12 @@ message = "Assigning to string literal \"__NameSpacesLoading__\"; R will bind th
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__NameSpacesLoading__` <- c(package, loading) ``."
+
 [diagnostic.range]
 start_line = 194
 start_character = 4
 end_line = 194
 end_character = 27
-
 [[diagnostic]]
 package = "base"
 path = "R/namespace.R"
@@ -128,6 +128,7 @@ message = "Assigning to string literal \"__LoadingNamespaceInfo__\"; R will bind
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__LoadingNamespaceInfo__` <- list(...) ``."
+
 [diagnostic.range]
 start_line = 558
 start_character = 8
@@ -140,12 +141,12 @@ message = "Assigning to string literal \"x\"; R will bind the value to the varia
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/compiler"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `x` <- ... ``."
+
 [diagnostic.range]
 start_line = 126
 start_character = 38
 end_line = 126
 end_character = 41
-
 [[diagnostic]]
 package = "compiler"
 path = "tests/assign.R"
@@ -153,12 +154,12 @@ message = "Cannot assign to numeric literal `3`."
 evidence = "Confirmed real: inside quote() testing the compiler checkAssign error for numeric-literal assignment."
 source = "R SVN trunk src/library/compiler"
 minimal_edit = "Intentional test case; no edit needed."
+
 [diagnostic.range]
 start_line = 127
 start_character = 38
 end_line = 127
 end_character = 39
-
 [[diagnostic]]
 package = "compiler"
 path = "tests/envir.R"
@@ -166,12 +167,12 @@ message = "Assigning to string literal \"v\"; R will bind the value to the varia
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/compiler"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `v` <- ... ``."
+
 [diagnostic.range]
 start_line = 49
 start_character = 41
 end_line = 49
 end_character = 44
-
 [[diagnostic]]
 package = "datasets"
 path = "data/AirPassengers.R"
@@ -179,12 +180,12 @@ message = "Assigning to string literal \"AirPassengers\"; R will bind the value 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `AirPassengers` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 15
-
 [[diagnostic]]
 package = "datasets"
 path = "data/BJsales.R"
@@ -192,12 +193,12 @@ message = "Assigning to string literal \"BJsales.lead\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `BJsales.lead` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 14
-
 [[diagnostic]]
 package = "datasets"
 path = "data/BJsales.R"
@@ -205,12 +206,12 @@ message = "Assigning to string literal \"BJsales\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `BJsales` <- ... ``."
+
 [diagnostic.range]
 start_line = 13
 start_character = 0
 end_line = 13
 end_character = 9
-
 [[diagnostic]]
 package = "datasets"
 path = "data/ChickWeight.R"
@@ -218,12 +219,12 @@ message = "Assigning to string literal \"ChickWeight\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `ChickWeight` <- ... ``."
+
 [diagnostic.range]
 start_line = 3
 start_character = 0
 end_line = 3
 end_character = 13
-
 [[diagnostic]]
 package = "datasets"
 path = "data/DNase.R"
@@ -231,12 +232,12 @@ message = "Assigning to string literal \"DNase\"; R will bind the value to the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `DNase` <- ... ``."
+
 [diagnostic.range]
 start_line = 3
 start_character = 0
 end_line = 3
 end_character = 7
-
 [[diagnostic]]
 package = "datasets"
 path = "data/EuStockMarkets.R"
@@ -244,12 +245,12 @@ message = "Assigning to string literal \"EuStockMarkets\"; R will bind the value
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `EuStockMarkets` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 16
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Harman23.cor.R"
@@ -257,12 +258,12 @@ message = "Assigning to string literal \"Harman23.cor\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Harman23.cor` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 14
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Harman74.cor.R"
@@ -270,12 +271,12 @@ message = "Assigning to string literal \"Harman74.cor\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Harman74.cor` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 14
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Indometh.R"
@@ -283,12 +284,12 @@ message = "Assigning to string literal \"Indometh\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Indometh` <- ... ``."
+
 [diagnostic.range]
 start_line = 5
 start_character = 0
 end_line = 5
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/InsectSprays.R"
@@ -296,12 +297,12 @@ message = "Assigning to string literal \"InsectSprays\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `InsectSprays` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 14
-
 [[diagnostic]]
 package = "datasets"
 path = "data/LakeHuron.R"
@@ -309,12 +310,12 @@ message = "Assigning to string literal \"LakeHuron\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `LakeHuron` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 11
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Loblolly.R"
@@ -322,12 +323,12 @@ message = "Assigning to string literal \"Loblolly\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Loblolly` <- ... ``."
+
 [diagnostic.range]
 start_line = 3
 start_character = 0
 end_line = 3
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Orange.R"
@@ -335,12 +336,12 @@ message = "Assigning to string literal \"Orange\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Orange` <- ... ``."
+
 [diagnostic.range]
 start_line = 3
 start_character = 0
 end_line = 3
 end_character = 8
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Puromycin.R"
@@ -348,12 +349,12 @@ message = "Assigning to string literal \"Puromycin\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Puromycin` <- ... ``."
+
 [diagnostic.range]
 start_line = 2
 start_character = 0
 end_line = 2
 end_character = 11
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Seatbelts.R"
@@ -361,12 +362,12 @@ message = "Assigning to string literal \"Seatbelts\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Seatbelts` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 11
-
 [[diagnostic]]
 package = "datasets"
 path = "data/Theoph.R"
@@ -374,12 +375,12 @@ message = "Assigning to string literal \"Theoph\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Theoph` <- ... ``."
+
 [diagnostic.range]
 start_line = 3
 start_character = 0
 end_line = 3
 end_character = 8
-
 [[diagnostic]]
 package = "datasets"
 path = "data/UKDriverDeaths.R"
@@ -387,12 +388,12 @@ message = "Assigning to string literal \"UKDriverDeaths\"; R will bind the value
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `UKDriverDeaths` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 16
-
 [[diagnostic]]
 package = "datasets"
 path = "data/UKLungDeaths.R"
@@ -400,12 +401,12 @@ message = "Assigning to string literal \"ldeaths\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `ldeaths` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 9
-
 [[diagnostic]]
 package = "datasets"
 path = "data/UKLungDeaths.R"
@@ -413,12 +414,12 @@ message = "Assigning to string literal \"fdeaths\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `fdeaths` <- ... ``."
+
 [diagnostic.range]
 start_line = 9
 start_character = 0
 end_line = 9
 end_character = 9
-
 [[diagnostic]]
 package = "datasets"
 path = "data/UKLungDeaths.R"
@@ -426,12 +427,12 @@ message = "Assigning to string literal \"mdeaths\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `mdeaths` <- ... ``."
+
 [diagnostic.range]
 start_line = 17
 start_character = 0
 end_line = 17
 end_character = 9
-
 [[diagnostic]]
 package = "datasets"
 path = "data/USAccDeaths.R"
@@ -439,12 +440,12 @@ message = "Assigning to string literal \"USAccDeaths\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `USAccDeaths` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 13
-
 [[diagnostic]]
 package = "datasets"
 path = "data/USPersonalExpenditure.R"
@@ -452,12 +453,12 @@ message = "Assigning to string literal \"USPersonalExpenditure\"; R will bind th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `USPersonalExpenditure` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 23
-
 [[diagnostic]]
 package = "datasets"
 path = "data/VADeaths.R"
@@ -465,12 +466,12 @@ message = "Assigning to string literal \"VADeaths\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `VADeaths` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/WorldPhones.R"
@@ -478,12 +479,12 @@ message = "Assigning to string literal \"WorldPhones\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `WorldPhones` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 13
-
 [[diagnostic]]
 package = "datasets"
 path = "data/ability.cov.R"
@@ -491,12 +492,12 @@ message = "Assigning to string literal \"ability.cov\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `ability.cov` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 13
-
 [[diagnostic]]
 package = "datasets"
 path = "data/airmiles.R"
@@ -504,12 +505,12 @@ message = "Assigning to string literal \"airmiles\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `airmiles` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/attenu.R"
@@ -517,12 +518,12 @@ message = "Assigning to string literal \"attenu\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `attenu` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 8
-
 [[diagnostic]]
 package = "datasets"
 path = "data/austres.R"
@@ -530,12 +531,12 @@ message = "Assigning to string literal \"austres\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `austres` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 9
-
 [[diagnostic]]
 package = "datasets"
 path = "data/co2.R"
@@ -543,12 +544,12 @@ message = "Assigning to string literal \"co2\"; R will bind the value to the var
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `co2` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 5
-
 [[diagnostic]]
 package = "datasets"
 path = "data/discoveries.R"
@@ -556,12 +557,12 @@ message = "Assigning to string literal \"discoveries\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `discoveries` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 13
-
 [[diagnostic]]
 package = "datasets"
 path = "data/eurodist.R"
@@ -569,12 +570,12 @@ message = "Assigning to string literal \"eurodist\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `eurodist` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/faithful.R"
@@ -582,12 +583,12 @@ message = "Assigning to string literal \"faithful\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `faithful` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/iris.R"
@@ -595,12 +596,12 @@ message = "Assigning to string literal \"iris\"; R will bind the value to the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `iris` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 6
-
 [[diagnostic]]
 package = "datasets"
 path = "data/iris3.R"
@@ -608,12 +609,12 @@ message = "Assigning to string literal \"iris3\"; R will bind the value to the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `iris3` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 7
-
 [[diagnostic]]
 package = "datasets"
 path = "data/islands.R"
@@ -621,12 +622,12 @@ message = "Assigning to string literal \"islands\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `islands` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 9
-
 [[diagnostic]]
 package = "datasets"
 path = "data/lh.R"
@@ -634,12 +635,12 @@ message = "Assigning to string literal \"lh\"; R will bind the value to the vari
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `lh` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 4
-
 [[diagnostic]]
 package = "datasets"
 path = "data/lynx.R"
@@ -647,12 +648,12 @@ message = "Assigning to string literal \"lynx\"; R will bind the value to the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `lynx` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 6
-
 [[diagnostic]]
 package = "datasets"
 path = "data/mtcars.R"
@@ -660,12 +661,12 @@ message = "Assigning to string literal \"mtcars\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `mtcars` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 8
-
 [[diagnostic]]
 package = "datasets"
 path = "data/nhtemp.R"
@@ -673,12 +674,12 @@ message = "Assigning to string literal \"nhtemp\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `nhtemp` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 8
-
 [[diagnostic]]
 package = "datasets"
 path = "data/precip.R"
@@ -686,12 +687,12 @@ message = "Assigning to string literal \"precip\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `precip` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 8
-
 [[diagnostic]]
 package = "datasets"
 path = "data/presidents.R"
@@ -699,12 +700,12 @@ message = "Assigning to string literal \"presidents\"; R will bind the value to 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `presidents` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 12
-
 [[diagnostic]]
 package = "datasets"
 path = "data/pressure.R"
@@ -712,12 +713,12 @@ message = "Assigning to string literal \"pressure\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `pressure` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/randu.R"
@@ -725,12 +726,12 @@ message = "Assigning to string literal \"randu\"; R will bind the value to the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `randu` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 7
-
 [[diagnostic]]
 package = "datasets"
 path = "data/rivers.R"
@@ -738,12 +739,12 @@ message = "Assigning to string literal \"rivers\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `rivers` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 8
-
 [[diagnostic]]
 package = "datasets"
 path = "data/state.R"
@@ -751,12 +752,12 @@ message = "Assigning to string literal \"state.area\"; R will bind the value to 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `state.area` <- ... ``."
+
 [diagnostic.range]
 start_line = 24
 start_character = 0
 end_line = 24
 end_character = 12
-
 [[diagnostic]]
 package = "datasets"
 path = "data/state.R"
@@ -764,12 +765,12 @@ message = "Assigning to string literal \"state.center\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `state.center` <- ... ``."
+
 [diagnostic.range]
 start_line = 31
 start_character = 0
 end_line = 31
 end_character = 14
-
 [[diagnostic]]
 package = "datasets"
 path = "data/state.R"
@@ -777,12 +778,12 @@ message = "Assigning to string literal \"state.division\"; R will bind the value
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `state.division` <- ... ``."
+
 [diagnostic.range]
 start_line = 50
 start_character = 0
 end_line = 50
 end_character = 16
-
 [[diagnostic]]
 package = "datasets"
 path = "data/state.R"
@@ -790,12 +791,12 @@ message = "Assigning to string literal \"state.region\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `state.region` <- ... ``."
+
 [diagnostic.range]
 start_line = 58
 start_character = 0
 end_line = 58
 end_character = 14
-
 [[diagnostic]]
 package = "datasets"
 path = "data/state.R"
@@ -803,12 +804,12 @@ message = "Assigning to string literal \"state.x77\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `state.x77` <- ... ``."
+
 [diagnostic.range]
 start_line = 64
 start_character = 0
 end_line = 64
 end_character = 11
-
 [[diagnostic]]
 package = "datasets"
 path = "data/sunspots.R"
@@ -816,12 +817,12 @@ message = "Assigning to string literal \"sunspots\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `sunspots` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/treering.R"
@@ -829,12 +830,12 @@ message = "Assigning to string literal \"treering\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `treering` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 10
-
 [[diagnostic]]
 package = "datasets"
 path = "data/trees.R"
@@ -842,12 +843,12 @@ message = "Assigning to string literal \"trees\"; R will bind the value to the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `trees` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 7
-
 [[diagnostic]]
 package = "datasets"
 path = "data/uspop.R"
@@ -855,12 +856,12 @@ message = "Assigning to string literal \"uspop\"; R will bind the value to the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `uspop` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 7
-
 [[diagnostic]]
 package = "datasets"
 path = "data/volcano.R"
@@ -868,12 +869,12 @@ message = "Assigning to string literal \"volcano\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `volcano` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 9
-
 [[diagnostic]]
 package = "datasets"
 path = "data/women.R"
@@ -881,12 +882,12 @@ message = "Assigning to string literal \"women\"; R will bind the value to the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/datasets"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `women` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 7
-
 [[diagnostic]]
 package = "methods"
 path = "R/BasicClasses.R"
@@ -894,12 +895,12 @@ message = "Assigning to string literal \"<undef>\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `<undef>` <- ... ``."
+
 [diagnostic.range]
 start_line = 130
 start_character = 54
 end_line = 130
 end_character = 63
-
 [[diagnostic]]
 package = "methods"
 path = "R/ClassExtensions.R"
@@ -907,12 +908,12 @@ message = "Assigning to string literal \"S3Part<-\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `S3Part<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 113
 start_character = 0
 end_line = 113
 end_character = 10
-
 [[diagnostic]]
 package = "methods"
 path = "R/SClasses.R"
@@ -920,12 +921,12 @@ message = "Assigning to string literal \"slot<-\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `slot<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 296
 start_character = 0
 end_line = 296
 end_character = 8
-
 [[diagnostic]]
 package = "methods"
 path = "R/addedFunctions.R"
@@ -933,12 +934,12 @@ message = "Assigning to string literal \"el<-\"; R will bind the value to the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `el<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 70
 start_character = 0
 end_line = 70
 end_character = 6
-
 [[diagnostic]]
 package = "methods"
 path = "R/addedFunctions.R"
@@ -946,12 +947,12 @@ message = "Assigning to string literal \"elNamed<-\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `elNamed<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 90
 start_character = 0
 end_line = 90
 end_character = 11
-
 [[diagnostic]]
 package = "methods"
 path = "R/as.R"
@@ -959,12 +960,12 @@ message = "Assigning to string literal \"as<-\"; R will bind the value to the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `as<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 148
 start_character = 0
 end_line = 148
 end_character = 6
-
 [[diagnostic]]
 package = "methods"
 path = "R/is.R"
@@ -972,12 +973,12 @@ message = "Assigning to string literal \".newDirectSuperclass<-\"; R will bind t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `.newDirectSuperclass<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 290
 start_character = 0
 end_line = 290
 end_character = 24
-
 [[diagnostic]]
 package = "methods"
 path = "R/languageEl.R"
@@ -985,12 +986,12 @@ message = "Assigning to string literal \"languageEl<-\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `languageEl<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 52
 start_character = 0
 end_line = 52
 end_character = 14
-
 [[diagnostic]]
 package = "methods"
 path = "R/oldClass.R"
@@ -998,12 +999,12 @@ message = "Assigning to string literal \"S3Class<-\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `S3Class<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 283
 start_character = 0
 end_line = 283
 end_character = 11
-
 [[diagnostic]]
 package = "splines"
 path = "R/splines.R"
@@ -1011,12 +1012,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/splines"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 63
 start_character = 28
 end_line = 63
 end_character = 30
-
 [[diagnostic]]
 package = "stats"
 path = "R/arima.R"
@@ -1024,12 +1025,12 @@ message = "Assigning to string literal \"%+%\"; R will bind the value to the var
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `%+%` <- ... ``."
+
 [diagnostic.range]
 start_line = 27
 start_character = 4
 end_line = 27
 end_character = 9
-
 [[diagnostic]]
 package = "stats"
 path = "R/family.R"
@@ -1037,12 +1038,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 580
 start_character = 59
 end_line = 580
 end_character = 61
-
 [[diagnostic]]
 package = "stats"
 path = "R/models.R"
@@ -1050,12 +1051,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 124
 start_character = 20
 end_line = 124
 end_character = 22
-
 [[diagnostic]]
 package = "stats"
 path = "R/nlm.R"
@@ -1063,12 +1064,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 78
 start_character = 51
 end_line = 78
 end_character = 53
-
 [[diagnostic]]
 package = "stats"
 path = "R/proj.R"
@@ -1076,12 +1077,12 @@ message = "Assigning to string literal \"attr.assign<-\"; R will bind the value 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `attr.assign<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 130
 start_character = 4
 end_line = 130
 end_character = 19
-
 [[diagnostic]]
 package = "stats"
 path = "R/prop.test.R"
@@ -1089,12 +1090,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 70
 start_character = 14
 end_line = 70
 end_character = 16
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/Tk.R"
@@ -1102,12 +1103,12 @@ message = "Assigning to string literal \"tclObj<-\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `tclObj<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 207
 start_character = 0
 end_line = 207
 end_character = 10
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/Tk.R"
@@ -1115,12 +1116,12 @@ message = "Assigning to string literal \"tclObj<-.tclVar\"; R will bind the valu
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `tclObj<-.tclVar` <- ... ``."
+
 [diagnostic.range]
 start_line = 215
 start_character = 0
 end_line = 215
 end_character = 17
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/Tk.R"
@@ -1128,12 +1129,12 @@ message = "Assigning to string literal \"tclvalue<-\"; R will bind the value to 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `tclvalue<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 222
 start_character = 0
 end_line = 222
 end_character = 12
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/Tk.R"
@@ -1141,12 +1142,12 @@ message = "Assigning to string literal \"tclvalue<-.tclVar\"; R will bind the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `tclvalue<-.tclVar` <- ... ``."
+
 [diagnostic.range]
 start_line = 232
 start_character = 0
 end_line = 232
 end_character = 19
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/Tk.R"
@@ -1154,12 +1155,12 @@ message = "Assigning to string literal \"tclvalue<-.default\"; R will bind the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `tclvalue<-.default` <- ... ``."
+
 [diagnostic.range]
 start_line = 240
 start_character = 0
 end_line = 240
 end_character = 20
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/Tk.R"
@@ -1167,12 +1168,12 @@ message = "Assigning to string literal \"tktitle<-\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `tktitle<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 352
 start_character = 0
 end_line = 352
 end_character = 11
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/tclarray.R"
@@ -1180,12 +1181,12 @@ message = "Assigning to string literal \"[[.tclArray\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[[.tclArray` <- ... ``."
+
 [diagnostic.range]
 start_line = 26
 start_character = 0
 end_line = 26
 end_character = 13
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/tclarray.R"
@@ -1193,12 +1194,12 @@ message = "Assigning to string literal \"[[<-.tclArray\"; R will bind the value 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[[<-.tclArray` <- ... ``."
+
 [diagnostic.range]
 start_line = 34
 start_character = 0
 end_line = 34
 end_character = 15
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/tclarray.R"
@@ -1206,12 +1207,12 @@ message = "Assigning to string literal \"$.tclArray\"; R will bind the value to 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `$.tclArray` <- ... ``."
+
 [diagnostic.range]
 start_line = 46
 start_character = 0
 end_line = 46
 end_character = 12
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/tclarray.R"
@@ -1219,12 +1220,12 @@ message = "Assigning to string literal \"$<-.tclArray\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `$<-.tclArray` <- ... ``."
+
 [diagnostic.range]
 start_line = 54
 start_character = 0
 end_line = 54
 end_character = 14
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/tclarray.R"
@@ -1232,12 +1233,12 @@ message = "Assigning to string literal \"names<-.tclArray\"; R will bind the val
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `names<-.tclArray` <- ... ``."
+
 [diagnostic.range]
 start_line = 69
 start_character = 0
 end_line = 69
 end_character = 18
-
 [[diagnostic]]
 package = "tcltk"
 path = "R/tclarray.R"
@@ -1245,12 +1246,12 @@ message = "Assigning to string literal \"length<-.tclArray\"; R will bind the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/tcltk"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `length<-.tclArray` <- ... ``."
+
 [diagnostic.range]
 start_line = 75
 start_character = 0
 end_line = 75
 end_character = 19
-
 [[diagnostic]]
 package = "tools"
 path = "R/check.R"
@@ -1258,12 +1259,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/tools"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 4085
 start_character = 69
 end_line = 4085
 end_character = 71
-
 [[diagnostic]]
 package = "tools"
 path = "R/news.R"
@@ -1271,12 +1272,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/tools"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 878
 start_character = 36
 end_line = 878
 end_character = 38
-
 [[diagnostic]]
 package = "tools"
 path = "R/utils.R"
@@ -1284,12 +1285,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/tools"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 912
 start_character = 43
 end_line = 912
 end_character = 45
-
 [[diagnostic]]
 package = "utils"
 path = "R/sourceutils.R"
@@ -1297,13 +1298,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "R SVN trunk src/library/utils"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 86
 start_character = 51
 end_line = 86
 end_character = 53
-
-
 [[diagnostic]]
 package = "codetools"
 path = "tests/tests.R"
@@ -1311,12 +1311,12 @@ message = "Assigning to string literal \"v\"; R will bind the value to the varia
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git codetools"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `v` <- ... ``."
+
 [diagnostic.range]
 start_line = 21
 start_character = 38
 end_line = 21
 end_character = 41
-
 [[diagnostic]]
 package = "foreign"
 path = "R/minitab.R"
@@ -1324,12 +1324,12 @@ message = "Assigning to string literal \"read.mtp\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git foreign"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `read.mtp` <- ... ``."
+
 [diagnostic.range]
 start_line = 28
 start_character = 0
 end_line = 28
 end_character = 10
-
 [[diagnostic]]
 package = "lattice"
 path = "R/shingle.R"
@@ -1337,12 +1337,12 @@ message = "Assigning to string literal \"[.shingle\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git lattice"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.shingle` <- ... ``."
+
 [diagnostic.range]
 start_line = 23
 start_character = 0
 end_line = 23
 end_character = 11
-
 [[diagnostic]]
 package = "lattice"
 path = "R/summary.trellis.R"
@@ -1350,12 +1350,12 @@ message = "Assigning to string literal \"dimnames<-.trellis\"; R will bind the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git lattice"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `dimnames<-.trellis` <- ... ``."
+
 [diagnostic.range]
 start_line = 90
 start_character = 0
 end_line = 90
 end_character = 20
-
 [[diagnostic]]
 package = "lattice"
 path = "R/update.trellis.R"
@@ -1363,12 +1363,12 @@ message = "Assigning to string literal \"[.trellis\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git lattice"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.trellis` <- ... ``."
+
 [diagnostic.range]
 start_line = 510
 start_character = 0
 end_line = 510
 end_character = 11
-
 [[diagnostic]]
 package = "MASS"
 path = "R/area.R"
@@ -1376,12 +1376,12 @@ message = "Assigning to string literal \"area\"; R will bind the value to the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `area` <- ... ``."
+
 [diagnostic.range]
 start_line = 16
 start_character = 0
 end_line = 16
 end_character = 6
-
 [[diagnostic]]
 package = "MASS"
 path = "R/area.R"
@@ -1389,12 +1389,12 @@ message = "Assigning to string literal \"fbeta\"; R will bind the value to the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `fbeta` <- ... ``."
+
 [diagnostic.range]
 start_line = 36
 start_character = 0
 end_line = 36
 end_character = 7
-
 [[diagnostic]]
 package = "MASS"
 path = "R/area.R"
@@ -1402,12 +1402,12 @@ message = "Assigning to string literal \"print.abbrev\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `print.abbrev` <- ... ``."
+
 [diagnostic.range]
 start_line = 41
 start_character = 0
 end_line = 41
 end_character = 14
-
 [[diagnostic]]
 package = "MASS"
 path = "R/enlist.R"
@@ -1415,12 +1415,12 @@ message = "Assigning to string literal \"enlist\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `enlist` <- ... ``."
+
 [diagnostic.range]
 start_line = 16
 start_character = 0
 end_line = 16
 end_character = 8
-
 [[diagnostic]]
 package = "MASS"
 path = "R/fractions.R"
@@ -1428,12 +1428,12 @@ message = "Assigning to string literal \"[.fractions\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.fractions` <- ... ``."
+
 [diagnostic.range]
 start_line = 90
 start_character = 0
 end_line = 90
 end_character = 13
-
 [[diagnostic]]
 package = "MASS"
 path = "R/fractions.R"
@@ -1441,12 +1441,12 @@ message = "Assigning to string literal \"[<-.fractions\"; R will bind the value 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[<-.fractions` <- ... ``."
+
 [diagnostic.range]
 start_line = 96
 start_character = 0
 end_line = 96
 end_character = 15
-
 [[diagnostic]]
 package = "MASS"
 path = "R/rms.curv.R"
@@ -1454,12 +1454,12 @@ message = "Assigning to string literal \"rms.curv\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `rms.curv` <- ... ``."
+
 [diagnostic.range]
 start_line = 16
 start_character = 0
 end_line = 16
 end_character = 10
-
 [[diagnostic]]
 package = "MASS"
 path = "R/rms.curv.R"
@@ -1467,12 +1467,12 @@ message = "Assigning to string literal \"print.rms.curv\"; R will bind the value
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `print.rms.curv` <- ... ``."
+
 [diagnostic.range]
 start_line = 57
 start_character = 0
 end_line = 57
 end_character = 16
-
 [[diagnostic]]
 package = "MASS"
 path = "R/truehist.R"
@@ -1480,12 +1480,12 @@ message = "Assigning to string literal \"truehist\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git MASS"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `truehist` <- ... ``."
+
 [diagnostic.range]
 start_line = 16
 start_character = 0
 end_line = 16
 end_character = 10
-
 [[diagnostic]]
 package = "mgcv"
 path = "R/misc.r"
@@ -1493,12 +1493,12 @@ message = "Assigning to string literal \"%.%\"; R will bind the value to the var
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git mgcv"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `%.%` <- ... ``."
+
 [diagnostic.range]
 start_line = 57
 start_character = 0
 end_line = 57
 end_character = 5
-
 [[diagnostic]]
 package = "mgcv"
 path = "R/misc.r"
@@ -1506,12 +1506,12 @@ message = "Assigning to string literal \"sdiag<-\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git mgcv"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `sdiag<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 123
 start_character = 0
 end_line = 123
 end_character = 9
-
 [[diagnostic]]
 package = "mgcv"
 path = "R/plots.r"
@@ -1519,12 +1519,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "CRAN/git mgcv"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 1514
 start_character = 63
 end_line = 1514
 end_character = 65
-
 [[diagnostic]]
 package = "mgcv"
 path = "R/soap.r"
@@ -1532,12 +1532,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "CRAN/git mgcv"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 325
 start_character = 33
 end_line = 325
 end_character = 35
-
 [[diagnostic]]
 package = "nlme"
 path = "R/groupedData.R"
@@ -1545,12 +1545,12 @@ message = "Assigning to string literal \"[.groupedData\"; R will bind the value 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.groupedData` <- ... ``."
+
 [diagnostic.range]
 start_line = 581
 start_character = 0
 end_line = 581
 end_character = 15
-
 [[diagnostic]]
 package = "nlme"
 path = "R/modelStruct.R"
@@ -1558,12 +1558,12 @@ message = "Assigning to string literal \"coef<-.modelStruct\"; R will bind the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.modelStruct` <- ... ``."
+
 [diagnostic.range]
 start_line = 35
 start_character = 0
 end_line = 35
 end_character = 20
-
 [[diagnostic]]
 package = "nlme"
 path = "R/newFunc.R"
@@ -1571,12 +1571,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 324
 start_character = 32
 end_line = 324
 end_character = 34
-
 [[diagnostic]]
 package = "nlme"
 path = "R/newGenerics.R"
@@ -1584,12 +1584,12 @@ message = "Assigning to string literal \"coef<-\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 33
 start_character = 0
 end_line = 33
 end_character = 8
-
 [[diagnostic]]
 package = "nlme"
 path = "R/newGenerics.R"
@@ -1597,12 +1597,12 @@ message = "Assigning to string literal \"coefficients<-\"; R will bind the value
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coefficients<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 33
 start_character = 12
 end_line = 33
 end_character = 28
-
 [[diagnostic]]
 package = "nlme"
 path = "R/newGenerics.R"
@@ -1610,12 +1610,12 @@ message = "Assigning to string literal \"covariate<-\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `covariate<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 47
 start_character = 0
 end_line = 47
 end_character = 13
-
 [[diagnostic]]
 package = "nlme"
 path = "R/newGenerics.R"
@@ -1623,12 +1623,12 @@ message = "Assigning to string literal \"matrix<-\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `matrix<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 110
 start_character = 0
 end_line = 110
 end_character = 10
-
 [[diagnostic]]
 package = "nlme"
 path = "R/newGenerics.R"
@@ -1636,12 +1636,12 @@ message = "Assigning to string literal \"Names<-\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Names<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 118
 start_character = 0
 end_line = 118
 end_character = 9
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1649,12 +1649,12 @@ message = "Assigning to string literal \"coef<-.pdMat\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.pdMat` <- ... ``."
+
 [diagnostic.range]
 start_line = 251
 start_character = 0
 end_line = 251
 end_character = 14
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1662,12 +1662,12 @@ message = "Assigning to string literal \"[.pdMat\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.pdMat` <- ... ``."
+
 [diagnostic.range]
 start_line = 551
 start_character = 0
 end_line = 551
 end_character = 9
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1675,12 +1675,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 561
 start_character = 21
 end_line = 561
 end_character = 23
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1688,12 +1688,12 @@ message = "Assigning to string literal \"[<-.pdMat\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[<-.pdMat` <- ... ``."
+
 [diagnostic.range]
 start_line = 571
 start_character = 0
 end_line = 571
 end_character = 11
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1701,12 +1701,12 @@ message = "Assigning to string literal \"coef<-.pdBlocked\"; R will bind the val
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.pdBlocked` <- ... ``."
+
 [diagnostic.range]
 start_line = 1970
 start_character = 0
 end_line = 1970
 end_character = 18
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1714,12 +1714,12 @@ message = "Assigning to string literal \"matrix<-.pdBlocked\"; R will bind the v
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `matrix<-.pdBlocked` <- ... ``."
+
 [diagnostic.range]
 start_line = 2036
 start_character = 0
 end_line = 2036
 end_character = 20
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1727,12 +1727,12 @@ message = "Assigning to string literal \"Names<-.pdBlocked\"; R will bind the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Names<-.pdBlocked` <- ... ``."
+
 [diagnostic.range]
 start_line = 2068
 start_character = 0
 end_line = 2068
 end_character = 19
-
 [[diagnostic]]
 package = "nlme"
 path = "R/pdMat.R"
@@ -1740,12 +1740,12 @@ message = "Assigning to string literal \"[.pdBlocked\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.pdBlocked` <- ... ``."
+
 [diagnostic.range]
 start_line = 2106
 start_character = 0
 end_line = 2106
 end_character = 13
-
 [[diagnostic]]
 package = "nlme"
 path = "R/reStruct.R"
@@ -1753,12 +1753,12 @@ message = "Assigning to string literal \"coef<-.reStruct\"; R will bind the valu
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.reStruct` <- ... ``."
+
 [diagnostic.range]
 start_line = 182
 start_character = 0
 end_line = 182
 end_character = 17
-
 [[diagnostic]]
 package = "nlme"
 path = "R/reStruct.R"
@@ -1766,12 +1766,12 @@ message = "Assigning to string literal \"matrix<-.reStruct\"; R will bind the va
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `matrix<-.reStruct` <- ... ``."
+
 [diagnostic.range]
 start_line = 304
 start_character = 0
 end_line = 304
 end_character = 19
-
 [[diagnostic]]
 package = "nlme"
 path = "R/reStruct.R"
@@ -1779,12 +1779,12 @@ message = "Assigning to string literal \"Names<-.reStruct\"; R will bind the val
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `Names<-.reStruct` <- ... ``."
+
 [diagnostic.range]
 start_line = 375
 start_character = 0
 end_line = 375
 end_character = 18
-
 [[diagnostic]]
 package = "nlme"
 path = "R/reStruct.R"
@@ -1792,12 +1792,12 @@ message = "Assigning to string literal \"[.reStruct\"; R will bind the value to 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.reStruct` <- ... ``."
+
 [diagnostic.range]
 start_line = 436
 start_character = 0
 end_line = 436
 end_character = 12
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1805,12 +1805,12 @@ message = "Assigning to string literal \"covariate<-.varFunc\"; R will bind the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `covariate<-.varFunc` <- ... ``."
+
 [diagnostic.range]
 start_line = 85
 start_character = 0
 end_line = 85
 end_character = 21
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1818,12 +1818,12 @@ message = "Assigning to string literal \"coef<-.varFixed\"; R will bind the valu
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.varFixed` <- ... ``."
+
 [diagnostic.range]
 start_line = 223
 start_character = 0
 end_line = 223
 end_character = 17
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1831,12 +1831,12 @@ message = "Assigning to string literal \"coef<-.varIdent\"; R will bind the valu
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.varIdent` <- ... ``."
+
 [diagnostic.range]
 start_line = 327
 start_character = 0
 end_line = 327
 end_character = 17
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1844,12 +1844,12 @@ message = "Assigning to string literal \"coef<-.varPower\"; R will bind the valu
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.varPower` <- ... ``."
+
 [diagnostic.range]
 start_line = 519
 start_character = 0
 end_line = 519
 end_character = 17
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1857,12 +1857,12 @@ message = "Assigning to string literal \"coef<-.varExp\"; R will bind the value 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.varExp` <- ... ``."
+
 [diagnostic.range]
 start_line = 732
 start_character = 0
 end_line = 732
 end_character = 15
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1870,12 +1870,12 @@ message = "Assigning to string literal \"coef<-.varConstPower\"; R will bind the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.varConstPower` <- ... ``."
+
 [diagnostic.range]
 start_line = 991
 start_character = 0
 end_line = 991
 end_character = 22
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1883,12 +1883,12 @@ message = "Assigning to string literal \"coef<-.varConstProp\"; R will bind the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.varConstProp` <- ... ``."
+
 [diagnostic.range]
 start_line = 1257
 start_character = 0
 end_line = 1257
 end_character = 21
-
 [[diagnostic]]
 package = "nlme"
 path = "R/varFunc.R"
@@ -1896,12 +1896,12 @@ message = "Assigning to string literal \"coef<-.varComb\"; R will bind the value
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `coef<-.varComb` <- ... ``."
+
 [diagnostic.range]
 start_line = 1449
 start_character = 0
 end_line = 1449
 end_character = 16
-
 [[diagnostic]]
 package = "nlme"
 path = "tests/deparse.R"
@@ -1909,12 +1909,12 @@ message = "Assigning to string literal \"mydata2\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `mydata2` <- ... ``."
+
 [diagnostic.range]
 start_line = 39
 start_character = 0
 end_line = 39
 end_character = 9
-
 [[diagnostic]]
 package = "survival"
 path = "R/Surv.R"
@@ -1922,12 +1922,12 @@ message = "Assigning to string literal \"[.Surv\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.Surv` <- ... ``."
+
 [diagnostic.range]
 start_line = 235
 start_character = 0
 end_line = 235
 end_character = 8
-
 [[diagnostic]]
 package = "survival"
 path = "R/Surv.R"
@@ -1935,12 +1935,12 @@ message = "Assigning to string literal \"names<-.Surv\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `names<-.Surv` <- ... ``."
+
 [diagnostic.range]
 start_line = 305
 start_character = 0
 end_line = 305
 end_character = 14
-
 [[diagnostic]]
 package = "survival"
 path = "R/Surv2.R"
@@ -1948,12 +1948,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 10
 start_character = 32
 end_line = 10
 end_character = 34
-
 [[diagnostic]]
 package = "survival"
 path = "R/Surv2.R"
@@ -1961,12 +1961,12 @@ message = "Assigning to string literal \"[.Surv2\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.Surv2` <- ... ``."
+
 [diagnostic.range]
 start_line = 75
 start_character = 0
 end_line = 75
 end_character = 9
-
 [[diagnostic]]
 package = "survival"
 path = "R/Surv2.R"
@@ -1974,12 +1974,12 @@ message = "Assigning to string literal \"names<-.Surv2\"; R will bind the value 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `names<-.Surv2` <- ... ``."
+
 [diagnostic.range]
 start_line = 130
 start_character = 0
 end_line = 130
 end_character = 15
-
 [[diagnostic]]
 package = "survival"
 path = "R/aareg.R"
@@ -1987,12 +1987,12 @@ message = "Assigning to string literal \"[.aareg\"; R will bind the value to the
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.aareg` <- ... ``."
+
 [diagnostic.range]
 start_line = 395
 start_character = 0
 end_line = 395
 end_character = 9
-
 [[diagnostic]]
 package = "survival"
 path = "R/cch.R"
@@ -2000,12 +2000,12 @@ message = "Assigning to string literal \"print.cch\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `print.cch` <- ... ``."
+
 [diagnostic.range]
 start_line = 318
 start_character = 0
 end_line = 318
 end_character = 11
-
 [[diagnostic]]
 package = "survival"
 path = "R/cch.R"
@@ -2013,12 +2013,12 @@ message = "Assigning to string literal \"summary.cch\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `summary.cch` <- ... ``."
+
 [diagnostic.range]
 start_line = 354
 start_character = 0
 end_line = 354
 end_character = 13
-
 [[diagnostic]]
 package = "survival"
 path = "R/cox.zph.R"
@@ -2026,12 +2026,12 @@ message = "Assigning to string literal \"[.cox.zph\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.cox.zph` <- ... ``."
+
 [diagnostic.range]
 start_line = 234
 start_character = 0
 end_line = 234
 end_character = 11
-
 [[diagnostic]]
 package = "survival"
 path = "R/is.na.coxph.penalty.R"
@@ -2039,12 +2039,12 @@ message = "Assigning to string literal \"[.coxph.penalty\"; R will bind the valu
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.coxph.penalty` <- ... ``."
+
 [diagnostic.range]
 start_line = 5
 start_character = 0
 end_line = 5
 end_character = 17
-
 [[diagnostic]]
 package = "survival"
 path = "R/predict.coxph.R"
@@ -2052,12 +2052,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 66
 start_character = 45
 end_line = 66
 end_character = 47
-
 [[diagnostic]]
 package = "survival"
 path = "R/predict.coxphms.R"
@@ -2065,12 +2065,12 @@ message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`
 evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
 [diagnostic.range]
 start_line = 76
 start_character = 45
 end_line = 76
 end_character = 47
-
 [[diagnostic]]
 package = "survival"
 path = "R/ratetable.R"
@@ -2078,12 +2078,12 @@ message = "Assigning to string literal \"[.ratetable\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.ratetable` <- ... ``."
+
 [diagnostic.range]
 start_line = 6
 start_character = 0
 end_line = 6
 end_character = 13
-
 [[diagnostic]]
 package = "survival"
 path = "R/ratetableold.R"
@@ -2091,12 +2091,12 @@ message = "Assigning to string literal \"[.ratetable2\"; R will bind the value t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.ratetable2` <- ... ``."
+
 [diagnostic.range]
 start_line = 42
 start_character = 0
 end_line = 42
 end_character = 14
-
 [[diagnostic]]
 package = "survival"
 path = "R/survfit.R"
@@ -2104,12 +2104,12 @@ message = "Assigning to string literal \"[.survfit\"; R will bind the value to t
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.survfit` <- ... ``."
+
 [diagnostic.range]
 start_line = 189
 start_character = 0
 end_line = 189
 end_character = 11
-
 [[diagnostic]]
 package = "survival"
 path = "R/survfitms.R"
@@ -2117,12 +2117,12 @@ message = "Assigning to string literal \"[.survfitms\"; R will bind the value to
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.survfitms` <- ... ``."
+
 [diagnostic.range]
 start_line = 178
 start_character = 0
 end_line = 178
 end_character = 13
-
 [[diagnostic]]
 package = "survival"
 path = "R/tcut.R"
@@ -2130,12 +2130,12 @@ message = "Assigning to string literal \"[.tcut\"; R will bind the value to the 
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.tcut` <- ... ``."
+
 [diagnostic.range]
 start_line = 35
 start_character = 0
 end_line = 35
 end_character = 8
-
 [[diagnostic]]
 package = "survival"
 path = "R/tmerge.R"
@@ -2143,25 +2143,12 @@ message = "Assigning to string literal \"[.tmerge\"; R will bind the value to th
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git survival"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `[.tmerge` <- ... ``."
+
 [diagnostic.range]
 start_line = 570
 start_character = 0
 end_line = 570
 end_character = 10
-
-[[diagnostic]]
-package = "stats"
-path = "demo/smooth.R"
-message = "Undefined variable: x1"
-evidence = "Confirmed real: `x1` is referenced at line 36 but never defined anywhere in demo/smooth.R; this is a genuine bug in the R demo code."
-source = "R SVN trunk src/library/stats"
-minimal_edit = "Define `x1` before use, or correct the reference to the intended variable."
-[diagnostic.range]
-start_line = 35
-start_character = 14
-end_line = 35
-end_character = 16
-
 [[diagnostic]]
 package = "stats"
 path = "tests/drop1-polr.R"
@@ -2169,14 +2156,12 @@ message = "Undefined variable: lreg1"
 evidence = "Confirmed real: `lreg` is defined at line 19 but `lreg1` is referenced at line 20; this is a genuine typo in the R test code."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Correct `lreg1` to `lreg`."
+
 [diagnostic.range]
 start_line = 19
 start_character = 18
 end_line = 19
 end_character = 23
-
-# --- Tidyverse group accepted-real diagnostics (added 2026-06-08) ---
-
 [[diagnostic]]
 package = "dbplyr"
 path = "R/utils-format.R"
@@ -2184,25 +2169,25 @@ message = "Assigning to string literal 'big_mark'; R will bind the value to the 
 evidence = "String-literal assignment for `big_mark`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "dbplyr GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `big_mark` <- ... ``."
+
 [diagnostic.range]
 start_line = 38
 start_character = 0
 end_line = 38
 end_character = 10
-
 [[diagnostic]]
 package = "ggplot2"
 path = "R/geom-text.R"
-message = """Mixed `&` and `|` without parentheses; `&` binds tighter than `|`. Add parentheses to clarify intent: `(a & b) | c` or `a & (b | c)`."""
+message = "Mixed `&` and `|` without parentheses; `&` binds tighter than `|`. Add parentheses to clarify intent: `(a & b) | c` or `a & (b | c)`."
 evidence = "Mixed bitwise `&` and `|` without explicit parentheses; adding parentheses removes this diagnostic."
 source = "ggplot2 GitHub dev"
 minimal_edit = "Add parentheses to clarify operator precedence."
+
 [diagnostic.range]
 start_line = 229
 start_character = 37
 end_line = 229
 end_character = 38
-
 [[diagnostic]]
 package = "ggplot2"
 path = "R/plot-construction.R"
@@ -2210,25 +2195,25 @@ message = "Assigning to string literal \"%+%\"; R will bind the value to the var
 evidence = "String-literal assignment for `%+%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "ggplot2 GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%+%` <- ... ``."
+
 [diagnostic.range]
 start_line = 81
 start_character = 0
 end_line = 81
 end_character = 5
-
 [[diagnostic]]
 package = "ggplot2"
 path = "R/theme-current.R"
-message = """Assigning to string literal "%+replace%"; R will bind the value to the variable named by the string. Was this intentional?"""
+message = "Assigning to string literal \"%+replace%\"; R will bind the value to the variable named by the string. Was this intentional?"
 evidence = "String-literal assignment for `%+replace%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "ggplot2 GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%+replace%` <- ... ``."
+
 [diagnostic.range]
 start_line = 129
 start_character = 0
 end_line = 129
 end_character = 12
-
 [[diagnostic]]
 package = "ggplot2"
 path = "R/utilities.R"
@@ -2236,12 +2221,12 @@ message = "Assigning to string literal \"%||%\"; R will bind the value to the va
 evidence = "String-literal assignment for `%||%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "ggplot2 GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%||%` <- ... ``."
+
 [diagnostic.range]
 start_line = 9
 start_character = 0
 end_line = 9
 end_character = 6
-
 [[diagnostic]]
 package = "ggplot2"
 path = "R/utilities.R"
@@ -2249,25 +2234,25 @@ message = "Assigning to string literal \"%|W|%\"; R will bind the value to the v
 evidence = "String-literal assignment for `%|W|%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "ggplot2 GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%|W|%` <- ... ``."
+
 [diagnostic.range]
 start_line = 13
 start_character = 0
 end_line = 13
 end_character = 7
-
 [[diagnostic]]
 package = "httr"
 path = "R/insensitive.r"
-message = """Assigning to string literal "$.insensitive"; R will bind the value to the variable named by the string. Was this intentional?"""
+message = "Assigning to string literal \"$.insensitive\"; R will bind the value to the variable named by the string. Was this intentional?"
 evidence = "String-literal assignment for `$.insensitive`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "httr GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `$.insensitive` <- ... ``."
+
 [diagnostic.range]
 start_line = 30
 start_character = 0
 end_line = 30
 end_character = 15
-
 [[diagnostic]]
 package = "httr"
 path = "R/url.r"
@@ -2275,12 +2260,12 @@ message = "Assigning to string literal \"[.url\"; R will bind the value to the v
 evidence = "String-literal assignment for `[.url`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "httr GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `[.url` <- ... ``."
+
 [diagnostic.range]
 start_line = 101
 start_character = 0
 end_line = 101
 end_character = 7
-
 [[diagnostic]]
 package = "httr"
 path = "R/utils.r"
@@ -2288,12 +2273,12 @@ message = "Assigning to string literal \"%||%\"; R will bind the value to the va
 evidence = "String-literal assignment for `%||%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "httr GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%||%` <- ... ``."
+
 [diagnostic.range]
 start_line = 0
 start_character = 0
 end_line = 0
 end_character = 6
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/accessors-date.R"
@@ -2301,12 +2286,12 @@ message = "Assigning to string literal \"date<-\"; R will bind the value to the 
 evidence = "String-literal assignment for `date<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `date<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 51
 start_character = 0
 end_line = 51
 end_character = 8
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/accessors-day.r"
@@ -2314,12 +2299,12 @@ message = "Assigning to string literal \"wday<-\"; R will bind the value to the 
 evidence = "String-literal assignment for `wday<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `wday<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 198
 start_character = 0
 end_line = 198
 end_character = 8
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/accessors-day.r"
@@ -2327,12 +2312,12 @@ message = "Assigning to string literal \"yday<-\"; R will bind the value to the 
 evidence = "String-literal assignment for `yday<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `yday<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 210
 start_character = 0
 end_line = 210
 end_character = 8
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/accessors-tz.r"
@@ -2340,12 +2325,12 @@ message = "Assigning to string literal \"tz<-\"; R will bind the value to the va
 evidence = "String-literal assignment for `tz<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `tz<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 113
 start_character = 0
 end_line = 113
 end_character = 6
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/accessors-week.r"
@@ -2353,12 +2338,12 @@ message = "Assigning to string literal \"week<-\"; R will bind the value to the 
 evidence = "String-literal assignment for `week<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `week<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 31
 start_character = 0
 end_line = 31
 end_character = 8
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/intervals.r"
@@ -2366,38 +2351,38 @@ message = "Assigning to string literal \"%--%\"; R will bind the value to the va
 evidence = "String-literal assignment for `%--%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%--%` <- ... ``."
+
 [diagnostic.range]
 start_line = 273
 start_character = 0
 end_line = 273
 end_character = 6
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/intervals.r"
-message = """Assigning to string literal "int_start<-"; R will bind the value to the variable named by the string. Was this intentional?"""
+message = "Assigning to string literal \"int_start<-\"; R will bind the value to the variable named by the string. Was this intentional?"
 evidence = "String-literal assignment for `int_start<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `int_start<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 300
 start_character = 0
 end_line = 300
 end_character = 13
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/intervals.r"
-message = """Assigning to string literal "int_end<-"; R will bind the value to the variable named by the string. Was this intentional?"""
+message = "Assigning to string literal \"int_end<-\"; R will bind the value to the variable named by the string. Was this intentional?"
 evidence = "String-literal assignment for `int_end<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `int_end<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 320
 start_character = 0
 end_line = 320
 end_character = 11
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/ops-m+.r"
@@ -2405,12 +2390,12 @@ message = "Assigning to string literal \"%m+%\"; R will bind the value to the va
 evidence = "String-literal assignment for `%m+%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%m+%` <- ... ``."
+
 [diagnostic.range]
 start_line = 53
 start_character = 0
 end_line = 53
 end_character = 6
-
 [[diagnostic]]
 package = "lubridate"
 path = "R/ops-m+.r"
@@ -2418,19 +2403,20 @@ message = "Assigning to string literal \"%m-%\"; R will bind the value to the va
 evidence = "String-literal assignment for `%m-%`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "lubridate GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%m-%` <- ... ``."
+
 [diagnostic.range]
 start_line = 79
 start_character = 0
 end_line = 79
 end_character = 6
-
 [[diagnostic]]
 package = "stringr"
 path = "R/sub.R"
-message = """Assigning to string literal "str_sub<-"; R will bind the value to the variable named by the string. Was this intentional?"""
+message = "Assigning to string literal \"str_sub<-\"; R will bind the value to the variable named by the string. Was this intentional?"
 evidence = "String-literal assignment for `str_sub<-`. Rewriting as backtick-quoted name removes this diagnostic."
 source = "stringr GitHub dev"
 minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `str_sub<-` <- ... ``."
+
 [diagnostic.range]
 start_line = 78
 start_character = 0
