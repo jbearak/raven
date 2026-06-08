@@ -2148,3 +2148,29 @@ start_line = 570
 start_character = 0
 end_line = 570
 end_character = 10
+
+[[diagnostic]]
+package = "stats"
+path = "demo/smooth.R"
+message = "Undefined variable: x1"
+evidence = "Confirmed real: `x1` is referenced at line 36 but never defined anywhere in demo/smooth.R; this is a genuine bug in the R demo code."
+source = "R SVN trunk src/library/stats"
+minimal_edit = "Define `x1` before use, or correct the reference to the intended variable."
+[diagnostic.range]
+start_line = 35
+start_character = 14
+end_line = 35
+end_character = 16
+
+[[diagnostic]]
+package = "stats"
+path = "tests/drop1-polr.R"
+message = "Undefined variable: lreg1"
+evidence = "Confirmed real: `lreg` is defined at line 19 but `lreg1` is referenced at line 20; this is a genuine typo in the R test code."
+source = "R SVN trunk src/library/stats"
+minimal_edit = "Correct `lreg1` to `lreg`."
+[diagnostic.range]
+start_line = 19
+start_character = 18
+end_line = 19
+end_character = 23

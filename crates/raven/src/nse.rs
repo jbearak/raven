@@ -311,6 +311,17 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             "window_order" => ArgPolicy::per_formal(&[".data", "..."], &[], true),
             _ => return None,
         },
+        "survival" => match name {
+            // tmerge(data1, data2, id, ...): `id` is data-masked (a column of
+            // data2) and every `...` argument is a data-masked time-dependent
+            // term — typically a call to the tmerge-only NSE helpers
+            // `tdc`/`event`/`cumtdc`/`cumevent` whose own arguments are columns.
+            // None of those helpers exist as resolvable bindings outside
+            // tmerge's evaluation, so capturing `id` + `...` suppresses them
+            // and their column arguments while keeping `data1`/`data2` checked.
+            "tmerge" => ArgPolicy::per_formal(&["data1", "data2", "id", "..."], &["id"], true),
+            _ => return None,
+        },
         _ => return None,
     };
     Some(policy)
@@ -1976,6 +1987,24 @@ mod tests {
         let p = package_policy("dbplyr", "window_order").unwrap();
         let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
         assert_eq!(mask, vec![false, true]);
+    }
+
+    #[test]
+    fn survival_tmerge_suppresses_id_and_dots_keeps_data() {
+        // tmerge(data1, data2, id = idcol, death = event(t, s), x = tdc(t, v)):
+        // data1/data2 stay checked; `id` and every `...` term are suppressed.
+        let p = package_policy("survival", "tmerge").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, None, Some("id"), Some("death"), Some("x")]),
+            false,
+        );
+        assert_eq!(mask, vec![false, false, true, true, true]);
+    }
+
+    #[test]
+    fn survival_non_tmerge_has_no_policy() {
+        assert!(package_policy("survival", "coxph").is_none());
     }
 
     #[test]

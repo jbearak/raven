@@ -12568,6 +12568,44 @@ fn is_builtin(name: &str) -> bool {
     ) {
         return true;
     }
+    // Platform-specific base functions that the builtin generator misses when
+    // it runs on a non-Windows host (the symbols are only registered in base R
+    // on Windows). Code guards their use with `.Platform$OS.type == "windows"`
+    // or places them under `R/windows/`, but the names are part of base R.
+    if matches!(
+        name,
+        "shell"
+            | "shell.exec"
+            | "Sys.junction"
+            | "getClipboardFormats"
+            | "readClipboard"
+            | "writeClipboard"
+            | "setWindowTitle"
+            | "getWindowTitle"
+            | "getIdentification"
+            | "win.version"
+            | "readRegistry"
+            | "DLL.version"
+            | "zip.unpack"
+            | "choose.files"
+            | "choose.dir"
+            | "winDialog"
+            | "winDialogString"
+            | "winMenuAdd"
+            | "winMenuAddItem"
+            | "winMenuDel"
+            | "winMenuDelItem"
+            | "winMenuNames"
+            | "winMenuItems"
+            | "winProgressBar"
+            | "getWinProgressBar"
+            | "setWinProgressBar"
+            | "bringToTop"
+            | "arrangeWindows"
+            | "shortPathName"
+    ) {
+        return true;
+    }
     // Check comprehensive builtin list
     builtins::is_builtin(name) || unquote_backtick_name(name).is_some_and(is_builtin)
 }
@@ -12588,12 +12626,16 @@ fn is_implicit_search_path_binding(name: &str) -> bool {
     matches!(normalized, ".Autoloaded")
 }
 
-/// Returns true when `node` is one of R's S3 method-frame special variables.
+/// Returns true when `node` is one of R's method-frame special variables that
+/// the dispatcher injects.
 ///
-/// R injects `.Generic`, `.Method`, and `.Class` when an S3 method runs. Treat
-/// them as implicit locals only when the use is inside a function assigned to an
-/// S3 method-shaped name (`generic.class`), so ordinary `.Generic` references in
-/// non-method functions remain diagnosable.
+/// R injects `.Generic`, `.Method`, and `.Class` when a method runs. Treat them
+/// as implicit locals only when the use is inside:
+/// - a function assigned to an S3 method-shaped name (`generic.class`), or
+/// - a function passed to `setMethod(...)` (S4 dispatch, including group
+///   generics like `Ops`/`Math`/`Summary`/`Complex`).
+///
+/// so ordinary `.Generic` references in non-method functions remain diagnosable.
 fn is_s3_method_special_variable_usage(node: Node, text: &str, name: &str) -> bool {
     if !matches!(name, ".Generic" | ".Method" | ".Class") {
         return false;
@@ -12601,13 +12643,37 @@ fn is_s3_method_special_variable_usage(node: Node, text: &str, name: &str) -> bo
 
     let mut current = node;
     while let Some(function) = containing_function_definition(current) {
-        if function_definition_is_s3_method_binding(function, text) {
+        if function_definition_is_s3_method_binding(function, text)
+            || function_definition_is_set_method_argument(function, text)
+        {
             return true;
         }
         current = function;
     }
 
     false
+}
+
+/// Returns true when `function` is an argument to a `setMethod(...)` call — the
+/// S4 way of defining a method, whose body runs with `.Generic`/`.Method`/
+/// `.Class` injected by the dispatcher.
+fn function_definition_is_set_method_argument(function: Node, text: &str) -> bool {
+    // function_definition → argument → arguments → call
+    let Some(arg) = function
+        .parent()
+        .filter(|parent| parent.kind() == "argument")
+    else {
+        return false;
+    };
+    let Some(args) = arg.parent().filter(|parent| parent.kind() == "arguments") else {
+        return false;
+    };
+    let Some(call) = args.parent().filter(|parent| parent.kind() == "call") else {
+        return false;
+    };
+    call.child_by_field_name("function")
+        .map(|func| node_text(func, text))
+        .is_some_and(|name| name == "setMethod")
 }
 
 fn function_definition_is_s3_method_binding(function: Node, text: &str) -> bool {
@@ -17706,6 +17772,18 @@ mod tests {
     }
 
     #[test]
+    fn test_windows_only_base_builtins() {
+        // These are base/utils functions only registered on Windows, so the
+        // builtin generator (run on non-Windows) misses them. They must still
+        // be recognized so platform-guarded code doesn't draw FPs.
+        assert!(is_builtin("shell.exec"));
+        assert!(is_builtin("shell"));
+        assert!(is_builtin("Sys.junction"));
+        assert!(is_builtin("readRegistry"));
+        assert!(is_builtin("choose.files"));
+    }
+
+    #[test]
     fn test_not_builtin() {
         assert!(!is_builtin("my_custom_function"));
         assert!(!is_builtin("undefined_var"));
@@ -21086,6 +21164,61 @@ clean_data <- function(x) {
                     .iter()
                     .any(|m| m == &format!("Undefined variable: {special}")),
                 "S3 method special variable `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// S4 group-generic method bodies (defined via `setMethod("Ops"|"Math"|...)`)
+    /// run with `.Generic`, `.Method`, and `.Class` injected by the dispatcher.
+    /// These must not be flagged as undefined. Regression for Matrix's 45 FPs.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_s4_setmethod_special_variables() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "setMethod(\"Ops\", \"myClass\", function(e1, e2) {\n  callGeneric(.Generic, e1, e2)\n  list(.Method, .Class)\n})\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged. messages: {messages:?}",
+        );
+        for special in [".Generic", ".Method", ".Class"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "S4 method special `{special}` must not be flagged. messages: {messages:?}",
             );
         }
     }

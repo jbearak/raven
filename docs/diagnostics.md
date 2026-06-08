@@ -51,6 +51,14 @@ If the symbol is defined later in the same file at top level, the message also r
 - A declaration directive (`@lsp-var`, `@lsp-func`)
 - An `@lsp-ignore` on the line
 
+Raven also recognizes a few call forms that bind a name at runtime, so the bound name resolves without a directive:
+- `assign("x", ...)` and write/append-mode `textConnection("x", "w")` bind `x`.
+- `load("foo.rda")` binds the conventional object name `foo`.
+- `setGeneric("g", ...)` / `setGroupGeneric("g", ...)` bind the generic `g`, so other files in the same package that call it resolve (common in S4-heavy packages like Matrix, whose generics live in a single `R/` file).
+- Inside an S4 method body (`setMethod("Ops"|"Math"|"Summary"|…, ...)`) or an S3 method bound to a `generic.class` name, the dispatcher-injected specials `.Generic`, `.Method`, and `.Class` are in scope.
+
+Windows-only base functions (`shell.exec`, `Sys.junction`, `readRegistry`, the `win*`/clipboard helpers, …) are recognized as builtins even though Raven's builtin list is generated on non-Windows hosts, so platform-guarded code does not draw a false positive.
+
 **Never checked:** Symbols on the RHS of `$` or `@` (member access), function parameters, named-argument labels, and formula variables (`y ~ x`).
 
 #### Call arguments and bracket indices
@@ -81,7 +89,7 @@ Two opt-out settings turn off this descent and restore blanket suppression for h
 - `raven.diagnostics.undefinedVariableInCallArguments` (default `true`)
 - `raven.diagnostics.undefinedVariableInBracketIndices` (default `true`)
 
-**Limitations:** The NSE policy table covers the common, slow-moving surface (base/utils metaprogramming and object-name helpers, default-attached `stats` model-fitting `subset`/`weights` data-masking, `dplyr`/`tidyr` data-masking and tidy-select verbs including attached Bioconductor tidy-omics generics from `plyranges`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`, `tibble`/`targets` constructors and target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes` step/role column captures, ggplot2 mapping helpers, rlang capture helpers, a few DSLs) but is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive. In data.table projects, an unresolved non-data.table object such as `df[typo, ]` may be silently skipped. In-place `setDT()` conversions are not detected. Use `# nolint`, `@lsp-ignore`, or the opt-out settings as escape hatches.
+**Limitations:** The NSE policy table covers the common, slow-moving surface (base/utils metaprogramming and object-name helpers, default-attached `stats` model-fitting `subset`/`weights` data-masking, `dplyr`/`tidyr` data-masking and tidy-select verbs including attached Bioconductor tidy-omics generics from `plyranges`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`, `tibble`/`targets` constructors and target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes` step/role column captures, ggplot2 mapping helpers, rlang capture helpers, `survival::tmerge` time-dependent terms, a few DSLs) but is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive. In data.table projects, an unresolved non-data.table object such as `df[typo, ]` may be silently skipped. In-place `setDT()` conversions are not detected. Use `# nolint`, `@lsp-ignore`, or the opt-out settings as escape hatches.
 
 ### Package Diagnostics
 

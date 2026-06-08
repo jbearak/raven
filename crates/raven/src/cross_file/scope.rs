@@ -1966,6 +1966,53 @@ fn collect_definitions(
             .insert(symbol.name.clone(), symbol);
     }
 
+    // Check for setGeneric("name", ...) / setGroupGeneric("name", ...) calls.
+    // These bind the generic function name in the package namespace, so sibling
+    // package files that call the generic must resolve it. Without this, S4-heavy
+    // packages (e.g. Matrix, where generics live in R/00_Generic.R and are used
+    // throughout) produce spurious "undefined variable" diagnostics for every
+    // generic. The name argument is always a string literal in practice.
+    if node.kind() == "call"
+        && let Some(symbol) = try_extract_set_generic_definition(node, line_index, uri)
+    {
+        let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+        let event = ScopeEvent::Def {
+            line: symbol.defined_line,
+            column: symbol.defined_column,
+            visible_from_line: visible_line,
+            visible_from_column: visible_column,
+            symbol: symbol.clone(),
+            function_scope: None,
+        };
+        artifacts.timeline.push(event);
+        artifacts
+            .exported_interface
+            .insert(symbol.name.clone(), symbol);
+    }
+
+    // Check for textConnection("name", "w"|"a") calls. In write/append mode,
+    // R creates a character variable of the given name in the calling
+    // environment to accumulate written output; later uses of that name must
+    // resolve. Read mode (the default) treats the first argument as data, not a
+    // variable name, so it is deliberately not modeled.
+    if node.kind() == "call"
+        && let Some(symbol) = try_extract_text_connection_definition(node, line_index, uri)
+    {
+        let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+        let event = ScopeEvent::Def {
+            line: symbol.defined_line,
+            column: symbol.defined_column,
+            visible_from_line: visible_line,
+            visible_from_column: visible_column,
+            symbol: symbol.clone(),
+            function_scope: None,
+        };
+        artifacts.timeline.push(event);
+        artifacts
+            .exported_interface
+            .insert(symbol.name.clone(), symbol);
+    }
+
     // Check for for loop iterators.
     //
     // For-loop iterators are bound *before* the body executes, and the
@@ -2547,6 +2594,141 @@ fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Opt
         kind: SymbolKind::Variable,
         source_uri: uri.clone(),
         defined_line: start.row as u32,
+        defined_column: column,
+        signature: None,
+        is_declared: false,
+    })
+}
+
+/// Extract the generic name defined by a `setGeneric("name", ...)` or
+/// `setGroupGeneric("name", ...)` call.
+///
+/// `setGeneric` binds a function of the given name in the calling environment
+/// (the package namespace). Modeling it as a definition lets sibling package
+/// files resolve calls to the generic. Only the common, statically-safe shape
+/// is handled: the first positional argument (or named `name=`) is a string
+/// literal naming a valid identifier-like generic. (Generic names can contain
+/// characters that need backtick-quoting, e.g. operators; the raw string
+/// content is used as the symbol name regardless, matching how callers spell
+/// it.)
+fn try_extract_set_generic_definition(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Option<ScopedSymbol> {
+    let func_node = node.child_by_field_name("function")?;
+    let func_name = node_text(func_node, line_index.text);
+    if func_name != "setGeneric" && func_name != "setGroupGeneric" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    let mut name_arg = None;
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            // Named argument: only the `name=` argument carries the generic name.
+            if node_text(name_node, line_index.text) == "name" {
+                name_arg = child.child_by_field_name("value");
+                break;
+            }
+        } else {
+            // First positional argument is the generic name.
+            name_arg = child.child_by_field_name("value");
+            break;
+        }
+    }
+
+    let name_node = name_arg?;
+    if name_node.kind() != "string" {
+        return None;
+    }
+    let name_str = string_literal_content(name_node, line_index.text)?;
+    if name_str.is_empty() {
+        return None;
+    }
+
+    let (line, column) = node_start_position_utf16(node, line_index);
+    Some(ScopedSymbol {
+        name: Arc::from(name_str),
+        kind: SymbolKind::Function,
+        source_uri: uri.clone(),
+        defined_line: line,
+        defined_column: column,
+        signature: None,
+        is_declared: false,
+    })
+}
+
+/// Extract the variable name created by a write/append-mode `textConnection`.
+///
+/// `textConnection(object, open = "r", ...)`: when `open` is `"w"`/`"wb"`/
+/// `"a"`/`"ab"`, R creates a character variable named by the `object` string
+/// literal in the calling environment to accumulate output. In the default
+/// read mode the `object` argument is character *data* to read from, not a
+/// variable name, so only the write/append shape is modeled here.
+fn try_extract_text_connection_definition(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Option<ScopedSymbol> {
+    let func_node = node.child_by_field_name("function")?;
+    if node_text(func_node, line_index.text) != "textConnection" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    let mut object_arg = None;
+    let mut open_arg = None;
+    let mut positional_index = 0;
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            match node_text(name_node, line_index.text) {
+                "object" => object_arg = child.child_by_field_name("value"),
+                "open" => open_arg = child.child_by_field_name("value"),
+                _ => {}
+            }
+        } else {
+            // Positional: 0 = object, 1 = open.
+            match positional_index {
+                0 => object_arg = child.child_by_field_name("value"),
+                1 => open_arg = child.child_by_field_name("value"),
+                _ => {}
+            }
+            positional_index += 1;
+        }
+    }
+
+    // Require an explicit write/append open mode; read mode does not bind.
+    let open_node = open_arg?;
+    if open_node.kind() != "string" {
+        return None;
+    }
+    let open_mode = string_literal_content(open_node, line_index.text)?;
+    if !matches!(open_mode, "w" | "wb" | "a" | "ab") {
+        return None;
+    }
+
+    let object_node = object_arg?;
+    if object_node.kind() != "string" {
+        return None;
+    }
+    let name_str = string_literal_content(object_node, line_index.text)?;
+    if name_str.is_empty() || !is_valid_unquoted_r_identifier(name_str) {
+        return None;
+    }
+
+    let (line, column) = node_start_position_utf16(node, line_index);
+    Some(ScopedSymbol {
+        name: Arc::from(name_str),
+        kind: SymbolKind::Variable,
+        source_uri: uri.clone(),
+        defined_line: line,
         defined_column: column,
         signature: None,
         is_declared: false,
@@ -6226,6 +6408,65 @@ mod tests {
 
         assert_eq!(artifacts.exported_interface.len(), 1);
         assert!(artifacts.exported_interface.contains_key("x"));
+    }
+
+    #[test]
+    fn test_set_generic_defines_name() {
+        // `setGeneric("lu", ...)` binds the generic name `lu` in the namespace,
+        // so sibling package files that call `lu(x)` must resolve it. This is
+        // the dominant cause of Matrix's cross-file "undefined generic" FPs.
+        let code = "setGeneric(\"lu\", function(x, ...) standardGeneric(\"lu\"))";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert!(
+            artifacts.exported_interface.contains_key("lu"),
+            "setGeneric should define the generic name in the exported interface"
+        );
+        let symbol = artifacts.exported_interface.get("lu").unwrap();
+        assert_eq!(symbol.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_set_generic_named_arg() {
+        // `setGeneric(name = "foo", ...)` — named first argument.
+        let code = "setGeneric(name = \"foo\", function(x) standardGeneric(\"foo\"))";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert!(
+            artifacts.exported_interface.contains_key("foo"),
+            "setGeneric with named `name=` arg should define the generic"
+        );
+    }
+
+    #[test]
+    fn test_text_connection_write_mode_defines_name() {
+        // `textConnection("ctxt", "w")` creates a variable named `ctxt` in the
+        // calling environment to capture written output. Subsequent uses of
+        // `ctxt` must resolve.
+        let code = "textConnection(\"ctxt\", \"w\")\nctxt";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert!(
+            artifacts.exported_interface.contains_key("ctxt"),
+            "textConnection write-mode should define the named output variable"
+        );
+    }
+
+    #[test]
+    fn test_text_connection_read_mode_does_not_define() {
+        // Default (read) mode: the first argument is character DATA to read
+        // from, not a variable name. Must NOT create a binding.
+        let code = "textConnection(\"line1\\nline2\")";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert!(
+            !artifacts.exported_interface.contains_key("line1"),
+            "textConnection read-mode must not define a binding from its data arg"
+        );
     }
 
     #[test]
