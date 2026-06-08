@@ -42,6 +42,11 @@ pub struct Chunk {
     /// `{r setup, eval=FALSE}`), or — for `# %%` cells — the text after the
     /// marker. `None` when no label is present.
     pub label: Option<String>,
+    /// `true` when the chunk header contains a literal `eval = FALSE` or
+    /// `eval = F` option. Such chunks are display-only (never executed by
+    /// knitr) and their body may contain intentionally malformed R — blanking
+    /// them in [`mask_to_r`] prevents spurious syntax diagnostics.
+    pub eval_disabled: bool,
 }
 
 fn fence_header_re() -> &'static Regex {
@@ -137,6 +142,7 @@ fn detect_rmd_chunks(lines: &[&str]) -> Vec<Chunk> {
             .unwrap_or_default();
         let header_rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
         let label = parse_header_label(header_rest);
+        let eval_disabled = has_eval_false(header_rest);
 
         let fence_char = fence.chars().next().unwrap_or('`');
         let min_len = fence.len();
@@ -165,6 +171,7 @@ fn detect_rmd_chunks(lines: &[&str]) -> Vec<Chunk> {
             closing_fence_line: closing_line,
             language: lang,
             label,
+            eval_disabled,
         });
 
         i = match closing_line {
@@ -210,6 +217,7 @@ fn detect_r_cells(lines: &[&str]) -> Vec<Chunk> {
             closing_fence_line: None,
             language: "r".to_string(),
             label: cell_label(lines[header]),
+            eval_disabled: false,
         });
     }
     chunks
@@ -312,6 +320,82 @@ fn parse_header_label(rest: &str) -> Option<String> {
     None
 }
 
+/// Returns `true` when the chunk header options contain a literal
+/// `eval = FALSE` or `eval = F` (the only R expressions that disable
+/// evaluation statically). Uses the same bracket/quote-aware comma split as
+/// [`parse_header_label`] so nested commas (e.g. `fig.dim=c(5, 6)`) don't
+/// confuse the scan.
+fn has_eval_false(header_rest: &str) -> bool {
+    let trimmed = header_rest.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Same comma-split logic as parse_header_label.
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+    let mut depth = 0i32;
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if let Some(q) = in_quote {
+            current.push(ch);
+            if ch == '\\' && i + 1 < chars.len() {
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if ch == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                in_quote = Some(ch);
+                current.push(ch);
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' | '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    for raw in &parts {
+        let part = raw.trim();
+        // Match `eval = FALSE`, `eval=F`, `eval = F`, `eval=FALSE`.
+        if let Some(val) = part.strip_prefix("eval") {
+            let val = val.trim_start();
+            if let Some(val) = val.strip_prefix('=') {
+                let val = val.trim();
+                if val == "FALSE" || val == "F" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// True for chunk language tags that should be parsed as R. Pandoc/knitr
 /// permit a few aliases (`r`, `R`, plus the rare `Rscript`). The chunk
 /// detector lower-cases the tag before storing it, so a simple ASCII compare
@@ -337,6 +421,12 @@ fn chunk_reuse_re() -> &'static Regex {
 /// guard so callers iterate all chunks and let-else past the non-R ones.
 pub(crate) fn r_chunk_body_range(chunk: &Chunk, total_lines: u32) -> Option<(u32, u32)> {
     if !is_r_chunk_language(&chunk.language) {
+        return None;
+    }
+    // eval=FALSE chunks are display-only; their body may contain intentionally
+    // malformed R (e.g. incomplete snippets in vignettes). Blanking them
+    // prevents spurious syntax diagnostics.
+    if chunk.eval_disabled {
         return None;
     }
     let body_start = chunk.header_line.saturating_add(1);
@@ -907,6 +997,83 @@ mod tests {
         assert_eq!(lines[1], "x <- 1"); // kept
         assert_eq!(lines[2], ""); // <<setup>> → blanked
         assert_eq!(lines[3], "y <- 2"); // kept
+    }
+
+    // =========================================================================
+    // eval=FALSE chunk blanking tests
+    // =========================================================================
+
+    #[test]
+    fn mask_blanks_eval_false_chunk() {
+        // eval=FALSE chunk body contains malformed R; mask must blank it.
+        let src = "```{r, eval = FALSE}\ndf |> unnest(x))\n```\n";
+        let masked = mask_to_r(src);
+        let lines: Vec<&str> = masked.split('\n').collect();
+        assert_eq!(seg_count(&masked), seg_count(src));
+        assert_eq!(lines[0], ""); // header
+        assert_eq!(lines[1], ""); // body → blanked (eval=FALSE)
+        assert_eq!(lines[2], ""); // closing fence
+    }
+
+    #[test]
+    fn mask_blanks_eval_f_chunk() {
+        // eval=F (shorthand) should also be blanked.
+        let src = "```{r, eval=F}\nmy_func <- function(...) {\n}\n}\n```\n";
+        let masked = mask_to_r(src);
+        let lines: Vec<&str> = masked.split('\n').collect();
+        assert_eq!(seg_count(&masked), seg_count(src));
+        // All body lines blanked.
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "");
+    }
+
+    #[test]
+    fn mask_keeps_eval_true_chunk() {
+        // eval=TRUE (explicit) must still preserve the body.
+        let src = "```{r, eval = TRUE}\nx <- 1\n```\n";
+        let masked = mask_to_r(src);
+        let lines: Vec<&str> = masked.split('\n').collect();
+        assert_eq!(lines[1], "x <- 1");
+    }
+
+    #[test]
+    fn mask_keeps_chunk_without_eval_option() {
+        // No eval option at all → body preserved (default eval=TRUE).
+        let src = "```{r setup}\nx <- 1\n```\n";
+        let masked = mask_to_r(src);
+        let lines: Vec<&str> = masked.split('\n').collect();
+        assert_eq!(lines[1], "x <- 1");
+    }
+
+    #[test]
+    fn mask_blanks_eval_false_with_other_options() {
+        // eval=FALSE mixed with other options; only eval matters for blanking.
+        let src = "```{r, fig.width=10, eval = FALSE, echo=TRUE}\nread_excel(..., range = cell_cols(c(\"A\", \"Z\"))\n```\n";
+        let masked = mask_to_r(src);
+        let lines: Vec<&str> = masked.split('\n').collect();
+        // Body line has unclosed paren — would be a syntax error if not blanked.
+        assert_eq!(lines[1], "");
+    }
+
+    #[test]
+    fn has_eval_false_detects_variants() {
+        assert!(has_eval_false(", eval = FALSE"));
+        assert!(has_eval_false(", eval=FALSE"));
+        assert!(has_eval_false(", eval = F"));
+        assert!(has_eval_false(", eval=F"));
+        assert!(has_eval_false(" setup, eval = FALSE, echo=TRUE"));
+        assert!(has_eval_false(", fig.dim=c(5, 6), eval=FALSE"));
+    }
+
+    #[test]
+    fn has_eval_false_rejects_non_false() {
+        assert!(!has_eval_false(", eval = TRUE"));
+        assert!(!has_eval_false(", eval=TRUE"));
+        assert!(!has_eval_false(", eval = T"));
+        assert!(!has_eval_false(""));
+        assert!(!has_eval_false(", echo = FALSE")); // not eval
+        assert!(!has_eval_false(", eval = is_ci()")); // dynamic
     }
 
     // =========================================================================

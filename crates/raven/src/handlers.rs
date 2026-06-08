@@ -27380,16 +27380,17 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
-    fn rmd_eval_false_chunk_still_diagnosed() {
-        // `eval=FALSE` only affects knitr execution, not static analysis: a
-        // syntax error inside such a chunk is still flagged.
+    fn rmd_eval_false_chunk_not_diagnosed() {
+        // `eval=FALSE` chunks are display-only: their body may contain
+        // intentionally malformed R (vignette snippets), so the mask blanks
+        // them and no syntax diagnostic should appear.
         let code = "# Title\n\n```{r, eval=FALSE}\nx <- (\n```\n";
         let diags = rmd_diagnostics(code, "file:///eval.Rmd", |_| {});
         assert!(
-            diags
+            !diags
                 .iter()
-                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR) && d.range.start.line == 3),
-            "a syntax error inside an eval=FALSE chunk must still be flagged on line 3, got {:?}",
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "an eval=FALSE chunk must NOT produce syntax diagnostics, got {:?}",
             diags
                 .iter()
                 .map(|d| (d.range.start.line, d.message.clone()))

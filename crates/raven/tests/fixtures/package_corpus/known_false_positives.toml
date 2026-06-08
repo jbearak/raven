@@ -27544,7 +27544,7 @@ end_character = 2
 package = "dtplyr"
 path = "vignettes/benchmark.R"
 message = "Missing opening `(`"
-reason = "Rmd chunk extraction artifact or incomplete code snippet"
+reason = "Intentionally malformed code snippet in vignette (extra `)` after data.table `]`)"
 [false_positive.range]
 start_line = 33
 start_character = 46
@@ -27577,7 +27577,7 @@ end_character = 2
 package = "dtplyr"
 path = "vignettes/benchmark.R"
 message = "Missing opening `(`"
-reason = "Rmd chunk extraction artifact or incomplete code snippet"
+reason = "Intentionally malformed code snippet in vignette (extra `)` after data.table `]`)"
 [false_positive.range]
 start_line = 40
 start_character = 45
@@ -27610,7 +27610,7 @@ end_character = 2
 package = "dtplyr"
 path = "vignettes/benchmark.R"
 message = "Missing opening `(`"
-reason = "Rmd chunk extraction artifact or incomplete code snippet"
+reason = "Intentionally malformed code snippet in vignette (extra `)` after data.table `]`)"
 [false_positive.range]
 start_line = 47
 start_character = 59
@@ -32612,17 +32612,6 @@ end_line = 98
 end_character = 18
 
 [[false_positive]]
-package = "readxl"
-path = "vignettes/sheet-geometry.Rmd"
-message = "Unclosed `(`: missing matching `)`"
-reason = "Rmd chunk extraction artifact or incomplete code snippet"
-[false_positive.range]
-start_line = 162
-start_character = 10
-end_line = 162
-end_character = 46
-
-[[false_positive]]
 package = "reprex"
 path = "talks/2018-09_reprex-rstudio-webinar/05_shock-and-awe.R"
 message = "Undefined variable: gapminder"
@@ -36097,17 +36086,6 @@ start_line = 39
 start_character = 9
 end_line = 39
 end_character = 13
-
-[[false_positive]]
-package = "tidyr"
-path = "vignettes/in-packages.Rmd"
-message = "Missing opening `{`"
-reason = "Rmd chunk extraction artifact or incomplete code snippet"
-[false_positive.range]
-start_line = 166
-start_character = 0
-end_line = 166
-end_character = 1
 
 [[false_positive]]
 package = "tidyr"
