@@ -5586,6 +5586,9 @@ fn collect_undefined_variables_from_snapshot(
         {
             continue;
         }
+        if is_r6_method_special_variable_usage(usage_node, text, &name, &top_level_defs_by_name) {
+            continue;
+        }
 
         // knitr/Quarto-injected `params` (see `is_implicit_rmd_params`): the
         // masked analysis text blanks the frontmatter, so a declared `params`
@@ -12637,6 +12640,82 @@ fn is_implicit_search_path_binding(name: &str) -> bool {
 }
 
 /// Returns true when `node` is one of R's method-frame special variables that
+/// R6 class method bodies run with `self`, `private`, and `super` injected by
+/// R6 at construction time. Treat them as implicit locals when the use is inside
+/// a function value within the `public`, `private`, or `active` list arguments
+/// of `R6Class(...)` or `R6::R6Class(...)`. A top-level local named `R6Class`
+/// disables the treatment (shadow).
+fn is_r6_method_special_variable_usage(
+    node: Node,
+    text: &str,
+    name: &str,
+    top_level_defs: &HashMap<String, Vec<(u32, u32)>>,
+) -> bool {
+    if !matches!(name, "self" | "private" | "super") {
+        return false;
+    }
+    if top_level_defs.contains_key("R6Class") {
+        return false;
+    }
+
+    let mut current = node;
+    while let Some(function) = containing_function_definition(current) {
+        if function_definition_is_r6_method(function, text) {
+            return true;
+        }
+        current = function;
+    }
+
+    false
+}
+
+/// Returns true when `function` is a value inside a `public=list(...)`,
+/// `private=list(...)`, or `active=list(...)` argument of an `R6Class(...)`
+/// or `R6::R6Class(...)` call.
+fn function_definition_is_r6_method(function: Node, text: &str) -> bool {
+    // function_definition → argument(value) → arguments → call (the list() call)
+    // then: list() call → argument(name=public|private|active, value) → arguments → call (R6Class)
+    let Some(list_arg) = containing_argument_value(function) else {
+        return false;
+    };
+    let Some(list_args) = list_arg.parent().filter(|p| p.kind() == "arguments") else {
+        return false;
+    };
+    let Some(list_call) = list_args.parent().filter(|p| p.kind() == "call") else {
+        return false;
+    };
+    // The list() call should be named `list`
+    if list_call
+        .child_by_field_name("function")
+        .is_none_or(|f| node_text(f, text) != "list")
+    {
+        return false;
+    }
+    // The list() call must be the value of a named argument (public/private/active)
+    let Some(r6_arg) = list_call.parent().filter(|p| p.kind() == "argument") else {
+        return false;
+    };
+    let Some(arg_name_node) = r6_arg.child_by_field_name("name") else {
+        return false;
+    };
+    let arg_name = node_text(arg_name_node, text);
+    if !matches!(arg_name, "public" | "private" | "active") {
+        return false;
+    }
+    // The named argument must be inside an R6Class(...) / R6::R6Class(...) call
+    let Some(r6_args) = r6_arg.parent().filter(|p| p.kind() == "arguments") else {
+        return false;
+    };
+    let Some(r6_call) = r6_args.parent().filter(|p| p.kind() == "call") else {
+        return false;
+    };
+    let Some(r6_func) = r6_call.child_by_field_name("function") else {
+        return false;
+    };
+    let func_text = node_text(r6_func, text);
+    func_text == "R6Class" || func_text == "R6::R6Class"
+}
+
 /// the dispatcher injects.
 ///
 /// R injects `.Generic`, `.Method`, and `.Class` when a method runs. Treat them
@@ -21233,6 +21312,331 @@ clean_data <- function(x) {
                     .iter()
                     .any(|m| m == &format!("Undefined variable: {special}")),
                 "S4 method special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// R6 class method bodies run with `self`, `private`, and `super` injected
+    /// by R6 at construction time. They must not be flagged as undefined inside
+    /// `public`, `private`, or `active` method bodies of `R6Class(...)`.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_self_private_super() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6::R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+      private$helper()
+      super$initialize()
+    }
+  ),
+  private = list(
+    helper = function() {
+      self$data
+      private$internal
+    }
+  ),
+  active = list(
+    value = function() {
+      self$compute()
+      private$cache
+      super$value
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged. messages: {messages:?}",
+        );
+        for pronoun in ["self", "private", "super"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                "R6 pronoun `{pronoun}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// R6 pronouns must also resolve inside nested helper functions within
+    /// R6Class method bodies.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_pronouns_in_nested_function() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6::R6Class("MyClass",
+  public = list(
+    run = function() {
+      helper <- function() {
+        self$data
+        private$x
+      }
+      helper()
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        for pronoun in ["self", "private"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                "R6 pronoun `{pronoun}` in nested fn must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// A top-level local named `R6Class` shadows the package function and
+    /// disables R6 pronoun injection.
+    #[tokio::test]
+    async fn test_r6_shadow_disables_pronoun_suppression() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"R6Class <- function(...) list(...)
+MyClass <- R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        // With R6Class shadowed, `self` should be flagged as undefined
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: self"),
+            "R6 pronoun `self` must be flagged when R6Class is shadowed. messages: {messages:?}",
+        );
+    }
+
+    /// A genuine undefined inside an R6 method body must still be flagged.
+    #[tokio::test]
+    async fn test_r6_method_genuine_undefined_still_flags() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6::R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+      completely_nonexistent_var
+    }
+  )
+)
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: completely_nonexistent_var"),
+            "genuine undefined inside R6 method must still be flagged. messages: {messages:?}",
+        );
+        // But `self` should NOT be flagged
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: self"),
+            "R6 pronoun `self` must not be flagged. messages: {messages:?}",
+        );
+    }
+
+    /// R6 pronouns must also be suppressed with bare `R6Class(...)` calls
+    /// (without the `R6::` namespace prefix).
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_bare_r6class_call() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+      private$helper()
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        for pronoun in ["self", "private"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                "R6 pronoun `{pronoun}` must not be flagged with bare R6Class. messages: {messages:?}",
             );
         }
     }
