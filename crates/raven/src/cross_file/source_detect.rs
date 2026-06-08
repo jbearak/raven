@@ -363,16 +363,16 @@ fn call_is_internal_routine_argument(call_node: Node, content: &str) -> bool {
     if arg.child_by_field_name("name").is_some() {
         return false;
     }
-    if !arg
+    if arg
         .child_by_field_name("value")
-        .is_some_and(|value| value.id() == call_node.id())
+        .is_none_or(|value| value.id() != call_node.id())
     {
         return false;
     }
     let Some(args) = arg.parent().filter(|node| node.kind() == "arguments") else {
         return false;
     };
-    if !first_positional_arg_value(args).is_some_and(|value| value.id() == call_node.id()) {
+    if first_positional_arg_value(args).is_none_or(|value| value.id() != call_node.id()) {
         return false;
     }
     let Some(outer_call) = args.parent().filter(|node| node.kind() == "call") else {

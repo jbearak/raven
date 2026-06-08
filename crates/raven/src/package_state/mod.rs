@@ -143,6 +143,7 @@ use std::path::Path;
 /// Rules:
 /// - `<root>/R/**/*.R` (or `*.r`) → `Source`
 /// - `<root>/tests/testthat/**/*.R` (or `*.r`) → `Test`
+/// - `<root>/tests/testit/**/*.R` (or `*.r`) → `Test`
 /// - everything else → `None`
 pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind> {
     let rel = path.strip_prefix(workspace_root).ok()?;
@@ -158,7 +159,7 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
         "R" => Some(RFileKind::Source),
         "tests" => {
             let second = comps.next()?.as_os_str().to_str()?;
-            if second == "testthat" {
+            if second == "testthat" || second == "testit" {
                 Some(RFileKind::Test)
             } else {
                 None
@@ -221,6 +222,17 @@ mod path_tests {
         assert_eq!(
             is_r_source_path(
                 Path::new("/work/pkg/tests/testthat/test-utils.R"),
+                Path::new("/work/pkg")
+            ),
+            Some(RFileKind::Test),
+        );
+    }
+
+    #[test]
+    fn r_source_path_recognizes_testit() {
+        assert_eq!(
+            is_r_source_path(
+                Path::new("/work/pkg/tests/testit/test-utils.R"),
                 Path::new("/work/pkg")
             ),
             Some(RFileKind::Test),

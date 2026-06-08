@@ -11596,6 +11596,7 @@ impl<'a> NseAnalysis<'a> {
 /// maps and mis-shadow a sibling callee of the same name. A nested NSE helper
 /// simply falls to the conservative unresolved-callee path. The `data.table::`
 /// qualifier scan stays file-wide because data.table-in-play is a file fact.
+#[allow(clippy::too_many_arguments)] // collector pattern: accumulates into multiple pre-existing sets
 fn collect_nse_facts(
     node: Node,
     text: &str,
@@ -12007,10 +12008,9 @@ fn collect_captured_formals(
         && let Some(args) = node.child_by_field_name("arguments")
         && let Some(value) = first_positional_arg_value(args)
         && let Some(name) = captured_formal_for_first_arg(helper, value, text, formals)
+        && !captured.iter().any(|c| c == name)
     {
-        if !captured.iter().any(|c| c == name) {
-            captured.push(name.to_string());
-        }
+        captured.push(name.to_string());
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -12341,10 +12341,10 @@ fn collect_call_usages<'a>(
     // A pipe (`df %>% f(...)` / `df |> f(...)`) supplies the first formal, so
     // the syntactic positional arguments bind starting one formal later.
     let pipe_fed = call_is_pipe_fed(node, text);
-    if let Some(func) = node.child_by_field_name("function") {
-        if !internal_routine_call {
-            collect_usages_with_analysis(func, text, analysis, context, used);
-        }
+    if let Some(func) = node.child_by_field_name("function")
+        && !internal_routine_call
+    {
+        collect_usages_with_analysis(func, text, analysis, context, used);
     }
     if let Some(args) = node.child_by_field_name("arguments") {
         apply_arg_policy(args, text, analysis, context, &policy, pipe_fed, used);
@@ -12367,16 +12367,16 @@ fn call_is_internal_routine_argument(call_node: Node, text: &str) -> bool {
     if arg.child_by_field_name("name").is_some() {
         return false;
     }
-    if !arg
+    if arg
         .child_by_field_name("value")
-        .is_some_and(|value| value.id() == call_node.id())
+        .is_none_or(|value| value.id() != call_node.id())
     {
         return false;
     }
     let Some(args) = arg.parent().filter(|node| node.kind() == "arguments") else {
         return false;
     };
-    if !first_positional_arg_value(args).is_some_and(|value| value.id() == call_node.id()) {
+    if first_positional_arg_value(args).is_none_or(|value| value.id() != call_node.id()) {
         return false;
     }
     let Some(outer_call) = args.parent().filter(|node| node.kind() == "call") else {
@@ -12569,8 +12569,7 @@ fn is_builtin(name: &str) -> bool {
         return true;
     }
     // Check comprehensive builtin list
-    builtins::is_builtin(name)
-        || unquote_backtick_name(name).is_some_and(|unquoted| is_builtin(unquoted))
+    builtins::is_builtin(name) || unquote_backtick_name(name).is_some_and(is_builtin)
 }
 
 fn unquote_backtick_name(name: &str) -> Option<&str> {

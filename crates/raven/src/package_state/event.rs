@@ -233,10 +233,13 @@ fn translate_watched_directory(
 fn is_tracked_package_dir(path: &Path, root: &Path) -> bool {
     let r_dir = root.join("R");
     let testthat_dir = root.join("tests").join("testthat");
+    let testit_dir = root.join("tests").join("testit");
     path == r_dir
         || path.starts_with(&r_dir)
         || path == testthat_dir
-        || path.starts_with(testthat_dir)
+        || path.starts_with(&testthat_dir)
+        || path == testit_dir
+        || path.starts_with(&testit_dir)
 }
 
 fn collect_r_file_inputs_from_dir(

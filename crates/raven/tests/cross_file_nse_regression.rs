@@ -220,3 +220,53 @@ fn backtick_quoted_base_operators_as_values_not_flagged() {
         );
     }
 }
+
+/// Package tests under `tests/testit/` must see package-internal symbols,
+/// namespace imports, and package exports — same as `tests/testthat/`.
+/// Regression test for: DT package had 182 false positives because Raven
+/// did not classify `tests/testit/**/*.R` as package test scope.
+#[test]
+fn testit_test_files_see_package_namespace() {
+    let dir = TempDir::new().unwrap();
+    let pkg = dir.path();
+    // Minimal DESCRIPTION
+    std::fs::write(
+        pkg.join("DESCRIPTION"),
+        "Package: mypkg\nVersion: 0.1.0\nTitle: Test\n",
+    )
+    .unwrap();
+    // NAMESPACE with an export and an import
+    std::fs::write(
+        pkg.join("NAMESPACE"),
+        "export(my_fun)\nimportFrom(utils,head)\n",
+    )
+    .unwrap();
+    // R/ source
+    std::fs::create_dir_all(pkg.join("R")).unwrap();
+    std::fs::write(
+        pkg.join("R").join("fun.R"),
+        "my_fun <- function(x) x + 1\ninternal_helper <- function(y) y * 2\n",
+    )
+    .unwrap();
+    // tests/testit/ test file that uses package internals and imports
+    std::fs::create_dir_all(pkg.join("tests").join("testit")).unwrap();
+    std::fs::write(
+        pkg.join("tests").join("testit").join("test-fun.R"),
+        "a <- my_fun(1)\nb <- internal_helper(2)\nc <- head(1:10)\n",
+    )
+    .unwrap();
+
+    let output = run_check(pkg);
+    assert!(
+        !output.contains("Undefined variable: my_fun"),
+        "testit test file should see exported my_fun. Output:\n{output}"
+    );
+    assert!(
+        !output.contains("Undefined variable: internal_helper"),
+        "testit test file should see package-internal internal_helper. Output:\n{output}"
+    );
+    assert!(
+        !output.contains("Undefined variable: head"),
+        "testit test file should see imported head. Output:\n{output}"
+    );
+}

@@ -1188,10 +1188,13 @@ License: MIT
     }
 
     #[test]
-    fn test_normalize_preserves_comments() {
+    fn test_normalize_strips_comments() {
         let content = "# comment\nexport(foo)";
         let normalized = normalize_multiline_directives(content);
-        assert!(normalized.contains("# comment"));
+        assert!(
+            !normalized.contains("# comment"),
+            "comments should be stripped"
+        );
         assert!(normalized.contains("export(foo)"));
     }
 

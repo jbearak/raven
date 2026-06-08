@@ -662,21 +662,42 @@ mod tests {
     }
 
     /// Phase 5b behavior change: a workspace with NAMESPACE but no DESCRIPTION
-    /// does NOT activate package mode (Auto mode requires a valid `Package:` field
-    /// in DESCRIPTION). Consequently, `scope_contribution` is empty — no
-    /// importFrom symbols or internal symbols are injected, matching script-mode.
-    ///
-    /// This codifies spec §11.1 behavior: "package mode requires both DESCRIPTION
-    /// (with a Package: field) and NAMESPACE". Non-package workspaces run as
-    /// script mode regardless of NAMESPACE presence.
+    /// and no R source files does NOT activate package mode in Auto mode.
+    /// However, if both a NAMESPACE and R source files exist (even without
+    /// DESCRIPTION), package mode activates with name "unknown" to support
+    /// `raven check --workspace` on minimal package directories.
     #[test]
-    fn non_package_namespace_does_not_produce_scope_contribution() {
-        // Auto mode with NAMESPACE but no DESCRIPTION.
+    fn namespace_alone_without_sources_does_not_produce_scope_contribution() {
+        // Auto mode with NAMESPACE but no DESCRIPTION and no R source files.
         let mut inputs = empty_inputs(PackageMode::Auto);
         inputs.namespace = Some(NamespaceInput {
             text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
         });
-        // Add an R file with a top-level definition.
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        // No source files → no package mode → empty scope contribution.
+        assert!(
+            s.workspace.is_none(),
+            "Auto mode with NAMESPACE but no source files must not produce a workspace"
+        );
+        assert!(s.scope_contribution.workspace_root.is_none());
+        assert!(s.scope_contribution.imported_symbols.is_empty());
+        assert!(s.scope_contribution.full_imports.is_empty());
+    }
+
+    /// When both NAMESPACE and R source files exist (but no DESCRIPTION),
+    /// Auto mode activates package mode with name "unknown".
+    #[test]
+    fn namespace_with_sources_activates_package_mode_without_description() {
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.namespace = Some(NamespaceInput {
+            text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
+        });
         let r_path: PathBuf = "/work/pkg/R/utils.R".into();
         let text: Arc<str> = "helper <- function() 1\n".into();
         inputs.r_files.insert(
@@ -694,23 +715,14 @@ mod tests {
             &PackageInputDelta::Initial,
         );
 
-        // No workspace → no package mode → empty scope contribution.
         assert!(
-            s.workspace.is_none(),
-            "Auto mode without DESCRIPTION must not produce a workspace"
+            s.workspace.is_some(),
+            "Auto mode with NAMESPACE + source files should produce a workspace"
         );
-        assert!(s.scope_contribution.workspace_root.is_none());
+        assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
         assert!(
-            s.scope_contribution.r_internal_symbols.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject internal symbols"
-        );
-        assert!(
-            s.scope_contribution.imported_symbols.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject importFrom symbols"
-        );
-        assert!(
-            s.scope_contribution.full_imports.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject full imports"
+            s.scope_contribution.r_internal_symbols.contains("helper"),
+            "internal symbols should be injected"
         );
     }
 
