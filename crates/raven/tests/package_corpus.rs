@@ -30,6 +30,7 @@ use tempfile::TempDir;
 const R_SVN_LIBRARY_URL: &str = "https://svn.r-project.org/R/trunk/src/library";
 const CRAN_CONTRIB_URL: &str = "https://cloud.r-project.org/src/contrib";
 const TRIAGE_FIXTURE: &str = include_str!("fixtures/package_corpus/accepted_real_diagnostics.toml");
+const FP_FIXTURE: &str = include_str!("fixtures/package_corpus/known_false_positives.toml");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 enum PackageGroup {
@@ -438,6 +439,47 @@ struct DiagnosticRangeToml {
     end_character: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct FalsePositiveFixture {
+    #[serde(default, rename = "false_positive")]
+    false_positives: Vec<FalsePositiveEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FalsePositiveEntry {
+    package: String,
+    path: String,
+    message: String,
+    range: DiagnosticRangeToml,
+    #[serde(default)]
+    #[allow(dead_code)] // present for documentation in the TOML fixture
+    reason: Option<String>,
+}
+
+impl FalsePositiveFixture {
+    fn load() -> Self {
+        toml::from_str(FP_FIXTURE).expect("known false positives fixture parses")
+    }
+
+    fn keys_for_package(&self, package: &str) -> BTreeSet<DiagnosticKey> {
+        self.false_positives
+            .iter()
+            .filter(|fp| fp.package == package)
+            .map(|fp| DiagnosticKey {
+                package: fp.package.clone(),
+                path: fp.path.clone(),
+                message: fp.message.clone(),
+                range: DiagnosticRange {
+                    start_line: fp.range.start_line,
+                    start_character: fp.range.start_character,
+                    end_line: fp.range.end_line,
+                    end_character: fp.range.end_character,
+                },
+            })
+            .collect()
+    }
+}
+
 impl TriageFixture {
     fn load() -> Self {
         toml::from_str(TRIAGE_FIXTURE).expect("package corpus triage fixture parses")
@@ -723,7 +765,11 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
         code: None,
     };
 
-    let classification = classify_observed(&[accepted, unclassified.clone()], &fixture);
+    let fp_fixture = FalsePositiveFixture {
+        false_positives: vec![],
+    };
+    let classification =
+        classify_observed(&[accepted, unclassified.clone()], &fixture, &fp_fixture);
 
     assert_eq!(classification.unclassified, vec![unclassified]);
     assert_eq!(classification.stale_acceptances.len(), 1);
@@ -834,7 +880,8 @@ fn run_corpus(packages: &[&PackageSpec]) -> Result<Vec<CheckReport>, String> {
     eprintln!("package corpus report: {}", report_path.display());
 
     let fixture = TriageFixture::load();
-    let classification = classify_reports(&reports, &fixture);
+    let fp_fixture = FalsePositiveFixture::load();
+    let classification = classify_reports(&reports, &fixture, &fp_fixture);
     if !classification.unclassified.is_empty() || !classification.stale_acceptances.is_empty() {
         if allow_unclassified_collection() {
             eprintln!(
@@ -1178,15 +1225,23 @@ fn code_to_string(value: Value) -> Option<String> {
     }
 }
 
-fn classify_reports(reports: &[CheckReport], fixture: &TriageFixture) -> Classification {
+fn classify_reports(
+    reports: &[CheckReport],
+    fixture: &TriageFixture,
+    fp_fixture: &FalsePositiveFixture,
+) -> Classification {
     let observed = reports
         .iter()
         .flat_map(|report| report.diagnostics.iter().cloned())
         .collect::<Vec<_>>();
-    classify_observed(&observed, fixture)
+    classify_observed(&observed, fixture, fp_fixture)
 }
 
-fn classify_observed(observed: &[ObservedDiagnostic], fixture: &TriageFixture) -> Classification {
+fn classify_observed(
+    observed: &[ObservedDiagnostic],
+    fixture: &TriageFixture,
+    fp_fixture: &FalsePositiveFixture,
+) -> Classification {
     let observed_keys: BTreeSet<_> = observed.iter().map(ObservedDiagnostic::key).collect();
     let observed_packages: BTreeSet<_> =
         observed.iter().map(|diag| diag.package.as_str()).collect();
@@ -1196,6 +1251,9 @@ fn classify_observed(observed: &[ObservedDiagnostic], fixture: &TriageFixture) -
             !fixture
                 .accepted_keys_for_package(&diag.package)
                 .contains(&diag.key())
+                && !fp_fixture
+                    .keys_for_package(&diag.package)
+                    .contains(&diag.key())
         })
         .cloned()
         .collect();

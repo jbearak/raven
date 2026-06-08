@@ -1,0 +1,445 @@
+# Known false positives in the base package corpus.
+# These are Raven diagnostics that are incorrect — the code is valid.
+# Each entry should eventually become a Raven fix (TDD regression).
+# Until fixed, they are excluded from strict-mode failure.
+
+[[false_positive]]
+package = "compiler"
+path = "tests/curexpr.R"
+message = "Undefined variable: dummy"
+reason = "variable created by eval(parse(text=...)) dynamic code in test"
+[false_positive.range]
+start_line = 90
+start_character = 22
+end_line = 90
+end_character = 27
+
+[[false_positive]]
+package = "methods"
+path = "R/ClassExtensions.R"
+message = "Undefined variable: THISCLASS"
+reason = "metaprogramming template replaced by substituteDirect()"
+[false_positive.range]
+start_line = 63
+start_character = 37
+end_line = 63
+end_character = 46
+
+[[false_positive]]
+package = "methods"
+path = "R/is.R"
+message = "Undefined variable: .newDirectSuperclass"
+reason = "replacement function getter — only the `<-` variant is needed here"
+[false_positive.range]
+start_line = 206
+start_character = 4
+end_line = 206
+end_character = 24
+
+[[false_positive]]
+package = "methods"
+path = "tests/basicRefClass.R"
+message = "Undefined variable: .self"
+reason = "reference class self-reference restored by load()"
+[false_positive.range]
+start_line = 257
+start_character = 29
+end_line = 257
+end_character = 34
+
+[[false_positive]]
+package = "methods"
+path = "tests/basicRefClass.R"
+message = "Undefined variable: ctxt"
+reason = "variable created by textConnection() NSE"
+[false_positive.range]
+start_line = 401
+start_character = 42
+end_line = 401
+end_character = 46
+
+[[false_positive]]
+package = "methods"
+path = "tests/basicRefClass.R"
+message = "Undefined variable: ctxt"
+reason = "variable created by textConnection() NSE"
+[false_positive.range]
+start_line = 402
+start_character = 39
+end_line = 402
+end_character = 43
+
+[[false_positive]]
+package = "methods"
+path = "tests/basicRefClass.R"
+message = "Undefined variable: ctxt"
+reason = "variable created by textConnection() NSE"
+[false_positive.range]
+start_line = 403
+start_character = 49
+end_line = 403
+end_character = 53
+
+[[false_positive]]
+package = "methods"
+path = "tests/duplicateClass.R"
+message = "Undefined variable: bar"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 34
+start_character = 10
+end_line = 34
+end_character = 13
+
+[[false_positive]]
+package = "methods"
+path = "tests/duplicateClass.R"
+message = "Undefined variable: bar"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 35
+start_character = 10
+end_line = 35
+end_character = 13
+
+[[false_positive]]
+package = "methods"
+path = "tests/testConditionalIs.R"
+message = "Undefined variable: ff"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 14
+start_character = 13
+end_line = 14
+end_character = 15
+
+[[false_positive]]
+package = "methods"
+path = "tests/testConditionalIs.R"
+message = "Undefined variable: ff"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 21
+start_character = 20
+end_line = 21
+end_character = 22
+
+[[false_positive]]
+package = "methods"
+path = "tests/testConditionalIs.R"
+message = "Undefined variable: ff"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 22
+start_character = 13
+end_line = 22
+end_character = 15
+
+[[false_positive]]
+package = "methods"
+path = "tests/testConditionalIs.R"
+message = "Undefined variable: ff"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 32
+start_character = 20
+end_line = 32
+end_character = 22
+
+[[false_positive]]
+package = "methods"
+path = "tests/testConditionalIs.R"
+message = "Undefined variable: ff"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 33
+start_character = 20
+end_line = 33
+end_character = 22
+
+[[false_positive]]
+package = "methods"
+path = "tests/testGroupGeneric.R"
+message = "Undefined variable: f1"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 36
+start_character = 8
+end_line = 36
+end_character = 10
+
+[[false_positive]]
+package = "methods"
+path = "tests/testGroupGeneric.R"
+message = "Undefined variable: f1"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 38
+start_character = 8
+end_line = 38
+end_character = 10
+
+[[false_positive]]
+package = "methods"
+path = "tests/testGroupGeneric.R"
+message = "Undefined variable: f1"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 43
+start_character = 49
+end_line = 43
+end_character = 51
+
+[[false_positive]]
+package = "methods"
+path = "tests/testIs.R"
+message = "Undefined variable: size"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 22
+start_character = 13
+end_line = 22
+end_character = 17
+
+[[false_positive]]
+package = "methods"
+path = "tests/testIs.R"
+message = "Undefined variable: size"
+reason = "binding created by setGeneric() NSE"
+[false_positive.range]
+start_line = 28
+start_character = 20
+end_line = 28
+end_character = 24
+
+[[false_positive]]
+package = "stats"
+path = "demo/lm.glm.R"
+message = "Undefined variable: logit"
+reason = "package-internal function not visible in demo/ scope"
+[false_positive.range]
+start_line = 95
+start_character = 51
+end_line = 95
+end_character = 56
+
+[[false_positive]]
+package = "stats"
+path = "demo/lm.glm.R"
+message = "Undefined variable: probit"
+reason = "package-internal function not visible in demo/ scope"
+[false_positive.range]
+start_line = 96
+start_character = 51
+end_line = 96
+end_character = 57
+
+[[false_positive]]
+package = "stats"
+path = "demo/lm.glm.R"
+message = "Undefined variable: cloglog"
+reason = "package-internal function not visible in demo/ scope"
+[false_positive.range]
+start_line = 97
+start_character = 51
+end_line = 97
+end_character = 58
+
+[[false_positive]]
+package = "stats"
+path = "demo/smooth.R"
+message = "Undefined variable: x1"
+reason = "likely genuine R source bug (variable never defined in demo/smooth.R)"
+[false_positive.range]
+start_line = 35
+start_character = 14
+end_line = 35
+end_character = 16
+
+[[false_positive]]
+package = "stats"
+path = "tests/drop1-polr.R"
+message = "Undefined variable: lreg1"
+reason = "likely typo for lreg (genuine R source bug, not a Raven FP)"
+[false_positive.range]
+start_line = 19
+start_character = 18
+end_line = 19
+end_character = 23
+
+[[false_positive]]
+package = "stats"
+path = "tests/drop1-polr.R"
+message = "Undefined variable: housing"
+reason = "dataset from MASS loaded via require()"
+[false_positive.range]
+start_line = 25
+start_character = 44
+end_line = 25
+end_character = 51
+
+[[false_positive]]
+package = "stats"
+path = "tests/drop1-polr.R"
+message = "Undefined variable: housing"
+reason = "dataset from MASS loaded via require()"
+[false_positive.range]
+start_line = 26
+start_character = 30
+end_line = 26
+end_character = 37
+
+[[false_positive]]
+package = "stats"
+path = "tests/factanal-tst.R"
+message = "Undefined variable: oblimin"
+reason = "function from GPArotation loaded via require()"
+[false_positive.range]
+start_line = 15
+start_character = 23
+end_line = 15
+end_character = 30
+
+[[false_positive]]
+package = "stats"
+path = "tests/factanal-tst.R"
+message = "Undefined variable: oblimin"
+reason = "function from GPArotation loaded via require()"
+[false_positive.range]
+start_line = 17
+start_character = 23
+end_line = 17
+end_character = 30
+
+[[false_positive]]
+package = "stats"
+path = "tests/glm-etc.R"
+message = "Undefined variable: ch"
+reason = "data-frame column used via plot.formula NSE"
+[false_positive.range]
+start_line = 181
+start_character = 42
+end_line = 181
+end_character = 44
+
+[[false_positive]]
+package = "stats"
+path = "tests/loglin.R"
+message = "Undefined variable: Cars93"
+reason = "dataset from MASS loaded via require()"
+[false_positive.range]
+start_line = 17
+start_character = 33
+end_line = 17
+end_character = 39
+
+[[false_positive]]
+package = "stats"
+path = "tests/ts-tests.R"
+message = "Undefined variable: Seatbelts"
+reason = "dataset from datasets package (default-attached)"
+[false_positive.range]
+start_line = 179
+start_character = 11
+end_line = 179
+end_character = 20
+
+[[false_positive]]
+package = "stats"
+path = "tests/ts-tests.R"
+message = "Undefined variable: Seatbelts"
+reason = "dataset from datasets package (default-attached)"
+[false_positive.range]
+start_line = 182
+start_character = 55
+end_line = 182
+end_character = 64
+
+[[false_positive]]
+package = "tools"
+path = "R/check.R"
+message = "Undefined variable: Sys.junction"
+reason = "Windows-only C-registered function"
+[false_positive.range]
+start_line = 150
+start_character = 16
+end_line = 150
+end_character = 28
+
+[[false_positive]]
+package = "tools"
+path = "R/install.R"
+message = "File not found: 'install.libs.R'"
+reason = "dynamic source() path resolved at runtime"
+[false_positive.range]
+start_line = 646
+start_character = 16
+end_line = 646
+end_character = 40
+
+[[false_positive]]
+package = "utils"
+path = "R/RShowDoc.R"
+message = "Undefined variable: shell.exec"
+reason = "Windows-only C-registered function"
+[false_positive.range]
+start_line = 26
+start_character = 12
+end_line = 26
+end_character = 22
+
+[[false_positive]]
+package = "utils"
+path = "R/RShowDoc.R"
+message = "Undefined variable: shell.exec"
+reason = "Windows-only C-registered function"
+[false_positive.range]
+start_line = 35
+start_character = 12
+end_line = 35
+end_character = 22
+
+[[false_positive]]
+package = "utils"
+path = "R/help.start.R"
+message = "Undefined variable: shell.exec"
+reason = "Windows-only C-registered function"
+[false_positive.range]
+start_line = 66
+start_character = 43
+end_line = 66
+end_character = 53
+
+[[false_positive]]
+package = "utils"
+path = "R/vignette.R"
+message = "Undefined variable: shell.exec"
+reason = "Windows-only C-registered function"
+[false_positive.range]
+start_line = 105
+start_character = 13
+end_line = 105
+end_character = 23
+
+[[false_positive]]
+package = "utils"
+path = "R/windows/create.post.R"
+message = "Undefined variable: shell.exec"
+reason = "Windows-only C-registered function"
+[false_positive.range]
+start_line = 75
+start_character = 17
+end_line = 75
+end_character = 27
+
+[[false_positive]]
+package = "utils"
+path = "R/windows/sysutils.R"
+message = "Undefined variable: shell.exec"
+reason = "Windows-only C-registered function"
+[false_positive.range]
+start_line = 109
+start_character = 4
+end_line = 109
+end_character = 14
+
