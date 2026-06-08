@@ -20516,6 +20516,7 @@ clean_data <- function(x) {
                         full_imports: Default::default(),
                         test_attached_packages: Default::default(),
                         test_helper_symbols: Default::default(),
+                        dataset_symbols: Default::default(),
                     },
                     ..Default::default()
                 });
@@ -20595,6 +20596,7 @@ clean_data <- function(x) {
                         full_imports: std::sync::Arc::new(full),
                         test_attached_packages: Default::default(),
                         test_helper_symbols: Default::default(),
+                        dataset_symbols: Default::default(),
                     },
                     ..Default::default()
                 });
@@ -20661,6 +20663,7 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -21033,6 +21036,7 @@ clean_data <- function(x) {
                     full_imports: std::sync::Arc::new(full_imports),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22385,6 +22389,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22465,6 +22470,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: std::sync::Arc::new(helpers),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22541,6 +22547,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: std::sync::Arc::new(helpers),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22627,6 +22634,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22737,6 +22745,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22849,6 +22858,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22936,6 +22946,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -22971,6 +22982,207 @@ y <- totally_undefined_baseline()
                 .iter()
                 .any(|d| d.message == "Undefined variable: test_that"),
             "R/ files must flag testthat exports as undefined. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // ========================================================================
+    // Dataset symbols: package data/ directory (Workstream D)
+    // ========================================================================
+
+    /// Package dataset symbols suppress undefined-variable in a vignette file.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_dataset_in_vignette() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut datasets = BTreeSet::new();
+        datasets.insert("mpg".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: std::sync::Arc::new(datasets),
+                },
+                ..Default::default()
+            });
+
+        let code = "head(mpg)\n";
+        let uri = Url::parse("file:///work/pkg/vignettes/intro.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d.message.contains("mpg")),
+            "dataset 'mpg' must suppress undefined-variable in vignettes/. got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Package dataset symbols suppress undefined-variable in a test file.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_dataset_in_test() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut datasets = BTreeSet::new();
+        datasets.insert("starwars".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: std::sync::Arc::new(datasets),
+                },
+                ..Default::default()
+            });
+
+        let code = "nrow(starwars)\n";
+        let uri = Url::parse("file:///work/pkg/tests/testthat/test-data.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d.message.contains("starwars")),
+            "dataset 'starwars' must suppress undefined-variable in tests/. got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// NEGATIVE: a non-dataset bare name still flags as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_flags_non_dataset_in_vignette() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut datasets = BTreeSet::new();
+        datasets.insert("mpg".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: std::sync::Arc::new(datasets),
+                },
+                ..Default::default()
+            });
+
+        let code = "head(not_a_dataset)\n";
+        let uri = Url::parse("file:///work/pkg/vignettes/intro.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("not_a_dataset")),
+            "non-dataset name must still flag as undefined. got: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())

@@ -149,6 +149,7 @@ fn initial_inputs() -> PackageInputs {
         }),
         namespace: None,
         r_files: BTreeMap::new(),
+        dataset_names: BTreeSet::new(),
     }
 }
 

@@ -178,6 +178,13 @@ fn translate_watched(
         return Some(PackageInputDelta::RFileChanged { path, kind });
     }
 
+    // data/ directory file changes: rescan dataset names.
+    let data_dir = root.join("data");
+    if path.starts_with(&data_dir) && path != data_dir {
+        inputs.dataset_names = super::scan_own_package_data_dir(root);
+        return Some(PackageInputDelta::DataDirChanged);
+    }
+
     translate_watched_directory(inputs, root, &path, deleted)
 }
 
@@ -192,6 +199,13 @@ fn translate_watched_directory(
     }
     if !is_tracked_package_dir(path, root) {
         return None;
+    }
+
+    // data/ directory: rescan dataset names rather than collecting R source files.
+    let data_dir = root.join("data");
+    if path == data_dir || path.starts_with(&data_dir) {
+        inputs.dataset_names = super::scan_own_package_data_dir(root);
+        return Some(PackageInputDelta::DataDirChanged);
     }
 
     let mut deltas = Vec::new();
@@ -234,12 +248,15 @@ fn is_tracked_package_dir(path: &Path, root: &Path) -> bool {
     let r_dir = root.join("R");
     let testthat_dir = root.join("tests").join("testthat");
     let testit_dir = root.join("tests").join("testit");
+    let data_dir = root.join("data");
     path == r_dir
         || path.starts_with(&r_dir)
         || path == testthat_dir
         || path.starts_with(&testthat_dir)
         || path == testit_dir
         || path.starts_with(&testit_dir)
+        || path == data_dir
+        || path.starts_with(&data_dir)
 }
 
 fn collect_r_file_inputs_from_dir(

@@ -1732,6 +1732,7 @@ pub(crate) fn initialize_package_inputs_from_state(
 
     let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
     state.package_inputs.r_files = new_r_files;
+    state.package_inputs.dataset_names = crate::package_state::scan_own_package_data_dir(&root);
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
     // Resolve system.file() sources in workspace index now that package state

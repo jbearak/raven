@@ -41,6 +41,7 @@ pub fn derive_package_state(
         &namespace_model,
         &r_file_facts,
         inputs.description.as_ref(),
+        &inputs.dataset_names,
     );
     PackageState {
         workspace,
@@ -55,6 +56,7 @@ fn build_scope_contribution(
     namespace_model: &Option<PackageNamespaceModel>,
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
     description: Option<&DescriptionInput>,
+    dataset_names: &BTreeSet<String>,
 ) -> PackageScopeContribution {
     let Some(ws) = workspace else {
         return PackageScopeContribution::default();
@@ -134,6 +136,7 @@ fn build_scope_contribution(
         full_imports: Arc::new(full_imports),
         test_attached_packages: Arc::new(test_attached_packages),
         test_helper_symbols: Arc::new(test_helper_symbols),
+        dataset_symbols: Arc::new(dataset_names.clone()),
     }
 }
 
@@ -292,6 +295,7 @@ mod tests {
             description: None,
             namespace: None,
             r_files: BTreeMap::new(),
+            dataset_names: BTreeSet::new(),
         }
     }
 
@@ -1142,5 +1146,48 @@ foo <- function() 1
         let b_syms = map.get(&helper_b).expect("helper-b entry");
         assert!(b_syms.contains("fixture_b"));
         assert!(!b_syms.contains("fixture_a"));
+    }
+
+    // ------------------------------------------------------------------
+    // Dataset symbols from data/ directory (Workstream D)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn scope_contribution_carries_dataset_names_from_inputs() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.dataset_names.insert("mpg".to_string());
+        inputs.dataset_names.insert("diamonds".to_string());
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        assert!(
+            s.scope_contribution.dataset_symbols.contains("mpg"),
+            "dataset_symbols must contain mpg: {:?}",
+            s.scope_contribution.dataset_symbols,
+        );
+        assert!(
+            s.scope_contribution.dataset_symbols.contains("diamonds"),
+            "dataset_symbols must contain diamonds: {:?}",
+            s.scope_contribution.dataset_symbols,
+        );
+    }
+
+    #[test]
+    fn scope_contribution_empty_datasets_when_no_workspace() {
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.dataset_names.insert("mpg".to_string());
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        // No workspace → no scope contribution → datasets not injected.
+        assert!(s.scope_contribution.dataset_symbols.is_empty());
     }
 }

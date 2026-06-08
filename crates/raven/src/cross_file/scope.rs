@@ -4645,6 +4645,14 @@ fn compute_contribution_symbol_names(
     let Ok(path) = queried_uri.to_file_path() else {
         return out;
     };
+
+    // Dataset symbols are visible to any file in the workspace.
+    if crate::package_state::is_package_workspace_r_file(&path, root) {
+        for sym in contrib.dataset_symbols.iter() {
+            out.insert(Arc::from(sym.as_str()));
+        }
+    }
+
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
         return out;
     };
@@ -4731,7 +4739,34 @@ pub(crate) fn append_package_contribution(
     let Ok(path) = uri.to_file_path() else {
         return;
     };
-    // Only inject for files under <root>/R/ or <root>/tests/testthat/.
+
+    // Use a synthetic URI scheme for package-internal symbols so consumers
+    // can distinguish them from real file-backed definitions.
+    let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
+        .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
+
+    // Dataset symbols are visible to ANY file in the workspace (R/, tests/,
+    // vignettes/, inst/, demo/, data-raw/).
+    if crate::package_state::is_package_workspace_r_file(&path, root) {
+        for sym in contrib.dataset_symbols.iter() {
+            let name: Arc<str> = Arc::from(sym.as_str());
+            scope
+                .symbols
+                .entry(name.clone())
+                .or_insert_with(|| ScopedSymbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    source_uri: pkg_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                    is_declared: false,
+                });
+        }
+    }
+
+    // Only inject r_internal_symbols and imported_symbols for files under
+    // <root>/R/ or <root>/tests/.
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
         return;
     };
@@ -19487,6 +19522,7 @@ mod package_contribution_tests {
             full_imports: Arc::new(BTreeSet::new()),
             test_attached_packages: Arc::new(BTreeSet::new()),
             test_helper_symbols: Arc::new(std::collections::BTreeMap::new()),
+            dataset_symbols: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -20125,6 +20161,182 @@ mod package_contribution_tests {
         assert!(
             scope.symbols.contains_key("Cholesky"),
             "package symbols must still be injected. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Dataset symbols: visible package-wide (Workstream D)
+    // ------------------------------------------------------------------
+
+    /// Build a contribution with dataset symbols.
+    fn make_contribution_with_datasets(
+        workspace_root_path: &str,
+        internal: &[&str],
+        datasets: &[&str],
+    ) -> PackageScopeContribution {
+        let r_internal_symbols: BTreeSet<String> = internal.iter().map(|s| s.to_string()).collect();
+        let dataset_symbols: BTreeSet<String> = datasets.iter().map(|s| s.to_string()).collect();
+        PackageScopeContribution {
+            workspace_root: Some(std::path::PathBuf::from(workspace_root_path)),
+            r_internal_symbols: Arc::new(r_internal_symbols),
+            imported_symbols: Arc::new(BTreeMap::new()),
+            full_imports: Arc::new(BTreeSet::new()),
+            test_attached_packages: Arc::new(BTreeSet::new()),
+            test_helper_symbols: Arc::new(BTreeMap::new()),
+            dataset_symbols: Arc::new(dataset_symbols),
+        }
+    }
+
+    /// Dataset symbols are visible in a vignette file.
+    #[test]
+    fn dataset_visible_in_vignette() {
+        let contrib = make_contribution_with_datasets("/work/pkg", &[], &["mpg", "diamonds"]);
+        let uri = Url::parse("file:///work/pkg/vignettes/intro.R").unwrap();
+        let code = "head(mpg)\n";
+        let arts = artifacts_for(&uri, code);
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &uri { Some(arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+
+        let scope = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope.symbols.contains_key("mpg"),
+            "dataset 'mpg' must be visible in vignettes/. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.symbols.contains_key("diamonds"),
+            "dataset 'diamonds' must be visible in vignettes/. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Dataset symbols are visible in test files.
+    #[test]
+    fn dataset_visible_in_test() {
+        let contrib = make_contribution_with_datasets("/work/pkg", &[], &["starwars"]);
+        let uri = Url::parse("file:///work/pkg/tests/testthat/test-data.R").unwrap();
+        let code = "nrow(starwars)\n";
+        let arts = artifacts_for(&uri, code);
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &uri { Some(arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+
+        let scope = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope.symbols.contains_key("starwars"),
+            "dataset 'starwars' must be visible in tests/testthat/. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Dataset symbols are visible in R/ files.
+    #[test]
+    fn dataset_visible_in_r_dir() {
+        let contrib = make_contribution_with_datasets("/work/pkg", &["helper"], &["mpg"]);
+        let uri = Url::parse("file:///work/pkg/R/analysis.R").unwrap();
+        let code = "head(mpg)\n";
+        let arts = artifacts_for(&uri, code);
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &uri { Some(arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+
+        let scope = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope.symbols.contains_key("mpg"),
+            "dataset 'mpg' must be visible in R/. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Dataset symbols are NOT visible outside the workspace root.
+    #[test]
+    fn dataset_not_visible_outside_workspace() {
+        let contrib = make_contribution_with_datasets("/work/pkg", &[], &["mpg"]);
+        let uri = Url::parse("file:///other/project/script.R").unwrap();
+        let code = "head(mpg)\n";
+        let arts = artifacts_for(&uri, code);
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &uri { Some(arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+
+        let scope = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("mpg"),
+            "dataset 'mpg' must NOT be visible outside workspace. visible: {:?}",
             scope.symbols.keys().collect::<Vec<_>>()
         );
     }
