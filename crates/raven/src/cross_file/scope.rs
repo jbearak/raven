@@ -4653,7 +4653,16 @@ fn compute_contribution_symbol_names(
         }
     }
 
+    let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
+        if is_dev_context {
+            for sym in contrib.r_internal_symbols.iter() {
+                out.insert(Arc::from(sym.as_str()));
+            }
+            for sym in contrib.imported_symbols.keys() {
+                out.insert(Arc::from(sym.as_str()));
+            }
+        }
         return out;
     };
     for sym in contrib.r_internal_symbols.iter() {
@@ -4765,9 +4774,46 @@ pub(crate) fn append_package_contribution(
         }
     }
 
-    // Only inject r_internal_symbols and imported_symbols for files under
-    // <root>/R/ or <root>/tests/.
+    // Inject r_internal_symbols and imported_symbols for files under
+    // <root>/R/, <root>/tests/, or dev-context dirs (inst/, demo/,
+    // data-raw/, vignettes/, revdep/).
+    let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
+        if !is_dev_context {
+            return;
+        }
+        // Dev-context files see r_internal_symbols + imported_symbols but
+        // NOT test_helper_symbols or test_attached_packages.
+        for sym in contrib.r_internal_symbols.iter() {
+            let name: Arc<str> = Arc::from(sym.as_str());
+            scope
+                .symbols
+                .entry(name.clone())
+                .or_insert_with(|| ScopedSymbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    source_uri: pkg_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                    is_declared: false,
+                });
+        }
+        for sym in contrib.imported_symbols.keys() {
+            let name: Arc<str> = Arc::from(sym.as_str());
+            scope
+                .symbols
+                .entry(name.clone())
+                .or_insert_with(|| ScopedSymbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    source_uri: pkg_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                    is_declared: false,
+                });
+        }
         return;
     };
 
@@ -19686,16 +19732,16 @@ mod package_contribution_tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 3: contribution does NOT inject into file outside R/
+    // Test 3: contribution does NOT inject into file outside package
     // ------------------------------------------------------------------
 
-    /// A file NOT under `<root>/R/` or `<root>/tests/testthat/` must NOT
-    /// receive the package contribution, even when `Some(&contrib)` is passed.
+    /// A file NOT under any recognized package directory must NOT receive
+    /// the package contribution, even when `Some(&contrib)` is passed.
     #[test]
-    fn contribution_not_injected_outside_r_dir() {
+    fn contribution_not_injected_outside_package() {
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        // Script under inst/ — not a package source file.
-        let script_uri = Url::parse("file:///work/pkg/inst/script.R").unwrap();
+        // Script outside the workspace entirely.
+        let script_uri = Url::parse("file:///other/script.R").unwrap();
         let script_code = "result <- helper()";
         let script_arts = artifacts_for(&script_uri, script_code);
 
@@ -19728,8 +19774,237 @@ mod package_contribution_tests {
         );
         assert!(
             !scope.symbols.contains_key("helper"),
-            "files outside R/ must not receive package contribution; \
+            "files outside package must not receive package contribution; \
              visible symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: dev-context dirs see package contribution
+    // ------------------------------------------------------------------
+
+    /// Files under `inst/`, `demo/`, `data-raw/`, `vignettes/`, `revdep/`
+    /// must see `r_internal_symbols` and `imported_symbols` — one-way
+    /// visibility from R/ into dev-context directories.
+    #[test]
+    fn package_contribution_visible_in_dev_context_dirs() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let dev_dirs = [
+            "file:///work/pkg/inst/script.R",
+            "file:///work/pkg/demo/example.R",
+            "file:///work/pkg/data-raw/prepare.R",
+            "file:///work/pkg/vignettes/intro.R",
+            "file:///work/pkg/revdep/check.R",
+            // Nested paths work too
+            "file:///work/pkg/inst/extdata/helper.R",
+            "file:///work/pkg/vignettes/articles/deep.R",
+        ];
+
+        for uri_str in dev_dirs {
+            let uri = Url::parse(uri_str).unwrap();
+            let code = "result <- pkg_fn()";
+            let arts = artifacts_for(&uri, code);
+
+            let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if u == &uri { Some(arts.clone()) } else { None }
+            };
+            let get_metadata = |_u: &Url| -> Option<
+                std::sync::Arc<super::super::types::CrossFileMetadata>,
+            > { None };
+            let graph = super::super::dependency::DependencyGraph::new();
+
+            let contrib = make_contribution("/work/pkg", &["pkg_fn"], &["filter"]);
+            let scope = scope_at_position_with_graph(
+                &uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                super::super::config::BackwardDependencyMode::Explicit,
+                &|| false,
+                Some(&contrib),
+            );
+            assert!(
+                scope.symbols.contains_key("pkg_fn"),
+                "{uri_str}: dev-context file must see r_internal_symbols. visible: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                scope.symbols.contains_key("filter"),
+                "{uri_str}: dev-context file must see imported_symbols. visible: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Test: dev-context dirs do NOT receive testthat helpers
+    // ------------------------------------------------------------------
+
+    /// Dev-context files must NOT receive `test_helper_symbols` or
+    /// `test_attached_packages` — those are testthat-specific.
+    #[test]
+    fn dev_context_does_not_receive_testthat_helpers() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let uri = Url::parse("file:///work/pkg/inst/script.R").unwrap();
+        let code = "result <- use_helper()";
+        let arts = artifacts_for(&uri, code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &uri { Some(arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        let mut contrib = make_contribution("/work/pkg", &["pkg_fn"], &[]);
+        let mut helpers = std::collections::BTreeMap::new();
+        let mut helper_syms = BTreeSet::new();
+        helper_syms.insert("use_helper".to_string());
+        helpers.insert(
+            std::path::PathBuf::from("/work/pkg/tests/testthat/helper-utils.R"),
+            Arc::new(helper_syms),
+        );
+        contrib.test_helper_symbols = Arc::new(helpers);
+        contrib.test_attached_packages =
+            Arc::new(std::iter::once("testthat".to_string()).collect());
+
+        let scope = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        // Package symbols ARE injected
+        assert!(
+            scope.symbols.contains_key("pkg_fn"),
+            "dev-context should see r_internal_symbols"
+        );
+        // Helper symbols are NOT injected
+        assert!(
+            !scope.symbols.contains_key("use_helper"),
+            "dev-context must NOT receive testthat helper symbols. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        // test_attached_packages NOT injected
+        assert!(
+            !scope.inherited_packages.contains("testthat"),
+            "dev-context must NOT receive test_attached_packages"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // CRITICAL: undefined symbol still flags in dev-context (no leak)
+    // ------------------------------------------------------------------
+
+    /// A symbol that is NOT in `r_internal_symbols` or `imported_symbols`
+    /// must NOT be visible in a dev-context file. This ensures the
+    /// contribution is additive-only and doesn't suppress legitimate
+    /// undefined-variable diagnostics.
+    #[test]
+    fn undefined_symbol_not_visible_in_dev_context() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let uri = Url::parse("file:///work/pkg/inst/example.R").unwrap();
+        let code = "result <- nonexistent_fn()";
+        let arts = artifacts_for(&uri, code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &uri { Some(arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Contribution carries `pkg_fn` but NOT `nonexistent_fn`.
+        let contrib = make_contribution("/work/pkg", &["pkg_fn"], &["filter"]);
+        let scope = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("nonexistent_fn"),
+            "undefined symbol must NOT appear in dev-context scope — \
+             contribution must not suppress legitimate undefined-variable errors. \
+             visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        // Verify the contribution DID inject — only the correct symbols
+        assert!(scope.symbols.contains_key("pkg_fn"));
+        assert!(scope.symbols.contains_key("filter"));
+    }
+
+    // ------------------------------------------------------------------
+    // Test: dev-context defs do NOT leak into R/
+    // ------------------------------------------------------------------
+
+    /// A symbol defined only in a dev-context file must NOT appear in R/ scope.
+    /// Dev-context files are NOT tracked in `r_files` so their defs never
+    /// enter `r_internal_symbols`. This test verifies the scope-side invariant.
+    #[test]
+    fn dev_context_defs_do_not_leak_into_r_dir() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- inst_only_fn()";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Contribution does NOT carry `inst_only_fn` because it's only
+        // defined in inst/ (which doesn't feed into r_internal_symbols).
+        let contrib = make_contribution("/work/pkg", &["pkg_fn"], &["filter"]);
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("inst_only_fn"),
+            "dev-context defs must not leak into R/. visible: {:?}",
             scope.symbols.keys().collect::<Vec<_>>()
         );
     }

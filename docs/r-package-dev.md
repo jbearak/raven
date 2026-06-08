@@ -28,7 +28,7 @@ run_analysis <- function(data) {
 }
 ```
 
-Files outside `R/` (e.g., `tests/`, `inst/`, `vignettes/`) are not included in mutual visibility.
+Files outside `R/` (e.g., `tests/`, `inst/`, `vignettes/`) are not included in mutual visibility — but they get one-way read access to `R/` symbols (see below).
 
 ### Tests directory awareness
 
@@ -110,6 +110,32 @@ test_that("works on demo_input", {
 
 Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
 for visibility purposes; declare any cross-file fixtures in `helper*.R`.
+
+### Dev-context directories (`inst/`, `demo/`, `data-raw/`, `vignettes/`, `revdep/`)
+
+Files under these directories get the same one-way read access to package
+symbols as test files: they see all `R/*.R` top-level symbols and NAMESPACE
+imports, so calling your own package functions from a vignette, demo script,
+or data-preparation script produces no "undefined variable" diagnostic.
+
+Their own definitions never leak back into `R/`, and they don't see each
+other — a function defined in `inst/examples/helpers.R` is not visible from
+`vignettes/intro.Rmd`, and vice versa.
+
+```r
+# R/analysis.R
+run_model <- function(data) { ... }
+
+# vignettes/tutorial.Rmd (or vignettes/tutorial.R)
+result <- run_model(example_data)  # No diagnostic — visible from R/
+
+# inst/scripts/demo.R
+output <- run_model(sample_input)  # No diagnostic
+```
+
+Symbols that are NOT exported or defined in `R/` still flag as undefined
+in these directories — the one-way visibility is limited to what the package
+actually provides.
 
 ### Build commands
 

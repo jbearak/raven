@@ -201,6 +201,28 @@ pub fn is_testthat_or_testit_test(path: &Path, workspace_root: &Path) -> bool {
     second == "testthat" || second == "testit"
 }
 
+/// Returns `true` when `path` is an R file under one of the package's
+/// "dev-context" directories: `inst/`, `demo/`, `data-raw/`, `vignettes/`,
+/// `revdep/`. These directories see the package's own R/ top-level symbols
+/// and NAMESPACE imports (one-way: their defs never leak into R/, and they
+/// don't see each other). Package mode only.
+pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
+    let Some(rel) = path.strip_prefix(workspace_root).ok() else {
+        return false;
+    };
+    let is_r_extension = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
+    );
+    if !is_r_extension {
+        return false;
+    }
+    let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    matches!(first, "inst" | "demo" | "data-raw" | "vignettes" | "revdep")
+}
+
 /// Returns `true` when `path` is an R file anywhere under the workspace root
 /// that should see the package's own dataset symbols. This is broader than
 /// `is_r_source_path`: datasets are visible in R/, tests/, vignettes/, inst/,
@@ -515,6 +537,63 @@ mod path_tests {
         ));
         assert!(!is_testthat_or_testit_test(
             Path::new("/work/pkg/R/utils.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn dev_context_path_recognizes_all_dirs() {
+        let root = Path::new("/work/pkg");
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/inst/script.R"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/demo/example.R"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/data-raw/prepare.R"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/vignettes/intro.Rmd"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/revdep/check.R"),
+            root
+        ));
+        // Nested paths
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/inst/extdata/helper.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn dev_context_path_rejects_non_dev_dirs() {
+        let root = Path::new("/work/pkg");
+        // R/ is not dev-context (it's Source)
+        assert!(!is_dev_context_path(Path::new("/work/pkg/R/utils.R"), root));
+        // tests/ is not dev-context (it's Test)
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/tests/testthat/test-x.R"),
+            root
+        ));
+        // Outside workspace
+        assert!(!is_dev_context_path(
+            Path::new("/other/inst/script.R"),
+            root
+        ));
+        // Non-R extension
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/inst/data.csv"),
+            root
+        ));
+        // Random dir
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/src/code.R"),
             root
         ));
     }
