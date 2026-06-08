@@ -12,6 +12,7 @@ pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
 pub mod event;
+pub mod sysdata;
 
 #[cfg(test)]
 mod proptest_machine;
@@ -88,6 +89,11 @@ pub struct PackageInputs {
     /// `data/*.{rda,RData,rds,tab,txt,csv}` and top-level assignments from
     /// `data/*.R` scripts.
     pub dataset_names: BTreeSet<String>,
+    /// Symbol names from `R/sysdata.rda`. Populated by AST-scanning
+    /// `data-raw/**/*.R` for `use_data(..., internal=TRUE)` and
+    /// `save(..., file="...sysdata.rda")` calls, with an R-subprocess
+    /// fallback when AST finds nothing and an R executable is available.
+    pub sysdata_names: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -620,6 +626,8 @@ pub struct RFileFacts {
     pub kind: RFileKind,
     pub roxygen_namespace: RoxygenNamespace,
     pub top_level_defs: Arc<BTreeSet<String>>,
+    /// Symbols bound inside `.onLoad`/`.onAttach` hooks in this file.
+    pub onload_bindings: Arc<BTreeSet<String>>,
     pub content_digest: ContentDigest,
 }
 
@@ -670,6 +678,18 @@ pub struct PackageScopeContribution {
     /// scanning `<root>/data/` for file stems of recognized data extensions
     /// plus top-level assignments in `data/*.R` scripts.
     pub dataset_symbols: Arc<BTreeSet<String>>,
+
+    /// Symbols from `R/sysdata.rda` — internal data objects available to
+    /// all code within the package namespace at runtime. Visible in R/,
+    /// tests/testthat/, and dev-context files. Populated via AST scanning
+    /// of `data-raw/**/*.R` for generating calls, with an R-subprocess
+    /// fallback.
+    pub sysdata_symbols: Arc<BTreeSet<String>>,
+
+    /// Symbols bound inside `.onLoad`/`.onAttach` hooks via
+    /// `assign("x", ..., envir=ns)` or `ns$x <- ...`. Visible alongside
+    /// `r_internal_symbols`.
+    pub onload_symbols: Arc<BTreeSet<String>>,
 }
 
 #[cfg(test)]

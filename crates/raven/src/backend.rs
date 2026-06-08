@@ -1733,6 +1733,8 @@ pub(crate) fn initialize_package_inputs_from_state(
     let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
     state.package_inputs.r_files = new_r_files;
     state.package_inputs.dataset_names = crate::package_state::scan_own_package_data_dir(&root);
+    state.package_inputs.sysdata_names =
+        crate::package_state::sysdata::scan_sysdata_generating_scripts(&root);
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
     // Resolve system.file() sources in workspace index now that package state
@@ -2585,6 +2587,48 @@ impl LanguageServer for Backend {
         // rebuilds `PackageLibrary` (re-running `.libPaths()`) and restarts the
         // watcher over the newly-discovered paths. See `docs/packages.md`.
         restart_libpath_watcher(&self.state, &self.client, true).await;
+
+        // R fallback for sysdata: when the AST scan found nothing AND
+        // R/sysdata.rda exists, try loading via an R subprocess.
+        {
+            let needs_fallback = {
+                let state = self.state.read().await;
+                let has_sysdata_rda = state
+                    .package_inputs
+                    .workspace_root
+                    .as_ref()
+                    .map(|r| r.join("R").join("sysdata.rda").is_file())
+                    .unwrap_or(false);
+                state.package_inputs.sysdata_names.is_empty() && has_sysdata_rda
+            };
+            if needs_fallback {
+                let state_arc = self.state.clone();
+                tokio::spawn(async move {
+                    let (r_path, workspace_root) = {
+                        let state = state_arc.read().await;
+                        let r = state
+                            .package_library
+                            .r_subprocess()
+                            .map(|r| r.r_path().clone());
+                        let root = state.package_inputs.workspace_root.clone();
+                        (r, root)
+                    };
+                    if let (Some(r_path), Some(root)) = (r_path, workspace_root)
+                        && let Some(r) = crate::r_subprocess::RSubprocess::new(Some(r_path))
+                    {
+                        let names =
+                            crate::package_state::sysdata::load_sysdata_via_r(&r, &root).await;
+                        if !names.is_empty() {
+                            let mut state = state_arc.write().await;
+                            state.package_inputs.sysdata_names = names;
+                            state.apply_package_event(
+                                &crate::package_state::PackageInputDelta::DataDirChanged,
+                            );
+                        }
+                    }
+                });
+            }
+        }
 
         // Register dynamic file watches for raven.toml / .lintr. VS Code also
         // covers these via its synchronize.fileEvents glob, so this is a no-op

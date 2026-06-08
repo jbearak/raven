@@ -185,6 +185,13 @@ fn translate_watched(
         return Some(PackageInputDelta::DataDirChanged);
     }
 
+    // data-raw/ directory file changes: rescan sysdata generating scripts.
+    let data_raw_dir = root.join("data-raw");
+    if path.starts_with(&data_raw_dir) && path != data_raw_dir {
+        inputs.sysdata_names = super::sysdata::scan_sysdata_generating_scripts(root);
+        return Some(PackageInputDelta::DataDirChanged);
+    }
+
     translate_watched_directory(inputs, root, &path, deleted)
 }
 

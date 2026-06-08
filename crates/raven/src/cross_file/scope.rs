@@ -4659,6 +4659,12 @@ fn compute_contribution_symbol_names(
             for sym in contrib.r_internal_symbols.iter() {
                 out.insert(Arc::from(sym.as_str()));
             }
+            for sym in contrib.sysdata_symbols.iter() {
+                out.insert(Arc::from(sym.as_str()));
+            }
+            for sym in contrib.onload_symbols.iter() {
+                out.insert(Arc::from(sym.as_str()));
+            }
             for sym in contrib.imported_symbols.keys() {
                 out.insert(Arc::from(sym.as_str()));
             }
@@ -4666,6 +4672,12 @@ fn compute_contribution_symbol_names(
         return out;
     };
     for sym in contrib.r_internal_symbols.iter() {
+        out.insert(Arc::from(sym.as_str()));
+    }
+    for sym in contrib.sysdata_symbols.iter() {
+        out.insert(Arc::from(sym.as_str()));
+    }
+    for sym in contrib.onload_symbols.iter() {
         out.insert(Arc::from(sym.as_str()));
     }
     for sym in contrib.imported_symbols.keys() {
@@ -4799,6 +4811,36 @@ pub(crate) fn append_package_contribution(
                     is_declared: false,
                 });
         }
+        for sym in contrib.sysdata_symbols.iter() {
+            let name: Arc<str> = Arc::from(sym.as_str());
+            scope
+                .symbols
+                .entry(name.clone())
+                .or_insert_with(|| ScopedSymbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    source_uri: pkg_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                    is_declared: false,
+                });
+        }
+        for sym in contrib.onload_symbols.iter() {
+            let name: Arc<str> = Arc::from(sym.as_str());
+            scope
+                .symbols
+                .entry(name.clone())
+                .or_insert_with(|| ScopedSymbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    source_uri: pkg_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                    is_declared: false,
+                });
+        }
         for sym in contrib.imported_symbols.keys() {
             let name: Arc<str> = Arc::from(sym.as_str());
             scope
@@ -4828,6 +4870,38 @@ pub(crate) fn append_package_contribution(
     // assignments aren't misclassified as functions. When
     // `PackageScopeContribution` propagates kind metadata, use it here.
     for sym in contrib.r_internal_symbols.iter() {
+        let name: Arc<str> = Arc::from(sym.as_str());
+        scope
+            .symbols
+            .entry(name.clone())
+            .or_insert_with(|| ScopedSymbol {
+                name,
+                kind: SymbolKind::Variable,
+                source_uri: pkg_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+                is_declared: false,
+            });
+    }
+
+    for sym in contrib.sysdata_symbols.iter() {
+        let name: Arc<str> = Arc::from(sym.as_str());
+        scope
+            .symbols
+            .entry(name.clone())
+            .or_insert_with(|| ScopedSymbol {
+                name,
+                kind: SymbolKind::Variable,
+                source_uri: pkg_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+                is_declared: false,
+            });
+    }
+
+    for sym in contrib.onload_symbols.iter() {
         let name: Arc<str> = Arc::from(sym.as_str());
         scope
             .symbols
@@ -19569,6 +19643,8 @@ mod package_contribution_tests {
             test_attached_packages: Arc::new(BTreeSet::new()),
             test_helper_symbols: Arc::new(std::collections::BTreeMap::new()),
             dataset_symbols: Arc::new(BTreeSet::new()),
+            sysdata_symbols: Arc::new(BTreeSet::new()),
+            onload_symbols: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -20462,6 +20538,8 @@ mod package_contribution_tests {
             test_attached_packages: Arc::new(BTreeSet::new()),
             test_helper_symbols: Arc::new(BTreeMap::new()),
             dataset_symbols: Arc::new(dataset_symbols),
+            sysdata_symbols: Arc::new(BTreeSet::new()),
+            onload_symbols: Arc::new(BTreeSet::new()),
         }
     }
 

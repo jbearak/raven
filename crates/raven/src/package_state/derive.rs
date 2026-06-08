@@ -42,6 +42,7 @@ pub fn derive_package_state(
         &r_file_facts,
         inputs.description.as_ref(),
         &inputs.dataset_names,
+        &inputs.sysdata_names,
     );
     PackageState {
         workspace,
@@ -57,6 +58,7 @@ fn build_scope_contribution(
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
     description: Option<&DescriptionInput>,
     dataset_names: &BTreeSet<String>,
+    sysdata_names: &BTreeSet<String>,
 ) -> PackageScopeContribution {
     let Some(ws) = workspace else {
         return PackageScopeContribution::default();
@@ -83,12 +85,16 @@ fn build_scope_contribution(
     // symmetry with `r_internal_symbols` (which has the same limitation
     // for R/ files).
     let mut r_internal_symbols: BTreeSet<String> = BTreeSet::new();
+    let mut onload_all: BTreeSet<String> = BTreeSet::new();
     let mut test_helper_symbols: BTreeMap<PathBuf, Arc<BTreeSet<String>>> = BTreeMap::new();
     for (path, facts) in r_file_facts {
         match facts.kind {
             RFileKind::Source => {
                 for def in facts.top_level_defs.iter() {
                     r_internal_symbols.insert(def.clone());
+                }
+                for sym in facts.onload_bindings.iter() {
+                    onload_all.insert(sym.clone());
                 }
             }
             RFileKind::Test => {
@@ -137,6 +143,8 @@ fn build_scope_contribution(
         test_attached_packages: Arc::new(test_attached_packages),
         test_helper_symbols: Arc::new(test_helper_symbols),
         dataset_symbols: Arc::new(dataset_names.clone()),
+        sysdata_symbols: Arc::new(sysdata_names.clone()),
+        onload_symbols: Arc::new(onload_all),
     }
 }
 
@@ -242,6 +250,9 @@ fn derive_r_file_facts(
                 kind: file.kind,
                 roxygen_namespace: crate::roxygen::extract_roxygen_namespace_tags(&file.text),
                 top_level_defs: Arc::new(crate::roxygen::extract_top_level_defs(&file.text)),
+                onload_bindings: Arc::new(crate::package_state::sysdata::extract_onload_bindings(
+                    &file.text,
+                )),
                 content_digest: file.content_digest,
             },
         };
@@ -296,6 +307,7 @@ mod tests {
             namespace: None,
             r_files: BTreeMap::new(),
             dataset_names: BTreeSet::new(),
+            sysdata_names: BTreeSet::new(),
         }
     }
 
