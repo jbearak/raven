@@ -20716,6 +20716,288 @@ clean_data <- function(x) {
         );
     }
 
+    /// Workstream B: a NAMESPACE `importFrom(pkg, fn)` MUST suppress
+    /// "Undefined variable: fn" for `R/*.R` files even when `pkg` is NOT
+    /// installed — the explicit symbol name is statically known from the
+    /// NAMESPACE directive and needs no package library lookup.
+    ///
+    /// This test exercises the FULL derivation path (NAMESPACE text →
+    /// `derive_package_state` → `scope_contribution.imported_symbols` →
+    /// scope injection → diagnostic suppression), unlike
+    /// `test_diagnostic_suppresses_importFrom_in_package_file` which uses
+    /// manual `set_from`.
+    #[tokio::test]
+    async fn test_importfrom_resolves_without_source_package_installed() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        // package_library_ready is FALSE — simulates R unavailable / source
+        // package not installed (CI environment with no R).
+        state.package_library_ready = false;
+
+        // Set up package inputs with NAMESPACE containing importFrom for a
+        // non-installed package.
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: mypkg\nImports: nonexistent_pkg_xyz\n".into(),
+        });
+        state.package_inputs.namespace = Some(NamespaceInput {
+            text:
+                "importFrom(nonexistent_pkg_xyz, imported_fn, another_imported)\nexport(my_func)\n"
+                    .into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "my_func <- function() {\n  imported_fn()\n  another_imported()\n  genuine_undefined()\n}\n"
+                .into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/main.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // Verify derivation produced the imported symbols.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .imported_symbols
+                .contains_key("imported_fn"),
+            "derivation must populate imported_symbols from NAMESPACE importFrom: {:?}",
+            state.package_state.scope_contribution().imported_symbols,
+        );
+
+        let code = "my_func <- function() {\n  imported_fn()\n  another_imported()\n  genuine_undefined()\n}\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.contains(&"Undefined variable: genuine_undefined"),
+            "baseline undefined MUST still fire; got: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("imported_fn")),
+            "importFrom symbol must not be flagged even when source package is absent; got: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("another_imported")),
+            "all importFrom symbols must resolve; got: {messages:?}",
+        );
+    }
+
+    /// Workstream B negative test: `import(pkg)` (whole-package import) does
+    /// NOT make arbitrary symbols resolve when the package is not installed.
+    /// Only explicitly NAMED `importFrom(pkg, fn)` symbols are trusted
+    /// without install; whole-package imports legitimately need the package's
+    /// export list to know what's available.
+    #[tokio::test]
+    async fn test_whole_package_import_does_not_resolve_arbitrary_symbols_when_uninstalled() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = false;
+
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: mypkg\nImports: nonexistent_pkg_xyz\n".into(),
+        });
+        // Only whole-package import — no importFrom for specific symbols.
+        state.package_inputs.namespace = Some(NamespaceInput {
+            text: "import(nonexistent_pkg_xyz)\nexport(my_func)\n".into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "my_func <- function() {\n  some_function_from_pkg()\n}\n".into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/main.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // `imported_symbols` must be empty — only importFrom populates it.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .imported_symbols
+                .is_empty(),
+            "whole-package import must NOT populate imported_symbols: {:?}",
+            state.package_state.scope_contribution().imported_symbols,
+        );
+        // `full_imports` must contain the package name.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .full_imports
+                .contains("nonexistent_pkg_xyz"),
+            "import(pkg) must appear in full_imports: {:?}",
+            state.package_state.scope_contribution().full_imports,
+        );
+
+        let code = "my_func <- function() {\n  some_function_from_pkg()\n}\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        // When the package is NOT installed and library is NOT ready, the
+        // symbol cannot be resolved via the package library. The undefined-
+        // variable diagnostic SHOULD fire (the pending-cache suppression
+        // only kicks in when `package_library_ready` is true and the
+        // package exists on disk).
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("some_function_from_pkg")),
+            "whole-package import with uninstalled package must NOT resolve arbitrary symbols; got: {messages:?}",
+        );
+    }
+
+    /// Workstream B negative test: a symbol NOT listed in any `importFrom`
+    /// directive must still be flagged as undefined even when other symbols
+    /// from the same package ARE imported. Ensures no leak of unnamed imports.
+    #[tokio::test]
+    async fn test_importfrom_does_not_leak_unnamed_symbols() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = false;
+
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: mypkg\nImports: somepkg\n".into(),
+        });
+        // Import only `allowed_fn` from somepkg — `not_imported_fn` is NOT listed.
+        state.package_inputs.namespace = Some(NamespaceInput {
+            text: "importFrom(somepkg, allowed_fn)\nexport(my_func)\n".into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "my_func <- function() {\n  allowed_fn()\n  not_imported_fn()\n}\n".into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/main.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        let code = "my_func <- function() {\n  allowed_fn()\n  not_imported_fn()\n}\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("allowed_fn")),
+            "explicitly imported symbol must resolve; got: {messages:?}",
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("not_imported_fn")),
+            "symbol NOT in importFrom must still be flagged as undefined; got: {messages:?}",
+        );
+    }
+
     /// Issue #398 end-to-end: data.table visibility derived from package
     /// metadata — modeled via `full_imports` (NAMESPACE `import(data.table)` /
     /// DESCRIPTION `Imports: data.table`), NOT a directly-injected package
