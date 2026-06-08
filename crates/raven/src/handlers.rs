@@ -21287,6 +21287,103 @@ clean_data <- function(x) {
         );
     }
 
+    /// Assignments inside a top-level if/else/for/while/repeat block are
+    /// top-level bindings visible from that statement onward. This is the
+    /// pattern used by rlang vendored standalone files:
+    /// `if (!exists("is_true")) is_true <- function(x) x`
+    /// followed by `is_true(something)`.
+    #[test]
+    fn test_diagnostic_suppresses_conditional_def_after_if_block() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "if (!exists(\"is_true\")) {\n  is_true <- function(x) x\n}\nis_true(y)\nna_chr <- NA_character_\nif (TRUE) {\n  deferred_run <- function(fn) fn()\n}\ndeferred_run(identity)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined must fire; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("is_true")),
+            "conditional def inside if block must not be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("deferred_run")),
+            "conditional def inside if block must not be flagged; messages: {messages:?}"
+        );
+    }
+
+    /// Assignments inside a function body must stay local — they must NOT
+    /// be promoted to top-level even when nested inside control flow.
+    #[test]
+    fn test_diagnostic_function_body_conditional_def_stays_local() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "f <- function() {\n  if (TRUE) {\n    local_var <- 42\n  }\n  local_var\n}\nlocal_var\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined must fire; messages: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("local_var")),
+            "function-body def must be flagged at top-level usage; messages: {messages:?}"
+        );
+    }
+
+    /// A binding defined inside a top-level control-flow block must NOT be
+    /// visible before its statement (used-before-defined).
+    #[test]
+    fn test_diagnostic_flags_use_before_conditional_def() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "is_true(y)\nif (!exists(\"is_true\")) {\n  is_true <- function(x) x\n}\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("is_true")),
+            "use-before-defined must still be flagged for conditional defs; messages: {messages:?}"
+        );
+    }
+
     /// `mostattributes(x) <- value` dispatches to the replacement binding
     /// `mostattributes<-`; the syntactic call head `mostattributes` is not a
     /// separate variable lookup.

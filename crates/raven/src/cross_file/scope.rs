@@ -19321,6 +19321,127 @@ y <- filter(df)"#;
             "data() binding must be visible after the call"
         );
     }
+
+    #[test]
+    fn conditional_def_visible_after_if_block() {
+        let code = "if (!exists(\"is_true\")) {\n  is_true <- function(x) x\n}\nis_true(y)\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert!(
+            artifacts.exported_interface.contains_key("is_true"),
+            "conditional def should be in exported_interface"
+        );
+
+        let scope = scope_at_position(&artifacts, 3, 0, false);
+        assert!(
+            scope.symbols.contains_key("is_true"),
+            "conditional def should be visible after the if block. Symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn conditional_def_not_visible_before_if_block() {
+        let code = "is_true(y)\nif (!exists(\"is_true\")) {\n  is_true <- function(x) x\n}\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 0, 0, false);
+        assert!(
+            !scope.symbols.contains_key("is_true"),
+            "conditional def must NOT be visible before the if block"
+        );
+    }
+
+    #[test]
+    fn conditional_def_no_braces_visible_after() {
+        // Single-expression if (no braces) — common in compat-purrr.R
+        let code = "if (!exists(\"is_true\")) is_true <- function(x) x\nis_true(y)\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        assert!(
+            artifacts.exported_interface.contains_key("is_true"),
+            "no-brace conditional def should be in exported_interface"
+        );
+
+        let scope = scope_at_position(&artifacts, 1, 0, false);
+        assert!(
+            scope.symbols.contains_key("is_true"),
+            "no-brace conditional def should be visible after the if statement. Symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn for_loop_body_def_visible_after() {
+        let code = "for (i in 1:3) {\n  my_var <- i\n}\nmy_var\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 3, 0, false);
+        assert!(
+            scope.symbols.contains_key("my_var"),
+            "def inside top-level for body should be visible after. Symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn while_loop_body_def_visible_after() {
+        let code = "while (cond) {\n  my_var <- 42\n}\nmy_var\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 3, 0, false);
+        assert!(
+            scope.symbols.contains_key("my_var"),
+            "def inside top-level while body should be visible after. Symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repeat_body_def_visible_after() {
+        let code = "repeat {\n  my_var <- 42\n  break\n}\nmy_var\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 4, 0, false);
+        assert!(
+            scope.symbols.contains_key("my_var"),
+            "def inside top-level repeat body should be visible after. Symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn if_else_both_branches_def_visible_after() {
+        let code = "if (cond) {\n  x <- 1\n} else {\n  x <- 2\n}\nx\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 5, 0, false);
+        assert!(
+            scope.symbols.contains_key("x"),
+            "def inside top-level if/else should be visible after. Symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn function_body_def_stays_local() {
+        let code = "f <- function() {\n  if (TRUE) {\n    local_var <- 42\n  }\n  local_var\n}\nlocal_var\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 6, 0, false);
+        assert!(
+            !scope.symbols.contains_key("local_var"),
+            "function-body def must stay local, not promoted to top level"
+        );
+    }
 }
 
 // ============================================================================
