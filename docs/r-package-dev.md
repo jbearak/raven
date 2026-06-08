@@ -111,12 +111,13 @@ test_that("works on demo_input", {
 Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
 for visibility purposes; declare any cross-file fixtures in `helper*.R`.
 
-### Dev-context directories (`inst/`, `demo/`, `data-raw/`, `vignettes/`, `revdep/`)
+### Dev-context directories (`inst/`, `demo/`, `data-raw/`, `vignettes/`, `revdep/`, `man/`)
 
 Files under these directories get the same one-way read access to package
 symbols as test files: they see all `R/*.R` top-level symbols and NAMESPACE
 imports, so calling your own package functions from a vignette, demo script,
-or data-preparation script produces no "undefined variable" diagnostic.
+data-preparation script, or man-page Rmd helper produces no "undefined
+variable" diagnostic.
 
 Their own definitions never leak back into `R/`, and they don't see each
 other — a function defined in `inst/examples/helpers.R` is not visible from

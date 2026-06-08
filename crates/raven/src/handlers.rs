@@ -27109,6 +27109,76 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
+    fn rmd_man_file_sees_package_exports() {
+        // A .Rmd under man/rmd/ is a dev-context file: it must see the
+        // package's own r_internal_symbols and imported_symbols, so
+        // references to package exports are NOT flagged as undefined.
+        let code = "# Topic\n\n```{r}\nabort(\"oops\")\n```\n";
+        let diags = rmd_diagnostics(code, "file:///work/pkg/man/rmd/topic.Rmd", |state| {
+            use std::collections::{BTreeMap, BTreeSet};
+            let workspace_root = tower_lsp::lsp_types::Url::parse("file:///work/pkg").unwrap();
+            state.workspace_folders = vec![workspace_root];
+            let mut internal = BTreeSet::new();
+            internal.insert("abort".to_string());
+            state
+                .package_state
+                .set_from(crate::package_state::PackageState {
+                    scope_contribution: crate::package_state::PackageScopeContribution {
+                        workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        r_internal_symbols: std::sync::Arc::new(internal),
+                        imported_symbols: std::sync::Arc::new(BTreeMap::new()),
+                        full_imports: Default::default(),
+                        test_attached_packages: Default::default(),
+                        test_helper_symbols: Default::default(),
+                        dataset_symbols: Default::default(),
+                    },
+                    ..Default::default()
+                });
+        });
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: abort")),
+            "man/rmd/ file must see package exports, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_genuine_undefined_in_later_chunk_still_flagged() {
+        // Cross-chunk scope means earlier-chunk bindings flow to later
+        // chunks, but a genuinely undefined symbol still flags even when
+        // it appears after valid definitions.
+        let code = "```{r}\nx <- 1\n```\n\n```{r}\ny <- x + 1\n```\n\n```{r}\nprint(never_defined_anywhere)\n```\n";
+        let diags = rmd_diagnostics(code, "file:///cross_undef.Rmd", |_| {});
+        // x must NOT be flagged (cross-chunk resolution)
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: x")),
+            "x from chunk 1 must resolve in chunk 2, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        // never_defined_anywhere MUST be flagged
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: never_defined_anywhere"),
+            "genuinely undefined symbol must still flag in later chunk, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn rmd_nolint_inside_chunk_respected() {
         // A lint-triggering line inside a chunk carrying `# nolint` must be
         // suppressed; the same rule must still fire on a sibling line without

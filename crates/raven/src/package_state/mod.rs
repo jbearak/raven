@@ -203,9 +203,9 @@ pub fn is_testthat_or_testit_test(path: &Path, workspace_root: &Path) -> bool {
 
 /// Returns `true` when `path` is an R file under one of the package's
 /// "dev-context" directories: `inst/`, `demo/`, `data-raw/`, `vignettes/`,
-/// `revdep/`. These directories see the package's own R/ top-level symbols
-/// and NAMESPACE imports (one-way: their defs never leak into R/, and they
-/// don't see each other). Package mode only.
+/// `revdep/`, `man/`. These directories see the package's own R/ top-level
+/// symbols and NAMESPACE imports (one-way: their defs never leak into R/,
+/// and they don't see each other). Package mode only.
 pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
     let Some(rel) = path.strip_prefix(workspace_root).ok() else {
         return false;
@@ -220,7 +220,10 @@ pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
     let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
         return false;
     };
-    matches!(first, "inst" | "demo" | "data-raw" | "vignettes" | "revdep")
+    matches!(
+        first,
+        "inst" | "demo" | "data-raw" | "vignettes" | "revdep" | "man"
+    )
 }
 
 /// Returns `true` when `path` is an R file anywhere under the workspace root
@@ -562,6 +565,10 @@ mod path_tests {
         ));
         assert!(is_dev_context_path(
             Path::new("/work/pkg/revdep/check.R"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/man/rmd/topic.Rmd"),
             root
         ));
         // Nested paths

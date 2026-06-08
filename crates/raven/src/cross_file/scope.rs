@@ -19799,6 +19799,8 @@ mod package_contribution_tests {
             // Nested paths work too
             "file:///work/pkg/inst/extdata/helper.R",
             "file:///work/pkg/vignettes/articles/deep.R",
+            // man/rmd/ (rlang-style Rmd help files)
+            "file:///work/pkg/man/rmd/topic.Rmd",
         ];
 
         for uri_str in dev_dirs {
