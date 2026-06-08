@@ -144,6 +144,7 @@ use std::path::Path;
 /// - `<root>/R/**/*.R` (or `*.r`) → `Source`
 /// - `<root>/tests/testthat/**/*.R` (or `*.r`) → `Test`
 /// - `<root>/tests/testit/**/*.R` (or `*.r`) → `Test`
+/// - `<root>/tests/*.R` (direct children only, or `*.r`) → `Test`
 /// - everything else → `None`
 pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind> {
     let rel = path.strip_prefix(workspace_root).ok()?;
@@ -161,12 +162,37 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
             let second = comps.next()?.as_os_str().to_str()?;
             if second == "testthat" || second == "testit" {
                 Some(RFileKind::Test)
+            } else if comps.next().is_none() {
+                // Direct child of tests/ (no further path components) —
+                // plain R CMD check test script.
+                Some(RFileKind::Test)
             } else {
                 None
             }
         }
         _ => None,
     }
+}
+
+/// Returns `true` when `path` is under `<root>/tests/testthat/` or
+/// `<root>/tests/testit/` — i.e. a testthat/testit-managed test file,
+/// NOT a plain `tests/*.R` script. Used to gate testthat-specific
+/// injections (helper symbols, test_attached_packages).
+pub fn is_testthat_or_testit_test(path: &Path, workspace_root: &Path) -> bool {
+    let Some(rel) = path.strip_prefix(workspace_root).ok() else {
+        return false;
+    };
+    let mut comps = rel.components();
+    let Some(first) = comps.next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    if first != "tests" {
+        return false;
+    }
+    let Some(second) = comps.next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    second == "testthat" || second == "testit"
 }
 
 /// Returns `true` for testthat-recognized helper files: files under
@@ -319,6 +345,54 @@ mod path_tests {
         assert!(!is_test_helper_filename("βλέπω-utils.R"));
         // A non-ASCII-leading name that happens to share a tail must not match either.
         assert!(!is_test_helper_filename("éhelper.R"));
+    }
+
+    #[test]
+    fn r_source_path_recognizes_plain_tests() {
+        let root = Path::new("/work/pkg");
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/Simple.R"), root),
+            Some(RFileKind::Test),
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/indexing.R"), root),
+            Some(RFileKind::Test),
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/foo.r"), root),
+            Some(RFileKind::Test),
+        );
+    }
+
+    #[test]
+    fn r_source_path_rejects_tests_subdirs_other_than_testthat_testit() {
+        let root = Path::new("/work/pkg");
+        // files in unrecognized subdirs of tests/ should NOT be tracked
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/other/foo.R"), root),
+            None
+        );
+    }
+
+    #[test]
+    fn is_testthat_or_testit_test_distinguishes_correctly() {
+        let root = Path::new("/work/pkg");
+        assert!(is_testthat_or_testit_test(
+            Path::new("/work/pkg/tests/testthat/test-x.R"),
+            root
+        ));
+        assert!(is_testthat_or_testit_test(
+            Path::new("/work/pkg/tests/testit/test-x.R"),
+            root
+        ));
+        assert!(!is_testthat_or_testit_test(
+            Path::new("/work/pkg/tests/Simple.R"),
+            root
+        ));
+        assert!(!is_testthat_or_testit_test(
+            Path::new("/work/pkg/R/utils.R"),
+            root
+        ));
     }
 }
 

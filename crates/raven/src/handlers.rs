@@ -4472,6 +4472,11 @@ async fn collect_missing_file_diagnostics_standalone(
     let mut paths_to_check: Vec<(std::path::PathBuf, String, u32, u32, bool, bool)> = Vec::new();
 
     for source in &meta.sources {
+        // Sources with a pre-resolved URI (cross-package system.file) are
+        // intentionally outside the workspace — skip path diagnostics.
+        if source.resolved_uri.is_some() {
+            continue;
+        }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
             crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
@@ -4773,6 +4778,11 @@ fn collect_missing_file_diagnostics_from_snapshot(
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
 
     for source in &meta.sources {
+        // Sources with a pre-resolved URI (cross-package system.file) are
+        // intentionally outside the workspace — skip path diagnostics.
+        if source.resolved_uri.is_some() {
+            continue;
+        }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
             crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
@@ -12972,12 +12982,16 @@ fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> 
         return Vec::new();
     };
     match crate::package_state::is_r_source_path(&path, root) {
-        Some(crate::package_state::RFileKind::Test) => snapshot
-            .scope_contribution
-            .test_attached_packages
-            .iter()
-            .cloned()
-            .collect(),
+        Some(crate::package_state::RFileKind::Test)
+            if crate::package_state::is_testthat_or_testit_test(&path, root) =>
+        {
+            snapshot
+                .scope_contribution
+                .test_attached_packages
+                .iter()
+                .cloned()
+                .collect()
+        }
         _ => Vec::new(),
     }
 }

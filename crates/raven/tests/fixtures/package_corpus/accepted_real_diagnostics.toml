@@ -2174,3 +2174,265 @@ start_line = 19
 start_character = 18
 end_line = 19
 end_character = 23
+
+# --- Tidyverse group accepted-real diagnostics (added 2026-06-08) ---
+
+[[diagnostic]]
+package = "dbplyr"
+path = "R/utils-format.R"
+message = "Assigning to string literal 'big_mark'; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `big_mark`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "dbplyr GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `big_mark` <- ... ``."
+[diagnostic.range]
+start_line = 38
+start_character = 0
+end_line = 38
+end_character = 10
+
+[[diagnostic]]
+package = "ggplot2"
+path = "R/geom-text.R"
+message = """Mixed `&` and `|` without parentheses; `&` binds tighter than `|`. Add parentheses to clarify intent: `(a & b) | c` or `a & (b | c)`."""
+evidence = "Mixed bitwise `&` and `|` without explicit parentheses; adding parentheses removes this diagnostic."
+source = "ggplot2 GitHub dev"
+minimal_edit = "Add parentheses to clarify operator precedence."
+[diagnostic.range]
+start_line = 229
+start_character = 37
+end_line = 229
+end_character = 38
+
+[[diagnostic]]
+package = "ggplot2"
+path = "R/plot-construction.R"
+message = "Assigning to string literal \"%+%\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `%+%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "ggplot2 GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%+%` <- ... ``."
+[diagnostic.range]
+start_line = 81
+start_character = 0
+end_line = 81
+end_character = 5
+
+[[diagnostic]]
+package = "ggplot2"
+path = "R/theme-current.R"
+message = """Assigning to string literal "%+replace%"; R will bind the value to the variable named by the string. Was this intentional?"""
+evidence = "String-literal assignment for `%+replace%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "ggplot2 GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%+replace%` <- ... ``."
+[diagnostic.range]
+start_line = 129
+start_character = 0
+end_line = 129
+end_character = 12
+
+[[diagnostic]]
+package = "ggplot2"
+path = "R/utilities.R"
+message = "Assigning to string literal \"%||%\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `%||%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "ggplot2 GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%||%` <- ... ``."
+[diagnostic.range]
+start_line = 9
+start_character = 0
+end_line = 9
+end_character = 6
+
+[[diagnostic]]
+package = "ggplot2"
+path = "R/utilities.R"
+message = "Assigning to string literal \"%|W|%\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `%|W|%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "ggplot2 GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%|W|%` <- ... ``."
+[diagnostic.range]
+start_line = 13
+start_character = 0
+end_line = 13
+end_character = 7
+
+[[diagnostic]]
+package = "httr"
+path = "R/insensitive.r"
+message = """Assigning to string literal "$.insensitive"; R will bind the value to the variable named by the string. Was this intentional?"""
+evidence = "String-literal assignment for `$.insensitive`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "httr GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `$.insensitive` <- ... ``."
+[diagnostic.range]
+start_line = 30
+start_character = 0
+end_line = 30
+end_character = 15
+
+[[diagnostic]]
+package = "httr"
+path = "R/url.r"
+message = "Assigning to string literal \"[.url\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `[.url`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "httr GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `[.url` <- ... ``."
+[diagnostic.range]
+start_line = 101
+start_character = 0
+end_line = 101
+end_character = 7
+
+[[diagnostic]]
+package = "httr"
+path = "R/utils.r"
+message = "Assigning to string literal \"%||%\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `%||%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "httr GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%||%` <- ... ``."
+[diagnostic.range]
+start_line = 0
+start_character = 0
+end_line = 0
+end_character = 6
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/accessors-date.R"
+message = "Assigning to string literal \"date<-\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `date<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `date<-` <- ... ``."
+[diagnostic.range]
+start_line = 51
+start_character = 0
+end_line = 51
+end_character = 8
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/accessors-day.r"
+message = "Assigning to string literal \"wday<-\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `wday<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `wday<-` <- ... ``."
+[diagnostic.range]
+start_line = 198
+start_character = 0
+end_line = 198
+end_character = 8
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/accessors-day.r"
+message = "Assigning to string literal \"yday<-\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `yday<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `yday<-` <- ... ``."
+[diagnostic.range]
+start_line = 210
+start_character = 0
+end_line = 210
+end_character = 8
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/accessors-tz.r"
+message = "Assigning to string literal \"tz<-\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `tz<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `tz<-` <- ... ``."
+[diagnostic.range]
+start_line = 113
+start_character = 0
+end_line = 113
+end_character = 6
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/accessors-week.r"
+message = "Assigning to string literal \"week<-\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `week<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `week<-` <- ... ``."
+[diagnostic.range]
+start_line = 31
+start_character = 0
+end_line = 31
+end_character = 8
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/intervals.r"
+message = "Assigning to string literal \"%--%\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `%--%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%--%` <- ... ``."
+[diagnostic.range]
+start_line = 273
+start_character = 0
+end_line = 273
+end_character = 6
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/intervals.r"
+message = """Assigning to string literal "int_start<-"; R will bind the value to the variable named by the string. Was this intentional?"""
+evidence = "String-literal assignment for `int_start<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `int_start<-` <- ... ``."
+[diagnostic.range]
+start_line = 300
+start_character = 0
+end_line = 300
+end_character = 13
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/intervals.r"
+message = """Assigning to string literal "int_end<-"; R will bind the value to the variable named by the string. Was this intentional?"""
+evidence = "String-literal assignment for `int_end<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `int_end<-` <- ... ``."
+[diagnostic.range]
+start_line = 320
+start_character = 0
+end_line = 320
+end_character = 11
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/ops-m+.r"
+message = "Assigning to string literal \"%m+%\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `%m+%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%m+%` <- ... ``."
+[diagnostic.range]
+start_line = 53
+start_character = 0
+end_line = 53
+end_character = 6
+
+[[diagnostic]]
+package = "lubridate"
+path = "R/ops-m+.r"
+message = "Assigning to string literal \"%m-%\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "String-literal assignment for `%m-%`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "lubridate GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `%m-%` <- ... ``."
+[diagnostic.range]
+start_line = 79
+start_character = 0
+end_line = 79
+end_character = 6
+
+[[diagnostic]]
+package = "stringr"
+path = "R/sub.R"
+message = """Assigning to string literal "str_sub<-"; R will bind the value to the variable named by the string. Was this intentional?"""
+evidence = "String-literal assignment for `str_sub<-`. Rewriting as backtick-quoted name removes this diagnostic."
+source = "stringr GitHub dev"
+minimal_edit = "Replace string-literal LHS with backtick-quoted name: `` `str_sub<-` <- ... ``."
+[diagnostic.range]
+start_line = 78
+start_character = 0
+end_line = 78
+end_character = 11

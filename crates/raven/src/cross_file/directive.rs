@@ -277,6 +277,8 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 // `is_function_scoped: false`) is what tags the resulting
                 // ForwardSource as a load-time ordering constraint.
                 is_function_scoped: false,
+                system_file: None,
+                resolved_uri: None,
             });
             continue;
         }

@@ -114,6 +114,19 @@ pub struct ForwardSource {
     /// which are header-only and run at load time.
     #[serde(default)]
     pub is_function_scoped: bool,
+    /// If the `source()` file argument is a `system.file(...)` call with
+    /// statically determinable string-literal parts and package, store the
+    /// extracted call here. Resolution is deferred to the path-resolve layer
+    /// because it needs workspace and library-path information unavailable at
+    /// parse time. When `Some`, `path` is empty.
+    #[serde(default)]
+    pub system_file: Option<super::source_detect::SystemFileCall>,
+    /// Pre-resolved absolute file URI for cross-package `system.file()` targets.
+    /// When set, dependency and scope resolution use this directly instead of
+    /// calling `resolve_path` (which can't handle true absolute paths outside
+    /// the workspace). Set by `resolve_system_file_sources` for branch-2 hits.
+    #[serde(default)]
+    pub resolved_uri: Option<tower_lsp::lsp_types::Url>,
 }
 
 fn default_sys_source_global_env() -> bool {

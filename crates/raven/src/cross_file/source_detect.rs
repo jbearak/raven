@@ -12,6 +12,17 @@ use tree_sitter::{Node, Tree};
 use super::scope::FunctionScopeInterval;
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
+/// A statically-extracted `system.file(...)` call used as the path argument
+/// to `source()`. Contains the string-literal positional parts and the
+/// `package = "P"` value needed to resolve the path at analysis time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SystemFileCall {
+    /// Positional string-literal parts (joined with `/` to form the relative path).
+    pub parts: Vec<String>,
+    /// The `package` argument value (must be a string literal).
+    pub package: String,
+}
+
 /// Detected rm()/remove() call with extracted symbol names
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RmCall {
@@ -126,7 +137,22 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
     };
 
     let args_node = node.child_by_field_name("arguments")?;
-    let path = find_file_argument(&args_node, content)?;
+
+    // Try normal string-literal path first
+    let path = find_file_argument(&args_node, content);
+
+    // If no string literal, try system.file() call in the path position
+    let system_file = if path.is_none() {
+        try_extract_system_file_argument(&args_node, content)
+    } else {
+        None
+    };
+
+    // Need either a path or a system.file() call
+    if path.is_none() && system_file.is_none() {
+        return None;
+    }
+
     let local = find_bool_argument(&args_node, content, "local").unwrap_or(false);
     let chdir = find_bool_argument(&args_node, content, "chdir").unwrap_or(false);
 
@@ -142,7 +168,7 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
     let column = byte_offset_to_utf16_column(line_text, start.column);
 
     Some(ForwardSource {
-        path,
+        path: path.unwrap_or_default(),
         line: start.row as u32,
         column,
         is_directive: false,
@@ -154,6 +180,8 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
         directive_line: 0,     // Not applicable for AST-detected sources
         user_line_zero: false, // Not applicable for AST-detected sources
         is_function_scoped: has_function_definition_ancestor(node),
+        system_file,
+        resolved_uri: None,
     })
 }
 
@@ -224,6 +252,96 @@ fn find_file_argument(args_node: &Node, content: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Try to extract a `system.file(...)` call from the file-argument position of
+/// a `source()` call. Returns `Some(SystemFileCall)` when the argument is a call
+/// to `system.file` with all-string-literal positional parts and a literal
+/// `package = "P"` named argument. Returns `None` for computed/variable args.
+fn try_extract_system_file_argument(args_node: &Node, content: &str) -> Option<SystemFileCall> {
+    let mut cursor = args_node.walk();
+    let children: Vec<_> = args_node.children(&mut cursor).collect();
+
+    // Look for named "file" argument first
+    for child in &children {
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "file"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                return try_parse_system_file_call(value_node, content);
+            }
+        }
+    }
+
+    // Use first positional argument
+    for child in &children {
+        if child.kind() == "argument"
+            && child.child_by_field_name("name").is_none()
+            && let Some(value_node) = child.child_by_field_name("value")
+        {
+            return try_parse_system_file_call(value_node, content);
+        }
+    }
+
+    None
+}
+
+/// Parse a `system.file(part1, part2, ..., package = "P")` call node.
+/// Returns `Some(SystemFileCall)` when:
+/// - The callee is `system.file`
+/// - All positional arguments are string literals
+/// - There is at least one positional string-literal part
+/// - There is a named `package = "P"` argument with a string-literal value
+fn try_parse_system_file_call(node: Node, content: &str) -> Option<SystemFileCall> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let func_node = node.child_by_field_name("function")?;
+    let func_text = node_text(func_node, content);
+    if func_text != "system.file" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    if args_node.has_error() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut package: Option<String> = None;
+
+    let mut arg_cursor = args_node.walk();
+    for child in args_node.children(&mut arg_cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            let name = node_text(name_node, content);
+            if name == "package" {
+                let value_node = child.child_by_field_name("value")?;
+                package = extract_string_literal(value_node, content);
+                // Non-literal package arg → bail
+                package.as_ref()?;
+            }
+            // Ignore other named args (mustWork, lib.loc, fsep)
+        } else {
+            // Positional argument — must be a string literal
+            let value_node = child.child_by_field_name("value")?;
+            let part = extract_string_literal(value_node, content)?;
+            parts.push(part);
+        }
+    }
+
+    // Must have at least one part and a package
+    let package = package?;
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(SystemFileCall { parts, package })
 }
 
 fn find_bool_argument(args_node: &Node, content: &str, param_name: &str) -> Option<bool> {
@@ -2602,6 +2720,58 @@ library(ggplot2)"#;
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
+    }
+
+    // ==================== system.file() detection in source() ====================
+
+    #[test]
+    fn test_source_system_file_single_part() {
+        let code = r#"source(system.file("helper.R", package = "Matrix"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].path.is_empty());
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["helper.R"]);
+        assert_eq!(sf.package, "Matrix");
+    }
+
+    #[test]
+    fn test_source_system_file_multi_part() {
+        let code = r#"source(system.file("a", "b.R", package = "P"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["a", "b.R"]);
+        assert_eq!(sf.package, "P");
+    }
+
+    #[test]
+    fn test_source_system_file_non_literal_arg_skipped() {
+        // A variable positional arg → bail (unresolved = no ForwardSource)
+        let code = r#"source(system.file(x, package = "P"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_no_package_skipped() {
+        // No package= arg → not parseable
+        let code = r#"source(system.file("helper.R"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_variable_package_skipped() {
+        // Non-literal package= → bail
+        let code = r#"source(system.file("helper.R", package = pkg))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
     }
 }
 

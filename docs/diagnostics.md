@@ -54,6 +54,7 @@ If the symbol is defined later in the same file at top level, the message also r
 Raven also recognizes a few call forms that bind a name at runtime, so the bound name resolves without a directive:
 - `assign("x", ...)` and write/append-mode `textConnection("x", "w")` bind `x`.
 - `load("foo.rda")` binds the conventional object name `foo`.
+- `data(foo, bar)` binds each named dataset (`foo`, `bar`) from the call onward, whether given as a bare name or a string; named arguments such as `package=` are ignored.
 - `setGeneric("g", ...)` / `setGroupGeneric("g", ...)` bind the generic `g`, so other files in the same package that call it resolve (common in S4-heavy packages like Matrix, whose generics live in a single `R/` file).
 - Inside an S4 method body (`setMethod("Ops"|"Math"|"Summary"|…, ...)`) or an S3 method bound to a `generic.class` name, the dispatcher-injected specials `.Generic`, `.Method`, and `.Class` are in scope.
 

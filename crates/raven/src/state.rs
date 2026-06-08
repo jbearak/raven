@@ -978,6 +978,13 @@ impl WorldState {
     fn build_dependency_graph_from_workspace(&mut self) {
         let workspace_root = self.workspace_folders.first().cloned();
 
+        // Resolve system.file() entries before building the graph so that
+        // dependency edges reflect the concrete paths.
+        let ws = self.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str()).map(|s| s.to_owned());
+        let ws_root = ws.map(|w| w.root.clone());
+        let lib_paths = self.package_library.lib_paths().to_vec();
+
         // Collect URIs and metadata to avoid borrow conflicts with self.
         // `entry.metadata` is `Arc<CrossFileMetadata>`, so the clone is a
         // refcount bump rather than a deep clone of Vec/HashSet/String fields.
@@ -994,7 +1001,17 @@ impl WorldState {
             ..
         } = self;
 
-        for (uri, meta) in &entries {
+        for (uri, meta) in &mut entries {
+            // Resolve system.file() sources if any are present
+            if meta.sources.iter().any(|s| s.system_file.is_some()) {
+                let m = Arc::make_mut(meta);
+                crate::cross_file::resolve_system_file_sources(
+                    m,
+                    ws_name.as_deref(),
+                    ws_root.as_deref(),
+                    &lib_paths,
+                );
+            }
             let get_content = |parent_uri: &Url| -> Option<String> {
                 workspace_index_new
                     .get(parent_uri)
@@ -1012,6 +1029,133 @@ impl WorldState {
             "Built dependency graph from {} workspace files",
             entries.len()
         );
+    }
+
+    /// Resolve `system.file()` sources in workspace index metadata and rebuild
+    /// affected dependency graph edges. Must be called after `apply_package_event`
+    /// so that `package_state.workspace()` is populated.
+    pub fn resolve_system_file_in_workspace(&mut self) {
+        let ws = self.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str()).map(|s| s.to_owned());
+        let ws_root = ws.map(|w| w.root.clone());
+        let lib_paths = self.package_library.lib_paths().to_vec();
+
+        // Collect URIs that have unresolved system.file entries
+        let affected: Vec<(Url, crate::workspace_index::IndexEntry)> = self
+            .workspace_index_new
+            .iter()
+            .into_iter()
+            .filter(|(_, entry)| {
+                entry
+                    .metadata
+                    .sources
+                    .iter()
+                    .any(|s| s.system_file.is_some())
+            })
+            .collect();
+
+        if affected.is_empty() {
+            return;
+        }
+
+        // Resolve in stored metadata and re-insert
+        let affected_uris: Vec<Url> = affected.iter().map(|(u, _)| u.clone()).collect();
+        for (uri, mut entry) in affected {
+            let meta = Arc::make_mut(&mut entry.metadata);
+            crate::cross_file::resolve_system_file_sources(
+                meta,
+                ws_name.as_deref(),
+                ws_root.as_deref(),
+                &lib_paths,
+            );
+            self.workspace_index_new.insert(uri, entry);
+        }
+
+        // Rebuild graph edges for affected files
+        let workspace_root = self.workspace_folders.first().cloned();
+        for uri in &affected_uris {
+            if let Some(entry) = self.workspace_index_new.get(uri) {
+                let meta = entry.metadata.clone();
+                let get_content = |parent_uri: &Url| -> Option<String> {
+                    self.workspace_index_new
+                        .get(parent_uri)
+                        .map(|e| e.contents.to_string())
+                };
+                self.cross_file_graph.update_file(
+                    uri,
+                    meta.as_ref(),
+                    workspace_root.as_ref(),
+                    get_content,
+                );
+            }
+        }
+
+        // Index outside-workspace files resolved via cross-package system.file
+        // so their artifacts are available to scope resolution.
+        self.index_cross_package_resolved_files();
+    }
+
+    /// Read, parse, and index outside-workspace files that were resolved via
+    /// cross-package `system.file()`. Called after `resolve_system_file_sources`
+    /// populates `resolved_uri` fields and graph edges are rebuilt.
+    fn index_cross_package_resolved_files(&mut self) {
+        // Collect resolved_uris from all workspace entries
+        let mut external_uris: Vec<Url> = Vec::new();
+        for (_, entry) in self.workspace_index_new.iter() {
+            for source in &entry.metadata.sources {
+                if let Some(ref uri) = source.resolved_uri
+                    && !self.workspace_index_new.contains(uri)
+                {
+                    external_uris.push(uri.clone());
+                }
+            }
+        }
+        external_uris.sort();
+        external_uris.dedup();
+
+        for uri in external_uris {
+            if self.workspace_index_new.contains(&uri) {
+                continue;
+            }
+            let Some(path) = uri.to_file_path().ok() else {
+                continue;
+            };
+            let Ok(content) = read_source(&path) else {
+                continue;
+            };
+            let Ok(fs_meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
+            let tree = parser.parse(&content, None);
+            let metadata = Arc::new(crate::cross_file::extract_metadata(&content));
+            let artifacts = tree.as_ref().map_or_else(
+                || Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+                |t| {
+                    Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                        &uri,
+                        t,
+                        &content,
+                        Some(&metadata),
+                    ))
+                },
+            );
+            let snapshot =
+                crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_meta, &content);
+
+            let entry = crate::workspace_index::IndexEntry {
+                contents: Rope::from_str(&content),
+                tree,
+                loaded_packages: Vec::new(),
+                snapshot,
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            self.workspace_index_new.insert(uri, entry);
+        }
     }
 }
 

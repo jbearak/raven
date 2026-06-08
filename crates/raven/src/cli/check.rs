@@ -202,6 +202,16 @@ fn open_disk_fallback_target(
         |parent_uri| state.get_enriched_metadata(parent_uri),
         max_chain_depth,
     );
+
+    // Resolve system.file() source entries into concrete paths
+    {
+        let ws = state.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str());
+        let ws_root = ws.map(|w| w.root.as_path());
+        let lib_paths = state.package_library.lib_paths();
+        crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
+    }
+
     // Pre-collect parent content for any backward directives (`@lsp-sourced-by`
     // with `match=`/inference call sites) before the mutable `update_file`
     // borrow, mirroring did_open. Forward `source()` edges — the only kind chunk
@@ -279,6 +289,11 @@ pub async fn run(args: CheckArgs) -> i32 {
     // its own one-line note to stderr. The returned verdict feeds the
     // missing-export-metadata warning below.
     let shipped_db_load = maybe_init_r(&mut state, &root).await;
+
+    // Resolve system.file() sources now that both package state AND library
+    // paths are available (maybe_init_r populates lib_paths from R discovery
+    // and additionalLibraryPaths).
+    state.resolve_system_file_in_workspace();
 
     // Resolve which files to report diagnostics for. A named path that does not
     // exist is an operator error (exit 2), matching `raven lint`.

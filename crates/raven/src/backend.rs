@@ -1733,6 +1733,10 @@ pub(crate) fn initialize_package_inputs_from_state(
     let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
     state.package_inputs.r_files = new_r_files;
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+
+    // Resolve system.file() sources in workspace index now that package state
+    // (workspace name, lib paths) is available.
+    state.resolve_system_file_in_workspace();
 }
 
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
@@ -2921,6 +2925,17 @@ impl LanguageServer for Backend {
                 max_chain_depth,
             );
 
+            // Resolve system.file() source entries into concrete paths
+            {
+                let ws = state.package_state.workspace();
+                let ws_name = ws.map(|w| w.name.as_str());
+                let ws_root = ws.map(|w| w.root.as_path());
+                let lib_paths = state.package_library.lib_paths();
+                crate::cross_file::resolve_system_file_sources(
+                    &mut meta, ws_name, ws_root, lib_paths,
+                );
+            }
+
             // Update new DocumentStore with enriched metadata (Requirement 1.3).
             // `chunk_kind` was classified above by languageId-then-URI so
             // untitled `.Rmd`/`.qmd` buffers mask their tree/artifacts (#343).
@@ -2984,14 +2999,17 @@ impl LanguageServer for Backend {
                 );
 
                 for source in &meta.sources {
-                    if let Some(ctx) = path_ctx.as_ref()
-                        && let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                                &source.path,
-                                ctx,
-                            )
-                        && let Ok(source_uri) = Url::from_file_path(resolved)
-                    {
+                    let source_uri_opt = source.resolved_uri.clone().or_else(|| {
+                        path_ctx.as_ref().and_then(|ctx| {
+                            let resolved =
+                                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                                    &source.path,
+                                    ctx,
+                                );
+                            resolved.and_then(|p| Url::from_file_path(p).ok())
+                        })
+                    });
+                    if let Some(source_uri) = source_uri_opt {
                         // Check if file needs indexing (not open, not in workspace index)
                         if !state.documents.contains_key(&source_uri)
                             && !state.cross_file_workspace_index.contains(&source_uri)
@@ -3327,6 +3345,17 @@ impl LanguageServer for Backend {
                     meta.inherited_working_directory
                 );
 
+                // Resolve system.file() source entries into concrete paths
+                {
+                    let ws = state.package_state.workspace();
+                    let ws_name = ws.map(|w| w.name.as_str());
+                    let ws_root = ws.map(|w| w.root.as_path());
+                    let lib_paths = state.package_library.lib_paths();
+                    crate::cross_file::resolve_system_file_sources(
+                        &mut meta, ws_name, ws_root, lib_paths,
+                    );
+                }
+
                 state
                     .document_store
                     .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
@@ -3425,34 +3454,32 @@ impl LanguageServer for Backend {
                 }
 
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
-                if let Some(forward_ctx) =
-                    crate::cross_file::path_resolve::PathContext::from_metadata(
-                        &uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                    )
-                {
-                    for source in &meta.sources {
-                        if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                                &source.path,
-                                &forward_ctx,
-                            )
-                            && let Ok(child_uri) = Url::from_file_path(resolved)
-                        {
-                            let needs_indexing = {
-                                !state.documents.contains_key(&child_uri)
-                                    && !state.cross_file_workspace_index.contains(&child_uri)
-                            };
-                            if needs_indexing {
-                                log::trace!(
-                                    "did_open re-enrich: indexing direct source {}",
-                                    child_uri
+                let forward_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                    &uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                );
+                for source in &meta.sources {
+                    let child_uri_opt = source.resolved_uri.clone().or_else(|| {
+                        forward_ctx.as_ref().and_then(|ctx| {
+                            let resolved =
+                                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                                    &source.path,
+                                    ctx,
                                 );
-                                drop(state);
-                                let _ = self.index_file_on_demand(&child_uri).await;
-                                state = self.state.write().await;
-                            }
+                            resolved.and_then(|p| Url::from_file_path(p).ok())
+                        })
+                    });
+                    if let Some(child_uri) = child_uri_opt {
+                        let needs_indexing = {
+                            !state.documents.contains_key(&child_uri)
+                                && !state.cross_file_workspace_index.contains(&child_uri)
+                        };
+                        if needs_indexing {
+                            log::trace!("did_open re-enrich: indexing direct source {}", child_uri);
+                            drop(state);
+                            let _ = self.index_file_on_demand(&child_uri).await;
+                            state = self.state.write().await;
                         }
                     }
                 }
@@ -3478,6 +3505,17 @@ impl LanguageServer for Backend {
                 |parent_uri| state.get_enriched_metadata(parent_uri),
                 max_chain_depth,
             );
+
+            // Resolve system.file() source entries into concrete paths
+            {
+                let ws = state.package_state.workspace();
+                let ws_name = ws.map(|w| w.name.as_str());
+                let ws_root = ws.map(|w| w.root.as_path());
+                let lib_paths = state.package_library.lib_paths();
+                crate::cross_file::resolve_system_file_sources(
+                    &mut meta, ws_name, ws_root, lib_paths,
+                );
+            }
 
             state
                 .document_store
@@ -3762,6 +3800,17 @@ impl LanguageServer for Backend {
                     |parent_uri| state.get_enriched_metadata(parent_uri),
                     max_chain_depth,
                 );
+
+                // Resolve system.file() source entries into concrete paths
+                {
+                    let ws = state.package_state.workspace();
+                    let ws_name = ws.map(|w| w.name.as_str());
+                    let ws_root = ws.map(|w| w.root.as_path());
+                    let lib_paths = state.package_library.lib_paths();
+                    crate::cross_file::resolve_system_file_sources(
+                        &mut meta, ws_name, ws_root, lib_paths,
+                    );
+                }
 
                 // Collect package names for prefetch (validate names to
                 // reject suspicious inputs before R subprocess calls)
@@ -4887,7 +4936,23 @@ impl LanguageServer for Backend {
                     };
 
                     // Compute metadata and artifacts
-                    let cross_file_meta = crate::cross_file::extract_metadata(&content);
+                    let mut cross_file_meta = crate::cross_file::extract_metadata(&content);
+
+                    // Resolve system.file() source entries into concrete paths
+                    {
+                        let state = state_arc.read().await;
+                        let ws = state.package_state.workspace();
+                        let ws_name = ws.map(|w| w.name.as_str());
+                        let ws_root = ws.map(|w| w.root.as_path());
+                        let lib_paths = state.package_library.lib_paths();
+                        crate::cross_file::resolve_system_file_sources(
+                            &mut cross_file_meta,
+                            ws_name,
+                            ws_root,
+                            lib_paths,
+                        );
+                    }
+
                     let artifacts = std::sync::Arc::new({
                         let mut parser = tree_sitter::Parser::new();
                         if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {

@@ -2013,6 +2013,30 @@ fn collect_definitions(
             .insert(symbol.name.clone(), symbol);
     }
 
+    // Check for data() calls. `data(foo, "bar")` loads named datasets into the
+    // calling environment. Model each positional identifier/string arg as a
+    // binding visible from the call's end position.
+    if node.kind() == "call" {
+        let data_symbols = try_extract_data_call_definitions(node, line_index, uri);
+        if !data_symbols.is_empty() {
+            let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+            for symbol in data_symbols {
+                let event = ScopeEvent::Def {
+                    line: symbol.defined_line,
+                    column: symbol.defined_column,
+                    visible_from_line: visible_line,
+                    visible_from_column: visible_column,
+                    symbol: symbol.clone(),
+                    function_scope: None,
+                };
+                artifacts.timeline.push(event);
+                artifacts
+                    .exported_interface
+                    .insert(symbol.name.clone(), symbol);
+            }
+        }
+    }
+
     // Check for for loop iterators.
     //
     // For-loop iterators are bound *before* the body executes, and the
@@ -2793,6 +2817,78 @@ fn try_extract_literal_load_call_definition(
     };
 
     Some((symbol, visible_line, visible_column))
+}
+
+/// Extract dataset names bound by a `data(...)` or `utils::data(...)` call.
+///
+/// `data(foo, "bar")` binds `foo` and `bar` in the calling environment from
+/// the call onward — the same semantics as `load()`. Only positional arguments
+/// that are bare identifiers or string literals are recognized; named arguments
+/// (`package=`, `envir=`, `list=`, etc.) are skipped.
+fn try_extract_data_call_definitions(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Vec<ScopedSymbol> {
+    let func_node = match node.child_by_field_name("function") {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+
+    let is_data = match func_node.kind() {
+        "identifier" => node_text(func_node, line_index.text) == "data",
+        "namespace_operator" => func_node
+            .child_by_field_name("rhs")
+            .is_some_and(|rhs| node_text(rhs, line_index.text) == "data"),
+        _ => false,
+    };
+    if !is_data {
+        return Vec::new();
+    }
+
+    let args_node = match node.child_by_field_name("arguments") {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    let (line, column) = node_start_position_utf16(node, line_index);
+    let mut symbols = Vec::new();
+
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        // Skip named arguments
+        if child.child_by_field_name("name").is_some() {
+            continue;
+        }
+        let value_node = match child.child_by_field_name("value") {
+            Some(v) => v,
+            None => continue,
+        };
+        let name: &str = match value_node.kind() {
+            "identifier" => node_text(value_node, line_index.text),
+            "string" => match string_literal_content(value_node, line_index.text) {
+                Some(s) => s,
+                None => continue,
+            },
+            _ => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push(ScopedSymbol {
+            name: Arc::from(name),
+            kind: SymbolKind::Variable,
+            source_uri: uri.clone(),
+            defined_line: line,
+            defined_column: column,
+            signature: None,
+            is_declared: false,
+        });
+    }
+
+    symbols
 }
 
 fn string_literal_content<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str> {
@@ -4183,11 +4279,13 @@ where
                         })
                         .map(|edge| edge.to.clone())
                         .or_else(|| {
-                            // Fallback: resolve path directly (for cases without graph edges)
-                            path_ctx.as_ref().and_then(|ctx| {
-                                let resolved =
-                                    super::path_resolve::resolve_path(&source.path, ctx)?;
-                                super::path_resolve::path_to_uri(&resolved)
+                            // Fallback: use pre-resolved URI or resolve path directly
+                            source.resolved_uri.clone().or_else(|| {
+                                path_ctx.as_ref().and_then(|ctx| {
+                                    let resolved =
+                                        super::path_resolve::resolve_path(&source.path, ctx)?;
+                                    super::path_resolve::path_to_uri(&resolved)
+                                })
                             })
                         });
 
@@ -4522,8 +4620,8 @@ where
 /// Compute the set of symbol names the package contribution would inject
 /// for `queried_uri`, mirroring [`append_package_contribution`]'s path /
 /// `RFileKind` gating. Returns an empty set when there's no contribution
-/// or when the queried URI isn't under `<root>/R/` or
-/// `<root>/tests/testthat/`.
+/// or when the queried URI isn't under `<root>/R/`, `<root>/tests/testthat/`,
+/// `<root>/tests/testit/`, or directly under `<root>/tests/`.
 ///
 /// Used by [`ScopeStream`] so `is_visible` / `symbol_for` agree with
 /// `snapshot()` on which contribution-derived names are in scope — out-of-
@@ -4556,7 +4654,9 @@ fn compute_contribution_symbol_names(
     for sym in contrib.imported_symbols.keys() {
         out.insert(Arc::from(sym.as_str()));
     }
-    if kind == crate::package_state::RFileKind::Test {
+    if kind == crate::package_state::RFileKind::Test
+        && crate::package_state::is_testthat_or_testit_test(&path, root)
+    {
         // Mirror `append_package_contribution`'s sourcing-order gate so
         // `is_visible` / `symbol_for` agree with `snapshot()`: a helper
         // file only sees alphabetically-earlier helpers, while
@@ -4679,13 +4779,14 @@ pub(crate) fn append_package_contribution(
     }
 
     // Test-only contributions: only inject when the queried file is under
-    // `tests/testthat/`. Helper symbols are visible to peer test files;
-    // attached packages model `testthat::test_check`'s implicit
-    // `library(testthat)` before sourcing tests. Neither propagates into R/
-    // — that asymmetry is preserved by gating on `RFileKind::Test` here,
-    // mirroring how `r_internal_symbols` is partitioned in
-    // `build_scope_contribution`.
-    if kind == crate::package_state::RFileKind::Test {
+    // `tests/testthat/` or `tests/testit/` (NOT plain `tests/*.R`). Helper
+    // symbols are visible to peer test files; attached packages model
+    // `testthat::test_check`'s implicit `library(testthat)` before sourcing
+    // tests. Neither propagates into R/ or plain test scripts — that
+    // asymmetry is preserved by gating on `is_testthat_or_testit_test` here.
+    if kind == crate::package_state::RFileKind::Test
+        && crate::package_state::is_testthat_or_testit_test(&path, root)
+    {
         // Per-helper-file iteration so a helper's own top-level defs are
         // NOT injected back into the helper itself — preserves
         // forward-reference diagnostics inside a helper file. Without
@@ -5709,9 +5810,11 @@ where
             })
             .map(|edge| edge.to.clone())
             .or_else(|| {
-                self.path_ctx.as_ref().and_then(|ctx| {
-                    let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
-                    super::path_resolve::path_to_uri(&resolved)
+                source.resolved_uri.clone().or_else(|| {
+                    self.path_ctx.as_ref().and_then(|ctx| {
+                        let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
+                        super::path_resolve::path_to_uri(&resolved)
+                    })
                 })
             });
         let Some(child_uri) = child_uri else {
@@ -19136,6 +19239,88 @@ y <- filter(df)"#;
             "stream and recursive resolver must agree on symbol set inside sibling function",
         );
     }
+
+    #[test]
+    fn data_call_bare_identifier_binds() {
+        let code = "data(lung)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(
+            artifacts.exported_interface.contains_key("lung"),
+            "data(lung) should bind `lung`"
+        );
+    }
+
+    #[test]
+    fn data_call_string_literal_binds() {
+        let code = "data(\"lung\")";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(
+            artifacts.exported_interface.contains_key("lung"),
+            "data(\"lung\") should bind `lung`"
+        );
+    }
+
+    #[test]
+    fn data_call_skips_named_args() {
+        let code = "data(lung, package = \"survival\")";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(
+            artifacts.exported_interface.contains_key("lung"),
+            "data(lung, package=...) should bind `lung`"
+        );
+        assert!(
+            !artifacts.exported_interface.contains_key("package"),
+            "named arg `package` must not be bound"
+        );
+        assert!(
+            !artifacts.exported_interface.contains_key("survival"),
+            "named arg value must not be bound"
+        );
+    }
+
+    #[test]
+    fn data_call_multiple_positional_binds_all() {
+        let code = "data(a, b, c)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("a"));
+        assert!(artifacts.exported_interface.contains_key("b"));
+        assert!(artifacts.exported_interface.contains_key("c"));
+    }
+
+    #[test]
+    fn data_call_no_args_binds_nothing() {
+        let code = "data()";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(
+            artifacts.exported_interface.is_empty(),
+            "data() with no args should bind nothing"
+        );
+    }
+
+    #[test]
+    fn data_call_visibility_from_call_end() {
+        // Use before data() should not resolve; use after should.
+        let code = "print(lung)\ndata(lung)\nprint(lung)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let before = scope_at_position(&artifacts, 0, 6, false);
+        assert!(
+            !before.symbols.contains_key("lung"),
+            "data() binding must not be visible before the call"
+        );
+
+        let after = scope_at_position(&artifacts, 2, 6, false);
+        assert!(
+            after.symbols.contains_key("lung"),
+            "data() binding must be visible after the call"
+        );
+    }
 }
 
 // ============================================================================
@@ -19586,6 +19771,240 @@ mod package_contribution_tests {
             sym.kind,
             SymbolKind::Variable,
             "local definition kind must be Variable, not the synthetic Function"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: package-internal symbol visible in plain tests/*.R file
+    // ------------------------------------------------------------------
+
+    /// A plain `tests/Simple.R` file (directly under `<root>/tests/`, not
+    /// inside testthat/ or testit/) must receive `r_internal_symbols` +
+    /// `imported_symbols` injection — R CMD check attaches the package
+    /// before running these scripts.
+    #[test]
+    fn package_contribution_visible_in_plain_test_file() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let test_uri = Url::parse("file:///work/pkg/tests/Simple.R").unwrap();
+        let test_code = "result <- Cholesky(M)";
+        let test_arts = artifacts_for(&test_uri, test_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &test_uri {
+                Some(test_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        let contrib = make_contribution("/work/pkg", &["Cholesky", "tril"], &["filter"]);
+        let scope = scope_at_position_with_graph(
+            &test_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            scope.symbols.contains_key("Cholesky"),
+            "plain tests/*.R must see r_internal_symbols. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.symbols.contains_key("filter"),
+            "plain tests/*.R must see imported_symbols. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: plain tests/*.R defs do NOT leak into R/ or other test files
+    // ------------------------------------------------------------------
+
+    /// A definition in `tests/Simple.R` must NOT appear in the scope of
+    /// `R/main.R` or `tests/indexing.R` — plain test scripts run as
+    /// separate Rscript sessions and their defs never enter
+    /// `r_internal_symbols`.
+    #[test]
+    fn plain_test_defs_do_not_leak_into_r_dir() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let main_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- test_only_fn()";
+        let main_arts = artifacts_for(&main_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &main_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // The contribution should NOT carry test_only_fn because derive
+        // excludes RFileKind::Test from r_internal_symbols. Simulate this:
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        assert!(
+            !scope.symbols.contains_key("test_only_fn"),
+            "plain test defs must not leak into R/. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: plain tests/*.R do NOT receive testthat helper symbols
+    // ------------------------------------------------------------------
+
+    /// Plain `tests/*.R` scripts must NOT receive `test_helper_symbols` or
+    /// `test_attached_packages` — those are testthat-specific injections.
+    #[test]
+    fn plain_test_does_not_receive_testthat_helpers() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let test_uri = Url::parse("file:///work/pkg/tests/Simple.R").unwrap();
+        let test_code = "result <- use_helper()";
+        let test_arts = artifacts_for(&test_uri, test_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &test_uri {
+                Some(test_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Build a contribution with testthat helper symbols
+        let mut contrib = make_contribution("/work/pkg", &["Cholesky"], &[]);
+        let mut helpers = std::collections::BTreeMap::new();
+        let mut helper_syms = BTreeSet::new();
+        helper_syms.insert("use_helper".to_string());
+        helpers.insert(
+            std::path::PathBuf::from("/work/pkg/tests/testthat/helper-utils.R"),
+            Arc::new(helper_syms),
+        );
+        contrib.test_helper_symbols = Arc::new(helpers);
+        contrib.test_attached_packages =
+            Arc::new(std::iter::once("testthat".to_string()).collect());
+
+        let scope = scope_at_position_with_graph(
+            &test_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        // Package symbols are injected
+        assert!(
+            scope.symbols.contains_key("Cholesky"),
+            "plain test should see r_internal_symbols"
+        );
+        // Helper symbols are NOT injected
+        assert!(
+            !scope.symbols.contains_key("use_helper"),
+            "plain tests/*.R must NOT receive testthat helper symbols. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        // test_attached_packages NOT injected
+        assert!(
+            !scope.inherited_packages.contains("testthat"),
+            "plain tests/*.R must NOT receive test_attached_packages"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test: used-before-defined preserved in plain test file
+    // ------------------------------------------------------------------
+
+    /// Forward references (used before defined) within a plain test file
+    /// must still be detected — the package contribution injects R/-derived
+    /// symbols, but a symbol defined later in the SAME file must NOT be
+    /// pre-visible from contribution injection.
+    #[test]
+    fn used_before_defined_preserved_in_plain_test() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let test_uri = Url::parse("file:///work/pkg/tests/Simple.R").unwrap();
+        // `local_fn` used at line 0, defined at line 1 — forward reference.
+        let test_code = "result <- local_fn()\nlocal_fn <- function() 42";
+        let test_arts = artifacts_for(&test_uri, test_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &test_uri {
+                Some(test_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // Contribution does NOT carry `local_fn` (it's not from R/).
+        let contrib = make_contribution("/work/pkg", &["Cholesky"], &[]);
+        // Query scope at line 0 (before `local_fn` definition on line 1).
+        let scope = scope_at_position_with_graph(
+            &test_uri,
+            0,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        // `local_fn` must NOT be visible at line 0 (used before defined).
+        assert!(
+            !scope.symbols.contains_key("local_fn"),
+            "used-before-defined must still be detected in plain tests. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        // But the package symbol IS visible.
+        assert!(
+            scope.symbols.contains_key("Cholesky"),
+            "package symbols must still be injected. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
         );
     }
 }

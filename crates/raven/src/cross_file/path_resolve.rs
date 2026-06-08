@@ -393,6 +393,110 @@ pub fn normalize_path_public(path: &Path) -> Option<PathBuf> {
     normalize_path(path)
 }
 
+/// Resolve a `system.file(parts..., package = P)` call to a filesystem path.
+///
+/// Resolution algorithm (the two layouts differ by an `inst/` prefix):
+/// 1. If `P == workspace_package_name` → `<workspace_root>/inst/<rel>`
+///    (source layout, WITH `inst/`).
+/// 2. Else if `P` is installed → search each `lib_paths` entry for
+///    `<lib_path>/P/<rel>` (installed layout, NO `inst/` prefix; first hit wins).
+/// 3. Otherwise → `None` (unresolved).
+///
+/// `rel` is formed by joining `parts` with `/`.
+pub fn resolve_system_file(
+    parts: &[String],
+    package: &str,
+    workspace_package_name: Option<&str>,
+    workspace_root: Option<&Path>,
+    lib_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    if parts.is_empty() {
+        return None;
+    }
+    let rel: PathBuf = parts.iter().collect();
+
+    // Branch 1: same as workspace package → source layout with inst/ prefix
+    if let (Some(ws_pkg), Some(ws_root)) = (workspace_package_name, workspace_root)
+        && package == ws_pkg
+    {
+        let candidate = ws_root.join("inst").join(&rel);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        // Even if file doesn't exist yet, return the path so diagnostics
+        // can report a missing file (consistent with resolve_path behavior).
+        return Some(candidate);
+    }
+
+    // Branch 2: installed package → search lib_paths without inst/ prefix
+    for lib_path in lib_paths {
+        let candidate = lib_path.join(package).join(&rel);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // Branch 3: unresolved
+    None
+}
+
+/// Resolve any `system_file`-bearing `ForwardSource` entries in `meta` into
+/// concrete paths. Call after `extract_metadata` when workspace and library
+/// context is available. Each resolved entry gets `source.path` populated and
+/// `source.system_file` cleared so the existing dependency/scope machinery
+/// handles them transparently.
+pub fn resolve_system_file_sources(
+    meta: &mut super::types::CrossFileMetadata,
+    workspace_package_name: Option<&str>,
+    workspace_root: Option<&Path>,
+    lib_paths: &[PathBuf],
+) {
+    for source in &mut meta.sources {
+        if let Some(ref sf) = source.system_file {
+            // Branch 1: same as workspace package → source layout with inst/ prefix
+            if let Some(ws_pkg) = workspace_package_name
+                && sf.package == ws_pkg
+                && workspace_root.is_some()
+            {
+                let rel: PathBuf = sf.parts.iter().collect();
+                source.path = format!("/inst/{}", rel.display());
+                source.system_file = None;
+            } else if !lib_paths.is_empty() {
+                // Branch 2: cross-package → search lib_paths (only when
+                // lib_paths are actually available; otherwise leave intact
+                // for a later retry after R initialization).
+                let resolved = resolve_system_file(
+                    &sf.parts,
+                    &sf.package,
+                    workspace_package_name,
+                    workspace_root,
+                    lib_paths,
+                );
+                if let Some(abs_path) = resolved {
+                    source.resolved_uri = Url::from_file_path(&abs_path).ok();
+                    source.path = abs_path.display().to_string();
+                    source.system_file = None;
+                }
+                // If unresolved with lib_paths available (truly uninstalled),
+                // system_file stays Some → retain below drops it.
+            }
+            // When lib_paths is empty AND not same-package, system_file stays
+            // intact — entry survives retain for a later retry.
+        }
+    }
+    // Drop entries that were attempted but failed: system_file still Some AND
+    // lib_paths were available (truly uninstalled). Entries left because
+    // lib_paths was empty survive for a subsequent call.
+    let drop_unresolved = !lib_paths.is_empty();
+    meta.sources.retain(|s| {
+        if s.system_file.is_none() {
+            return true; // resolved or non-system.file source
+        }
+        // system_file is Some: keep only if lib_paths was empty (deferred)
+        !drop_unresolved
+    });
+}
+
 /// Convert a resolved path to a file URI.
 /// Creates a file:// URI from an absolute filesystem path.
 pub fn path_to_uri(path: &Path) -> Option<Url> {
@@ -751,6 +855,139 @@ mod tests {
         let path = Path::new("/../../../a");
         let result = normalize_path(path).unwrap();
         assert_eq!(result, PathBuf::from("/a"));
+    }
+
+    // ==================== system.file resolution tests ====================
+
+    #[test]
+    fn test_resolve_system_file_same_package_inst_prefix() {
+        // Same-package: workspace "Matrix" with inst/test-tools.R → resolved via inst/
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_root = tmp.path();
+        std::fs::create_dir_all(ws_root.join("inst")).unwrap();
+        std::fs::write(ws_root.join("inst/test-tools.R"), "f <- 1").unwrap();
+
+        let result = resolve_system_file(
+            &["test-tools.R".to_string()],
+            "Matrix",
+            Some("Matrix"),
+            Some(ws_root),
+            &[],
+        );
+        assert_eq!(result, Some(ws_root.join("inst/test-tools.R")));
+    }
+
+    #[test]
+    fn test_resolve_system_file_installed_cross_package_no_inst() {
+        // Installed cross-package: lib_path contains P/helper.R (no inst/ prefix)
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        std::fs::create_dir_all(lib.join("P")).unwrap();
+        std::fs::write(lib.join("P/helper.R"), "g <- 2").unwrap();
+
+        let result = resolve_system_file(
+            &["helper.R".to_string()],
+            "P",
+            Some("MyPkg"),
+            Some(Path::new("/fake/ws")),
+            &[lib.to_path_buf()],
+        );
+        assert_eq!(result, Some(lib.join("P/helper.R")));
+    }
+
+    #[test]
+    fn test_resolve_system_file_multi_part_join() {
+        // Multi-part: system.file("a", "b.R", package = "P") → P/a/b.R
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        std::fs::create_dir_all(lib.join("P/a")).unwrap();
+        std::fs::write(lib.join("P/a/b.R"), "h <- 3").unwrap();
+
+        let result = resolve_system_file(
+            &["a".to_string(), "b.R".to_string()],
+            "P",
+            None,
+            None,
+            &[lib.to_path_buf()],
+        );
+        assert_eq!(result, Some(lib.join("P/a/b.R")));
+    }
+
+    #[test]
+    fn test_resolve_system_file_unresolved_fallback() {
+        // Package neither self nor installed → None, no panic
+        let result = resolve_system_file(
+            &["helper.R".to_string()],
+            "NonExistent",
+            Some("MyPkg"),
+            Some(Path::new("/fake/ws")),
+            &[PathBuf::from("/no/such/lib")],
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_system_file_sources_integration() {
+        // resolve_system_file_sources sets workspace-root-relative path and clears system_file
+        use super::super::source_detect::SystemFileCall;
+        use super::super::types::{CrossFileMetadata, ForwardSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_root = tmp.path();
+        std::fs::create_dir_all(ws_root.join("inst")).unwrap();
+        std::fs::write(ws_root.join("inst/helper.R"), "x <- 1").unwrap();
+
+        let mut meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                system_file: Some(SystemFileCall {
+                    parts: vec!["helper.R".to_string()],
+                    package: "mypkg".to_string(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        resolve_system_file_sources(&mut meta, Some("mypkg"), Some(ws_root), &[]);
+
+        assert_eq!(meta.sources[0].path, "/inst/helper.R");
+        assert!(meta.sources[0].system_file.is_none());
+    }
+
+    #[test]
+    fn test_resolve_system_file_sources_unresolved_dropped() {
+        // Unresolved (cross-package, not installed) entries are removed when
+        // lib_paths is non-empty (meaning resolution was actually attempted).
+        use super::super::source_detect::SystemFileCall;
+        use super::super::types::{CrossFileMetadata, ForwardSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_root = tmp.path();
+        // A lib_path that exists but doesn't contain the package
+        let lib_dir = tempfile::tempdir().unwrap();
+
+        let mut meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                system_file: Some(SystemFileCall {
+                    parts: vec!["setup.R".to_string()],
+                    package: "otherpkg".to_string(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        resolve_system_file_sources(
+            &mut meta,
+            Some("mypkg"),
+            Some(ws_root),
+            &[lib_dir.path().to_path_buf()],
+        );
+
+        assert!(
+            meta.sources.is_empty(),
+            "Unresolved entries must be removed when lib_paths is available"
+        );
     }
 }
 

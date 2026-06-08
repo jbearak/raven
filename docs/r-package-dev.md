@@ -37,6 +37,13 @@ symbols (`R/*.R`) and to symbols imported via NAMESPACE/roxygen. Tests can
 call internal package functions without "undefined variable" diagnostics.
 Symbols defined in test files are not visible from `R/*.R`.
 
+The same one-way access extends to plain top-level `tests/*.R` scripts (the
+old-style files `R CMD check` runs directly, e.g. `tests/Simple.R`): because
+the package is loaded when its tests run, those scripts see all `R/` top-level
+symbols and NAMESPACE imports. Unlike `tests/testthat/helper-*.R`, plain test
+scripts do **not** see each other's definitions — `R CMD check` runs each in a
+separate process — and their own definitions never leak into `R/`.
+
 ```r
 # R/helpers.R
 process_data <- function(df) { ... }
