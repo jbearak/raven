@@ -326,7 +326,12 @@ fn try_parse_system_file_call(node: Node, content: &str) -> Option<SystemFileCal
                 // Non-literal package arg → bail
                 package.as_ref()?;
             }
-            // Ignore other named args (mustWork, lib.loc, fsep)
+            // lib.loc/fsep alter path resolution in ways we can't model
+            // statically — bail so we don't resolve to the wrong file.
+            if name == "lib.loc" || name == "fsep" {
+                return None;
+            }
+            // Other named args (e.g. mustWork) don't affect path layout
         } else {
             // Positional argument — must be a string literal
             let value_node = child.child_by_field_name("value")?;
@@ -2772,6 +2777,36 @@ library(ggplot2)"#;
         let tree = parse_r(code);
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_rejected() {
+        // lib.loc alters search path — unresolvable statically
+        let code = r#"source(system.file("x.R", package = "p", lib.loc = foo))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_fsep_rejected() {
+        // fsep alters path construction — unresolvable statically
+        let code = r#"source(system.file("x.R", package = "p", fsep = "/"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_must_work_accepted() {
+        // mustWork doesn't affect path layout — still resolvable
+        let code = r#"source(system.file("x.R", package = "p", mustWork = FALSE))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
     }
 }
 
