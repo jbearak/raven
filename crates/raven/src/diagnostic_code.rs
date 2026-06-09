@@ -125,6 +125,17 @@ pub fn parent(code: &str) -> Option<&'static str> {
     None
 }
 
+/// Is `code` a suppressible diagnostic code — i.e., one that the suppression
+/// machinery can actually match and silence? Codes in [`LINT_CODES`] and
+/// [`SUPPRESSIBLE_ANALYZER_CODES`] are suppressible. Non-suppressible codes
+/// (like `syntax-error` and its children, `unresolved-source-path`, etc.)
+/// can never be matched by a directive, so an `expect` targeting only
+/// non-suppressible codes should not report `unused-suppression`.
+pub fn is_suppressible(code: &str) -> bool {
+    let norm = normalize(code);
+    LINT_CODES.contains(&norm.as_str()) || SUPPRESSIBLE_ANALYZER_CODES.contains(&norm.as_str())
+}
+
 /// Does a suppression code written by the user cover a diagnostic's code?
 ///
 /// True when the (normalized) codes are equal, or when the suppression code is
@@ -219,5 +230,21 @@ mod tests {
         }
         assert!(suppresses("unclosed-paren", "unclosed-paren"));
         assert!(!suppresses("unclosed-paren", "unclosed-brace"));
+    }
+
+    #[test]
+    fn is_suppressible_identifies_suppressible_codes() {
+        // Lint codes are suppressible.
+        assert!(is_suppressible("line-length"));
+        assert!(is_suppressible("line_length")); // snake_case accepted
+        // Suppressible analyzer codes.
+        assert!(is_suppressible("undefined-variable"));
+        assert!(is_suppressible("assign-to-string-literal"));
+        assert!(is_suppressible("package-not-installed"));
+        // Non-suppressible codes.
+        assert!(!is_suppressible("syntax-error"));
+        assert!(!is_suppressible("unclosed-paren"));
+        assert!(!is_suppressible("unresolved-source-path"));
+        assert!(!is_suppressible("unused-suppression"));
     }
 }

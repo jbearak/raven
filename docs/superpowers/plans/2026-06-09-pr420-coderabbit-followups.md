@@ -386,5 +386,8 @@ rather than implicit.
 Then: full gates + strict corpus, push, reply to CodeRabbit, `@coderabbitai review`.
 
 ## Deferred-questions list (append as you go)
-- (none yet — record any finding you skip-with-reason here, plus any API-name
-  corrections to the anchors above.)
+- **F-2 (decided: option a — leave LSP-only, document):** `reportUnusedSuppressions` stays editor-only. All `diagnostics.*` severity settings are likewise editor-only — this is consistent. Added "Editor-only" note to `docs/configuration.md`. Wiring it through `config_file` for CLI would be feasible but is not justified until explicitly requested.
+- **F-3 (confirmed: `# nolint` excluded from sweep):** `# nolint` / `# nolint start/end` directives are handled entirely in the lint track's own `Suppressions` system (`linting/nolint.rs`) and are never pushed to `suppression_directives`. They are therefore invisible to the unused-suppression sweep by design — lintr-compat aliases stay silent.
+- **F-4 (confirmed: chunk suppressions are Ignore-flavored only):** `append_chunk_suppressions` in `chunks.rs` hardcodes `SuppressionFlavor::Ignore`, so chunk-level directives (`raven.ignore=…`, `# raven: ignore-chunk`) never report unused unless the global `reportUnusedSuppressions` sweep is on. An `expect` written inside a chunk body works as a normal per-line directive. No change needed.
+- **F-5 (confirmed: `expect` surface is intended):** The surface (`# raven: expect`, `-next`, `-start`/`-end`, `-file`, `@lsp-expect`, `@lsp-expect-next`) mirrors every `ignore` form. Confirmed as complete and intentional.
+- **H (decided: KEEP the two security-hardening commits in PR #420):** The two security fixes (path-escape rejection in `system_file_relative_path` and sysdata path escaping in `.onLoad` extraction) touch the same `system.file`/sysdata subsystems that Groups A, C, and E address in this same PR. Keeping them here is consistent; they'd only be reverted into a separate PR if PR #420 were split by subsystem, which is not planned.

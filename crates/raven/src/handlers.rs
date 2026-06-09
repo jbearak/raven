@@ -5042,6 +5042,15 @@ fn collect_unused_suppression_diagnostics(
         if !report {
             continue;
         }
+        // Skip directives that target only non-suppressible codes — they can
+        // never match anything, so "unused" is misleading (it's "not applicable").
+        if let crate::cross_file::types::LineSuppression::Codes(ref cs) = directive.what
+            && !cs
+                .iter()
+                .any(|c| crate::diagnostic_code::is_suppressible(c))
+        {
+            continue;
+        }
         let used = suppressed
             .iter()
             .any(|(line, code)| directive.covers_line(*line) && directive.what.covers(Some(code)));
@@ -7977,6 +7986,51 @@ mod unused_suppression_tests {
         let mut out = Vec::new();
         collect_unused_suppression_diagnostics(&dirs, &suppressed, false, &mut out);
         assert_eq!(unused_codes(&out), vec![1]);
+    }
+
+    #[test]
+    fn expect_non_suppressible_code_does_not_report_unused() {
+        // `# raven: expect[syntax-error]` targets a non-suppressible code —
+        // it can never match, so no unused-suppression should be emitted.
+        let dirs = vec![directive(
+            4,
+            LineSuppression::Codes(vec!["syntax-error".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert!(
+            unused_codes(&out).is_empty(),
+            "non-suppressible code should not produce unused-suppression"
+        );
+    }
+
+    #[test]
+    fn expect_suppressible_code_on_clean_line_still_reports_unused() {
+        // `# raven: expect[undefined-variable]` on a line with no diagnostic →
+        // still reports unused because the code IS suppressible.
+        let dirs = vec![directive(
+            7,
+            LineSuppression::Codes(vec!["undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert_eq!(unused_codes(&out), vec![7]);
+    }
+
+    #[test]
+    fn expect_mixed_codes_reports_unused_if_any_is_suppressible() {
+        // If at least one code is suppressible, the directive participates in
+        // the sweep (and reports unused if nothing matched).
+        let dirs = vec![directive(
+            9,
+            LineSuppression::Codes(vec!["syntax-error".into(), "undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert_eq!(unused_codes(&out), vec![9]);
     }
 }
 
