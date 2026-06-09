@@ -312,16 +312,16 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             _ => return None,
         },
         "survival" => match name {
-            // tmerge(data1, data2, id, ...): `id` is data-masked (a column of
-            // data2) and every `...` argument is a data-masked time-dependent
-            // term — typically a call to the tmerge-only NSE helpers
-            // `tdc`/`event`/`cumtdc`/`cumevent` whose own arguments are columns.
-            // None of those helpers exist as resolvable bindings outside
-            // tmerge's evaluation, so capturing `id` + `...` suppresses them
-            // and their column arguments while keeping `data1`/`data2` checked.
+            // tmerge(data1, data2, id, ..., tstart, tstop, options):
+            // `id`, `tstart`, and `tstop` are data-masked (column expressions
+            // evaluated within `data1`) — e.g. tmerge(..., tstart=age, tstop=futime).
+            // Every `...` argument is a data-masked time-dependent term — typically
+            // a call to the tmerge-only NSE helpers `tdc`/`event`/`cumtdc`/`cumevent`.
+            // `options` is a plain control list (e.g. list(tdcstart=...)) and is
+            // NOT data-masked, so it stays checked.
             "tmerge" => ArgPolicy::per_formal(
                 &["data1", "data2", "id", "...", "tstart", "tstop", "options"],
-                &["id"],
+                &["id", "tstart", "tstop"],
                 true,
             ),
             _ => return None,
@@ -2007,9 +2007,9 @@ mod tests {
     }
 
     #[test]
-    fn survival_tmerge_flags_post_dots_formals() {
-        // tstart, tstop, options are named formals after `...`; they are NOT
-        // data-masked and must be flagged when passed an undefined symbol.
+    fn survival_tmerge_suppresses_tstart_tstop_flags_options() {
+        // tstart and tstop are data-masked (column expressions in data1), so
+        // they must be suppressed. `options` is a plain control list — flagged.
         let p = package_policy("survival", "tmerge").unwrap();
         let mask = suppressed_arguments(
             &p,
@@ -2024,9 +2024,9 @@ mod tests {
             ]),
             false,
         );
-        // data1, data2: not suppressed; id: masked; ev: dots-captured;
-        // tstart, tstop, options: explicit formals, not captured → flagged.
-        assert_eq!(mask, vec![false, false, true, true, false, false, false]);
+        // data1, data2: checked; id: masked; ev: dots-captured;
+        // tstart, tstop: data-masked → suppressed; options: control → flagged.
+        assert_eq!(mask, vec![false, false, true, true, true, true, false]);
     }
 
     #[test]

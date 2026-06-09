@@ -326,10 +326,22 @@ fn try_parse_system_file_call(node: Node, content: &str) -> Option<SystemFileCal
                 // Non-literal package arg → bail
                 package.as_ref()?;
             }
-            // lib.loc/fsep alter path resolution in ways we can't model
-            // statically — bail so we don't resolve to the wrong file.
-            if name == "lib.loc" || name == "fsep" {
-                return None;
+            // lib.loc: accept when the value is a standard-library reference
+            // (.Library, .Library.site, .libPaths()) — these resolve to the
+            // default search path our resolver already uses. Reject otherwise.
+            if name == "lib.loc" {
+                let value_node = child.child_by_field_name("value")?;
+                if !is_standard_lib_loc(value_node, content) {
+                    return None;
+                }
+            }
+            // fsep: the default is "/"; accept that (no-op), reject others.
+            if name == "fsep" {
+                let value_node = child.child_by_field_name("value")?;
+                let text = node_text(value_node, content);
+                if text != "\"/\"" && text != "'/'" {
+                    return None;
+                }
             }
             // Other named args (e.g. mustWork) don't affect path layout
         } else {
@@ -381,6 +393,23 @@ fn extract_string_literal(node: Node, content: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Returns true when a `lib.loc` value node refers to a standard library path
+/// that our resolver already searches (`.Library`, `.Library.site`, or a call
+/// to `.libPaths()`). These are safe to resolve as-if-absent.
+fn is_standard_lib_loc(node: Node, content: &str) -> bool {
+    let text = node_text(node, content);
+    if text == ".Library" || text == ".Library.site" {
+        return true;
+    }
+    // .libPaths() — a call node whose function leaf is `.libPaths`
+    if node.kind() == "call"
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        return node_text(func, content) == ".libPaths";
+    }
+    false
 }
 
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
@@ -2790,8 +2819,8 @@ library(ggplot2)"#;
 
     #[test]
     fn test_source_system_file_fsep_rejected() {
-        // fsep alters path construction — unresolvable statically
-        let code = r#"source(system.file("x.R", package = "p", fsep = "/"))"#;
+        // Non-default fsep alters path construction — unresolvable statically
+        let code = r#"source(system.file("x.R", package = "p", fsep = "\\"))"#;
         let tree = parse_r(code);
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 0);
@@ -2801,6 +2830,42 @@ library(ggplot2)"#;
     fn test_source_system_file_must_work_accepted() {
         // mustWork doesn't affect path layout — still resolvable
         let code = r#"source(system.file("x.R", package = "p", mustWork = FALSE))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_dot_library_accepted() {
+        // .Library is the default library path — safe to resolve as-if-absent
+        let code = r#"source(system.file("test-tools-1.R", package = "Matrix", lib.loc = .Library), keep.source = FALSE)"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["test-tools-1.R"]);
+        assert_eq!(sf.package, "Matrix");
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_lib_paths_accepted() {
+        // .libPaths() returns the default search paths — safe to resolve
+        let code = r#"source(system.file("x.R", package = "p", lib.loc = .libPaths()))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
+    }
+
+    #[test]
+    fn test_source_system_file_fsep_default_accepted() {
+        // fsep = "/" is the default — no-op, safe to resolve
+        let code = r#"source(system.file("x.R", package = "p", fsep = "/"))"#;
         let tree = parse_r(code);
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
