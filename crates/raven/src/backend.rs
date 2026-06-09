@@ -2585,6 +2585,15 @@ impl LanguageServer for Backend {
             self.surface_load_notes(&load_notes).await;
         }
 
+        // Re-resolve system.file() sources now that lib_paths are available.
+        // The workspace scan (Task A) may have called resolve_system_file_in_workspace()
+        // before the library was ready, leaving branch-2 (installed-package)
+        // targets unresolved. This second pass picks them up.
+        if package_library_ready {
+            let mut state = self.state.write().await;
+            state.resolve_system_file_in_workspace();
+        }
+
         // Start the libpath watcher if enabled and we have a real package
         // library. `lib_paths` is captured here as a one-time snapshot — if the
         // user later changes `.libPaths()` mid-session (e.g. `renv` switches
@@ -3366,6 +3375,12 @@ impl LanguageServer for Backend {
 
             // Re-enrich metadata now that backward/forward chains are indexed.
             // This ensures working-directory inheritance is accurate before diagnostics.
+            // Ensure the package library is ready so resolve_system_file_sources
+            // sees populated lib_paths (Finding 3: don't hold the write lock
+            // across the await).
+            if packages_enabled {
+                let _ = self.ensure_package_library_initialized().await;
+            }
             {
                 let mut state = self.state.write().await;
                 let workspace_root = state.workspace_folders.first().cloned();
@@ -3540,6 +3555,11 @@ impl LanguageServer for Backend {
         // Even when on-demand indexing is disabled, re-enrich metadata so inherited
         // working-directory context and graph edges match did_change behavior.
         else {
+            // Ensure library is ready so resolve_system_file_sources sees
+            // populated lib_paths (Finding 3: await outside write lock).
+            if packages_enabled {
+                let _ = self.ensure_package_library_initialized().await;
+            }
             let mut state = self.state.write().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
@@ -6210,7 +6230,16 @@ impl Backend {
             None => crate::cross_file::scope::ScopeArtifacts::default(),
         });
 
-        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) = {
+        let (
+            workspace_root,
+            packages_enabled,
+            open_docs,
+            workspace_index_version,
+            parent_content,
+            sys_file_ws_name,
+            sys_file_ws_root,
+            sys_file_lib_paths,
+        ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
@@ -6247,14 +6276,32 @@ impl Backend {
             let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
             let workspace_index_version = state.workspace_index_new.version();
 
+            // Capture system.file() resolution inputs for post-enrich resolve
+            let ws = state.package_state.workspace();
+            let ws_name = ws.map(|w| w.name.as_str().to_owned());
+            let ws_root = ws.map(|w| w.root.clone());
+            let lib_paths = state.package_library.lib_paths().to_vec();
+
             (
                 workspace_root,
                 packages_enabled,
                 open_docs,
                 workspace_index_version,
                 parent_content,
+                ws_name,
+                ws_root,
+                lib_paths,
             )
         };
+
+        // Resolve system.file() source entries into concrete paths so
+        // transitive on-demand walks don't stop at this hop.
+        crate::cross_file::resolve_system_file_sources(
+            &mut cross_file_meta,
+            sys_file_ws_name.as_deref(),
+            sys_file_ws_root.as_deref(),
+            &sys_file_lib_paths,
+        );
 
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -6554,7 +6601,16 @@ impl Backend {
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) = {
+        let (
+            workspace_root,
+            packages_enabled,
+            open_docs,
+            workspace_index_version,
+            parent_content,
+            sys_file_ws_name,
+            sys_file_ws_root,
+            sys_file_lib_paths,
+        ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let packages_enabled = state.cross_file_config.packages_enabled;
@@ -6582,14 +6638,32 @@ impl Backend {
             let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
             let workspace_index_version = state.workspace_index_new.version();
 
+            // Capture system.file() resolution inputs for post-enrich resolve
+            let ws = state.package_state.workspace();
+            let ws_name = ws.map(|w| w.name.as_str().to_owned());
+            let ws_root = ws.map(|w| w.root.clone());
+            let lib_paths = state.package_library.lib_paths().to_vec();
+
             (
                 workspace_root,
                 packages_enabled,
                 open_docs,
                 workspace_index_version,
                 parent_content,
+                ws_name,
+                ws_root,
+                lib_paths,
             )
         };
+
+        // Resolve system.file() source entries into concrete paths so
+        // transitive on-demand walks don't stop at this hop.
+        crate::cross_file::resolve_system_file_sources(
+            &mut cross_file_meta,
+            sys_file_ws_name.as_deref(),
+            sys_file_ws_root.as_deref(),
+            &sys_file_lib_paths,
+        );
 
         let loaded_packages =
             extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);

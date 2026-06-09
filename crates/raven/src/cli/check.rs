@@ -1204,6 +1204,7 @@ mod tests {
                 state.cross_file_config.packages_missing_package_severity = None;
             }
             maybe_init_r(&mut state, &root).await;
+            state.resolve_system_file_in_workspace();
             let mut operator_error = false;
             let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
             prefetch_reported_packages(&state, &targets).await;
