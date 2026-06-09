@@ -319,7 +319,11 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             // None of those helpers exist as resolvable bindings outside
             // tmerge's evaluation, so capturing `id` + `...` suppresses them
             // and their column arguments while keeping `data1`/`data2` checked.
-            "tmerge" => ArgPolicy::per_formal(&["data1", "data2", "id", "..."], &["id"], true),
+            "tmerge" => ArgPolicy::per_formal(
+                &["data1", "data2", "id", "...", "tstart", "tstop", "options"],
+                &["id"],
+                true,
+            ),
             _ => return None,
         },
         _ => return None,
@@ -2000,6 +2004,29 @@ mod tests {
             false,
         );
         assert_eq!(mask, vec![false, false, true, true, true]);
+    }
+
+    #[test]
+    fn survival_tmerge_flags_post_dots_formals() {
+        // tstart, tstop, options are named formals after `...`; they are NOT
+        // data-masked and must be flagged when passed an undefined symbol.
+        let p = package_policy("survival", "tmerge").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[
+                None,
+                None,
+                Some("id"),
+                Some("ev"),
+                Some("tstart"),
+                Some("tstop"),
+                Some("options"),
+            ]),
+            false,
+        );
+        // data1, data2: not suppressed; id: masked; ev: dots-captured;
+        // tstart, tstop, options: explicit formals, not captured → flagged.
+        assert_eq!(mask, vec![false, false, true, true, false, false, false]);
     }
 
     #[test]

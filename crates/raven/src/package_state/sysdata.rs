@@ -32,10 +32,15 @@ fn scan_dir_recursive(dir: &Path, symbols: &mut BTreeSet<String>) {
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if ft.is_dir() && !ft.is_symlink() {
             scan_dir_recursive(&path, symbols);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
+        } else if ft.is_file()
+            && matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
             && let Ok(content) = fs::read_to_string(&path)
         {
             extract_sysdata_names_from_source(&content, symbols);
@@ -679,5 +684,27 @@ bar <- 42
             "expected sysdata_var2, got: {:?}",
             names
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_dir_recursive_skips_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_raw = tmp.path().join("data-raw");
+        std::fs::create_dir(&data_raw).unwrap();
+        // A regular R file that should be found.
+        std::fs::write(
+            data_raw.join("gen.R"),
+            "usethis::use_data(found, internal = TRUE)\n",
+        )
+        .unwrap();
+        // Create a symlink loop: data-raw/loop -> .. (ancestor)
+        symlink(tmp.path(), data_raw.join("loop")).unwrap();
+
+        // Must terminate despite the symlink loop.
+        let syms = scan_sysdata_generating_scripts(tmp.path());
+        assert!(syms.contains("found"), "expected 'found' in {:?}", syms);
     }
 }

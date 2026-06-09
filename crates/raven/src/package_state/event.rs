@@ -215,6 +215,13 @@ fn translate_watched_directory(
         return Some(PackageInputDelta::DataDirChanged);
     }
 
+    // data-raw/ directory: rescan sysdata generating scripts.
+    let data_raw_dir = root.join("data-raw");
+    if path == data_raw_dir || path.starts_with(&data_raw_dir) {
+        inputs.sysdata_names = super::sysdata::scan_sysdata_generating_scripts(root);
+        return Some(PackageInputDelta::DataDirChanged);
+    }
+
     let mut deltas = Vec::new();
     let existing_under_path: Vec<_> = inputs
         .r_files
@@ -256,6 +263,7 @@ fn is_tracked_package_dir(path: &Path, root: &Path) -> bool {
     let testthat_dir = root.join("tests").join("testthat");
     let testit_dir = root.join("tests").join("testit");
     let data_dir = root.join("data");
+    let data_raw_dir = root.join("data-raw");
     path == r_dir
         || path.starts_with(&r_dir)
         || path == testthat_dir
@@ -264,6 +272,8 @@ fn is_tracked_package_dir(path: &Path, root: &Path) -> bool {
         || path.starts_with(&testit_dir)
         || path == data_dir
         || path.starts_with(&data_dir)
+        || path == data_raw_dir
+        || path.starts_with(&data_raw_dir)
 }
 
 fn collect_r_file_inputs_from_dir(
@@ -778,5 +788,42 @@ mod tests {
         );
         assert!(matches!(delta, Some(PackageInputDelta::SettingChanged)));
         assert_eq!(inputs.package_mode, PackageMode::Disabled);
+    }
+
+    #[test]
+    fn watched_data_raw_directory_event_refreshes_sysdata_names() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let data_raw = root.join("data-raw");
+        std::fs::create_dir_all(&data_raw).unwrap();
+        std::fs::write(
+            data_raw.join("generate.R"),
+            "usethis::use_data(my_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&data_raw).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert!(
+            matches!(delta, Some(PackageInputDelta::DataDirChanged)),
+            "expected DataDirChanged, got: {:?}",
+            delta
+        );
+        assert!(
+            inputs.sysdata_names.contains("my_internal"),
+            "expected sysdata_names to contain 'my_internal', got: {:?}",
+            inputs.sysdata_names
+        );
     }
 }
