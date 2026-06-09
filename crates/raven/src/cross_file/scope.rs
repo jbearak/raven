@@ -1224,12 +1224,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         .iter()
         .map(|(name, line)| (name.as_str(), *line))
         .collect();
-    artifacts.interface_hash = compute_interface_hash(
-        &artifacts.exported_interface,
-        &loaded_packages,
-        &[],
-        &removal_refs,
-    );
+    // F3: hash only the top-level interface (function-scope-filtered) so a
+    // function-local rename never invalidates dependents that source this file.
+    let top_level = top_level_interface(&artifacts);
+    artifacts.interface_hash =
+        compute_interface_hash(&top_level, &loaded_packages, &[], &removal_refs);
 
     artifacts
 }
@@ -1487,8 +1486,11 @@ pub fn compute_artifacts_with_metadata(
         .iter()
         .map(|(name, line)| (name.as_str(), *line))
         .collect();
+    // F3: hash only the top-level interface (function-scope-filtered) so a
+    // function-local rename never invalidates dependents that source this file.
+    let top_level = top_level_interface(&artifacts);
     artifacts.interface_hash = compute_interface_hash(
-        &artifacts.exported_interface,
+        &top_level,
         &loaded_packages,
         &declared_symbols,
         &removal_refs,
@@ -3295,6 +3297,30 @@ pub fn live_top_level_exports(artifacts: &ScopeArtifacts) -> std::collections::H
         }
     }
     live
+}
+
+/// The subset of [`ScopeArtifacts::exported_interface`] that this file actually
+/// makes visible to other files: top-level (function-scope `None`) live
+/// definitions, rm-aware, carrying each symbol's full [`ScopedSymbol`] details.
+///
+/// This is the canonical "exports" accessor. Consumers that need the file's
+/// cross-file/package-visible interface — `interface_hash` change detection and
+/// Cmd+T workspace symbols — must use this rather than reaching directly for
+/// the scope-blind `exported_interface` map, which also contains function-local
+/// bindings (the [`ScopeArtifacts::exported_interface`] FOOTGUN). Same-file,
+/// scope-blind lookups (e.g. "is this name defined anywhere in the file") may
+/// still consult `exported_interface` directly.
+///
+/// Each call walks the timeline once (via [`live_top_level_exports`]) and
+/// allocates a fresh map; memoize in hot paths.
+pub fn top_level_interface(artifacts: &ScopeArtifacts) -> HashMap<Arc<str>, ScopedSymbol> {
+    let live = live_top_level_exports(artifacts);
+    artifacts
+        .exported_interface
+        .iter()
+        .filter(|(name, _)| live.contains(name.as_ref()))
+        .map(|(name, sym)| (name.clone(), sym.clone()))
+        .collect()
 }
 
 /// Extract top-level rm()/remove() events from a finalized timeline.
@@ -6344,6 +6370,56 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// F3: the interface hash is computed over the file's *top-level* exports,
+    /// so renaming a function-local binding does not change it (and therefore
+    /// does not invalidate dependents that source the file).
+    #[test]
+    fn interface_hash_ignores_function_local_rename() {
+        let a = "f <- function() { local_x <- 1; local_x }";
+        let b = "f <- function() { renamed_y <- 1; renamed_y }";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts(&test_uri(), &ta, a).interface_hash;
+        let hb = compute_artifacts(&test_uri(), &tb, b).interface_hash;
+        assert_eq!(
+            ha, hb,
+            "renaming a function-local must not change interface_hash"
+        );
+    }
+
+    /// F3: renaming a *top-level* export does change the interface hash.
+    #[test]
+    fn interface_hash_reflects_top_level_rename() {
+        let a = "g <- function() 1";
+        let b = "h <- function() 1";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts(&test_uri(), &ta, a).interface_hash;
+        let hb = compute_artifacts(&test_uri(), &tb, b).interface_hash;
+        assert_ne!(
+            ha, hb,
+            "renaming a top-level export must change interface_hash"
+        );
+    }
+
+    /// F3: the canonical exports accessor returns top-level definitions only,
+    /// excluding function-locals that the scope-blind map still contains.
+    #[test]
+    fn top_level_interface_excludes_function_locals() {
+        let code = "top_fn <- function() { inner_local <- 1; inner_local }\ntop_var <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let iface = top_level_interface(&artifacts);
+        assert!(iface.contains_key("top_fn"));
+        assert!(iface.contains_key("top_var"));
+        assert!(
+            !iface.contains_key("inner_local"),
+            "function-local must not appear in the top-level interface"
+        );
+        // The scope-blind map still carries the local (documented footgun).
+        assert!(artifacts.exported_interface.contains_key("inner_local"));
     }
 
     #[test]

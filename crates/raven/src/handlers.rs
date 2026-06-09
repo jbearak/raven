@@ -4199,9 +4199,11 @@ fn collect_legacy_ast_symbols(
 /// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
 ///
 /// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
-/// skips declared (virtual) symbols such as `@lsp-var`/`@lsp-func`, and maps internal symbol kinds
-/// to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation` with the
-/// provided `file_uri` and the symbol's definition position.
+/// restricts results to the file's **top-level** live exports (function-locals are excluded — see
+/// the [`ScopeArtifacts::exported_interface`] footgun), skips declared (virtual) symbols such as
+/// `@lsp-var`/`@lsp-func`, and maps internal symbol kinds to LSP `SymbolKind` values. Each matched
+/// symbol is appended as a `SymbolInformation` with the provided `file_uri` and the symbol's
+/// definition position.
 ///
 /// - `file_uri`: URI to assign to each returned `SymbolInformation`.
 /// - `artifacts`: Precomputed `ScopeArtifacts` containing `exported_interface`.
@@ -4217,8 +4219,17 @@ fn collect_workspace_symbols_from_artifacts(
 ) {
     let container_name = extract_container_name(file_uri);
 
+    // F3: Cmd+T surfaces a file's cross-file-visible interface, not its
+    // function-locals. Restrict to top-level live exports (rm-aware) rather
+    // than the scope-blind `exported_interface` map.
+    let top_level = crate::cross_file::scope::live_top_level_exports(artifacts);
+
     for scoped_symbol in artifacts.exported_interface.values() {
         if !scoped_symbol.name.to_lowercase().contains(lower_query) {
+            continue;
+        }
+
+        if !top_level.contains(scoped_symbol.name.as_ref()) {
             continue;
         }
 
