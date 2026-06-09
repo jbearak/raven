@@ -242,7 +242,7 @@ The object-name lint has independent style settings for **functions** (`objectNa
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 
-- `# nolint` on a line suppresses lints on that line (rule-name filters like `# nolint: line_length` are accepted; for now, all rules are suppressed on suppressed lines).
+- `# nolint` on a line suppresses lints on that line (rule-name filters like `# nolint: line_length` narrow suppression to the named rules).
 - `# nolint start` / `# nolint end` brackets a region.
 - The standard `# @lsp-ignore` and `# @lsp-ignore-next` markers also apply to lint diagnostics.
 

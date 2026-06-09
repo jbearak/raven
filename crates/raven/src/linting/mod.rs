@@ -286,6 +286,38 @@ fn run_semantic_checks_with(
     out
 }
 
+/// F2 Step 4: does a range- or file-level suppression in `meta` cover a **lint**
+/// diagnostic at `line` with code `code`?
+///
+/// The per-line `nolint` parser that `run_lints` consults never sees a chunk
+/// header (`raven.ignore=…` is blanked in the masked text) and maps a bare
+/// `# raven: ignore-chunk` only to its own line, so chunk-level (and, for
+/// callers that don't otherwise apply them, block/file) suppressions live only
+/// in [`CrossFileMetadata`](crate::cross_file::types::CrossFileMetadata)'s
+/// `ignored_ranges` / `ignored_file`. Both the diagnostics pipeline and
+/// `raven lint` call this to apply those suppressions to lint findings.
+///
+/// Restricted to [`LINT_CODES`](crate::diagnostic_code::LINT_CODES): analyzer
+/// codes are handled inline by their own collectors, and the dependency-graph
+/// diagnostics are intentionally never suppressed by ignore directives.
+pub fn range_or_file_suppresses(
+    meta: &crate::cross_file::types::CrossFileMetadata,
+    line: u32,
+    code: &str,
+) -> bool {
+    let norm = crate::diagnostic_code::normalize(code);
+    if !crate::diagnostic_code::LINT_CODES.contains(&norm.as_str()) {
+        return false;
+    }
+    meta.ignored_file
+        .as_ref()
+        .is_some_and(|f| f.covers(Some(&norm)))
+        || meta
+            .ignored_ranges
+            .iter()
+            .any(|r| line >= r.start && line <= r.end && r.what.covers(Some(&norm)))
+}
+
 /// F2 Step 3: the `(line, kebab-code)` pairs that lint-track suppression
 /// directives actually removed from `text`.
 ///

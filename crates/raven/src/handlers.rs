@@ -624,6 +624,38 @@ pub(crate) fn diagnostics_from_snapshot(
         scope_cache.len(),
     );
 
+    // F2 Step 4: range- and file-level suppressions (`# raven: ignore-start/end`,
+    // `ignore-file`, and chunk-level `raven.ignore` / `# raven: ignore-chunk`)
+    // live in `directive_meta.ignored_ranges` / `ignored_file`. The analyzer
+    // collectors consult these inline, but the lint track has its own
+    // suppression parser (`nolint`) that never sees a chunk header
+    // (`raven.ignore=…` is blanked in the masked text) and maps a bare
+    // `# raven: ignore-chunk` only to its own line. Apply the range/file
+    // suppressions to the **lint** diagnostics here so a suppressed chunk
+    // silences them too. Restricted to lint codes on purpose: analyzer
+    // diagnostics on these lines were already dropped inline, and the
+    // dependency-graph diagnostics (circular dependency, missing file, …) are
+    // intentionally never suppressed by ignore directives (see docs/linting.md).
+    {
+        let meta = &snapshot.directive_meta;
+        if !meta.ignored_ranges.is_empty() || meta.ignored_file.is_some() {
+            diagnostics.retain(|d| {
+                let Some(NumberOrString::String(raw_code)) = &d.code else {
+                    return true;
+                };
+                let line = d.range.start.line;
+                if crate::linting::range_or_file_suppresses(meta, line, raw_code) {
+                    if track_unused {
+                        suppressed_pairs.push((line, crate::diagnostic_code::normalize(raw_code)));
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
     // F2 Step 3: complete the `unused-suppression` sweep. The analyzer track
     // already captured its suppressed pairs into `suppressed_pairs`; add the
     // lint track's (recomputed raw, then filtered by the lint suppression map)
@@ -5082,6 +5114,9 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
     }
 }
 
+// Collector wired into the diagnostics pipeline; the argument list mirrors the
+// sibling collectors (snapshot/uri/node/text/out/cache/cancel) plus the F2
+// unused-suppression sink. Splitting it into a struct would not aid clarity.
 #[allow(clippy::too_many_arguments)]
 fn collect_out_of_scope_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,

@@ -252,61 +252,7 @@ fn cell_label(line: &str) -> Option<String> {
 /// Comma splitting respects nested brackets and quoted strings so that values
 /// like `fig.dim=c(5, 6)` or `lab="a,b"` don't trip the parser.
 fn parse_header_label(rest: &str) -> Option<String> {
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    // Split on commas while keeping nested brackets and quoted strings intact.
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_quote: Option<char> = None;
-    let mut depth = 0i32;
-
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
-        if let Some(q) = in_quote {
-            current.push(ch);
-            if ch == '\\' && i + 1 < chars.len() {
-                current.push(chars[i + 1]);
-                i += 2;
-                continue;
-            }
-            if ch == q {
-                in_quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match ch {
-            '"' | '\'' => {
-                in_quote = Some(ch);
-                current.push(ch);
-            }
-            '(' | '[' | '{' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' | ']' | '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                parts.push(std::mem::take(&mut current));
-            }
-            _ => current.push(ch),
-        }
-        i += 1;
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
-    for raw in parts {
+    for raw in split_header_options(rest) {
         let part = raw.trim();
         if part.is_empty() {
             continue;
@@ -326,61 +272,7 @@ fn parse_header_label(rest: &str) -> Option<String> {
 /// [`parse_header_label`] so nested commas (e.g. `fig.dim=c(5, 6)`) don't
 /// confuse the scan.
 fn has_eval_false(header_rest: &str) -> bool {
-    let trimmed = header_rest.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // Same comma-split logic as parse_header_label.
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_quote: Option<char> = None;
-    let mut depth = 0i32;
-
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
-        if let Some(q) = in_quote {
-            current.push(ch);
-            if ch == '\\' && i + 1 < chars.len() {
-                current.push(chars[i + 1]);
-                i += 2;
-                continue;
-            }
-            if ch == q {
-                in_quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match ch {
-            '"' | '\'' => {
-                in_quote = Some(ch);
-                current.push(ch);
-            }
-            '(' | '[' | '{' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' | ']' | '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                parts.push(std::mem::take(&mut current));
-            }
-            _ => current.push(ch),
-        }
-        i += 1;
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
-    for raw in &parts {
+    for raw in split_header_options(header_rest) {
         let part = raw.trim();
         // Match `eval = FALSE`, `eval=F`, `eval = F`, `eval=FALSE`.
         if let Some(val) = part.strip_prefix("eval") {
