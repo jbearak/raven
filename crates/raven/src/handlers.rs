@@ -626,16 +626,14 @@ pub(crate) fn diagnostics_from_snapshot(
 
     // F2 Step 4: range- and file-level suppressions (`# raven: ignore-start/end`,
     // `ignore-file`, and chunk-level `raven.ignore` / `# raven: ignore-chunk`)
-    // live in `directive_meta.ignored_ranges` / `ignored_file`. The analyzer
-    // collectors consult these inline, but the lint track has its own
-    // suppression parser (`nolint`) that never sees a chunk header
-    // (`raven.ignore=…` is blanked in the masked text) and maps a bare
-    // `# raven: ignore-chunk` only to its own line. Apply the range/file
-    // suppressions to the **lint** diagnostics here so a suppressed chunk
-    // silences them too. Restricted to lint codes on purpose: analyzer
-    // diagnostics on these lines were already dropped inline, and the
-    // dependency-graph diagnostics (circular dependency, missing file, …) are
-    // intentionally never suppressed by ignore directives (see docs/linting.md).
+    // live in `directive_meta.ignored_ranges` / `ignored_file`. The
+    // undefined-variable / missing-package collectors consult them inline, but
+    // the lint track's `nolint` parser and the AST `assign-to-string-literal`
+    // collector do not. Apply them here as a final filter (see
+    // `linting::range_or_file_suppresses`, which is restricted to the
+    // suppressible lint + analyzer codes) so a suppressed chunk/block/file
+    // silences every suppressible diagnostic. Inline-dropped diagnostics are no
+    // longer in the list, so this only removes the ones the inline paths missed.
     {
         let meta = &snapshot.directive_meta;
         if !meta.ignored_ranges.is_empty() || meta.ignored_file.is_some() {

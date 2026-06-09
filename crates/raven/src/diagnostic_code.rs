@@ -63,6 +63,20 @@ pub const ANALYZER_CODES: &[&str] = &[
     UNUSED_SUPPRESSION,
 ];
 
+/// Analyzer codes that ignore directives may suppress. This is the subset of
+/// [`ANALYZER_CODES`] that the suppression machinery actually honors:
+/// `undefined-variable`, `assign-to-string-literal`, and `package-not-installed`.
+/// Deliberately excludes `syntax-error` (parse errors are not suppressible),
+/// `unresolved-source-path` and the other dependency-graph diagnostics (governed
+/// only by their severity settings), and `unused-suppression` itself. Used by
+/// the range/file/chunk post-filter so block- and chunk-level suppression covers
+/// these codes the same way the inline per-line checks do. See `docs/linting.md`.
+pub const SUPPRESSIBLE_ANALYZER_CODES: &[&str] = &[
+    UNDEFINED_VARIABLE,
+    ASSIGN_TO_STRING_LITERAL,
+    PACKAGE_NOT_INSTALLED,
+];
+
 /// Canonical lint codes, kebab-case (the suppression spelling of the
 /// `snake_case` rule identifiers in [`crate::linting::rule_ids`]).
 pub const LINT_CODES: &[&str] = &[

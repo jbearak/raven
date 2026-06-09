@@ -286,27 +286,33 @@ fn run_semantic_checks_with(
     out
 }
 
-/// F2 Step 4: does a range- or file-level suppression in `meta` cover a **lint**
+/// F2 Step 4: does a range- or file-level suppression in `meta` cover a
 /// diagnostic at `line` with code `code`?
 ///
-/// The per-line `nolint` parser that `run_lints` consults never sees a chunk
-/// header (`raven.ignore=…` is blanked in the masked text) and maps a bare
-/// `# raven: ignore-chunk` only to its own line, so chunk-level (and, for
-/// callers that don't otherwise apply them, block/file) suppressions live only
-/// in [`CrossFileMetadata`](crate::cross_file::types::CrossFileMetadata)'s
-/// `ignored_ranges` / `ignored_file`. Both the diagnostics pipeline and
-/// `raven lint` call this to apply those suppressions to lint findings.
+/// Block (`# raven: ignore-start/end`), file (`# raven: ignore-file`), and
+/// chunk-level (`raven.ignore=…`, `# raven: ignore-chunk`) suppressions live in
+/// [`CrossFileMetadata`](crate::cross_file::types::CrossFileMetadata)'s
+/// `ignored_ranges` / `ignored_file`. Some diagnostics consult these inline
+/// (the undefined-variable / missing-package collectors), but the lint track's
+/// per-line `nolint` parser and the AST `assign-to-string-literal` collector do
+/// not — so the diagnostics pipeline and `raven lint` call this as a final
+/// filter to apply range/file suppression uniformly.
 ///
-/// Restricted to [`LINT_CODES`](crate::diagnostic_code::LINT_CODES): analyzer
-/// codes are handled inline by their own collectors, and the dependency-graph
-/// diagnostics are intentionally never suppressed by ignore directives.
+/// Restricted to the suppressible codes —
+/// [`LINT_CODES`](crate::diagnostic_code::LINT_CODES) and
+/// [`SUPPRESSIBLE_ANALYZER_CODES`](crate::diagnostic_code::SUPPRESSIBLE_ANALYZER_CODES)
+/// — so parse errors and the dependency-graph diagnostics are never suppressed
+/// by ignore directives. Removing an analyzer code that was already dropped
+/// inline is a harmless no-op (it is no longer in the diagnostic list).
 pub fn range_or_file_suppresses(
     meta: &crate::cross_file::types::CrossFileMetadata,
     line: u32,
     code: &str,
 ) -> bool {
     let norm = crate::diagnostic_code::normalize(code);
-    if !crate::diagnostic_code::LINT_CODES.contains(&norm.as_str()) {
+    let suppressible = crate::diagnostic_code::LINT_CODES.contains(&norm.as_str())
+        || crate::diagnostic_code::SUPPRESSIBLE_ANALYZER_CODES.contains(&norm.as_str());
+    if !suppressible {
         return false;
     }
     meta.ignored_file

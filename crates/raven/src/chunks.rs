@@ -667,9 +667,13 @@ pub fn append_chunk_suppressions(
             continue;
         };
 
-        // Form 1: header option (`raven.ignore=...`).
+        // Form 1: header option (`raven.ignore=...`). Strip a leading BOM so a
+        // chunk header on line 0 of a BOM-prefixed document still matches the
+        // `^`-anchored fence regex (mirrors `detect_chunks`, which is
+        // BOM-tolerant via `lines_for_column0_scan`).
         let header_opts = lines
             .get(chunk.header_line as usize)
+            .map(|h| h.strip_prefix('\u{FEFF}').unwrap_or(h))
             .and_then(|h| header_re.captures(h))
             .and_then(|c| c.get(3).map(|m| m.as_str().to_string()))
             .unwrap_or_default();
@@ -1451,5 +1455,32 @@ mod tests {
         let mut meta = crate::cross_file::types::CrossFileMetadata::default();
         append_chunk_suppressions(&mut meta, src);
         assert!(meta.ignored_ranges.is_empty());
+    }
+
+    #[test]
+    fn chunk_option_suppression_crlf() {
+        // CRLF line endings must not defeat header-option parsing or the
+        // in-chunk directive (regex tolerates trailing \r).
+        let src = "```{r, raven.ignore=TRUE}\r\nx <- undefined\r\n```\r\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert_eq!(meta.ignored_ranges.len(), 1);
+        assert_eq!(meta.ignored_ranges[0].what, LineSuppression::All);
+
+        let src2 = "```{r}\r\n# raven: ignore-chunk\r\nx <- undefined\r\n```\r\n";
+        let mut meta2 = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta2, src2);
+        assert_eq!(meta2.ignored_ranges.len(), 1);
+    }
+
+    #[test]
+    fn chunk_option_suppression_bom_first_line_header() {
+        // A BOM-prefixed document whose first line is the chunk header must
+        // still parse the `raven.ignore` option.
+        let src = "\u{FEFF}```{r, raven.ignore=TRUE}\nx <- undefined\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert_eq!(meta.ignored_ranges.len(), 1);
+        assert_eq!(meta.ignored_ranges[0].what, LineSuppression::All);
     }
 }

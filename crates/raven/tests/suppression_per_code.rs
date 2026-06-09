@@ -173,3 +173,28 @@ fn chunk_option_per_code_only_targets_named_code() {
         "per-code chunk option must not suppress an unrelated code. Output:\n{out}"
     );
 }
+
+#[test]
+fn ignore_file_suppresses_assign_to_string_literal() {
+    // assign-to-string-literal is handled by the AST collector (line/next only);
+    // the range/file post-filter must cover it for ignore-file/block/chunk.
+    let with = check_one("# raven: ignore-file\n\"x\" <- 1\n");
+    assert!(
+        !with.contains("string literal"),
+        "ignore-file must suppress assign-to-string-literal. Output:\n{with}"
+    );
+    let without = check_one("\"x\" <- 1\n");
+    assert!(
+        without.contains("string literal"),
+        "control: assign-to-string-literal should be reported without suppression. Output:\n{without}"
+    );
+}
+
+#[test]
+fn chunk_option_suppresses_assign_to_string_literal() {
+    let out = check_one_rmd("---\ntitle: T\n---\n\n```{r, raven.ignore=TRUE}\n\"x\" <- 1\n```\n");
+    assert!(
+        !out.contains("string literal"),
+        "raven.ignore=TRUE chunk must suppress assign-to-string-literal. Output:\n{out}"
+    );
+}
