@@ -195,6 +195,16 @@ impl DiagnosticsSnapshot {
             .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
         let metadata_elapsed = build_start.elapsed();
 
+        // F2 Step 4: chunk-level suppression for Rmd/Quarto. The chunk header
+        // (which carries `raven.ignore=...`) is blanked in the masked analysis
+        // `text`, so derive chunk suppression ranges from the RAW document text
+        // and merge them into this snapshot's owned `directive_meta`. Safe to
+        // mutate here: `directive_meta` is a deep-cloned/owned copy, not the
+        // shared cached `Arc`.
+        if doc.is_rmd_document() {
+            crate::chunks::append_chunk_suppressions(&mut directive_meta, &doc.text());
+        }
+
         // Compute inherited working directory if needed
         if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
             let workspace_root = state.workspace_folders.first();

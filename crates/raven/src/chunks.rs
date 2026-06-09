@@ -603,6 +603,219 @@ pub fn position_in_r_chunk_body(text: &str, line: u32) -> bool {
     false
 }
 
+/// Regex for the in-chunk `# raven: ignore-chunk` directive (F2 Step 4),
+/// optionally with a `[code]` selector. Anchored to the start of a (possibly
+/// indented) line; a trailing comment-only directive.
+fn ignore_chunk_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*#\s*raven:\s*ignore-chunk(?:\[([^\]]*)\])?\s*\r?$")
+            .expect("ignore-chunk regex")
+    })
+}
+
+/// Parse a comma-separated `[code]` body (or `None`/empty) into a
+/// [`LineSuppression`], normalizing each code to canonical kebab-case. Mirrors
+/// the directive/lint-track parsers; empty → blanket.
+fn chunk_codes_or_all(body: Option<&str>) -> crate::cross_file::types::LineSuppression {
+    use crate::cross_file::types::LineSuppression;
+    match body {
+        None => LineSuppression::All,
+        Some(b) => {
+            let codes: Vec<String> = b
+                .split(',')
+                .map(crate::diagnostic_code::normalize)
+                .filter(|c| !c.is_empty())
+                .collect();
+            if codes.is_empty() {
+                LineSuppression::All
+            } else {
+                LineSuppression::Codes(codes)
+            }
+        }
+    }
+}
+
+/// If `line` is an in-chunk `# raven: ignore-chunk` directive, return what it
+/// suppresses; otherwise `None`.
+fn parse_ignore_chunk_directive(line: &str) -> Option<crate::cross_file::types::LineSuppression> {
+    let caps = ignore_chunk_re().captures(line)?;
+    Some(chunk_codes_or_all(caps.get(1).map(|m| m.as_str())))
+}
+
+/// Parse the `raven.ignore` knitr chunk option out of a chunk header's option
+/// string (group 3 of [`fence_header_re`]). Returns:
+/// * `Some(All)` for `raven.ignore=TRUE`/`=T` or a bare `raven.ignore`;
+/// * `Some(Codes(..))` for `raven.ignore="a,b"` / `='a'` (quoted code list);
+/// * `None` when the option is absent or explicitly `FALSE`/`F`.
+///
+/// Uses the same bracket/quote-aware comma split as [`has_eval_false`] so a
+/// value like `fig.dim=c(5, 6)` doesn't confuse the scan.
+fn chunk_ignore_option(header_rest: &str) -> Option<crate::cross_file::types::LineSuppression> {
+    use crate::cross_file::types::LineSuppression;
+    let parts = split_header_options(header_rest);
+    for raw in &parts {
+        let part = raw.trim();
+        let Some(val) = part.strip_prefix("raven.ignore") else {
+            continue;
+        };
+        let val = val.trim_start();
+        // Bare `raven.ignore` (no `=`) means blanket-on.
+        let Some(val) = val.strip_prefix('=') else {
+            if val.is_empty() {
+                return Some(LineSuppression::All);
+            }
+            // `raven.ignoreX` — not our option.
+            continue;
+        };
+        let val = val.trim();
+        return match val {
+            "TRUE" | "T" => Some(LineSuppression::All),
+            "FALSE" | "F" => None,
+            _ => {
+                // Quoted code list: strip surrounding quotes, split on commas.
+                let unquoted = val
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                    .unwrap_or(val);
+                Some(chunk_codes_or_all(Some(unquoted)))
+            }
+        };
+    }
+    None
+}
+
+/// Bracket/quote-aware comma split of a chunk-header option string. Shared by
+/// [`chunk_ignore_option`]; identical logic to the split inside
+/// [`has_eval_false`]/[`parse_header_label`].
+fn split_header_options(header_rest: &str) -> Vec<String> {
+    let trimmed = header_rest.trim();
+    let mut parts: Vec<String> = Vec::new();
+    if trimmed.is_empty() {
+        return parts;
+    }
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+    let mut depth = 0i32;
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if let Some(q) = in_quote {
+            current.push(ch);
+            if ch == '\\' && i + 1 < chars.len() {
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if ch == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                in_quote = Some(ch);
+                current.push(ch);
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' | '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                current.push(ch);
+            }
+            ',' if depth == 0 => parts.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// F2 Step 4: append chunk-level suppression ranges (and directives) derived
+/// from an R Markdown / Quarto document's **raw** text to `meta`.
+///
+/// Two forms, both mapping the whole R chunk *body* onto the existing
+/// [`SuppressionRange`](crate::cross_file::types::SuppressionRange) machinery so
+/// the per-code analyzer/lint enforcement applies unchanged:
+/// 1. a knitr chunk **option** in the header — `{r, raven.ignore=TRUE}`
+///    (blanket) or `{r, raven.ignore="undefined-variable"}` (per-code); and
+/// 2. an in-chunk **directive** `# raven: ignore-chunk` (optionally `[code]`)
+///    anywhere in the chunk body.
+///
+/// Chunk suppressions are always the [`SuppressionFlavor::Ignore`] flavor
+/// (silent). Must be called on the RAW document text: the chunk header (which
+/// carries the option) is blanked in the masked analysis text. The directive
+/// hint anchor is the chunk header line. `# raven: ignore-start/end` blocks
+/// inside a chunk are handled by the normal directive parser (chunk bodies
+/// survive masking), so they need no special handling here.
+pub fn append_chunk_suppressions(
+    meta: &mut crate::cross_file::types::CrossFileMetadata,
+    raw_text: &str,
+) {
+    use crate::cross_file::types::{
+        LineSuppression, SuppressionDirective, SuppressionFlavor, SuppressionRange,
+    };
+    let lines: Vec<&str> = raw_text.split('\n').collect();
+    let total_lines = lines.len() as u32;
+    let chunks = detect_chunks(raw_text, ChunkKind::Rmd);
+    let header_re = fence_header_re();
+
+    for chunk in &chunks {
+        let Some((body_start, end_line)) = r_chunk_body_range(chunk, total_lines) else {
+            continue;
+        };
+
+        // Form 1: header option (`raven.ignore=...`).
+        let header_opts = lines
+            .get(chunk.header_line as usize)
+            .and_then(|h| header_re.captures(h))
+            .and_then(|c| c.get(3).map(|m| m.as_str().to_string()))
+            .unwrap_or_default();
+        let mut what: Option<LineSuppression> = chunk_ignore_option(&header_opts);
+
+        // Form 2: in-chunk `# raven: ignore-chunk` (merged with any header option).
+        for idx in body_start..=end_line {
+            if let Some(w) = lines
+                .get(idx as usize)
+                .and_then(|l| parse_ignore_chunk_directive(l))
+            {
+                what = Some(match what {
+                    Some(mut existing) => {
+                        existing.merge(w);
+                        existing
+                    }
+                    None => w,
+                });
+            }
+        }
+
+        if let Some(what) = what {
+            meta.ignored_ranges.push(SuppressionRange {
+                start: body_start,
+                end: end_line,
+                what: what.clone(),
+            });
+            meta.suppression_directives.push(SuppressionDirective {
+                directive_line: chunk.header_line,
+                target_start: body_start,
+                target_end: end_line,
+                what,
+                flavor: SuppressionFlavor::Ignore,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,5 +1472,92 @@ mod tests {
         // A document that opens with prose has no frontmatter block at all.
         let src = "# Heading\n---\nparams:\n  year: 2024\n---\n";
         assert!(!frontmatter_declares_params(src));
+    }
+
+    // =========================================================================
+    // F2 Step 4: chunk-level suppression
+    // =========================================================================
+
+    use crate::cross_file::types::{LineSuppression, SuppressionFlavor};
+
+    #[test]
+    fn chunk_option_blanket_suppresses_whole_body() {
+        let src = "```{r, raven.ignore=TRUE}\nx <- undefined\ny <- also_undefined\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert_eq!(meta.ignored_ranges.len(), 1);
+        let r = &meta.ignored_ranges[0];
+        assert_eq!((r.start, r.end), (1, 2));
+        assert_eq!(r.what, LineSuppression::All);
+        // Enumerated as an Ignore-flavored directive anchored at the header.
+        assert_eq!(meta.suppression_directives.len(), 1);
+        assert_eq!(meta.suppression_directives[0].directive_line, 0);
+        assert_eq!(
+            meta.suppression_directives[0].flavor,
+            SuppressionFlavor::Ignore
+        );
+    }
+
+    #[test]
+    fn chunk_option_per_code_suppresses_only_listed_codes() {
+        let src = "```{r, raven.ignore=\"undefined-variable\"}\nx <- undefined\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert_eq!(meta.ignored_ranges.len(), 1);
+        let r = &meta.ignored_ranges[0];
+        assert!(r.what.covers(Some("undefined-variable")));
+        assert!(!r.what.covers(Some("line-length")));
+    }
+
+    #[test]
+    fn chunk_option_false_does_not_suppress() {
+        let src = "```{r, raven.ignore=FALSE}\nx <- undefined\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert!(meta.ignored_ranges.is_empty());
+    }
+
+    #[test]
+    fn in_chunk_ignore_chunk_directive_suppresses_body() {
+        let src = "```{r}\n# raven: ignore-chunk\nx <- undefined\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert_eq!(meta.ignored_ranges.len(), 1);
+        let r = &meta.ignored_ranges[0];
+        // Body is lines 1..=2 (the directive line + the code line).
+        assert_eq!((r.start, r.end), (1, 2));
+        assert_eq!(r.what, LineSuppression::All);
+    }
+
+    #[test]
+    fn in_chunk_ignore_chunk_with_code_selector() {
+        let src =
+            "```{r}\nx <- undefined  # nothing\n# raven: ignore-chunk[undefined-variable]\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert_eq!(meta.ignored_ranges.len(), 1);
+        assert!(
+            meta.ignored_ranges[0]
+                .what
+                .covers(Some("undefined-variable"))
+        );
+        assert!(!meta.ignored_ranges[0].what.covers(Some("line-length")));
+    }
+
+    #[test]
+    fn plain_chunk_without_option_is_not_suppressed() {
+        let src = "```{r}\nx <- 1\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert!(meta.ignored_ranges.is_empty());
+        assert!(meta.suppression_directives.is_empty());
+    }
+
+    #[test]
+    fn non_r_chunk_option_is_ignored() {
+        let src = "```{python, raven.ignore=TRUE}\nprint('hi')\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert!(meta.ignored_ranges.is_empty());
     }
 }

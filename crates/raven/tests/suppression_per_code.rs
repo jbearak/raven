@@ -33,6 +33,12 @@ fn check_one(source: &str) -> String {
     run_check(dir.path())
 }
 
+fn check_one_rmd(source: &str) -> String {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("main.Rmd"), source).unwrap();
+    run_check(dir.path())
+}
+
 #[test]
 fn matching_code_suppresses_undefined_variable() {
     let out = check_one("result <- totally_undefined_thing # raven: ignore[undefined-variable]\n");
@@ -119,5 +125,51 @@ fn ignore_that_suppresses_nothing_is_not_reported_by_default() {
     assert!(
         !out.contains("unused-suppression") && !out.contains("Unused"),
         "a silent `ignore` must NOT be reported as unused by default. Output:\n{out}"
+    );
+}
+
+// ---- F2 Step 4: chunk-level suppression for .Rmd/.qmd ----
+
+#[test]
+fn chunk_option_raven_ignore_suppresses_chunk_body() {
+    let out = check_one_rmd(
+        "---\ntitle: T\n---\n\n```{r, raven.ignore=TRUE}\nresult <- totally_undefined_thing\n```\n",
+    );
+    assert!(
+        !out.contains("Undefined variable: totally_undefined_thing"),
+        "raven.ignore=TRUE chunk option should suppress the whole chunk body. Output:\n{out}"
+    );
+}
+
+#[test]
+fn chunk_without_option_still_reports() {
+    let out =
+        check_one_rmd("---\ntitle: T\n---\n\n```{r}\nresult <- totally_undefined_thing\n```\n");
+    assert!(
+        out.contains("Undefined variable: totally_undefined_thing"),
+        "a chunk without raven.ignore must still report diagnostics. Output:\n{out}"
+    );
+}
+
+#[test]
+fn in_chunk_ignore_chunk_directive_suppresses_body_e2e() {
+    let out = check_one_rmd(
+        "---\ntitle: T\n---\n\n```{r}\n# raven: ignore-chunk\nresult <- totally_undefined_thing\n```\n",
+    );
+    assert!(
+        !out.contains("Undefined variable: totally_undefined_thing"),
+        "# raven: ignore-chunk should suppress the chunk body. Output:\n{out}"
+    );
+}
+
+#[test]
+fn chunk_option_per_code_only_targets_named_code() {
+    // raven.ignore="package-not-installed" must NOT suppress an undefined-variable.
+    let out = check_one_rmd(
+        "---\ntitle: T\n---\n\n```{r, raven.ignore=\"package-not-installed\"}\nresult <- totally_undefined_thing\n```\n",
+    );
+    assert!(
+        out.contains("Undefined variable: totally_undefined_thing"),
+        "per-code chunk option must not suppress an unrelated code. Output:\n{out}"
     );
 }

@@ -442,3 +442,44 @@ three-group corpus passed in 456s — no regression).
    unused. Consistent with Step-1 decision #3. Not surfaced as a user feature.
 
 ### Remaining: Step 4, 5, then review (task 12) + PR (task 13)
+
+---
+
+## PROGRESS UPDATE — Step 4 DONE (on `prod-test`)
+
+**Status:** fmt clean, clippy clean, full `cargo test -p raven --features
+test-support` green (4647 lib + integration + 55 doctests), e2e
+`suppression_per_code` 12 pass. (bun + strict corpus deferred to the pre-review
+gate run.)
+
+### Step 4 — chunk-level suppression for `.Rmd`/`.qmd`: DONE
+- **`chunks.rs`**: added `append_chunk_suppressions(meta, raw_text)` +
+  helpers (`chunk_ignore_option`, `parse_ignore_chunk_directive`,
+  `split_header_options`, `ignore_chunk_re`, `chunk_codes_or_all`). Two forms,
+  both mapped onto the Step-2 `SuppressionRange` machinery over the chunk
+  **body** lines (`r_chunk_body_range`), `Ignore` flavor:
+  1. knitr header option `{r, raven.ignore=TRUE}` (blanket), `=FALSE` (off),
+     `="undefined-variable"` / `='a,b'` (per-code, quoted);
+  2. in-chunk `# raven: ignore-chunk` (optionally `[code]`) anywhere in the body.
+  `# raven: ignore-start/end` inside a chunk already works via the normal
+  directive parser (chunk bodies survive masking) — no special handling.
+- **`handlers.rs` `DiagnosticsSnapshot::build`**: calls
+  `append_chunk_suppressions(&mut directive_meta, &doc.text())` for Rmd docs.
+  This is the single chokepoint where `directive_meta` is finalized for
+  diagnostics AND raw text is available (chunk headers are blanked in the masked
+  analysis text, so the option must be read from raw). The CLI `raven check`
+  path funnels through the same `DiagnosticsSnapshot::build`, so it's covered.
+  The mutated `directive_meta` is the snapshot's owned copy, not the shared Arc.
+- **Tests**: 7 chunks.rs unit tests + 4 e2e tests in `suppression_per_code.rs`.
+
+### Decisions made this session (append to deferred list)
+9. **`# raven: ignore-chunk` is recognized only via the chunk-aware pass**
+   (`append_chunk_suppressions`), not the flat `parse_directives` — it needs
+   chunk boundaries. `parse_directives` correctly ignores it (no regex match),
+   so there is no double-processing.
+10. **Chunk suppressions are `Ignore`-flavored** (silent). There is no
+    `expect`-chunk form; an `expect` inside a chunk body still works as a normal
+    line/next directive via `parse_directives`. Revisit if a chunk-level expect
+    is wanted.
+
+### Remaining: Step 5 (docs), then review (task 12) + PR (task 13)
