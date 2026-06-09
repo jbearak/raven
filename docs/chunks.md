@@ -161,6 +161,7 @@ Raven parses the header inside `{…}` and recognizes:
 Two options affect Raven specifically:
 
 - `eval = FALSE` (or `eval = F`) — Raven dims the chunk's background tint to signal that it will not be evaluated by `knitr` or `quarto render`. The CodeLens still offers to run the chunk manually if you want.
+- `raven.ignore` — suppresses Raven's diagnostics for the chunk body: `raven.ignore=TRUE` silences everything, `raven.ignore="undefined-variable, line-length"` narrows it to the listed codes (`raven.ignore=FALSE` is the default no-op). See [Suppressing diagnostics in a chunk](#suppressing-diagnostics-in-a-chunk).
 
 Every other option is preserved on the parsed chunk but Raven does not interpret it.
 
