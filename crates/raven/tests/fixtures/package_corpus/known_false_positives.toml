@@ -21763,18 +21763,6 @@ start_line = 29
 start_character = 24
 end_line = 29
 end_character = 31
-
-[[false_positive]]
-package = "httr"
-path = "demo/oauth2-yelp.R"
-message = "Undefined variable: token"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 40
-start_character = 31
-end_line = 40
-end_character = 36
 [[false_positive]]
 package = "lattice"
 path = "tests/MASSch04.R"
@@ -23428,72 +23416,6 @@ end_line = 181
 end_character = 44
 [[false_positive]]
 package = "survival"
-path = "R/parsecovar.R"
-message = "Undefined variable: k"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 178
-start_character = 48
-end_line = 178
-end_character = 49
-[[false_positive]]
-package = "survival"
-path = "R/parsecovar.R"
-message = "Undefined variable: k"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 181
-start_character = 46
-end_line = 181
-end_character = 47
-[[false_positive]]
-package = "survival"
-path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 35
-start_character = 21
-end_line = 35
-end_character = 28
-[[false_positive]]
-package = "survival"
-path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 35
-start_character = 46
-end_line = 35
-end_character = 53
-[[false_positive]]
-package = "survival"
-path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 35
-start_character = 59
-end_line = 35
-end_character = 66
-[[false_positive]]
-package = "survival"
-path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 41
-start_character = 27
-end_line = 41
-end_character = 34
-[[false_positive]]
-package = "survival"
 path = "R/survcallback.R"
 message = "Undefined variable: nvar"
 reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
@@ -24779,17 +24701,7 @@ start_line = 38
 start_character = 61
 end_line = 38
 end_character = 63
-[[false_positive]]
-package = "survival"
-path = "tests/multi2.R"
-message = "Undefined variable: d1"
-reason = "formula variable (introduced by model.frame/model evaluation)"
 
-[false_positive.range]
-start_line = 78
-start_character = 8
-end_line = 78
-end_character = 10
 [[false_positive]]
 package = "survival"
 path = "tests/multi2.R"
@@ -26176,17 +26088,7 @@ start_line = 41
 start_character = 28
 end_line = 41
 end_character = 37
-[[false_positive]]
-package = "utils"
-path = "R/mach-o.R"
-message = "Undefined variable: f"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
 
-[false_positive.range]
-start_line = 47
-start_character = 24
-end_line = 47
-end_character = 25
 [[false_positive]]
 package = "utils"
 path = "R/page.R"

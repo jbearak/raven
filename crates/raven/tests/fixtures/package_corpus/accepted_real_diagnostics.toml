@@ -2741,3 +2741,102 @@ start_line = 371
 start_character = 17
 end_line = 371
 end_character = 27
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 35
+start_character = 21
+end_line = 35
+end_character = 28
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 35
+start_character = 46
+end_line = 35
+end_character = 53
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 35
+start_character = 59
+end_line = 35
+end_character = 66
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 41
+start_character = 27
+end_line = 41
+end_character = 34
+[[diagnostic]]
+package = "httr"
+path = "demo/oauth2-yelp.R"
+message = "Undefined variable: token"
+evidence = "File defines yelp_token (line 24) but uses undefined token (line 41); should be config(token = yelp_token)."
+
+[diagnostic.range]
+start_line = 40
+start_character = 31
+end_line = 40
+end_character = 36
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: d1"
+evidence = "d1 never defined anywhere in file; dead code inside if(FALSE) block; same pattern as accepted indx1/2/3 entries."
+
+[diagnostic.range]
+start_line = 78
+start_character = 8
+end_line = 78
+end_character = 10
+[[diagnostic]]
+package = "utils"
+path = "R/mach-o.R"
+message = "Undefined variable: f"
+evidence = "isSeekable(f) called at line 48 but f <- filename assigned at line 49; used-before-defined."
+
+[diagnostic.range]
+start_line = 47
+start_character = 24
+end_line = 47
+end_character = 25
+[[diagnostic]]
+package = "survival"
+path = "R/parsecovar.R"
+message = "Undefined variable: k"
+evidence = "any(k = expr) passes named arg to any(), does not bind k in calling scope. k undefined at stop() call."
+
+[diagnostic.range]
+start_line = 178
+start_character = 48
+end_line = 178
+end_character = 49
+[[diagnostic]]
+package = "survival"
+path = "R/parsecovar.R"
+message = "Undefined variable: k"
+evidence = "any(k = expr) passes named arg to any(), does not bind k in calling scope. k undefined at stop() call."
+
+[diagnostic.range]
+start_line = 181
+start_character = 46
+end_line = 181
+end_character = 47
