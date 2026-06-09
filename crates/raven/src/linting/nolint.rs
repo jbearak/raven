@@ -1,6 +1,10 @@
 //! Lint suppression parsing.
 //!
 //! Recognised markers:
+//! * `# raven: ignore` / `-next` / `-start` / `-end` / `-file` — Raven's
+//!   primary suppression namespace (F2), optionally with a `[code]` selector.
+//!   In this lint-track parser a `[code]` selector is accepted but applies
+//!   blanket per line (same interim behaviour as `# nolint: rule`).
 //! * `# nolint` (or `# nolint: rule_a, rule_b`) — lintr-style line-level
 //!   suppression on the same source line.
 //! * `# nolint start` / `# nolint end` — lintr-style block suppression,
@@ -36,6 +40,7 @@ impl Suppressions {
         let mut suppressed = HashSet::new();
         let mut in_block = false;
         let mut block_start: Option<u32> = None;
+        let mut file_level = false;
 
         for (idx, line) in text.lines().enumerate() {
             let line_no = idx as u32;
@@ -67,6 +72,9 @@ impl Suppressions {
                 Some(NolintMarker::NextLine) => {
                     suppressed.insert(line_no + 1);
                 }
+                Some(NolintMarker::File) => {
+                    file_level = true;
+                }
                 None => {}
             }
 
@@ -80,6 +88,14 @@ impl Suppressions {
         if in_block && let Some(start) = block_start {
             let total_lines = text.lines().count() as u32;
             for l in start..total_lines {
+                suppressed.insert(l);
+            }
+        }
+
+        // `# raven: ignore-file` suppresses every line in the file.
+        if file_level {
+            let total_lines = text.lines().count() as u32;
+            for l in 0..total_lines {
                 suppressed.insert(l);
             }
         }
@@ -101,6 +117,8 @@ enum NolintMarker {
     End,
     /// `# @lsp-ignore-next` — suppresses the line *after* the marker.
     NextLine,
+    /// `# raven: ignore-file` — suppresses every line in the file.
+    File,
 }
 
 /// Scan a line for a `# nolint` marker (with optional `start`/`end` suffix).
@@ -220,6 +238,14 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
         .trim_start_matches(|c: char| c == '#' || c.is_whitespace())
         .to_ascii_lowercase();
 
+    // `# raven:` is the primary suppression namespace (F2). It covers the
+    // lint track here exactly as `# nolint`/`@lsp-ignore` do; an optional
+    // `[code]` selector is accepted but, like `# nolint: rule`, applies
+    // blanket per line in this lint-track parser for now.
+    if let Some(marker) = classify_raven(&trimmed) {
+        return Some(marker);
+    }
+
     if let Some(rest) = matches_keyword(&trimmed, "nolint") {
         let rest = rest.trim_start();
         return if rest.starts_with("start") {
@@ -247,6 +273,38 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
     }
 
     None
+}
+
+/// Classify a `# raven: <action>` suppression directive (lint track).
+///
+/// `trimmed` is the lowercased comment body with leading `#`/whitespace
+/// stripped. Recognizes `ignore`, `ignore-next`, `ignore-start`, `ignore-end`,
+/// and `ignore-file`, each optionally followed by a `[code]` selector. Returns
+/// `None` when the body is not a `raven:` directive.
+fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
+    let rest = matches_keyword(trimmed, "raven")?;
+    // Require the namespace separator `:` (optionally surrounded by spaces).
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    // Drop any `[code]` selector — blanket for now in the lint-track parser.
+    let action = rest.split('[').next().unwrap_or(rest).trim();
+    let action = matches_keyword(action, "ignore")?;
+    let action = action.trim_start_matches('-').trim();
+    if action.is_empty() {
+        Some(NolintMarker::Line)
+    } else if action.starts_with("next") {
+        Some(NolintMarker::NextLine)
+    } else if action.starts_with("start") {
+        Some(NolintMarker::Start)
+    } else if action.starts_with("end") {
+        Some(NolintMarker::End)
+    } else if action.starts_with("file") {
+        Some(NolintMarker::File)
+    } else {
+        // `# raven: ignore<something-unknown>` — be conservative and treat as a
+        // plain line ignore rather than silently dropping it.
+        Some(NolintMarker::Line)
+    }
 }
 
 /// Match `keyword` as a word in `haystack`: the keyword must appear as a
@@ -426,5 +484,70 @@ mod tests {
         let s = Suppressions::from_text("# x <- 1 # @lsp-ignore-next\ny <- 2\n");
         assert!(!s.is_suppressed(0));
         assert!(!s.is_suppressed(1));
+    }
+
+    // ---- F2: `# raven:` primary suppression namespace (lint track) ----
+
+    #[test]
+    fn raven_ignore_suppresses_current_line() {
+        let s = Suppressions::from_text("x = 1 # raven: ignore\ny = 2\n");
+        assert!(s.is_suppressed(0));
+        assert!(!s.is_suppressed(1));
+    }
+
+    #[test]
+    fn raven_ignore_with_code_selector_suppresses_line() {
+        let s = Suppressions::from_text("x = 1 # raven: ignore[line-length]\n");
+        assert!(s.is_suppressed(0));
+    }
+
+    #[test]
+    fn raven_ignore_next_suppresses_following_line() {
+        let s = Suppressions::from_text("# raven: ignore-next\nx = 1\ny = 2\n");
+        assert!(!s.is_suppressed(0));
+        assert!(s.is_suppressed(1));
+        assert!(!s.is_suppressed(2));
+    }
+
+    #[test]
+    fn raven_ignore_start_end_brackets_block() {
+        let src = "a\n# raven: ignore-start\nb\nc\n# raven: ignore-end\nd\n";
+        let s = Suppressions::from_text(src);
+        assert!(!s.is_suppressed(0));
+        assert!(s.is_suppressed(1));
+        assert!(s.is_suppressed(2));
+        assert!(s.is_suppressed(3));
+        assert!(s.is_suppressed(4));
+        assert!(!s.is_suppressed(5));
+    }
+
+    #[test]
+    fn raven_ignore_file_suppresses_every_line() {
+        let s = Suppressions::from_text("# raven: ignore-file\nx = 1\ny = 2\nz = 3\n");
+        assert!(s.is_suppressed(0));
+        assert!(s.is_suppressed(1));
+        assert!(s.is_suppressed(2));
+        assert!(s.is_suppressed(3));
+    }
+
+    #[test]
+    fn raven_ignore_file_with_code_selector_suppresses_every_line() {
+        let s = Suppressions::from_text("# raven: ignore-file[object-name]\nx = 1\n");
+        assert!(s.is_suppressed(0));
+        assert!(s.is_suppressed(1));
+    }
+
+    #[test]
+    fn typo_ravenous_does_not_suppress() {
+        let s = Suppressions::from_text("x = 1 # ravenous appetite\n");
+        assert!(!s.is_suppressed(0));
+    }
+
+    #[test]
+    fn raven_without_namespace_colon_does_not_suppress() {
+        // A prose comment that happens to start with "raven" but is not a
+        // `raven:` directive must not suppress.
+        let s = Suppressions::from_text("x = 1 # raven is a static analyzer\n");
+        assert!(!s.is_suppressed(0));
     }
 }

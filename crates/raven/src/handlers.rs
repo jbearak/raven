@@ -10558,6 +10558,14 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn raven_ignore_suppresses_diagnostic_on_ast_path() {
+        // F2: `# raven:` aliases on the analyzer AST suppression path.
+        assert_none("TRUE <- 1 # raven: ignore");
+        assert_none("TRUE <- 1 # raven: ignore[assign-to-string-literal]");
+        assert_none("# raven: ignore-next\nTRUE <- 1");
+    }
+
+    #[test]
     fn lsp_ignore_marker_requires_word_boundary() {
         // `@lsp-ignored` and `@lsp-ignore_foo` aren't the directive — must
         // not be picked up by substring matching.
@@ -11144,13 +11152,33 @@ enum LspIgnoreKind {
 }
 
 /// Classify the text after a `#` that opens a comment. Returns `SameLine`
-/// for `@lsp-ignore` (with optional rule filter) and `NextLine` for
-/// `@lsp-ignore-next`. Returns `None` otherwise. Matches word-boundary so
-/// `@lsp-ignored` does not match `@lsp-ignore`.
+/// for `@lsp-ignore` / `# raven: ignore` (with optional `[code]` selector) and
+/// `NextLine` for `@lsp-ignore-next` / `# raven: ignore-next`. Returns `None`
+/// otherwise. Matches word-boundary so `@lsp-ignored` does not match
+/// `@lsp-ignore`.
 fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
     // Allow extra leading `#` characters (`## @lsp-ignore`) and whitespace,
     // mirroring `linting::nolint::classify`.
     let trimmed = after_hash.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
+
+    // `# raven:` primary namespace (F2): the analyzer track aliases the line /
+    // next-line ignore forms.
+    if let Some(rest) = trimmed.strip_prefix("raven:") {
+        let action = rest.trim_start();
+        let action = action.split('[').next().unwrap_or(action).trim();
+        let suffix = action.strip_prefix("ignore")?;
+        let suffix = suffix.trim_start_matches('-').trim();
+        return if suffix.starts_with("next") {
+            Some(LspIgnoreKind::NextLine)
+        } else if suffix.is_empty() {
+            Some(LspIgnoreKind::SameLine)
+        } else {
+            // `ignore-start`/`ignore-end`/`ignore-file` are not modeled on the
+            // analyzer AST path yet; don't misclassify them as a line ignore.
+            None
+        };
+    }
+
     let rest = trimmed.strip_prefix("@lsp-ignore")?;
     // Word-boundary: the next byte (if any) must not be an identifier byte.
     // `-` and `:` are explicitly allowed because they begin the `-next`

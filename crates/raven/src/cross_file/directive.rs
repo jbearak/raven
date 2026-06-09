@@ -18,6 +18,8 @@ struct DirectivePatterns {
     working_dir: Regex,
     ignore: Regex,
     ignore_next: Regex,
+    raven_ignore: Regex,
+    raven_ignore_next: Regex,
     declare_var: Regex,
     declare_func: Regex,
 }
@@ -114,6 +116,17 @@ fn patterns() -> &'static DirectivePatterns {
             ignore_next: Regex::new(
                 r"^\s*#\s*@lsp-ignore-next\s*:?\s*$"
             ).unwrap(),
+            // `# raven:` is the primary suppression namespace (F2). For the
+            // analyzer track it aliases the line / next-line ignore forms
+            // (`@lsp-ignore` parity); an optional `[code]` selector is accepted.
+            // `-next` is excluded from the same-line form by requiring the
+            // `ignore` token to be followed only by an optional `[code]` and EOL.
+            raven_ignore: Regex::new(
+                r"#\s*raven:\s*ignore(?:\[[^\]]*\])?\s*$"
+            ).unwrap(),
+            raven_ignore_next: Regex::new(
+                r"^\s*#\s*raven:\s*ignore-next(?:\[[^\]]*\])?\s*$"
+            ).unwrap(),
             // Declaration directives for variables
             // Synonyms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
@@ -167,9 +180,10 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         }
 
         // Fast pre-filter: skip lines that can't contain any directive.
-        // All directives require "@lsp-" so a cheap contains() check avoids
-        // running 7 regex matches on the vast majority of lines.
-        if !line.contains("@lsp-") {
+        // All directives require "@lsp-" (or the "raven:" suppression
+        // namespace) so a cheap contains() check avoids running the regex
+        // battery on the vast majority of lines.
+        if !line.contains("@lsp-") && !line.contains("raven:") {
             continue;
         }
 
@@ -293,6 +307,23 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         if patterns.ignore_next.is_match(line) {
             log::trace!("  Parsed @lsp-ignore-next directive at line {}", line_num);
             meta.ignored_next_lines.insert(line_num + 1);
+            continue;
+        }
+
+        // Full-file: `# raven:` primary-namespace ignore aliases (F2).
+        // `-next` is checked first since the same-line form excludes it.
+        if patterns.raven_ignore_next.is_match(line) {
+            log::trace!(
+                "  Parsed `# raven: ignore-next` directive at line {}",
+                line_num
+            );
+            meta.ignored_next_lines.insert(line_num + 1);
+            continue;
+        }
+
+        if patterns.raven_ignore.is_match(line) {
+            log::trace!("  Parsed `# raven: ignore` directive at line {}", line_num);
+            meta.ignored_lines.insert(line_num);
             continue;
         }
 
@@ -499,6 +530,27 @@ mod tests {
         assert!(!is_line_ignored(&meta, 1)); // x <- 1
         assert!(!is_line_ignored(&meta, 2)); // @lsp-ignore-next line
         assert!(is_line_ignored(&meta, 3)); // y <- 2 (next line after ignore-next)
+    }
+
+    /// F2: `# raven: ignore` / `ignore-next` alias the analyzer-track ignore
+    /// lines exactly like `@lsp-ignore` / `@lsp-ignore-next`.
+    #[test]
+    fn test_raven_ignore_aliases_analyzer_track() {
+        let content =
+            "x <- undefined # raven: ignore\n# raven: ignore-next\ny <- undefined2\nz <- ok";
+        let meta = parse_directives(content);
+        assert!(is_line_ignored(&meta, 0)); // trailing `# raven: ignore`
+        assert!(!is_line_ignored(&meta, 1)); // the directive line itself
+        assert!(is_line_ignored(&meta, 2)); // targeted by ignore-next
+        assert!(!is_line_ignored(&meta, 3));
+    }
+
+    /// F2: a `[code]` selector on the analyzer-track alias is accepted.
+    #[test]
+    fn test_raven_ignore_with_code_selector() {
+        let content = "x <- undefined # raven: ignore[undefined-variable]";
+        let meta = parse_directives(content);
+        assert!(is_line_ignored(&meta, 0));
     }
 
     #[test]

@@ -275,15 +275,20 @@ REditorSupport's LSP will surface `lintr` diagnostics; Raven will continue to su
 
 ## Suppression matrix
 
-Raven recognizes both `lintr` and its own suppression markers. All four apply to lint diagnostics. `# @lsp-ignore` and `# @lsp-ignore-next` additionally apply to several of Raven's other diagnostics — undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol errors. They do **not** suppress structural syntax parse errors (unbalanced brackets, orphan `else`, etc.), which can only be turned off with `raven.diagnostics.enabled`, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth exceeded, redundant directive), which are governed only by their own [severity settings](diagnostics.md#cross-file-diagnostics). `# nolint` and `# nolint start/end` apply to lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks only; they do not suppress any parse-error diagnostics.
+Raven recognizes its own `# raven:` primary namespace, the legacy `@lsp-ignore` aliases, and `lintr`'s `# nolint`. All apply to lint diagnostics. `# raven: ignore` / `# raven: ignore-next` (and their `@lsp-ignore` / `@lsp-ignore-next` aliases) additionally apply to several of Raven's other diagnostics — undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol errors. They do **not** suppress structural syntax parse errors (unbalanced brackets, orphan `else`, etc.), which can only be turned off with `raven.diagnostics.enabled`, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth exceeded, redundant directive), which are governed only by their own [severity settings](diagnostics.md#cross-file-diagnostics). `# nolint` and `# nolint start/end` apply to lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks only; they do not suppress any parse-error diagnostics.
 
 | Marker | Scope | Origin | Applies to |
 |---|---|---|---|
+| `# raven: ignore` (trailing) | The line it appears on | Raven (primary) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol diagnostics. **Not** parse errors, nor the dependency-graph diagnostics |
+| `# raven: ignore-next` | The *following* source line | Raven (primary) | Same as `# raven: ignore` |
+| `# raven: ignore-start` … `# raven: ignore-end` | Inclusive range between the two markers | Raven (primary) | Lint diagnostics |
+| `# raven: ignore-file` | Every line in the file | Raven (primary) | Lint diagnostics |
+| `# raven: ignore[code]` | As above, narrowed to one code | Raven (primary) | The selector is accepted in all forms; in the lint track it currently suppresses all rules on the target line (per-code enforcement is staged) |
 | `# nolint` (trailing) | The line it appears on | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
 | `# nolint: rule_a, rule_b` | The line it appears on | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks (rule filter accepted but currently ignored — suppresses all rules on the line) |
 | `# nolint start` … `# nolint end` | Inclusive range between the two markers | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
-| `# @lsp-ignore` | The line it appears on | Raven | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol diagnostics. **Not** parse errors, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth, redundant directive) |
-| `# @lsp-ignore-next` | The *following* source line | Raven | Same as `# @lsp-ignore` |
+| `# @lsp-ignore` | The line it appears on | Raven (alias of `# raven: ignore`) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol diagnostics. **Not** parse errors, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth, redundant directive) |
+| `# @lsp-ignore-next` | The *following* source line | Raven (alias of `# raven: ignore-next`) | Same as `# @lsp-ignore` |
 
 Notes:
 

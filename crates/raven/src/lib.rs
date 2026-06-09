@@ -23,6 +23,7 @@ pub mod chunks;
 pub mod completion_context;
 pub mod config_file;
 pub mod content_provider;
+pub mod diagnostic_code;
 pub mod document_store;
 pub mod extract_op;
 pub mod file_path_intellisense;

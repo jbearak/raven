@@ -4,7 +4,7 @@ Raven recognizes special comment directives that provide hints the static analyz
 
 ## General Syntax
 
-All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # @lsp-source file.R`. The one exception is `@lsp-ignore`, which works as a trailing comment.
+All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # @lsp-source file.R`. The exceptions are the ignore markers `# raven: ignore` and its alias `@lsp-ignore`, which work as trailing comments.
 
 All directives support optional colon and quotes:
 ```r
@@ -184,13 +184,38 @@ eval(parse(text = code_string))
 
 ## Ignore Directives
 
+Raven's primary suppression namespace is **`# raven:`**. It works both in the
+editor (LSP) and in `raven check`. The legacy `@lsp-ignore` / `@lsp-ignore-next`
+markers remain permanent aliases for the line and next-line forms.
+
 Suppress diagnostics on a specific line:
 
 ```r
-x <- foo # @lsp-ignore  # Trailing form: suppresses diagnostics on this line
-# @lsp-ignore-next      # Standalone form: suppresses diagnostics on the next line
+x <- foo # raven: ignore    # Trailing form: suppresses diagnostics on this line
+# raven: ignore-next        # Standalone form: suppresses diagnostics on the next line
+
+x <- foo # @lsp-ignore      # Alias of `# raven: ignore`
+# @lsp-ignore-next          # Alias of `# raven: ignore-next`
 ```
 
-A standalone `# @lsp-ignore` on its own line has no effect — comment lines carry no diagnostics. Use `# @lsp-ignore-next` to suppress the following line, or place `# @lsp-ignore` as a trailing comment on the line you want suppressed.
+An optional `[code]` selector narrows a suppression to a single diagnostic
+code, e.g. `# raven: ignore[undefined-variable]` or
+`x <- foo # @lsp-ignore[undefined-variable]`. The diagnostic codes are the
+kebab-case names listed in [Diagnostics](diagnostics.md) and the lint rule
+names in [Linting](linting.md) (both `kebab-case` and lintr's `snake_case`
+spelling are accepted). A bare `# raven: ignore` with no selector suppresses
+every diagnostic on the target line.
 
-`@lsp-ignore` is the only directive that can appear as a trailing comment.
+A standalone `# raven: ignore` (or `# @lsp-ignore`) on its own line has no
+effect — comment lines carry no diagnostics. Use the `-next` form to suppress
+the following line, or place the marker as a trailing comment on the line you
+want suppressed.
+
+The `# raven:` ignore and ignore-next forms, like `@lsp-ignore`, may appear as
+trailing comments. The broader **file-level** (`# raven: ignore-file`) and
+**block** (`# raven: ignore-start` … `# raven: ignore-end`) forms currently
+apply to the opt-in [style/lint diagnostics](linting.md); see
+[Linting](linting.md) for the full suppression matrix. For lintr compatibility,
+`# nolint` / `# nolint start` / `# nolint end` also remain, scoped to the lint
+diagnostics.
+
