@@ -157,7 +157,15 @@ use std::path::Path;
 /// - `<root>/tests/testthat/**/*.R` (or `*.r`) → `Test`
 /// - `<root>/tests/testit/**/*.R` (or `*.r`) → `Test`
 /// - `<root>/tests/*.R` (direct children only, or `*.r`) → `Test`
+/// - `<root>/inst/tinytest/**/*.R` (or `*.r`) → `Test`
+/// - `<root>/inst/unitTests/**/*.R` (or `*.r`) → `Test`
 /// - everything else → `None`
+///
+/// `inst/tinytest/` and `inst/unitTests/` are installed test suites that run
+/// with the package loaded, so they are `Test`-kind (one-way package R/
+/// visibility) like `tests/testthat/`. They are NOT testthat-managed, so
+/// [`is_testthat_or_testit_test`] still excludes them from testthat-specific
+/// helper/attached-package injection.
 pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind> {
     let rel = path.strip_prefix(workspace_root).ok()?;
     let mut comps = rel.components();
@@ -170,6 +178,15 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
 
     match first {
         "R" => Some(RFileKind::Source),
+        "inst" => {
+            // Installed test suites run with the package loaded.
+            let second = comps.next()?.as_os_str().to_str()?;
+            if second == "tinytest" || second == "unitTests" {
+                Some(RFileKind::Test)
+            } else {
+                None
+            }
+        }
         "tests" => {
             let second = comps.next()?.as_os_str().to_str()?;
             if second == "testthat" || second == "testit" {
@@ -208,10 +225,18 @@ pub fn is_testthat_or_testit_test(path: &Path, workspace_root: &Path) -> bool {
 }
 
 /// Returns `true` when `path` is an R file under one of the package's
-/// "dev-context" directories: `inst/`, `demo/`, `data-raw/`, `vignettes/`,
-/// `revdep/`, `man/`. These directories see the package's own R/ top-level
-/// symbols and NAMESPACE imports (one-way: their defs never leak into R/,
-/// and they don't see each other). Package mode only.
+/// "dev-context" directories: `demo/`, `vignettes/`, `data-raw/`, `man/`.
+/// These directories see the package's own R/ top-level symbols and NAMESPACE
+/// imports (one-way: their defs never leak into R/, and they don't see each
+/// other) because the package is loaded when their code runs. Package mode
+/// only.
+///
+/// `inst/` and `revdep/` are deliberately excluded: plain `inst/` scripts
+/// (examples, shiny apps, rmarkdown templates) and reverse-dependency checks
+/// are not run with the package implicitly loaded, so they rely on explicit
+/// `library()`/directives like any other script. (Installed test suites under
+/// `inst/tinytest/` and `inst/unitTests/` are handled separately as `Test`-kind
+/// files by [`is_r_source_path`].)
 pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
     let Some(rel) = path.strip_prefix(workspace_root).ok() else {
         return false;
@@ -226,10 +251,7 @@ pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
     let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
         return false;
     };
-    matches!(
-        first,
-        "inst" | "demo" | "data-raw" | "vignettes" | "revdep" | "man"
-    )
+    matches!(first, "demo" | "data-raw" | "vignettes" | "man")
 }
 
 /// Returns `true` when `path` is an R file anywhere under the workspace root
@@ -554,10 +576,6 @@ mod path_tests {
     fn dev_context_path_recognizes_all_dirs() {
         let root = Path::new("/work/pkg");
         assert!(is_dev_context_path(
-            Path::new("/work/pkg/inst/script.R"),
-            root
-        ));
-        assert!(is_dev_context_path(
             Path::new("/work/pkg/demo/example.R"),
             root
         ));
@@ -570,16 +588,59 @@ mod path_tests {
             root
         ));
         assert!(is_dev_context_path(
-            Path::new("/work/pkg/revdep/check.R"),
-            root
-        ));
-        assert!(is_dev_context_path(
             Path::new("/work/pkg/man/rmd/topic.Rmd"),
             root
         ));
-        // Nested paths
-        assert!(is_dev_context_path(
+    }
+
+    /// F4: `inst/` and `revdep/` are no longer blanket dev-context — plain
+    /// `inst/` scripts and revdep checks rely on explicit `library()`.
+    #[test]
+    fn dev_context_path_excludes_inst_and_revdep() {
+        let root = Path::new("/work/pkg");
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/inst/script.R"),
+            root
+        ));
+        assert!(!is_dev_context_path(
             Path::new("/work/pkg/inst/extdata/helper.R"),
+            root
+        ));
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/revdep/check.R"),
+            root
+        ));
+        // A bare reference inside an installed rmarkdown template skeleton is
+        // NOT silenced: the file sees no implicit package symbols.
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/inst/rmarkdown/templates/report/skeleton/skeleton.Rmd"),
+            root
+        ));
+    }
+
+    /// F4: installed test suites under `inst/tinytest/` and `inst/unitTests/`
+    /// are `Test`-kind (one-way package R/ visibility) — they run with the
+    /// package loaded.
+    #[test]
+    fn r_source_path_recognizes_inst_test_suites() {
+        let root = Path::new("/work/pkg");
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/inst/tinytest/test_a.R"), root),
+            Some(RFileKind::Test),
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/inst/unitTests/runit.foo.R"), root),
+            Some(RFileKind::Test),
+        );
+        // Other inst/ R files remain untracked.
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/inst/script.R"), root),
+            None,
+        );
+        // tinytest/unitTests are not testthat-managed, so testthat-specific
+        // injection still excludes them.
+        assert!(!is_testthat_or_testit_test(
+            Path::new("/work/pkg/inst/tinytest/test_a.R"),
             root
         ));
     }

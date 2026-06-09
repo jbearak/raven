@@ -4798,8 +4798,8 @@ pub(crate) fn append_package_contribution(
     }
 
     // Inject r_internal_symbols and imported_symbols for files under
-    // <root>/R/, <root>/tests/, or dev-context dirs (inst/, demo/,
-    // data-raw/, vignettes/, revdep/).
+    // <root>/R/, <root>/tests/, or dev-context dirs (demo/, data-raw/,
+    // vignettes/, man/).
     let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
         if !is_dev_context {
@@ -19878,13 +19878,10 @@ mod package_contribution_tests {
     fn package_contribution_visible_in_dev_context_dirs() {
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
         let dev_dirs = [
-            "file:///work/pkg/inst/script.R",
             "file:///work/pkg/demo/example.R",
             "file:///work/pkg/data-raw/prepare.R",
             "file:///work/pkg/vignettes/intro.R",
-            "file:///work/pkg/revdep/check.R",
             // Nested paths work too
-            "file:///work/pkg/inst/extdata/helper.R",
             "file:///work/pkg/vignettes/articles/deep.R",
             // man/rmd/ (rlang-style Rmd help files)
             "file:///work/pkg/man/rmd/topic.Rmd",
@@ -19933,6 +19930,64 @@ mod package_contribution_tests {
     }
 
     // ------------------------------------------------------------------
+    // F4: inst/ is no longer blanket dev-context; inst/tinytest is Test-kind
+    // ------------------------------------------------------------------
+
+    /// A plain `inst/` script no longer receives the package contribution, so a
+    /// bare reference there is NOT silenced. An installed test suite under
+    /// `inst/tinytest/` IS `Test`-kind and DOES see package R/ symbols.
+    #[test]
+    fn f4_inst_script_not_silenced_but_tinytest_sees_package() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let graph = super::super::dependency::DependencyGraph::new();
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+
+        let check = |uri_str: &str| -> bool {
+            let uri = Url::parse(uri_str).unwrap();
+            let code = "result <- pkg_fn()";
+            let arts = artifacts_for(&uri, code);
+            let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if u == &uri { Some(arts.clone()) } else { None }
+            };
+            let contrib = make_contribution("/work/pkg", &["pkg_fn"], &[]);
+            let scope = scope_at_position_with_graph(
+                &uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                super::super::config::BackwardDependencyMode::Explicit,
+                &|| false,
+                Some(&contrib),
+            );
+            scope.symbols.contains_key("pkg_fn")
+        };
+
+        assert!(
+            !check("file:///work/pkg/inst/rmarkdown/templates/report/skeleton/skeleton.Rmd"),
+            "plain inst/ script must NOT see package contribution (not silenced)"
+        );
+        assert!(
+            !check("file:///work/pkg/inst/shiny/app.R"),
+            "plain inst/ script must NOT see package contribution (not silenced)"
+        );
+        assert!(
+            check("file:///work/pkg/inst/tinytest/test_a.R"),
+            "inst/tinytest is Test-kind and must see package R/ symbols"
+        );
+        assert!(
+            check("file:///work/pkg/inst/unitTests/runit.foo.R"),
+            "inst/unitTests is Test-kind and must see package R/ symbols"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Test: dev-context dirs do NOT receive testthat helpers
     // ------------------------------------------------------------------
 
@@ -19941,7 +19996,7 @@ mod package_contribution_tests {
     #[test]
     fn dev_context_does_not_receive_testthat_helpers() {
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let uri = Url::parse("file:///work/pkg/inst/script.R").unwrap();
+        let uri = Url::parse("file:///work/pkg/demo/example.R").unwrap();
         let code = "result <- use_helper()";
         let arts = artifacts_for(&uri, code);
 
@@ -20008,7 +20063,7 @@ mod package_contribution_tests {
     #[test]
     fn undefined_symbol_not_visible_in_dev_context() {
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
-        let uri = Url::parse("file:///work/pkg/inst/example.R").unwrap();
+        let uri = Url::parse("file:///work/pkg/demo/example.R").unwrap();
         let code = "result <- nonexistent_fn()";
         let arts = artifacts_for(&uri, code);
 

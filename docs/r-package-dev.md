@@ -111,7 +111,7 @@ test_that("works on demo_input", {
 Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
 for visibility purposes; declare any cross-file fixtures in `helper*.R`.
 
-### Dev-context directories (`inst/`, `demo/`, `data-raw/`, `vignettes/`, `revdep/`, `man/`)
+### Dev-context directories (`demo/`, `data-raw/`, `vignettes/`, `man/`)
 
 Files under these directories get the same one-way read access to package
 symbols as test files: they see all `R/*.R` top-level symbols and NAMESPACE
@@ -120,7 +120,7 @@ data-preparation script, or man-page Rmd helper produces no "undefined
 variable" diagnostic.
 
 Their own definitions never leak back into `R/`, and they don't see each
-other — a function defined in `inst/examples/helpers.R` is not visible from
+other — a function defined in `data-raw/prepare.R` is not visible from
 `vignettes/intro.Rmd`, and vice versa.
 
 ```r
@@ -130,13 +130,22 @@ run_model <- function(data) { ... }
 # vignettes/tutorial.Rmd (or vignettes/tutorial.R)
 result <- run_model(example_data)  # No diagnostic — visible from R/
 
-# inst/scripts/demo.R
+# demo/walkthrough.R
 output <- run_model(sample_input)  # No diagnostic
 ```
 
 Symbols that are NOT exported or defined in `R/` still flag as undefined
 in these directories — the one-way visibility is limited to what the package
 actually provides.
+
+**`inst/` and `revdep/` are not dev-context.** Plain `inst/` scripts (shiny
+apps, rmarkdown template skeletons, example scripts) and reverse-dependency
+checks are not run with the package implicitly loaded, so they rely on an
+explicit `library(yourpkg)` or a [directive](directives.md) just like any other
+script — a bare reference to a package function there *is* flagged. The one
+exception is installed test suites: R files under `inst/tinytest/` and
+`inst/unitTests/` are treated as **test files** (one-way package R/ visibility),
+since those suites run with the package loaded.
 
 ### Build commands
 

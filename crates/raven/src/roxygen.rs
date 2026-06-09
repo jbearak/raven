@@ -1588,7 +1588,7 @@ fn extract_first_identifier(line: &str) -> Option<String> {
 /// assignment in the file, including ones nested inside function bodies, so
 /// reading its keys would leak function-locals into the package-visible
 /// symbol set. That leak previously masked real undefined-variable
-/// diagnostics once dev-context dirs (demo/, inst/, …) gained package
+/// diagnostics once dev-context dirs (demo/, vignettes/, …) gained package
 /// visibility — e.g. stats `demo/smooth.R`'s genuine `x1` bug.
 pub fn extract_top_level_defs(text: &str) -> std::collections::BTreeSet<String> {
     use tree_sitter::Parser;
@@ -1909,7 +1909,7 @@ bar <- function() {}
         // NOT be collected as package-visible top-level definitions; only
         // genuine file-scope bindings are. Regression guard: a function-local
         // `x1 <- ...` inside an `if` block was leaking into
-        // `r_internal_symbols` and, once dev-context dirs (demo/, inst/, …)
+        // `r_internal_symbols` and, once dev-context dirs (demo/, vignettes/, …)
         // gained package visibility, masking real undefined-variable
         // diagnostics (e.g. stats `demo/smooth.R`'s genuine `x1` bug).
         let text = "\
