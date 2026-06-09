@@ -1,15 +1,26 @@
-# Plan: resolve the 10 deferred CodeRabbit findings on PR #420
+# Plan: resolve PR #420 follow-ups (F2 session decisions + deferred CodeRabbit findings)
 
 Self-contained handoff for a fresh session. Branch: **`prod-test`** (PR #420).
-HEAD at handoff: `4140412a`. These are the findings CodeRabbit raised on PR #420
-that the F2 session deferred as out-of-scope for the suppression feature. The
-maintainer wants them **fixed in this same PR** (no tracking issues). "Nothing
-is too small or too difficult to handle immediately" — do all ten, including the
-`system.file()` lifecycle group.
+HEAD at handoff: `789108d6`. The maintainer wants **everything deferred by the
+F2 suppression session resolved in this same PR** (no tracking issues). "Nothing
+is too small or too difficult to handle immediately."
 
-All of these live in subsystems the F2 work did **not** author (the
-`system.file()` resolver, the package-state watcher / sysdata scan, and the NSE
-argument-policy table), so read the surrounding code before touching it.
+This plan covers three things:
+
+1. **F2 session decisions to revisit** (Group F) — judgment calls the F2 session
+   made on a "smallest-reasonable" basis. They are not bugs, but the maintainer
+   should confirm or change each; two are genuinely actionable.
+2. **A placement decision** (Group H) — whether the two security-hardening
+   commits already on the branch stay in this PR.
+3. **The 10 deferred CodeRabbit findings** (Groups A–E) — all in subsystems the
+   F2 work did **not** author (the `system.file()` resolver, the package-state
+   watcher / sysdata scan, and the NSE argument-policy table), so read the
+   surrounding code before touching it.
+
+Background context lives in
+`docs/superpowers/plans/2026-06-09-f2-suppression-completion-and-review.md`
+(the F2 plan; its "Decisions" + "PROGRESS UPDATE" sections explain the choices
+referenced in Group F).
 
 ## Working discipline
 
@@ -269,8 +280,92 @@ extractor identifies the namespace env. Add tests: a namespace-targeted
 
 ---
 
+## Group F — F2 session decisions to revisit
+
+These are choices the F2 session made on a "smallest-reasonable" basis (recorded
+as Decisions 5–10 + the Step-3 note in the F2 plan). Confirm or change each. Two
+(F-1, F-2) are genuinely actionable; the rest are confirm-or-document.
+
+### F-1 — `expect[<non-suppressible-code>]` always reports `unused-suppression`
+Only `LINT_CODES` + `SUPPRESSIBLE_ANALYZER_CODES` (`undefined-variable`,
+`assign-to-string-literal`, `package-not-installed`) are actually suppressible.
+`syntax-error`, `unresolved-source-path`, and the dependency-graph codes are
+not. So `# raven: expect[syntax-error]` can never match anything and emits a
+**perpetual** `unused-suppression` HINT — confusing (it reads as "remove this"
+even though the code was never suppressible).
+
+**Recommended fix (small, in `handlers.rs::collect_unused_suppression_diagnostics`):**
+when a directive's `what` is `Codes(cs)` and **none** of `cs` is suppressible
+(not in `LINT_CODES` ∪ `SUPPRESSIBLE_ANALYZER_CODES`, accounting for
+`syntax-error` umbrella children via `diagnostic_code`), **skip** the
+unused-suppression report for that directive — it's "not applicable", not
+"unused". Add a `diagnostic_code::is_suppressible(code) -> bool` helper. Leave a
+blanket `expect` (`All`) as-is (it legitimately reports unused when the line had
+no suppressible diagnostic). Tests: `expect[syntax-error]` produces **no**
+`unused-suppression`; `expect[undefined-variable]` on a clean line still does.
+
+### F-2 — `reportUnusedSuppressions` is LSP-only (no `raven.toml` / CLI)
+The setting is parsed only in `backend.rs` from LSP init options, not in
+`config_file/mod.rs`, so `raven check` users cannot enable the global
+ignore-sweep. (`expect` itself works in `raven check` without the setting; only
+the *all-ignores* sweep is gated.) Note **all** `diagnostics.*` severities are
+currently LSP-only too, so this is a consistency question.
+
+**Decide:** (a) leave LSP-only (document it), or (b) layer it through
+`config_file` so `raven.toml` `[diagnostics] reportUnusedSuppressions = true`
+works for CLI. If (b): wire it into the config_file parse path that populates
+`CrossFileConfig` for the CLI (`cli/check.rs`), mirroring how lint config is
+layered; add a CLI e2e test (the suppression e2e harness in
+`crates/raven/tests/suppression_per_code.rs` can write a `raven.toml`). Smallest-
+reasonable: (a) unless CLI parity is explicitly wanted.
+
+### F-3 — `# nolint` excluded from the unused-suppression sweep
+The sweep is driven solely by the analyzer-track `# raven:` / `@lsp-` directive
+enumeration (`CrossFileMetadata::suppression_directives`); bare lintr `# nolint`
+/ `# nolint start` directives are never reported as unused, even under the
+global setting. Pyright sweeps lint-suppression equivalents too.
+
+**Decide:** confirm (lintr-compat aliases stay silent) or extend the enumeration
+to `# nolint` directives. Smallest-reasonable: confirm + document; extending
+needs a parallel enumeration in `linting/nolint.rs` feeding the sweep.
+
+### F-4 — chunk suppressions are `Ignore`-flavored only
+`raven.ignore` / `# raven: ignore-chunk` always behave as silent `ignore`; there
+is no asserting chunk form. **Decide:** confirm (an `expect` inside a chunk body
+still works as a normal line/next directive) or add an asserting chunk option.
+Smallest-reasonable: confirm + document.
+
+### F-5 — `expect` mirrors every `ignore` form (incl. `@lsp-expect`)
+Completeness decision; no action expected. Confirm the surface
+(`# raven: expect`, `-next`, `-start/-end`, `-file`, `@lsp-expect`,
+`@lsp-expect-next`) is the intended one.
+
+---
+
+## Group H — placement of the two security-hardening commits
+
+The F2 session, while acting on CodeRabbit, also committed two **security**
+fixes that live in the `system.file` / `sysdata` subsystems rather than the F2
+suppression feature (commit `2decdc70`):
+- `path_resolve.rs` — reject path-escaping `system.file()` components (`..`,
+  absolute, drive prefix) via `system_file_relative_path`.
+- `sysdata.rs:456` — escape the sysdata path into a safe R string literal before
+  `load("…")`.
+
+Because the maintainer has chosen to resolve the rest of the `system.file` /
+`sysdata` findings **in this same PR** (this plan), keeping these two fixes in
+PR #420 is now consistent — **recommended decision: keep them in-PR.** Only
+revisit (revert into a separate PR) if PR #420 is later split by subsystem. No
+action needed unless that split happens; recorded here so the choice is explicit
+rather than implicit.
+
+---
+
 ## Suggested order
 
+0. **Group F + Group H** — make the decisions first (they may change scope: e.g.
+   F-1 is a small code fix; F-2 may add config wiring). Record each on the
+   deferred list with the chosen option.
 1. **Group D** (tmerge) and **Group E findings 8–9** — small, isolated, low risk.
 2. **Group E finding 10** (.onLoad scoping) — needs care to identify the ns env.
 3. **Group C** (lib.loc/fsep rejection) — small, but corpus-affecting.
