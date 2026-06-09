@@ -150,16 +150,16 @@ enum NolintMarker {
 
 /// Parse a `[code, code2]` bracket selector into a [`LineSuppression`]. `text`
 /// must begin at (or before, with leading whitespace) the `[`. Returns
-/// [`LineSuppression::All`] when there is no bracket or it is empty.
-fn parse_bracket_codes(text: &str) -> LineSuppression {
+/// `Some(LineSuppression::All)` when there is no bracket, and `None` when a
+/// bracket is opened but never closed (a malformed selector — the caller must
+/// then reject the whole directive rather than silently blanket-suppress).
+fn parse_bracket_codes(text: &str) -> Option<LineSuppression> {
     let text = text.trim_start();
     let Some(rest) = text.strip_prefix('[') else {
-        return LineSuppression::All;
+        return Some(LineSuppression::All);
     };
-    let Some(end) = rest.find(']') else {
-        return LineSuppression::All;
-    };
-    codes_or_all(&rest[..end])
+    let end = rest.find(']')?;
+    Some(codes_or_all(&rest[..end]))
 }
 
 /// Parse a lintr `: rule_a, rule_b` filter into a [`LineSuppression`]. `text` is
@@ -334,10 +334,10 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
         // all resolve to NextLine. Anything else on the same line is a
         // same-line ignore. `@lsp-expect*` is the asserting flavor (F2 Step 3)
         // and suppresses identically here.
-        let same_line_codes = parse_bracket_codes(rest);
+        let same_line_codes = parse_bracket_codes(rest)?;
         let after = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
         return if let Some(after_next) = after.strip_prefix("next") {
-            Some(NolintMarker::NextLine(parse_bracket_codes(after_next)))
+            Some(NolintMarker::NextLine(parse_bracket_codes(after_next)?))
         } else {
             Some(NolintMarker::Line(same_line_codes))
         };
@@ -368,21 +368,18 @@ fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
     let action = after_ignore.trim_start_matches('-');
     let bracket_at = action.find('[').unwrap_or(action.len());
     let word = action[..bracket_at].trim();
-    let codes = parse_bracket_codes(&action[bracket_at..]);
-    if word.is_empty() {
-        Some(NolintMarker::Line(codes))
-    } else if word.starts_with("next") {
-        Some(NolintMarker::NextLine(codes))
-    } else if word.starts_with("start") {
-        Some(NolintMarker::Start(codes))
-    } else if word.starts_with("end") {
-        Some(NolintMarker::End)
-    } else if word.starts_with("file") {
-        Some(NolintMarker::File(codes))
-    } else {
-        // `# raven: ignore<something-unknown>` — be conservative and treat as a
-        // plain line ignore rather than silently dropping it.
-        Some(NolintMarker::Line(codes))
+    let codes = parse_bracket_codes(&action[bracket_at..])?;
+    // Exact action words only: a typo like `ignore-filed` must NOT prefix-match
+    // `file` and escalate to a whole-file suppression, and an unterminated
+    // `[...` selector (rejected by `parse_bracket_codes` above) must not become
+    // a blanket suppression.
+    match word {
+        "" => Some(NolintMarker::Line(codes)),
+        "next" => Some(NolintMarker::NextLine(codes)),
+        "start" => Some(NolintMarker::Start(codes)),
+        "end" => Some(NolintMarker::End),
+        "file" => Some(NolintMarker::File(codes)),
+        _ => None,
     }
 }
 
@@ -620,6 +617,34 @@ mod tests {
     fn typo_ravenous_does_not_suppress() {
         let s = Suppressions::from_text("x = 1 # ravenous appetite\n");
         assert!(!s.is_suppressed(0));
+    }
+
+    /// CodeRabbit: a typo like `# raven: ignore-filed` must NOT prefix-match
+    /// `file` and escalate to a whole-file suppression.
+    #[test]
+    fn typo_ignore_filed_does_not_suppress_file() {
+        let s = Suppressions::from_text("# raven: ignore-filed\nx = 1\ny = 2\n");
+        assert!(!s.is_suppressed(0));
+        assert!(!s.is_suppressed(1));
+        assert!(!s.is_suppressed(2));
+    }
+
+    /// An unterminated `[...` selector must be rejected, not treated as a
+    /// blanket suppression.
+    #[test]
+    fn unterminated_bracket_selector_does_not_suppress() {
+        let s = Suppressions::from_text("x = 1 # raven: ignore[object-name\n");
+        assert!(!s.is_suppressed(0));
+        let s2 = Suppressions::from_text("x = 1 # @lsp-ignore[object-name\n");
+        assert!(!s2.is_suppressed(0));
+    }
+
+    /// An unknown action word is rejected rather than silently blanketing.
+    #[test]
+    fn unknown_raven_action_does_not_suppress() {
+        let s = Suppressions::from_text("# raven: ignore-frobnicate\nx = 1\n");
+        assert!(!s.is_suppressed(0));
+        assert!(!s.is_suppressed(1));
     }
 
     #[test]

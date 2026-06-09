@@ -231,7 +231,17 @@ fn is_directive_marker(trimmed_line: &str) -> bool {
             Some(c) => c.is_whitespace() || c == ':' || c == '-',
         };
     }
-    body.starts_with("@lsp-")
+    if body.starts_with("@lsp-") {
+        return true;
+    }
+    // `# raven:` primary suppression namespace (F2), including the next-line
+    // forms (`ignore-next` / `expect-next`) that never suppress their own line.
+    // Treat the directive line itself as a marker so the `commented_code` rule
+    // never parses it as commented-out code or glues it into a comment block.
+    if let Some(after) = body_lower.strip_prefix("raven") {
+        return after.trim_start().starts_with(':');
+    }
+    false
 }
 
 /// Emacs-style mode line, e.g. `# -*- coding: utf-8 -*-`. R code rarely uses

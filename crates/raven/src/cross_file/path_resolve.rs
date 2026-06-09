@@ -403,6 +403,31 @@ pub fn normalize_path_public(path: &Path) -> Option<PathBuf> {
 /// 3. Otherwise → `None` (unresolved).
 ///
 /// `rel` is formed by joining `parts` with `/`.
+/// Build the relative path from `system.file()` literal components, rejecting
+/// any that would escape the intended base (`<workspace>/inst` or
+/// `<lib>/<pkg>`). A component that is an absolute path, a drive prefix, or
+/// contains a `..` parent segment is refused — otherwise a literal such as
+/// `system.file("..", "..", "secret.R", package = "pkg")` would turn
+/// `system.file()` analysis into an arbitrary local-file read for an untrusted
+/// workspace. Returns `None` for empty input or any escaping component.
+fn system_file_relative_path(parts: &[String]) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut rel = PathBuf::new();
+    for part in parts {
+        let candidate = Path::new(part);
+        if candidate.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return None;
+        }
+        rel.push(candidate);
+    }
+    (!rel.as_os_str().is_empty()).then_some(rel)
+}
+
 pub fn resolve_system_file(
     parts: &[String],
     package: &str,
@@ -410,10 +435,7 @@ pub fn resolve_system_file(
     workspace_root: Option<&Path>,
     lib_paths: &[PathBuf],
 ) -> Option<PathBuf> {
-    if parts.is_empty() {
-        return None;
-    }
-    let rel: PathBuf = parts.iter().collect();
+    let rel = system_file_relative_path(parts)?;
 
     // Branch 1: same as workspace package → source layout with inst/ prefix
     if let (Some(ws_pkg), Some(ws_root)) = (workspace_package_name, workspace_root)
@@ -458,7 +480,9 @@ pub fn resolve_system_file_sources(
                 && sf.package == ws_pkg
                 && workspace_root.is_some()
             {
-                let rel: PathBuf = sf.parts.iter().collect();
+                let Some(rel) = system_file_relative_path(&sf.parts) else {
+                    continue;
+                };
                 source.path = format!("/inst/{}", rel.display());
                 source.system_file = None;
             } else if !lib_paths.is_empty() {
@@ -521,6 +545,40 @@ mod tests {
         let ctx = make_context("/project/src/main.R", Some("/project"));
         let resolved = resolve_path("utils.R", &ctx).unwrap();
         assert_eq!(resolved, PathBuf::from("/project/src/utils.R"));
+    }
+
+    #[test]
+    fn system_file_rejects_escaping_components() {
+        // Parent-dir, absolute, and empty parts must not resolve — otherwise a
+        // crafted `system.file("..", ...)` could read files outside the package.
+        let lib = vec![PathBuf::from("/lib")];
+        assert_eq!(
+            resolve_system_file(
+                &["..".into(), "..".into(), "secret.R".into()],
+                "pkg",
+                None,
+                None,
+                &lib,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_system_file(&["/etc/passwd".into()], "pkg", None, None, &lib),
+            None
+        );
+        assert_eq!(resolve_system_file(&[], "pkg", None, None, &lib), None);
+        // A normal relative component still resolves via the workspace branch
+        // (which returns the candidate path even when the file doesn't exist).
+        assert_eq!(
+            resolve_system_file(
+                &["extdata".into(), "x.R".into()],
+                "pkg",
+                Some("pkg"),
+                Some(Path::new("/ws")),
+                &lib,
+            ),
+            Some(PathBuf::from("/ws/inst/extdata/x.R"))
+        );
     }
 
     #[test]

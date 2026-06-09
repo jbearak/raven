@@ -448,11 +448,24 @@ pub async fn load_sysdata_via_r(
         return cached_symbols.clone();
     }
 
-    // Build R code — no user input interpolation (path is workspace-derived)
+    // Build R code. The path is workspace-derived, but filesystem paths can
+    // legally contain `"`, `\`, and control characters, so escape it into a
+    // safe R string literal rather than interpolating verbatim.
     let sysdata_path_str = sysdata_path.to_string_lossy().replace('\\', "/");
+    let escaped_path: String = sysdata_path_str
+        .chars()
+        .flat_map(|c| match c {
+            '"' => vec!['\\', '"'],
+            '\\' => vec!['\\', '\\'],
+            '\n' => vec!['\\', 'n'],
+            '\r' => vec!['\\', 'r'],
+            '\t' => vec!['\\', 't'],
+            other => vec![other],
+        })
+        .collect();
     let r_code = format!(
         r#"e <- new.env(parent = emptyenv()); load("{}", e); cat(ls(e), sep = "\n")"#,
-        sysdata_path_str
+        escaped_path
     );
 
     let result = match tokio::time::timeout(
