@@ -8,6 +8,16 @@ Decisions in this plan are FINAL (agreed with the maintainer). Don't relitigate;
 if something is genuinely ambiguous, make the smallest reasonable choice and note
 it.
 
+**Run non-blocking throughout (applies to the WHOLE plan, every phase).** Never
+pause to wait on the maintainer mid-run. Whenever you hit a question, ambiguity,
+judgment call, or finding you'd otherwise want to raise: make the smallest
+reasonable decision, record it on a single **deferred-questions list**, and keep
+going. Surface that list to the maintainer **once, at the very end**, as a
+closing summary with your choices and recommendations. The only thing that
+legitimately halts progress is a hard blocker (e.g. gates can't be made green, or
+a corpus regression you cannot resolve) — and even then, exhaust alternatives
+first.
+
 ## Where things stand
 - This branch already landed a large package-corpus FP-hardening effort: 9
   workstreams (R6 pronouns, dataset/dev-dir visibility, sysdata, `.Generic`,
@@ -202,15 +212,11 @@ green) → re-run all agents. **Done when two CONSECUTIVE passes yield zero
 been parked per the safety valve below do not block completion). Adjust the agent set between iterations if you learn a better
 decomposition (maintainer's explicit latitude).
 
-**Safety valve (don't lower the bar, don't block, don't loop forever):** triage
-each finding as actionable vs. subjective/out-of-scope. Keep iterating on
-actionable findings. For items that are subjective nitpicks the orchestrator
-judges out-of-scope (or where agents disagree with each other) and that aren't
-converging after a few iterations, do NOT pause and wait on the maintainer:
-**park** them on a deferred-questions list, move on, and finish the rest of the
-plan. Surface the parked list to the maintainer **at the end**, when the plan is
-otherwise complete — as a closing summary with recommendations, not a mid-run
-stop.
+**Safety valve (don't lower the bar):** triage each finding as actionable vs.
+subjective/out-of-scope. Keep iterating on actionable findings. Per the global
+non-blocking principle above, park subjective/out-of-scope items (or agent
+disagreements) on the deferred-questions list and continue — never pause for the
+maintainer mid-run.
 
 ## THEN: PR #420
 - Rewrite the PR **title** (CodeRabbit flagged "prod test" as vague) to something
