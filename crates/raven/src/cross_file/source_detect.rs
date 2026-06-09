@@ -397,10 +397,10 @@ fn extract_string_literal(node: Node, content: &str) -> Option<String> {
 
 /// Returns true when a `lib.loc` value node refers to a standard library path
 /// that our resolver already searches (`.Library`, `.Library.site`, or a call
-/// to `.libPaths()`). These are safe to resolve as-if-absent.
+/// to `.libPaths()`), or is `NULL` (identical to omitting `lib.loc`).
 fn is_standard_lib_loc(node: Node, content: &str) -> bool {
     let text = node_text(node, content);
-    if text == ".Library" || text == ".Library.site" {
+    if text == ".Library" || text == ".Library.site" || text == "NULL" {
         return true;
     }
     // .libPaths() — a call node whose function leaf is `.libPaths`
@@ -2854,6 +2854,18 @@ library(ggplot2)"#;
     fn test_source_system_file_lib_loc_lib_paths_accepted() {
         // .libPaths() returns the default search paths — safe to resolve
         let code = r#"source(system.file("x.R", package = "p", lib.loc = .libPaths()))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_null_accepted() {
+        // lib.loc = NULL is identical to omitting lib.loc — safe to resolve
+        let code = r#"source(system.file("x.R", package = "p", lib.loc = NULL))"#;
         let tree = parse_r(code);
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);

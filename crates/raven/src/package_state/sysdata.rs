@@ -39,7 +39,7 @@ fn scan_dir_recursive(dir: &Path, symbols: &mut BTreeSet<String>) {
         let path = entry.path();
         if ft.is_dir() && !ft.is_symlink() {
             scan_dir_recursive(&path, symbols);
-        } else if ft.is_file()
+        } else if (ft.is_file() || (ft.is_symlink() && path.is_file()))
             && matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
             && let Ok(content) = fs::read_to_string(&path)
         {
@@ -284,6 +284,14 @@ fn collect_namespace_bound_idents(body: Node, content: &str) -> BTreeSet<String>
     idents
 }
 
+/// Returns true when `name` is a function that produces a namespace environment.
+fn is_namespace_producing_call_name(name: &str) -> bool {
+    matches!(
+        name,
+        "topenv" | "asNamespace" | "getNamespace" | "parent.env"
+    )
+}
+
 /// Check if a node is an expression that produces a namespace environment:
 /// `topenv(...)`, `asNamespace(...)`, `getNamespace(...)`, or
 /// `parent.env(environment())`.
@@ -294,17 +302,16 @@ fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
     let Some(func_node) = node.child_by_field_name("function") else {
         return false;
     };
-    let func_text = node_text(func_node, content);
-    matches!(func_text, "topenv" | "asNamespace" | "getNamespace") || func_text == "parent.env" // parent.env(environment()) pattern
+    is_namespace_producing_call_name(node_text(func_node, content))
 }
 
-/// Check if a node is a namespace-like expression: either a `topenv(...)` call
+/// Check if a node is a namespace-like expression: a namespace-producing call
 /// or an identifier previously bound to the namespace.
 fn is_namespace_like(node: Node, content: &str, ns_idents: &BTreeSet<String>) -> bool {
     match node.kind() {
         "call" => {
             if let Some(func_node) = node.child_by_field_name("function") {
-                node_text(func_node, content) == "topenv"
+                is_namespace_producing_call_name(node_text(func_node, content))
             } else {
                 false
             }
@@ -809,6 +816,27 @@ bar <- 42
         assert!(syms.contains("dynamic"), "getNamespace assign: {:?}", syms);
     }
 
+    #[test]
+    fn onload_inline_as_namespace_envir_collected() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  assign("inlined", val, envir = asNamespace(pkgname))
+  getNamespace(pkgname)$dollar_inline <- TRUE
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            syms.contains("inlined"),
+            "inline asNamespace envir: {:?}",
+            syms
+        );
+        assert!(
+            syms.contains("dollar_inline"),
+            "inline getNamespace $ assign: {:?}",
+            syms
+        );
+    }
+
     // --- Filesystem scan ---
 
     #[test]
@@ -876,5 +904,27 @@ bar <- 42
         // Must terminate despite the symlink loop.
         let syms = scan_sysdata_generating_scripts(tmp.path());
         assert!(syms.contains("found"), "expected 'found' in {:?}", syms);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_dir_recursive_follows_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_raw = tmp.path().join("data-raw");
+        std::fs::create_dir(&data_raw).unwrap();
+        // Real file outside data-raw
+        let real_file = tmp.path().join("real.R");
+        std::fs::write(&real_file, "usethis::use_data(linked, internal = TRUE)\n").unwrap();
+        // Symlink to the real file inside data-raw
+        symlink(&real_file, data_raw.join("link.R")).unwrap();
+
+        let syms = scan_sysdata_generating_scripts(tmp.path());
+        assert!(
+            syms.contains("linked"),
+            "symlinked file should be scanned: {:?}",
+            syms
+        );
     }
 }

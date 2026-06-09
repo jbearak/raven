@@ -310,7 +310,7 @@ In R Markdown (`.Rmd`) and Quarto (`.qmd`) documents, the R code inside chunks i
 - Syntax errors, undefined variables, and lint findings inside `{r}` (and `{rscript}`) chunks are reported at the document's own coordinates, exactly as they would be in a `.R` file.
 - Prose, YAML, markdown links, and non-R chunks never produce diagnostics.
 - Symbols defined in one R chunk are in scope in later R chunks (the chunks share a single analysis), so a variable assigned in an early chunk and used in a later one is not flagged as undefined.
-- Chunk options that only affect knitr execution (such as `eval=FALSE`) do not suppress static analysis — a syntax error in an `eval=FALSE` chunk is still flagged.
+- Chunk options that only affect knitr execution (such as `eval=FALSE`) suppress diagnostics for that chunk body — it may hold intentionally incomplete snippets — but language intelligence (completions, semantic tokens, indentation) still works inside it.
 - `# nolint` markers and `# @lsp-ignore` directives work inside chunks just as in plain R.
 
 ### Parameterized reports (`params`)
