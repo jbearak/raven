@@ -547,7 +547,7 @@ fn budget_single_file_completion() {
 fn derive_package_state_500_file_keystroke_budget() {
     use raven::cross_file::config::PackageMode;
     use raven::package_state::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Instant;
@@ -561,6 +561,8 @@ fn derive_package_state_500_file_keystroke_budget() {
         }),
         namespace: None,
         r_files: BTreeMap::new(),
+        dataset_names: BTreeSet::new(),
+        sysdata_names: BTreeSet::new(),
     };
     for i in 0..500 {
         let p = root.join("R").join(format!("file_{}.R", i));
