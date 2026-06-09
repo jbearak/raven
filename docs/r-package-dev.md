@@ -290,6 +290,9 @@ suppresses indices on **unresolved** objects (such as a function parameter
 does not flag the column names `value` / `grp`. Objects you construct locally
 with `data.frame()` / `tibble()` / `read.csv()` are still treated as
 non-data.table, so `df[undefined_var, ]` is flagged. `[[` is always checked.
+A statement-level by-reference converter updates that classification from the
+call onward: `setDT(x)` makes `x` a data.table, `setDF(x)` makes it a plain
+data.frame, and `setattr(x, "class", ...)` sets the class explicitly.
 See [Diagnostics](diagnostics.md#call-arguments-and-bracket-indices) for the
 full rules and the `undefinedVariableInBracketIndices` opt-out.
 

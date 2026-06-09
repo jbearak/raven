@@ -11489,6 +11489,12 @@ pub(crate) struct NseAnalysis<'a> {
     /// Variable names whose defining RHS is a known data.frame-family
     /// constructor (so `[` indices are checked even when data.table is loaded).
     non_data_table_objects: HashSet<String>,
+    /// By-reference class-transition events (`setDT`/`setDF`/`setattr`) per
+    /// variable, sorted ascending by source byte offset. A transition at or
+    /// before a `[` overrides the constructor-derived classification from that
+    /// point onward (F1), analogous to how `load()` bindings become visible
+    /// from the call site forward.
+    class_transitions: HashMap<String, Vec<(usize, DataTableClass)>>,
     /// Reference Class generator variables assigned from `setRefClass(...)`.
     reference_class_generators: HashMap<String, ReferenceClassInfo>,
     /// Class name to generator-variable name for same-file `contains = ...`
@@ -11521,6 +11527,7 @@ impl<'a> NseAnalysis<'a> {
         let mut local_function_policies = HashMap::new();
         let mut data_table_objects = HashSet::new();
         let mut non_data_table_objects = HashSet::new();
+        let mut class_transitions: HashMap<String, Vec<(usize, DataTableClass)>> = HashMap::new();
         let mut reference_class_generators = HashMap::new();
         let mut reference_class_by_class = HashMap::new();
         let mut reference_class_method_functions = HashMap::new();
@@ -11531,12 +11538,18 @@ impl<'a> NseAnalysis<'a> {
             &mut local_function_policies,
             &mut data_table_objects,
             &mut non_data_table_objects,
+            &mut class_transitions,
             &mut reference_class_generators,
             &mut reference_class_by_class,
             &mut reference_class_method_functions,
             &mut data_table_qualifier_seen,
             false,
         );
+        // Keep each variable's transition list ordered by position so the
+        // as-of-position lookup can scan from the end.
+        for events in class_transitions.values_mut() {
+            events.sort_by_key(|(start, _)| *start);
+        }
         // data.table is "in play" if it is an in-play package (library()/import)
         // or the file uses a `data.table::` qualified reference (Phase 3).
         let data_table_in_play =
@@ -11549,12 +11562,26 @@ impl<'a> NseAnalysis<'a> {
             data_table_in_play,
             data_table_objects,
             non_data_table_objects,
+            class_transitions,
             reference_class_generators,
             reference_class_by_class,
             reference_class_method_functions,
             package_library,
             base_exports,
         }
+    }
+
+    /// The data.table class of `name` as of byte `pos`, per the latest
+    /// by-reference transition at or before `pos`. `None` when no such
+    /// transition exists (the caller then falls back to the constructor-derived
+    /// classification).
+    fn class_transition_before(&self, name: &str, pos: usize) -> Option<DataTableClass> {
+        self.class_transitions
+            .get(name)?
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= pos)
+            .map(|(_, class)| *class)
     }
 
     fn reference_class_generator_has_member(
@@ -11616,6 +11643,7 @@ fn collect_nse_facts(
     local_function_policies: &mut HashMap<String, crate::nse::ArgPolicy>,
     data_table_objects: &mut HashSet<String>,
     non_data_table_objects: &mut HashSet<String>,
+    class_transitions: &mut HashMap<String, Vec<(usize, DataTableClass)>>,
     reference_class_generators: &mut HashMap<String, ReferenceClassInfo>,
     reference_class_by_class: &mut HashMap<String, String>,
     reference_class_method_functions: &mut HashMap<String, HashSet<String>>,
@@ -11628,6 +11656,16 @@ fn collect_nse_facts(
             .is_some_and(|lhs| node_text(lhs, text) == "data.table")
     {
         *data_table_qualifier_seen = true;
+    }
+    // F1: a statement-level by-reference converter (`setDT`/`setDF`/`setattr`)
+    // flips its first argument's class from this call onward. Recorded only at
+    // top level (like the constructor bindings below) to avoid cross-scope
+    // contamination between sibling functions.
+    if !in_function && let Some((name, class)) = by_reference_class_transition(node, text) {
+        class_transitions
+            .entry(name)
+            .or_default()
+            .push((node.start_byte(), class));
     }
     collect_reference_class_method_registrations(
         node,
@@ -11675,6 +11713,7 @@ fn collect_nse_facts(
             local_function_policies,
             data_table_objects,
             non_data_table_objects,
+            class_transitions,
             reference_class_generators,
             reference_class_by_class,
             reference_class_method_functions,
@@ -11940,6 +11979,59 @@ fn constructor_data_table_class(node: Node, text: &str) -> DataTableClass {
         | "read.csv2" | "read.table" | "read_csv" | "read_csv2" | "read_tsv" | "read_delim"
         | "read_excel" => DataTableClass::NonDataTable,
         _ => DataTableClass::Unknown,
+    }
+}
+
+/// F1: classify a statement-level by-reference class converter. `setDT(x)` and
+/// `setDF(x)` flip `x` to data.table / data.frame respectively; `setattr(x,
+/// "class", value)` sets the class explicitly. Returns the affected variable
+/// name (the first positional argument, which must be a bare identifier) and
+/// the class it transitions to, or `None` when the call is not a recognized
+/// by-reference converter or its target is not a plain name.
+fn by_reference_class_transition(node: Node, text: &str) -> Option<(String, DataTableClass)> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let leaf = node
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))?;
+    let args = node.child_by_field_name("arguments")?;
+    let first = unwrap_parenthesized(first_positional_arg_value(args)?);
+    if first.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(first, text).to_string();
+    match leaf {
+        "setDT" => Some((name, DataTableClass::DataTable)),
+        "setDF" => Some((name, DataTableClass::NonDataTable)),
+        "setattr" => setattr_class_transition(node, text).map(|class| (name, class)),
+        _ => None,
+    }
+}
+
+/// Classify the class assigned by `setattr(x, "class", value)`. Only a literal
+/// `"class"` attribute name is recognized; the value is matched textually — a
+/// value mentioning `data.table` makes `x` a data.table, a data.frame-family
+/// class makes it a non-data.table, and anything else is not modeled (`None`).
+fn setattr_class_transition(call: Node, text: &str) -> Option<DataTableClass> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let positional: Vec<Node> = args
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "argument" && c.child_by_field_name("name").is_none())
+        .filter_map(|c| c.child_by_field_name("value"))
+        .collect();
+    // setattr(x, name, value): the attribute name must be the literal "class".
+    if literal_string_value(unwrap_parenthesized(*positional.get(1)?), text)?.as_str() != "class" {
+        return None;
+    }
+    let value_text = node_text(unwrap_parenthesized(*positional.get(2)?), text);
+    if value_text.contains("data.table") {
+        Some(DataTableClass::DataTable)
+    } else if value_text.contains("data.frame") || value_text.contains("tbl_df") {
+        Some(DataTableClass::NonDataTable)
+    } else {
+        None
     }
 }
 
@@ -12231,6 +12323,11 @@ fn subset_object_data_table_class(
     };
     if obj.kind() == "identifier" {
         let name = node_text(obj, text);
+        // F1: a by-reference transition (setDT/setDF/setattr) at or before this
+        // `[` overrides the constructor-derived classification.
+        if let Some(class) = analysis.class_transition_before(name, node.start_byte()) {
+            return class;
+        }
         if analysis.data_table_objects.contains(name) {
             return DataTableClass::DataTable;
         }
@@ -19163,6 +19260,69 @@ mod tests {
                 "constructor {ctor} should classify as non-data.table"
             );
         }
+    }
+
+    // ---- F1: data.table by-reference class transitions (setDT/setDF/setattr) ----
+
+    /// A statement-level `setDT(x)` flips `x` to data.table from that call
+    /// onward, so a subsequent `x[, newcol := val]` suppresses `newcol`/`val`.
+    #[test]
+    fn nse_setdt_flips_class_to_data_table() {
+        let code = "x <- read.csv(\"f.csv\")\nsetDT(x)\nx[, newcol := val]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "newcol"));
+        assert!(!was_collected(&used, "val"));
+    }
+
+    /// `setDT(x)` works even when `x` has no constructor-derived classification
+    /// (e.g. a function argument or loaded frame): the call itself establishes
+    /// the data.table class from that point onward.
+    #[test]
+    fn nse_setdt_without_prior_constructor_suppresses() {
+        let code = "setDT(x)\nx[, mean(value), by = grp]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "value"));
+        assert!(!was_collected(&used, "grp"));
+    }
+
+    /// `setDF(x)` flips a data.table back to a plain data.frame from that call
+    /// onward, so a later `x[undefined_idx, ]` is checked again.
+    #[test]
+    fn nse_setdf_flips_class_back_to_data_frame() {
+        let code = "x <- as.data.table(d)\nsetDF(x)\nx[undefined_idx, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "undefined_idx"));
+    }
+
+    /// A bracket index *before* the `setDT(x)` transition keeps the prior
+    /// classification (here: non-data.table constructor), so it is still
+    /// checked; only indices after the call are suppressed.
+    #[test]
+    fn nse_setdt_transition_is_positional() {
+        let code = "x <- data.frame(a = 1)\nx[before_idx, ]\nsetDT(x)\nx[, after := 1]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "before_idx"));
+        assert!(!was_collected(&used, "after"));
+    }
+
+    /// `setattr(x, "class", "data.table")` is a by-reference class set: `x`
+    /// becomes a data.table from that call onward.
+    #[test]
+    fn nse_setattr_class_data_table_flips_class() {
+        let code = "x <- read.csv(\"f.csv\")\nsetattr(x, \"class\", c(\"data.table\", \"data.frame\"))\nx[, j := val]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "j"));
+        assert!(!was_collected(&used, "val"));
     }
 
     // ========================================================================
