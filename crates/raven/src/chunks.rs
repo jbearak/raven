@@ -311,14 +311,12 @@ fn chunk_reuse_re() -> &'static Regex {
 /// The returned `(body_start, end_line)` pair is guaranteed to satisfy
 /// `body_start <= end_line < total_lines`. Folds the [`is_r_chunk_language`]
 /// guard so callers iterate all chunks and let-else past the non-R ones.
+///
+/// Note: this returns a range even for `eval=FALSE` chunks — callers that
+/// need to suppress such chunks (e.g. [`mask_to_r`] for diagnostics) check
+/// `chunk.eval_disabled` themselves.
 pub(crate) fn r_chunk_body_range(chunk: &Chunk, total_lines: u32) -> Option<(u32, u32)> {
     if !is_r_chunk_language(&chunk.language) {
-        return None;
-    }
-    // eval=FALSE chunks are display-only; their body may contain intentionally
-    // malformed R (e.g. incomplete snippets in vignettes). Blanking them
-    // prevents spurious syntax diagnostics.
-    if chunk.eval_disabled {
         return None;
     }
     let body_start = chunk.header_line.saturating_add(1);
@@ -378,6 +376,14 @@ pub fn mask_to_r(text: &str) -> String {
         let Some((body_start, end_line)) = r_chunk_body_range(chunk, total_lines as u32) else {
             continue;
         };
+        // eval=FALSE chunks are display-only; their body may contain
+        // intentionally malformed R. Blank them in the masked view so
+        // diagnostics are suppressed, but leave r_chunk_body_range returning
+        // the range so position-gated editor features (completion, semantic
+        // tokens, indentation) still see the body.
+        if chunk.eval_disabled {
+            continue;
+        }
         for idx in body_start as usize..=end_line as usize {
             // Blank knitr chunk-reuse references; keep everything else.
             if !reuse_re.is_match(segments[idx]) {
@@ -666,6 +672,11 @@ pub fn append_chunk_suppressions(
         let Some((body_start, end_line)) = r_chunk_body_range(chunk, total_lines) else {
             continue;
         };
+        // eval=FALSE bodies are already blanked in mask_to_r — no diagnostics
+        // are produced for them, so no suppressions are needed.
+        if chunk.eval_disabled {
+            continue;
+        }
 
         // Form 1: header option (`raven.ignore=...`). Strip a leading BOM so a
         // chunk header on line 0 of a BOM-prefixed document still matches the
@@ -1229,6 +1240,14 @@ mod tests {
         let src = "```{r}\nx <- 1\n```\n";
         // Line 99 is way past the end.
         assert!(!position_in_r_chunk_body(src, 99));
+    }
+
+    #[test]
+    fn position_in_r_chunk_body_true_for_eval_false_chunk() {
+        // eval=FALSE chunks are display-only but position-gated editor features
+        // (completion, semantic tokens, indentation) must still see the body.
+        let src = "```{r, eval=FALSE}\nx <- 1\n```\n";
+        assert!(position_in_r_chunk_body(src, 1));
     }
 
     #[test]
