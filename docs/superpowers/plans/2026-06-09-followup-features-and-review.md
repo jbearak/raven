@@ -197,16 +197,20 @@ convergence across agents is signal):
    looks for what they missed / cross-cutting themes.
 
 **Loop:** synthesize findings → apply fixes (TDD, gates green, corpus strict
-green) → re-run all agents. **Done when two CONSECUTIVE passes yield ZERO findings
-from every agent.** Adjust the agent set between iterations if you learn a better
+green) → re-run all agents. **Done when two CONSECUTIVE passes yield zero
+*actionable* findings from every agent** (subjective/out-of-scope items that have
+been parked per the safety valve below do not block completion). Adjust the agent set between iterations if you learn a better
 decomposition (maintainer's explicit latitude).
 
-**Safety valve (don't lower the bar, don't loop forever):** triage each finding
-as actionable vs. subjective/out-of-scope. Keep iterating on actionable findings.
-If, after ~5 iterations, the only remaining items are subjective nitpicks the
-orchestrator judges out-of-scope (or agents disagree with each other), STOP and
-escalate to the maintainer with the shortlist and a recommendation rather than
-burning iterations chasing zero asymptotically.
+**Safety valve (don't lower the bar, don't block, don't loop forever):** triage
+each finding as actionable vs. subjective/out-of-scope. Keep iterating on
+actionable findings. For items that are subjective nitpicks the orchestrator
+judges out-of-scope (or where agents disagree with each other) and that aren't
+converging after a few iterations, do NOT pause and wait on the maintainer:
+**park** them on a deferred-questions list, move on, and finish the rest of the
+plan. Surface the parked list to the maintainer **at the end**, when the plan is
+otherwise complete — as a closing summary with recommendations, not a mid-run
+stop.
 
 ## THEN: PR #420
 - Rewrite the PR **title** (CodeRabbit flagged "prod test" as vague) to something
