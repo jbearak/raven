@@ -269,3 +269,105 @@ subjective/out-of-scope items on the deferred-questions list; don't pause.
 - (resolved) man/.Rd, setattr heuristic, tools/install.R drift — see Decisions.
 - The `[code]` blanket-interim note in `linting.md` must be removed once Step 1
   lands.
+
+
+---
+
+## PROGRESS UPDATE — Steps 1 & 2 DONE (commit `b8ec2b77` on `prod-test`)
+
+**Status:** fmt clean, clippy clean (`--all-targets --features test-support`),
+full `cargo test -p raven --features test-support` green (4631 lib + all
+integration targets + 55 doctests). `bun test` and the strict three-group corpus
+**NOT yet re-run since this commit** — run them before the review phase (see
+"Gates not yet re-run" below).
+
+### Step 1 — per-code enforcement: DONE
+- **`cross_file/types.rs`**: added `enum LineSuppression { All, Codes(Vec<String>) }`
+  with `covers(Option<&str>)` (blanket covers all; `Codes` covers via
+  `diagnostic_code::suppresses`, and only when the diagnostic code is `Some`) and
+  `merge()`. Added `struct SuppressionRange { start, end, what }`. Changed
+  `ignored_lines`/`ignored_next_lines` from `HashSet<u32>` to
+  `HashMap<u32, LineSuppression>`; added `ignored_file: Option<LineSuppression>`
+  and `ignored_ranges: Vec<SuppressionRange>` (both `#[serde(default)]`).
+- **`cross_file/directive.rs`**: ignore regexes now capture an optional `[code]`
+  (group 1); added `raven_ignore_start`/`raven_ignore_end`/`raven_ignore_file`
+  regexes and `@lsp-ignore[code]` / `@lsp-ignore-next[code]`. Helpers
+  `parse_suppression_codes`, `insert_line_suppression`. New public
+  `is_line_ignored_for_code(meta, line, code: Option<&str>)`; `is_line_ignored`
+  kept as the **blanket-only** shim (`code: None`, so only `All` matches).
+- **`handlers.rs`**: assigned `Diagnostic.code` to analyzer diagnostics —
+  `UNDEFINED_VARIABLE` (undefined-variable + "used before available"),
+  `PACKAGE_NOT_INSTALLED`, `ASSIGN_TO_STRING_LITERAL` (all invalid-assignment
+  targets), `UNRESOLVED_SOURCE_PATH` (both standalone + snapshot missing-file
+  collectors, incl. "outside workspace"/"parent not found"), `SYNTAX_ERROR`
+  (umbrella, all syntax-error pushes). The 3 enforcement sites now call
+  `is_line_ignored_for_code(.., Some(code))`. The AST invalid-assignment path
+  (`lsp_ignored_lines_from_tree` / `visit_comments_for_ignore` /
+  `classify_comment_for_ignore` / `classify_lsp_ignore_marker`) now produces a
+  `HashMap<u32, LineSuppression>` and matches against `ASSIGN_TO_STRING_LITERAL`.
+- **`linting/nolint.rs`**: `Suppressions` stores `HashMap<u32, LineSuppression>`;
+  markers carry codes (`NolintMarker::{Line,Start,NextLine,File}(LineSuppression)`,
+  `End`). New `is_suppressed_code(line, rule_id)`; `is_suppressed` is now
+  `#[cfg(test)]`-only (blanket "any entry"). `# nolint: rule` and `[code]`
+  selectors are now honored **per-rule**. All 20 rule files call
+  `is_suppressed_code(line, rule_ids::X)`.
+- **Tests**: unit (`directive.rs`, `nolint.rs`, AST path in `handlers.rs`) + new
+  e2e `crates/raven/tests/suppression_per_code.rs` (5 tests, `raven check`).
+
+### Step 2 — analyzer file-level + block/range: DONE (folded into Step 1)
+`# raven: ignore-file[code]` (recognized **anywhere**, not header-only — see
+decision below), `# raven: ignore-start[code]` … `# raven: ignore-end` (block,
+inclusive of directive lines, unterminated → EOF). All flow through
+`is_line_ignored_for_code` (checks file, line, next-line, then ranges).
+
+### Decisions made this session (smallest-reasonable, append to deferred list)
+1. **"used before available"** diagnostic carries `UNDEFINED_VARIABLE` (plan
+   grouped sites 5104/5578 as undefined-variable). Suppress with
+   `ignore[undefined-variable]`.
+2. **All invalid-assignment-target diagnostics** (incl. ERROR "Cannot assign to
+   NULL/NA/...") share the `ASSIGN_TO_STRING_LITERAL` code — the canonical
+   namespace has no finer code for them. `ignore[assign-to-string-literal]`
+   covers the whole family.
+3. **Syntax errors** carry the umbrella `SYNTAX_ERROR` only; the concrete
+   `SYNTAX_ERROR_CHILDREN` (`unclosed-paren`, …) are defined but **not emitted**,
+   so `ignore[unclosed-paren]` won't match while `ignore[syntax-error]` covers
+   all. (Syntax errors are not wired into any suppression enforcement site
+   anyway — codes are for reporting/consistency.) Revisit if child-targeting is
+   wanted.
+4. **`ignore-file` is recognized anywhere**, not header-only as the plan
+   suggested, to stay consistent with the existing lint-track behavior in
+   `nolint.rs`. (Existing lint-track `ignore-file` tests all place it on line 0,
+   so this is consistent.) Revisit if header-only is required.
+
+### Gates not yet re-run since `b8ec2b77`
+- `bun test` (root) — Step 1-2 are Rust-only, no TS touched, so expected green;
+  confirm anyway.
+- Strict three-group corpus
+  (`RAVEN_CORPUS_GROUPS=base,recommended,tidyverse cargo test -p raven --features
+  test-support --test package_corpus package_corpus_selected -- --ignored`,
+  ~7.5 min). Diagnostics now carry `code`, but corpus matching is by
+  message+range (the `ObservedDiagnostic.code` field is informational), so no
+  regression expected — **verify**.
+
+### Remaining: Step 3, 4, 5, then review (task 12) + PR (task 13)
+- **Step 3 (expect + unused-suppression + global setting)** — NOT started. The
+  pipeline must record per-directive whether it suppressed ≥1 diagnostic. The
+  inline-filter architecture (each diagnostic checks `is_line_ignored*`) does not
+  attribute suppression to directives. Suggested approach: expose the full set of
+  parsed directives (line, kind, codes, `is_expect`) on both tracks; compute the
+  "raw" (pre-suppression) diagnostics; a directive is *used* iff some raw
+  diagnostic on its target line is covered by it. `expect` with empty coverage →
+  `unused-suppression` (HINT) at the directive range; under
+  `raven.diagnostics.reportUnusedSuppressions` (default OFF) the sweep extends to
+  all ignore directives. Add `expect` parsing to all three recognizers
+  (`nolint.rs`, `directive.rs`, AST `classify_lsp_ignore_marker`). Wire the VS
+  Code setting per the AGENTS.md 3-place invariant + regenerate settings-ref.
+- **Step 4 (chunk-level for Rmd/qmd)** — knitr chunk option `raven.ignore=TRUE`
+  (and per-code) + in-chunk `# raven: ignore-chunk`; map chunk line range onto
+  the Step-2 `SuppressionRange` machinery. Lives in `cross_file/` Rmd extraction
+  + `chunks.rs`.
+- **Step 5 (docs)** — `diagnostics.md` (enumerate canonical codes + expect +
+  unused-suppression), `directives.md` (drop "interim/staged" caveats, document
+  file/block/chunk + per-code now enforced), `linting.md` (per-code now enforced;
+  `# nolint: rule` now honored — remove the blanket-interim note), `chunks.md`,
+  `configuration.md` + regenerate `settings-reference.md`.
