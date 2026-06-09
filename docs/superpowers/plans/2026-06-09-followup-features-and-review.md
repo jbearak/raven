@@ -58,6 +58,9 @@ a non-data.table `[` still flags. Update `docs/diagnostics.md` and
   check`; the `lsp-` prefix is legacy since `raven check` isn't an LSP).
 - **`@lsp-ignore` / `@lsp-ignore-next` remain permanent aliases** (maintainer
   uses them; parity with the Sight Stata LSP). Don't remove or deprecate-warn.
+  They cover the line / next-line `ignore` forms (gaining an optional `[code]`);
+  the new `expect` flavor and the `-file`/`-start`/`-end` forms are
+  `# raven:`-only — aliases need not grow every form.
 - **`# nolint` / `# nolint start` / `# nolint end` remain**, scoped to the
   **style/lint diagnostics gated by `raven.linting.enabled`** (lintr compat).
   See `crates/raven/src/linting/nolint.rs`.
@@ -81,6 +84,12 @@ a non-data.table `[` still flags. Update `docs/diagnostics.md` and
      (default OFF)** that extends the `unused-suppression` check to ALL
      `ignore`/`@lsp-ignore`/`nolint` directives (Pyright-style global sweep).
      Wire per the VS Code settings invariant above.
+   - **Implementation note:** stale detection needs to know what each directive
+     actually suppressed. Design the suppression pipeline to record, per
+     directive, the set of diagnostics it removed, so `unused-suppression` can
+     fire precisely when that set is empty (and `expect` can require it
+     non-empty). `unused-suppression` is hint severity, so it does NOT gate
+     `raven check` under `--max-severity error` by default.
 
 **Chunk-level suppression for `.Rmd`/`.qmd` (both forms — maintainer confirmed):**
 - a knitr **chunk option** (e.g. ```` ```{r, raven.ignore=TRUE} ```` or a
@@ -93,9 +102,17 @@ a non-data.table `[` still flags. Update `docs/diagnostics.md` and
   anti-pattern). Support **cascading sub-kinds** à la Pyrefly (`syntax-error`
   umbrella over `unclosed-paren`/`missing-brace`; suppressing the parent
   suppresses children).
-- ONE unified code namespace for analyzer diagnostics AND lint rules. Re-express
-  the existing lint `rule_ids` (`crates/raven/src/linting/rule_ids.rs`) in
-  kebab-case. Nothing external depends on current IDs, so renaming is fine.
+- ONE unified, kebab-case namespace for the **suppression codes** used in
+  `# raven: ignore[...]`, covering analyzer diagnostics AND lint rules.
+  **CAUTION — lint rule identifiers are NOT purely internal.** `.lintr`
+  compatibility and `raven.toml` / VS Code lint config let users enable/disable
+  rules *by name*, and `.lintr` uses lintr's `snake_case` + `_linter` names. Do
+  NOT break existing lint-config keys. Either (a) keep the config/`.lintr` rule
+  keys as-is and map them to kebab-case suppression codes, or (b) accept both
+  spellings via aliases. Verify against `docs/linting.md`,
+  `crates/raven/src/config_file/`, and the lint settings in
+  `editors/vscode/package.json`. Only the *suppression-code spelling* is free to
+  be kebab-case.
 - Enumerate the canonical set in `docs/diagnostics.md` (e.g. `undefined-variable`,
   `unused-suppression`, `syntax-error`(+children), `unresolved-source-path`,
   `assign-to-string-literal`, `mixed-logical`, plus lint rules `line-length`,
@@ -108,6 +125,13 @@ chunk masking in `cross_file/` (Rmd/qmd). Docs: rewrite the Ignore-directives
 section of `docs/directives.md`, update `docs/linting.md`, `docs/diagnostics.md`,
 `docs/chunks.md`, `docs/configuration.md` + settings reference. Keep existing
 `@lsp-ignore`/`nolint` tests green and add full coverage for the new forms.
+
+**Suggested build order within F2** (each its own TDD commit): (1) settle the
+kebab-case code namespace + lint-config compatibility mapping; (2) `# raven:`
+parser with per-code targeting + `@lsp-` aliases; (3) file-level and block/range;
+(4) the `expect` flavor + `unused-suppression` + the global setting; (5)
+chunk-level (option + in-chunk directive). F1, F3, F4 are independent of F2 and of
+each other and can be done in any order / as separate commits.
 
 ### F3 — `exported_interface` footgun cleanup
 The dangerous correctness misuse is already fixed (`c48dd1bc`) and the field doc
@@ -131,6 +155,11 @@ In `crates/raven/src/package_state/mod.rs` (`is_dev_context_path`,
 `package_state/derive.rs`:
 - **Dev-context set becomes: `demo/`, `vignettes/`, `data-raw/`, `man/`** (all
   "package is loaded when this runs"). One-way package R/ visibility as today.
+  NOTE: `man/` files are `.Rd`, not `.R`, and `is_dev_context_path`'s extension
+  list is `R/r/Rmd/rmd/qmd`. Verify how `man/*.Rd` `\examples{}` blocks are
+  actually extracted and scoped (WS-F added `man/`) — if `.Rd` example
+  extraction runs through a different path, make the F4 changes and tests target
+  that path rather than assuming the extension list covers it.
 - **Drop `inst/` and `revdep/`** from blanket dev-context injection.
 - **Promote `inst/tinytest/` and `inst/unitTests/` to `Test`-kind** (one-way
   package visibility + test-framework awareness, like `tests/testthat/`) — these
@@ -147,7 +176,12 @@ In `crates/raven/src/package_state/mod.rs` (`is_dev_context_path`,
 ## MULTI-AGENT REVIEW (after F1–F4; report-only)
 Run a **parallel** set of reviewer subagents over the **entire PR diff**
 (`main…prod-test`). Reviewers **report findings only** — the orchestrator
-synthesizes and applies fixes. Agents (don't drop any; they're probabilistic and
+synthesizes and applies fixes. Focus reviewers on **source and docs**; the diff
+includes thousands of lines of generated corpus fixtures
+(`tests/fixtures/package_corpus/*.toml`) — treat those as data, not line-review
+them. Reviewers should also **verify CodeRabbit's prior findings against current
+HEAD** (the old `run_check` exit-status check, the `classify_observed` perf
+nitpick, and the two then-stale tests) and confirm they're resolved or fix them. Agents (don't drop any; they're probabilistic and
 convergence across agents is signal):
 1. Repo coding-standards conformance (AGENTS.md invariants, module/doc-comment
    conventions, error handling, settings-wiring invariant).
@@ -166,6 +200,13 @@ convergence across agents is signal):
 green) → re-run all agents. **Done when two CONSECUTIVE passes yield ZERO findings
 from every agent.** Adjust the agent set between iterations if you learn a better
 decomposition (maintainer's explicit latitude).
+
+**Safety valve (don't lower the bar, don't loop forever):** triage each finding
+as actionable vs. subjective/out-of-scope. Keep iterating on actionable findings.
+If, after ~5 iterations, the only remaining items are subjective nitpicks the
+orchestrator judges out-of-scope (or agents disagree with each other), STOP and
+escalate to the maintainer with the shortlist and a recommendation rather than
+burning iterations chasing zero asymptotically.
 
 ## THEN: PR #420
 - Rewrite the PR **title** (CodeRabbit flagged "prod test" as vague) to something
