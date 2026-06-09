@@ -257,43 +257,104 @@ fn is_onload_definition(node: Node, content: &str) -> bool {
 }
 
 fn extract_bindings_from_body(body: Node, content: &str, symbols: &mut BTreeSet<String>) {
-    visit_body_for_bindings(body, content, symbols, false);
+    // First pass: identify identifiers bound to the namespace env via
+    // `<ident> <- topenv(...)` / `asNamespace(...)` / `getNamespace(...)`.
+    let ns_idents = collect_namespace_bound_idents(body, content);
+    visit_body_for_bindings(body, content, symbols, &ns_idents, false);
+}
+
+/// Scan top-level assignments in the hook body for patterns that bind an
+/// identifier to the namespace environment (e.g. `ns <- topenv(environment())`).
+/// Returns the set of identifier names that can be treated as namespace-like.
+fn collect_namespace_bound_idents(body: Node, content: &str) -> BTreeSet<String> {
+    let mut idents = BTreeSet::new();
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() == "binary_operator"
+            && let Some(op) = child.child_by_field_name("operator")
+            && matches!(node_text(op, content), "<-" | "=")
+            && let Some(lhs) = child.child_by_field_name("lhs")
+            && lhs.kind() == "identifier"
+            && let Some(rhs) = child.child_by_field_name("rhs")
+            && is_namespace_creating_expr(rhs, content)
+        {
+            idents.insert(node_text(lhs, content).to_string());
+        }
+    }
+    idents
+}
+
+/// Check if a node is an expression that produces a namespace environment:
+/// `topenv(...)`, `asNamespace(...)`, `getNamespace(...)`, or
+/// `parent.env(environment())`.
+fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
+    if node.kind() != "call" {
+        return false;
+    }
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let func_text = node_text(func_node, content);
+    matches!(func_text, "topenv" | "asNamespace" | "getNamespace") || func_text == "parent.env" // parent.env(environment()) pattern
+}
+
+/// Check if a node is a namespace-like expression: either a `topenv(...)` call
+/// or an identifier previously bound to the namespace.
+fn is_namespace_like(node: Node, content: &str, ns_idents: &BTreeSet<String>) -> bool {
+    match node.kind() {
+        "call" => {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                node_text(func_node, content) == "topenv"
+            } else {
+                false
+            }
+        }
+        "identifier" => ns_idents.contains(node_text(node, content)),
+        _ => false,
+    }
 }
 
 fn visit_body_for_bindings(
     node: Node,
     content: &str,
     symbols: &mut BTreeSet<String>,
+    ns_idents: &BTreeSet<String>,
     inside_nested_function: bool,
 ) {
     match node.kind() {
         "call" if !inside_nested_function => {
-            try_extract_assign_call(node, content, symbols);
+            try_extract_assign_call(node, content, symbols, ns_idents);
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, inside_nested_function);
+                visit_body_for_bindings(child, content, symbols, ns_idents, inside_nested_function);
             }
         }
         "binary_operator" if !inside_nested_function => {
-            try_extract_dollar_assignment(node, content, symbols);
+            try_extract_dollar_assignment(node, content, symbols, ns_idents);
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, inside_nested_function);
+                visit_body_for_bindings(child, content, symbols, ns_idents, inside_nested_function);
             }
         }
         "function_definition" => {
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, true);
+                visit_body_for_bindings(child, content, symbols, ns_idents, true);
             }
         }
         _ => {
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, inside_nested_function);
+                visit_body_for_bindings(child, content, symbols, ns_idents, inside_nested_function);
             }
         }
     }
 }
 
-/// Match `assign("x", value, envir = ns)` — extract "x".
-fn try_extract_assign_call(node: Node, content: &str, symbols: &mut BTreeSet<String>) {
+/// Match `assign("x", value, envir = <ns>)` — extract "x" only when the
+/// `envir` target is namespace-like (a tracked ns identifier or `topenv(...)`).
+fn try_extract_assign_call(
+    node: Node,
+    content: &str,
+    symbols: &mut BTreeSet<String>,
+    ns_idents: &BTreeSet<String>,
+) {
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
     };
@@ -303,7 +364,8 @@ fn try_extract_assign_call(node: Node, content: &str, symbols: &mut BTreeSet<Str
     let Some(args_node) = node.child_by_field_name("arguments") else {
         return;
     };
-    if !has_named_arg(&args_node, content, "envir") {
+    // Check envir arg is namespace-like
+    if !envir_is_namespace_like(&args_node, content, ns_idents) {
         return;
     }
     // First positional arg should be a string literal with the name
@@ -322,8 +384,29 @@ fn try_extract_assign_call(node: Node, content: &str, symbols: &mut BTreeSet<Str
     }
 }
 
-/// Match `ns$x <- ...` or `topenv()$x <- ...` patterns.
-fn try_extract_dollar_assignment(node: Node, content: &str, symbols: &mut BTreeSet<String>) {
+/// Check if the `envir` named argument is a namespace-like expression.
+fn envir_is_namespace_like(args_node: &Node, content: &str, ns_idents: &BTreeSet<String>) -> bool {
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+            && node_text(name_node, content) == "envir"
+            && let Some(value_node) = child.child_by_field_name("value")
+        {
+            return is_namespace_like(value_node, content, ns_idents);
+        }
+    }
+    false
+}
+
+/// Match `<ns>$x <- ...` or `topenv()$x <- ...` patterns — only when the
+/// receiver is namespace-like.
+fn try_extract_dollar_assignment(
+    node: Node,
+    content: &str,
+    symbols: &mut BTreeSet<String>,
+    ns_idents: &BTreeSet<String>,
+) {
     // Must be an assignment operator
     let Some(op) = node.child_by_field_name("operator") else {
         return;
@@ -343,6 +426,10 @@ fn try_extract_dollar_assignment(node: Node, content: &str, symbols: &mut BTreeS
         return;
     }
     if node_text(children[1], content) != "$" {
+        return;
+    }
+    // Check that the receiver (children[0]) is namespace-like
+    if !is_namespace_like(children[0], content, ns_idents) {
         return;
     }
     let field = &children[2];
@@ -376,19 +463,6 @@ fn has_named_bool_arg(args_node: &Node, content: &str, param: &str, expected: bo
             } else {
                 val == "FALSE" || val == "F"
             };
-        }
-    }
-    false
-}
-
-fn has_named_arg(args_node: &Node, content: &str, param: &str) -> bool {
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() == "argument"
-            && let Some(name_node) = child.child_by_field_name("name")
-            && node_text(name_node, content) == param
-        {
-            return true;
         }
     }
     false
@@ -570,6 +644,7 @@ mod tests {
     fn onload_assign_with_envir_extracts() {
         let code = r#"
 .onLoad <- function(libname, pkgname) {
+  ns <- topenv(environment())
   assign("x", 42, envir = ns)
 }
 "#;
@@ -615,6 +690,7 @@ my_func <- function() {
     fn nested_function_inside_onload_stays_local() {
         let code = r#"
 .onLoad <- function(libname, pkgname) {
+  ns <- topenv(environment())
   helper <- function() {
     assign("local_only", 1, envir = e)
   }
@@ -637,6 +713,100 @@ bar <- 42
         assert!(sysdata_syms.is_empty());
         let onload_syms = extract_onload_bindings(code);
         assert!(onload_syms.is_empty());
+    }
+
+    // --- .onLoad namespace-awareness (Group E finding 10) ---
+
+    #[test]
+    fn onload_assign_to_non_ns_envir_not_collected() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  e <- new.env(parent = emptyenv())
+  assign("tmp", 1, envir = e)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            !syms.contains("tmp"),
+            "local assign should not be collected: {:?}",
+            syms
+        );
+    }
+
+    #[test]
+    fn onload_dollar_assign_to_non_ns_not_collected() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  cache <- new.env(parent = emptyenv())
+  cache$foo <- 1
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            !syms.contains("foo"),
+            "local $ assign should not be collected: {:?}",
+            syms
+        );
+    }
+
+    #[test]
+    fn onload_assign_to_topenv_call_collected() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  assign("bar", 99, envir = topenv(environment()))
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            syms.contains("bar"),
+            "topenv() envir should be collected: {:?}",
+            syms
+        );
+    }
+
+    #[test]
+    fn onload_dollar_assign_to_topenv_call_collected() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  topenv(environment())$baz <- "hello"
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            syms.contains("baz"),
+            "topenv()$ should be collected: {:?}",
+            syms
+        );
+    }
+
+    #[test]
+    fn onload_ns_via_as_namespace_collected() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  nsenv <- asNamespace(pkgname)
+  assign("exported_fn", my_fn, envir = nsenv)
+  nsenv$another <- 42
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            syms.contains("exported_fn"),
+            "asNamespace assign: {:?}",
+            syms
+        );
+        assert!(syms.contains("another"), "asNamespace $ assign: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_ns_via_get_namespace_collected() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  ns <- getNamespace(pkgname)
+  assign("dynamic", value, envir = ns)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(syms.contains("dynamic"), "getNamespace assign: {:?}", syms);
     }
 
     // --- Filesystem scan ---
