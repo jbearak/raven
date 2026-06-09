@@ -2664,3 +2664,80 @@ start_line = 20
 start_character = 68
 end_line = 20
 end_character = 69
+[[diagnostic]]
+package = "mgcv"
+path = "R/sparse.r"
+message = "Undefined variable: ind"
+evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
+
+[diagnostic.range]
+start_line = 399
+start_character = 6
+end_line = 399
+end_character = 9
+[[diagnostic]]
+package = "mgcv"
+path = "R/sparse.r"
+message = "Undefined variable: ind"
+evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
+
+[diagnostic.range]
+start_line = 403
+start_character = 4
+end_line = 403
+end_character = 7
+[[diagnostic]]
+package = "mgcv"
+path = "R/sparse.r"
+message = "Undefined variable: ind"
+evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
+
+[diagnostic.range]
+start_line = 406
+start_character = 16
+end_line = 406
+end_character = 19
+[[diagnostic]]
+package = "lubridate"
+path = "R/coercion.r"
+message = "Undefined variable: x"
+evidence = "Function signature is function(new, orig) but body uses class(x). Parameter name mismatch — should be class(new)."
+
+[diagnostic.range]
+start_line = 116
+start_character = 73
+end_line = 116
+end_character = 74
+[[diagnostic]]
+package = "grDevices"
+path = "R/postscript.R"
+message = "Undefined variable: cmd"
+evidence = "stop(gettextf(..., cmd)) at line 992 (0-indexed 991) uses `cmd` which isn't assigned until line 995. Used-before-defined that will crash if system2() returns non-zero."
+
+[diagnostic.range]
+start_line = 991
+start_character = 64
+end_line = 991
+end_character = 67
+[[diagnostic]]
+package = "dbplyr"
+path = "R/verb-pivot-wider.R"
+message = "Undefined variable: error_call"
+evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
+
+[diagnostic.range]
+start_line = 364
+start_character = 17
+end_line = 364
+end_character = 27
+[[diagnostic]]
+package = "dbplyr"
+path = "R/verb-pivot-wider.R"
+message = "Undefined variable: error_call"
+evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
+
+[diagnostic.range]
+start_line = 371
+start_character = 17
+end_line = 371
+end_character = 27

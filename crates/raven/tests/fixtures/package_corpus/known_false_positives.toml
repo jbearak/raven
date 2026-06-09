@@ -20898,28 +20898,6 @@ end_character = 21
 package = "dbplyr"
 path = "R/verb-pivot-wider.R"
 message = "Undefined variable: error_call"
-reason = "formula variable (introduced by model.frame/model evaluation)"
-
-[false_positive.range]
-start_line = 364
-start_character = 17
-end_line = 364
-end_character = 27
-[[false_positive]]
-package = "dbplyr"
-path = "R/verb-pivot-wider.R"
-message = "Undefined variable: error_call"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 371
-start_character = 17
-end_line = 371
-end_character = 27
-[[false_positive]]
-package = "dbplyr"
-path = "R/verb-pivot-wider.R"
-message = "Undefined variable: error_call"
 reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
 
 [false_positive.range]
@@ -21785,17 +21763,7 @@ start_line = 29
 start_character = 24
 end_line = 29
 end_character = 31
-[[false_positive]]
-package = "grDevices"
-path = "R/postscript.R"
-message = "Undefined variable: cmd"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
 
-[false_positive.range]
-start_line = 991
-start_character = 64
-end_line = 991
-end_character = 67
 [[false_positive]]
 package = "httr"
 path = "demo/oauth2-yelp.R"
@@ -21972,17 +21940,7 @@ start_line = 26
 start_character = 35
 end_line = 26
 end_character = 36
-[[false_positive]]
-package = "lubridate"
-path = "R/coercion.r"
-message = "Undefined variable: x"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
 
-[false_positive.range]
-start_line = 116
-start_character = 73
-end_line = 116
-end_character = 74
 [[false_positive]]
 package = "methods"
 path = "R/ClassExtensions.R"
@@ -23050,39 +23008,6 @@ start_line = 1230
 start_character = 28
 end_line = 1230
 end_character = 34
-[[false_positive]]
-package = "mgcv"
-path = "R/sparse.r"
-message = "Undefined variable: ind"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 399
-start_character = 6
-end_line = 399
-end_character = 9
-[[false_positive]]
-package = "mgcv"
-path = "R/sparse.r"
-message = "Undefined variable: ind"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 403
-start_character = 4
-end_line = 403
-end_character = 7
-[[false_positive]]
-package = "mgcv"
-path = "R/sparse.r"
-message = "Undefined variable: ind"
-reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
-
-[false_positive.range]
-start_line = 406
-start_character = 16
-end_line = 406
-end_character = 19
 [[false_positive]]
 package = "parallel"
 path = "R/RngStream.R"
