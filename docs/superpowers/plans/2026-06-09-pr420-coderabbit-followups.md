@@ -37,6 +37,16 @@ referenced in Group F).
   `cross_file/path_resolve.rs`/`source_detect.rs` affect cross-file edges, so
   **re-run the strict corpus** before finalizing:
   `RAVEN_CORPUS_GROUPS=base,recommended,tidyverse cargo test -p raven --features test-support --test package_corpus package_corpus_selected -- --ignored` (~8 min).
+- **Release-only test target (don't skip):** `crates/raven/tests/performance_budgets.rs`
+  is gated `#![cfg(not(debug_assertions))]`, so a default debug `cargo test`
+  **never compiles it** — CI builds it in release (the `PERF_BIN` step). A struct
+  change can therefore pass every debug gate and still break CI (this exact thing
+  happened: `PackageInputs` gained `dataset_names`/`sysdata_names` and the perf
+  test wasn't updated — fixed in `4e2fcd32`). Before pushing, run a release
+  compile of the perf target:
+  `cargo test -p raven --release --features test-support --test performance_budgets --no-run`.
+  Several Group-E changes touch `package_state` (`PackageInputs`, watcher/sysdata)
+  — re-check this after them.
 - Commit at sensible checkpoints (one per group is fine). Preserve history.
 - **Non-blocking:** on any ambiguity make the smallest reasonable decision,
   record it on the deferred list, keep going.
