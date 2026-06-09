@@ -77,6 +77,7 @@ export interface RavenInitializationOptions {
         undefinedVariableInBracketIndices?: boolean;
         mixedLogicalSeverity?: SeverityLevel;
         conditionAssignmentSeverity?: SeverityLevel;
+        reportUnusedSuppressions?: boolean;
     };
     packages?: {
         enabled?: boolean;
@@ -297,6 +298,7 @@ export function getInitializationOptions(
     const undefinedVariableInBracketIndices = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariableInBracketIndices');
     const mixedLogicalSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.mixedLogicalSeverity');
     const conditionAssignmentSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.conditionAssignmentSeverity');
+    const reportUnusedSuppressions = getExplicitSetting<boolean>(config, 'diagnostics.reportUnusedSuppressions');
 
     options.diagnostics = {
         enabled: diagnosticsEnabled,
@@ -315,6 +317,9 @@ export function getInitializationOptions(
     }
     if (conditionAssignmentSeverity !== undefined) {
         options.diagnostics.conditionAssignmentSeverity = conditionAssignmentSeverity;
+    }
+    if (reportUnusedSuppressions !== undefined) {
+        options.diagnostics.reportUnusedSuppressions = reportUnusedSuppressions;
     }
 
     const packagesEnabled = getExplicitSetting<boolean>(config, 'packages.enabled');

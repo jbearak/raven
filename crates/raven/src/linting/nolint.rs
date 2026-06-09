@@ -325,12 +325,15 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
         };
     }
 
-    if let Some(rest) = matches_keyword(&trimmed, "@lsp-ignore") {
-        // An optional `[code]` selector may directly follow `@lsp-ignore`.
+    if let Some(rest) = matches_keyword(&trimmed, "@lsp-ignore")
+        .or_else(|| matches_keyword(&trimmed, "@lsp-expect"))
+    {
+        // An optional `[code]` selector may directly follow the marker.
         // Match `-next`, `:next`, or whitespace+`next` after the marker so
         // `@lsp-ignore-next`, `@lsp-ignore: next`, and `@lsp-ignore next`
         // all resolve to NextLine. Anything else on the same line is a
-        // same-line ignore.
+        // same-line ignore. `@lsp-expect*` is the asserting flavor (F2 Step 3)
+        // and suppresses identically here.
         let same_line_codes = parse_bracket_codes(rest);
         let after = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
         return if let Some(after_next) = after.strip_prefix("next") {
@@ -355,7 +358,11 @@ fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
     // Require the namespace separator `:` (optionally surrounded by spaces).
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(':')?.trim_start();
-    let after_ignore = matches_keyword(rest, "ignore")?;
+    // `expect` is the asserting flavor (F2 Step 3); in the lint track it
+    // suppresses identically to `ignore`. The `unused-suppression` distinction
+    // is handled by the analyzer-track directive enumeration, not here.
+    let after_ignore =
+        matches_keyword(rest, "ignore").or_else(|| matches_keyword(rest, "expect"))?;
     // `after_ignore` is "", "-next", "-start", "-end", "-file", or any of
     // those followed by a `[code]` selector (and the bare `ignore[code]` form).
     let action = after_ignore.trim_start_matches('-');

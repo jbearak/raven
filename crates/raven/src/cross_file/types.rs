@@ -83,6 +83,56 @@ pub struct SuppressionRange {
     pub what: LineSuppression,
 }
 
+/// The flavor of a suppression directive (F2 Step 3).
+///
+/// `Ignore` is silent: it never warns, even when it suppressed nothing (like
+/// Rust's `#[allow]` / `@ts-ignore`). `Expect` asserts that a diagnostic *will*
+/// be suppressed: if it suppressed nothing, an `unused-suppression` hint is
+/// emitted at the directive's line (like Rust's `#[expect]` /
+/// `@ts-expect-error`). Both flavors suppress diagnostics identically; they
+/// differ only in the `unused-suppression` sweep.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SuppressionFlavor {
+    /// Silent suppression — never reported as unused unless the global
+    /// `reportUnusedSuppressions` sweep is enabled.
+    Ignore,
+    /// Asserting suppression — reported as unused whenever it suppressed
+    /// nothing, regardless of the global sweep.
+    Expect,
+}
+
+/// One parsed suppression directive, retained for the `unused-suppression`
+/// sweep (F2 Step 3).
+///
+/// Unlike the inline `ignored_*` maps — which are keyed by *target* line for
+/// fast per-diagnostic lookup — this records the directive's own line (the
+/// anchor where an `unused-suppression` hint is reported), the inclusive target
+/// line range it governs, what it suppresses, and its flavor. A directive is
+/// "used" iff at least one diagnostic on a covered line carries a code its
+/// `what` covers; an unused `Expect` (or, under the global sweep, an unused
+/// `Ignore`) produces an `unused-suppression` diagnostic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuppressionDirective {
+    /// 0-based line of the directive comment itself (hint anchor).
+    pub directive_line: u32,
+    /// First 0-based line the directive suppresses (inclusive).
+    pub target_start: u32,
+    /// Last 0-based line the directive suppresses (inclusive). `u32::MAX` for a
+    /// file-level directive, which covers every line.
+    pub target_end: u32,
+    /// What the directive suppresses (blanket or code-scoped).
+    pub what: LineSuppression,
+    /// `Ignore` (silent) or `Expect` (asserts a suppression occurs).
+    pub flavor: SuppressionFlavor,
+}
+
+impl SuppressionDirective {
+    /// Does this directive govern `line`?
+    pub fn covers_line(&self, line: u32) -> bool {
+        line >= self.target_start && line <= self.target_end
+    }
+}
+
 /// Complete cross-file metadata for a document
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossFileMetadata {
@@ -111,6 +161,13 @@ pub struct CrossFileMetadata {
     /// Each entry is `(start_line, end_line_inclusive, what)`, 0-based.
     #[serde(default)]
     pub ignored_ranges: Vec<SuppressionRange>,
+    /// All parsed suppression directives (both `ignore` and `expect` flavors),
+    /// retained for the `unused-suppression` sweep (F2 Step 3). Separate from
+    /// the inline `ignored_*` maps, which are keyed by *target* line for fast
+    /// per-diagnostic lookup; this list keeps each directive's own line and
+    /// flavor so an unused directive can be reported at its source.
+    #[serde(default)]
+    pub suppression_directives: Vec<SuppressionDirective>,
     /// Detected library(), require(), loadNamespace() calls
     pub library_calls: Vec<LibraryCall>,
     /// Variables declared via @lsp-var directives

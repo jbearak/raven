@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use super::types::{
     BackwardDirective, CallSiteSpec, CrossFileMetadata, DeclaredSymbol, ForwardSource,
-    LineSuppression, SuppressionRange,
+    LineSuppression, SuppressionDirective, SuppressionFlavor, SuppressionRange,
 };
 
 /// Compiled regex patterns for directive parsing
@@ -49,6 +49,15 @@ fn parse_suppression_codes(raw: Option<&str>) -> LineSuppression {
                 LineSuppression::Codes(codes)
             }
         }
+    }
+}
+
+/// Map the flavor capture (`ignore` | `expect`) into a [`SuppressionFlavor`].
+/// Defaults to [`SuppressionFlavor::Ignore`] when absent or unrecognized.
+fn parse_flavor(raw: Option<&str>) -> SuppressionFlavor {
+    match raw {
+        Some("expect") => SuppressionFlavor::Expect,
+        _ => SuppressionFlavor::Ignore,
     }
 }
 
@@ -151,33 +160,36 @@ fn patterns() -> &'static DirectivePatterns {
                 r#"^\s*#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
             ignore: Regex::new(
-                r"#\s*@lsp-ignore(?:\[([^\]]*)\])?\s*:?\s*$"
+                r"#\s*@lsp-(ignore|expect)(?:\[([^\]]*)\])?\s*:?\s*$"
             ).unwrap(),
             ignore_next: Regex::new(
-                r"^\s*#\s*@lsp-ignore-next(?:\[([^\]]*)\])?\s*:?\s*$"
+                r"^\s*#\s*@lsp-(ignore|expect)-next(?:\[([^\]]*)\])?\s*:?\s*$"
             ).unwrap(),
             // `# raven:` is the primary suppression namespace (F2). For the
             // analyzer track it aliases the line / next-line ignore forms
             // (`@lsp-ignore` parity), plus block (`-start`/`-end`) and
             // file-level (`-file`) forms. Each form takes an optional `[code]`
             // selector (comma-separated codes) that targets specific diagnostic
-            // codes; absent brackets mean a blanket ignore. The same-line form
-            // excludes `-next`/`-start`/`-end`/`-file` by requiring the
-            // `ignore` token to be followed only by an optional `[code]` + EOL.
+            // codes; absent brackets mean a blanket ignore. Each form also
+            // comes in two flavors — `ignore` (silent) and `expect` (asserts a
+            // suppression, warns via `unused-suppression` if none occurred) —
+            // captured as group 1; the `[code]` body is group 2. The same-line
+            // form excludes `-next`/`-start`/`-end`/`-file` by requiring the
+            // verb to be followed only by an optional `[code]` + EOL.
             raven_ignore: Regex::new(
-                r"#\s*raven:\s*ignore(?:\[([^\]]*)\])?\s*$"
+                r"#\s*raven:\s*(ignore|expect)(?:\[([^\]]*)\])?\s*$"
             ).unwrap(),
             raven_ignore_next: Regex::new(
-                r"^\s*#\s*raven:\s*ignore-next(?:\[([^\]]*)\])?\s*$"
+                r"^\s*#\s*raven:\s*(ignore|expect)-next(?:\[([^\]]*)\])?\s*$"
             ).unwrap(),
             raven_ignore_start: Regex::new(
-                r"^\s*#\s*raven:\s*ignore-start(?:\[([^\]]*)\])?\s*$"
+                r"^\s*#\s*raven:\s*(ignore|expect)-start(?:\[([^\]]*)\])?\s*$"
             ).unwrap(),
             raven_ignore_end: Regex::new(
-                r"^\s*#\s*raven:\s*ignore-end\s*$"
+                r"^\s*#\s*raven:\s*(?:ignore|expect)-end\s*$"
             ).unwrap(),
             raven_ignore_file: Regex::new(
-                r"^\s*#\s*raven:\s*ignore-file(?:\[([^\]]*)\])?\s*$"
+                r"^\s*#\s*raven:\s*(ignore|expect)-file(?:\[([^\]]*)\])?\s*$"
             ).unwrap(),
             // Declaration directives for variables
             // Synonyms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
@@ -219,10 +231,10 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
     // in the file header (consecutive blank/comment lines from the start).
     let mut in_header = true;
 
-    // Open `# raven: ignore-start` block, if any: (start_line, what). Closed by
-    // `# raven: ignore-end`; an unterminated block extends to EOF (mirrors the
-    // lint track's `# nolint start` behavior).
-    let mut open_block: Option<(u32, LineSuppression)> = None;
+    // Open `# raven: ignore-start` block, if any: (start_line, what, flavor).
+    // Closed by `# raven: ignore-end`; an unterminated block extends to EOF
+    // (mirrors the lint track's `# nolint start` behavior).
+    let mut open_block: Option<(u32, LineSuppression, SuppressionFlavor)> = None;
     let mut total_lines: u32 = 0;
 
     for (line_num, line) in content.lines().enumerate() {
@@ -356,19 +368,39 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             continue;
         }
 
-        // Full-file: ignore directives. Each captures an optional `[code]`
-        // selector (capture group 1) that narrows what it suppresses.
+        // Full-file: ignore directives. Each captures an optional flavor
+        // (`ignore`|`expect`, group 1) and `[code]` selector (group 2) that
+        // narrows what it suppresses.
         if let Some(caps) = patterns.ignore.captures(line) {
-            log::trace!("  Parsed @lsp-ignore directive at line {}", line_num);
-            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_lines, line_num, what);
+            log::trace!("  Parsed @lsp-ignore/expect directive at line {}", line_num);
+            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
+            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_lines, line_num, what.clone());
+            meta.suppression_directives.push(SuppressionDirective {
+                directive_line: line_num,
+                target_start: line_num,
+                target_end: line_num,
+                what,
+                flavor,
+            });
             continue;
         }
 
         if let Some(caps) = patterns.ignore_next.captures(line) {
-            log::trace!("  Parsed @lsp-ignore-next directive at line {}", line_num);
-            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what);
+            log::trace!(
+                "  Parsed @lsp-ignore/expect-next directive at line {}",
+                line_num
+            );
+            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
+            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what.clone());
+            meta.suppression_directives.push(SuppressionDirective {
+                directive_line: line_num,
+                target_start: line_num + 1,
+                target_end: line_num + 1,
+                what,
+                flavor,
+            });
             continue;
         }
 
@@ -376,52 +408,93 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // block (`-start`/`-end`) and file (`-file`) forms are checked first
         // since `raven_ignore` (the same-line form) does not match them.
         if let Some(caps) = patterns.raven_ignore_start.captures(line) {
-            log::trace!("  Parsed `# raven: ignore-start` at line {}", line_num);
+            log::trace!(
+                "  Parsed `# raven: ignore/expect-start` at line {}",
+                line_num
+            );
             // A nested start is ignored until the current block closes (mirrors
             // the lint track, which does not nest).
             if open_block.is_none() {
-                let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
-                open_block = Some((line_num, what));
+                let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
+                let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
+                open_block = Some((line_num, what, flavor));
             }
             continue;
         }
 
         if patterns.raven_ignore_end.is_match(line) {
-            log::trace!("  Parsed `# raven: ignore-end` at line {}", line_num);
-            if let Some((start, what)) = open_block.take() {
+            log::trace!("  Parsed `# raven: ignore/expect-end` at line {}", line_num);
+            if let Some((start, what, flavor)) = open_block.take() {
                 meta.ignored_ranges.push(SuppressionRange {
                     start,
                     end: line_num,
+                    what: what.clone(),
+                });
+                meta.suppression_directives.push(SuppressionDirective {
+                    directive_line: start,
+                    target_start: start,
+                    target_end: line_num,
                     what,
+                    flavor,
                 });
             }
             continue;
         }
 
         if let Some(caps) = patterns.raven_ignore_file.captures(line) {
-            log::trace!("  Parsed `# raven: ignore-file` at line {}", line_num);
-            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
+            log::trace!(
+                "  Parsed `# raven: ignore/expect-file` at line {}",
+                line_num
+            );
+            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
+            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
             match &mut meta.ignored_file {
-                Some(existing) => existing.merge(what),
-                None => meta.ignored_file = Some(what),
+                Some(existing) => existing.merge(what.clone()),
+                None => meta.ignored_file = Some(what.clone()),
             }
+            meta.suppression_directives.push(SuppressionDirective {
+                directive_line: line_num,
+                target_start: 0,
+                target_end: u32::MAX,
+                what,
+                flavor,
+            });
             continue;
         }
 
         if let Some(caps) = patterns.raven_ignore_next.captures(line) {
             log::trace!(
-                "  Parsed `# raven: ignore-next` directive at line {}",
+                "  Parsed `# raven: ignore/expect-next` directive at line {}",
                 line_num
             );
-            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what);
+            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
+            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what.clone());
+            meta.suppression_directives.push(SuppressionDirective {
+                directive_line: line_num,
+                target_start: line_num + 1,
+                target_end: line_num + 1,
+                what,
+                flavor,
+            });
             continue;
         }
 
         if let Some(caps) = patterns.raven_ignore.captures(line) {
-            log::trace!("  Parsed `# raven: ignore` directive at line {}", line_num);
-            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_lines, line_num, what);
+            log::trace!(
+                "  Parsed `# raven: ignore/expect` directive at line {}",
+                line_num
+            );
+            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
+            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_lines, line_num, what.clone());
+            meta.suppression_directives.push(SuppressionDirective {
+                directive_line: line_num,
+                target_start: line_num,
+                target_end: line_num,
+                what,
+                flavor,
+            });
             continue;
         }
 
@@ -465,10 +538,20 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
     // An unterminated `# raven: ignore-start` extends to EOF (mirrors the lint
     // track's `# nolint start` behavior so a missing `-end` doesn't silently
     // lose coverage).
-    if let Some((start, what)) = open_block.take() {
+    if let Some((start, what, flavor)) = open_block.take() {
         let end = total_lines.saturating_sub(1);
-        meta.ignored_ranges
-            .push(SuppressionRange { start, end, what });
+        meta.ignored_ranges.push(SuppressionRange {
+            start,
+            end,
+            what: what.clone(),
+        });
+        meta.suppression_directives.push(SuppressionDirective {
+            directive_line: start,
+            target_start: start,
+            target_end: end,
+            what,
+            flavor,
+        });
     }
 
     log::trace!(
@@ -751,6 +834,96 @@ mod tests {
             1,
             Some("package-not-installed")
         ));
+    }
+
+    /// F2 Step 3: `expect` is recognized as a suppressing directive on the
+    /// analyzer track (suppresses identically to `ignore`) and is enumerated
+    /// with `flavor = Expect`.
+    #[test]
+    fn test_raven_expect_suppresses_and_records_flavor() {
+        let content = "x <- undefined # raven: expect[undefined-variable]";
+        let meta = parse_directives(content);
+        // Suppresses just like ignore.
+        assert!(is_line_ignored_for_code(
+            &meta,
+            0,
+            Some("undefined-variable")
+        ));
+        // Enumerated as an Expect directive at line 0.
+        assert_eq!(meta.suppression_directives.len(), 1);
+        let d = &meta.suppression_directives[0];
+        assert_eq!(d.flavor, SuppressionFlavor::Expect);
+        assert_eq!(d.directive_line, 0);
+        assert_eq!(d.target_start, 0);
+        assert_eq!(d.target_end, 0);
+    }
+
+    /// F2 Step 3: a plain `ignore` is enumerated with `flavor = Ignore`.
+    #[test]
+    fn test_raven_ignore_records_ignore_flavor() {
+        let content = "x <- undefined # raven: ignore";
+        let meta = parse_directives(content);
+        assert_eq!(meta.suppression_directives.len(), 1);
+        assert_eq!(
+            meta.suppression_directives[0].flavor,
+            SuppressionFlavor::Ignore
+        );
+    }
+
+    /// F2 Step 3: `@lsp-expect` / `@lsp-expect-next` aliases.
+    #[test]
+    fn test_lsp_expect_aliases() {
+        let meta = parse_directives("x <- undefined # @lsp-expect[undefined-variable]");
+        assert_eq!(meta.suppression_directives.len(), 1);
+        assert_eq!(
+            meta.suppression_directives[0].flavor,
+            SuppressionFlavor::Expect
+        );
+        assert!(is_line_ignored_for_code(
+            &meta,
+            0,
+            Some("undefined-variable")
+        ));
+
+        let meta = parse_directives("# @lsp-expect-next\ny <- undefined");
+        assert_eq!(meta.suppression_directives.len(), 1);
+        let d = &meta.suppression_directives[0];
+        assert_eq!(d.flavor, SuppressionFlavor::Expect);
+        assert_eq!(d.directive_line, 0);
+        assert_eq!(d.target_start, 1);
+        assert_eq!(d.target_end, 1);
+        assert!(is_line_ignored(&meta, 1));
+    }
+
+    /// F2 Step 3: `expect-start` … `ignore-end` forms a range directive with
+    /// the start line as the hint anchor and the whole block as target.
+    #[test]
+    fn test_raven_expect_block_enumeration() {
+        let content = "# raven: expect-start[undefined-variable]\na <- b\nc <- d\n# raven: ignore-end\ne <- f";
+        let meta = parse_directives(content);
+        let block: Vec<_> = meta
+            .suppression_directives
+            .iter()
+            .filter(|d| d.target_start != d.target_end || d.target_start == 0)
+            .collect();
+        assert_eq!(block.len(), 1);
+        let d = block[0];
+        assert_eq!(d.flavor, SuppressionFlavor::Expect);
+        assert_eq!(d.directive_line, 0);
+        assert_eq!(d.target_start, 0);
+        assert_eq!(d.target_end, 3);
+    }
+
+    /// F2 Step 3: `expect-file` covers every line (target_end = u32::MAX).
+    #[test]
+    fn test_raven_expect_file_enumeration() {
+        let content = "# raven: expect-file[undefined-variable]\nx <- undefined";
+        let meta = parse_directives(content);
+        assert_eq!(meta.suppression_directives.len(), 1);
+        let d = &meta.suppression_directives[0];
+        assert_eq!(d.flavor, SuppressionFlavor::Expect);
+        assert_eq!(d.target_start, 0);
+        assert_eq!(d.target_end, u32::MAX);
     }
 
     #[test]

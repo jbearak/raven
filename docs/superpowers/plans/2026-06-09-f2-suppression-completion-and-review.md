@@ -371,3 +371,74 @@ inclusive of directive lines, unterminated → EOF). All flow through
   file/block/chunk + per-code now enforced), `linting.md` (per-code now enforced;
   `# nolint: rule` now honored — remove the blanket-interim note), `chunks.md`,
   `configuration.md` + regenerate `settings-reference.md`.
+
+---
+
+## PROGRESS UPDATE — Step 3 DONE (on `prod-test`)
+
+**Status:** fmt clean, clippy clean (`--all-targets --features test-support`),
+full `cargo test -p raven --features test-support` green (lib + integration +
+55 doctests), root `bun test` green (1321 pass), settings-reference drift test
+green, VS Code `tsc --noEmit` clean. Gate confirmed before this commit (the two
+not-yet-rerun gates from Steps 1-2 were re-run first: bun 1321 pass, strict
+three-group corpus passed in 456s — no regression).
+
+### Step 3 — expect flavor + unused-suppression + global setting: DONE
+- **`cross_file/types.rs`**: added `enum SuppressionFlavor { Ignore, Expect }`
+  and `struct SuppressionDirective { directive_line, target_start, target_end,
+  what, flavor }` with `covers_line()`. New `#[serde(default)]
+  suppression_directives: Vec<SuppressionDirective>` on `CrossFileMetadata` —
+  the enumeration that drives the unused-suppression sweep (separate from the
+  target-line-keyed inline `ignored_*` maps).
+- **`cross_file/directive.rs`**: ignore/expect regexes now capture the flavor
+  (`ignore|expect`, group 1) + `[code]` (group 2). Both flavors populate the
+  inline maps (suppress identically) AND push a `SuppressionDirective`. Added
+  `@lsp-expect`/`@lsp-expect-next` aliases. 5 new unit tests.
+- **`linting/nolint.rs`** + **`handlers.rs` AST `classify_lsp_ignore_marker`**:
+  `expect` recognized as a suppressing alias of `ignore` (the warn-if-unused
+  distinction is driven only by the directive enumeration, not these tracks).
+- **`linting/mod.rs`**: `run_lints`/`run_semantic_checks` refactored into
+  `_with(owned Suppressions)` + added `run_lints_raw`/`run_semantic_checks_raw`
+  and `suppressed_lint_pairs()` — recomputes raw (pre-suppression) lint+semantic
+  diagnostics and returns the (line, kebab-code) pairs the lint suppression map
+  actually removed. Encapsulates the `nolint` dependency in the module.
+- **`handlers.rs`**: analyzer collectors capture the `(line, code)` pairs they
+  actually suppress, but only when the sweep is active (an `expect` directive
+  present OR the global setting on) — fast path otherwise unchanged. Missing-
+  package reordered (package_exists before the ignore check). Out-of-scope and
+  undefined-variable gate the early-exit on `!tracking` and record at the
+  would-be-push site. AST invalid-assignment records at its post-classification
+  ignore check. New `collect_unused_suppression_diagnostics()` emits HINT
+  `unused-suppression` for unused `expect` (always) / unused `ignore` (only
+  under the global setting). 4 new unit tests + 3 new e2e tests in
+  `suppression_per_code.rs`.
+- **Config + VS Code wiring**: `report_unused_suppressions` on `CrossFileConfig`
+  (default false), parsed in `backend.rs` (LSP-only, consistent with the other
+  `diagnostics.*` settings which are not config_file-layered). Wired the
+  `raven.diagnostics.reportUnusedSuppressions` VS Code setting in all 3 places
+  (`package.json` + `initializationOptions.ts` + `SETTINGS_MAPPING`/test) and
+  regenerated `docs/settings-reference.md`.
+
+### Decisions made this session (smallest-reasonable; deferred list)
+5. **`expect` mirrors all `ignore` forms** on the `# raven:` namespace
+   (`expect`, `-next`, `-start`/`-end`, `-file`) plus `@lsp-expect`/
+   `@lsp-expect-next`. `expect-end` is unnecessary (an `expect-start` block is
+   closed by any `ignore-end`/`expect-end`). Documented in Step 5.
+6. **Unused-suppression reporting is driven solely by the analyzer-track
+   directive enumeration** (`directive.rs::parse_directives`). Bare lintr
+   `# nolint`/`# nolint start` directives are NOT enumerated, so they are never
+   reported as unused even under the global sweep. Rationale: `nolint` is a
+   lintr-compat alias with no `expect` concept; the sweep is a Raven feature
+   keyed on Raven's own `# raven:`/`@lsp-` directives. Revisit if nolint-sweep
+   parity is wanted.
+7. **"Used" = a directive covered ≥1 *suppressed* (line, code) pair**, computed
+   from analyzer-captured pairs + `suppressed_lint_pairs`. Emitted (non-
+   suppressed) diagnostics are irrelevant: if a directive covered them they'd
+   have been suppressed. Lint pairs are recomputed (raw lint pass) only when the
+   sweep is active — a bounded extra cost gated on `expect` presence / the
+   global setting; zero overhead in the common case.
+8. **Syntax-error suppression unchanged** — syntax errors are still not wired
+   into any enforcement site, so an `expect[syntax-error]` would always report
+   unused. Consistent with Step-1 decision #3. Not surfaced as a user feature.
+
+### Remaining: Step 4, 5, then review (task 12) + PR (task 13)

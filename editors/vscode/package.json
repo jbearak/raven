@@ -1229,6 +1229,11 @@
           "default": "warning",
           "description": "Severity for the condition-assignment diagnostic. Flags `=` used as a binary operator directly inside an `if` or `while` condition. R rejects `if (x = 1)` as a syntax error at runtime but tree-sitter-r accepts it silently. Named-argument `=` inside function calls within the condition is not flagged."
         },
+        "raven.diagnostics.reportUnusedSuppressions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Report every suppression directive that suppressed nothing as an unused-suppression hint, not just `# raven: expect[...]` directives. When disabled (the default), only `expect` directives are checked — a plain `# raven: ignore` / `# @lsp-ignore` / `# nolint` is silent even if it matched no diagnostic. When enabled (Pyright-style), all ignore directives are also reported as unused when they suppress nothing. The hint is HINT severity, so it does not affect `raven check` exit status by default."
+        },
         "raven.packages.enabled": {
           "type": "boolean",
           "default": true,

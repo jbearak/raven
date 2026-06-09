@@ -430,10 +430,34 @@ pub(crate) fn diagnostics_from_snapshot(
 
     let mut diagnostics = Vec::new();
 
+    // F2 Step 3: the `unused-suppression` sweep. Active when any `expect`
+    // directive is present (always reported) OR the project-wide
+    // `reportUnusedSuppressions` setting is on (reports every ignore too). When
+    // inactive (the common case) the collectors take their normal fast path and
+    // record nothing.
+    let report_unused_all = snapshot.cross_file_config.report_unused_suppressions;
+    let has_expect = snapshot
+        .directive_meta
+        .suppression_directives
+        .iter()
+        .any(|d| d.flavor == crate::cross_file::types::SuppressionFlavor::Expect);
+    let track_unused = report_unused_all || has_expect;
+    // (line, kebab-code) pairs that were actually suppressed across both tracks.
+    let mut suppressed_pairs: Vec<(u32, String)> = Vec::new();
+
     // Fast collectors (no scope resolution needed)
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
-    collect_invalid_assignment_targets(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+    collect_invalid_assignment_targets(
+        snapshot.tree.root_node(),
+        &snapshot.text,
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
 
     // Semantic checks: always-on rules that flag likely-wrong code regardless
     // of the style-lint master switch.
@@ -503,7 +527,15 @@ pub(crate) fn diagnostics_from_snapshot(
     collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
 
     // Missing package diagnostics
-    collect_missing_package_diagnostics_from_snapshot(snapshot, &mut diagnostics);
+    collect_missing_package_diagnostics_from_snapshot(
+        snapshot,
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
 
     // Redundant directive diagnostics
     collect_redundant_directive_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
@@ -533,6 +565,11 @@ pub(crate) fn diagnostics_from_snapshot(
         &mut diagnostics,
         &mut scope_cache,
         cancel,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
     );
 
     if cancel.is_cancelled() {
@@ -554,6 +591,11 @@ pub(crate) fn diagnostics_from_snapshot(
             &mut diagnostics,
             &mut scope_cache,
             cancel,
+            if track_unused {
+                Some(&mut suppressed_pairs)
+            } else {
+                None
+            },
         );
     }
 
@@ -571,6 +613,26 @@ pub(crate) fn diagnostics_from_snapshot(
         scope_start.elapsed().as_millis(),
         scope_cache.len(),
     );
+
+    // F2 Step 3: complete the `unused-suppression` sweep. The analyzer track
+    // already captured its suppressed pairs into `suppressed_pairs`; add the
+    // lint track's (recomputed raw, then filtered by the lint suppression map)
+    // and emit a HINT for every directive that suppressed nothing.
+    if track_unused {
+        suppressed_pairs.extend(crate::linting::suppressed_lint_pairs(
+            &snapshot.text,
+            snapshot.tree.root_node(),
+            &snapshot.lint_config,
+            snapshot.cross_file_config.mixed_logical_severity,
+            snapshot.cross_file_config.condition_assignment_severity,
+        ));
+        collect_unused_suppression_diagnostics(
+            &snapshot.directive_meta.suppression_directives,
+            &suppressed_pairs,
+            report_unused_all,
+            &mut diagnostics,
+        );
+    }
 
     Some(diagnostics)
 }
@@ -4863,6 +4925,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
 fn collect_missing_package_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
     if !snapshot.cross_file_config.packages_enabled {
         return;
@@ -4884,27 +4947,88 @@ fn collect_missing_package_diagnostics_from_snapshot(
     };
 
     for lib_call in &snapshot.directive_meta.library_calls {
+        // Confirm the package is actually missing *before* consulting the
+        // suppression directive, so the `unused-suppression` sweep records a
+        // hit only when there was a real diagnostic to suppress (F2 Step 3).
+        if snapshot.package_library.package_exists(&lib_call.package) {
+            continue;
+        }
         if crate::cross_file::directive::is_line_ignored_for_code(
             &snapshot.directive_meta,
             lib_call.line,
             Some(crate::diagnostic_code::PACKAGE_NOT_INSTALLED),
         ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    lib_call.line,
+                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+                ));
+            }
             continue;
         }
-        if !snapshot.package_library.package_exists(&lib_call.package) {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(lib_call.line, 0),
-                    end: Position::new(lib_call.line, lib_call.column),
-                },
-                severity: Some(severity),
-                message: format!("Package '{}' is not installed", lib_call.package),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
-                )),
-                ..Default::default()
-            });
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(lib_call.line, 0),
+                end: Position::new(lib_call.line, lib_call.column),
+            },
+            severity: Some(severity),
+            message: format!("Package '{}' is not installed", lib_call.package),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+}
+
+/// F2 Step 3: emit `unused-suppression` (HINT) diagnostics for suppression
+/// directives that suppressed nothing.
+///
+/// `suppressed` is the set of `(line, kebab-code)` pairs actually removed by
+/// suppression across both the analyzer and lint tracks. A directive is "used"
+/// iff some suppressed pair falls on a line it covers and carries a code its
+/// `what` covers. An unused `Expect` is always reported; an unused `Ignore` is
+/// reported only when `report_all` (the `reportUnusedSuppressions` setting) is
+/// enabled. The hint is anchored at the directive's own line.
+fn collect_unused_suppression_diagnostics(
+    directives: &[crate::cross_file::types::SuppressionDirective],
+    suppressed: &[(u32, String)],
+    report_all: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use crate::cross_file::types::SuppressionFlavor;
+    for directive in directives {
+        let report = report_all || directive.flavor == SuppressionFlavor::Expect;
+        if !report {
+            continue;
         }
+        let used = suppressed
+            .iter()
+            .any(|(line, code)| directive.covers_line(*line) && directive.what.covers(Some(code)));
+        if used {
+            continue;
+        }
+        let message = match directive.flavor {
+            SuppressionFlavor::Expect => {
+                "Unused `expect` suppression: no matching diagnostic was suppressed here."
+                    .to_string()
+            }
+            SuppressionFlavor::Ignore => {
+                "Unused suppression: no matching diagnostic was suppressed here.".to_string()
+            }
+        };
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(directive.directive_line, 0),
+                end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
+            },
+            severity: Some(DiagnosticSeverity::HINT),
+            message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNUSED_SUPPRESSION.to_string(),
+            )),
+            ..Default::default()
+        });
     }
 }
 
@@ -4948,6 +5072,7 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_out_of_scope_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -4956,6 +5081,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
     cancel: &DiagCancelToken,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
     let Some(severity) = snapshot.cross_file_config.out_of_scope_severity else {
         return;
@@ -5126,11 +5252,16 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             return;
         }
 
-        if crate::cross_file::directive::is_line_ignored_for_code(
+        // Whether this usage's line carries a suppression covering
+        // undefined-variable. When not tracking unused suppressions we skip
+        // immediately (fast path); when tracking we proceed so the directive's
+        // usage can be recorded at the would-be push site (F2 Step 3).
+        let suppressed_line = crate::cross_file::directive::is_line_ignored_for_code(
             &snapshot.directive_meta,
             *usage_line,
             Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
-        ) {
+        );
+        if suppressed_line && suppressed_out.is_none() {
             continue;
         }
         if is_reserved_word(name) {
@@ -5241,22 +5372,31 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             let end_col =
                 byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
 
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(*usage_line, start_col),
-                    end: Position::new(usage_node.end_position().row as u32, end_col),
-                },
-                severity: Some(severity),
-                message: format!(
-                    "'{}' is used before it's available (sourced on line {})",
-                    name,
-                    source.line + 1
-                ),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
-                )),
-                ..Default::default()
-            });
+            if suppressed_line {
+                if let Some(out) = suppressed_out.as_deref_mut() {
+                    out.push((
+                        *usage_line,
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    ));
+                }
+            } else {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(*usage_line, start_col),
+                        end: Position::new(usage_node.end_position().row as u32, end_col),
+                    },
+                    severity: Some(severity),
+                    message: format!(
+                        "'{}' is used before it's available (sourced on line {})",
+                        name,
+                        source.line + 1
+                    ),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    )),
+                    ..Default::default()
+                });
+            }
             break;
         }
     }
@@ -5374,6 +5514,7 @@ fn collect_undefined_variables_from_snapshot(
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
     cancel: &DiagCancelToken,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
     use crate::cross_file::config::BackwardDependencyMode;
     use crate::cross_file::types::byte_offset_to_utf16_column;
@@ -5607,11 +5748,16 @@ fn collect_undefined_variables_from_snapshot(
 
         let usage_line = usage_node.start_position().row as u32;
 
-        if crate::cross_file::directive::is_line_ignored_for_code(
+        // Whether this usage's line carries a suppression covering
+        // undefined-variable. Fast path skips immediately when not tracking
+        // unused suppressions; when tracking we proceed so a real suppressed
+        // diagnostic can be recorded at the would-be push site (F2 Step 3).
+        let suppressed_line = crate::cross_file::directive::is_line_ignored_for_code(
             &snapshot.directive_meta,
             usage_line,
             Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
-        ) {
+        );
+        if suppressed_line && suppressed_out.is_none() {
             continue;
         }
         let unquoted_usage_name = unquote_backtick_name(&name).map(str::to_string);
@@ -5880,6 +6026,16 @@ fn collect_undefined_variables_from_snapshot(
             ),
             None => format!("Undefined variable: {}", name),
         };
+
+        if suppressed_line {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    usage_line,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                ));
+            }
+            continue;
+        }
 
         diagnostics.push(Diagnostic {
             range: Range {
@@ -7690,6 +7846,95 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
          For assignment use `<-`; for a pipeline use `|>` (R 4.1+) or `%>%`."
             .to_string(),
     )
+}
+
+#[cfg(test)]
+mod unused_suppression_tests {
+    use super::collect_unused_suppression_diagnostics;
+    use crate::cross_file::types::{LineSuppression, SuppressionDirective, SuppressionFlavor};
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+
+    fn directive(
+        line: u32,
+        what: LineSuppression,
+        flavor: SuppressionFlavor,
+    ) -> SuppressionDirective {
+        SuppressionDirective {
+            directive_line: line,
+            target_start: line,
+            target_end: line,
+            what,
+            flavor,
+        }
+    }
+
+    fn unused_codes(diags: &[Diagnostic]) -> Vec<u32> {
+        diags
+            .iter()
+            .filter(|d| {
+                matches!(&d.code, Some(NumberOrString::String(c)) if c == crate::diagnostic_code::UNUSED_SUPPRESSION)
+            })
+            .map(|d| d.range.start.line)
+            .collect()
+    }
+
+    #[test]
+    fn used_expect_is_not_reported() {
+        let dirs = vec![directive(
+            2,
+            LineSuppression::Codes(vec!["undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let suppressed = vec![(2u32, "undefined-variable".to_string())];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &suppressed, false, &mut out);
+        assert!(unused_codes(&out).is_empty());
+    }
+
+    #[test]
+    fn unused_expect_is_reported_as_hint() {
+        let dirs = vec![directive(
+            5,
+            LineSuppression::Codes(vec!["undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert_eq!(unused_codes(&out), vec![5]);
+        assert_eq!(out[0].severity, Some(DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn unused_ignore_is_silent_by_default_but_swept_when_enabled() {
+        let dirs = vec![directive(
+            3,
+            LineSuppression::All,
+            SuppressionFlavor::Ignore,
+        )];
+        // Default: ignore that suppressed nothing is silent.
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert!(unused_codes(&out).is_empty());
+        // Sweep on: now reported.
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], true, &mut out);
+        assert_eq!(unused_codes(&out), vec![3]);
+    }
+
+    #[test]
+    fn code_mismatch_counts_as_unused() {
+        // expect[line-length] but only an undefined-variable was suppressed on
+        // the line → the expect covered nothing it asked for.
+        let dirs = vec![directive(
+            1,
+            LineSuppression::Codes(vec!["line-length".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let suppressed = vec![(1u32, "undefined-variable".to_string())];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &suppressed, false, &mut out);
+        assert_eq!(unused_codes(&out), vec![1]);
+    }
 }
 
 #[cfg(test)]
@@ -10296,7 +10541,7 @@ mod invalid_assignment_target_tests {
     fn collect(code: &str) -> Vec<Diagnostic> {
         let tree = parse_r(code);
         let mut diagnostics = Vec::new();
-        collect_invalid_assignment_targets(tree.root_node(), code, &mut diagnostics);
+        collect_invalid_assignment_targets(tree.root_node(), code, &mut diagnostics, None);
         diagnostics
     }
 
@@ -11111,9 +11356,20 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// `=` inside a call (`f(name = value)`) is skipped, matching the existing
 /// assignment-operator lint's logic. `T <- FALSE` is **not** flagged: `T`
 /// and `F` are regular bindings, not reserved words.
-fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+fn collect_invalid_assignment_targets(
+    node: Node,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
     let ignored = lsp_ignored_lines_from_tree(node, text);
-    collect_invalid_assignment_targets_inner(node, text, &ignored, diagnostics);
+    collect_invalid_assignment_targets_inner(
+        node,
+        text,
+        &ignored,
+        diagnostics,
+        &mut suppressed_out,
+    );
 }
 
 fn collect_invalid_assignment_targets_inner(
@@ -11121,13 +11377,14 @@ fn collect_invalid_assignment_targets_inner(
     text: &str,
     ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
+    suppressed_out: &mut Option<&mut Vec<(u32, String)>>,
 ) {
     if node.kind() == "binary_operator" {
-        check_invalid_assignment_target(node, text, ignored, diagnostics);
+        check_invalid_assignment_target(node, text, ignored, diagnostics, suppressed_out);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_invalid_assignment_targets_inner(child, text, ignored, diagnostics);
+        collect_invalid_assignment_targets_inner(child, text, ignored, diagnostics, suppressed_out);
     }
 }
 
@@ -11272,16 +11529,21 @@ fn classify_lsp_ignore_marker(
     let trimmed = after_hash.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
 
     // `# raven:` primary namespace (F2): the analyzer track aliases the line /
-    // next-line ignore forms.
+    // next-line ignore forms. `expect` is the asserting flavor; on this AST
+    // path it suppresses identically to `ignore` (the `unused-suppression`
+    // distinction is driven by the directive enumeration in `directive.rs`).
     if let Some(rest) = trimmed.strip_prefix("raven:") {
         let rest = rest.trim_start();
         let action = rest.split('[').next().unwrap_or(rest).trim();
-        let suffix = action.strip_prefix("ignore")?;
+        let suffix = action
+            .strip_prefix("ignore")
+            .or_else(|| action.strip_prefix("expect"))?;
         let suffix = suffix.trim_start_matches('-').trim();
-        // The `[code]` selector follows the `ignore...` token; locate it from
-        // the original `rest` after the action word.
-        let what =
-            codes_from(&rest[rest.find("ignore").map(|i| i + "ignore".len()).unwrap_or(0)..]);
+        // The `[code]` selector, if any, starts at the first `[` in `rest`.
+        let what = match rest.find('[') {
+            Some(i) => codes_from(&rest[i..]),
+            None => LineSuppression::All,
+        };
         return if suffix.starts_with("next") {
             Some((LspIgnoreKind::NextLine, what))
         } else if suffix.is_empty() {
@@ -11293,7 +11555,9 @@ fn classify_lsp_ignore_marker(
         };
     }
 
-    let rest = trimmed.strip_prefix("@lsp-ignore")?;
+    let rest = trimmed
+        .strip_prefix("@lsp-ignore")
+        .or_else(|| trimmed.strip_prefix("@lsp-expect"))?;
     // Word-boundary: the next byte (if any) must not be an identifier byte.
     // `-`, `:`, `[`, and whitespace are allowed because they begin the `-next`
     // suffix, a rule filter, or a `[code]` selector.
@@ -11318,6 +11582,7 @@ fn check_invalid_assignment_target(
     text: &str,
     ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
+    suppressed_out: &mut Option<&mut Vec<(u32, String)>>,
 ) {
     let Some(op) = binop.child_by_field_name("operator") else {
         return;
@@ -11357,6 +11622,12 @@ fn check_invalid_assignment_target(
         .get(&row)
         .is_some_and(|s| s.covers(Some(crate::diagnostic_code::ASSIGN_TO_STRING_LITERAL)))
     {
+        if let Some(out) = suppressed_out.as_deref_mut() {
+            out.push((
+                row,
+                crate::diagnostic_code::ASSIGN_TO_STRING_LITERAL.to_string(),
+            ));
+        }
         return;
     }
     let line_text = text.lines().nth(row as usize).unwrap_or("");
@@ -20972,6 +21243,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Sanity: the baseline undefined symbol MUST still be flagged —
@@ -21086,6 +21358,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
@@ -21189,6 +21462,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // When the package is NOT installed and library is NOT ready, the
@@ -21268,6 +21542,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
@@ -21347,6 +21622,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -21416,6 +21692,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -21486,6 +21763,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Sanity: the baseline undefined symbol MUST be flagged — otherwise the
@@ -21906,6 +22184,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -21962,6 +22241,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22027,6 +22307,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22105,6 +22386,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22171,6 +22453,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22234,6 +22517,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22292,6 +22576,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22352,6 +22637,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22413,6 +22699,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22474,6 +22761,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22535,6 +22823,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22591,6 +22880,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -22633,6 +22923,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         diagnostics.into_iter().map(|d| d.message).collect()
@@ -22767,6 +23058,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -22850,6 +23142,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -22929,6 +23222,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23018,6 +23312,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23144,6 +23439,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23252,6 +23548,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23336,6 +23633,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23409,6 +23707,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23476,6 +23775,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23543,6 +23843,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23612,6 +23913,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -23681,6 +23983,7 @@ y <- totally_undefined_baseline()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -34490,7 +34793,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
@@ -34544,7 +34847,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
@@ -34596,7 +34899,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
@@ -34647,7 +34950,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this variable
             let undefined_diags: Vec<_> = diagnostics
@@ -35573,7 +35876,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this variable
             let undefined_diags: Vec<_> = diagnostics
@@ -35632,7 +35935,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this function
             let undefined_diags: Vec<_> = diagnostics
@@ -35694,7 +35997,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this symbol
             let undefined_diags: Vec<_> = diagnostics
@@ -35773,7 +36076,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Exact match should NOT produce diagnostic
             let exact_diags: Vec<_> = diagnostics
@@ -35856,7 +36159,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // var1 on line 0 (before declaration) should produce diagnostic
             let var1_before_diags: Vec<_> = diagnostics
@@ -35974,7 +36277,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this symbol
             let undefined_diags: Vec<_> = diagnostics
@@ -44367,7 +44670,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -44409,7 +44712,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -44440,7 +44743,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -44471,7 +44774,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -44496,7 +44799,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -44521,7 +44824,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -44560,7 +44863,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         let _ = fs::remove_dir_all(&tmp);
 
@@ -44730,7 +45033,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -44938,6 +45241,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -45835,6 +46139,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -45905,6 +46210,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Snapshot-path message format: "'j' is used before it's available (sourced on line N)".
@@ -45978,6 +46284,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -46044,6 +46351,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -46109,6 +46417,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -46178,6 +46487,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -47345,6 +47655,7 @@ x <- 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
@@ -47388,6 +47699,7 @@ greet <- function() \"hi\"
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let greet_diags: Vec<_> = diagnostics
@@ -47434,6 +47746,7 @@ g <- \\(x) x + 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let g_diags: Vec<_> = diagnostics
@@ -47486,6 +47799,7 @@ f <- function() {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let x_diags: Vec<_> = diagnostics
@@ -47535,6 +47849,7 @@ x <- 2
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let x_diags: Vec<_> = diagnostics
@@ -47574,6 +47889,7 @@ totally_unknown
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
@@ -47608,6 +47924,7 @@ x <- 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
@@ -47677,6 +47994,7 @@ x <- 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // food is used on lines 0 and 1, defined on line 2 → 2 forward references
@@ -47743,6 +48061,7 @@ x
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
@@ -47774,6 +48093,7 @@ x <- 2
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
@@ -47809,6 +48129,7 @@ myvar
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -47843,6 +48164,7 @@ myfunc()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -47877,6 +48199,7 @@ myfunc()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -47915,6 +48238,7 @@ MyVar
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -47952,6 +48276,7 @@ MyVar
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             assert_eq!(
@@ -47989,6 +48314,7 @@ MyVar
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             assert_eq!(
@@ -48025,6 +48351,7 @@ myvar
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Both usages should be flagged since the directive is not recognized as a trailing comment
@@ -48126,6 +48453,7 @@ mysymbol
             &mut diagnostics1,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -48154,6 +48482,7 @@ mysymbol
             &mut diagnostics2,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -49991,6 +50320,7 @@ mod function_parameter_tests {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         diagnostics
@@ -50297,6 +50627,7 @@ add <- function(a, b) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
@@ -50355,6 +50686,7 @@ outer_func <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
@@ -50412,6 +50744,7 @@ my_func <- function(a = undefined_var) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings
@@ -50472,6 +50805,7 @@ other_func <- function(y = still_missing) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -50527,6 +50861,7 @@ other_func <- function(y = still_missing) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -50576,6 +50911,7 @@ my_func()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -50617,6 +50953,7 @@ my_func(1)
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -50658,6 +50995,7 @@ my_func()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -50700,6 +51038,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings
@@ -50755,6 +51094,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -50887,6 +51227,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -50942,6 +51283,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -50996,6 +51338,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -51057,6 +51400,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         assert!(
             !diagnostics
@@ -51082,6 +51426,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         assert!(
             diagnostics
@@ -51124,6 +51469,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -51179,6 +51525,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -51229,6 +51576,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -51277,6 +51625,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -51356,6 +51705,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let merp_diags: Vec<_> = diagnostics
@@ -51416,6 +51766,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let x_diags_on_print: Vec<_> = diagnostics
@@ -51470,6 +51821,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_self_diags: Vec<_> = diagnostics
@@ -51512,6 +51864,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -51573,6 +51926,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -51624,6 +51978,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
             let messages: Vec<&String> = diagnostics.iter().map(|d| &d.message).collect();
 
@@ -51690,6 +52045,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         diagnostics.into_iter().map(|d| d.message).collect()
     }

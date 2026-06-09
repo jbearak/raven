@@ -78,3 +78,46 @@ fn ignore_next_with_code_targets_following_line() {
         "ignore-next[undefined-variable] should suppress the next line. Output:\n{out}"
     );
 }
+
+// ---- F2 Step 3: `expect` flavor + `unused-suppression` (HINT) ----
+
+#[test]
+fn expect_that_suppresses_a_diagnostic_is_not_reported_unused() {
+    // The `expect` actually suppresses an undefined-variable, so no
+    // unused-suppression hint should appear.
+    let out = check_one("result <- totally_undefined_thing # raven: expect[undefined-variable]\n");
+    assert!(
+        !out.contains("Undefined variable: totally_undefined_thing"),
+        "expect should suppress the undefined-variable diagnostic. Output:\n{out}"
+    );
+    assert!(
+        !out.contains("unused-suppression") && !out.contains("Unused"),
+        "a used `expect` must NOT be reported as unused. Output:\n{out}"
+    );
+}
+
+#[test]
+fn expect_that_suppresses_nothing_is_reported_unused() {
+    // `defined_value` IS defined, so the expect suppresses nothing → it must be
+    // reported as unused (HINT).
+    let out = check_one(
+        "defined_value <- 1\nresult <- defined_value # raven: expect[undefined-variable]\n",
+    );
+    assert!(
+        out.contains("unused-suppression") || out.contains("Unused `expect` suppression"),
+        "an `expect` that suppressed nothing must be reported as unused. Output:\n{out}"
+    );
+}
+
+#[test]
+fn ignore_that_suppresses_nothing_is_not_reported_by_default() {
+    // A plain `ignore` that suppresses nothing is silent by default (the
+    // reportUnusedSuppressions sweep is off).
+    let out = check_one(
+        "defined_value <- 1\nresult <- defined_value # raven: ignore[undefined-variable]\n",
+    );
+    assert!(
+        !out.contains("unused-suppression") && !out.contains("Unused"),
+        "a silent `ignore` must NOT be reported as unused by default. Output:\n{out}"
+    );
+}

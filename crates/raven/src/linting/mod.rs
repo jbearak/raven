@@ -104,6 +104,27 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
     }
 
     let suppressions = nolint::Suppressions::from_text(text);
+    run_lints_with(text, tree_root, config, suppressions)
+}
+
+/// Same as [`run_lints`] but with **no** suppression filtering — every
+/// violation is emitted regardless of `# nolint` / `# raven:` / `@lsp-ignore`
+/// markers. Used by the `unused-suppression` sweep (F2 Step 3) to recover the
+/// raw, pre-suppression lint diagnostics so it can tell which suppression
+/// directives actually removed something.
+pub fn run_lints_raw(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Diagnostic> {
+    if !config.enabled {
+        return Vec::new();
+    }
+    run_lints_with(text, tree_root, config, nolint::Suppressions::default())
+}
+
+fn run_lints_with(
+    text: &str,
+    tree_root: Node<'_>,
+    config: &LintConfig,
+    suppressions: nolint::Suppressions,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
 
     if let Some(sev) = config.line_length_severity {
@@ -219,12 +240,86 @@ pub fn run_semantic_checks(
         return Vec::new();
     }
     let suppressions = nolint::Suppressions::from_text(text);
+    run_semantic_checks_with(
+        text,
+        root,
+        mixed_logical_severity,
+        condition_assignment_severity,
+        suppressions,
+    )
+}
+
+/// Same as [`run_semantic_checks`] but with **no** suppression filtering. Used
+/// by the `unused-suppression` sweep (F2 Step 3); see [`run_lints_raw`].
+pub fn run_semantic_checks_raw(
+    text: &str,
+    root: Node<'_>,
+    mixed_logical_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+    condition_assignment_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+) -> Vec<Diagnostic> {
+    if mixed_logical_severity.is_none() && condition_assignment_severity.is_none() {
+        return Vec::new();
+    }
+    run_semantic_checks_with(
+        text,
+        root,
+        mixed_logical_severity,
+        condition_assignment_severity,
+        nolint::Suppressions::default(),
+    )
+}
+
+fn run_semantic_checks_with(
+    text: &str,
+    root: Node<'_>,
+    mixed_logical_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+    condition_assignment_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+    suppressions: nolint::Suppressions,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     if let Some(sev) = mixed_logical_severity {
         rules::mixed_logical::collect(text, root, sev, &suppressions, &mut out);
     }
     if let Some(sev) = condition_assignment_severity {
         rules::condition_assignment::collect(text, root, sev, &suppressions, &mut out);
+    }
+    out
+}
+
+/// F2 Step 3: the `(line, kebab-code)` pairs that lint-track suppression
+/// directives actually removed from `text`.
+///
+/// Recomputes the raw (pre-suppression) lint + semantic diagnostics and returns
+/// those whose line is suppressed for their rule. The `unused-suppression`
+/// sweep uses this — combined with the analyzer track's captured pairs — to
+/// decide which directives suppressed something and which are unused. Keeping
+/// the `nolint` dependency inside this module avoids exposing the suppression
+/// parser to the rest of the crate.
+pub fn suppressed_lint_pairs(
+    text: &str,
+    tree_root: Node<'_>,
+    config: &LintConfig,
+    mixed_logical_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+    condition_assignment_severity: Option<tower_lsp::lsp_types::DiagnosticSeverity>,
+) -> Vec<(u32, String)> {
+    let suppressions = nolint::Suppressions::from_text(text);
+    let raw = run_lints_raw(text, tree_root, config)
+        .into_iter()
+        .chain(run_semantic_checks_raw(
+            text,
+            tree_root,
+            mixed_logical_severity,
+            condition_assignment_severity,
+        ));
+    let mut out = Vec::new();
+    for d in raw {
+        if let Some(tower_lsp::lsp_types::NumberOrString::String(code)) = &d.code {
+            let line = d.range.start.line;
+            let rule_id = crate::diagnostic_code::to_lint_rule_id(code);
+            if suppressions.is_suppressed_code(line, &rule_id) {
+                out.push((line, crate::diagnostic_code::normalize(code)));
+            }
+        }
     }
     out
 }

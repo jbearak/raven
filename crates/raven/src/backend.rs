@@ -365,6 +365,13 @@ pub(crate) fn parse_cross_file_config(
         {
             config.condition_assignment_severity = parse_severity(sev);
         }
+        // Parse diagnostics.reportUnusedSuppressions (F2 Step 3)
+        if let Some(v) = diag
+            .get("reportUnusedSuppressions")
+            .and_then(|v| v.as_bool())
+        {
+            config.report_unused_suppressions = v;
+        }
     }
 
     // Parse package settings (Requirement 12, Task 14.2)
