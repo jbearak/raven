@@ -50,7 +50,7 @@ fn visit(
             };
             if bad {
                 let line_no = op_node.start_position().row as u32;
-                if !suppressions.is_suppressed(line_no) {
+                if !suppressions.is_suppressed_code(line_no, rule_ids::ASSIGNMENT_OPERATOR) {
                     let line_text = text.lines().nth(line_no as usize).unwrap_or("");
                     let start_col =
                         byte_offset_to_utf16_column(line_text, op_node.start_position().column);

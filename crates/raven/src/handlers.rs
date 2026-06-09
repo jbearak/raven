@@ -4570,6 +4570,9 @@ async fn collect_missing_file_diagnostics_standalone(
                     },
                     severity: Some(missing_file_severity),
                     message: format!("Path is outside workspace: '{}'", directive.path),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                    )),
                     ..Default::default()
                 });
                 continue;
@@ -4591,6 +4594,9 @@ async fn collect_missing_file_diagnostics_standalone(
                 },
                 severity: Some(missing_file_severity),
                 message: format!("Cannot resolve parent path: '{}'", directive.path),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
                 ..Default::default()
             });
         }
@@ -4631,6 +4637,9 @@ async fn collect_missing_file_diagnostics_standalone(
                     },
                     severity: Some(missing_file_severity),
                     message: format!("Parent file not found: '{}'", path_str),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                    )),
                     ..Default::default()
                 });
             } else {
@@ -4653,6 +4662,9 @@ async fn collect_missing_file_diagnostics_standalone(
                     },
                     severity: Some(missing_file_severity),
                     message,
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                    )),
                     ..Default::default()
                 });
             }
@@ -4819,6 +4831,9 @@ fn collect_missing_file_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message,
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
                 ..Default::default()
             });
         }
@@ -4836,6 +4851,9 @@ fn collect_missing_file_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message: format!("Cannot resolve parent path: '{}'", sourced_by.path),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
                 ..Default::default()
             });
         }
@@ -4866,7 +4884,11 @@ fn collect_missing_package_diagnostics_from_snapshot(
     };
 
     for lib_call in &snapshot.directive_meta.library_calls {
-        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, lib_call.line) {
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            lib_call.line,
+            Some(crate::diagnostic_code::PACKAGE_NOT_INSTALLED),
+        ) {
             continue;
         }
         if !snapshot.package_library.package_exists(&lib_call.package) {
@@ -4877,6 +4899,9 @@ fn collect_missing_package_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message: format!("Package '{}' is not installed", lib_call.package),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+                )),
                 ..Default::default()
             });
         }
@@ -5101,7 +5126,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             return;
         }
 
-        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, *usage_line) {
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            *usage_line,
+            Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
+        ) {
             continue;
         }
         if is_reserved_word(name) {
@@ -5223,6 +5252,9 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                     name,
                     source.line + 1
                 ),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
                 ..Default::default()
             });
             break;
@@ -5575,7 +5607,11 @@ fn collect_undefined_variables_from_snapshot(
 
         let usage_line = usage_node.start_position().row as u32;
 
-        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, usage_line) {
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            usage_line,
+            Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
+        ) {
             continue;
         }
         let unquoted_usage_name = unquote_backtick_name(&name).map(str::to_string);
@@ -5852,6 +5888,9 @@ fn collect_undefined_variables_from_snapshot(
             },
             severity: Some(severity),
             message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
             ..Default::default()
         });
     }
@@ -6829,6 +6868,9 @@ fn collect_syntax_errors_inner(
                     range: diag.range,
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: diag.message,
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                    )),
                     ..Default::default()
                 });
             }
@@ -6838,6 +6880,9 @@ fn collect_syntax_errors_inner(
                     range: minimize_error_range(node, text),
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: "Syntax error".to_string(),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                    )),
                     ..Default::default()
                 });
             }
@@ -6847,6 +6892,9 @@ fn collect_syntax_errors_inner(
                         range: diag.range,
                         severity: Some(DiagnosticSeverity::ERROR),
                         message: diag.message,
+                        code: Some(NumberOrString::String(
+                            crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                        )),
                         ..Default::default()
                     });
                 }
@@ -6878,6 +6926,9 @@ fn collect_syntax_errors_inner(
                             k.opener_str(),
                             k.closer_str(),
                         ),
+                        code: Some(NumberOrString::String(
+                            crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                        )),
                         ..Default::default()
                     });
                 } else {
@@ -6914,6 +6965,9 @@ fn collect_syntax_errors_inner(
             },
             severity: Some(DiagnosticSeverity::ERROR),
             message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+            )),
             ..Default::default()
         });
     }
@@ -10566,6 +10620,18 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn code_selector_on_ast_path_targets_only_named_code() {
+        // F2: a `[code]` selector that does not name `assign-to-string-literal`
+        // must NOT suppress the assignment diagnostic.
+        let diags = collect("TRUE <- 1 # raven: ignore[line-length]");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("TRUE <- 1 # @lsp-ignore[undefined-variable]");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        // The matching code (or a bare ignore) does suppress.
+        assert_none("TRUE <- 1 # @lsp-ignore[assign-to-string-literal]");
+    }
+
+    #[test]
     fn lsp_ignore_marker_requires_word_boundary() {
         // `@lsp-ignored` and `@lsp-ignore_foo` aren't the directive — must
         // not be picked up by substring matching.
@@ -11053,7 +11119,7 @@ fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut 
 fn collect_invalid_assignment_targets_inner(
     node: Node,
     text: &str,
-    ignored: &std::collections::HashSet<u32>,
+    ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if node.kind() == "binary_operator" {
@@ -11082,13 +11148,20 @@ fn collect_invalid_assignment_targets_inner(
 /// `# nolint: line_length` for an unrelated style lint would be a
 /// surprise; restricting to `@lsp-ignore` keeps the suppression channel
 /// the same one the rest of `handlers.rs` uses.
-fn lsp_ignored_lines_from_tree(root: Node<'_>, text: &str) -> std::collections::HashSet<u32> {
-    let mut out = std::collections::HashSet::new();
+fn lsp_ignored_lines_from_tree(
+    root: Node<'_>,
+    text: &str,
+) -> std::collections::HashMap<u32, crate::cross_file::types::LineSuppression> {
+    let mut out = std::collections::HashMap::new();
     visit_comments_for_ignore(root, text, &mut out);
     out
 }
 
-fn visit_comments_for_ignore(node: Node<'_>, text: &str, out: &mut std::collections::HashSet<u32>) {
+fn visit_comments_for_ignore(
+    node: Node<'_>,
+    text: &str,
+    out: &mut std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
+) {
     if node.kind() == "comment" {
         classify_comment_for_ignore(node, text, out);
         // Comments have no AST children we care about.
@@ -11103,8 +11176,9 @@ fn visit_comments_for_ignore(node: Node<'_>, text: &str, out: &mut std::collecti
 fn classify_comment_for_ignore(
     comment: Node<'_>,
     text: &str,
-    out: &mut std::collections::HashSet<u32>,
+    out: &mut std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
 ) {
+    use crate::cross_file::types::LineSuppression;
     let raw = text
         .get(comment.start_byte()..comment.end_byte())
         .unwrap_or("");
@@ -11118,27 +11192,35 @@ fn classify_comment_for_ignore(
     let prefix = line_text.get(..start_col).unwrap_or("");
     let standalone = prefix.trim().is_empty();
 
+    let insert = |out: &mut std::collections::HashMap<u32, LineSuppression>,
+                  line: u32,
+                  what: LineSuppression| {
+        out.entry(line)
+            .and_modify(|e| e.merge(what.clone()))
+            .or_insert(what);
+    };
+
     // Collapsing these inner `if`s into match guards would force a wildcard
     // arm and lose exhaustiveness over `LspIgnoreKind` variants.
     #[allow(clippy::collapsible_match)]
     match classify_lsp_ignore_marker(body) {
-        Some(LspIgnoreKind::SameLine) => {
+        Some((LspIgnoreKind::SameLine, what)) => {
             // Inline `# @lsp-ignore` suppresses *this* line — but only
             // when there's code before the marker. A standalone
             // `# @lsp-ignore` on its own line has nothing to suppress
             // (use `# @lsp-ignore-next` instead).
             if !standalone {
-                out.insert(row);
+                insert(out, row, what);
             }
         }
-        Some(LspIgnoreKind::NextLine) => {
+        Some((LspIgnoreKind::NextLine, what)) => {
             // `@lsp-ignore-next` only applies when the comment is on its
             // own line, matching the directive parser in
             // `cross_file/directive.rs`. A trailing
             // `x <- 1 # @lsp-ignore-next` does NOT suppress the next
             // line.
             if standalone {
-                out.insert(row.saturating_add(1));
+                insert(out, row.saturating_add(1), what);
             }
         }
         None => {}
@@ -11151,12 +11233,40 @@ enum LspIgnoreKind {
     NextLine,
 }
 
-/// Classify the text after a `#` that opens a comment. Returns `SameLine`
-/// for `@lsp-ignore` / `# raven: ignore` (with optional `[code]` selector) and
-/// `NextLine` for `@lsp-ignore-next` / `# raven: ignore-next`. Returns `None`
-/// otherwise. Matches word-boundary so `@lsp-ignored` does not match
-/// `@lsp-ignore`.
-fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
+/// Classify the text after a `#` that opens a comment. Returns the ignore kind
+/// (`SameLine` for `@lsp-ignore` / `# raven: ignore`, `NextLine` for the
+/// `-next` forms) paired with what it suppresses (a blanket
+/// [`LineSuppression::All`] or a code-scoped set parsed from the `[code]`
+/// selector). Returns `None` otherwise. Matches word-boundary so
+/// `@lsp-ignored` does not match `@lsp-ignore`.
+fn classify_lsp_ignore_marker(
+    after_hash: &str,
+) -> Option<(LspIgnoreKind, crate::cross_file::types::LineSuppression)> {
+    use crate::cross_file::types::LineSuppression;
+
+    // Parse an optional `[code, code2]` selector immediately following the
+    // marker keyword into a `LineSuppression`.
+    fn codes_from(after: &str) -> LineSuppression {
+        let after = after.trim_start();
+        let Some(rest) = after.strip_prefix('[') else {
+            return LineSuppression::All;
+        };
+        let Some(end) = rest.find(']') else {
+            return LineSuppression::All;
+        };
+        let body = &rest[..end];
+        let codes: Vec<String> = body
+            .split(',')
+            .map(crate::diagnostic_code::normalize)
+            .filter(|c| !c.is_empty())
+            .collect();
+        if codes.is_empty() {
+            LineSuppression::All
+        } else {
+            LineSuppression::Codes(codes)
+        }
+    }
+
     // Allow extra leading `#` characters (`## @lsp-ignore`) and whitespace,
     // mirroring `linting::nolint::classify`.
     let trimmed = after_hash.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
@@ -11164,14 +11274,18 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
     // `# raven:` primary namespace (F2): the analyzer track aliases the line /
     // next-line ignore forms.
     if let Some(rest) = trimmed.strip_prefix("raven:") {
-        let action = rest.trim_start();
-        let action = action.split('[').next().unwrap_or(action).trim();
+        let rest = rest.trim_start();
+        let action = rest.split('[').next().unwrap_or(rest).trim();
         let suffix = action.strip_prefix("ignore")?;
         let suffix = suffix.trim_start_matches('-').trim();
+        // The `[code]` selector follows the `ignore...` token; locate it from
+        // the original `rest` after the action word.
+        let what =
+            codes_from(&rest[rest.find("ignore").map(|i| i + "ignore".len()).unwrap_or(0)..]);
         return if suffix.starts_with("next") {
-            Some(LspIgnoreKind::NextLine)
+            Some((LspIgnoreKind::NextLine, what))
         } else if suffix.is_empty() {
-            Some(LspIgnoreKind::SameLine)
+            Some((LspIgnoreKind::SameLine, what))
         } else {
             // `ignore-start`/`ignore-end`/`ignore-file` are not modeled on the
             // analyzer AST path yet; don't misclassify them as a line ignore.
@@ -11181,18 +11295,19 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
 
     let rest = trimmed.strip_prefix("@lsp-ignore")?;
     // Word-boundary: the next byte (if any) must not be an identifier byte.
-    // `-` and `:` are explicitly allowed because they begin the `-next`
-    // suffix or rule filter.
+    // `-`, `:`, `[`, and whitespace are allowed because they begin the `-next`
+    // suffix, a rule filter, or a `[code]` selector.
     match rest.as_bytes().first() {
-        None => Some(LspIgnoreKind::SameLine),
+        None => Some((LspIgnoreKind::SameLine, LineSuppression::All)),
         Some(b) if b.is_ascii_alphanumeric() || *b == b'_' => None,
         Some(_) => {
+            // `[code]` may directly follow `@lsp-ignore` or `@lsp-ignore-next`.
             let suffix =
                 rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
-            if suffix.starts_with("next") {
-                Some(LspIgnoreKind::NextLine)
+            if let Some(after_next) = suffix.strip_prefix("next") {
+                Some((LspIgnoreKind::NextLine, codes_from(after_next)))
             } else {
-                Some(LspIgnoreKind::SameLine)
+                Some((LspIgnoreKind::SameLine, codes_from(rest)))
             }
         }
     }
@@ -11201,7 +11316,7 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
 fn check_invalid_assignment_target(
     binop: Node,
     text: &str,
-    ignored: &std::collections::HashSet<u32>,
+    ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(op) = binop.child_by_field_name("operator") else {
@@ -11238,7 +11353,10 @@ fn check_invalid_assignment_target(
     };
 
     let row = target.start_position().row as u32;
-    if ignored.contains(&row) {
+    if ignored
+        .get(&row)
+        .is_some_and(|s| s.covers(Some(crate::diagnostic_code::ASSIGN_TO_STRING_LITERAL)))
+    {
         return;
     }
     let line_text = text.lines().nth(row as usize).unwrap_or("");
@@ -11262,6 +11380,9 @@ fn check_invalid_assignment_target(
         },
         severity: Some(classification.severity),
         message: classification.format_message(target_text),
+        code: Some(NumberOrString::String(
+            crate::diagnostic_code::ASSIGN_TO_STRING_LITERAL.to_string(),
+        )),
         ..Default::default()
     });
 }

@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 
 use super::types::{
     BackwardDirective, CallSiteSpec, CrossFileMetadata, DeclaredSymbol, ForwardSource,
+    LineSuppression, SuppressionRange,
 };
 
 /// Compiled regex patterns for directive parsing
@@ -20,8 +21,47 @@ struct DirectivePatterns {
     ignore_next: Regex,
     raven_ignore: Regex,
     raven_ignore_next: Regex,
+    raven_ignore_start: Regex,
+    raven_ignore_end: Regex,
+    raven_ignore_file: Regex,
     declare_var: Regex,
     declare_func: Regex,
+}
+
+/// Convert an optional `[code]` selector capture into a [`LineSuppression`].
+///
+/// `None` (no brackets) and an empty/blank bracket body both mean a blanket
+/// ignore. Otherwise the body is split on commas and each code normalized to
+/// its canonical kebab-case spelling (so `[line_length, undefined-variable]`
+/// works).
+fn parse_suppression_codes(raw: Option<&str>) -> LineSuppression {
+    match raw {
+        None => LineSuppression::All,
+        Some(body) => {
+            let codes: Vec<String> = body
+                .split(',')
+                .map(crate::diagnostic_code::normalize)
+                .filter(|c| !c.is_empty())
+                .collect();
+            if codes.is_empty() {
+                LineSuppression::All
+            } else {
+                LineSuppression::Codes(codes)
+            }
+        }
+    }
+}
+
+/// Insert a line→suppression mapping, merging with any existing entry so a line
+/// carrying two directives accumulates both (and `All` stays absorbing).
+fn insert_line_suppression(
+    map: &mut std::collections::HashMap<u32, LineSuppression>,
+    line: u32,
+    what: LineSuppression,
+) {
+    map.entry(line)
+        .and_modify(|existing| existing.merge(what.clone()))
+        .or_insert(what);
 }
 
 /// Extract path from capture groups (double-quoted, single-quoted, or unquoted)
@@ -111,21 +151,33 @@ fn patterns() -> &'static DirectivePatterns {
                 r#"^\s*#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
             ignore: Regex::new(
-                r"#\s*@lsp-ignore\s*:?\s*$"
+                r"#\s*@lsp-ignore(?:\[([^\]]*)\])?\s*:?\s*$"
             ).unwrap(),
             ignore_next: Regex::new(
-                r"^\s*#\s*@lsp-ignore-next\s*:?\s*$"
+                r"^\s*#\s*@lsp-ignore-next(?:\[([^\]]*)\])?\s*:?\s*$"
             ).unwrap(),
             // `# raven:` is the primary suppression namespace (F2). For the
             // analyzer track it aliases the line / next-line ignore forms
-            // (`@lsp-ignore` parity); an optional `[code]` selector is accepted.
-            // `-next` is excluded from the same-line form by requiring the
-            // `ignore` token to be followed only by an optional `[code]` and EOL.
+            // (`@lsp-ignore` parity), plus block (`-start`/`-end`) and
+            // file-level (`-file`) forms. Each form takes an optional `[code]`
+            // selector (comma-separated codes) that targets specific diagnostic
+            // codes; absent brackets mean a blanket ignore. The same-line form
+            // excludes `-next`/`-start`/`-end`/`-file` by requiring the
+            // `ignore` token to be followed only by an optional `[code]` + EOL.
             raven_ignore: Regex::new(
-                r"#\s*raven:\s*ignore(?:\[[^\]]*\])?\s*$"
+                r"#\s*raven:\s*ignore(?:\[([^\]]*)\])?\s*$"
             ).unwrap(),
             raven_ignore_next: Regex::new(
-                r"^\s*#\s*raven:\s*ignore-next(?:\[[^\]]*\])?\s*$"
+                r"^\s*#\s*raven:\s*ignore-next(?:\[([^\]]*)\])?\s*$"
+            ).unwrap(),
+            raven_ignore_start: Regex::new(
+                r"^\s*#\s*raven:\s*ignore-start(?:\[([^\]]*)\])?\s*$"
+            ).unwrap(),
+            raven_ignore_end: Regex::new(
+                r"^\s*#\s*raven:\s*ignore-end\s*$"
+            ).unwrap(),
+            raven_ignore_file: Regex::new(
+                r"^\s*#\s*raven:\s*ignore-file(?:\[([^\]]*)\])?\s*$"
             ).unwrap(),
             // Declaration directives for variables
             // Synonyms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
@@ -167,8 +219,15 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
     // in the file header (consecutive blank/comment lines from the start).
     let mut in_header = true;
 
+    // Open `# raven: ignore-start` block, if any: (start_line, what). Closed by
+    // `# raven: ignore-end`; an unterminated block extends to EOF (mirrors the
+    // lint track's `# nolint start` behavior).
+    let mut open_block: Option<(u32, LineSuppression)> = None;
+    let mut total_lines: u32 = 0;
+
     for (line_num, line) in content.lines().enumerate() {
         let line_num = line_num as u32;
+        total_lines = line_num + 1;
 
         // Track header boundary before the @lsp- pre-filter so that code lines
         // without directives still end the header region.
@@ -297,33 +356,72 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             continue;
         }
 
-        // Full-file: ignore directives
-        if patterns.ignore.is_match(line) {
+        // Full-file: ignore directives. Each captures an optional `[code]`
+        // selector (capture group 1) that narrows what it suppresses.
+        if let Some(caps) = patterns.ignore.captures(line) {
             log::trace!("  Parsed @lsp-ignore directive at line {}", line_num);
-            meta.ignored_lines.insert(line_num);
+            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_lines, line_num, what);
             continue;
         }
 
-        if patterns.ignore_next.is_match(line) {
+        if let Some(caps) = patterns.ignore_next.captures(line) {
             log::trace!("  Parsed @lsp-ignore-next directive at line {}", line_num);
-            meta.ignored_next_lines.insert(line_num + 1);
+            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what);
             continue;
         }
 
-        // Full-file: `# raven:` primary-namespace ignore aliases (F2).
-        // `-next` is checked first since the same-line form excludes it.
-        if patterns.raven_ignore_next.is_match(line) {
+        // Full-file: `# raven:` primary-namespace ignore aliases (F2). The
+        // block (`-start`/`-end`) and file (`-file`) forms are checked first
+        // since `raven_ignore` (the same-line form) does not match them.
+        if let Some(caps) = patterns.raven_ignore_start.captures(line) {
+            log::trace!("  Parsed `# raven: ignore-start` at line {}", line_num);
+            // A nested start is ignored until the current block closes (mirrors
+            // the lint track, which does not nest).
+            if open_block.is_none() {
+                let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
+                open_block = Some((line_num, what));
+            }
+            continue;
+        }
+
+        if patterns.raven_ignore_end.is_match(line) {
+            log::trace!("  Parsed `# raven: ignore-end` at line {}", line_num);
+            if let Some((start, what)) = open_block.take() {
+                meta.ignored_ranges.push(SuppressionRange {
+                    start,
+                    end: line_num,
+                    what,
+                });
+            }
+            continue;
+        }
+
+        if let Some(caps) = patterns.raven_ignore_file.captures(line) {
+            log::trace!("  Parsed `# raven: ignore-file` at line {}", line_num);
+            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
+            match &mut meta.ignored_file {
+                Some(existing) => existing.merge(what),
+                None => meta.ignored_file = Some(what),
+            }
+            continue;
+        }
+
+        if let Some(caps) = patterns.raven_ignore_next.captures(line) {
             log::trace!(
                 "  Parsed `# raven: ignore-next` directive at line {}",
                 line_num
             );
-            meta.ignored_next_lines.insert(line_num + 1);
+            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what);
             continue;
         }
 
-        if patterns.raven_ignore.is_match(line) {
+        if let Some(caps) = patterns.raven_ignore.captures(line) {
             log::trace!("  Parsed `# raven: ignore` directive at line {}", line_num);
-            meta.ignored_lines.insert(line_num);
+            let what = parse_suppression_codes(caps.get(1).map(|m| m.as_str()));
+            insert_line_suppression(&mut meta.ignored_lines, line_num, what);
             continue;
         }
 
@@ -364,6 +462,15 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         }
     }
 
+    // An unterminated `# raven: ignore-start` extends to EOF (mirrors the lint
+    // track's `# nolint start` behavior so a missing `-end` doesn't silently
+    // lose coverage).
+    if let Some((start, what)) = open_block.take() {
+        let end = total_lines.saturating_sub(1);
+        meta.ignored_ranges
+            .push(SuppressionRange { start, end, what });
+    }
+
     log::trace!(
         "Completed directive parsing: {} backward directives, {} forward directives, working_dir={:?}, {} ignored lines, {} declared vars, {} declared funcs",
         meta.sourced_by.len(),
@@ -377,10 +484,48 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
     meta
 }
 
-/// Check if a line should have diagnostics suppressed.
-/// Returns true if line has @lsp-ignore or is targeted by @lsp-ignore-next.
+/// Check if a line should have a diagnostic with `code` suppressed.
+///
+/// Considers, in turn: a file-level ignore, a line-scoped ignore on `line`, a
+/// next-line ignore targeting `line`, and any block range covering `line`. A
+/// blanket directive (`LineSuppression::All`) covers any code; a code-scoped
+/// directive covers only diagnostics whose code is
+/// [`suppresses`](crate::diagnostic_code::suppresses)-covered by one of its
+/// listed codes (and only when `code` is `Some`).
+pub fn is_line_ignored_for_code(
+    metadata: &CrossFileMetadata,
+    line: u32,
+    code: Option<&str>,
+) -> bool {
+    if let Some(file) = &metadata.ignored_file
+        && file.covers(code)
+    {
+        return true;
+    }
+    if let Some(s) = metadata.ignored_lines.get(&line)
+        && s.covers(code)
+    {
+        return true;
+    }
+    if let Some(s) = metadata.ignored_next_lines.get(&line)
+        && s.covers(code)
+    {
+        return true;
+    }
+    metadata
+        .ignored_ranges
+        .iter()
+        .any(|r| line >= r.start && line <= r.end && r.what.covers(code))
+}
+
+/// Check if a line carries a *blanket* ignore (covers any diagnostic code).
+///
+/// Equivalent to [`is_line_ignored_for_code`] with `code: None`: only
+/// `LineSuppression::All` entries match, since a code-scoped directive cannot
+/// suppress an unknown code. Retained for callers that have no diagnostic code
+/// in hand.
 pub fn is_line_ignored(metadata: &CrossFileMetadata, line: u32) -> bool {
-    metadata.ignored_lines.contains(&line) || metadata.ignored_next_lines.contains(&line)
+    is_line_ignored_for_code(metadata, line, None)
 }
 
 #[cfg(test)]
@@ -512,14 +657,14 @@ mod tests {
     fn test_ignore_directive() {
         let content = "x <- 1\n# @lsp-ignore\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(meta.ignored_lines.contains(&1));
+        assert!(meta.ignored_lines.contains_key(&1));
     }
 
     #[test]
     fn test_ignore_next_directive() {
         let content = "# @lsp-ignore-next\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(meta.ignored_next_lines.contains(&1));
+        assert!(meta.ignored_next_lines.contains_key(&1));
     }
 
     #[test]
@@ -545,12 +690,67 @@ mod tests {
         assert!(!is_line_ignored(&meta, 3));
     }
 
-    /// F2: a `[code]` selector on the analyzer-track alias is accepted.
+    /// F2: a `[code]` selector on the analyzer-track alias targets only the
+    /// listed code — it suppresses `undefined-variable` but not other codes,
+    /// and is *not* a blanket ignore.
     #[test]
     fn test_raven_ignore_with_code_selector() {
         let content = "x <- undefined # raven: ignore[undefined-variable]";
         let meta = parse_directives(content);
+        assert!(is_line_ignored_for_code(
+            &meta,
+            0,
+            Some("undefined-variable")
+        ));
+        assert!(!is_line_ignored_for_code(
+            &meta,
+            0,
+            Some("package-not-installed")
+        ));
+        // Not a blanket ignore: a code-less query does not match.
+        assert!(!is_line_ignored(&meta, 0));
+    }
+
+    /// F2: a bare `# raven: ignore` (no `[code]`) is a blanket ignore that
+    /// covers any code, including a code-less query.
+    #[test]
+    fn test_raven_ignore_blanket_covers_any_code() {
+        let content = "x <- undefined # raven: ignore";
+        let meta = parse_directives(content);
         assert!(is_line_ignored(&meta, 0));
+        assert!(is_line_ignored_for_code(
+            &meta,
+            0,
+            Some("undefined-variable")
+        ));
+        assert!(is_line_ignored_for_code(&meta, 0, Some("anything-at-all")));
+    }
+
+    /// F2: block and file forms on the analyzer track.
+    #[test]
+    fn test_raven_ignore_block_and_file_forms() {
+        let block = "# raven: ignore-start\na <- b\nc <- d\n# raven: ignore-end\ne <- f";
+        let meta = parse_directives(block);
+        // Inclusive of the start/end directive lines, mirroring `# nolint
+        // start`/`end`. The directive lines are comments, so this is harmless.
+        assert!(is_line_ignored(&meta, 0));
+        assert!(is_line_ignored(&meta, 1));
+        assert!(is_line_ignored(&meta, 2));
+        assert!(is_line_ignored(&meta, 3));
+        assert!(!is_line_ignored(&meta, 4));
+
+        let file = "# raven: ignore-file[undefined-variable]\nx <- undefined";
+        let meta = parse_directives(file);
+        assert!(is_line_ignored_for_code(
+            &meta,
+            1,
+            Some("undefined-variable")
+        ));
+        assert!(!is_line_ignored_for_code(
+            &meta,
+            1,
+            Some("package-not-installed")
+        ));
     }
 
     #[test]
@@ -565,7 +765,7 @@ x <- undefined"#;
         assert_eq!(meta.sourced_by.len(), 1);
         assert_eq!(meta.sources.len(), 1); // Only directive, not source() call
         assert_eq!(meta.working_directory, Some("/data".to_string()));
-        assert!(meta.ignored_lines.contains(&4));
+        assert!(meta.ignored_lines.contains_key(&4));
     }
 
     // Tests for quoted paths with spaces (Requirements 2.1-2.6)
@@ -996,14 +1196,14 @@ x <- undefined"#;
     fn test_ignore_directive_no_at_prefix_not_recognized() {
         let content = "x <- 1\n# lsp-ignore\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(!meta.ignored_lines.contains(&1));
+        assert!(!meta.ignored_lines.contains_key(&1));
     }
 
     #[test]
     fn test_ignore_next_directive_no_at_prefix_not_recognized() {
         let content = "# lsp-ignore-next\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(!meta.ignored_next_lines.contains(&1));
+        assert!(!meta.ignored_next_lines.contains_key(&1));
     }
 
     // ============================================================================
@@ -1037,7 +1237,7 @@ x <- undefined"#;
     fn test_trailing_comment_ignore_next_not_recognized() {
         let content = "x <- 1 # @lsp-ignore-next\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(!meta.ignored_next_lines.contains(&1));
+        assert!(!meta.ignored_next_lines.contains_key(&1));
     }
 
     #[test]
@@ -1060,7 +1260,7 @@ x <- undefined"#;
         // so you can write `x <- foo # @lsp-ignore` to suppress diagnostics on that line
         let content = "x <- foo # @lsp-ignore";
         let meta = parse_directives(content);
-        assert!(meta.ignored_lines.contains(&0));
+        assert!(meta.ignored_lines.contains_key(&0));
     }
 
     #[test]
@@ -1133,7 +1333,7 @@ x <- undefined"#;
     fn test_ignore_after_code_still_recognized() {
         let content = "x <- 1\n# @lsp-ignore\ny <- undefined";
         let meta = parse_directives(content);
-        assert!(meta.ignored_lines.contains(&1));
+        assert!(meta.ignored_lines.contains_key(&1));
     }
 
     #[test]
@@ -1379,7 +1579,7 @@ x <- undefined"#;
         assert_eq!(meta.declared_variables.len(), 1);
         assert_eq!(meta.declared_functions.len(), 1);
         assert_eq!(meta.working_directory, Some("/data".to_string()));
-        assert!(meta.ignored_lines.contains(&4));
+        assert!(meta.ignored_lines.contains_key(&4));
     }
 
     // Edge cases

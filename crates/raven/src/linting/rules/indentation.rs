@@ -72,7 +72,7 @@ pub(crate) fn collect(
 
     for (idx, line_text) in lines.iter().enumerate() {
         let line_no = idx as u32;
-        if suppressions.is_suppressed(line_no) {
+        if suppressions.is_suppressed_code(line_no, rule_ids::INDENTATION) {
             continue;
         }
         if line_text.trim().is_empty() {

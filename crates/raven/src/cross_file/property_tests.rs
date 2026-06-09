@@ -3057,7 +3057,7 @@ proptest! {
         let metadata = parse_directives(&code_ignore);
 
         // The @lsp-ignore directive should be parsed
-        prop_assert!(metadata.ignored_lines.contains(&line_num),
+        prop_assert!(metadata.ignored_lines.contains_key(&line_num),
             "Line {} should be in ignored_lines", line_num);
         prop_assert!(is_line_ignored(&metadata, line_num),
             "Line {} should be ignored", line_num);
@@ -3070,7 +3070,7 @@ proptest! {
         let metadata_next = parse_directives(&code_ignore_next);
 
         // The line after @lsp-ignore-next should be in ignored_next_lines
-        prop_assert!(metadata_next.ignored_next_lines.contains(&(line_num + 1)),
+        prop_assert!(metadata_next.ignored_next_lines.contains_key(&(line_num + 1)),
             "Line {} should be in ignored_next_lines (from @lsp-ignore-next)", line_num + 1);
         prop_assert!(is_line_ignored(&metadata_next, line_num + 1),
             "Line {} should be ignored (from @lsp-ignore-next)", line_num + 1);

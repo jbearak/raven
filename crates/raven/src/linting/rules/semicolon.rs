@@ -94,7 +94,7 @@ fn scan(
         let line_text = text.get(line_start..line_end).unwrap_or("");
         let col_byte = offset - line_start;
         let line_no_u32 = line_no as u32;
-        if suppressions.is_suppressed(line_no_u32) {
+        if suppressions.is_suppressed_code(line_no_u32, rule_ids::SEMICOLON) {
             continue;
         }
         let start_col = byte_offset_to_utf16_column(line_text, col_byte);

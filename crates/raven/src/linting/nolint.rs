@@ -24,23 +24,34 @@
 //! rule. The shape of `Suppressions` is intentionally rule-agnostic so a
 //! future revision can match per rule without an API break.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
+use crate::cross_file::types::LineSuppression;
 use crate::linting::parse_gate::looks_like_code;
 
-/// Pre-computed line-suppression set for a document.
+/// Pre-computed line-suppression map for a document: each suppressed line maps
+/// to *what* it suppresses (a blanket [`LineSuppression::All`] or a code-scoped
+/// set). Code-scoped entries come from a `[code]` selector
+/// (`# raven: ignore[line-length]`) or the lintr `# nolint: rule` filter.
 #[derive(Debug, Default)]
 pub(crate) struct Suppressions {
-    suppressed_lines: HashSet<u32>,
+    suppressed: HashMap<u32, LineSuppression>,
 }
 
 impl Suppressions {
-    /// Parse `# nolint` markers out of `text`.
+    /// Parse `# nolint` / `# raven:` / `# @lsp-ignore` markers out of `text`.
     pub(crate) fn from_text(text: &str) -> Self {
-        let mut suppressed = HashSet::new();
+        let mut suppressed: HashMap<u32, LineSuppression> = HashMap::new();
         let mut in_block = false;
         let mut block_start: Option<u32> = None;
-        let mut file_level = false;
+        let mut block_codes = LineSuppression::All;
+        let mut file_level: Option<LineSuppression> = None;
+
+        let insert = |map: &mut HashMap<u32, LineSuppression>, line: u32, what: LineSuppression| {
+            map.entry(line)
+                .and_modify(|e| e.merge(what.clone()))
+                .or_insert(what);
+        };
 
         for (idx, line) in text.lines().enumerate() {
             let line_no = idx as u32;
@@ -50,36 +61,39 @@ impl Suppressions {
             // wildcard arm and lose exhaustiveness over `NolintMarker` variants.
             #[allow(clippy::collapsible_match)]
             match marker {
-                Some(NolintMarker::Start) => {
+                Some(NolintMarker::Start(codes)) => {
                     if !in_block {
                         in_block = true;
                         block_start = Some(line_no);
+                        block_codes = codes;
                     }
                 }
                 Some(NolintMarker::End) => {
                     if in_block {
                         let start = block_start.unwrap_or(line_no);
                         for l in start..=line_no {
-                            suppressed.insert(l);
+                            insert(&mut suppressed, l, block_codes.clone());
                         }
                         in_block = false;
                         block_start = None;
+                        block_codes = LineSuppression::All;
                     }
                 }
-                Some(NolintMarker::Line) => {
-                    suppressed.insert(line_no);
+                Some(NolintMarker::Line(codes)) => {
+                    insert(&mut suppressed, line_no, codes);
                 }
-                Some(NolintMarker::NextLine) => {
-                    suppressed.insert(line_no + 1);
+                Some(NolintMarker::NextLine(codes)) => {
+                    insert(&mut suppressed, line_no + 1, codes);
                 }
-                Some(NolintMarker::File) => {
-                    file_level = true;
-                }
+                Some(NolintMarker::File(codes)) => match &mut file_level {
+                    Some(existing) => existing.merge(codes),
+                    None => file_level = Some(codes),
+                },
                 None => {}
             }
 
             if in_block {
-                suppressed.insert(line_no);
+                insert(&mut suppressed, line_no, block_codes.clone());
             }
         }
 
@@ -88,37 +102,90 @@ impl Suppressions {
         if in_block && let Some(start) = block_start {
             let total_lines = text.lines().count() as u32;
             for l in start..total_lines {
-                suppressed.insert(l);
+                insert(&mut suppressed, l, block_codes.clone());
             }
         }
 
-        // `# raven: ignore-file` suppresses every line in the file.
-        if file_level {
+        // `# raven: ignore-file` suppresses every line in the file (for the
+        // matching codes).
+        if let Some(codes) = file_level {
             let total_lines = text.lines().count() as u32;
             for l in 0..total_lines {
-                suppressed.insert(l);
+                insert(&mut suppressed, l, codes.clone());
             }
         }
 
-        Self {
-            suppressed_lines: suppressed,
-        }
+        Self { suppressed }
     }
 
-    /// Is the given zero-indexed line suppressed?
+    /// Is the given zero-indexed line suppressed for *any* rule? True when the
+    /// line carries any suppression entry, blanket or code-scoped. Test-only
+    /// helper; production code uses [`Suppressions::is_suppressed_code`].
+    #[cfg(test)]
     pub(crate) fn is_suppressed(&self, line: u32) -> bool {
-        self.suppressed_lines.contains(&line)
+        self.suppressed.contains_key(&line)
+    }
+
+    /// Is the given zero-indexed line suppressed for the lint rule `rule_id`
+    /// (snake_case, e.g. `line_length`)? A blanket directive covers every rule;
+    /// a code-scoped directive covers only rules whose code is
+    /// [`suppresses`](crate::diagnostic_code::suppresses)-covered by one of its
+    /// listed codes.
+    pub(crate) fn is_suppressed_code(&self, line: u32, rule_id: &str) -> bool {
+        self.suppressed
+            .get(&line)
+            .is_some_and(|s| s.covers(Some(rule_id)))
     }
 }
 
 enum NolintMarker {
-    Line,
-    Start,
+    Line(LineSuppression),
+    Start(LineSuppression),
     End,
     /// `# @lsp-ignore-next` — suppresses the line *after* the marker.
-    NextLine,
+    NextLine(LineSuppression),
     /// `# raven: ignore-file` — suppresses every line in the file.
-    File,
+    File(LineSuppression),
+}
+
+/// Parse a `[code, code2]` bracket selector into a [`LineSuppression`]. `text`
+/// must begin at (or before, with leading whitespace) the `[`. Returns
+/// [`LineSuppression::All`] when there is no bracket or it is empty.
+fn parse_bracket_codes(text: &str) -> LineSuppression {
+    let text = text.trim_start();
+    let Some(rest) = text.strip_prefix('[') else {
+        return LineSuppression::All;
+    };
+    let Some(end) = rest.find(']') else {
+        return LineSuppression::All;
+    };
+    codes_or_all(&rest[..end])
+}
+
+/// Parse a lintr `: rule_a, rule_b` filter into a [`LineSuppression`]. `text` is
+/// everything after the `nolint` keyword. Returns [`LineSuppression::All`] when
+/// there is no `:` filter.
+fn parse_colon_codes(text: &str) -> LineSuppression {
+    let text = text.trim_start();
+    match text.strip_prefix(':') {
+        Some(rest) => codes_or_all(rest),
+        None => LineSuppression::All,
+    }
+}
+
+/// Split a comma-separated code body into a [`LineSuppression`], normalizing
+/// each code to canonical kebab-case. Empty → [`LineSuppression::All`].
+fn codes_or_all(body: &str) -> LineSuppression {
+    let codes: Vec<String> = body
+        .split(',')
+        .map(crate::diagnostic_code::normalize)
+        .filter(|c| !c.is_empty())
+        .collect();
+    if codes.is_empty() {
+        LineSuppression::All
+    } else {
+        LineSuppression::Codes(codes)
+    }
 }
 
 /// Scan a line for a `# nolint` marker (with optional `start`/`end` suffix).
@@ -216,7 +283,7 @@ fn find_inline_marker(body: &str) -> Option<NolintMarker> {
             // `NextLine` variant (see the doc comment above), parse-gate the
             // prefix, then commit — or give up.
             let marker = match classify(&body[i + 1..])? {
-                NolintMarker::NextLine => return None,
+                NolintMarker::NextLine(_) => return None,
                 m => m,
             };
             let prefix = &body[..i];
@@ -239,36 +306,37 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
         .to_ascii_lowercase();
 
     // `# raven:` is the primary suppression namespace (F2). It covers the
-    // lint track here exactly as `# nolint`/`@lsp-ignore` do; an optional
-    // `[code]` selector is accepted but, like `# nolint: rule`, applies
-    // blanket per line in this lint-track parser for now.
+    // lint track here exactly as `# nolint`/`@lsp-ignore` do, and honors a
+    // `[code]` selector that narrows suppression to specific lint rules.
     if let Some(marker) = classify_raven(&trimmed) {
         return Some(marker);
     }
 
     if let Some(rest) = matches_keyword(&trimmed, "nolint") {
         let rest = rest.trim_start();
-        return if rest.starts_with("start") {
-            Some(NolintMarker::Start)
+        return if let Some(after) = rest.strip_prefix("start") {
+            // `# nolint start` or `# nolint start: rule_a, rule_b`.
+            Some(NolintMarker::Start(parse_colon_codes(after)))
         } else if rest.starts_with("end") {
             Some(NolintMarker::End)
         } else {
-            // Either bare `# nolint` or `# nolint: rule_a, rule_b`. Either way
-            // it is a line-level suppression for now.
-            Some(NolintMarker::Line)
+            // Either bare `# nolint` or `# nolint: rule_a, rule_b`.
+            Some(NolintMarker::Line(parse_colon_codes(rest)))
         };
     }
 
     if let Some(rest) = matches_keyword(&trimmed, "@lsp-ignore") {
+        // An optional `[code]` selector may directly follow `@lsp-ignore`.
         // Match `-next`, `:next`, or whitespace+`next` after the marker so
         // `@lsp-ignore-next`, `@lsp-ignore: next`, and `@lsp-ignore next`
         // all resolve to NextLine. Anything else on the same line is a
         // same-line ignore.
-        let rest = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
-        return if rest.starts_with("next") {
-            Some(NolintMarker::NextLine)
+        let same_line_codes = parse_bracket_codes(rest);
+        let after = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
+        return if let Some(after_next) = after.strip_prefix("next") {
+            Some(NolintMarker::NextLine(parse_bracket_codes(after_next)))
         } else {
-            Some(NolintMarker::Line)
+            Some(NolintMarker::Line(same_line_codes))
         };
     }
 
@@ -279,31 +347,35 @@ fn classify(after_hash: &str) -> Option<NolintMarker> {
 ///
 /// `trimmed` is the lowercased comment body with leading `#`/whitespace
 /// stripped. Recognizes `ignore`, `ignore-next`, `ignore-start`, `ignore-end`,
-/// and `ignore-file`, each optionally followed by a `[code]` selector. Returns
-/// `None` when the body is not a `raven:` directive.
+/// and `ignore-file`, each optionally followed by a `[code]` selector that
+/// narrows suppression to specific lint rules. Returns `None` when the body is
+/// not a `raven:` directive.
 fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
     let rest = matches_keyword(trimmed, "raven")?;
     // Require the namespace separator `:` (optionally surrounded by spaces).
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(':')?.trim_start();
-    // Drop any `[code]` selector — blanket for now in the lint-track parser.
-    let action = rest.split('[').next().unwrap_or(rest).trim();
-    let action = matches_keyword(action, "ignore")?;
-    let action = action.trim_start_matches('-').trim();
-    if action.is_empty() {
-        Some(NolintMarker::Line)
-    } else if action.starts_with("next") {
-        Some(NolintMarker::NextLine)
-    } else if action.starts_with("start") {
-        Some(NolintMarker::Start)
-    } else if action.starts_with("end") {
+    let after_ignore = matches_keyword(rest, "ignore")?;
+    // `after_ignore` is "", "-next", "-start", "-end", "-file", or any of
+    // those followed by a `[code]` selector (and the bare `ignore[code]` form).
+    let action = after_ignore.trim_start_matches('-');
+    let bracket_at = action.find('[').unwrap_or(action.len());
+    let word = action[..bracket_at].trim();
+    let codes = parse_bracket_codes(&action[bracket_at..]);
+    if word.is_empty() {
+        Some(NolintMarker::Line(codes))
+    } else if word.starts_with("next") {
+        Some(NolintMarker::NextLine(codes))
+    } else if word.starts_with("start") {
+        Some(NolintMarker::Start(codes))
+    } else if word.starts_with("end") {
         Some(NolintMarker::End)
-    } else if action.starts_with("file") {
-        Some(NolintMarker::File)
+    } else if word.starts_with("file") {
+        Some(NolintMarker::File(codes))
     } else {
         // `# raven: ignore<something-unknown>` — be conservative and treat as a
         // plain line ignore rather than silently dropping it.
-        Some(NolintMarker::Line)
+        Some(NolintMarker::Line(codes))
     }
 }
 
@@ -315,13 +387,13 @@ fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
 fn matches_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = haystack.strip_prefix(keyword)?;
     match rest.as_bytes().first() {
-        // EOL, whitespace, colon, or `-` (used by `@lsp-ignore-next` and
-        // `# nolint:`). Anything else means we matched the middle of an
-        // unrelated word.
+        // EOL, whitespace, colon, `-` (used by `@lsp-ignore-next` and
+        // `# nolint:`), or `[` (the `[code]` selector). Anything else means we
+        // matched the middle of an unrelated word.
         None => Some(rest),
         Some(b) => {
             let c = *b as char;
-            if c.is_whitespace() || c == ':' || c == '-' {
+            if c.is_whitespace() || c == ':' || c == '-' || c == '[' {
                 Some(rest)
             } else {
                 None
@@ -549,5 +621,76 @@ mod tests {
         // `raven:` directive must not suppress.
         let s = Suppressions::from_text("x = 1 # raven is a static analyzer\n");
         assert!(!s.is_suppressed(0));
+    }
+
+    // ---- F2: per-code (`[code]`) lint suppression ----
+
+    use crate::linting::rule_ids;
+
+    #[test]
+    fn code_selector_targets_only_the_named_rule() {
+        let s = Suppressions::from_text("x = 1 # raven: ignore[line-length]\n");
+        assert!(s.is_suppressed_code(0, rule_ids::LINE_LENGTH));
+        assert!(!s.is_suppressed_code(0, rule_ids::OBJECT_NAME));
+    }
+
+    #[test]
+    fn bare_ignore_blankets_all_rules() {
+        let s = Suppressions::from_text("x = 1 # raven: ignore\n");
+        assert!(s.is_suppressed_code(0, rule_ids::LINE_LENGTH));
+        assert!(s.is_suppressed_code(0, rule_ids::OBJECT_NAME));
+    }
+
+    #[test]
+    fn code_selector_accepts_snake_case_spelling() {
+        // A user who writes the lintr snake_case rule id is honored.
+        let s = Suppressions::from_text("x = 1 # raven: ignore[line_length]\n");
+        assert!(s.is_suppressed_code(0, rule_ids::LINE_LENGTH));
+    }
+
+    #[test]
+    fn nolint_rule_filter_is_now_honored_per_rule() {
+        // The lintr `# nolint: rule` filter now targets that rule only.
+        let s = Suppressions::from_text("x = 1 # nolint: line_length\n");
+        assert!(s.is_suppressed_code(0, rule_ids::LINE_LENGTH));
+        assert!(!s.is_suppressed_code(0, rule_ids::OBJECT_NAME));
+    }
+
+    #[test]
+    fn nolint_bare_blankets_all_rules() {
+        let s = Suppressions::from_text("x = 1 # nolint\n");
+        assert!(s.is_suppressed_code(0, rule_ids::LINE_LENGTH));
+        assert!(s.is_suppressed_code(0, rule_ids::OBJECT_NAME));
+    }
+
+    #[test]
+    fn lsp_ignore_with_code_selector_targets_only_named_rule() {
+        let s = Suppressions::from_text("x = 1 # @lsp-ignore[object-name]\n");
+        assert!(s.is_suppressed_code(0, rule_ids::OBJECT_NAME));
+        assert!(!s.is_suppressed_code(0, rule_ids::LINE_LENGTH));
+    }
+
+    #[test]
+    fn raven_ignore_next_with_code_selector_targets_following_line() {
+        let s = Suppressions::from_text("# raven: ignore-next[line-length]\nx = 1\n");
+        assert!(s.is_suppressed_code(1, rule_ids::LINE_LENGTH));
+        assert!(!s.is_suppressed_code(1, rule_ids::OBJECT_NAME));
+    }
+
+    #[test]
+    fn multiple_codes_in_one_selector() {
+        let s = Suppressions::from_text("x = 1 # raven: ignore[line-length, object-name]\n");
+        assert!(s.is_suppressed_code(0, rule_ids::LINE_LENGTH));
+        assert!(s.is_suppressed_code(0, rule_ids::OBJECT_NAME));
+        assert!(!s.is_suppressed_code(0, rule_ids::NO_TAB));
+    }
+
+    #[test]
+    fn block_with_code_selector_targets_only_named_rule() {
+        let s = Suppressions::from_text(
+            "# raven: ignore-start[line-length]\nx = 1\ny = 2\n# raven: ignore-end\n",
+        );
+        assert!(s.is_suppressed_code(1, rule_ids::LINE_LENGTH));
+        assert!(!s.is_suppressed_code(1, rule_ids::OBJECT_NAME));
     }
 }
