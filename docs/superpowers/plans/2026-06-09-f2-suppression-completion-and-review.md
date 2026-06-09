@@ -483,3 +483,36 @@ gate run.)
     is wanted.
 
 ### Remaining: Step 5 (docs), then review (task 12) + PR (task 13)
+
+---
+
+## PROGRESS UPDATE — Task 12 (review) + Task 13 (PR #420) DONE
+
+### Task 12 — multi-agent review: 4 rounds, two consecutive clean passes
+- **Round 1** found a BLOCKER (chunk suppression didn't cover lint diagnostics) + SHOULDs → fixed in `9d77cb9f` (`linting::range_or_file_suppresses` applied in `diagnostics_from_snapshot` + `cli/lint.rs`; stale doc; chunks.rs split dedup; allow-reason).
+- **Round 2** found a SHOULD (`assign-to-string-literal` leaked through range/file/chunk suppression) → fixed in `41644eb1` (`SUPPRESSIBLE_ANALYZER_CODES`; BOM header strip; CRLF/BOM tests).
+- **Round 3** CLEAN PASS (added expect-block e2e tests, `37017b47`).
+- **Round 4** CLEAN PASS (added `raven.ignore` to chunks.md options list, `570d9436`).
+- CodeRabbit prior findings re-verified against HEAD: `run_check` exit-status correct; `classify_observed` no longer exists (N/A); the two then-stale tests pass.
+
+### Task 13 — PR #420
+- Retitled "prod test" → "Suppression system overhaul + diagnostic-quality & NSE fixes"; rewrote the description to the expanded scope (suppression system headline + diagnostic-quality/NSE/package-mode fixes). Pushed `fadcfaac..570d9436` (fast-forward, history preserved).
+- CodeRabbit posted a fresh incremental review (13 findings) spanning the whole `main…prod-test` diff — most on **non-F2 subsystems** from earlier branch sessions.
+- **Addressed** (commit `2decdc70`):
+  - `nolint.rs` — reject malformed/typo `# raven:` directives (no more `ignore-filed` → whole-file escalation; unterminated `[...` rejected). [F2]
+  - `commented_code.rs` — `is_directive_marker` recognizes the `# raven:` namespace. [F2]
+  - `path_resolve.rs` — reject path-escaping `system.file()` components (`..`/absolute) — security hardening, contained.
+  - `sysdata.rs` — escape the sysdata path into a safe R string literal before `load()` — security hardening, contained.
+
+### Deferred CodeRabbit findings (non-F2; out of this session's scope — for maintainer)
+These are pre-existing branch features (system.file resolution, package_state/sysdata, NSE) committed before this session's F2 baseline; fixing them well needs deeper subsystem knowledge / behavior changes with higher regression risk:
+1. `backend.rs:1749` — delay workspace-wide `system.file()` resolution until `PackageLibrary` is ready.
+2. `backend.rs:3065` / `3509` — populate `resolved_uri` in on-demand-indexed metadata too.
+3. `backend.rs:3409` / `3561` / `3856` — resolve open-document `system.file()` after package-library readiness is guaranteed.
+4. `check.rs:1206` — `collect_diagnostics_blocking()` should call `resolve_system_file_in_workspace()` to match `run()`.
+5. `chunks.rs:323` — `eval=FALSE` guard in `r_chunk_body_range` disables editor features for display-only chunks; consider moving the guard into `mask_to_r`. (Pre-existing design; touches eval=FALSE tests.)
+6. `source_detect.rs:330` — `system.file()` `lib.loc`/`fsep` named args are ignored rather than modeled/rejected.
+7. `nse.rs:323` — NSE finding (collapsed).
+8. `package_state/event.rs:193` — handle `data-raw/` directory events like file events.
+9. `package_state/sysdata.rs:39` — skip directory symlinks during recursive `data-raw` scans.
+10. `package_state/sysdata.rs:355` — restrict `.onLoad` symbol extraction to namespace targets.
