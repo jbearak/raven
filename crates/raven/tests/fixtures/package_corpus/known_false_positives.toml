@@ -20761,39 +20761,7 @@ start_line = 147
 start_character = 48
 end_line = 147
 end_character = 51
-[[false_positive]]
-package = "Matrix"
-path = "R/subassign.R"
-message = "Undefined variable: i"
-reason = "formula variable (introduced by model.frame/model evaluation)"
 
-[false_positive.range]
-start_line = 18
-start_character = 17
-end_line = 18
-end_character = 18
-[[false_positive]]
-package = "Matrix"
-path = "R/subassign.R"
-message = "Undefined variable: i"
-reason = "formula variable (introduced by model.frame/model evaluation)"
-
-[false_positive.range]
-start_line = 19
-start_character = 67
-end_line = 19
-end_character = 68
-[[false_positive]]
-package = "Matrix"
-path = "R/subassign.R"
-message = "Undefined variable: i"
-reason = "formula variable (introduced by model.frame/model evaluation)"
-
-[false_positive.range]
-start_line = 20
-start_character = 68
-end_line = 20
-end_character = 69
 [[false_positive]]
 package = "Matrix"
 path = "R/subassign.R"

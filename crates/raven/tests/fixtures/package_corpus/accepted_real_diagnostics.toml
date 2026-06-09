@@ -2631,3 +2631,36 @@ start_line = 106
 start_character = 13
 end_line = 106
 end_character = 18
+[[diagnostic]]
+package = "Matrix"
+path = "R/subassign.R"
+message = "Undefined variable: i"
+evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
+
+[diagnostic.range]
+start_line = 18
+start_character = 17
+end_line = 18
+end_character = 18
+[[diagnostic]]
+package = "Matrix"
+path = "R/subassign.R"
+message = "Undefined variable: i"
+evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
+
+[diagnostic.range]
+start_line = 19
+start_character = 67
+end_line = 19
+end_character = 68
+[[diagnostic]]
+package = "Matrix"
+path = "R/subassign.R"
+message = "Undefined variable: i"
+evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
+
+[diagnostic.range]
+start_line = 20
+start_character = 68
+end_line = 20
+end_character = 69
