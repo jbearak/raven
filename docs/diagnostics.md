@@ -8,11 +8,51 @@ Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, 
 
 ## Quick Reference
 
-- **Silence one site** — add `# @lsp-ignore` on the line, or `# @lsp-ignore-next` on the line above
+- **Silence one site** — add `# raven: ignore` on the line (or `# raven: ignore-next` on the line above). `# @lsp-ignore` is a permanent alias. See [Suppressing diagnostics](#suppressing-diagnostics)
 - **Declare a symbol the analyzer can't see** — use [`@lsp-var`, `@lsp-func`](directives.md#declaration-directives)
 - **Bring a parent file's symbols into scope** — usually nothing to do (auto mode infers relationships). Add `@lsp-sourced-by` only when auto-discovery can't see the link. See [Cross-File Awareness](cross-file.md)
 - **Turn a category off globally** — set the matching severity to `"off"` (see [Configuration](configuration.md))
 - **Disable everything** — set `raven.diagnostics.enabled` to `false`
+
+## Diagnostic codes
+
+Every diagnostic carries a stable, kebab-case `code` (never an opaque number).
+The code is the spelling you write inside a suppression selector, e.g.
+`# raven: ignore[undefined-variable]`. The analyzer codes are:
+
+| Code | Diagnostic |
+|---|---|
+| `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") |
+| `syntax-error` | Parse errors (the umbrella code for every parse-error message above) |
+| `unresolved-source-path` | A `source()` / `@lsp-source` path that does not resolve to a file |
+| `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target |
+| `package-not-installed` | `library()` / `require()` of a package that is not installed |
+| `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below |
+
+The opt-in style/lint rules contribute their own codes (`line-length`,
+`object-name`, …); the full list is in [Linting](linting.md). Both the
+kebab-case spelling and lintr's `snake_case` spelling are accepted in a
+selector.
+
+## Suppressing diagnostics
+
+Use the `# raven:` directives (and their `@lsp-` aliases) to silence
+diagnostics on a line, the next line, a block, a whole file, or an R Markdown
+chunk — optionally narrowed to a `[code]`. The full syntax, including the
+file/block forms, lives in [Directives → Ignore Directives](directives.md#ignore-directives).
+
+Two flavors:
+
+- **`# raven: ignore`** — silent. It never warns, even if it matched nothing.
+- **`# raven: expect`** — asserts the suppression is used. If an `expect`
+  directive matches no diagnostic, Raven emits an `unused-suppression` **hint**
+  at the directive's line (like Rust's `#[expect]` / TypeScript's
+  `@ts-expect-error`), so a now-stale directive can be deleted. Set
+  [`raven.diagnostics.reportUnusedSuppressions`](configuration.md) to `true` to
+  extend that unused check to *every* ignore directive (Pyright-style).
+
+`unused-suppression` is **hint** severity, so it never gates
+`raven check --max-severity error` by default.
 
 ## Diagnostic Categories
 

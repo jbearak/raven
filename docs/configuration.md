@@ -104,6 +104,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | `raven.crossFile.redundantDirectiveSeverity` | `"hint"` | Redundant `@lsp-source` directive |
 | `raven.diagnostics.mixedLogicalSeverity` | `"warning"` | `\|` / `\|\|` whose immediate operand is a bare `&` / `&&` (not wrapped in parentheses). Since `&` binds tighter than `\|` in R, the grouping is silent — the rule asks for explicit parentheses. Applies everywhere, not just inside `if` / `while` conditions. |
 | `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | Binary `=` used directly inside an `if` / `while` condition (likely `==` intended). |
+| `raven.diagnostics.reportUnusedSuppressions` | `false` | Report **every** suppression directive that suppressed nothing as an `unused-suppression` hint, not just `# raven: expect[...]` directives. With the default `false`, only `expect` directives are checked; a plain `# raven: ignore` / `# @lsp-ignore` / `# nolint` stays silent even when it matched no diagnostic. Pyright-style; the hint is HINT severity, so it never gates `raven check --max-severity error` by default. See [Directives → Ignore Directives](directives.md#ignore-directives). |
 
 ## Package Settings
 
