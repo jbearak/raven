@@ -681,7 +681,18 @@ pub enum ScopeEvent {
 /// Per-file scope artifacts
 #[derive(Debug, Clone)]
 pub struct ScopeArtifacts {
-    /// Exported interface (all symbols defined in this file)
+    /// All symbols **defined anywhere** in this file, INCLUDING ones bound
+    /// inside function bodies (e.g. a local `x <- 1` within `f <- function()
+    /// { x <- 1 }`). This is a flat, scope-blind, rm-blind map.
+    ///
+    /// FOOTGUN: despite the name, this is NOT the set of names the file
+    /// "exports" to other files. Treating `exported_interface.keys()` as
+    /// cross-file / package-visible exports leaks function-locals into other
+    /// files' scope and can mask real undefined-variable diagnostics (see the
+    /// `extract_top_level_defs` regression). For "what this file makes visible
+    /// to sourcing/peer files" use [`live_top_level_exports`] (function-scope
+    /// and rm aware) or walk the `timeline`. Use this map only for
+    /// whole-file change detection (`interface_hash`) and same-file lookups.
     pub exported_interface: HashMap<Arc<str>, ScopedSymbol>,
     /// Timeline of scope events in document order
     pub timeline: Vec<ScopeEvent>,
