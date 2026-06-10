@@ -567,6 +567,10 @@ struct PackageCheckout {
 struct Classification {
     unclassified: Vec<ObservedDiagnostic>,
     stale_acceptances: Vec<DiagnosticKey>,
+    /// Known-false-positive entries that were not observed. Informational only:
+    /// a non-zero count means Raven improved and the FP ledger has dead entries,
+    /// but it must never cause a corpus run to fail.
+    stale_false_positives: Vec<DiagnosticKey>,
 }
 
 #[test]
@@ -660,6 +664,21 @@ fn triage_fixture_is_parseable_and_unique() {
             keys.insert(diagnostic.key()),
             "duplicate accepted diagnostic: {diagnostic:?}"
         );
+    }
+}
+
+#[test]
+fn fp_fixture_is_parseable() {
+    // Validates that known_false_positives.toml is syntactically valid TOML and
+    // that every entry has a non-empty reason field.
+    let fixture = FalsePositiveFixture::load();
+    for fp in &fixture.false_positives {
+        if let Some(reason) = &fp.reason {
+            assert!(
+                !reason.trim().is_empty(),
+                "known false positive must have non-empty reason: {fp:?}"
+            );
+        }
     }
 }
 
@@ -882,6 +901,24 @@ fn run_corpus(packages: &[&PackageSpec]) -> Result<Vec<CheckReport>, String> {
     let fixture = TriageFixture::load();
     let fp_fixture = FalsePositiveFixture::load();
     let classification = classify_reports(&reports, &fixture, &fp_fixture);
+    // Stale FPs are informational: Raven improved and the FP ledger has dead entries.
+    // Report them but never fail the run — corpus runs must not break because Raven got better.
+    if !classification.stale_false_positives.is_empty() {
+        eprintln!(
+            "stale known-false-positive entries (Raven no longer emits these — consider pruning): {}",
+            classification.stale_false_positives.len()
+        );
+        for key in &classification.stale_false_positives {
+            eprintln!(
+                "  stale-fp: {} {}:{}:{} {}",
+                key.package,
+                key.path,
+                key.range.start_line + 1,
+                key.range.start_character + 1,
+                key.message
+            );
+        }
+    }
     if !classification.unclassified.is_empty() || !classification.stale_acceptances.is_empty() {
         if allow_unclassified_collection() {
             eprintln!(
@@ -1264,10 +1301,28 @@ fn classify_observed(
         .map(TriageDiagnostic::key)
         .filter(|key| !observed_keys.contains(key))
         .collect();
+    let stale_false_positives = fp_fixture
+        .false_positives
+        .iter()
+        .filter(|fp| observed_packages.contains(fp.package.as_str()))
+        .map(|fp| DiagnosticKey {
+            package: fp.package.clone(),
+            path: fp.path.clone(),
+            message: fp.message.clone(),
+            range: DiagnosticRange {
+                start_line: fp.range.start_line,
+                start_character: fp.range.start_character,
+                end_line: fp.range.end_line,
+                end_character: fp.range.end_character,
+            },
+        })
+        .filter(|key| !observed_keys.contains(key))
+        .collect();
 
     Classification {
         unclassified,
         stale_acceptances,
+        stale_false_positives,
     }
 }
 

@@ -19,7 +19,7 @@ The runner lives in `crates/raven/tests/package_corpus.rs`, with fixtures under 
 
 Env vars: `RAVEN_CORPUS_GROUPS`, `RAVEN_CORPUS_PACKAGES`, `RAVEN_CORPUS_ALL`, `RAVEN_CORPUS_LIMIT`, `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`, `RAVEN_CORPUS_KEEP_TEMP`, `RAVEN_CORPUS_REPORT_DIR`.
 
-The accepted-real fixture (`accepted_real_diagnostics.toml`) records 10 confirmed diagnostics for `base`.
+The accepted-real fixture (`accepted_real_diagnostics.toml`) records 71 confirmed diagnostics (post-reclassification; see below). The known-false-positives fixture (`known_false_positives.toml`) records 2576 entries.
 
 ## Triage status
 
@@ -56,6 +56,10 @@ The accepted-real fixture (`accepted_real_diagnostics.toml`) records 10 confirme
 - `.Autoloaded` modeled as implicit startup binding.
 - `.External.graphics` treats first argument as native routine name.
 - String-literal assignment targets create scope bindings for downstream resolution.
+
+## Ledger reclassification (prod-test)
+
+153 entries were moved from `accepted_real_diagnostics.toml` to `known_false_positives.toml`. All had the message `Assigning to string literal "…"` and fell into one of two idiom classes that Raven over-flags: (a) S3/replacement/operator method definitions via quoted-string LHS (e.g. `"[.Surv" <- function(...)`, `"coef<-.varPower" <- function(...)`) — semantically identical to the backtick form and standard R practice; (b) R-core's datasets package `data/*.R` files (`"iris" <- ...`, `"AirPassengers" <- ...` — 55 entries) which use the canonical quoted-name form. The underlying diagnostic gap (no function-RHS exemption in `suspicious_target_kind`) is pre-existing behavior tracked for a follow-up fix. Post-reclassification counts: **71 accepted-real**, **2576 known-FP**.
 
 ## Validation
 
