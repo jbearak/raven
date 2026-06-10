@@ -25,6 +25,23 @@ fn run_check(workspace: &std::path::Path) -> String {
         .args(["--max-severity", "off", "--no-color"])
         .output()
         .expect("failed to execute raven check");
+    // `raven check` exit codes: 0 = no diagnostic exceeded `--max-severity`,
+    // 1 = a diagnostic exceeded it (these tests run with `--max-severity off`,
+    // so *any* emitted diagnostic yields exit 1 — that is the normal, healthy
+    // outcome for the positive-assertion tests here), 2 = operator error
+    // (bad path / unreadable workspace). A code outside {0, 1} — or no exit
+    // code at all (killed by a signal / crash) — means the binary did not run
+    // the analysis to completion. Without this guard, negative
+    // `!output.contains(...)` checks would pass vacuously on a crashed binary.
+    let code = output.status.code();
+    assert!(
+        matches!(code, Some(0) | Some(1)),
+        "raven check did not complete cleanly (exit {code:?}); \
+         expected 0 (clean) or 1 (diagnostic exceeded threshold).\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
@@ -268,5 +285,82 @@ fn testit_test_files_see_package_namespace() {
     assert!(
         !output.contains("Undefined variable: head"),
         "testit test file should see imported head. Output:\n{output}"
+    );
+}
+
+/// Diamond topology: `main_a.R` sources `helper.R`; `main_c.R` ALSO sources
+/// `helper.R` and does `library(dplyr)`. `main_a.R` itself has no library()
+/// call anywhere in its ancestor chain or its forward-sourced descendants, and
+/// uses `df |> filter(undefined_col > 1)`.
+///
+/// `main_c.R` is an "uncle" of `main_a.R` (reachable only by going DOWN from A
+/// to the shared `helper.R` and then back UP to C). A correct in-play walk runs
+/// two separate directional passes — ancestors-only and descendants-only — and
+/// must NOT cross from a shared child back up to that child's OTHER parents.
+/// So C's `library(dplyr)` must NOT suppress the genuine undefined-variable
+/// diagnostic for `undefined_col` in `main_a.R`.
+///
+/// Regression test for: `collect_in_play_packages` rewritten as a single
+/// undirected BFS that pushed both dependents and dependencies onto one shared
+/// queue, letting a sibling's `library()` contaminate an unrelated file's
+/// in-play set (topology-dependent false negative).
+#[test]
+fn diamond_sibling_library_does_not_suppress_undefined_in_other_branch() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("main_a.R"),
+        "source(\"helper.R\")\n\
+         df <- data.frame(x = 1:10)\n\
+         result <- df |> filter(undefined_col > 1)\n",
+    )
+    .unwrap();
+    // helper.R is the shared child; it loads nothing.
+    std::fs::write(
+        dir.path().join("helper.R"),
+        "shared_helper <- function() 1\n",
+    )
+    .unwrap();
+    // main_c.R is the sibling/uncle: sources the same helper and loads dplyr.
+    std::fs::write(
+        dir.path().join("main_c.R"),
+        "library(dplyr)\nsource(\"helper.R\")\n",
+    )
+    .unwrap();
+
+    let output = run_check(dir.path());
+    assert!(
+        output.contains("Undefined variable: undefined_col"),
+        "A sibling file's library(dplyr) (reached via the shared helper.R) \
+         must NOT suppress the genuine undefined-variable diagnostic for \
+         undefined_col in main_a.R. Output:\n{output}"
+    );
+}
+
+/// Positive control for the directional fix: a genuine two-level ancestor
+/// chain. `grandparent.R` does `library(dplyr)` and sources `parent.R`, which
+/// sources `leaf.R`. `leaf.R` uses `filter(col > 1)`. dplyr must propagate
+/// transitively up the ancestor chain (grandparent -> parent -> leaf), so `col`
+/// is NOT flagged. This proves the ancestors-only pass still walks
+/// transitively after the fix.
+#[test]
+fn transitive_ancestor_chain_library_propagates_nse() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("grandparent.R"),
+        "library(dplyr)\nsource(\"parent.R\")\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("parent.R"), "source(\"leaf.R\")\n").unwrap();
+    std::fs::write(
+        dir.path().join("leaf.R"),
+        "df <- data.frame(x = 1:10)\nresult <- df |> filter(x > 5)\n",
+    )
+    .unwrap();
+
+    let output = run_check(dir.path());
+    assert!(
+        !output.contains("Undefined variable: x"),
+        "library(dplyr) on the grandparent must propagate transitively down \
+         the ancestor chain to leaf.R's filter(). Output:\n{output}"
     );
 }

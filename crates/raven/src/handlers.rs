@@ -5491,44 +5491,95 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
     // Also include packages loaded by forward-sourced files (files this file
     // sources), since `source("loader.R")` where loader.R has `library(dplyr)`
     // makes dplyr available in the calling file after the source() point.
+    //
+    // This is TWO separate directional passes, NOT one undirected walk:
+    //   1. ancestors-only — follow `get_dependents` edges (edge.from = the
+    //      parent that sources `current`) transitively UP the chain.
+    //   2. descendants-only — follow `get_dependencies` edges (edge.to = the
+    //      child `current` sources) transitively DOWN the chain.
+    // Mixing the two onto one queue with a shared `visited` set lets the walk
+    // cross from a shared child back UP to that child's OTHER parents (an
+    // "uncle"/"sibling" file), so an unrelated sibling's `library()` would
+    // silently suppress genuine diagnostics in this file — a topology-dependent
+    // false negative. Keeping the passes separate, each with its own `visited`
+    // and bounds, confines collection to this file's true ancestor and
+    // descendant chains. (An ancestor's OTHER forward-sourced children — this
+    // file's siblings via a shared parent — are deliberately NOT included.)
     {
-        let mut visited: HashSet<Url> = HashSet::new();
-        let mut queue: Vec<Url> = vec![uri.clone()];
-        while let Some(current) = queue.pop() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-            // Backward edges: parent files that source this file
-            for edge in snapshot.cross_file_graph.get_dependents(&current) {
-                if let Some(parent_meta) = snapshot.metadata_map.get(&edge.from) {
-                    for call in &parent_meta.library_calls {
+        let max_depth = snapshot.cross_file_config.max_chain_depth;
+        let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
+
+        let collect_libraries_from =
+            |meta_uri: &Url, packages: &mut HashSet<String>, attached: &mut HashSet<String>| {
+                if let Some(meta) = snapshot.metadata_map.get(meta_uri) {
+                    for call in &meta.library_calls {
                         if call.package.is_empty() {
                             continue;
                         }
                         let package = call.package.clone();
                         if call.attaches {
-                            attached_packages_for_meta.insert(package.clone());
+                            attached.insert(package.clone());
                         }
                         packages.insert(package);
                     }
                 }
-                queue.push(edge.from.clone());
+            };
+
+        // Pass 1: ancestors-only (files that source this file, transitively).
+        {
+            let mut visited: HashSet<Url> = HashSet::new();
+            visited.insert(uri.clone());
+            let mut frontier: Vec<Url> = vec![uri.clone()];
+            for _ in 0..max_depth {
+                if frontier.is_empty() || visited.len() >= max_visited {
+                    break;
+                }
+                let mut next: Vec<Url> = Vec::new();
+                for current in &frontier {
+                    for edge in snapshot.cross_file_graph.get_dependents(current) {
+                        if visited.len() >= max_visited {
+                            break;
+                        }
+                        if visited.insert(edge.from.clone()) {
+                            collect_libraries_from(
+                                &edge.from,
+                                &mut packages,
+                                &mut attached_packages_for_meta,
+                            );
+                            next.push(edge.from.clone());
+                        }
+                    }
+                }
+                frontier = next;
             }
-            // Forward edges: files sourced by this file
-            for edge in snapshot.cross_file_graph.get_dependencies(&current) {
-                if let Some(child_meta) = snapshot.metadata_map.get(&edge.to) {
-                    for call in &child_meta.library_calls {
-                        if call.package.is_empty() {
-                            continue;
+        }
+
+        // Pass 2: descendants-only (files this file sources, transitively).
+        {
+            let mut visited: HashSet<Url> = HashSet::new();
+            visited.insert(uri.clone());
+            let mut frontier: Vec<Url> = vec![uri.clone()];
+            for _ in 0..max_depth {
+                if frontier.is_empty() || visited.len() >= max_visited {
+                    break;
+                }
+                let mut next: Vec<Url> = Vec::new();
+                for current in &frontier {
+                    for edge in snapshot.cross_file_graph.get_dependencies(current) {
+                        if visited.len() >= max_visited {
+                            break;
                         }
-                        let package = call.package.clone();
-                        if call.attaches {
-                            attached_packages_for_meta.insert(package.clone());
+                        if visited.insert(edge.to.clone()) {
+                            collect_libraries_from(
+                                &edge.to,
+                                &mut packages,
+                                &mut attached_packages_for_meta,
+                            );
+                            next.push(edge.to.clone());
                         }
-                        packages.insert(package);
                     }
                 }
-                queue.push(edge.to.clone());
+                frontier = next;
             }
         }
     }
