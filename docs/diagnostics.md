@@ -17,17 +17,21 @@ Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, 
 ## Diagnostic codes
 
 Every diagnostic carries a stable, kebab-case `code` (never an opaque number).
-The code is the spelling you write inside a suppression selector, e.g.
-`# raven: ignore[undefined-variable]`. The analyzer codes are:
+Not every code is suppressible: only codes marked **suppressible** below can be
+targeted by a `[code]` selector inside a `# raven: ignore[...]` directive.
+Writing `# raven: ignore[syntax-error]` or `# raven: ignore[unresolved-source-path]`
+is a silent no-op — those codes are deliberately excluded from suppression (parse
+errors cannot be suppressed; path-resolution and other dependency-graph diagnostics
+are governed only by their severity settings). The suppressible analyzer codes are:
 
-| Code | Diagnostic |
-|---|---|
-| `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") |
-| `syntax-error` | Parse errors (the umbrella code for every parse-error message above) |
-| `unresolved-source-path` | A `source()` / `@lsp-source` path that does not resolve to a file |
-| `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target |
-| `package-not-installed` | `library()` / `require()` of a package that is not installed |
-| `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below |
+| Code | Diagnostic | Suppressible? |
+|---|---|---|
+| `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") | Yes |
+| `syntax-error` | Parse errors (the umbrella code for every parse-error message above) | No |
+| `unresolved-source-path` | A `source()` / `@lsp-source` path that does not resolve to a file | No |
+| `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
+| `package-not-installed` | `library()` / `require()` of a package that is not installed | Yes |
+| `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |
 
 The opt-in style/lint rules contribute their own codes (`line-length`,
 `object-name`, …); the full list is in [Linting](linting.md). Both the

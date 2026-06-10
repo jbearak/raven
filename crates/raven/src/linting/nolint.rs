@@ -3,8 +3,9 @@
 //! Recognised markers:
 //! * `# raven: ignore` / `-next` / `-start` / `-end` / `-file` — Raven's
 //!   primary suppression namespace (F2), optionally with a `[code]` selector.
-//!   In this lint-track parser a `[code]` selector is accepted but applies
-//!   blanket per line (same interim behaviour as `# nolint: rule`).
+//!   A `[code]` selector is enforced per rule: `parse_colon_codes` returns
+//!   `LineSuppression::Codes` and `is_suppressed_code` matches against it, so
+//!   `# raven: ignore[line-length]` suppresses only `line-length`.
 //! * `# nolint` (or `# nolint: rule_a, rule_b`) — lintr-style line-level
 //!   suppression on the same source line.
 //! * `# nolint start` / `# nolint end` — lintr-style block suppression,
@@ -20,9 +21,9 @@
 //! which lints happen to be enabled.
 //!
 //! Rule-name filters (the `: rule_a, rule_b` suffix on `# nolint`) are
-//! recognised but ignored for now — line-level suppression applies to every
-//! rule. The shape of `Suppressions` is intentionally rule-agnostic so a
-//! future revision can match per rule without an API break.
+//! enforced per rule — `# nolint: line_length` suppresses only the
+//! `line_length` lint, leaving others in place. Both kebab-case and lintr
+//! `snake_case` spellings are accepted.
 
 use std::collections::HashMap;
 

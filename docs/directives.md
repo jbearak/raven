@@ -204,8 +204,10 @@ x <- foo # @lsp-ignore      # Alias of `# raven: ignore`
 A standalone `# raven: ignore` (or `# @lsp-ignore`) on its own line has no
 effect — comment lines carry no diagnostics. Use the `-next` form to suppress
 the following line, or place the marker as a trailing comment on the line you
-want suppressed. The line and next-line forms may appear as trailing comments;
-the file/block forms below must be on their own line.
+want suppressed. The plain `ignore` / `@lsp-ignore` line forms may appear as
+trailing comments; the `-next`, file, and block forms must be standalone (on
+their own line) — a trailing `x <- 1 # raven: ignore-next` is silently
+ignored.
 
 ### Per-code selector
 

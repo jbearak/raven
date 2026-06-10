@@ -281,7 +281,7 @@ A `[code]` selector is **enforced per rule/code** in both tracks: `# raven: igno
 
 | Marker | Scope | Origin | Applies to |
 |---|---|---|---|
-| `# raven: ignore` (trailing) | The line it appears on | Raven (primary) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol diagnostics. **Not** parse errors, nor the dependency-graph diagnostics |
+| `# raven: ignore` (trailing) | The line it appears on | Raven (primary) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus `undefined-variable`, `assign-to-string-literal`, and `package-not-installed` diagnostics (and out-of-scope usages, which carry the `undefined-variable` code). **Not** parse errors, nor the dependency-graph diagnostics |
 | `# raven: ignore-next` | The *following* source line | Raven (primary) | Same as `# raven: ignore` |
 | `# raven: ignore-start` … `# raven: ignore-end` | Inclusive range between the two markers | Raven (primary) | Same as `# raven: ignore` (lint **and** analyzer diagnostics) |
 | `# raven: ignore-file` | Every line in the file | Raven (primary) | Same as `# raven: ignore` (lint **and** analyzer diagnostics) |
@@ -290,7 +290,7 @@ A `[code]` selector is **enforced per rule/code** in both tracks: `# raven: igno
 | `# nolint` (trailing) | The line it appears on | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
 | `# nolint: rule_a, rule_b` | The line it appears on | `lintr` convention | Lint diagnostics and the semantic checks, narrowed to the named rules (honored per rule) |
 | `# nolint start` … `# nolint end` | Inclusive range between the two markers | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
-| `# @lsp-ignore` | The line it appears on | Raven (alias of `# raven: ignore`) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol diagnostics. **Not** parse errors, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth, redundant directive) |
+| `# @lsp-ignore` | The line it appears on | Raven (alias of `# raven: ignore`) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus `undefined-variable`, `assign-to-string-literal`, and `package-not-installed` diagnostics (and out-of-scope usages, which carry the `undefined-variable` code). **Not** parse errors, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth, redundant directive) |
 | `# @lsp-ignore-next` | The *following* source line | Raven (alias of `# raven: ignore-next`) | Same as `# @lsp-ignore` |
 
 Notes:

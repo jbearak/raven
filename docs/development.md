@@ -546,6 +546,43 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 - **`editors/vscode/src/knit/knit-output-panel.ts`** — Per-source-path webview-panel registry for the `Raven: Knit` output viewer. Keyed by `sourceUri.fsPath` (aligned with the in-flight gate in `knit-commands.ts`). Tracks a `previewColumn` static so new panels stack as tabs in a single column rather than scattering; `recomputePreviewColumn` runs on every `onDidChangeViewState` / `onDidDispose` and adopts a surviving panel's column when the recorded one empties. The companion `help/help-panel.ts` remains a singleton (one R-help context per session is the right shape for that domain). See `docs/superpowers/specs/2026-05-17-knit-panel-per-file-design.md`.
 - **`editors/vscode/src/viewer-tab-icon.ts`** + **`version-gate.ts`** — Editor-tab icons for the four webview viewers, assigned via `WebviewPanel.iconPath`. Codicon ids: help → `question`, data → `table`, plot → `graph`, knit → `book`. `WebviewPanel.iconPath` only honors a `ThemeIcon` at runtime on VSCode ≥ 1.110 (microsoft/vscode#282608); Raven's engine and `@types/vscode` floors both stay at `^1.82.0`, so `viewerTabIcon` returns `undefined` on older hosts (leaving the default page icon) and `applyViewerTabIcon` is the single helper callers should use. `applyViewerTabIcon` centralizes the locally widened `WebviewPanel.iconPath` cast required because the 1.82 typings only accept image `Uri` icons even though VSCode ≥ 1.110 accepts a `ThemeIcon` at runtime. `version-gate.ts` stays free of any `vscode` import so the pure `meetsMinVersion` is bun-testable (`tests/bun/version-gate.test.ts`).
 
+### `package_state/sysdata.rs` — sysdata symbol extraction
+
+`crates/raven/src/package_state/sysdata.rs` extracts the symbols written to `R/sysdata.rda` (package-internal data) and the names bound by `.onLoad`/`.onAttach`. The strategy is AST-first:
+
+1. **AST scan** — walks `data-raw/**/*.R` (recursively) looking for `usethis::use_data(..., internal = TRUE)` and `save(..., file = "...sysdata.rda")` calls. Also scans `R/*.R` files for `.onLoad`/`.onAttach` definitions and collects `assign("x", ..., envir = <ns>)` and `<ns>$x <- ...` bindings where the receiver is provably namespace-like (`topenv(environment())`, `asNamespace(...)`, `getNamespace(...)`, `parent.env(environment())`).
+
+2. **R-subprocess fallback** — only when the AST scan finds nothing *and* `R/sysdata.rda` actually exists. Loads the file via a one-shot R subprocess (`load()` into an empty env, then `ls()`), subject to a 10-second `tokio::time::timeout`. Results are cached by file digest so the subprocess is called at most once per `.rda` version. Any failure is fail-soft (returns empty).
+
+### `system.file()` source resolution
+
+`system.file(package = "pkg", "path/to/file.R")` calls are used by packages to reference installed data files. Raven resolves these to concrete paths and adds them as forward-source edges so cross-file analysis works across package boundaries.
+
+**Lifecycle:** Resolution is deferred until `lib_paths` are ready — the workspace scan may run before the package library is initialized. `resolve_system_file_in_workspace()` in `state.rs` is called twice: once at the end of the workspace scan (in case lib_paths are already available) and once after `PackageLibrary` initialization completes (`backend.rs`). This double-call is idempotent.
+
+**Locking discipline:** Callers must not hold the `WorldState` read lock across resolution. `WorldState::snapshot_system_file_inputs()` captures workspace name, workspace root, and `lib_paths` under the lock; the caller then drops the guard before calling `cross_file::resolve_system_file_sources()`. See `crates/raven/src/state.rs` and `backend.rs` for the two call sites.
+
+**Re-resolution:** If a `system.file()` source edge resolves to a path that was previously reported as an error (`unresolved-source-path`), the diagnostic is retracted once resolution succeeds.
+
+### Package-corpus workflow
+
+`crates/raven/tests/package_corpus.rs` is a long-running `raven check` regression suite against real R package sources. It is `#[ignore]`d by default because it requires network access to fetch package tarballs.
+
+**Two TOML ledgers** — committed at `crates/raven/tests/fixtures/package_corpus/`:
+- `accepted_real_diagnostics.toml` — diagnostics that are real bugs in the package (true positives, accepted as known findings).
+- `known_false_positives.toml` — diagnostics Raven emits incorrectly (tracked false positives, expected to shrink over time).
+
+**Running the corpus:** Use `--ignored --nocapture` to activate:
+```bash
+cargo test -p raven --test package_corpus -- --ignored --nocapture
+```
+
+**Env-var filters** (combine freely):
+- `RAVEN_CORPUS_GROUPS=base,recommended` — run only packages in the named group(s).
+- `RAVEN_CORPUS_PACKAGES=dplyr,DT` — run only the named packages.
+- `RAVEN_CORPUS_ALLOW_UNCLASSIFIED=1` — pass when a new diagnostic appears that hasn't been triaged yet; without it, unclassified findings fail the run.
+- `RAVEN_CORPUS_KEEP_TEMP=1` — preserve fetched package sources for local inspection.
+
 ## Coding conventions (repo-level)
 
 - Avoid `bail!`; prefer explicit `return Err(anyhow!(...))`.
