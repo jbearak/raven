@@ -139,7 +139,16 @@ fn try_extract_save_sysdata(node: Node, content: &str, symbols: &mut BTreeSet<St
     }
 }
 
-/// Check if the `file` argument contains "sysdata.rda" or "sysdata.RData".
+/// Check whether the `save(file = "...")` literal points at a package's
+/// `R/sysdata.rda` (the two conventional spellings `sysdata.rda` and
+/// `sysdata.RData`).
+///
+/// Matches on the path's final component only, exactly equal to one of those
+/// spellings. A loose substring test wrongly matched any path merely *containing*
+/// the token, e.g. `backup/mysysdata.rda.old` or `notsysdata.rda`; those are not
+/// `R/sysdata.rda` and must not feed the sysdata symbol set. The two accepted
+/// spellings preserve the existing case behavior (the stem is always lowercase
+/// `sysdata`; only the `.rda`/`.RData` extension casing differs).
 fn file_arg_is_sysdata(args_node: &Node, content: &str) -> bool {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
@@ -149,7 +158,9 @@ fn file_arg_is_sysdata(args_node: &Node, content: &str) -> bool {
             && let Some(value_node) = child.child_by_field_name("value")
             && let Some(s) = extract_string_literal(value_node, content)
         {
-            return s.contains("sysdata.rda") || s.contains("sysdata.RData");
+            // Final path component, splitting on both Unix and Windows separators.
+            let file_name = s.rsplit(['/', '\\']).next().unwrap_or(&s);
+            return file_name == "sysdata.rda" || file_name == "sysdata.RData";
         }
     }
     false
@@ -663,6 +674,46 @@ mod tests {
         let mut syms = BTreeSet::new();
         extract_sysdata_names_from_source(code, &mut syms);
         assert!(syms.is_empty(), "got: {:?}", syms);
+    }
+
+    // FIX 4: the `file=` match is on the final path component, exactly equal to
+    // `sysdata.rda` / `sysdata.RData` — a path that merely *contains* the token
+    // must not feed the sysdata symbol set.
+    #[test]
+    fn save_to_path_merely_containing_sysdata_token_does_not_extract() {
+        for path in [
+            "backup/mysysdata.rda.old", // token in the middle, wrong final component
+            "notsysdata.rda",           // longer stem
+            "sysdata.rda.bak",          // trailing suffix
+            "R/sysdata.RDATA",          // wrong extension casing
+            "presysdata.RData",
+        ] {
+            let code = format!(r#"save(z, file = "{path}")"#);
+            let mut syms = BTreeSet::new();
+            extract_sysdata_names_from_source(&code, &mut syms);
+            assert!(
+                syms.is_empty(),
+                "path {path:?} must not match, got: {syms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_with_windows_separator_sysdata_extracts() {
+        // The accepted spellings still match on a Windows-style path.
+        let code = r#"save(z, file = "R\\sysdata.rda")"#;
+        let mut syms = BTreeSet::new();
+        extract_sysdata_names_from_source(code, &mut syms);
+        assert!(syms.contains("z"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn save_with_rdata_casing_extracts() {
+        // Regression guard: the `sysdata.RData` spelling is still accepted.
+        let code = r#"save(z, file = "R/sysdata.RData")"#;
+        let mut syms = BTreeSet::new();
+        extract_sysdata_names_from_source(code, &mut syms);
+        assert!(syms.contains("z"), "got: {:?}", syms);
     }
 
     // --- .onLoad / .onAttach bindings ---

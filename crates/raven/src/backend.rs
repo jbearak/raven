@@ -1619,6 +1619,26 @@ fn is_package_source_dir(path: &std::path::Path, root: &std::path::Path) -> bool
         || path.starts_with(testthat_dir)
 }
 
+/// Whether `path` lives under the package's `data/` or `data-raw/` directories.
+///
+/// CREATED/CHANGED watched-file events for these directories must reach
+/// `package_state::event::translate`, which has dedicated handlers that rescan
+/// `dataset_names` (from `data/`) and `sysdata_names` (from `data-raw/`).
+/// The R-source gate (`is_r_source_path` / [`is_package_source_dir`]) does not
+/// cover them, so without this predicate adding or editing a `data/*.rda` or
+/// `data-raw/*.R` file would leave those symbol sets stale until an unrelated
+/// `R/` edit. (DELETE events already reach `translate` unconditionally.)
+///
+/// The directory boundaries mirror `event.rs`'s own detection: a path strictly
+/// *under* `data/` or `data-raw/` (not the directory node itself). `Path::starts_with`
+/// is component-wise, so `data-raw/` does not match the `data/` prefix.
+fn is_package_data_path(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let data_dir = root.join("data");
+    let data_raw_dir = root.join("data-raw");
+    (path.starts_with(&data_dir) && path != data_dir)
+        || (path.starts_with(&data_raw_dir) && path != data_raw_dir)
+}
+
 fn is_package_manifest_path(path: &std::path::Path, root: &std::path::Path) -> bool {
     path == root.join("DESCRIPTION") || path == root.join("NAMESPACE")
 }
@@ -5187,6 +5207,10 @@ impl LanguageServer for Backend {
                             u.to_file_path().ok().is_some_and(|p| {
                                 crate::package_state::is_r_source_path(&p, root).is_some()
                                     || is_package_source_dir(&p, root)
+                                    // data/ and data-raw/ CREATED/CHANGED events
+                                    // also have dedicated translate() handlers
+                                    // (dataset_names / sysdata_names rescans).
+                                    || is_package_data_path(&p, root)
                             })
                         })
                     });
@@ -8058,8 +8082,8 @@ mod tests {
         use super::super::{
             collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
             extend_with_open_package_docs, hydrate_package_r_files_from_state,
-            initialize_package_inputs_from_state, is_package_relevant_open_uri,
-            is_package_source_dir,
+            initialize_package_inputs_from_state, is_package_data_path,
+            is_package_relevant_open_uri, is_package_source_dir,
         };
         use crate::state::{Document, WorldState};
         use std::path::PathBuf;
@@ -8287,6 +8311,44 @@ mod tests {
                 &root
             ));
             assert!(!is_package_source_dir(&root.join("scratch.R"), &root));
+        }
+
+        #[test]
+        fn package_data_path_matches_data_and_data_raw_files() {
+            // FIX 2: CREATED/CHANGED events under data/ and data-raw/ must route
+            // through the package-state gate (they have dedicated translate()
+            // handlers that rescan dataset_names / sysdata_names).
+            let root = pkg_root();
+            assert!(is_package_data_path(
+                &root.join("data").join("mtcars.rda"),
+                &root
+            ));
+            assert!(is_package_data_path(
+                &root.join("data-raw").join("prep.R"),
+                &root
+            ));
+            assert!(is_package_data_path(
+                &root.join("data").join("sub").join("x.rda"),
+                &root
+            ));
+            // The directory nodes themselves are not data *files*.
+            assert!(!is_package_data_path(&root.join("data"), &root));
+            assert!(!is_package_data_path(&root.join("data-raw"), &root));
+            // Unrelated paths and sibling dirs with the `data` prefix must not match.
+            assert!(!is_package_data_path(&root.join("R").join("foo.R"), &root));
+            assert!(!is_package_data_path(
+                &root.join("database").join("x.R"),
+                &root
+            ));
+            // The gate must accept either source files or data files together,
+            // mirroring the `has_pkg_files` predicate in the watched-file handler.
+            let data_path = root.join("data-raw").join("prep.R");
+            assert!(
+                crate::package_state::is_r_source_path(&data_path, &root).is_none()
+                    && !is_package_source_dir(&data_path, &root)
+                    && is_package_data_path(&data_path, &root),
+                "data-raw/*.R is reached only via the data-path branch"
+            );
         }
 
         #[test]

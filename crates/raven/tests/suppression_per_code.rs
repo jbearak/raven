@@ -223,3 +223,52 @@ fn chunk_option_suppresses_assign_to_string_literal() {
         "raven.ignore=TRUE chunk must suppress assign-to-string-literal. Output:\n{out}"
     );
 }
+
+// FIX 1: the same-line `@lsp-ignore` / `# raven: ignore` parser must be
+// string-aware. A marker that lives inside a string literal that *opens* on the
+// line (and continues onto the next line) is NOT a trailing comment, so it must
+// not silence a genuine diagnostic on that line.
+
+#[test]
+fn lsp_ignore_inside_line_opening_multiline_string_does_not_suppress() {
+    // The `"` opens a string that continues to the next line, so `# @lsp-ignore`
+    // is string content, not a comment. The undefined-variable must still fire.
+    let out =
+        check_one("result <- totally_undefined_thing + \"abc # @lsp-ignore\nstill string\"\n");
+    assert!(
+        out.contains("Undefined variable: totally_undefined_thing"),
+        "a marker inside a line-opening multi-line string must NOT suppress. Output:\n{out}"
+    );
+}
+
+#[test]
+fn raven_ignore_inside_line_opening_multiline_string_does_not_suppress() {
+    let out =
+        check_one("result <- totally_undefined_thing + \"abc # raven: ignore\nstill string\"\n");
+    assert!(
+        out.contains("Undefined variable: totally_undefined_thing"),
+        "a `# raven: ignore` inside a line-opening multi-line string must NOT suppress. Output:\n{out}"
+    );
+}
+
+#[test]
+fn genuine_trailing_comment_marker_after_real_code_still_suppresses() {
+    // Regression guard for FIX 1: a real trailing comment after closed code must
+    // still suppress as before.
+    let out = check_one("result <- totally_undefined_thing # @lsp-ignore\n");
+    assert!(
+        !out.contains("Undefined variable: totally_undefined_thing"),
+        "a genuine trailing `# @lsp-ignore` after real code must still suppress. Output:\n{out}"
+    );
+}
+
+#[test]
+fn marker_inside_closed_single_line_string_does_not_suppress() {
+    // Baseline that was already correct: the string is closed before the `#`, but
+    // there is no out-of-string comment marker, so nothing is suppressed.
+    let out = check_one("result <- totally_undefined_thing + \"abc # @lsp-ignore\"\n");
+    assert!(
+        out.contains("Undefined variable: totally_undefined_thing"),
+        "a marker inside a closed single-line string must NOT suppress. Output:\n{out}"
+    );
+}

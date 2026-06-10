@@ -545,7 +545,14 @@ fn parse_ignore_chunk_directive(line: &str) -> Option<crate::cross_file::types::
 /// string (group 3 of [`fence_header_re`]). Returns:
 /// * `Some(All)` for `raven.ignore=TRUE`/`=T` or a bare `raven.ignore`;
 /// * `Some(Codes(..))` for `raven.ignore="a,b"` / `='a'` (quoted code list);
-/// * `None` when the option is absent or explicitly `FALSE`/`F`.
+/// * `None` when the option is absent, explicitly `FALSE`/`F`, OR an explicitly
+///   empty/whitespace-only quoted code list (`raven.ignore=""`). An empty *value*
+///   is an empty code list — it suppresses nothing, the inverse of a blanket
+///   ignore. (This differs from an empty `[code]` *bracket selector* on
+///   `# raven: ignore[]` / `ignore-chunk[]`, which means blanket per
+///   [`chunk_codes_or_all`] and the directive-track parser; brackets are a
+///   "narrow this" qualifier whose absence-or-emptiness defaults to all, whereas
+///   a quoted value is the list itself.)
 ///
 /// Uses the same bracket/quote-aware comma split as [`has_eval_false`] so a
 /// value like `fig.dim=c(5, 6)` doesn't confuse the scan.
@@ -577,6 +584,11 @@ fn chunk_ignore_option(header_rest: &str) -> Option<crate::cross_file::types::Li
                     .and_then(|v| v.strip_suffix('"'))
                     .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
                     .unwrap_or(val);
+                // An explicit empty/whitespace-only code list (`raven.ignore=""`)
+                // suppresses nothing — do not collapse it to a blanket ignore.
+                if unquoted.trim().is_empty() {
+                    return None;
+                }
                 Some(chunk_codes_or_all(Some(unquoted)))
             }
         };
@@ -1430,6 +1442,30 @@ mod tests {
         let mut meta = crate::cross_file::types::CrossFileMetadata::default();
         append_chunk_suppressions(&mut meta, src);
         assert!(meta.ignored_ranges.is_empty());
+    }
+
+    #[test]
+    fn chunk_option_empty_quoted_list_suppresses_nothing() {
+        // FIX 3: `raven.ignore=""` is an explicitly EMPTY code list, not a
+        // blanket ignore. It must suppress nothing (parses to None).
+        assert_eq!(chunk_ignore_option("raven.ignore=\"\""), None);
+        assert_eq!(chunk_ignore_option("raven.ignore=''"), None);
+        // Whitespace-only is also an empty list.
+        assert_eq!(chunk_ignore_option("raven.ignore=\"  \""), None);
+        // And end-to-end: an empty-list chunk produces no suppression range.
+        let src = "```{r, raven.ignore=\"\"}\nx <- undefined\n```\n";
+        let mut meta = crate::cross_file::types::CrossFileMetadata::default();
+        append_chunk_suppressions(&mut meta, src);
+        assert!(
+            meta.ignored_ranges.is_empty(),
+            "raven.ignore=\"\" must not create a suppression range, got {:?}",
+            meta.ignored_ranges
+        );
+        // Contrast: a non-empty list still suppresses the listed code.
+        assert!(matches!(
+            chunk_ignore_option("raven.ignore=\"undefined-variable\""),
+            Some(LineSuppression::Codes(_))
+        ));
     }
 
     #[test]

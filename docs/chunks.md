@@ -49,7 +49,9 @@ Two ways to silence Raven's diagnostics for an entire chunk:
   `raven.ignore=TRUE` (or `=T`) suppresses everything in the chunk body;
   `raven.ignore=FALSE` (the default) does nothing. Narrow it to specific codes
   with a quoted, comma-separated list:
-  `raven.ignore="undefined-variable, line-length"`.
+  `raven.ignore="undefined-variable, line-length"`. An explicitly empty list
+  (`raven.ignore=""`) is the empty set of codes and therefore suppresses
+  nothing — use `raven.ignore=TRUE` to silence the whole chunk.
 
 - **in-chunk directive** `# raven: ignore-chunk` anywhere in the chunk body
   (optionally `# raven: ignore-chunk[undefined-variable]`):

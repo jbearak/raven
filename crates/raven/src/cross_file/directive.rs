@@ -52,6 +52,44 @@ fn parse_suppression_codes(raw: Option<&str>) -> LineSuppression {
     }
 }
 
+/// Return the substring of `line` starting at the first `#` that is outside any
+/// single- or double-quoted string literal, or `None` if no such `#` exists.
+///
+/// The same-line ignore regexes (`patterns.ignore`, `patterns.raven_ignore`) are
+/// not start-anchored and have no string awareness, so a line that *opens* a
+/// multi-line string and ends with the marker text inside that string —
+/// `x <- foo + "abc # @lsp-ignore` — would otherwise match and silence a genuine
+/// diagnostic. Gating those regexes on this comment region prevents that: a `#`
+/// living inside an open string is not a comment start, so no marker is found.
+///
+/// This is a deliberate local copy of `linting::nolint::first_hash_body`; the two
+/// must stay in parity (same single-/double-quote and backslash-escape
+/// bookkeeping). It is copied rather than imported to avoid a cross-module
+/// dependency between the analyzer and lint tracks for a few lines of byte scan.
+fn comment_region_outside_strings(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && (in_single || in_double) {
+            i += 2;
+            continue;
+        }
+        if !in_single && b == b'"' {
+            in_double = !in_double;
+        } else if !in_double && b == b'\'' {
+            in_single = !in_single;
+        } else if !in_single && !in_double && b == b'#' {
+            return Some(&line[i..]);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Map the flavor capture (`ignore` | `expect`) into a [`SuppressionFlavor`].
 /// Defaults to [`SuppressionFlavor::Ignore`] when absent or unrecognized.
 fn parse_flavor(raw: Option<&str>) -> SuppressionFlavor {
@@ -370,8 +408,13 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
 
         // Full-file: ignore directives. Each captures an optional flavor
         // (`ignore`|`expect`, group 1) and `[code]` selector (group 2) that
-        // narrows what it suppresses.
-        if let Some(caps) = patterns.ignore.captures(line) {
+        // narrows what it suppresses. The same-line form is not start-anchored,
+        // so it is matched only against the comment region (the substring from
+        // the first `#` outside any string literal) — otherwise a marker that
+        // lives inside an *open* multi-line string would wrongly suppress.
+        if let Some(caps) = comment_region_outside_strings(line)
+            .and_then(|comment| patterns.ignore.captures(comment))
+        {
             log::trace!("  Parsed @lsp-ignore/expect directive at line {}", line_num);
             let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
             let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
@@ -480,7 +523,11 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             continue;
         }
 
-        if let Some(caps) = patterns.raven_ignore.captures(line) {
+        // Same-line form (not start-anchored); see `patterns.ignore` above for
+        // why this is gated on the comment region rather than the raw line.
+        if let Some(caps) = comment_region_outside_strings(line)
+            .and_then(|comment| patterns.raven_ignore.captures(comment))
+        {
             log::trace!(
                 "  Parsed `# raven: ignore/expect` directive at line {}",
                 line_num
