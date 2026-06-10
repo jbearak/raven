@@ -1483,6 +1483,58 @@ x <- undefined"#;
         assert!(meta.ignored_lines.contains_key(&0));
     }
 
+    // ============================================================================
+    // Tests for comment_region_outside_strings: a marker inside an OPEN
+    // multi-line string must not be parsed (the `#` is string content, not a
+    // comment start), while a genuine trailing comment after a CLOSED string
+    // still is. End-to-end coverage lives in tests/suppression_per_code.rs.
+    // ============================================================================
+
+    #[test]
+    fn test_lsp_ignore_marker_inside_open_string_is_not_parsed() {
+        let content = "x <- foo + \"abc # @lsp-ignore\nstill string\"\ny <- undefined\n";
+        let meta = parse_directives(content);
+        assert!(!meta.ignored_lines.contains_key(&0));
+    }
+
+    #[test]
+    fn test_raven_ignore_marker_inside_open_string_is_not_parsed() {
+        let content = "x <- foo + \"abc # raven: ignore\nstill string\"\ny <- undefined\n";
+        let meta = parse_directives(content);
+        assert!(!meta.ignored_lines.contains_key(&0));
+    }
+
+    #[test]
+    fn test_marker_after_closed_string_is_still_parsed() {
+        let content = "x <- foo + \"abc\" # @lsp-ignore\ny <- \"def\" # raven: ignore\n";
+        let meta = parse_directives(content);
+        assert!(meta.ignored_lines.contains_key(&0));
+        assert!(meta.ignored_lines.contains_key(&1));
+    }
+
+    #[test]
+    fn test_comment_region_outside_strings_helper() {
+        // Open string: the `#` is inside the unterminated literal -> None.
+        assert_eq!(
+            comment_region_outside_strings("x <- foo + \"abc # @lsp-ignore"),
+            None
+        );
+        assert_eq!(
+            comment_region_outside_strings("x <- foo + \"abc # raven: ignore"),
+            None
+        );
+        // Closed string: the `#` after it is a real comment start.
+        assert_eq!(
+            comment_region_outside_strings("x <- foo + \"abc\" # @lsp-ignore"),
+            Some("# @lsp-ignore")
+        );
+        // Escaped quote does not close the string.
+        assert_eq!(
+            comment_region_outside_strings("x <- \"a\\\" # raven: ignore"),
+            None
+        );
+    }
+
     #[test]
     fn test_indented_directive_recognized() {
         // Directives with leading whitespace (indented code) should still work

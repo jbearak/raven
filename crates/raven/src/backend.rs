@@ -2639,6 +2639,8 @@ impl LanguageServer for Backend {
             };
             if needs_fallback {
                 let state_arc = self.state.clone();
+                let client = self.client.clone();
+                let traversal_truncation = self.traversal_truncation.clone();
                 tokio::spawn(async move {
                     let (r_path, workspace_root) = {
                         let state = state_arc.read().await;
@@ -2655,11 +2657,34 @@ impl LanguageServer for Backend {
                         let names =
                             crate::package_state::sysdata::load_sysdata_via_r(&r, &root).await;
                         if !names.is_empty() {
-                            let mut state = state_arc.write().await;
-                            state.package_inputs.sysdata_names = names;
-                            state.apply_package_event(
-                                &crate::package_state::PackageInputDelta::DataDirChanged,
-                            );
+                            // Apply the fallback names under the write lock, then
+                            // snapshot the open URIs to republish. Without this,
+                            // open package buffers keep their pre-fallback
+                            // diagnostics (e.g. undefined-variable on sysdata
+                            // symbols) until the next edit.
+                            let open_uris: Vec<tower_lsp::lsp_types::Url> = {
+                                let mut state = state_arc.write().await;
+                                state.package_inputs.sysdata_names = names;
+                                state.apply_package_event(
+                                    &crate::package_state::PackageInputDelta::DataDirChanged,
+                                );
+                                let uris: Vec<_> = state.documents.keys().cloned().collect();
+                                state
+                                    .diagnostics_gate
+                                    .mark_force_republish_many(uris.iter());
+                                uris
+                            };
+                            // Route through the same debounced, bounded pipeline
+                            // the watcher consumer and `raven.refreshPackages`
+                            // use, so the republish cooperates with revalidation
+                            // cancellation/freshness gates.
+                            Backend::publish_diagnostics_for_uris_bounded(
+                                state_arc.clone(),
+                                client,
+                                open_uris,
+                                Some(traversal_truncation),
+                            )
+                            .await;
                         }
                     }
                 });
@@ -2763,6 +2788,15 @@ impl LanguageServer for Backend {
                     let mut state = self.state.write().await;
                     state.package_library = new_lib;
                     state.package_library_ready = ready;
+                    // Swapping the library may have changed `lib_paths`
+                    // (renv switch, `.Rprofile` edit). Re-resolve
+                    // `source(system.file(...))` edges against the new paths
+                    // BEFORE the force-republish below, so a file whose target
+                    // lives in a newly-discovered libpath stops being
+                    // stale/unresolved. See `rebuild_package_library`'s invariant.
+                    if ready {
+                        state.resolve_system_file_in_workspace();
+                    }
                 }
 
                 // Restart the watcher over the freshly-discovered libpaths so
@@ -6136,6 +6170,17 @@ impl Backend {
                 let mut state = self.state.write().await;
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
+                // The new library may carry different `lib_paths` (the user
+                // changed `raven.packages.additionalLibraryPaths`, or a
+                // raven.toml reload re-ran `.libPaths()`). Re-resolve
+                // `source(system.file(...))` edges against the new paths BEFORE
+                // the force-republish (the helper's returned `open_uris` are
+                // marked and republished by the caller), so targets in a
+                // newly-discovered libpath stop being stale/unresolved. See
+                // `rebuild_package_library`'s invariant.
+                if package_library_ready {
+                    state.resolve_system_file_in_workspace();
+                }
             }
 
             // Help/HTML help caches index by (topic, package); the package
@@ -7219,6 +7264,15 @@ pub(crate) async fn refresh_packages_command_body(
 /// mid-session changes to `.libPaths()` (e.g. renv switching projects, the user
 /// editing `.Rprofile`, or a `.libPaths(new, ...)` call) are picked up without
 /// requiring an LSP restart.
+///
+/// INVARIANT: any path that swaps the result into `state.package_library` (and
+/// thereby changes `lib_paths`) MUST call
+/// `WorldState::resolve_system_file_in_workspace()` under the write lock BEFORE
+/// force-republishing open documents. Otherwise a file whose
+/// `source(system.file(...))` resolves against a package in a newly-discovered
+/// libpath keeps its stale/unresolved `system_file` index entry until restart.
+/// Call sites: `raven.refreshPackages`, `reconcile_after_config_recompute`, and
+/// the post-Task-B startup retry in `initialized`.
 pub(crate) async fn rebuild_package_library(
     state_arc: &Arc<RwLock<WorldState>>,
 ) -> (Arc<crate::package_library::PackageLibrary>, bool) {
