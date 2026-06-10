@@ -374,7 +374,7 @@ pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
 
 /// Returns `true` for testthat-recognized test-preamble files: files under
 /// `tests/testthat/` whose basename starts with `"helper"` or `"setup"`
-/// (case-insensitive match against testthat's own loaders —
+/// (case-sensitive match against testthat's own loaders —
 /// `source_test_helpers` sources `^helper.*\\.[rR]$` and
 /// `source_test_setup` sources `^setup.*\\.[rR]$`, in that order, before any
 /// test file runs). Preamble top-level definitions are visible to peer files
@@ -391,22 +391,10 @@ pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
 /// files, where testthat's helper/setup sourcing semantics do not apply. This
 /// function only inspects the basename.
 pub fn is_test_preamble_filename(file_name: &str) -> bool {
-    // Case-insensitive ASCII prefix match. Slicing by raw byte index
-    // would panic when the prefix length lands inside a multi-byte UTF-8
-    // sequence (e.g. `tes\u{00E9}.R`), so iterate `bytes()` and compare
-    // against the ASCII prefix instead. Filenames are not normalized by
-    // Raven — a leading non-ASCII glyph that happens to lowercase to
-    // "helper"/"setup" is intentionally not matched; testthat's loaders
-    // match the ASCII patterns `^helper.*\.[rR]$` / `^setup.*\.[rR]$`.
-    fn starts_with_ascii_ci(bytes: &[u8], prefix: &[u8]) -> bool {
-        bytes.len() >= prefix.len()
-            && prefix
-                .iter()
-                .zip(bytes)
-                .all(|(p, b)| b.eq_ignore_ascii_case(p))
-    }
-    let bytes = file_name.as_bytes();
-    if !starts_with_ascii_ci(bytes, b"helper") && !starts_with_ascii_ci(bytes, b"setup") {
+    // Prefix is case-sensitive to match testthat's regexes
+    // `^helper.*\.[rR]$` / `^setup.*\.[rR]$`; only the extension accepts
+    // either `R` or `r`.
+    if !file_name.starts_with("helper") && !file_name.starts_with("setup") {
         return false;
     }
     matches!(
@@ -494,8 +482,6 @@ mod path_tests {
         assert!(is_test_preamble_filename("helper-utils.R"));
         assert!(is_test_preamble_filename("helper_utils.R"));
         assert!(is_test_preamble_filename("helper.r"));
-        assert!(is_test_preamble_filename("Helper-mixedCase.R"));
-        assert!(is_test_preamble_filename("HELPER-shouty.R"));
     }
 
     /// testthat also sources `setup*.R` files (`^setup.*\.[rR]$`) before any
@@ -509,8 +495,6 @@ mod path_tests {
         assert!(is_test_preamble_filename("setup-testing.R"));
         assert!(is_test_preamble_filename("setup_db.R"));
         assert!(is_test_preamble_filename("setup.r"));
-        assert!(is_test_preamble_filename("Setup-mixedCase.R"));
-        assert!(is_test_preamble_filename("SETUP-x.r"));
         // testthat's pattern is `^setup.*` — any "setup" prefix matches,
         // even without a separator.
         assert!(is_test_preamble_filename("setupx.R"));
@@ -519,6 +503,12 @@ mod path_tests {
     #[test]
     fn test_helper_filename_rejects_non_helpers() {
         assert!(!is_test_preamble_filename("test-utils.R"));
+        // testthat's loader regex is case-sensitive for the prefix:
+        // `^helper.*\.[Rr]$` / `^setup.*\.[Rr]$`.
+        assert!(!is_test_preamble_filename("Helper-mixedCase.R"));
+        assert!(!is_test_preamble_filename("HELPER-shouty.R"));
+        assert!(!is_test_preamble_filename("Setup-mixedCase.R"));
+        assert!(!is_test_preamble_filename("SETUP-x.r"));
         // Teardown files run AFTER the tests — their bindings are never
         // visible to test code, so they must NOT be treated as preamble.
         assert!(!is_test_preamble_filename("teardown.R"));

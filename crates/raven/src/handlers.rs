@@ -5685,6 +5685,7 @@ fn collect_undefined_variables_from_snapshot(
     };
 
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
+    let random_seed_initializer_end_offsets = collect_random_seed_initializer_end_offsets(text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
     let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> =
@@ -5874,6 +5875,14 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
         if is_implicit_search_path_binding(&name) {
+            continue;
+        }
+        if name == ".Random.seed"
+            && has_prior_token_end(
+                &random_seed_initializer_end_offsets,
+                usage_node.start_byte(),
+            )
+        {
             continue;
         }
         if is_s3_method_special_variable_usage(usage_node, text, &name) {
@@ -12384,11 +12393,27 @@ fn collect_package_loader_call_end_offsets(text: &str) -> Vec<usize> {
     end_offsets
 }
 
+/// Pre-compute end byte offsets for calls that materialize `.Random.seed`.
+fn collect_random_seed_initializer_end_offsets(text: &str) -> Vec<usize> {
+    let mut end_offsets: Vec<usize> = text
+        .match_indices("set.seed(")
+        .map(|(idx, pattern)| idx + pattern.len())
+        .collect();
+    end_offsets.sort_unstable();
+    end_offsets.dedup();
+    end_offsets
+}
+
 /// Returns true when there is a package loader token fully before `byte_limit`.
 fn has_prior_package_loader_call(call_end_offsets: &[usize], byte_limit: usize) -> bool {
     // Match original semantics of `&text[..byte_limit].contains(...)`:
     // a match counts only when the full token is inside the prefix.
-    call_end_offsets.partition_point(|&end| end <= byte_limit) > 0
+    has_prior_token_end(call_end_offsets, byte_limit)
+}
+
+/// Returns true when any token end offset is fully before `byte_limit`.
+fn has_prior_token_end(token_end_offsets: &[usize], byte_limit: usize) -> bool {
+    token_end_offsets.partition_point(|&end| end <= byte_limit) > 0
 }
 
 /// Memoized `package_exists()` lookup. `HashMap::entry` would force an
@@ -13718,21 +13743,15 @@ fn unquote_backtick_name(name: &str) -> Option<&str> {
 }
 
 /// Returns true for names R exposes through startup search-path environments
-/// (or materializes in the workspace itself) rather than ordinary package
-/// exports.
+/// rather than ordinary package exports.
 ///
 /// `.Autoloaded` lives in the default `Autoloads` environment (`.AutoloadEnv`),
 /// which is on the search path in normal R sessions. Base's `autoload()`
 /// legitimately reads it as a bare name even though it is not a binding in the
 /// base package environment.
-///
-/// `.Random.seed` is base R's documented RNG-state global (see `?Random`),
-/// materialized in the workspace (`.GlobalEnv`) by `set.seed()` or any RNG
-/// use, so code legitimately reads it as a bare name with no visible
-/// definition site.
 fn is_implicit_search_path_binding(name: &str) -> bool {
     let normalized = unquote_backtick_name(name).unwrap_or(name);
-    matches!(normalized, ".Autoloaded" | ".Random.seed")
+    matches!(normalized, ".Autoloaded")
 }
 
 /// Returns true when `node` is one of R's method-frame special variables that
@@ -22741,10 +22760,10 @@ clean_data <- function(x) {
     }
 
     /// `.Random.seed` is base R's documented RNG-state global, materialized in
-    /// the workspace by `set.seed()` / any RNG use, so reading it as a bare
-    /// name must not flag as undefined.
+    /// the workspace by `set.seed()`, so reading it after `set.seed()` must not
+    /// flag as undefined.
     #[test]
-    fn test_diagnostic_suppresses_random_seed_search_path_binding() {
+    fn test_diagnostic_suppresses_random_seed_after_set_seed() {
         use crate::state::{Document, WorldState};
 
         let workspace_root = Url::parse("file:///work").unwrap();
@@ -22769,7 +22788,42 @@ clean_data <- function(x) {
         );
         assert!(
             !messages.iter().any(|m| m.contains(".Random.seed")),
-            "`.Random.seed` is base R's RNG-state global; messages: {messages:?}"
+            "`.Random.seed` after set.seed() must be treated as initialized; messages: {messages:?}"
+        );
+    }
+
+    /// `.Random.seed` is not present at R startup; it is created only after
+    /// `set.seed()` here. A read before such a point must still be diagnosed
+    /// as undefined.
+    #[test]
+    fn test_diagnostic_reports_random_seed_before_initializer() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "s <- .Random.seed\nset.seed(42)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: .Random.seed"),
+            "`.Random.seed` before set.seed() must be reported; messages: {messages:?}"
         );
     }
 
