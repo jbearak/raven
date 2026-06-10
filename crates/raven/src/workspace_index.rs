@@ -335,6 +335,40 @@ impl WorkspaceIndex {
             .unwrap_or_default()
     }
 
+    /// Whether any entry satisfies `pred`, without cloning entries.
+    ///
+    /// Read-lock + iteration only (no LRU promotion); use as a cheap
+    /// pre-check before paying for a snapshot or a stronger lock.
+    pub fn any_entry<F>(&self, pred: F) -> bool
+    where
+        F: Fn(&IndexEntry) -> bool,
+    {
+        self.inner
+            .read()
+            .map(|guard| guard.iter().any(|(_, v)| pred(v)))
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of the entries satisfying `pred`.
+    ///
+    /// Like [`Self::iter`] but clones only the matching subset, so a sparse
+    /// predicate over a large index avoids the full O(N) entry clone.
+    pub fn entries_matching<F>(&self, pred: F) -> Vec<(Url, IndexEntry)>
+    where
+        F: Fn(&IndexEntry) -> bool,
+    {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|(_, v)| pred(v))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Get current version
     ///
     /// Returns the current monotonic version counter value.
@@ -736,6 +770,30 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///{}", name)).unwrap()
+    }
+
+    /// `any_entry` short-circuits without cloning entries; `entries_matching`
+    /// clones only the matching subset. Both are read-lock (`peek`-discipline)
+    /// operations used by the system.file resolution pre-checks.
+    #[test]
+    fn any_entry_and_entries_matching_filter_without_full_snapshot() {
+        let index = WorkspaceIndex::new(make_test_config());
+        index.insert(test_uri("a.R"), make_test_entry(1));
+        let mut tagged = make_test_entry(2);
+        tagged.loaded_packages = vec!["special".to_string()];
+        index.insert(test_uri("b.R"), tagged);
+
+        assert!(index.any_entry(|e| e.loaded_packages.iter().any(|p| p == "special")));
+        assert!(!index.any_entry(|e| e.loaded_packages.iter().any(|p| p == "absent")));
+
+        let matched = index.entries_matching(|e| e.loaded_packages.iter().any(|p| p == "special"));
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].0, test_uri("b.R"));
+        assert!(
+            index
+                .entries_matching(|e| e.loaded_packages.iter().any(|p| p == "absent"))
+                .is_empty()
+        );
     }
 
     #[test]

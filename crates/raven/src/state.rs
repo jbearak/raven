@@ -1046,47 +1046,104 @@ impl WorldState {
     }
 
     /// Resolve `system.file()` sources in workspace index metadata and rebuild
-    /// affected dependency graph edges. Must be called after `apply_package_event`
-    /// so that `package_state.workspace()` is populated.
-    pub fn resolve_system_file_in_workspace(&mut self) {
+    /// dependency graph edges for files whose resolution changed. Must be called
+    /// after `apply_package_event` so that `package_state.workspace()` is
+    /// populated.
+    ///
+    /// Every entry with `system_file.is_some()` is revisited — resolved entries
+    /// keep their `SystemFileCall` (see `resolve_system_file_sources`), so this
+    /// is the single recovery point for package lifecycle events: a package
+    /// install/removal in a watched libpath (`LibpathEvent::Changed`) and a
+    /// workspace `Package:` rename (the DESCRIPTION manifest branch) both call
+    /// this to form, drop, or re-target edges without the user editing the
+    /// sourcing file.
+    ///
+    /// Returns the URIs whose source resolution actually changed, so callers
+    /// can republish diagnostics for exactly those files (expand with
+    /// [`Self::system_file_republish_set`] to include open dependents).
+    pub fn resolve_system_file_in_workspace(&mut self) -> Vec<Url> {
+        self.resolve_system_file_in_workspace_for_packages(None)
+    }
+
+    /// Package-filtered variant of [`Self::resolve_system_file_in_workspace`]:
+    /// with `Some(packages)`, only entries containing a `system.file()` source
+    /// referencing one of those packages are re-resolved; everything else is
+    /// neither cloned nor disk-probed. The libpath-event consumer passes the
+    /// changed-package set so a package install/removal does not re-probe
+    /// every resolved entry in the workspace. Callers reacting to events that
+    /// can shift resolution for arbitrary packages (startup, library swaps,
+    /// a workspace `Package:` rename) pass `None`.
+    ///
+    /// Covers BOTH metadata stores: the workspace index (closed files) and
+    /// the document store (open buffers, which are authoritative and whose
+    /// metadata is read in preference to the index — see
+    /// `get_enriched_metadata`). Without the open-document pass, an open
+    /// buffer with a `system.file()` source would stay stale across package
+    /// lifecycle events until the user edited it, and would never recover at
+    /// all when the file is absent from the index (unsaved buffer,
+    /// `index_workspace = false`).
+    pub fn resolve_system_file_in_workspace_for_packages(
+        &mut self,
+        only_packages: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<Url> {
         let ws = self.package_state.workspace();
         let ws_name = ws.map(|w| w.name.as_str()).map(|s| s.to_owned());
         let ws_root = ws.map(|w| w.root.clone());
         let lib_paths = self.package_library.lib_paths().to_vec();
 
-        // Collect URIs that have unresolved system.file entries.
-        // `workspace_index_new.iter()` returns an owned Vec snapshot, so
-        // filter it in place rather than re-iterating.
-        let mut affected: Vec<(Url, crate::workspace_index::IndexEntry)> =
-            self.workspace_index_new.iter();
-        affected.retain(|(_, entry)| {
-            entry
-                .metadata
-                .sources
-                .iter()
-                .any(|s| s.system_file.is_some())
-        });
+        let source_selected = |s: &crate::cross_file::ForwardSource| {
+            s.system_file
+                .as_ref()
+                .is_some_and(|sf| only_packages.is_none_or(|pkgs| pkgs.contains(&sf.package)))
+        };
 
-        if affected.is_empty() {
-            return;
+        // Snapshot only the index entries with a selected system.file source —
+        // `entries_matching` clones just that subset, so workspaces without
+        // system.file sources (the common case) pay one predicate pass.
+        let affected = self
+            .workspace_index_new
+            .entries_matching(|entry| entry.metadata.sources.iter().any(source_selected));
+
+        // Open buffers with a selected system.file source (authoritative
+        // metadata lives in the document store, not the index).
+        let open_affected: Vec<Url> = self
+            .document_store
+            .uris()
+            .into_iter()
+            .filter(|uri| {
+                self.document_store
+                    .get_without_touch(uri)
+                    .is_some_and(|doc| doc.metadata.sources.iter().any(source_selected))
+            })
+            .collect();
+
+        if affected.is_empty() && open_affected.is_empty() {
+            return Vec::new();
         }
 
-        // Resolve in stored metadata and re-insert
-        let affected_uris: Vec<Url> = affected.iter().map(|(u, _)| u.clone()).collect();
+        // Resolve into a cloned sources Vec; only a real change pays for the
+        // full-metadata clone (`Arc::make_mut`), re-insertion, and the edge
+        // rebuild below (resolution is idempotent, so unchanged entries need
+        // none of them).
+        let mut changed_uris: Vec<Url> = Vec::new();
         for (uri, mut entry) in affected {
-            let meta = Arc::make_mut(&mut entry.metadata);
-            crate::cross_file::resolve_system_file_sources(
-                meta,
+            let mut new_sources = entry.metadata.sources.clone();
+            crate::cross_file::resolve_system_file_source_entries(
+                &mut new_sources,
                 ws_name.as_deref(),
                 ws_root.as_deref(),
                 &lib_paths,
             );
-            self.workspace_index_new.insert(uri, entry);
+            if new_sources != entry.metadata.sources {
+                Arc::make_mut(&mut entry.metadata).sources = new_sources;
+                changed_uris.push(uri.clone());
+                self.workspace_index_new.insert(uri, entry);
+            }
         }
 
-        // Rebuild graph edges for affected files
+        // Rebuild graph edges for changed index entries
         let workspace_root = self.workspace_folders.first().cloned();
-        for uri in &affected_uris {
+        for uri in &changed_uris {
             if let Some(entry) = self.workspace_index_new.get(uri) {
                 let meta = entry.metadata.clone();
                 let get_content = |parent_uri: &Url| -> Option<String> {
@@ -1103,16 +1160,106 @@ impl WorldState {
             }
         }
 
+        // Open-document pass. Runs AFTER the index pass so for a file present
+        // in both stores the graph edges rebuilt here — from the buffer's
+        // (authoritative) metadata — win over the index-derived ones. The
+        // index pass above rebuilt edges for every URI in `changed_uris`, so
+        // an open buffer whose own resolution is UNCHANGED still needs its
+        // edges re-asserted when the index pass touched the same file (e.g.
+        // the buffer resolved at did_open while the scanned index entry was
+        // still unresolved) — otherwise the graph would keep the stale
+        // index-derived edges until the user edits the buffer.
+        let index_rebuilt: std::collections::HashSet<Url> = changed_uris.iter().cloned().collect();
+        for uri in open_affected {
+            let Some(doc) = self.document_store.get_without_touch(&uri) else {
+                continue;
+            };
+            let mut new_sources = doc.metadata.sources.clone();
+            crate::cross_file::resolve_system_file_source_entries(
+                &mut new_sources,
+                ws_name.as_deref(),
+                ws_root.as_deref(),
+                &lib_paths,
+            );
+            let resolution_changed = new_sources != doc.metadata.sources;
+            let meta = if resolution_changed {
+                let mut new_meta = (*doc.metadata).clone();
+                new_meta.sources = new_sources;
+                let new_meta = Arc::new(new_meta);
+                self.document_store.replace_metadata(&uri, new_meta.clone());
+                new_meta
+            } else if index_rebuilt.contains(&uri) {
+                // Unchanged buffer, but the index pass overwrote this file's
+                // edges from index metadata — re-assert the buffer's.
+                doc.metadata.clone()
+            } else {
+                continue;
+            };
+            let get_content = |parent_uri: &Url| -> Option<String> {
+                self.workspace_index_new
+                    .get(parent_uri)
+                    .map(|e| e.contents.to_string())
+            };
+            self.cross_file_graph.update_file(
+                &uri,
+                meta.as_ref(),
+                workspace_root.as_ref(),
+                get_content,
+            );
+            if resolution_changed && !changed_uris.contains(&uri) {
+                changed_uris.push(uri);
+            }
+        }
+
         // Index outside-workspace files resolved via cross-package system.file
         // so their artifacts are available to scope resolution.
         self.index_cross_package_resolved_files();
+
+        changed_uris
+    }
+
+    /// Expand the changed-URI list from
+    /// [`Self::resolve_system_file_in_workspace`] into the open documents
+    /// whose diagnostics may be affected: the changed files themselves plus
+    /// their open transitive dependents and sibling subtrees. A parent's
+    /// cross-file scope traverses forward source edges transitively, so an
+    /// edge formed or dropped on a child changes the parent's diagnostics
+    /// even though the parent's own text and edges are untouched — the same
+    /// fan-out `did_change` performs via
+    /// `compute_affected_dependents_after_edit`.
+    pub fn system_file_republish_set(&self, changed: &[Url]) -> Vec<Url> {
+        let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        let mut out: Vec<Url> = Vec::new();
+        for uri in changed {
+            if self.documents.contains_key(uri) && seen.insert(uri.clone()) {
+                out.push(uri.clone());
+            }
+            let dependents =
+                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                    uri,
+                    false, // the file's text (interface) did not change
+                    true,  // its dependency edges did
+                    &self.cross_file_graph,
+                    |u| self.documents.contains_key(u),
+                    self.cross_file_config.max_chain_depth,
+                    self.cross_file_config.max_transitive_dependents_visited,
+                );
+            for dep in dependents {
+                if seen.insert(dep.clone()) {
+                    out.push(dep);
+                }
+            }
+        }
+        out
     }
 
     /// Read, parse, and index outside-workspace files that were resolved via
     /// cross-package `system.file()`. Called after `resolve_system_file_sources`
     /// populates `resolved_uri` fields and graph edges are rebuilt.
     fn index_cross_package_resolved_files(&mut self) {
-        // Collect resolved_uris from all workspace entries
+        // Collect resolved_uris from all workspace entries AND open buffers
+        // (open-document metadata is authoritative and may carry resolutions
+        // the index does not — unsaved buffers, index_workspace = false).
         let mut external_uris: Vec<Url> = Vec::new();
         for (_, entry) in self.workspace_index_new.iter() {
             for source in &entry.metadata.sources {
@@ -1120,6 +1267,17 @@ impl WorldState {
                     && !self.workspace_index_new.contains(uri)
                 {
                     external_uris.push(uri.clone());
+                }
+            }
+        }
+        for doc_uri in self.document_store.uris() {
+            if let Some(doc) = self.document_store.get_without_touch(&doc_uri) {
+                for source in &doc.metadata.sources {
+                    if let Some(ref uri) = source.resolved_uri
+                        && !self.workspace_index_new.contains(uri)
+                    {
+                        external_uris.push(uri.clone());
+                    }
                 }
             }
         }
@@ -2434,8 +2592,9 @@ mod tests {
             .expect("entry still indexed");
         assert_eq!(resolved.metadata.sources.len(), 1);
         assert!(
-            resolved.metadata.sources[0].system_file.is_none(),
-            "source must be resolved after the swap"
+            resolved.metadata.sources[0].system_file.is_some(),
+            "system_file must be retained after resolution so package \
+             lifecycle events can re-resolve"
         );
         let resolved_uri = resolved.metadata.sources[0]
             .resolved_uri

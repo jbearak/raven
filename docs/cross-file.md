@@ -31,7 +31,7 @@ Raven detects `source()` and `sys.source()` calls:
 - Single and double quotes: `source("path.R")` or `source('path.R')`
 - Named arguments: `source(file = "path.R")`
 - `local = TRUE` and `chdir = TRUE` parameters
-- `source(system.file("helper.R", package = "pkg"))` — the `system.file()` path is resolved statically: for the package being analyzed it maps to the source-tree `inst/` directory, and for an installed package it is found under the library paths (so a helper sourced this way contributes its definitions like any other `source()` target)
+- `source(system.file("helper.R", package = "pkg"))` — the `system.file()` path is resolved statically: for the package being analyzed it maps to the source-tree `inst/` directory, and for an installed package it is found under the library paths (so a helper sourced this way contributes its definitions like any other `source()` target). Resolution tracks package lifecycle events live: installing or removing the referenced package mid-session, or renaming the workspace package in `DESCRIPTION`, re-resolves these edges without editing the file or restarting
 - Dynamic paths (variables, expressions) are skipped gracefully
 
 `sys.source()` defaults to a non-global environment, so its symbols are treated as local and do **not** propagate to the calling file unless you pass `envir = globalenv()` (or `.GlobalEnv`).

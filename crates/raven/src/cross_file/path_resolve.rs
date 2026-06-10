@@ -464,16 +464,51 @@ pub fn resolve_system_file(
 
 /// Resolve any `system_file`-bearing `ForwardSource` entries in `meta` into
 /// concrete paths. Call after `extract_metadata` when workspace and library
-/// context is available. Each resolved entry gets `source.path` populated and
-/// `source.system_file` cleared so the existing dependency/scope machinery
-/// handles them transparently.
+/// context is available. Each resolved entry gets `source.path` (and, for
+/// cross-package hits, `source.resolved_uri`) populated so the existing
+/// dependency/scope machinery handles them transparently.
+///
+/// `source.system_file` is NEVER cleared and unresolved entries are NEVER
+/// dropped: resolution state is recomputed from scratch on every call so that
+/// package lifecycle events (install/removal in a watched libpath, a workspace
+/// `Package:` rename) can re-resolve without re-extracting metadata from
+/// source text. `WorldState::resolve_system_file_in_workspace` revisits every
+/// entry where `system_file.is_some()`. The function is idempotent: calling it
+/// again with the same inputs yields the same metadata.
+///
+/// Resolution states after a call:
+/// - branch 1 (workspace self-package): `path = "/inst/<rel>"`, `resolved_uri = None`
+/// - branch 2 hit (installed package): `path` absolute, `resolved_uri = Some`
+/// - branch 2 miss with non-empty `lib_paths` (not installed): `path` empty,
+///   `resolved_uri = None` — any prior resolution is cleared so a removed
+///   package's stale edge disappears
+/// - `lib_paths` empty and not self-package: left untouched (deferred until
+///   the package library is ready)
 pub fn resolve_system_file_sources(
     meta: &mut super::types::CrossFileMetadata,
     workspace_package_name: Option<&str>,
     workspace_root: Option<&Path>,
     lib_paths: &[PathBuf],
 ) {
-    for source in &mut meta.sources {
+    resolve_system_file_source_entries(
+        &mut meta.sources,
+        workspace_package_name,
+        workspace_root,
+        lib_paths,
+    );
+}
+
+/// Slice-based core of [`resolve_system_file_sources`]: resolves directly on
+/// a `ForwardSource` slice so callers that need change detection can resolve
+/// into a cloned `Vec` and compare, without deep-cloning the whole
+/// `CrossFileMetadata` (`Arc::make_mut`) when nothing changed.
+pub fn resolve_system_file_source_entries(
+    sources: &mut [super::types::ForwardSource],
+    workspace_package_name: Option<&str>,
+    workspace_root: Option<&Path>,
+    lib_paths: &[PathBuf],
+) {
+    for source in sources.iter_mut() {
         if let Some(ref sf) = source.system_file {
             // Branch 1: same as workspace package → source layout with inst/ prefix
             if let Some(ws_pkg) = workspace_package_name
@@ -484,7 +519,9 @@ pub fn resolve_system_file_sources(
                     continue;
                 };
                 source.path = format!("/inst/{}", rel.display());
-                source.system_file = None;
+                // Workspace-relative resolution: drop any stale cross-package
+                // URI from a previous pass (e.g. before a Package: rename).
+                source.resolved_uri = None;
             } else if !lib_paths.is_empty() {
                 // Branch 2: cross-package → search lib_paths (only when
                 // lib_paths are actually available; otherwise leave intact
@@ -499,26 +536,19 @@ pub fn resolve_system_file_sources(
                 if let Some(abs_path) = resolved {
                     source.resolved_uri = Url::from_file_path(&abs_path).ok();
                     source.path = abs_path.display().to_string();
-                    source.system_file = None;
+                } else {
+                    // Not installed: clear any stale resolution (the package
+                    // may have just been removed, or the workspace package
+                    // renamed away from a former branch-1 match) but retain
+                    // the entry so a later install event can re-resolve it.
+                    source.resolved_uri = None;
+                    source.path = String::new();
                 }
-                // If unresolved with lib_paths available (truly uninstalled),
-                // system_file stays Some → retain below drops it.
             }
-            // When lib_paths is empty AND not same-package, system_file stays
-            // intact — entry survives retain for a later retry.
+            // When lib_paths is empty AND not same-package, the entry is left
+            // intact — including any prior resolution — for a later retry.
         }
     }
-    // Drop entries that were attempted but failed: system_file still Some AND
-    // lib_paths were available (truly uninstalled). Entries left because
-    // lib_paths was empty survive for a subsequent call.
-    let drop_unresolved = !lib_paths.is_empty();
-    meta.sources.retain(|s| {
-        if s.system_file.is_none() {
-            return true; // resolved or non-system.file source
-        }
-        // system_file is Some: keep only if lib_paths was empty (deferred)
-        !drop_unresolved
-    });
 }
 
 /// Convert a resolved path to a file URI.
@@ -986,7 +1016,8 @@ mod tests {
 
     #[test]
     fn test_resolve_system_file_sources_integration() {
-        // resolve_system_file_sources sets workspace-root-relative path and clears system_file
+        // resolve_system_file_sources sets the workspace-root-relative path and
+        // retains system_file so later events can re-resolve.
         use super::super::source_detect::SystemFileCall;
         use super::super::types::{CrossFileMetadata, ForwardSource};
 
@@ -1009,13 +1040,18 @@ mod tests {
         resolve_system_file_sources(&mut meta, Some("mypkg"), Some(ws_root), &[]);
 
         assert_eq!(meta.sources[0].path, "/inst/helper.R");
-        assert!(meta.sources[0].system_file.is_none());
+        assert!(
+            meta.sources[0].system_file.is_some(),
+            "system_file must be retained so a Package: rename can re-resolve"
+        );
     }
 
     #[test]
-    fn test_resolve_system_file_sources_unresolved_dropped() {
-        // Unresolved (cross-package, not installed) entries are removed when
-        // lib_paths is non-empty (meaning resolution was actually attempted).
+    fn test_resolve_system_file_sources_unresolved_retained() {
+        // Unresolved (cross-package, not installed) entries are RETAINED even
+        // when lib_paths is non-empty (resolution attempted and failed), so a
+        // later package-install event can re-resolve them. They stay inert:
+        // empty path, no resolved_uri.
         use super::super::source_detect::SystemFileCall;
         use super::super::types::{CrossFileMetadata, ForwardSource};
 
@@ -1042,10 +1078,14 @@ mod tests {
             &[lib_dir.path().to_path_buf()],
         );
 
-        assert!(
-            meta.sources.is_empty(),
-            "Unresolved entries must be removed when lib_paths is available"
+        assert_eq!(
+            meta.sources.len(),
+            1,
+            "Unresolved entries must be retained for later re-resolution"
         );
+        assert!(meta.sources[0].system_file.is_some());
+        assert!(meta.sources[0].path.is_empty());
+        assert!(meta.sources[0].resolved_uri.is_none());
     }
 
     // ---- P7: system.file edge re-resolution after a library swap ----
@@ -1062,7 +1102,7 @@ mod tests {
 
     /// After a library swap that populates lib_paths, an unresolved
     /// `system_file` source is resolved to the installed path, `resolved_uri`
-    /// is set, and `system_file` is cleared to `None`.
+    /// is set, and `system_file` is retained for future re-resolution.
     #[test]
     fn system_file_re_resolved_after_library_swap() {
         use super::super::source_detect::SystemFileCall;
@@ -1104,8 +1144,8 @@ mod tests {
         );
 
         // --- Step 2: retry after the library swap (lib_paths now populated) ---
-        // Entry must resolve: system_file cleared, resolved_uri points into the
-        // new lib path.
+        // Entry must resolve: resolved_uri points into the new lib path while
+        // system_file stays Some for future lifecycle events.
         let mut meta_after = meta_before.clone();
         resolve_system_file_sources(
             &mut meta_after,
@@ -1119,8 +1159,9 @@ mod tests {
             "Entry must survive resolution (it resolved successfully)"
         );
         assert!(
-            meta_after.sources[0].system_file.is_none(),
-            "system_file must be None after successful resolution"
+            meta_after.sources[0].system_file.is_some(),
+            "system_file must be retained after successful resolution so a \
+             package-removal event can re-resolve"
         );
         let resolved_uri = meta_after.sources[0]
             .resolved_uri
@@ -1163,13 +1204,14 @@ mod tests {
 
         assert_eq!(meta.sources.len(), 1);
         assert!(
-            meta.sources[0].system_file.is_none(),
-            "same-package system.file() must resolve immediately (no lib_paths needed)"
+            meta.sources[0].path.contains("/inst/helper.R"),
+            "same-package system.file() must resolve immediately (no lib_paths \
+             needed); path must be set to the inst/ location, got: {:?}",
+            meta.sources[0].path
         );
         assert!(
-            meta.sources[0].path.contains("/inst/helper.R"),
-            "path must be set to the inst/ location, got: {:?}",
-            meta.sources[0].path
+            meta.sources[0].system_file.is_some(),
+            "system_file must be retained so a Package: rename can re-resolve"
         );
     }
 }
