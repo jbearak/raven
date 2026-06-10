@@ -7191,9 +7191,13 @@ pub async fn start_lsp() -> anyhow::Result<()> {
 }
 
 /// Collect effective packages for all open documents (direct `library()` calls
-/// plus inherited packages from parent `source()` chains) and prefetch their
-/// exports into `pkg_lib`. Snapshots state under the read lock, releases it
-/// before running scope resolution (per AGENTS.md lock-hold invariant).
+/// plus inherited packages from parent `source()` chains, plus — in package
+/// mode — NAMESPACE whole-package `import(pkg)` directives from
+/// `scope_contribution.full_imports`, whose exports the undefined-variable
+/// check resolves via `is_package_export` in both call and value position)
+/// and prefetch their exports into `pkg_lib`. Snapshots state under the read
+/// lock, releases it before running scope resolution (per AGENTS.md lock-hold
+/// invariant).
 pub(crate) async fn prefetch_packages_for_open_documents(
     state_arc: &Arc<RwLock<WorldState>>,
     pkg_lib: &Arc<crate::package_library::PackageLibrary>,
@@ -7214,6 +7218,11 @@ pub(crate) async fn prefetch_packages_for_open_documents(
     }; // read lock released
 
     let mut all_pkgs = doc_packages;
+    // Package mode: NAMESPACE `import(pkg)` puts every export of `pkg` in
+    // scope for the package's own R files, so warm those exports too (parity
+    // with `raven check`'s `prefetch_reported_packages`). `full_imports` is
+    // empty outside package mode, making this a no-op there.
+    all_pkgs.extend(probe.scope_contribution.full_imports.iter().cloned());
     let empty_base_exports = std::collections::HashSet::new();
     let get_artifacts = |target_uri: &Url| probe.artifacts_map.get(target_uri).cloned();
     let get_metadata = |target_uri: &Url| probe.metadata_map.get(target_uri).cloned();
@@ -10377,6 +10386,72 @@ mod refresh_packages_tests {
         assert!(
             pkg_lib.is_cached("stats").await,
             "stats must be re-cached after second prefetch"
+        );
+    }
+
+    /// Regression: in package mode, NAMESPACE `import(pkg)` whole-package
+    /// imports (`scope_contribution.full_imports`) must be prefetched
+    /// alongside `library()` attaches and inherited packages. Without the
+    /// warm-up, value-position references to a full import's exports emit
+    /// false "Undefined variable" diagnostics (the "pending" heuristic only
+    /// suppresses call-position uses) until something else warms the cache.
+    /// R-free: the fake installed package is parsed statically from a temp
+    /// library directory.
+    #[tokio::test]
+    async fn prefetch_covers_namespace_full_imports() {
+        use crate::package_state::{DescriptionInput, NamespaceInput, PackageInputDelta};
+        use crate::state::{Document, WorldState};
+        use tokio::sync::RwLock;
+
+        let libdir = tempfile::tempdir().unwrap();
+        let pkgdir = libdir.path().join("fakepkg");
+        std::fs::create_dir_all(&pkgdir).unwrap();
+        std::fs::write(
+            pkgdir.join("DESCRIPTION"),
+            "Package: fakepkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(pkgdir.join("NAMESPACE"), "export(real_export)\n").unwrap();
+
+        let mut lib = crate::package_library::PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![libdir.path().to_path_buf()]);
+        let pkg_lib = Arc::new(lib);
+
+        // Package-mode workspace whose NAMESPACE fully imports fakepkg; the
+        // open document attaches nothing itself, so only `full_imports` can
+        // drive the prefetch.
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let uri = Url::from_file_path(root_path.join("R").join("uses.R")).unwrap();
+        let mut world = WorldState::new();
+        world.package_library = pkg_lib.clone();
+        world.package_library_ready = true;
+        world.documents.insert(
+            uri.clone(),
+            Document::new("f <- function(x) identical(x, real_export)\n", Some(1)),
+        );
+        world.package_inputs.workspace_root = Some(root_path);
+        world.package_inputs.description = Some(DescriptionInput {
+            text: "Package: testpkg\nVersion: 1.0\nImports: fakepkg\n".into(),
+        });
+        world.package_inputs.namespace = Some(NamespaceInput {
+            text: "import(fakepkg)\n".into(),
+        });
+        world.apply_package_event(&PackageInputDelta::Initial);
+        assert!(
+            world
+                .package_state
+                .scope_contribution()
+                .full_imports
+                .contains("fakepkg"),
+            "fixture must derive fakepkg as a full import"
+        );
+        let state = Arc::new(RwLock::new(world));
+
+        prefetch_packages_for_open_documents(&state, &pkg_lib).await;
+        assert!(
+            pkg_lib.is_cached("fakepkg").await,
+            "NAMESPACE import(fakepkg) must be prefetched for open documents"
         );
     }
 

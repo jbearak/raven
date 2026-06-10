@@ -19,7 +19,7 @@ The runner lives in `crates/raven/tests/package_corpus.rs`, with fixtures under 
 
 Env vars: `RAVEN_CORPUS_GROUPS`, `RAVEN_CORPUS_PACKAGES`, `RAVEN_CORPUS_ALL`, `RAVEN_CORPUS_LIMIT`, `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`, `RAVEN_CORPUS_KEEP_TEMP`, `RAVEN_CORPUS_REPORT_DIR`.
 
-The accepted-real fixture (`accepted_real_diagnostics.toml`) records 72 confirmed diagnostics (post-reclassification; see below). The known-false-positives fixture (`known_false_positives.toml`) records 2422 entries.
+The accepted-real fixture (`accepted_real_diagnostics.toml`) records 102 confirmed diagnostics (post-reclassification; see below). The known-false-positives fixture (`known_false_positives.toml`) records 3590 entries.
 
 ## Triage status
 
@@ -40,9 +40,14 @@ The accepted-real fixture (`accepted_real_diagnostics.toml`) records 72 confirme
 
 ### Tidyverse (31 packages)
 
-- Not yet triaged — deferred to follow-up.
+- Triaged per idiom (issue #423): every known-FP entry was reviewed against the fetched sources and carries a single-idiom reason (no disjunctive catch-alls).
+- 35 accepted real (3 carried over after re-verification + 32 reclassified from the FP ledger: dtplyr's orphaned `vignettes/benchmark.R` with undefined `DF`/`DT` and stray `)` syntax errors — 21; three leftover magrittr `.` placeholders stranded by native-`|>`/pipe refactors (rvest, googledrive, broom); stale googledrive demos against the pre-rename API — 4; ggplot2 `icons/icons.R` use-before-definition; cli fixture calling a C-only symbol; pillar drake plan referencing a function-local). The 2 dbplyr `error_call` acceptances were dropped: with `import(rlang)` warmed the name resolves to rlang's exported `error_call` function, so the (still questionable) copied-from-tidyr sites are no longer name-diagnosable.
+- 2154 known FPs, dominated by: uninstalled-package attaches in tests/scripts (~1500, surfaced once import-warming removed an accidental call-position suppression — modeltests `check_*` in broom tests, dtplyr `helpers-library.R` attaches, Depends-chain attaches, archived revdep/internal scripts), dplyr/tidyselect data-masking (~250), pillar `assign()`-generated option accessors (117), `makeActiveBinding()` in `.onLoad` (27), `R/sysdata.rda` internal data, lazy-loaded datasets bundled in `Rdata.rdb`, eval/parse dynamic code, and knitr/Rmd runtime contexts.
+- Six fix clusters were converted to Raven fixes instead of ledger entries (see below); 243 entries pruned after the fixes landed.
 
 ## Implemented Raven fixes (this checkpoint)
+
+0. **Tidyverse triage fixes (#423):** (a) R6 positional member lists — `R6Class("Cls", list(...))` binds `self`/`private`/`super` in method bodies like the named `public=` form; (b) testthat `setup*.R` files inject top-level defs into sibling test scope like `helper*.R` (`is_test_helper_filename` → `is_test_preamble_filename`); (c) `raven check` and the editor prefetch warm NAMESPACE whole-package `import(pkg)` exports, fixing the call/value-position asymmetry; (d) zeallot `%<-%` and rlang `%<~%` create bindings (nested `c(...)` LHS supported); (e) embedded base-datasets table unioned under the installed-path INDEX fallback (INDEX topics under-enumerate multi-object entries: `state` → `state.x77`); (f) `.Random.seed` treated as an implicit search-path binding. Each TDD-backed with editor + CLI coverage.
 
 1. **testit scope:** Extended package-test scope classification from `tests/testthat/` to `tests/testit/`. Files under `tests/testit/**/*.R` now get namespace injection (package internals + imports + exports), matching testthat behavior. Unit test + process-level regression added.
 
@@ -67,10 +72,8 @@ The follow-up fix has since landed: `check_invalid_assignment_target` exempts st
 
 - `cargo fmt --all --check` ✓
 - `cargo clippy --workspace --all-targets --features test-support -- -D warnings` ✓ (zero warnings)
-- 4488 lib + 11 regression + 103 indent + 7 corpus + 3 pkg_db + 55 other = 4667 tests pass
-- `base` corpus: strict mode pass (10 accepted reals, 0 unclassified)
-- DT corpus: strict mode pass (0 diagnostics)
-- Full strict run, all four groups (`RAVEN_CORPUS_GROUPS=base,recommended,tidyverse,dt`, release binary, no `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`): 61 packages, 2494 observed diagnostics — base 111 (28 accepted / 83 known-FP), recommended 1392 (39 / 1353), tidyverse 991 (5 / 986), DT 0 — **0 unclassified, 0 stale acceptances, 0 stale FPs** after pruning the drift entry above.
+- `cargo test -p raven`: 4739 lib + auxiliary suites, 0 failures
+- Full strict run, all four groups (`RAVEN_CORPUS_GROUPS=base,recommended,tidyverse,dt`, release binary, no `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`): 61 packages, 3642 observed diagnostics — base 108 (28 accepted / 80 known-FP), recommended 1345 (39 / 1306), tidyverse 2189 (35 / 2154), DT 0 — **0 unclassified, 0 stale acceptances, 0 stale FPs**. Observed counts grew vs. the previous checkpoint because warming NAMESPACE `import()` exports removed an accidental call-position suppression of uninstalled-package symbols (classified per idiom); the six triage fixes and the embedded-datasets floor cleared 293 previously-recorded FP entries (243 tidyverse + 50 base/recommended `state.*`/`Seatbelts`/`iris3` INDEX-topic gaps).
 
 ## Remaining work
 
@@ -82,5 +85,4 @@ The follow-up fix has since landed: `check_invalid_assignment_target` exempts st
 ### Broader follow-up
 
 - Triage and fix recommended package false positives (priorities: `.Generic` implicit var — 45 FPs, `tmerge` NSE — 200 FPs, `data()`/`library()` loading — 2900 FPs).
-- Triage tidyverse package group.
 - Update user-facing diagnostics docs for any externally visible behavior changes.

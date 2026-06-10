@@ -100,8 +100,10 @@ Raven also recognizes a few call forms that bind a name at runtime, so the bound
 - `load("foo.rda")` binds the conventional object name `foo`.
 - `data(foo, bar)` binds each named dataset (`foo`, `bar`) from the call onward, whether given as a bare name or a string; named arguments such as `package=` are ignored.
 - `setGeneric("g", ...)` / `setGroupGeneric("g", ...)` bind the generic `g`, so other files in the same package that call it resolve (common in S4-heavy packages like Matrix, whose generics live in a single `R/` file).
+- zeallot's `c(a, b) %<-% value` binds each bare symbol on the left (nested `c(...)` destructuring included), and rlang's `x %<~% value` binds its bare-symbol left-hand side; both take effect from the statement onward, like `<-`. Other custom `%op%` operators do not bind.
 - Inside an S4 method body (`setMethod("Ops"|"Math"|"Summary"|…, ...)`) or an S3 method bound to a `generic.class` name, the dispatcher-injected specials `.Generic`, `.Method`, and `.Class` are in scope.
-- Inside an R6 class method body — a function value within the `public`, `private`, or `active` list arguments of `R6Class(...)` or `R6::R6Class(...)` — the pronouns `self`, `private`, and `super` are in scope (R6 injects them at construction time). A top-level definition of `R6Class` in the same file shadows the package function and disables this treatment.
+- Inside an R6 class method body — a function value within the `public`, `private`, or `active` list arguments of `R6Class(...)` or `R6::R6Class(...)`, or within an unnamed `list(...)` passed positionally among the call's first four arguments (`R6Class(classname, public, private, active)`) — the pronouns `self`, `private`, and `super` are in scope (R6 injects them at construction time). A top-level definition of `R6Class` in the same file shadows the package function and disables this treatment.
+- Base R's implicit search-path globals resolve as bare names: `.Autoloaded` (the startup `Autoloads` environment) and `.Random.seed` after a visible prior `set.seed()` call.
 
 Windows-only base functions (`shell.exec`, `Sys.junction`, `readRegistry`, the `win*`/clipboard helpers, …) are recognized as builtins even though Raven's builtin list is generated on non-Windows hosts, so platform-guarded code does not draw a false positive.
 

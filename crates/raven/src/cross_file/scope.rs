@@ -1934,6 +1934,33 @@ fn collect_definitions(
             .insert(symbol.name.clone(), symbol);
     }
 
+    // Check for zeallot/rlang binding operators: `LHS %<-% RHS` (zeallot
+    // destructuring; binds a bare-symbol LHS or every bare symbol inside a
+    // possibly-nested `c(...)` LHS) and `LHS %<~% RHS` (rlang delayed binding;
+    // bare-symbol LHS only). The RHS is evaluated (or promised) before the
+    // bindings install, so each binding becomes visible at the end of the
+    // whole statement — same rule as `<-` with a non-function RHS.
+    if node.kind() == "binary_operator" {
+        let destructured = try_extract_destructuring_assignment(node, line_index, uri);
+        if !destructured.is_empty() {
+            let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+            for symbol in destructured {
+                let event = ScopeEvent::Def {
+                    line: symbol.defined_line,
+                    column: symbol.defined_column,
+                    visible_from_line: visible_line,
+                    visible_from_column: visible_column,
+                    symbol: symbol.clone(),
+                    function_scope: None,
+                };
+                artifacts.timeline.push(event);
+                artifacts
+                    .exported_interface
+                    .insert(symbol.name.clone(), symbol);
+            }
+        }
+    }
+
     // Check for assign() calls (Requirement 17.4). The value argument is always
     // an immediately-evaluated expression (R does not introspect strings here),
     // so the RHS-before-binding rule always applies — the new binding becomes
@@ -3073,6 +3100,112 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
         defined_line: start.row as u32,
         defined_column: column,
         signature,
+        is_declared: false,
+    })
+}
+
+/// Extract the symbols bound by a destructuring/delayed binding operator:
+/// zeallot's `LHS %<-% RHS` and rlang's `LHS %<~% RHS`.
+///
+/// `%<-%` binds a bare-symbol LHS, or every bare symbol inside a (possibly
+/// nested) `c(...)` LHS — zeallot's nested destructuring. Non-symbol elements
+/// (literals, calls, subscripts) are skipped, not errors. `%<~%`
+/// (`rlang::delayedAssign`-style) binds a bare-symbol LHS only.
+///
+/// Both install ordinary bindings in the calling environment; like `<-` with a
+/// non-function RHS, the caller makes them visible from the end of the whole
+/// statement onward.
+fn try_extract_destructuring_assignment(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Vec<ScopedSymbol> {
+    let mut cursor = node.walk();
+    let children = crate::parser_pool::non_extra_children(node, &mut cursor);
+    if children.len() != 3 {
+        return Vec::new();
+    }
+    let lhs = children[0];
+    let op = children[1];
+    let op_text = node_text(op, line_index.text);
+
+    let mut symbols = Vec::new();
+    match op_text {
+        "%<-%" => collect_destructuring_lhs_symbols(lhs, line_index, uri, &mut symbols),
+        "%<~%" => {
+            if let Some(symbol) = destructuring_symbol_from_identifier(lhs, line_index, uri) {
+                symbols.push(symbol);
+            }
+        }
+        _ => {}
+    }
+    symbols
+}
+
+/// Collect the bare symbols a zeallot `%<-%` LHS binds: a single identifier,
+/// or the elements of a `c(...)` call, recursing into nested `c(...)` for
+/// nested destructuring. Anything else is skipped.
+fn collect_destructuring_lhs_symbols(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+    symbols: &mut Vec<ScopedSymbol>,
+) {
+    if let Some(symbol) = destructuring_symbol_from_identifier(node, line_index, uri) {
+        symbols.push(symbol);
+        return;
+    }
+    if node.kind() != "call" {
+        return;
+    }
+    if node
+        .child_by_field_name("function")
+        .is_none_or(|f| node_text(f, line_index.text) != "c")
+    {
+        return;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args.children(&mut cursor) {
+        if arg.kind() != "argument" {
+            continue;
+        }
+        // Named arguments (`c(a = x)`) name list elements, not bindings.
+        if arg.child_by_field_name("name").is_some() {
+            continue;
+        }
+        if let Some(value) = arg.child_by_field_name("value") {
+            collect_destructuring_lhs_symbols(value, line_index, uri, symbols);
+        }
+    }
+}
+
+/// Build a `ScopedSymbol` for a bare (non-reserved) identifier in a
+/// destructuring LHS, or `None` when `node` is not a bare symbol.
+fn destructuring_symbol_from_identifier(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Option<ScopedSymbol> {
+    if node.kind() != "identifier" || node.is_missing() {
+        return None;
+    }
+    let name_str = assignment_identifier_name(node, line_index.text)?;
+    if crate::reserved_words::is_reserved_word(name_str) {
+        return None;
+    }
+    let start = node.start_position();
+    let line_text = line_index.get_line(start.row);
+    let column = byte_offset_to_utf16_column(line_text, start.column);
+    Some(ScopedSymbol {
+        name: Arc::from(name_str),
+        kind: SymbolKind::Variable,
+        source_uri: uri.clone(),
+        defined_line: start.row as u32,
+        defined_column: column,
+        signature: None,
         is_declared: false,
     })
 }
@@ -4663,11 +4796,12 @@ where
 /// Used by [`ScopeStream`] so `is_visible` / `symbol_for` agree with
 /// `snapshot()` on which contribution-derived names are in scope — out-of-
 /// scope diagnostics call only `is_visible`, so without this set they
-/// would emit "used before available" misattributions for helper symbols.
+/// would emit "used before available" misattributions for preamble
+/// (helper*/setup*) symbols.
 ///
-/// `test_helper_symbols` keyed by helper path are filtered to exclude the
-/// queried file's own entry, preserving forward-reference diagnostics
-/// inside a helper file.
+/// `test_helper_symbols` keyed by preamble-file path are filtered to
+/// exclude the queried file's own entry, preserving forward-reference
+/// diagnostics inside a helper/setup file.
 fn compute_contribution_symbol_names(
     queried_uri: &Url,
     contribution: Option<&crate::package_state::PackageScopeContribution>,
@@ -4724,19 +4858,20 @@ fn compute_contribution_symbol_names(
         && crate::package_state::is_testthat_or_testit_test(&path, root)
     {
         // Mirror `append_package_contribution`'s sourcing-order gate so
-        // `is_visible` / `symbol_for` agree with `snapshot()`: a helper
-        // file only sees alphabetically-earlier helpers, while
-        // `test-*.R` and other non-helper test files see them all.
-        let queried_is_helper = path
+        // `is_visible` / `symbol_for` agree with `snapshot()`: a preamble
+        // file (helper*/setup*) only sees lexicographically-earlier
+        // preamble files, while `test-*.R` and other non-preamble test
+        // files see them all.
+        let queried_is_preamble = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(crate::package_state::is_test_helper_filename)
+            .map(crate::package_state::is_test_preamble_filename)
             .unwrap_or(false);
-        for (helper_path, syms) in contrib.test_helper_symbols.iter() {
-            if helper_path == &path {
+        for (preamble_path, syms) in contrib.test_helper_symbols.iter() {
+            if preamble_path == &path {
                 continue;
             }
-            if queried_is_helper && helper_path >= &path {
+            if queried_is_preamble && preamble_path >= &path {
                 continue;
             }
             for sym in syms.iter() {
@@ -4776,8 +4911,9 @@ pub fn is_package_internal_uri(uri: &Url) -> bool {
 /// - Every key in `contrib.imported_symbols` (NAMESPACE `importFrom` targets)
 ///
 /// For files under `<root>/tests/testthat/` additionally:
-/// - Every name in `contrib.test_helper_symbols` (top-level defs from
-///   `tests/testthat/helper-*.R`) is inserted into the symbol map
+/// - Every name in `contrib.test_helper_symbols` (top-level defs from the
+///   testthat preamble files `tests/testthat/helper*.R` and `setup*.R`) is
+///   inserted into the symbol map
 /// - Every package in `contrib.test_attached_packages` is added to
 ///   `scope.inherited_packages`, modelling the implicit `library(testthat)`
 ///   that `tests/testthat.R` performs before sourcing each test file.
@@ -4979,36 +5115,39 @@ pub(crate) fn append_package_contribution(
     if kind == crate::package_state::RFileKind::Test
         && crate::package_state::is_testthat_or_testit_test(&path, root)
     {
-        // Per-helper-file iteration so a helper's own top-level defs are
-        // NOT injected back into the helper itself — preserves
-        // forward-reference diagnostics inside a helper file. Without
+        // Per-preamble-file iteration so a preamble file's own top-level
+        // defs are NOT injected back into the file itself — preserves
+        // forward-reference diagnostics inside helper/setup files. Without
         // this skip, a `use_x()` usage above an `x <- ...` definition
         // would see `x` via the package contribution and silently mute
         // the legitimate "undefined variable" / forward-reference
         // diagnostic.
         //
-        // For a helper file querying ITS scope, only earlier-sorted
-        // helpers are visible — `testthat::source_test_helpers` sources
-        // files matching `^helper.*\.[rR]$` with `sort()` applied first,
-        // so `helper-b.R`'s top-level code never sees `helper-c.R`'s
-        // defs. For non-helper test files (`test-*.R`, etc.), all
-        // helpers have already been sourced by the time the test runs,
-        // so all helpers are visible.
-        let queried_is_helper = path
+        // For a preamble file querying ITS scope, only earlier-sourced
+        // preamble files are visible — testthat sources all helpers
+        // (`^helper.*\.[rR]$`, `sort()` order) and THEN all setup files
+        // (`^setup.*\.[rR]$`, `sort()` order), so `helper-b.R`'s
+        // top-level code never sees `helper-c.R`'s defs, and no helper
+        // sees any setup file's defs. For non-preamble test files
+        // (`test-*.R`, etc.), all preamble files have already been
+        // sourced by the time the test runs, so all are visible.
+        let queried_is_preamble = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(crate::package_state::is_test_helper_filename)
+            .map(crate::package_state::is_test_preamble_filename)
             .unwrap_or(false);
-        for (helper_path, syms) in contrib.test_helper_symbols.iter() {
-            if helper_path == &path {
+        for (preamble_path, syms) in contrib.test_helper_symbols.iter() {
+            if preamble_path == &path {
                 continue;
             }
-            // When the queried file is itself a helper, restrict
-            // visibility to helpers that sort strictly before it
+            // When the queried file is itself a preamble file, restrict
+            // visibility to preamble files that sort strictly before it
             // (testthat's source order). `PathBuf` comparison is
             // byte-lexicographic, which matches what `sort()` produces
-            // for the typical flat `tests/testthat/` layout.
-            if queried_is_helper && helper_path >= &path {
+            // for the typical flat `tests/testthat/` layout — and since
+            // "helper" < "setup" byte-wise, it also reproduces the
+            // helpers-before-setup phase ordering.
+            if queried_is_preamble && preamble_path >= &path {
                 continue;
             }
             for sym in syms.iter() {
@@ -5189,15 +5328,15 @@ where
 
     /// Pre-computed set of symbol names that the package contribution would
     /// inject for `queried_uri` (R/ internals + NAMESPACE-imported names +
-    /// helper top-level defs from peer `helper-*.R` files when querying a
-    /// file under `tests/testthat/`). Consulted by `is_visible` and
-    /// `symbol_for` as a fallthrough so out-of-scope diagnostics — which
-    /// only call `is_visible` — don't misattribute a contribution-provided
-    /// name to a forward `source()` call.
+    /// top-level defs from peer preamble files (`helper*.R` / `setup*.R`)
+    /// when querying a file under `tests/testthat/`). Consulted by
+    /// `is_visible` and `symbol_for` as a fallthrough so out-of-scope
+    /// diagnostics — which only call `is_visible` — don't misattribute a
+    /// contribution-provided name to a forward `source()` call.
     ///
-    /// Helper symbols from the queried file itself are intentionally
-    /// excluded (per-helper-file keying in `test_helper_symbols`) so
-    /// forward-reference diagnostics inside the helper still fire.
+    /// Preamble symbols from the queried file itself are intentionally
+    /// excluded (per-file keying in `test_helper_symbols`) so
+    /// forward-reference diagnostics inside the preamble file still fire.
     contribution_symbol_names: HashSet<Arc<str>>,
 }
 
@@ -12328,6 +12467,83 @@ outside_var <- 2"#;
             "Should have one PackageLoad event"
         );
         assert_eq!(package_load_events[0], "dplyr");
+    }
+
+    /// zeallot's `%<-%` destructures the RHS into the bare symbols of its LHS:
+    /// a bare-symbol LHS or every bare symbol inside a (possibly nested)
+    /// `c(...)` LHS. The bindings take effect from the statement onward, like
+    /// `<-` with a non-function RHS.
+    #[test]
+    fn test_zeallot_destructuring_defines_lhs_symbols_after_statement() {
+        let code = "c(a, c(b, d)) %<-% list(1, list(2, 3))\nprint(a)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let before = scope_at_position(&artifacts, 0, 0, false);
+        for name in ["a", "b", "d"] {
+            assert!(
+                !before.symbols.contains_key(name),
+                "`%<-%` must not bind `{name}` before the statement completes"
+            );
+        }
+
+        let after = scope_at_position(&artifacts, 1, 0, false);
+        for name in ["a", "b", "d"] {
+            assert!(
+                after.symbols.contains_key(name),
+                "`%<-%` must bind `{name}` from the statement onward"
+            );
+        }
+    }
+
+    /// `x %<-% value` with a bare-symbol LHS binds `x` like `<-`.
+    #[test]
+    fn test_zeallot_bare_symbol_lhs_defines_symbol() {
+        let code = "x %<-% list(1, 2)\nprint(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let after = scope_at_position(&artifacts, 1, 0, false);
+        assert!(
+            after.symbols.contains_key("x"),
+            "`x %<-% value` must bind `x` from the statement onward"
+        );
+    }
+
+    /// rlang's `%<~%` creates a delayed binding for a bare-symbol LHS only.
+    #[test]
+    fn test_rlang_delayed_binding_defines_bare_symbol_lhs() {
+        let code = "x %<~% compute_thing()\nc(p, q) %<~% list(1, 2)\nprint(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let after = scope_at_position(&artifacts, 2, 0, false);
+        assert!(
+            after.symbols.contains_key("x"),
+            "`x %<~% value` must bind `x` from the statement onward"
+        );
+        for name in ["p", "q"] {
+            assert!(
+                !after.symbols.contains_key(name),
+                "`%<~%` only binds a bare-symbol LHS; `{name}` must not be bound"
+            );
+        }
+    }
+
+    /// An unrelated custom `%foo%` operator must not create bindings.
+    #[test]
+    fn test_custom_special_operator_does_not_define_symbols() {
+        let code = "x %foo% 1\nc(p, q) %bar% list(1, 2)\nprint(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let after = scope_at_position(&artifacts, 2, 0, false);
+        for name in ["x", "p", "q"] {
+            assert!(
+                !after.symbols.contains_key(name),
+                "custom special operators must not bind `{name}`"
+            );
+        }
     }
 
     #[test]

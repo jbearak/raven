@@ -372,34 +372,30 @@ pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
     symbols
 }
 
-/// Returns `true` for testthat-recognized helper files: files under
-/// `tests/testthat/` whose basename starts with `"helper"` (case-insensitive
-/// match against testthat's own loader, which sources `^helper.*\\.[rR]$`
-/// before each test file). Helper top-level definitions are visible to peer
-/// files under `tests/testthat/`, but never propagate to `R/`. Setup files
-/// (`setup-*.R`) are not currently treated as helpers; if that scope expands,
-/// adjust here.
+/// Returns `true` for testthat-recognized test-preamble files: files under
+/// `tests/testthat/` whose basename starts with `"helper"` or `"setup"`
+/// (case-sensitive match against testthat's own loaders —
+/// `source_test_helpers` sources `^helper.*\\.[rR]$` and
+/// `source_test_setup` sources `^setup.*\\.[rR]$`, in that order, before any
+/// test file runs). Preamble top-level definitions are visible to peer files
+/// under `tests/testthat/`, but never propagate to `R/`.
 ///
-/// The caller is responsible for first confirming the file is under
-/// `tests/testthat/` (e.g. via `is_r_source_path` returning `RFileKind::Test`);
-/// this function only inspects the basename.
-pub fn is_test_helper_filename(file_name: &str) -> bool {
-    // Case-insensitive ASCII "helper" prefix. Slicing by raw byte index
-    // would panic when byte 6 lands inside a multi-byte UTF-8 sequence
-    // (e.g. `tes\u{00E9}.R`), so iterate `bytes()` and compare against
-    // the ASCII prefix instead. Filenames are not normalized by Raven —
-    // a leading non-ASCII glyph that happens to lowercase to "helper" is
-    // intentionally not matched; testthat's loader matches the ASCII
-    // pattern `^helper.*\.[rR]$`.
-    const PREFIX: &[u8] = b"helper";
-    let bytes = file_name.as_bytes();
-    if bytes.len() < PREFIX.len() {
+/// Teardown files (`teardown*.R`) are deliberately NOT matched: testthat
+/// sources them only AFTER all tests finish, so their bindings are never
+/// visible to test code.
+///
+/// The caller is responsible for first confirming the file is a **direct
+/// child of `tests/testthat/`** (e.g. `path.parent() == <root>/tests/testthat`,
+/// as `derive.rs` does). `is_r_source_path` returning `RFileKind::Test` is NOT
+/// a sufficient gate — it also matches `tests/testit/` and plain `tests/*.R`
+/// files, where testthat's helper/setup sourcing semantics do not apply. This
+/// function only inspects the basename.
+pub fn is_test_preamble_filename(file_name: &str) -> bool {
+    // Prefix is case-sensitive to match testthat's regexes
+    // `^helper.*\.[rR]$` / `^setup.*\.[rR]$`; only the extension accepts
+    // either `R` or `r`.
+    if !file_name.starts_with("helper") && !file_name.starts_with("setup") {
         return false;
-    }
-    for (i, p) in PREFIX.iter().enumerate() {
-        if !bytes[i].eq_ignore_ascii_case(p) {
-            return false;
-        }
     }
     matches!(
         Path::new(file_name).extension().and_then(|e| e.to_str()),
@@ -482,26 +478,52 @@ mod path_tests {
 
     #[test]
     fn test_helper_filename_recognizes_helper_prefix() {
-        assert!(is_test_helper_filename("helper.R"));
-        assert!(is_test_helper_filename("helper-utils.R"));
-        assert!(is_test_helper_filename("helper_utils.R"));
-        assert!(is_test_helper_filename("helper.r"));
-        assert!(is_test_helper_filename("Helper-mixedCase.R"));
-        assert!(is_test_helper_filename("HELPER-shouty.R"));
+        assert!(is_test_preamble_filename("helper.R"));
+        assert!(is_test_preamble_filename("helper-utils.R"));
+        assert!(is_test_preamble_filename("helper_utils.R"));
+        assert!(is_test_preamble_filename("helper.r"));
+    }
+
+    /// testthat also sources `setup*.R` files (`^setup.*\.[rR]$`) before any
+    /// test runs, so their top-level bindings are visible to test files
+    /// exactly like helper defs. Real-world FP this guards against:
+    /// googledrive's `tests/testthat/setup-testing.R` defines
+    /// `CLEAN <- SETUP <- FALSE`, referenced by 17 `test-*.R` files.
+    #[test]
+    fn test_preamble_filename_recognizes_setup_prefix() {
+        assert!(is_test_preamble_filename("setup.R"));
+        assert!(is_test_preamble_filename("setup-testing.R"));
+        assert!(is_test_preamble_filename("setup_db.R"));
+        assert!(is_test_preamble_filename("setup.r"));
+        // testthat's pattern is `^setup.*` — any "setup" prefix matches,
+        // even without a separator.
+        assert!(is_test_preamble_filename("setupx.R"));
     }
 
     #[test]
     fn test_helper_filename_rejects_non_helpers() {
-        assert!(!is_test_helper_filename("test-utils.R"));
-        assert!(!is_test_helper_filename("setup.R"));
-        assert!(!is_test_helper_filename("teardown.R"));
+        assert!(!is_test_preamble_filename("test-utils.R"));
+        // testthat's loader regex is case-sensitive for the prefix:
+        // `^helper.*\.[Rr]$` / `^setup.*\.[Rr]$`.
+        assert!(!is_test_preamble_filename("Helper-mixedCase.R"));
+        assert!(!is_test_preamble_filename("HELPER-shouty.R"));
+        assert!(!is_test_preamble_filename("Setup-mixedCase.R"));
+        assert!(!is_test_preamble_filename("SETUP-x.r"));
+        // Teardown files run AFTER the tests — their bindings are never
+        // visible to test code, so they must NOT be treated as preamble.
+        assert!(!is_test_preamble_filename("teardown.R"));
+        assert!(!is_test_preamble_filename("teardown-db.R"));
         // Prefix matches but extension is not R.
-        assert!(!is_test_helper_filename("helper-data.csv"));
-        assert!(!is_test_helper_filename("helper.txt"));
-        // Too short to start with "helper".
-        assert!(!is_test_helper_filename("help.R"));
-        // Doesn't start with the helper prefix.
-        assert!(!is_test_helper_filename("my-helper.R"));
+        assert!(!is_test_preamble_filename("helper-data.csv"));
+        assert!(!is_test_preamble_filename("helper.txt"));
+        assert!(!is_test_preamble_filename("setup-data.csv"));
+        assert!(!is_test_preamble_filename("setup.txt"));
+        // Too short to start with "helper" / "setup".
+        assert!(!is_test_preamble_filename("help.R"));
+        assert!(!is_test_preamble_filename("setu.R"));
+        // Doesn't start with either prefix.
+        assert!(!is_test_preamble_filename("my-helper.R"));
+        assert!(!is_test_preamble_filename("my-setup.R"));
     }
 
     /// Regression: byte-indexed slicing of a multi-byte UTF-8 filename
@@ -517,11 +539,15 @@ mod path_tests {
         // implementation must not panic and must not match (prefix bytes
         // 0..6 are "hel" + 3 bytes of emoji, which do not equal "helper").
         let name = "hel\u{1F600}.R";
-        assert!(!is_test_helper_filename(name));
+        assert!(!is_test_preamble_filename(name));
         // A purely non-ASCII prefix must not match (and must not panic).
-        assert!(!is_test_helper_filename("βλέπω-utils.R"));
+        assert!(!is_test_preamble_filename("βλέπω-utils.R"));
         // A non-ASCII-leading name that happens to share a tail must not match either.
-        assert!(!is_test_helper_filename("éhelper.R"));
+        assert!(!is_test_preamble_filename("éhelper.R"));
+        // Same guarantees for the "setup" prefix: byte index 5 falls inside
+        // the emoji, and a non-ASCII-leading tail match must not count.
+        assert!(!is_test_preamble_filename("set\u{1F600}.R"));
+        assert!(!is_test_preamble_filename("ésetup.R"));
     }
 
     #[test]
@@ -714,16 +740,17 @@ pub struct PackageScopeContribution {
     /// to `tests/testthat/` only.
     pub test_attached_packages: Arc<BTreeSet<String>>,
 
-    /// Top-level definitions contributed by `tests/testthat/helper-*.R`
-    /// files, keyed by the helper file's path so the scope-injection layer
-    /// can skip a helper's own definitions when querying that helper file
-    /// (otherwise a `use_x()` line earlier in the helper would falsely see
-    /// `x <- ...` defined later in the same file).
+    /// Top-level definitions contributed by testthat preamble files —
+    /// `tests/testthat/helper*.R` and `setup*.R` (see
+    /// [`is_test_preamble_filename`]) — keyed by the preamble file's path so
+    /// the scope-injection layer can skip a preamble file's own definitions
+    /// when querying that file (otherwise a `use_x()` line earlier in the
+    /// file would falsely see `x <- ...` defined later in the same file).
     ///
-    /// Visible from any file under `<root>/tests/testthat/` — peer helpers
-    /// see each other and `test-*.R` files see them all. Never injected
-    /// into files under `R/`. Mirrors `r_internal_symbols` but with the
-    /// opposite visibility direction.
+    /// Visible from any file under `<root>/tests/testthat/` — peer preamble
+    /// files see earlier-sourced ones and `test-*.R` files see them all.
+    /// Never injected into files under `R/`. Mirrors `r_internal_symbols`
+    /// but with the opposite visibility direction.
     ///
     /// `BTreeMap` ordering is intentional — derive iteration is
     /// deterministic so cached `PackageState` equality (used by the

@@ -614,16 +614,36 @@ async fn maybe_init_r(
 /// chunk `library()` call warms its package's exports too — without this the
 /// undefined-variable check would conservatively suppress bare calls to an
 /// installed-but-uncached package attached only inside a chunk, under-reporting
-/// relative to the editor. Cross-file *inherited* packages (attached in a
-/// `source()`d file) and packages of non-chunk targets the scan did not index
-/// are not prefetched here, so calls relying on those stay conservatively
-/// suppressed — a narrower gap than before, noted in `docs/cli.md`. No-op when
-/// the library isn't ready (e.g. R absent with no configured library paths).
+/// relative to the editor.
+///
+/// In package mode, also covers NAMESPACE whole-package `import(pkg)`
+/// directives (`scope_contribution.full_imports`). The undefined-variable
+/// check resolves both call- and value-position uses of a full import's
+/// exports via `is_package_export`, which needs the cache warm; without this
+/// the "pending" heuristic suppresses only call-position uses, so
+/// value-position references (default args, bare identifiers) would emit
+/// false "Undefined variable" diagnostics — an asymmetry the editor avoids.
+///
+/// Cross-file *inherited* packages (attached in a `source()`d file) and
+/// packages of non-chunk targets the scan did not index are not prefetched
+/// here, so calls relying on those stay conservatively suppressed — a narrower
+/// gap than before, noted in `docs/cli.md`. No-op when the library isn't ready
+/// (e.g. R absent with no configured library paths).
 async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &[PathBuf]) {
     if !state.package_library_ready {
         return;
     }
     let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Package mode: NAMESPACE `import(pkg)` puts every export of `pkg` in
+    // scope for the package's own R files, so warm those exports too.
+    packages.extend(
+        state
+            .package_state
+            .scope_contribution()
+            .full_imports
+            .iter()
+            .cloned(),
+    );
     for path in targets {
         let Ok(uri) = Url::from_file_path(path) else {
             continue;
@@ -1493,6 +1513,73 @@ mod tests {
             report_uninstalled: false,
         };
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn namespace_full_import_export_resolves_in_value_position() {
+        // Regression: in package mode, NAMESPACE `import(pkg)` whole-package
+        // imports (`scope_contribution.full_imports`) must have their exports
+        // prefetched just like per-file `library()` attaches. Without the
+        // warm-up, call-position uses of an installed-but-uncached full
+        // import are suppressed by the "pending" heuristic, but
+        // value-position references (default args, bare identifiers) emit
+        // false "Undefined variable" diagnostics — an asymmetry the editor
+        // does not have once its cache is warm.
+        //
+        // R-free: a fake installed package (static NAMESPACE parse) made
+        // `Ready` via `additionalLibraryPaths`, mirroring
+        // `reports_undefined_symbol_from_attached_package`.
+        let workspace = TempDir::new().unwrap();
+        let libdir = TempDir::new().unwrap();
+        let pkgdir = libdir.path().join("fakepkg");
+        fs::create_dir_all(&pkgdir).unwrap();
+        fs::write(
+            pkgdir.join("DESCRIPTION"),
+            "Package: fakepkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        fs::write(pkgdir.join("NAMESPACE"), "export(real_export)\n").unwrap();
+
+        // The workspace itself is a package whose NAMESPACE fully imports
+        // fakepkg; R/uses.R references the export in VALUE position only.
+        fs::write(
+            workspace.path().join("DESCRIPTION"),
+            "Package: testpkg\nVersion: 1.0\nImports: fakepkg\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("NAMESPACE"), "import(fakepkg)\n").unwrap();
+        fs::create_dir_all(workspace.path().join("R")).unwrap();
+        fs::write(
+            workspace.path().join("R").join("uses.R"),
+            "f <- function(x, .p = real_export) {\n  identical(x, real_export)\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            format!(
+                "[packages]\nadditionalLibraryPaths = [\"{}\"]\n",
+                libdir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let args = CheckArgs {
+            paths: Vec::new(),
+            workspace: Some(workspace.path().to_path_buf()),
+            config_path: None,
+            no_config: false,
+            format: OutputFormat::Json,
+            max_severity: SeverityLevel::Info,
+            quiet: true,
+            color: ColorChoice::Never,
+            report_uninstalled: false,
+        };
+        assert_eq!(
+            run_blocking(args),
+            EXIT_OK,
+            "value-position references to a NAMESPACE full import must resolve \
+             once its exports are prefetched"
+        );
     }
 
     #[test]

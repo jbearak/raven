@@ -744,28 +744,6 @@ start_character = 64
 end_line = 991
 end_character = 67
 [[diagnostic]]
-package = "dbplyr"
-path = "R/verb-pivot-wider.R"
-message = "Undefined variable: error_call"
-evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
-
-[diagnostic.range]
-start_line = 364
-start_character = 17
-end_line = 364
-end_character = 27
-[[diagnostic]]
-package = "dbplyr"
-path = "R/verb-pivot-wider.R"
-message = "Undefined variable: error_call"
-evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
-
-[diagnostic.range]
-start_line = 371
-start_character = 17
-end_line = 371
-end_character = 27
-[[diagnostic]]
 package = "survival"
 path = "R/points.survfit.R"
 message = "Undefined variable: cumprob"
@@ -864,3 +842,355 @@ start_line = 181
 start_character = 46
 end_line = 181
 end_character = 47
+[[diagnostic]]
+package = "broom"
+path = "R/margins.R"
+message = "Undefined variable: ."
+evidence = "In tidy.margins (R/margins.R lines 82-106), `ret <- { tryCatch(pivot_longer(ret, ...), error = function(e) { mutate(., ...) |> pivot_longer(...) }) }` \u2014 the block is NOT piped into (no %>% anywhere in margins.R; the success branch already uses `ret` explicitly), so `.` inside the error handler is unbound; if pivot_longer ever errors, the handler fails with \"object '.' not found\". Leftover from a magrittr-block-to-native-pipe refactor. Belongs in the accepted-real fixture."
+
+[diagnostic.range]
+start_line = 92
+start_character = 14
+end_line = 92
+end_character = 15
+[[diagnostic]]
+package = "cli"
+path = "tests/testthat/progresstest/R/test.R"
+message = "Undefined variable: test2"
+evidence = "test2() at tests/testthat/progresstest/R/test.R:38 has no definition anywhere: the C routine test2 (src/test.c:94) is exposed only as the prefixed object c_test2 (NAMESPACE: useDynLib(progresstest, .registration=TRUE, .fixes=\"c_\")), and no R-level test2 exists in the fixture or its Imports (only cli); calling test3() errors 'could not find function \"test2\"'"
+
+[diagnostic.range]
+start_line = 37
+start_character = 2
+end_line = 37
+end_character = 7
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 15
+start_character = 0
+end_line = 15
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 19
+start_character = 0
+end_line = 19
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 22
+start_character = 0
+end_line = 22
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 26
+start_character = 0
+end_line = 26
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 29
+start_character = 0
+end_line = 29
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 33
+start_character = 0
+end_line = 33
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Missing opening `(`"
+evidence = "Line 34 ends with `])` with no matching `(`; structurally identical sibling data.table one-liners at lines 20, 55, 64, 71, 78 end with bare `]`, so the extra `)` is an accidental leftover (likely from a deleted bench::mark() wrapper); the file fails to parse."
+
+[diagnostic.range]
+start_line = 33
+start_character = 46
+end_line = 33
+end_character = 47
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 36
+start_character = 0
+end_line = 36
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 40
+start_character = 0
+end_line = 40
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Missing opening `(`"
+evidence = "Line 41 ends with `])` with no matching `(`; structurally identical sibling data.table one-liners at lines 20, 55, 64, 71, 78 end with bare `]`, so the extra `)` is an accidental leftover (likely from a deleted bench::mark() wrapper); the file fails to parse."
+
+[diagnostic.range]
+start_line = 40
+start_character = 45
+end_line = 40
+end_character = 46
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 43
+start_character = 0
+end_line = 43
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 47
+start_character = 0
+end_line = 47
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Missing opening `(`"
+evidence = "Line 48 ends with `])` with no matching `(`; structurally identical sibling data.table one-liners at lines 20, 55, 64, 71, 78 end with bare `]`, so the extra `)` is an accidental leftover (likely from a deleted bench::mark() wrapper); the file fails to parse."
+
+[diagnostic.range]
+start_line = 47
+start_character = 59
+end_line = 47
+end_character = 60
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 50
+start_character = 0
+end_line = 50
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 54
+start_character = 0
+end_line = 54
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 57
+start_character = 0
+end_line = 57
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 63
+start_character = 0
+end_line = 63
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 66
+start_character = 0
+end_line = 66
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 70
+start_character = 0
+end_line = 70
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DF"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
+
+[diagnostic.range]
+start_line = 73
+start_character = 0
+end_line = 73
+end_character = 2
+[[diagnostic]]
+package = "dtplyr"
+path = "vignettes/benchmark.R"
+message = "Undefined variable: DT"
+evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
+
+[diagnostic.range]
+start_line = 77
+start_character = 0
+end_line = 77
+end_character = 2
+[[diagnostic]]
+package = "ggplot2"
+path = "icons/icons.R"
+message = "Undefined variable: g (defined later on line 521)"
+evidence = "g is used at line 516 inside write_icon(\"scale_colour_viridis_d\", {...}) (lines 512-518) but the only assignments to g are at lines 521 and 531, inside LATER write_icon blocks; write_icon forces its `code` promise immediately via grid.draw, so a fresh top-to-bottom run errors with \"object 'g' not found\" at this block \u2014 it is also missing the `g <- scale_fill_viridis_d(); g$train(1:5)` setup its siblings have"
+
+[diagnostic.range]
+start_line = 515
+start_character = 21
+end_line = 515
+end_character = 22
+[[diagnostic]]
+package = "googledrive"
+path = "data-raw/old/discovery-doc-prep.R"
+message = "Undefined variable: ."
+evidence = "Pipe chain at lines 13-18 uses the native |> operator, which has no `.` placeholder; `.` in find_package_root_file(\"data-raw\", .) at line 18 is an ordinary unbound symbol and the branch errors with 'object \".\" not found' at runtime"
+
+[diagnostic.range]
+start_line = 17
+start_character = 39
+end_line = 17
+end_character = 40
+[[diagnostic]]
+package = "googledrive"
+path = "internal/old/04_map_demo.Rmd"
+message = "Undefined variable: drive_file"
+evidence = "drive_file is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
+
+[diagnostic.range]
+start_line = 20
+start_character = 13
+end_line = 20
+end_character = 23
+[[diagnostic]]
+package = "googledrive"
+path = "internal/old/04_map_demo.Rmd"
+message = "Undefined variable: drive_delete"
+evidence = "drive_delete is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
+
+[diagnostic.range]
+start_line = 38
+start_character = 13
+end_line = 38
+end_character = 25
+[[diagnostic]]
+package = "googledrive"
+path = "internal/old/06_dots_demo.Rmd"
+message = "Undefined variable: drive_file"
+evidence = "drive_file is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
+
+[diagnostic.range]
+start_line = 46
+start_character = 2
+end_line = 46
+end_character = 12
+[[diagnostic]]
+package = "googledrive"
+path = "internal/old/06_dots_demo.Rmd"
+message = "Undefined variable: drive_file"
+evidence = "drive_file is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
+
+[diagnostic.range]
+start_line = 80
+start_character = 2
+end_line = 80
+end_character = 12
+[[diagnostic]]
+package = "pillar"
+path = "revdep/drake-deps.R"
+message = "Undefined variable: plan_deps"
+evidence = "revdep/drake-deps.R sources only revdep/drake-base.R, where plan_deps exists solely as a local inside get_plan_deps() (drake-base.R lines 30 and 43) and is never assigned at top level; drake::make() evaluates its plan argument normally, so the script fails at runtime with \"object 'plan_deps' not found\" (revdep/drake.R line 102 assigns plan_deps only inside another function and is not sourced here)"
+
+[diagnostic.range]
+start_line = 2
+start_character = 12
+end_line = 2
+end_character = 21
+[[diagnostic]]
+package = "rvest"
+path = "data-raw/keydef.R"
+message = "Undefined variable: keydef"
+evidence = "`keydef` is created only inside the V8 JavaScript context (ct$eval of the string \"keydef = {...}\" at lines 9-10); the R-level binding is `keydefs <- ct$get(\"keydef\")` at line 11. `tibble::enframe(keydef)` at line 15 would error at runtime with object 'keydef' not found \u2014 should be `keydefs`. Belongs in the accepted-real fixture."
+
+[diagnostic.range]
+start_line = 14
+start_character = 16
+end_line = 14
+end_character = 22
+[[diagnostic]]
+package = "rvest"
+path = "demo/tripadvisor.R"
+message = "Undefined variable: ."
+evidence = "The demo uses the native |> pipe exclusively (zero %>% in the file). Line 23 `html_attr(\"alt\") |> gsub(\" of 5 stars\", \"\", .)` desugars to gsub(lhs, \" of 5 stars\", \"\", .): the native pipe has no dot placeholder, so `.` is unbound and the call errors with object '.' not found (and the argument order is wrong besides). Belongs in the accepted-real fixture."
+
+[diagnostic.range]
+start_line = 22
+start_character = 26
+end_line = 22
+end_character = 27

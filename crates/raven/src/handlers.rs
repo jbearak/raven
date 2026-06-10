@@ -5685,6 +5685,8 @@ fn collect_undefined_variables_from_snapshot(
     };
 
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
+    let random_seed_initializer_end_offsets =
+        collect_random_seed_initializer_end_offsets(node, text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
     let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> =
@@ -5874,6 +5876,14 @@ fn collect_undefined_variables_from_snapshot(
             continue;
         }
         if is_implicit_search_path_binding(&name) {
+            continue;
+        }
+        if name == ".Random.seed"
+            && has_prior_token_end(
+                &random_seed_initializer_end_offsets,
+                usage_node.start_byte(),
+            )
+        {
             continue;
         }
         if is_s3_method_special_variable_usage(usage_node, text, &name) {
@@ -6188,6 +6198,70 @@ fn assignment_target_node(binop: Node) -> Option<Node> {
         "<-" | "=" | "<<-" => binop.child_by_field_name("lhs"),
         "->" | "->>" => binop.child_by_field_name("rhs"),
         _ => None,
+    }
+}
+
+/// Returns true when `node` is a binding target of zeallot's `%<-%` or rlang's
+/// `%<~%`: the bare-symbol LHS of either operator, or — for `%<-%` only — a
+/// bare symbol inside the (possibly nested) `c(...)` LHS of the operator.
+///
+/// These positions bind names rather than reference them; the scope walker
+/// records the matching definitions (see `try_extract_destructuring_assignment`
+/// in `cross_file::scope`), so the undefined-variable usage collector must skip
+/// them exactly like `<-` assignment targets. This lives next to — rather than
+/// inside — `is_assignment_target` because telling `%<-%` apart from an
+/// arbitrary `%foo%` operator requires the source text, which
+/// `is_structural_non_reference`'s signature does not carry.
+fn is_destructuring_assignment_target(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+
+    // Climb from the identifier through nested `c(...)` argument positions to
+    // the binary operator. Only unnamed argument values count: `c(a = x)`
+    // names a list element, it does not bind `a`.
+    let mut current = node;
+    loop {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            "binary_operator" => {
+                if parent.child_by_field_name("lhs").map(|lhs| lhs.id()) != Some(current.id()) {
+                    return false;
+                }
+                let Some(op) = parent.child_by_field_name("operator") else {
+                    return false;
+                };
+                return match node_text(op, text) {
+                    // `%<-%` binds the bare LHS symbol or any bare symbol in
+                    // the (possibly nested) `c(...)` LHS we climbed through.
+                    "%<-%" => true,
+                    // `%<~%` binds a bare-symbol LHS only — no destructuring.
+                    "%<~%" => current.id() == node.id(),
+                    _ => false,
+                };
+            }
+            "argument" => {
+                if parent.child_by_field_name("name").is_some()
+                    || parent.child_by_field_name("value").map(|v| v.id()) != Some(current.id())
+                {
+                    return false;
+                }
+                let Some(args) = parent.parent().filter(|p| p.kind() == "arguments") else {
+                    return false;
+                };
+                let Some(call) = args.parent().filter(|p| p.kind() == "call") else {
+                    return false;
+                };
+                if call
+                    .child_by_field_name("function")
+                    .is_none_or(|f| node_text(f, text) != "c")
+                {
+                    return false;
+                }
+                current = call;
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -12320,11 +12394,47 @@ fn collect_package_loader_call_end_offsets(text: &str) -> Vec<usize> {
     end_offsets
 }
 
+/// Pre-compute end byte offsets for calls that materialize `.Random.seed`.
+///
+/// Walks parsed `call` nodes (rather than scanning raw text) whose callee is
+/// `set.seed` or `base::set.seed`, recording the callee's end byte offset. The
+/// callee end is the latest offset guaranteed to precede the `(`, which keeps
+/// the consumer's "initializer token ends before the usage starts" semantics
+/// (`has_prior_token_end` against `usage_node.start_byte()`).
+///
+/// Because it consults the parse tree, a `set.seed(` appearing inside a comment
+/// or string literal is excluded by construction: such text is never a `call`
+/// node, so it cannot count as an initializer (review feedback P2).
+fn collect_random_seed_initializer_end_offsets(node: Node, text: &str) -> Vec<usize> {
+    let mut end_offsets: Vec<usize> = Vec::new();
+    let mut cursor = node.walk();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call"
+            && let Some(func) = current.child_by_field_name("function")
+        {
+            let callee = node_text(func, text);
+            if callee == "set.seed" || callee == "base::set.seed" {
+                end_offsets.push(func.end_byte());
+            }
+        }
+        stack.extend(current.children(&mut cursor));
+    }
+    end_offsets.sort_unstable();
+    end_offsets.dedup();
+    end_offsets
+}
+
 /// Returns true when there is a package loader token fully before `byte_limit`.
 fn has_prior_package_loader_call(call_end_offsets: &[usize], byte_limit: usize) -> bool {
     // Match original semantics of `&text[..byte_limit].contains(...)`:
     // a match counts only when the full token is inside the prefix.
-    call_end_offsets.partition_point(|&end| end <= byte_limit) > 0
+    has_prior_token_end(call_end_offsets, byte_limit)
+}
+
+/// Returns true when any token end offset is fully before `byte_limit`.
+fn has_prior_token_end(token_end_offsets: &[usize], byte_limit: usize) -> bool {
+    token_end_offsets.partition_point(|&end| end <= byte_limit) > 0
 }
 
 /// Memoized `package_exists()` lookup. `HashMap::entry` would force an
@@ -13286,6 +13396,11 @@ fn collect_usages_with_analysis<'a>(
         if is_structural_non_reference(node) {
             return;
         }
+        // zeallot `%<-%` / rlang `%<~%` binding targets — text-dependent, so
+        // checked alongside (not inside) `is_structural_non_reference`.
+        if is_destructuring_assignment_target(node, text) {
+            return;
+        }
         if references_formal_from_default_expression(node, text) {
             return;
         }
@@ -13690,12 +13805,20 @@ fn is_r6_method_special_variable_usage(
     false
 }
 
-/// Returns true when `function` is a value inside a `public=list(...)`,
-/// `private=list(...)`, or `active=list(...)` argument of an `R6Class(...)`
-/// or `R6::R6Class(...)` call.
+/// Returns true when `function` is a value inside a member `list(...)` argument
+/// of an `R6Class(...)` or `R6::R6Class(...)` call. Two argument shapes count:
+///
+/// - the value of a named `public=list(...)`, `private=list(...)`, or
+///   `active=list(...)` argument, or
+/// - an *unnamed* `list(...)` among the call's first four arguments —
+///   R6Class's signature is `R6Class(classname, public, private, active, ...)`,
+///   so the canonical positional form `R6::R6Class("Token", list(...))`
+///   (httr's Token, rvest) supplies member lists in argument positions 2–4.
 fn function_definition_is_r6_method(function: Node, text: &str) -> bool {
     // function_definition → argument(value) → arguments → call (the list() call)
-    // then: list() call → argument(name=public|private|active, value) → arguments → call (R6Class)
+    // then: list() call → argument → arguments → call (R6Class), where the
+    // argument is either named public/private/active or unnamed among the
+    // first four.
     let Some(list_arg) = containing_argument_value(function) else {
         return false;
     };
@@ -13712,18 +13835,11 @@ fn function_definition_is_r6_method(function: Node, text: &str) -> bool {
     {
         return false;
     }
-    // The list() call must be the value of a named argument (public/private/active)
+    // The list() call must itself be an argument of an R6Class(...) /
+    // R6::R6Class(...) call.
     let Some(r6_arg) = list_call.parent().filter(|p| p.kind() == "argument") else {
         return false;
     };
-    let Some(arg_name_node) = r6_arg.child_by_field_name("name") else {
-        return false;
-    };
-    let arg_name = node_text(arg_name_node, text);
-    if !matches!(arg_name, "public" | "private" | "active") {
-        return false;
-    }
-    // The named argument must be inside an R6Class(...) / R6::R6Class(...) call
     let Some(r6_args) = r6_arg.parent().filter(|p| p.kind() == "arguments") else {
         return false;
     };
@@ -13734,7 +13850,28 @@ fn function_definition_is_r6_method(function: Node, text: &str) -> bool {
         return false;
     };
     let func_text = node_text(r6_func, text);
-    func_text == "R6Class" || func_text == "R6::R6Class"
+    if func_text != "R6Class" && func_text != "R6::R6Class" {
+        return false;
+    }
+    match r6_arg.child_by_field_name("name") {
+        // Named argument: must be one of the member-list parameters.
+        Some(arg_name_node) => {
+            matches!(
+                node_text(arg_name_node, text),
+                "public" | "private" | "active"
+            )
+        }
+        // Unnamed argument: positional member list when it sits among the
+        // first four arguments (classname, public, private, active).
+        None => {
+            let mut cursor = r6_args.walk();
+            r6_args
+                .children(&mut cursor)
+                .filter(|c| c.kind() == "argument")
+                .position(|c| c.id() == r6_arg.id())
+                .is_some_and(|idx| idx < 4)
+        }
+    }
 }
 
 /// the dispatcher injects.
@@ -22643,6 +22780,304 @@ clean_data <- function(x) {
         );
     }
 
+    /// `.Random.seed` is base R's documented RNG-state global, materialized in
+    /// the workspace by `set.seed()`, so reading it after `set.seed()` must not
+    /// flag as undefined.
+    #[test]
+    fn test_diagnostic_suppresses_random_seed_after_set_seed() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "set.seed(42)\ns <- .Random.seed\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains(".Random.seed")),
+            "`.Random.seed` after set.seed() must be treated as initialized; messages: {messages:?}"
+        );
+    }
+
+    /// `.Random.seed` is not present at R startup; it is created only after
+    /// `set.seed()` here. A read before such a point must still be diagnosed
+    /// as undefined.
+    #[test]
+    fn test_diagnostic_reports_random_seed_before_initializer() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "s <- .Random.seed\nset.seed(42)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: .Random.seed"),
+            "`.Random.seed` before set.seed() must be reported; messages: {messages:?}"
+        );
+    }
+
+    /// A `set.seed(` that appears only inside a comment is not a real
+    /// initializer call, so a later `.Random.seed` read must still flag.
+    /// Guards against the raw-substring scan counting commented text.
+    #[test]
+    fn test_diagnostic_reports_random_seed_after_commented_set_seed() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "# set.seed(1)\ns <- .Random.seed\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: .Random.seed"),
+            "a commented-out `set.seed(` must not suppress `.Random.seed`; messages: {messages:?}"
+        );
+    }
+
+    /// A `set.seed(` that appears only inside a string literal is not a real
+    /// initializer call, so a later `.Random.seed` read must still flag.
+    #[test]
+    fn test_diagnostic_reports_random_seed_after_stringified_set_seed() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "x <- \"set.seed(1)\"\ns <- .Random.seed\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: .Random.seed"),
+            "a stringified `set.seed(` must not suppress `.Random.seed`; messages: {messages:?}"
+        );
+    }
+
+    /// A namespaced `base::set.seed()` call is a real initializer, so a later
+    /// `.Random.seed` read must be suppressed just like the bare form.
+    #[test]
+    fn test_diagnostic_suppresses_random_seed_after_namespaced_set_seed() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "base::set.seed(42)\ns <- .Random.seed\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains(".Random.seed")),
+            "`.Random.seed` after base::set.seed() must be treated as initialized; messages: {messages:?}"
+        );
+    }
+
+    /// zeallot's `%<-%` destructures into the bare symbols of its LHS —
+    /// `c(a, b) %<-% list(1, 2)` defines `a` and `b` (nested `c(...)` included)
+    /// — so later uses must not flag as undefined. The LHS symbols themselves
+    /// are binding targets, not references.
+    #[test]
+    fn test_diagnostic_zeallot_destructuring_defines_lhs_symbols() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "c(a, c(b, d)) %<-% list(1, list(2, 3))\nx %<-% list(4, 5)\nprint(a)\nprint(b)\nprint(d)\nprint(x)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        for name in ["a", "b", "d", "x"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m.starts_with(&format!("Undefined variable: {name}"))),
+                "`%<-%` must define `{name}`; messages: {messages:?}"
+            );
+        }
+    }
+
+    /// rlang's `%<~%` (delayed binding) defines its bare-symbol LHS, so later
+    /// uses must not flag as undefined.
+    #[test]
+    fn test_diagnostic_rlang_delayed_binding_defines_lhs_symbol() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code =
+            "error_call %<~% Sys.time()\nprint(error_call)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.starts_with("Undefined variable: error_call")),
+            "`%<~%` must define its bare-symbol LHS; messages: {messages:?}"
+        );
+    }
+
+    /// A use *before* the `%<-%` statement is still a forward reference and
+    /// must flag, exactly like `<-`.
+    #[test]
+    fn test_diagnostic_use_before_zeallot_binding_still_flags() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "print(a)\nc(a, b) %<-% list(1, 2)\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("Undefined variable: a")),
+            "use before the `%<-%` statement must still flag; messages: {messages:?}"
+        );
+    }
+
+    /// An unrelated custom `%foo%` operator must NOT create bindings; uses of
+    /// its LHS symbols remain undefined.
+    #[test]
+    fn test_diagnostic_custom_special_operator_does_not_bind() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "c(p, q) %foo% list(1, 2)\nprint(p)\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("Undefined variable: p")),
+            "`%foo%` must not bind `p`; messages: {messages:?}"
+        );
+    }
+
     /// R injects `.Generic`, `.Method`, and `.Class` into S3 method frames. They
     /// are not ordinary top-level variables, so `Ops.raster`-style method bodies
     /// must not report them as undefined.
@@ -23150,6 +23585,244 @@ y <- totally_undefined_baseline()
                 "R6 pronoun `{pronoun}` must not be flagged with bare R6Class. messages: {messages:?}",
             );
         }
+    }
+
+    /// R6Class's signature is `R6Class(classname, public, private, active, ...)`,
+    /// so an unnamed `list(...)` among the first four arguments is a member
+    /// list — the canonical positional form `R6::R6Class("Token", list(...))`
+    /// (httr's Token, rvest) must suppress the pronouns too.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_positional_member_list_namespaced() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"Token <- R6::R6Class("Token", list(
+  app = NULL,
+  initialize = function(app) {
+    self$app <- app
+    private$validate()
+  }
+))
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        for pronoun in ["self", "private"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                "R6 pronoun `{pronoun}` in positional member list must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// Positional member lists must also work with a bare `R6Class(...)` call.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_positional_member_list_bare() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"Token <- R6Class("Token", list(
+  field = NULL,
+  greet = function() {
+    self$field
+  }
+))
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: self"),
+            "R6 pronoun `self` in bare positional member list must not be flagged. messages: {messages:?}",
+        );
+    }
+
+    /// `self` in a method's *default argument* expression (httr's
+    /// `cache = function(path = self$cache_path)`) is still inside the member
+    /// list's containing-function walk and must be suppressed.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_pronoun_in_method_default_argument() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"Token <- R6::R6Class("Token", list(
+  cache_path = NULL,
+  cache = function(path = self$cache_path) {
+    path
+  }
+))
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: self"),
+            "R6 pronoun `self` in method default argument must not be flagged. messages: {messages:?}",
+        );
+    }
+
+    /// An unnamed `list(...)` passed to a call that is NOT `R6Class` must not
+    /// grant pronoun suppression: `self` inside it remains diagnosable.
+    #[tokio::test]
+    async fn test_positional_list_in_non_r6class_call_still_flags_self() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"Foo <- structure(list(
+  greet = function() {
+    self$name
+  }
+), class = "Foo")
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: self"),
+            "`self` in an unnamed list() passed to a non-R6Class call must still flag. messages: {messages:?}",
+        );
     }
 
     /// Reference Class method bodies run with injected method-frame helpers.
@@ -23725,6 +24398,159 @@ y <- totally_undefined_baseline()
                 .iter()
                 .any(|d| d.message == "Undefined variable: fixture"),
             "R/ files must not see test_helper_symbols — expected an \
+             undefined-variable diagnostic. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Build a `PackageState` by deriving from real inputs containing a
+    /// single `tests/testthat/setup-testing.R` defining
+    /// `CLEAN <- SETUP <- FALSE` (googledrive's real-world setup file).
+    /// Going through `derive_package_state` (instead of hand-building the
+    /// contribution like the helper tests above) exercises the
+    /// setup-filename recognition in `build_scope_contribution`.
+    fn package_state_with_setup_file() -> crate::package_state::PackageState {
+        use crate::cross_file::config::PackageMode;
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, PackageInputDelta, PackageInputs, PackageState,
+            RFileInput, RFileKind, derive_package_state,
+        };
+
+        let setup_text: std::sync::Arc<str> = "CLEAN <- SETUP <- FALSE\n".into();
+        let mut r_files = std::collections::BTreeMap::new();
+        r_files.insert(
+            std::path::PathBuf::from("/work/pkg/tests/testthat/setup-testing.R"),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: setup_text.clone(),
+                content_digest: ContentDigest::of(&setup_text),
+            },
+        );
+        let inputs = PackageInputs {
+            workspace_root: Some("/work/pkg".into()),
+            package_mode: PackageMode::Auto,
+            description: Some(DescriptionInput {
+                text: "Package: foo\n".into(),
+            }),
+            namespace: None,
+            r_files,
+            dataset_names: Default::default(),
+            sysdata_names: Default::default(),
+        };
+        derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        )
+    }
+
+    /// `setup*.R` parity with helpers: testthat sources setup files before
+    /// any test runs, so a setup-file top-level def must suppress
+    /// undefined-variable diagnostics in sibling test files. End-to-end:
+    /// derive → contribution → scope → diagnostics collector.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_setup_file_symbol_in_testthat_file() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state
+            .package_state
+            .set_from(package_state_with_setup_file());
+
+        let code = "x <- CLEAN\ny <- SETUP\n";
+        let uri = Url::parse("file:///work/pkg/tests/testthat/test-foo.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("Undefined variable:")),
+            "setup-file top-level defs must suppress undefined-variable for \
+             sibling test files. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Asymmetry guard: setup-file defs must NOT suppress undefined-variable
+    /// diagnostics for files under `R/` — same one-way visibility as helpers.
+    #[tokio::test]
+    // The test name embeds the literal `R/` package directory casing.
+    #[allow(non_snake_case)]
+    async fn test_diagnostic_does_not_suppress_setup_symbol_in_R_file() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state
+            .package_state
+            .set_from(package_state_with_setup_file());
+
+        let code = "x <- CLEAN\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: CLEAN"),
+            "R/ files must not see setup-file defs — expected an \
              undefined-variable diagnostic. messages: {:?}",
             diagnostics
                 .iter()
