@@ -1162,7 +1162,14 @@ impl WorldState {
 
         // Open-document pass. Runs AFTER the index pass so for a file present
         // in both stores the graph edges rebuilt here — from the buffer's
-        // (authoritative) metadata — win over the index-derived ones.
+        // (authoritative) metadata — win over the index-derived ones. The
+        // index pass above rebuilt edges for every URI in `changed_uris`, so
+        // an open buffer whose own resolution is UNCHANGED still needs its
+        // edges re-asserted when the index pass touched the same file (e.g.
+        // the buffer resolved at did_open while the scanned index entry was
+        // still unresolved) — otherwise the graph would keep the stale
+        // index-derived edges until the user edits the buffer.
+        let index_rebuilt: std::collections::HashSet<Url> = changed_uris.iter().cloned().collect();
         for uri in open_affected {
             let Some(doc) = self.document_store.get_without_touch(&uri) else {
                 continue;
@@ -1174,13 +1181,20 @@ impl WorldState {
                 ws_root.as_deref(),
                 &lib_paths,
             );
-            if new_sources == doc.metadata.sources {
+            let resolution_changed = new_sources != doc.metadata.sources;
+            let meta = if resolution_changed {
+                let mut new_meta = (*doc.metadata).clone();
+                new_meta.sources = new_sources;
+                let new_meta = Arc::new(new_meta);
+                self.document_store.replace_metadata(&uri, new_meta.clone());
+                new_meta
+            } else if index_rebuilt.contains(&uri) {
+                // Unchanged buffer, but the index pass overwrote this file's
+                // edges from index metadata — re-assert the buffer's.
+                doc.metadata.clone()
+            } else {
                 continue;
-            }
-            let mut new_meta = (*doc.metadata).clone();
-            new_meta.sources = new_sources;
-            let new_meta = Arc::new(new_meta);
-            self.document_store.replace_metadata(&uri, new_meta.clone());
+            };
             let get_content = |parent_uri: &Url| -> Option<String> {
                 self.workspace_index_new
                     .get(parent_uri)
@@ -1188,11 +1202,11 @@ impl WorldState {
             };
             self.cross_file_graph.update_file(
                 &uri,
-                new_meta.as_ref(),
+                meta.as_ref(),
                 workspace_root.as_ref(),
                 get_content,
             );
-            if !changed_uris.contains(&uri) {
+            if resolution_changed && !changed_uris.contains(&uri) {
                 changed_uris.push(uri);
             }
         }

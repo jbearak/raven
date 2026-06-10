@@ -528,6 +528,60 @@ mod lifecycle {
         );
     }
 
+    /// A file present in BOTH stores: the index pass may rebuild the graph
+    /// from stale index metadata (scanned before the package was installed,
+    /// source call at a different line than the edited buffer). Even when the
+    /// open buffer's own resolution is unchanged, the open-document pass must
+    /// re-assert buffer-derived graph edges — open documents are
+    /// authoritative.
+    #[tokio::test]
+    async fn open_buffer_graph_edges_win_over_index_rebuild_when_unchanged() {
+        let libdir = tempfile::tempdir().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        // Buffer has a comment line first → source call at line 1; the
+        // (stale) index entry has it at line 0.
+        let buffer_text = "# edited\nsource(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+
+        let mut state = state_with_lib(libdir.path());
+        state.document_store.open(uri.clone(), buffer_text, 1).await;
+
+        // First pass resolves the open buffer (did_open-time enrichment):
+        // edge from buffer metadata, call site at line 1.
+        state.resolve_system_file_in_workspace();
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&uri)
+                .iter()
+                .any(|e| e.call_site_line == Some(1)),
+            "precondition: buffer-derived edge at line 1"
+        );
+
+        // A stale scan result lands in the index: unresolved, source at line 0.
+        state
+            .workspace_index_new
+            .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
+
+        // Event pass: the index entry resolves (edge rebuild from index
+        // metadata, line 0); the buffer's resolution is unchanged, but its
+        // edges must still win.
+        state.resolve_system_file_in_workspace();
+        let deps = state.cross_file_graph.get_dependencies(&uri);
+        assert!(
+            deps.iter().any(|e| e.call_site_line == Some(1)),
+            "graph must reflect the authoritative open buffer (call site line 1), got {:?}",
+            deps.iter().map(|e| e.call_site_line).collect::<Vec<_>>()
+        );
+        assert!(
+            !deps.iter().any(|e| e.call_site_line == Some(0)),
+            "stale index-derived edge (line 0) must not survive the open-document pass"
+        );
+    }
+
     /// Open transitive dependents of a file whose system.file resolution
     /// changed must be in the republish set: file_b sources file_a, file_a's
     /// system.file edge forms after a package install — file_b's cross-file
