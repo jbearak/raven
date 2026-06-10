@@ -4585,9 +4585,12 @@ async fn collect_missing_file_diagnostics_standalone(
     let mut paths_to_check: Vec<(std::path::PathBuf, String, u32, u32, bool, bool)> = Vec::new();
 
     for source in &meta.sources {
-        // Sources with a pre-resolved URI (cross-package system.file) are
-        // intentionally outside the workspace — skip path diagnostics.
-        if source.resolved_uri.is_some() {
+        // system.file() sources never carry a literal path to diagnose: a
+        // resolved one points outside the workspace (skip), and an unresolved
+        // one (e.g. an uninstalled package, or branch-2 resolution deferred
+        // while lib_paths is empty) has an empty `path` and must degrade
+        // silently rather than emit a spurious "Cannot resolve path: ''".
+        if source.resolved_uri.is_some() || source.system_file.is_some() {
             continue;
         }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
@@ -4903,9 +4906,12 @@ fn collect_missing_file_diagnostics_from_snapshot(
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
 
     for source in &meta.sources {
-        // Sources with a pre-resolved URI (cross-package system.file) are
-        // intentionally outside the workspace — skip path diagnostics.
-        if source.resolved_uri.is_some() {
+        // system.file() sources never carry a literal path to diagnose: a
+        // resolved one points outside the workspace (skip), and an unresolved
+        // one (e.g. an uninstalled package, or branch-2 resolution deferred
+        // while lib_paths is empty) has an empty `path` and must degrade
+        // silently rather than emit a spurious "Cannot resolve path: ''".
+        if source.resolved_uri.is_some() || source.system_file.is_some() {
             continue;
         }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
@@ -11107,6 +11113,28 @@ mod semantic_warning_pipeline_tests {
             .insert(uri.clone(), Document::new(code, None));
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
         (snapshot, uri)
+    }
+
+    /// Regression: a cross-package `source(system.file(..., package = "p"))`
+    /// for an uninstalled package, resolved with empty `lib_paths` (e.g. a
+    /// headless `raven check` with no R), leaves the source entry deferred
+    /// (`system_file` Some, empty `path`). It must degrade silently rather than
+    /// emit a spurious `Cannot resolve path: ''`. `WorldState::new()` has an
+    /// empty package library, so this reproduces the deferred-retain state
+    /// deterministically without depending on a local R installation.
+    #[test]
+    fn unresolved_system_file_source_emits_no_cannot_resolve_path() {
+        let code = "source(system.file(\"scripts/setup.R\", package = \"otherpkg\"))\nx <- 1\n";
+        let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.starts_with("Cannot resolve path")),
+            "unresolved system.file() must not produce a path diagnostic; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     /// Build a snapshot for a `.Rmd` document with the opt-in lint master switch
