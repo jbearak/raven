@@ -1124,8 +1124,11 @@ impl WorldState {
         // Resolve into a cloned sources Vec; only a real change pays for the
         // full-metadata clone (`Arc::make_mut`), re-insertion, and the edge
         // rebuild below (resolution is idempotent, so unchanged entries need
-        // none of them).
+        // none of them). Previous targets of changed resolutions are
+        // collected so the cleanup below can drop external entries nothing
+        // references anymore.
         let mut changed_uris: Vec<Url> = Vec::new();
+        let mut old_targets: std::collections::HashSet<Url> = std::collections::HashSet::new();
         for (uri, mut entry) in affected {
             let mut new_sources = entry.metadata.sources.clone();
             crate::cross_file::resolve_system_file_source_entries(
@@ -1135,6 +1138,13 @@ impl WorldState {
                 &lib_paths,
             );
             if new_sources != entry.metadata.sources {
+                old_targets.extend(
+                    entry
+                        .metadata
+                        .sources
+                        .iter()
+                        .filter_map(|s| s.resolved_uri.clone()),
+                );
                 Arc::make_mut(&mut entry.metadata).sources = new_sources;
                 changed_uris.push(uri.clone());
                 self.workspace_index_new.insert(uri, entry);
@@ -1183,6 +1193,12 @@ impl WorldState {
             );
             let resolution_changed = new_sources != doc.metadata.sources;
             let meta = if resolution_changed {
+                old_targets.extend(
+                    doc.metadata
+                        .sources
+                        .iter()
+                        .filter_map(|s| s.resolved_uri.clone()),
+                );
                 let mut new_meta = (*doc.metadata).clone();
                 new_meta.sources = new_sources;
                 let new_meta = Arc::new(new_meta);
@@ -1215,7 +1231,75 @@ impl WorldState {
         // so their artifacts are available to scope resolution.
         self.index_cross_package_resolved_files();
 
+        // Drop external entries the changed resolutions no longer point at.
+        self.drop_orphaned_external_entries(old_targets);
+
         changed_uris
+    }
+
+    /// Drop outside-workspace index entries that were indexed as
+    /// cross-package `system.file()` targets (see
+    /// [`Self::index_cross_package_resolved_files`]) but lost their last
+    /// referencing resolution — without this, a cleared or re-targeted
+    /// `resolved_uri` leaves the previously indexed external file occupying
+    /// an LRU slot until natural eviction.
+    ///
+    /// `candidates` are the previous targets of resolutions that just
+    /// changed. A candidate is dropped only when it is (a) outside every
+    /// workspace folder — workspace files are owned by the workspace scan,
+    /// e.g. an renv library inside the project — (b) not an open document,
+    /// and (c) no longer referenced by any `resolved_uri` in the index or an
+    /// open buffer. The reference check is a full scan of sources, which is
+    /// acceptable because resolutions only change on rare package lifecycle
+    /// events.
+    fn drop_orphaned_external_entries(&mut self, candidates: std::collections::HashSet<Url>) {
+        if candidates.is_empty() {
+            return;
+        }
+        let workspace_dirs: Vec<std::path::PathBuf> = self
+            .workspace_folders
+            .iter()
+            .filter_map(|f| f.to_file_path().ok())
+            .collect();
+        for uri in candidates {
+            if !self.workspace_index_new.contains(&uri) {
+                continue;
+            }
+            if self.document_store.get_without_touch(&uri).is_some()
+                || self.documents.contains_key(&uri)
+            {
+                continue;
+            }
+            if let Ok(path) = uri.to_file_path()
+                && workspace_dirs.iter().any(|dir| path.starts_with(dir))
+            {
+                continue;
+            }
+            let referenced_from_index = self.workspace_index_new.any_entry(|entry| {
+                entry
+                    .metadata
+                    .sources
+                    .iter()
+                    .any(|s| s.resolved_uri.as_ref() == Some(&uri))
+            });
+            let referenced_from_open_doc = || {
+                self.document_store.uris().into_iter().any(|doc_uri| {
+                    self.document_store
+                        .get_without_touch(&doc_uri)
+                        .is_some_and(|doc| {
+                            doc.metadata
+                                .sources
+                                .iter()
+                                .any(|s| s.resolved_uri.as_ref() == Some(&uri))
+                        })
+                })
+            };
+            if referenced_from_index || referenced_from_open_doc() {
+                continue;
+            }
+            self.workspace_index_new.invalidate(&uri);
+            self.cross_file_graph.remove_file(&uri);
+        }
     }
 
     /// Expand the changed-URI list from

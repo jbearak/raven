@@ -476,6 +476,255 @@ mod lifecycle {
         );
     }
 
+    /// Index entry whose only source carries an already-resolved
+    /// cross-package target (`resolved_uri` set), as left behind by a prior
+    /// successful branch-2 resolution.
+    fn resolved_entry(pkg: &str, target: &Url) -> IndexEntry {
+        let metadata = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                system_file: Some(SystemFileCall {
+                    parts: vec!["helper.R".to_string()],
+                    package: pkg.to_string(),
+                }),
+                resolved_uri: Some(target.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        IndexEntry {
+            contents: ropey::Rope::from_str(&format!(
+                "source(system.file(\"helper.R\", package = \"{pkg}\"))\n"
+            )),
+            tree: None,
+            loaded_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: Some(1),
+            },
+            metadata: Arc::new(metadata),
+            artifacts: Arc::new(raven::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 1,
+        }
+    }
+
+    /// A successful cross-package resolution indexes the outside-workspace
+    /// target so its artifacts reach scope resolution. When the package is
+    /// removed and the resolution clears, nothing references that external
+    /// entry anymore — it must be dropped from the index rather than linger
+    /// in an LRU slot until natural eviction (#425).
+    #[test]
+    fn orphaned_external_entry_dropped_after_package_removal() {
+        let libdir = tempfile::tempdir().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        let mut state = state_with_lib(libdir.path());
+        state
+            .workspace_index_new
+            .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
+
+        state.resolve_system_file_in_workspace();
+        let target = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed")
+            .metadata
+            .sources[0]
+            .resolved_uri
+            .clone()
+            .expect("source must resolve while the package is installed");
+        assert!(
+            state.workspace_index_new.contains(&target),
+            "precondition: the cross-package target is indexed after resolution"
+        );
+
+        std::fs::remove_dir_all(&pkg_dir).unwrap();
+        state.resolve_system_file_in_workspace();
+
+        assert!(
+            !state.workspace_index_new.contains(&target),
+            "orphaned external index entry must be dropped once no resolution references it"
+        );
+    }
+
+    /// A library swap re-targets the resolution to a different installed
+    /// copy: the new target must be indexed and the previous one dropped —
+    /// nothing points at it anymore (#425).
+    #[test]
+    fn orphaned_external_entry_dropped_after_libpath_retarget() {
+        let libdir_a = tempfile::tempdir().unwrap();
+        let libdir_b = tempfile::tempdir().unwrap();
+        for lib in [&libdir_a, &libdir_b] {
+            let pkg_dir = lib.path().join("otherpkg");
+            std::fs::create_dir_all(&pkg_dir).unwrap();
+            std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+        }
+
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        let mut state = state_with_lib(libdir_a.path());
+        state
+            .workspace_index_new
+            .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
+
+        state.resolve_system_file_in_workspace();
+        let old_target = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed")
+            .metadata
+            .sources[0]
+            .resolved_uri
+            .clone()
+            .expect("source must resolve against libdir_a");
+        assert!(
+            state.workspace_index_new.contains(&old_target),
+            "precondition: libdir_a target indexed"
+        );
+
+        // Library swap: libdir_b now wins resolution.
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![libdir_b.path().to_path_buf()]);
+        state.package_library = Arc::new(lib);
+        state.resolve_system_file_in_workspace();
+
+        let new_target = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed")
+            .metadata
+            .sources[0]
+            .resolved_uri
+            .clone()
+            .expect("source must re-resolve against libdir_b");
+        assert_ne!(
+            old_target, new_target,
+            "precondition: resolution re-targeted"
+        );
+        assert!(
+            state.workspace_index_new.contains(&new_target),
+            "the re-targeted external file must be indexed"
+        );
+        assert!(
+            !state.workspace_index_new.contains(&old_target),
+            "the previous external target must be dropped after the re-target"
+        );
+    }
+
+    /// The external entry must be RETAINED while any other resolution still
+    /// points at it. Here a second file's resolution (whose package the
+    /// filtered event pass does not touch) references the same target as the
+    /// one being cleared.
+    #[test]
+    fn external_entry_retained_while_another_resolution_references_it() {
+        let libdir = tempfile::tempdir().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        let mut state = state_with_lib(libdir.path());
+        state
+            .workspace_index_new
+            .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
+
+        state.resolve_system_file_in_workspace();
+        let target = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed")
+            .metadata
+            .sources[0]
+            .resolved_uri
+            .clone()
+            .expect("source must resolve while the package is installed");
+        assert!(
+            state.workspace_index_new.contains(&target),
+            "precondition: target indexed"
+        );
+
+        // A second file's resolution still points at the same target; its
+        // package is untouched by the filtered event below.
+        let keeper_uri = Url::parse("file:///workspace/keeper.R").unwrap();
+        state
+            .workspace_index_new
+            .insert(keeper_uri, resolved_entry("keeperpkg", &target));
+
+        // otherpkg removed; the libpath-event consumer re-resolves only
+        // entries referencing {otherpkg}.
+        std::fs::remove_dir_all(&pkg_dir).unwrap();
+        let pkgs: std::collections::HashSet<String> =
+            std::iter::once("otherpkg".to_string()).collect();
+        state.resolve_system_file_in_workspace_for_packages(Some(&pkgs));
+
+        assert!(
+            state
+                .workspace_index_new
+                .get(&uri)
+                .expect("entry still indexed")
+                .metadata
+                .sources[0]
+                .resolved_uri
+                .is_none(),
+            "precondition: the cleared resolution actually cleared"
+        );
+        assert!(
+            state.workspace_index_new.contains(&target),
+            "external entry must be retained while another resolved_uri still references it"
+        );
+    }
+
+    /// renv-style layout: the package library lives INSIDE a workspace
+    /// folder, so the resolved target is a workspace file owned by the
+    /// workspace scan. The orphan cleanup must never drop entries under a
+    /// workspace folder.
+    #[test]
+    fn workspace_entry_not_dropped_by_orphan_cleanup() {
+        let workspace = tempfile::tempdir().unwrap();
+        // Canonicalize so the resolved target and the folder agree on
+        // symlinked temp paths (macOS /var -> /private/var).
+        let ws_root = workspace.path().canonicalize().unwrap();
+        let libdir = ws_root.join("renv").join("library");
+        let pkg_dir = libdir.join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        let mut state = state_with_lib(&libdir);
+        state
+            .workspace_folders
+            .push(Url::from_directory_path(&ws_root).unwrap());
+        state
+            .workspace_index_new
+            .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
+
+        state.resolve_system_file_in_workspace();
+        let target = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed")
+            .metadata
+            .sources[0]
+            .resolved_uri
+            .clone()
+            .expect("source must resolve while the package is installed");
+        assert!(
+            state.workspace_index_new.contains(&target),
+            "precondition: target indexed"
+        );
+
+        std::fs::remove_dir_all(&pkg_dir).unwrap();
+        state.resolve_system_file_in_workspace();
+
+        assert!(
+            state.workspace_index_new.contains(&target),
+            "entries under a workspace folder are owned by the workspace scan \
+             and must not be dropped by the orphan cleanup"
+        );
+    }
+
     /// Open buffers are authoritative: their metadata lives in the document
     /// store, not the workspace index, so the resolution pass must cover it
     /// too. An open buffer (here not even present in the workspace index —
