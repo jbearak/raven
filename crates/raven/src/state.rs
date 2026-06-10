@@ -1046,47 +1046,80 @@ impl WorldState {
     }
 
     /// Resolve `system.file()` sources in workspace index metadata and rebuild
-    /// affected dependency graph edges. Must be called after `apply_package_event`
-    /// so that `package_state.workspace()` is populated.
-    pub fn resolve_system_file_in_workspace(&mut self) {
+    /// dependency graph edges for files whose resolution changed. Must be called
+    /// after `apply_package_event` so that `package_state.workspace()` is
+    /// populated.
+    ///
+    /// Every entry with `system_file.is_some()` is revisited — resolved entries
+    /// keep their `SystemFileCall` (see `resolve_system_file_sources`), so this
+    /// is the single recovery point for package lifecycle events: a package
+    /// install/removal in a watched libpath (`LibpathEvent::Changed`) and a
+    /// workspace `Package:` rename (the DESCRIPTION manifest branch) both call
+    /// this to form, drop, or re-target edges without the user editing the
+    /// sourcing file.
+    ///
+    /// Returns the URIs whose source resolution actually changed, so callers
+    /// can republish diagnostics for exactly those files (expand with
+    /// [`Self::system_file_republish_set`] to include open dependents).
+    pub fn resolve_system_file_in_workspace(&mut self) -> Vec<Url> {
+        self.resolve_system_file_in_workspace_for_packages(None)
+    }
+
+    /// Package-filtered variant of [`Self::resolve_system_file_in_workspace`]:
+    /// with `Some(packages)`, only entries containing a `system.file()` source
+    /// referencing one of those packages are re-resolved; everything else is
+    /// neither cloned nor disk-probed. The libpath-event consumer passes the
+    /// changed-package set so a package install/removal does not re-probe
+    /// every resolved entry in the workspace. Callers reacting to events that
+    /// can shift resolution for arbitrary packages (startup, library swaps,
+    /// a workspace `Package:` rename) pass `None`.
+    pub fn resolve_system_file_in_workspace_for_packages(
+        &mut self,
+        only_packages: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<Url> {
         let ws = self.package_state.workspace();
         let ws_name = ws.map(|w| w.name.as_str()).map(|s| s.to_owned());
         let ws_root = ws.map(|w| w.root.clone());
         let lib_paths = self.package_library.lib_paths().to_vec();
 
-        // Collect URIs that have unresolved system.file entries.
-        // `workspace_index_new.iter()` returns an owned Vec snapshot, so
-        // filter it in place rather than re-iterating.
-        let mut affected: Vec<(Url, crate::workspace_index::IndexEntry)> =
-            self.workspace_index_new.iter();
-        affected.retain(|(_, entry)| {
-            entry
-                .metadata
-                .sources
-                .iter()
-                .any(|s| s.system_file.is_some())
+        // Snapshot only the entries with a selected system.file source —
+        // `entries_matching` clones just that subset, so workspaces without
+        // system.file sources (the common case) pay one predicate pass.
+        let affected = self.workspace_index_new.entries_matching(|entry| {
+            entry.metadata.sources.iter().any(|s| {
+                s.system_file
+                    .as_ref()
+                    .is_some_and(|sf| only_packages.is_none_or(|pkgs| pkgs.contains(&sf.package)))
+            })
         });
 
         if affected.is_empty() {
-            return;
+            return Vec::new();
         }
 
-        // Resolve in stored metadata and re-insert
-        let affected_uris: Vec<Url> = affected.iter().map(|(u, _)| u.clone()).collect();
+        // Resolve into a cloned sources Vec; only a real change pays for the
+        // full-metadata clone (`Arc::make_mut`), re-insertion, and the edge
+        // rebuild below (resolution is idempotent, so unchanged entries need
+        // none of them).
+        let mut changed_uris: Vec<Url> = Vec::new();
         for (uri, mut entry) in affected {
-            let meta = Arc::make_mut(&mut entry.metadata);
-            crate::cross_file::resolve_system_file_sources(
-                meta,
+            let mut new_sources = entry.metadata.sources.clone();
+            crate::cross_file::resolve_system_file_source_entries(
+                &mut new_sources,
                 ws_name.as_deref(),
                 ws_root.as_deref(),
                 &lib_paths,
             );
-            self.workspace_index_new.insert(uri, entry);
+            if new_sources != entry.metadata.sources {
+                Arc::make_mut(&mut entry.metadata).sources = new_sources;
+                changed_uris.push(uri.clone());
+                self.workspace_index_new.insert(uri, entry);
+            }
         }
 
-        // Rebuild graph edges for affected files
+        // Rebuild graph edges for changed files
         let workspace_root = self.workspace_folders.first().cloned();
-        for uri in &affected_uris {
+        for uri in &changed_uris {
             if let Some(entry) = self.workspace_index_new.get(uri) {
                 let meta = entry.metadata.clone();
                 let get_content = |parent_uri: &Url| -> Option<String> {
@@ -1106,6 +1139,43 @@ impl WorldState {
         // Index outside-workspace files resolved via cross-package system.file
         // so their artifacts are available to scope resolution.
         self.index_cross_package_resolved_files();
+
+        changed_uris
+    }
+
+    /// Expand the changed-URI list from
+    /// [`Self::resolve_system_file_in_workspace`] into the open documents
+    /// whose diagnostics may be affected: the changed files themselves plus
+    /// their open transitive dependents and sibling subtrees. A parent's
+    /// cross-file scope traverses forward source edges transitively, so an
+    /// edge formed or dropped on a child changes the parent's diagnostics
+    /// even though the parent's own text and edges are untouched — the same
+    /// fan-out `did_change` performs via
+    /// `compute_affected_dependents_after_edit`.
+    pub fn system_file_republish_set(&self, changed: &[Url]) -> Vec<Url> {
+        let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        let mut out: Vec<Url> = Vec::new();
+        for uri in changed {
+            if self.documents.contains_key(uri) && seen.insert(uri.clone()) {
+                out.push(uri.clone());
+            }
+            let dependents =
+                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                    uri,
+                    false, // the file's text (interface) did not change
+                    true,  // its dependency edges did
+                    &self.cross_file_graph,
+                    |u| self.documents.contains_key(u),
+                    self.cross_file_config.max_chain_depth,
+                    self.cross_file_config.max_transitive_dependents_visited,
+                );
+            for dep in dependents {
+                if seen.insert(dep.clone()) {
+                    out.push(dep);
+                }
+            }
+        }
+        out
     }
 
     /// Read, parse, and index outside-workspace files that were resolved via
@@ -2434,8 +2504,9 @@ mod tests {
             .expect("entry still indexed");
         assert_eq!(resolved.metadata.sources.len(), 1);
         assert!(
-            resolved.metadata.sources[0].system_file.is_none(),
-            "source must be resolved after the swap"
+            resolved.metadata.sources[0].system_file.is_some(),
+            "system_file must be retained after resolution so package \
+             lifecycle events can re-resolve"
         );
         let resolved_uri = resolved.metadata.sources[0]
             .resolved_uri

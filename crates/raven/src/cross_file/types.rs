@@ -261,6 +261,23 @@ fn default_sys_source_global_env() -> bool {
 }
 
 impl ForwardSource {
+    /// True when missing-file/path diagnostics must skip this source.
+    ///
+    /// `system.file()` sources mostly carry no literal path to diagnose: a
+    /// branch-2 resolved one (`resolved_uri` set) points outside the
+    /// workspace, and an unresolved one (e.g. an uninstalled package, or
+    /// branch-2 resolution deferred while lib_paths is empty) has an empty
+    /// `path` and must degrade silently rather than emit a spurious
+    /// "Cannot resolve path: ''". The exception is a branch-1 self-package
+    /// hit, whose workspace-relative `/inst/...` path IS diagnosable —
+    /// `system_file` stays `Some` on every system.file entry for
+    /// re-resolution (see `resolve_system_file_sources`), so "unresolved"
+    /// is encoded as `system_file` Some + empty `path`, not by `system_file`
+    /// presence alone.
+    pub fn exempt_from_missing_file_diagnostics(&self) -> bool {
+        self.resolved_uri.is_some() || (self.system_file.is_some() && self.path.is_empty())
+    }
+
     /// Check if symbols from this source should be inherited
     /// Returns false for local=TRUE or sys.source with non-global env
     pub fn inherits_symbols(&self) -> bool {
@@ -326,6 +343,53 @@ pub fn enrich_metadata_with_inherited_wd<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Four-state matrix for the missing-file-diagnostics exemption: only a
+    /// branch-2 resolved entry (resolved_uri set) or an inert unresolved
+    /// system.file entry (empty path) is exempt; a branch-1 "/inst/..." hit
+    /// and an ordinary path source remain diagnosable.
+    #[test]
+    fn exempt_from_missing_file_diagnostics_matrix() {
+        let sf = || {
+            Some(crate::cross_file::source_detect::SystemFileCall {
+                parts: vec!["helper.R".to_string()],
+                package: "pkg".to_string(),
+            })
+        };
+
+        // Branch-2 resolved: points outside the workspace → exempt.
+        let resolved = ForwardSource {
+            system_file: sf(),
+            path: "/lib/pkg/helper.R".to_string(),
+            resolved_uri: Some(
+                tower_lsp::lsp_types::Url::parse("file:///lib/pkg/helper.R").unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert!(resolved.exempt_from_missing_file_diagnostics());
+
+        // Unresolved/deferred: empty path, inert → exempt.
+        let unresolved = ForwardSource {
+            system_file: sf(),
+            ..Default::default()
+        };
+        assert!(unresolved.exempt_from_missing_file_diagnostics());
+
+        // Branch-1 self-package hit: workspace-relative path IS diagnosable.
+        let branch1 = ForwardSource {
+            system_file: sf(),
+            path: "/inst/helper.R".to_string(),
+            ..Default::default()
+        };
+        assert!(!branch1.exempt_from_missing_file_diagnostics());
+
+        // Ordinary path source: diagnosable.
+        let plain = ForwardSource {
+            path: "helper.R".to_string(),
+            ..Default::default()
+        };
+        assert!(!plain.exempt_from_missing_file_diagnostics());
+    }
 
     #[test]
     fn test_byte_offset_to_utf16_column_ascii() {

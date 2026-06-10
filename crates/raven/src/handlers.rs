@@ -4586,12 +4586,9 @@ async fn collect_missing_file_diagnostics_standalone(
     let mut paths_to_check: Vec<(std::path::PathBuf, String, u32, u32, bool, bool)> = Vec::new();
 
     for source in &meta.sources {
-        // system.file() sources never carry a literal path to diagnose: a
-        // resolved one points outside the workspace (skip), and an unresolved
-        // one (e.g. an uninstalled package, or branch-2 resolution deferred
-        // while lib_paths is empty) has an empty `path` and must degrade
-        // silently rather than emit a spurious "Cannot resolve path: ''".
-        if source.resolved_uri.is_some() || source.system_file.is_some() {
+        // Resolved or inert-unresolved system.file() sources carry no literal
+        // path to diagnose — see the predicate's doc comment for the matrix.
+        if source.exempt_from_missing_file_diagnostics() {
             continue;
         }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
@@ -4907,12 +4904,9 @@ fn collect_missing_file_diagnostics_from_snapshot(
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
 
     for source in &meta.sources {
-        // system.file() sources never carry a literal path to diagnose: a
-        // resolved one points outside the workspace (skip), and an unresolved
-        // one (e.g. an uninstalled package, or branch-2 resolution deferred
-        // while lib_paths is empty) has an empty `path` and must degrade
-        // silently rather than emit a spurious "Cannot resolve path: ''".
-        if source.resolved_uri.is_some() || source.system_file.is_some() {
+        // Resolved or inert-unresolved system.file() sources carry no literal
+        // path to diagnose — see the predicate's doc comment for the matrix.
+        if source.exempt_from_missing_file_diagnostics() {
             continue;
         }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {

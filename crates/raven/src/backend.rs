@@ -4986,6 +4986,10 @@ impl LanguageServer for Backend {
             if !deltas.is_empty() {
                 let batch = crate::package_state::PackageInputDelta::Batch(deltas);
                 state.apply_package_event(&batch);
+                // A `Package:` rename changes which `system.file()` references
+                // are self-package (branch 1), so re-resolve retained entries
+                // against the new workspace name.
+                let system_file_changed = state.resolve_system_file_in_workspace();
                 log::info!("Updated package state after DESCRIPTION/NAMESPACE change");
                 // Force republish for all open R files so namespace model
                 // changes propagate (they're not dependency-graph neighbors of
@@ -5012,6 +5016,17 @@ impl LanguageServer for Backend {
                 extend_affected_for_manifest_change(
                     &mut affected_open_docs,
                     open_keys_filtered,
+                    sync_publish_path,
+                    &state.diagnostics_gate,
+                );
+                // Files whose system.file resolution changed — and their open
+                // transitive dependents — can fall outside the
+                // package-relevant set (e.g. open scripts elsewhere in the
+                // workspace); extend them with the same gated marking.
+                let system_file_republish = state.system_file_republish_set(&system_file_changed);
+                extend_affected_for_manifest_change(
+                    &mut affected_open_docs,
+                    system_file_republish,
                     sync_publish_path,
                     &state.diagnostics_gate,
                 );
@@ -7506,6 +7521,37 @@ async fn run_libpath_consumer(
                     pkg_lib.prefetch_packages(&prefetch_vec).await;
                 }
 
+                // A package install/removal under a watched libpath can create
+                // or destroy `source(system.file(...))` resolution targets even
+                // though the set of lib_paths is unchanged. Pre-check under the
+                // read lock so workspaces without a matching system.file source
+                // (the common case) never pay for the write lock. Otherwise
+                // re-resolve just the entries referencing changed packages so
+                // edges form for a newly-installed package and stale edges drop
+                // for a removed one. The write-lock section does bounded disk
+                // work — stat probes per selected entry plus reading/parsing
+                // newly resolved external files in
+                // `index_cross_package_resolved_files` — the same work every
+                // library-swap site performs under this lock.
+                let touches_system_file = {
+                    let state = state_arc.read().await;
+                    state.workspace_index_new.any_entry(|entry| {
+                        entry.metadata.sources.iter().any(|s| {
+                            s.system_file
+                                .as_ref()
+                                .is_some_and(|sf| affected.contains(&sf.package))
+                        })
+                    })
+                };
+                let system_file_republish: Vec<Url> = if touches_system_file {
+                    let mut state = state_arc.write().await;
+                    let changed =
+                        state.resolve_system_file_in_workspace_for_packages(Some(&affected));
+                    state.system_file_republish_set(&changed)
+                } else {
+                    Vec::new()
+                };
+
                 // Collect URIs whose effective package scope intersects
                 // `trigger_set`.
                 //
@@ -7544,7 +7590,7 @@ async fn run_libpath_consumer(
                     probe.metadata_map.get(target_uri).cloned()
                 };
                 let empty_base_exports: HashSet<String> = HashSet::new();
-                let affected_uris: Vec<Url> = probe
+                let mut affected_uris: Vec<Url> = probe
                     .docs
                     .iter()
                     .filter_map(|(uri, line)| {
@@ -7584,6 +7630,18 @@ async fn run_libpath_consumer(
                         }
                     })
                     .collect();
+
+                // Union in the system.file republish set: open documents whose
+                // resolution changed plus their open transitive dependents —
+                // an edge formed or dropped on a child changes a parent's
+                // cross-file scope even when the parent loads no affected
+                // package. Closed files need no publish; the set is already
+                // filtered to open docs by `system_file_republish_set`.
+                for uri in system_file_republish {
+                    if !affected_uris.contains(&uri) {
+                        affected_uris.push(uri);
+                    }
+                }
 
                 // Force republish is safe: the text hasn't changed but the
                 // underlying package set has, so we want to overwrite the last
