@@ -77,6 +77,14 @@
 pub mod config;
 mod nolint;
 mod parse_gate;
+
+/// Test-only re-export of the `nolint` string scanner so the cross-parser
+/// parity property test in `cross_file::property_tests` can reach it. The
+/// `nolint` module itself stays private to `linting`.
+#[cfg(test)]
+pub(crate) use nolint::{
+    Suppressions as SuppressionsForParityTest, first_hash_body_for_parity_test,
+};
 pub mod rule_ids;
 mod rules;
 

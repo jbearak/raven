@@ -299,6 +299,16 @@ fn find_inline_marker(body: &str) -> Option<NolintMarker> {
     None
 }
 
+/// Test-only re-export of [`first_hash_body`] so the cross-parser parity
+/// property test in `cross_file::property_tests` can compare this scanner
+/// against `directive::comment_region_outside_strings` directly. Kept in
+/// lockstep by that test (see the parity doc comment on
+/// `comment_region_outside_strings`).
+#[cfg(test)]
+pub(crate) fn first_hash_body_for_parity_test(line: &str) -> Option<(usize, &str)> {
+    first_hash_body(line)
+}
+
 fn classify(after_hash: &str) -> Option<NolintMarker> {
     // Strip an arbitrary run of leading whitespace and additional `#` chars
     // (people sometimes write `## nolint`).

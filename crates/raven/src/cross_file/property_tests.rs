@@ -22770,3 +22770,300 @@ proptest! {
         );
     }
 }
+
+// ============================================================================
+// Suppression-parser parity (Probe B second-pass validation of PR #420)
+//
+// Three parsers must agree on the single question "is this `#` the start of a
+// real comment, or is it buried inside a string literal":
+//
+//   1. analyzer track   — `directive::comment_region_outside_strings`
+//      (a deliberate local copy of `nolint::first_hash_body`, with a parity
+//      doc comment promising they stay in lockstep);
+//   2. lint track       — `nolint::first_hash_body`;
+//   3. tree-sitter path — `handlers::lsp_ignored_lines_from_tree`, which walks
+//      `comment` nodes of a parsed tree (so strings, raw strings, multi-line
+//      strings, and backtick identifiers are never mistaken for comments).
+//
+// The two byte-scanners (1) and (2) are claimed byte-identical, so they are
+// compared at full proptest volume on adversarial lines. The tree-sitter path
+// uses a completely different mechanism (a real parser, not a hand-rolled
+// scanner), and has DOCUMENTED behavioral divergences from the scanners:
+//
+//   * a standalone `# @lsp-ignore` (no code before the marker) suppresses
+//     NOTHING on the AST path — "use `@lsp-ignore-next` instead"
+//     (see `classify_comment_for_ignore`);
+//   * `@lsp-ignore-next` is honored only when standalone;
+//   * the scanners' single-line quote bookkeeping treats an *unterminated*
+//     quote as "string runs to EOL", whereas tree-sitter only treats a `#` as
+//     non-comment when the parser actually places it inside a string node.
+//
+// Those divergences are ENCODED below (the three-way property restricts to the
+// shape where they cannot bite: a marker preceded by real, string-free code),
+// rather than papered over.
+// ============================================================================
+
+mod suppression_parity {
+    use super::*;
+    use crate::cross_file::directive::comment_region_outside_strings_for_parity_test as comment_region_outside_strings;
+    use crate::handlers::lsp_ignored_lines_from_text_for_parity_test;
+    use crate::linting::SuppressionsForParityTest as Suppressions;
+    use crate::linting::first_hash_body_for_parity_test as first_hash_body;
+
+    /// A single "token" of adversarial line content. Composed into a line by
+    /// `adversarial_line`. Deliberately exercises every string/quote/escape/
+    /// hash hazard the scanners must handle.
+    fn line_token() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Bare hashes (comment starts, or mid-string noise).
+            Just("#".to_string()),
+            Just("##".to_string()),
+            // Quote characters of both kinds, alone (toggles string state).
+            Just("\"".to_string()),
+            Just("'".to_string()),
+            // Backslash escapes (consume the next byte inside a string).
+            Just("\\".to_string()),
+            Just("\\\"".to_string()),
+            Just("\\'".to_string()),
+            Just("\\\\".to_string()),
+            // Complete string literals of both kinds, including ones that
+            // embed a `#` and embed the opposite quote.
+            Just("\"abc\"".to_string()),
+            Just("'abc'".to_string()),
+            Just("\"a # b\"".to_string()),
+            Just("'a # b'".to_string()),
+            Just("\"it's\"".to_string()),
+            Just("'say \"hi\"'".to_string()),
+            Just("\"esc\\\"q\"".to_string()),
+            // The suppression markers themselves, dropped at an arbitrary spot
+            // (after code, mid-string, etc.).
+            Just("@lsp-ignore".to_string()),
+            Just("@lsp-ignore-next".to_string()),
+            Just("raven: ignore".to_string()),
+            Just("nolint".to_string()),
+            // Ordinary code-ish fragments and whitespace.
+            Just("x <- 1".to_string()),
+            Just("foo(bar)".to_string()),
+            Just(" + ".to_string()),
+            Just(" ".to_string()),
+            Just("`a#b`".to_string()),
+        ]
+    }
+
+    /// Build an adversarial single line by concatenating 0..=8 tokens. Newlines
+    /// are intentionally excluded — both scanners are line-oriented and are
+    /// called per-line by their callers.
+    fn adversarial_line() -> impl Strategy<Value = String> {
+        prop::collection::vec(line_token(), 0..=8).prop_map(|toks| toks.concat())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// CORE PARITY: the analyzer-track scanner and the lint-track scanner
+        /// must make the byte-identical decision about where the comment region
+        /// begins, for ANY line.
+        ///
+        /// `comment_region_outside_strings` returns the slice starting at the
+        /// first comment `#`; `first_hash_body` returns `(index_of_#, &line[i+1..])`.
+        /// So agreement means: both `Some`/`None` together, and when `Some` the
+        /// directive slice equals `&line[hash_index..]`.
+        #[test]
+        fn prop_scanner_parity_directive_vs_nolint(line in adversarial_line()) {
+            let dir = comment_region_outside_strings(&line);
+            let nol = first_hash_body(&line);
+
+            match (dir, nol) {
+                (None, None) => {}
+                (Some(region), Some((idx, body))) => {
+                    // The directive region starts exactly at the `#` nolint found.
+                    prop_assert_eq!(
+                        region, &line[idx..],
+                        "scanner region mismatch on {:?}: dir slice vs &line[{}..]",
+                        line, idx
+                    );
+                    // And the directive region is `#` followed by nolint's body.
+                    prop_assert!(region.starts_with('#'));
+                    prop_assert_eq!(&region[1..], body,
+                        "comment body mismatch on {:?}", line);
+                }
+                (d, n) => prop_assert!(
+                    false,
+                    "scanner disagreement on {:?}: directive={:?} nolint={:?}",
+                    line, d, n
+                ),
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// Idempotence-style invariant tying the scanner to observable behavior:
+        /// if (and only if) the lint scanner finds a comment region, that region
+        /// is exactly the substring tree-sitter would have to recognize as a
+        /// comment node for any marker in it to fire. We assert the cheaper,
+        /// scanner-internal half: when a `#` is found, everything before it on
+        /// the line parses with balanced quote state (no `#` of the returned
+        /// region appears earlier outside strings). This pins the "first hash
+        /// outside strings" contract that all three parsers depend on.
+        #[test]
+        fn prop_first_hash_is_truly_first_outside_strings(line in adversarial_line()) {
+            if let Some((idx, _)) = first_hash_body(&line) {
+                // No earlier `#` may be a comment start: re-scanning the prefix
+                // up to `idx` must itself find no comment region.
+                let prefix = &line[..idx];
+                prop_assert_eq!(
+                    comment_region_outside_strings(prefix), None,
+                    "a `#` before idx={} in {:?} was also a comment start",
+                    idx, line
+                );
+            }
+        }
+    }
+
+    /// Append ` # @lsp-ignore` to a string-free, comment-free code prefix. The
+    /// prefix is chosen so that there is exactly one comment region (the one we
+    /// append) and no open string at the marker — the shape in which all three
+    /// parsers are documented to AGREE.
+    fn code_prefix_then_same_line_marker() -> impl Strategy<Value = String> {
+        // Simple code with no `#`, no quotes, no backslashes — so the appended
+        // marker is unambiguously the first (and only) comment region.
+        prop_oneof![
+            Just("x <- 1".to_string()),
+            Just("foo(bar)".to_string()),
+            Just("y = f(a, b)".to_string()),
+            Just("z <- g() + h()".to_string()),
+        ]
+        .prop_map(|code| format!("{code} # @lsp-ignore"))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        /// THREE-WAY AGREEMENT (restricted domain): for a real comment marker
+        /// after real, string-free code, all three parsers must agree the line
+        /// is suppressed. This is the overlap of their domains; the documented
+        /// divergences (standalone-only, `# nolint`, unterminated-quote) are
+        /// excluded by construction.
+        #[test]
+        fn prop_three_way_same_line_marker_agrees(line in code_prefix_then_same_line_marker()) {
+            // Analyzer track.
+            let meta = parse_directives(&line);
+            let dir_suppressed =
+                crate::cross_file::directive::is_line_ignored(&meta, 0);
+            // Lint track.
+            let supp = Suppressions::from_text(&line);
+            let lint_suppressed = supp.is_suppressed(0);
+            // Tree-sitter path.
+            let ts = lsp_ignored_lines_from_text_for_parity_test(&line);
+            let ts_suppressed = ts.contains_key(&0);
+
+            prop_assert!(
+                dir_suppressed && lint_suppressed && ts_suppressed,
+                "three-way disagreement on {:?}: directive={} lint={} tree-sitter={}",
+                line, dir_suppressed, lint_suppressed, ts_suppressed
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        /// THREE-WAY AGREEMENT on the negative case: a marker buried inside a
+        /// *terminated* string literal (so all three agree the string is closed
+        /// and the `#` is inside it) must suppress in NONE of the three parsers.
+        #[test]
+        fn prop_three_way_marker_inside_string_suppresses_none(
+            inner in prop_oneof![
+                Just("@lsp-ignore".to_string()),
+                Just("# @lsp-ignore".to_string()),
+                Just("# raven: ignore".to_string()),
+            ]
+        ) {
+            // `x <- "<marker>"` — the marker is wholly inside a closed double
+            // quoted string. No real comment exists on the line.
+            let line = format!("x <- \"{inner}\"");
+
+            let meta = parse_directives(&line);
+            let dir_suppressed =
+                crate::cross_file::directive::is_line_ignored(&meta, 0);
+            let supp = Suppressions::from_text(&line);
+            let lint_suppressed = supp.is_suppressed(0);
+            let ts = lsp_ignored_lines_from_text_for_parity_test(&line);
+            let ts_suppressed = ts.contains_key(&0);
+
+            prop_assert!(
+                !dir_suppressed && !lint_suppressed && !ts_suppressed,
+                "marker inside string wrongly suppressed on {:?}: directive={} lint={} tree-sitter={}",
+                line, dir_suppressed, lint_suppressed, ts_suppressed
+            );
+        }
+    }
+
+    /// Deterministic adversarial cases for the tree-sitter path, where its
+    /// mechanism (a real parser) legitimately diverges from the line scanners.
+    /// These are checked at fixed inputs rather than at proptest volume because
+    /// they probe parser-specific constructs (raw strings, multi-line strings)
+    /// rather than the shared scanner contract.
+    #[test]
+    fn tree_sitter_multiline_string_hides_marker() {
+        // The `# @lsp-ignore-next` lives inside a multi-line string opened on
+        // line 0 and closed on line 1. tree-sitter sees one string node, so no
+        // comment node, so nothing is suppressed.
+        let code = "x <- \"abc\n# @lsp-ignore-next\"\nTRUE <- 1";
+        let map = lsp_ignored_lines_from_text_for_parity_test(code);
+        assert!(
+            map.is_empty(),
+            "multi-line string should hide the marker, got {map:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_raw_string_hides_marker() {
+        // R raw strings: r"(...)" / R"[...]". A marker inside one is not a
+        // comment. (If tree-sitter-r does not model raw strings, the marker is
+        // still inside a regular string by the surrounding quotes, so this also
+        // serves as a regression guard.)
+        let code = "x <- r\"(# @lsp-ignore)\"";
+        let map = lsp_ignored_lines_from_text_for_parity_test(code);
+        assert!(
+            map.is_empty(),
+            "raw string should hide the marker, got {map:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_standalone_same_line_marker_suppresses_nothing() {
+        // Documented divergence: a standalone `# @lsp-ignore` (no code before
+        // it) suppresses nothing on the AST path.
+        let code = "# @lsp-ignore\nTRUE <- 1";
+        let map = lsp_ignored_lines_from_text_for_parity_test(code);
+        assert!(
+            !map.contains_key(&0) && !map.contains_key(&1),
+            "standalone same-line marker should suppress nothing, got {map:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_standalone_next_line_marker_suppresses_next() {
+        // Counterpart: standalone `# @lsp-ignore-next` suppresses the line after.
+        let code = "# @lsp-ignore-next\nTRUE <- 1";
+        let map = lsp_ignored_lines_from_text_for_parity_test(code);
+        assert!(
+            map.contains_key(&1) && !map.contains_key(&0),
+            "standalone next-line marker should suppress line 1, got {map:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_marker_after_code_in_backtick_identifier_is_not_comment() {
+        // A `#` inside a backtick-quoted identifier is not a comment.
+        let code = "`a # @lsp-ignore` <- 2";
+        let map = lsp_ignored_lines_from_text_for_parity_test(code);
+        assert!(
+            map.is_empty(),
+            "backtick identifier should hide the marker, got {map:?}"
+        );
+    }
+}

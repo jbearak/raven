@@ -66,6 +66,11 @@ fn parse_suppression_codes(raw: Option<&str>) -> LineSuppression {
 /// must stay in parity (same single-/double-quote and backslash-escape
 /// bookkeeping). It is copied rather than imported to avoid a cross-module
 /// dependency between the analyzer and lint tracks for a few lines of byte scan.
+///
+/// The parity with `nolint::first_hash_body` is enforced by a property test in
+/// `cross_file::property_tests`, which reaches this scanner through the
+/// `#[cfg(test)]` re-export [`comment_region_outside_strings_for_parity_test`]
+/// below.
 fn comment_region_outside_strings(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -88,6 +93,14 @@ fn comment_region_outside_strings(line: &str) -> Option<&str> {
         i += 1;
     }
     None
+}
+
+/// Test-only crate-visible accessor for [`comment_region_outside_strings`] so
+/// the cross-parser parity property test in `cross_file::property_tests` can
+/// compare it against `nolint::first_hash_body` directly.
+#[cfg(test)]
+pub(crate) fn comment_region_outside_strings_for_parity_test(line: &str) -> Option<&str> {
+    comment_region_outside_strings(line)
 }
 
 /// Map the flavor capture (`ignore` | `expect`) into a [`SuppressionFlavor`].

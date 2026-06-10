@@ -11798,6 +11798,26 @@ fn lsp_ignored_lines_from_tree(
     out
 }
 
+/// Test-only entry point for the cross-parser parity property test in
+/// `cross_file::property_tests`: parse `text` with `tree_sitter_r` and return
+/// the same suppressed-line map [`lsp_ignored_lines_from_tree`] produces. Keeps
+/// the tree-sitter comment-node path's string-vs-comment decision comparable
+/// against the two byte-scanners (`directive::comment_region_outside_strings`
+/// and `nolint::first_hash_body`).
+#[cfg(test)]
+pub(crate) fn lsp_ignored_lines_from_text_for_parity_test(
+    text: &str,
+) -> std::collections::HashMap<u32, crate::cross_file::types::LineSuppression> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .expect("load tree-sitter-r");
+    let Some(tree) = parser.parse(text, None) else {
+        return std::collections::HashMap::new();
+    };
+    lsp_ignored_lines_from_tree(tree.root_node(), text)
+}
+
 fn visit_comments_for_ignore(
     node: Node<'_>,
     text: &str,
