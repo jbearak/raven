@@ -24330,6 +24330,7 @@ y <- totally_undefined_baseline()
     /// Asymmetry guard: setup-file defs must NOT suppress undefined-variable
     /// diagnostics for files under `R/` — same one-way visibility as helpers.
     #[tokio::test]
+    // The test name embeds the literal `R/` package directory casing.
     #[allow(non_snake_case)]
     async fn test_diagnostic_does_not_suppress_setup_symbol_in_R_file() {
         use crate::state::{Document, WorldState};

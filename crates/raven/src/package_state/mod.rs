@@ -384,9 +384,12 @@ pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
 /// sources them only AFTER all tests finish, so their bindings are never
 /// visible to test code.
 ///
-/// The caller is responsible for first confirming the file is under
-/// `tests/testthat/` (e.g. via `is_r_source_path` returning `RFileKind::Test`);
-/// this function only inspects the basename.
+/// The caller is responsible for first confirming the file is a **direct
+/// child of `tests/testthat/`** (e.g. `path.parent() == <root>/tests/testthat`,
+/// as `derive.rs` does). `is_r_source_path` returning `RFileKind::Test` is NOT
+/// a sufficient gate — it also matches `tests/testit/` and plain `tests/*.R`
+/// files, where testthat's helper/setup sourcing semantics do not apply. This
+/// function only inspects the basename.
 pub fn is_test_preamble_filename(file_name: &str) -> bool {
     // Case-insensitive ASCII prefix match. Slicing by raw byte index
     // would panic when the prefix length lands inside a multi-byte UTF-8
