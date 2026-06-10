@@ -1282,15 +1282,26 @@ fn classify_observed(
     let observed_keys: BTreeSet<_> = observed.iter().map(ObservedDiagnostic::key).collect();
     let observed_packages: BTreeSet<_> =
         observed.iter().map(|diag| diag.package.as_str()).collect();
+    // Build the per-package accepted/known-FP key sets once instead of
+    // rebuilding them for every observed diagnostic.
+    let accepted_by_package: BTreeMap<&str, BTreeSet<DiagnosticKey>> = observed_packages
+        .iter()
+        .map(|&pkg| (pkg, fixture.accepted_keys_for_package(pkg)))
+        .collect();
+    let fp_by_package: BTreeMap<&str, BTreeSet<DiagnosticKey>> = observed_packages
+        .iter()
+        .map(|&pkg| (pkg, fp_fixture.keys_for_package(pkg)))
+        .collect();
     let unclassified = observed
         .iter()
         .filter(|diag| {
-            !fixture
-                .accepted_keys_for_package(&diag.package)
-                .contains(&diag.key())
-                && !fp_fixture
-                    .keys_for_package(&diag.package)
-                    .contains(&diag.key())
+            let key = diag.key();
+            !accepted_by_package
+                .get(diag.package.as_str())
+                .is_some_and(|keys| keys.contains(&key))
+                && !fp_by_package
+                    .get(diag.package.as_str())
+                    .is_some_and(|keys| keys.contains(&key))
         })
         .cloned()
         .collect();

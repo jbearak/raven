@@ -1054,19 +1054,18 @@ impl WorldState {
         let ws_root = ws.map(|w| w.root.clone());
         let lib_paths = self.package_library.lib_paths().to_vec();
 
-        // Collect URIs that have unresolved system.file entries
-        let affected: Vec<(Url, crate::workspace_index::IndexEntry)> = self
-            .workspace_index_new
-            .iter()
-            .into_iter()
-            .filter(|(_, entry)| {
-                entry
-                    .metadata
-                    .sources
-                    .iter()
-                    .any(|s| s.system_file.is_some())
-            })
-            .collect();
+        // Collect URIs that have unresolved system.file entries.
+        // `workspace_index_new.iter()` returns an owned Vec snapshot, so
+        // filter it in place rather than re-iterating.
+        let mut affected: Vec<(Url, crate::workspace_index::IndexEntry)> =
+            self.workspace_index_new.iter();
+        affected.retain(|(_, entry)| {
+            entry
+                .metadata
+                .sources
+                .iter()
+                .any(|s| s.system_file.is_some())
+        });
 
         if affected.is_empty() {
             return;
@@ -1127,6 +1126,9 @@ impl WorldState {
         external_uris.sort();
         external_uris.dedup();
 
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
+
         for uri in external_uris {
             if self.workspace_index_new.contains(&uri) {
                 continue;
@@ -1141,8 +1143,6 @@ impl WorldState {
                 continue;
             };
 
-            let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
             let tree = parser.parse(&content, None);
             let metadata = Arc::new(crate::cross_file::extract_metadata(&content));
             let artifacts = tree.as_ref().map_or_else(

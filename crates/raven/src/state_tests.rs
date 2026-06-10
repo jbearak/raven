@@ -151,13 +151,23 @@ my_func <- function(x) { x + 1 }
         fs::write(temp_dir.path().join("main.R"), "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (index, cross_file_entries, new_index_entries) =
+            scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 1, "Only root main.R should be indexed, not .github/");
         let uris: Vec<String> = index.keys().map(|u| u.to_string()).collect();
         assert!(uris.iter().any(|u| u.contains("main.R")));
         assert!(!uris.iter().any(|u| u.contains(".github")),
             ".github/ R files must not be scanned");
+        // The exclusion must hold for every map the same traversal produces.
+        assert!(
+            !cross_file_entries.keys().any(|u| u.as_str().contains(".github")),
+            ".github/ R files must not produce cross-file entries"
+        );
+        assert!(
+            !new_index_entries.keys().any(|u| u.as_str().contains(".github")),
+            ".github/ R files must not produce new index entries"
+        );
     }
 }
 
