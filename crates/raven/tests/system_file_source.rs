@@ -27,7 +27,27 @@ fn run_check(workspace: &std::path::Path) -> String {
         .args(["--max-severity", "off", "--no-color"])
         .output()
         .expect("failed to execute raven check");
+    // `raven check` exits 0 (clean) or 1 (diagnostics emitted; under
+    // `--max-severity off` any diagnostic trips this). Only exit 2 (operator
+    // error) or a signal indicate a genuine failure — without this guard the
+    // string assertions below would pass vacuously on empty stdout.
+    assert!(
+        matches!(output.status.code(), Some(0) | Some(1)),
+        "raven check failed (status {:?}). stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Escape a filesystem path for embedding in a TOML basic string. On Windows a
+/// raw path contains backslashes (and may contain quotes) that TOML would
+/// otherwise treat as escape sequences, producing invalid config.
+fn toml_escape(path: &std::path::Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 /// source(system.file("helper.R", package = <self>)) resolves the helper's
@@ -102,7 +122,7 @@ fn system_file_cross_package_installed_resolves_helper_into_scope() {
         workspace.path().join("raven.toml"),
         format!(
             "[packages]\nadditionalLibraryPaths = [\"{}\"]\n",
-            libdir.path().display()
+            toml_escape(libdir.path())
         ),
     )
     .unwrap();
@@ -194,7 +214,7 @@ fn system_file_transitive_nested_resolution() {
         workspace.path().join("raven.toml"),
         format!(
             "[packages]\nadditionalLibraryPaths = [\"{}\"]\n",
-            libdir.path().display()
+            toml_escape(libdir.path())
         ),
     )
     .unwrap();
@@ -247,7 +267,7 @@ fn system_file_collect_diagnostics_blocking_resolves_installed_package() {
         workspace.path().join("raven.toml"),
         format!(
             "[packages]\nadditionalLibraryPaths = [\"{}\"]\n",
-            libdir.path().display()
+            toml_escape(libdir.path())
         ),
     )
     .unwrap();

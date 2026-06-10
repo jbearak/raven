@@ -364,4 +364,15 @@ mod tests {
         assert!(!is_directive_marker("# nolinter"));
         assert!(!is_directive_marker("# lsp-ignore"));
     }
+
+    #[test]
+    fn directive_detector_recognizes_raven_namespace() {
+        // `# raven:` suppression directives (incl. next-line forms) are markers,
+        // not commented-out code.
+        assert!(is_directive_marker("# raven: ignore-next"));
+        assert!(is_directive_marker("# raven: expect-next"));
+        // Near-misses must NOT be treated as markers.
+        assert!(!is_directive_marker("# raven-ignore-next"));
+        assert!(!is_directive_marker("# ravene: ignore-next"));
+    }
 }

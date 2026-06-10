@@ -284,17 +284,13 @@ fn collect_namespace_bound_idents(body: Node, content: &str) -> BTreeSet<String>
     idents
 }
 
-/// Returns true when `name` is a function that produces a namespace environment.
-fn is_namespace_producing_call_name(name: &str) -> bool {
-    matches!(
-        name,
-        "topenv" | "asNamespace" | "getNamespace" | "parent.env"
-    )
-}
-
 /// Check if a node is an expression that produces a namespace environment:
 /// `topenv(...)`, `asNamespace(...)`, `getNamespace(...)`, or
-/// `parent.env(environment())`.
+/// `parent.env(environment())`. `parent.env` only qualifies when its first
+/// argument is itself a namespace-shaped expression — `parent.env` of an
+/// arbitrary local environment is NOT the namespace, so treating every
+/// `parent.env(...)` as namespace-producing would over-collect and mute real
+/// undefined-variable diagnostics.
 fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
     if node.kind() != "call" {
         return false;
@@ -302,20 +298,44 @@ fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
     let Some(func_node) = node.child_by_field_name("function") else {
         return false;
     };
-    is_namespace_producing_call_name(node_text(func_node, content))
+    match node_text(func_node, content) {
+        "topenv" | "asNamespace" | "getNamespace" => true,
+        "parent.env" => parent_env_arg_is_namespace_shaped(node, content),
+        _ => false,
+    }
+}
+
+/// The first positional argument of a `parent.env(...)` call is namespace-shaped:
+/// a bare `environment()` (whose parent in `.onLoad` is the namespace) or a
+/// nested namespace-producing call.
+fn parent_env_arg_is_namespace_shaped(call: Node, content: &str) -> bool {
+    let Some(args_node) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() == "argument" && child.child_by_field_name("name").is_none() {
+            let Some(value_node) = child.child_by_field_name("value") else {
+                return false;
+            };
+            if value_node.kind() != "call" {
+                return false;
+            }
+            let Some(f) = value_node.child_by_field_name("function") else {
+                return false;
+            };
+            return node_text(f, content) == "environment"
+                || is_namespace_creating_expr(value_node, content);
+        }
+    }
+    false
 }
 
 /// Check if a node is a namespace-like expression: a namespace-producing call
 /// or an identifier previously bound to the namespace.
 fn is_namespace_like(node: Node, content: &str, ns_idents: &BTreeSet<String>) -> bool {
     match node.kind() {
-        "call" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                is_namespace_producing_call_name(node_text(func_node, content))
-            } else {
-                false
-            }
-        }
+        "call" => is_namespace_creating_expr(node, content),
         "identifier" => ns_idents.contains(node_text(node, content)),
         _ => false,
     }
@@ -814,6 +834,52 @@ bar <- 42
 "#;
         let syms = extract_onload_bindings(code);
         assert!(syms.contains("dynamic"), "getNamespace assign: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_parent_env_environment_collected() {
+        // parent.env(environment()) in .onLoad IS the namespace.
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  ns <- parent.env(environment())
+  assign("pe_sym", value, envir = ns)
+  ns$pe_dollar <- 1
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            syms.contains("pe_sym"),
+            "parent.env(environment()) assign: {:?}",
+            syms
+        );
+        assert!(
+            syms.contains("pe_dollar"),
+            "parent.env(environment()) $ assign: {:?}",
+            syms
+        );
+    }
+
+    #[test]
+    fn onload_parent_env_local_not_collected() {
+        // parent.env(<local env>) is NOT the namespace — must not be collected.
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  e <- new.env(parent = emptyenv())
+  assign("local_pe", 1, envir = parent.env(e))
+  parent.env(e)$local_pe_dollar <- 2
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            !syms.contains("local_pe"),
+            "parent.env(local) assign must not be collected: {:?}",
+            syms
+        );
+        assert!(
+            !syms.contains("local_pe_dollar"),
+            "parent.env(local) $ assign must not be collected: {:?}",
+            syms
+        );
     }
 
     #[test]
