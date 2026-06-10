@@ -5685,7 +5685,8 @@ fn collect_undefined_variables_from_snapshot(
     };
 
     let package_loader_call_end_offsets = collect_package_loader_call_end_offsets(text);
-    let random_seed_initializer_end_offsets = collect_random_seed_initializer_end_offsets(text);
+    let random_seed_initializer_end_offsets =
+        collect_random_seed_initializer_end_offsets(node, text);
 
     let hoist_globals = snapshot.cross_file_config.hoist_globals_in_functions;
     let local_opt: Option<(HashSet<String>, scope::FunctionScopeTree)> =
@@ -12394,11 +12395,31 @@ fn collect_package_loader_call_end_offsets(text: &str) -> Vec<usize> {
 }
 
 /// Pre-compute end byte offsets for calls that materialize `.Random.seed`.
-fn collect_random_seed_initializer_end_offsets(text: &str) -> Vec<usize> {
-    let mut end_offsets: Vec<usize> = text
-        .match_indices("set.seed(")
-        .map(|(idx, pattern)| idx + pattern.len())
-        .collect();
+///
+/// Walks parsed `call` nodes (rather than scanning raw text) whose callee is
+/// `set.seed` or `base::set.seed`, recording the callee's end byte offset. The
+/// callee end is the latest offset guaranteed to precede the `(`, which keeps
+/// the consumer's "initializer token ends before the usage starts" semantics
+/// (`has_prior_token_end` against `usage_node.start_byte()`).
+///
+/// Because it consults the parse tree, a `set.seed(` appearing inside a comment
+/// or string literal is excluded by construction: such text is never a `call`
+/// node, so it cannot count as an initializer (review feedback P2).
+fn collect_random_seed_initializer_end_offsets(node: Node, text: &str) -> Vec<usize> {
+    let mut end_offsets: Vec<usize> = Vec::new();
+    let mut cursor = node.walk();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call"
+            && let Some(func) = current.child_by_field_name("function")
+        {
+            let callee = node_text(func, text);
+            if callee == "set.seed" || callee == "base::set.seed" {
+                end_offsets.push(func.end_byte());
+            }
+        }
+        stack.extend(current.children(&mut cursor));
+    }
     end_offsets.sort_unstable();
     end_offsets.dedup();
     end_offsets
@@ -22824,6 +22845,107 @@ clean_data <- function(x) {
                 .iter()
                 .any(|m| m == "Undefined variable: .Random.seed"),
             "`.Random.seed` before set.seed() must be reported; messages: {messages:?}"
+        );
+    }
+
+    /// A `set.seed(` that appears only inside a comment is not a real
+    /// initializer call, so a later `.Random.seed` read must still flag.
+    /// Guards against the raw-substring scan counting commented text.
+    #[test]
+    fn test_diagnostic_reports_random_seed_after_commented_set_seed() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "# set.seed(1)\ns <- .Random.seed\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: .Random.seed"),
+            "a commented-out `set.seed(` must not suppress `.Random.seed`; messages: {messages:?}"
+        );
+    }
+
+    /// A `set.seed(` that appears only inside a string literal is not a real
+    /// initializer call, so a later `.Random.seed` read must still flag.
+    #[test]
+    fn test_diagnostic_reports_random_seed_after_stringified_set_seed() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "x <- \"set.seed(1)\"\ns <- .Random.seed\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: .Random.seed"),
+            "a stringified `set.seed(` must not suppress `.Random.seed`; messages: {messages:?}"
+        );
+    }
+
+    /// A namespaced `base::set.seed()` call is a real initializer, so a later
+    /// `.Random.seed` read must be suppressed just like the bare form.
+    #[test]
+    fn test_diagnostic_suppresses_random_seed_after_namespaced_set_seed() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "base::set.seed(42)\ns <- .Random.seed\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains(".Random.seed")),
+            "`.Random.seed` after base::set.seed() must be treated as initialized; messages: {messages:?}"
         );
     }
 
