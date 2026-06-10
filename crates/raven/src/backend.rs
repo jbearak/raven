@@ -6277,10 +6277,7 @@ impl Backend {
             let workspace_index_version = state.workspace_index_new.version();
 
             // Capture system.file() resolution inputs for post-enrich resolve
-            let ws = state.package_state.workspace();
-            let ws_name = ws.map(|w| w.name.as_str().to_owned());
-            let ws_root = ws.map(|w| w.root.clone());
-            let lib_paths = state.package_library.lib_paths().to_vec();
+            let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
 
             (
                 workspace_root,
@@ -6639,10 +6636,7 @@ impl Backend {
             let workspace_index_version = state.workspace_index_new.version();
 
             // Capture system.file() resolution inputs for post-enrich resolve
-            let ws = state.package_state.workspace();
-            let ws_name = ws.map(|w| w.name.as_str().to_owned());
-            let ws_root = ws.map(|w| w.root.clone());
-            let lib_paths = state.package_library.lib_paths().to_vec();
+            let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
 
             (
                 workspace_root,

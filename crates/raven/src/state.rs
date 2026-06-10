@@ -526,6 +526,20 @@ impl WorldState {
         );
         self.package_state.set_from(new_package_state);
     }
+
+    /// Snapshot the owned inputs `resolve_system_file_sources` needs (workspace
+    /// name + root, and the library search paths) so a caller can drop the state
+    /// lock before resolving system.file() source edges (AGENTS.md locking
+    /// discipline: never hold the WorldState lock across cross-file resolution).
+    pub(crate) fn snapshot_system_file_inputs(
+        &self,
+    ) -> (Option<String>, Option<PathBuf>, Vec<PathBuf>) {
+        let ws = self.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str().to_owned());
+        let ws_root = ws.map(|w| w.root.clone());
+        let lib_paths = self.package_library.lib_paths().to_vec();
+        (ws_name, ws_root, lib_paths)
+    }
 }
 
 impl Default for WorldState {
