@@ -66,6 +66,15 @@ impl DiagCancelToken {
     }
 }
 
+fn reference_class_field_accessor_matches(field: &str, name: &str) -> bool {
+    let mut chars = field.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let suffix = format!("{}{}", first.to_ascii_uppercase(), chars.as_str());
+    name == format!("get{suffix}") || name == format!("set{suffix}")
+}
+
 // ============================================================================
 // Diagnostics Snapshot
 // ============================================================================
@@ -185,6 +194,16 @@ impl DiagnosticsSnapshot {
             .map(std::sync::Arc::unwrap_or_clone)
             .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
         let metadata_elapsed = build_start.elapsed();
+
+        // F2 Step 4: chunk-level suppression for Rmd/Quarto. The chunk header
+        // (which carries `raven.ignore=...`) is blanked in the masked analysis
+        // `text`, so derive chunk suppression ranges from the RAW document text
+        // and merge them into this snapshot's owned `directive_meta`. Safe to
+        // mutate here: `directive_meta` is a deep-cloned/owned copy, not the
+        // shared cached `Arc`.
+        if doc.is_rmd_document() {
+            crate::chunks::append_chunk_suppressions(&mut directive_meta, &doc.text());
+        }
 
         // Compute inherited working directory if needed
         if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
@@ -421,10 +440,35 @@ pub(crate) fn diagnostics_from_snapshot(
 
     let mut diagnostics = Vec::new();
 
+    // F2 Step 3: the `unused-suppression` sweep. Active when any `expect`
+    // directive is present (always reported) OR the project-wide
+    // `reportUnusedSuppressions` setting is on (reports every ignore too). When
+    // inactive (the common case) the collectors take their normal fast path and
+    // record nothing.
+    let report_unused_all = snapshot.cross_file_config.report_unused_suppressions;
+    let has_expect = snapshot
+        .directive_meta
+        .suppression_directives
+        .iter()
+        .any(|d| d.flavor == crate::cross_file::types::SuppressionFlavor::Expect);
+    let track_unused = report_unused_all || has_expect;
+    // (line, kebab-code) pairs that were actually suppressed across both tracks.
+    let mut suppressed_pairs: Vec<(u32, String)> = Vec::new();
+
     // Fast collectors (no scope resolution needed)
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
-    collect_invalid_assignment_targets(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+    collect_invalid_assignment_targets(
+        snapshot.tree.root_node(),
+        &snapshot.text,
+        is_package_data_file(uri),
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
 
     // Semantic checks: always-on rules that flag likely-wrong code regardless
     // of the style-lint master switch.
@@ -494,7 +538,15 @@ pub(crate) fn diagnostics_from_snapshot(
     collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
 
     // Missing package diagnostics
-    collect_missing_package_diagnostics_from_snapshot(snapshot, &mut diagnostics);
+    collect_missing_package_diagnostics_from_snapshot(
+        snapshot,
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
 
     // Redundant directive diagnostics
     collect_redundant_directive_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
@@ -524,6 +576,11 @@ pub(crate) fn diagnostics_from_snapshot(
         &mut diagnostics,
         &mut scope_cache,
         cancel,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
     );
 
     if cancel.is_cancelled() {
@@ -545,6 +602,11 @@ pub(crate) fn diagnostics_from_snapshot(
             &mut diagnostics,
             &mut scope_cache,
             cancel,
+            if track_unused {
+                Some(&mut suppressed_pairs)
+            } else {
+                None
+            },
         );
     }
 
@@ -562,6 +624,56 @@ pub(crate) fn diagnostics_from_snapshot(
         scope_start.elapsed().as_millis(),
         scope_cache.len(),
     );
+
+    // F2 Step 4: range- and file-level suppressions (`# raven: ignore-start/end`,
+    // `ignore-file`, and chunk-level `raven.ignore` / `# raven: ignore-chunk`)
+    // live in `directive_meta.ignored_ranges` / `ignored_file`. The
+    // undefined-variable / missing-package collectors consult them inline, but
+    // the lint track's `nolint` parser and the AST `assign-to-string-literal`
+    // collector do not. Apply them here as a final filter (see
+    // `linting::range_or_file_suppresses`, which is restricted to the
+    // suppressible lint + analyzer codes) so a suppressed chunk/block/file
+    // silences every suppressible diagnostic. Inline-dropped diagnostics are no
+    // longer in the list, so this only removes the ones the inline paths missed.
+    {
+        let meta = &snapshot.directive_meta;
+        if !meta.ignored_ranges.is_empty() || meta.ignored_file.is_some() {
+            diagnostics.retain(|d| {
+                let Some(NumberOrString::String(raw_code)) = &d.code else {
+                    return true;
+                };
+                let line = d.range.start.line;
+                if crate::linting::range_or_file_suppresses(meta, line, raw_code) {
+                    if track_unused {
+                        suppressed_pairs.push((line, crate::diagnostic_code::normalize(raw_code)));
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    // F2 Step 3: complete the `unused-suppression` sweep. The analyzer track
+    // already captured its suppressed pairs into `suppressed_pairs`; add the
+    // lint track's (recomputed raw, then filtered by the lint suppression map)
+    // and emit a HINT for every directive that suppressed nothing.
+    if track_unused {
+        suppressed_pairs.extend(crate::linting::suppressed_lint_pairs(
+            &snapshot.text,
+            snapshot.tree.root_node(),
+            &snapshot.lint_config,
+            snapshot.cross_file_config.mixed_logical_severity,
+            snapshot.cross_file_config.condition_assignment_severity,
+        ));
+        collect_unused_suppression_diagnostics(
+            &snapshot.directive_meta.suppression_directives,
+            &suppressed_pairs,
+            report_unused_all,
+            &mut diagnostics,
+        );
+    }
 
     Some(diagnostics)
 }
@@ -4190,9 +4302,11 @@ fn collect_legacy_ast_symbols(
 /// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
 ///
 /// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
-/// skips declared (virtual) symbols such as `@lsp-var`/`@lsp-func`, and maps internal symbol kinds
-/// to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation` with the
-/// provided `file_uri` and the symbol's definition position.
+/// restricts results to the file's **top-level** live exports (function-locals are excluded — see
+/// the [`ScopeArtifacts::exported_interface`] footgun), skips declared (virtual) symbols such as
+/// `@lsp-var`/`@lsp-func`, and maps internal symbol kinds to LSP `SymbolKind` values. Each matched
+/// symbol is appended as a `SymbolInformation` with the provided `file_uri` and the symbol's
+/// definition position.
 ///
 /// - `file_uri`: URI to assign to each returned `SymbolInformation`.
 /// - `artifacts`: Precomputed `ScopeArtifacts` containing `exported_interface`.
@@ -4208,8 +4322,17 @@ fn collect_workspace_symbols_from_artifacts(
 ) {
     let container_name = extract_container_name(file_uri);
 
+    // F3: Cmd+T surfaces a file's cross-file-visible interface, not its
+    // function-locals. Restrict to top-level live exports (rm-aware) rather
+    // than the scope-blind `exported_interface` map.
+    let top_level = crate::cross_file::scope::live_top_level_exports(artifacts);
+
     for scoped_symbol in artifacts.exported_interface.values() {
         if !scoped_symbol.name.to_lowercase().contains(lower_query) {
+            continue;
+        }
+
+        if !top_level.contains(scoped_symbol.name.as_ref()) {
             continue;
         }
 
@@ -4463,6 +4586,14 @@ async fn collect_missing_file_diagnostics_standalone(
     let mut paths_to_check: Vec<(std::path::PathBuf, String, u32, u32, bool, bool)> = Vec::new();
 
     for source in &meta.sources {
+        // system.file() sources never carry a literal path to diagnose: a
+        // resolved one points outside the workspace (skip), and an unresolved
+        // one (e.g. an uninstalled package, or branch-2 resolution deferred
+        // while lib_paths is empty) has an empty `path` and must degrade
+        // silently rather than emit a spurious "Cannot resolve path: ''".
+        if source.resolved_uri.is_some() || source.system_file.is_some() {
+            continue;
+        }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
             crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
@@ -4545,6 +4676,9 @@ async fn collect_missing_file_diagnostics_standalone(
                     },
                     severity: Some(missing_file_severity),
                     message: format!("Path is outside workspace: '{}'", directive.path),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                    )),
                     ..Default::default()
                 });
                 continue;
@@ -4566,6 +4700,9 @@ async fn collect_missing_file_diagnostics_standalone(
                 },
                 severity: Some(missing_file_severity),
                 message: format!("Cannot resolve parent path: '{}'", directive.path),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
                 ..Default::default()
             });
         }
@@ -4606,6 +4743,9 @@ async fn collect_missing_file_diagnostics_standalone(
                     },
                     severity: Some(missing_file_severity),
                     message: format!("Parent file not found: '{}'", path_str),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                    )),
                     ..Default::default()
                 });
             } else {
@@ -4628,6 +4768,9 @@ async fn collect_missing_file_diagnostics_standalone(
                     },
                     severity: Some(missing_file_severity),
                     message,
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                    )),
                     ..Default::default()
                 });
             }
@@ -4764,6 +4907,14 @@ fn collect_missing_file_diagnostics_from_snapshot(
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
 
     for source in &meta.sources {
+        // system.file() sources never carry a literal path to diagnose: a
+        // resolved one points outside the workspace (skip), and an unresolved
+        // one (e.g. an uninstalled package, or branch-2 resolution deferred
+        // while lib_paths is empty) has an empty `path` and must degrade
+        // silently rather than emit a spurious "Cannot resolve path: ''".
+        if source.resolved_uri.is_some() || source.system_file.is_some() {
+            continue;
+        }
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
             crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
@@ -4789,6 +4940,9 @@ fn collect_missing_file_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message,
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
                 ..Default::default()
             });
         }
@@ -4806,6 +4960,9 @@ fn collect_missing_file_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message: format!("Cannot resolve parent path: '{}'", sourced_by.path),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
                 ..Default::default()
             });
         }
@@ -4815,6 +4972,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
 fn collect_missing_package_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
     if !snapshot.cross_file_config.packages_enabled {
         return;
@@ -4836,20 +4994,97 @@ fn collect_missing_package_diagnostics_from_snapshot(
     };
 
     for lib_call in &snapshot.directive_meta.library_calls {
-        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, lib_call.line) {
+        // Confirm the package is actually missing *before* consulting the
+        // suppression directive, so the `unused-suppression` sweep records a
+        // hit only when there was a real diagnostic to suppress (F2 Step 3).
+        if snapshot.package_library.package_exists(&lib_call.package) {
             continue;
         }
-        if !snapshot.package_library.package_exists(&lib_call.package) {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(lib_call.line, 0),
-                    end: Position::new(lib_call.line, lib_call.column),
-                },
-                severity: Some(severity),
-                message: format!("Package '{}' is not installed", lib_call.package),
-                ..Default::default()
-            });
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            lib_call.line,
+            Some(crate::diagnostic_code::PACKAGE_NOT_INSTALLED),
+        ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    lib_call.line,
+                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+                ));
+            }
+            continue;
         }
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(lib_call.line, 0),
+                end: Position::new(lib_call.line, lib_call.column),
+            },
+            severity: Some(severity),
+            message: format!("Package '{}' is not installed", lib_call.package),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+}
+
+/// F2 Step 3: emit `unused-suppression` (HINT) diagnostics for suppression
+/// directives that suppressed nothing.
+///
+/// `suppressed` is the set of `(line, kebab-code)` pairs actually removed by
+/// suppression across both the analyzer and lint tracks. A directive is "used"
+/// iff some suppressed pair falls on a line it covers and carries a code its
+/// `what` covers. An unused `Expect` is always reported; an unused `Ignore` is
+/// reported only when `report_all` (the `reportUnusedSuppressions` setting) is
+/// enabled. The hint is anchored at the directive's own line.
+fn collect_unused_suppression_diagnostics(
+    directives: &[crate::cross_file::types::SuppressionDirective],
+    suppressed: &[(u32, String)],
+    report_all: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use crate::cross_file::types::SuppressionFlavor;
+    for directive in directives {
+        let report = report_all || directive.flavor == SuppressionFlavor::Expect;
+        if !report {
+            continue;
+        }
+        // Skip directives that target only non-suppressible codes — they can
+        // never match anything, so "unused" is misleading (it's "not applicable").
+        if let crate::cross_file::types::LineSuppression::Codes(ref cs) = directive.what
+            && !cs
+                .iter()
+                .any(|c| crate::diagnostic_code::is_suppressible(c))
+        {
+            continue;
+        }
+        let used = suppressed
+            .iter()
+            .any(|(line, code)| directive.covers_line(*line) && directive.what.covers(Some(code)));
+        if used {
+            continue;
+        }
+        let message = match directive.flavor {
+            SuppressionFlavor::Expect => {
+                "Unused `expect` suppression: no matching diagnostic was suppressed here."
+                    .to_string()
+            }
+            SuppressionFlavor::Ignore => {
+                "Unused suppression: no matching diagnostic was suppressed here.".to_string()
+            }
+        };
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(directive.directive_line, 0),
+                end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
+            },
+            severity: Some(DiagnosticSeverity::HINT),
+            message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNUSED_SUPPRESSION.to_string(),
+            )),
+            ..Default::default()
+        });
     }
 }
 
@@ -4893,6 +5128,10 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
     }
 }
 
+// Collector wired into the diagnostics pipeline; the argument list mirrors the
+// sibling collectors (snapshot/uri/node/text/out/cache/cancel) plus the F2
+// unused-suppression sink. Splitting it into a struct would not aid clarity.
+#[allow(clippy::too_many_arguments)]
 fn collect_out_of_scope_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -4901,6 +5140,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
     cancel: &DiagCancelToken,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
     let Some(severity) = snapshot.cross_file_config.out_of_scope_severity else {
         return;
@@ -5071,7 +5311,16 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             return;
         }
 
-        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, *usage_line) {
+        // Whether this usage's line carries a suppression covering
+        // undefined-variable. When not tracking unused suppressions we skip
+        // immediately (fast path); when tracking we proceed so the directive's
+        // usage can be recorded at the would-be push site (F2 Step 3).
+        let suppressed_line = crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            *usage_line,
+            Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
+        );
+        if suppressed_line && suppressed_out.is_none() {
             continue;
         }
         if is_reserved_word(name) {
@@ -5182,19 +5431,31 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             let end_col =
                 byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
 
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(*usage_line, start_col),
-                    end: Position::new(usage_node.end_position().row as u32, end_col),
-                },
-                severity: Some(severity),
-                message: format!(
-                    "'{}' is used before it's available (sourced on line {})",
-                    name,
-                    source.line + 1
-                ),
-                ..Default::default()
-            });
+            if suppressed_line {
+                if let Some(out) = suppressed_out.as_deref_mut() {
+                    out.push((
+                        *usage_line,
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    ));
+                }
+            } else {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position::new(*usage_line, start_col),
+                        end: Position::new(usage_node.end_position().row as u32, end_col),
+                    },
+                    severity: Some(severity),
+                    message: format!(
+                        "'{}' is used before it's available (sourced on line {})",
+                        name,
+                        source.line + 1
+                    ),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    )),
+                    ..Default::default()
+                });
+            }
             break;
         }
     }
@@ -5206,7 +5467,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 /// packages. Deliberately file-level rather than position-aware — the
 /// conservative "unresolved callee suppresses its arguments" fallback keeps the
 /// approximation safe.
-fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
+fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
     let mut packages: HashSet<String> = HashSet::new();
     let mut attached_packages_for_meta: HashSet<String> = HashSet::new();
     for call in &snapshot.directive_meta.library_calls {
@@ -5224,6 +5485,104 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot) -> Vec<String> {
             attached_packages_for_meta.insert(package.clone());
         }
         packages.insert(package);
+    }
+    // Include packages loaded by ancestor files in the cross-file source chain.
+    // Without this, a child file inheriting `dplyr` from a parent would not get
+    // NSE suppression for verbs like `filter` that shadow base/stats exports.
+    // Also include packages loaded by forward-sourced files (files this file
+    // sources), since `source("loader.R")` where loader.R has `library(dplyr)`
+    // makes dplyr available in the calling file after the source() point.
+    //
+    // This is TWO separate directional passes, NOT one undirected walk:
+    //   1. ancestors-only — follow `get_dependents` edges (edge.from = the
+    //      parent that sources `current`) transitively UP the chain.
+    //   2. descendants-only — follow `get_dependencies` edges (edge.to = the
+    //      child `current` sources) transitively DOWN the chain.
+    // Mixing the two onto one queue with a shared `visited` set lets the walk
+    // cross from a shared child back UP to that child's OTHER parents (an
+    // "uncle"/"sibling" file), so an unrelated sibling's `library()` would
+    // silently suppress genuine diagnostics in this file — a topology-dependent
+    // false negative. Keeping the passes separate, each with its own `visited`
+    // and bounds, confines collection to this file's true ancestor and
+    // descendant chains. (An ancestor's OTHER forward-sourced children — this
+    // file's siblings via a shared parent — are deliberately NOT included.)
+    {
+        let max_depth = snapshot.cross_file_config.max_chain_depth;
+        let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
+
+        let collect_libraries_from =
+            |meta_uri: &Url, packages: &mut HashSet<String>, attached: &mut HashSet<String>| {
+                if let Some(meta) = snapshot.metadata_map.get(meta_uri) {
+                    for call in &meta.library_calls {
+                        if call.package.is_empty() {
+                            continue;
+                        }
+                        let package = call.package.clone();
+                        if call.attaches {
+                            attached.insert(package.clone());
+                        }
+                        packages.insert(package);
+                    }
+                }
+            };
+
+        // Pass 1: ancestors-only (files that source this file, transitively).
+        {
+            let mut visited: HashSet<Url> = HashSet::new();
+            visited.insert(uri.clone());
+            let mut frontier: Vec<Url> = vec![uri.clone()];
+            for _ in 0..max_depth {
+                if frontier.is_empty() || visited.len() >= max_visited {
+                    break;
+                }
+                let mut next: Vec<Url> = Vec::new();
+                for current in &frontier {
+                    for edge in snapshot.cross_file_graph.get_dependents(current) {
+                        if visited.len() >= max_visited {
+                            break;
+                        }
+                        if visited.insert(edge.from.clone()) {
+                            collect_libraries_from(
+                                &edge.from,
+                                &mut packages,
+                                &mut attached_packages_for_meta,
+                            );
+                            next.push(edge.from.clone());
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
+
+        // Pass 2: descendants-only (files this file sources, transitively).
+        {
+            let mut visited: HashSet<Url> = HashSet::new();
+            visited.insert(uri.clone());
+            let mut frontier: Vec<Url> = vec![uri.clone()];
+            for _ in 0..max_depth {
+                if frontier.is_empty() || visited.len() >= max_visited {
+                    break;
+                }
+                let mut next: Vec<Url> = Vec::new();
+                for current in &frontier {
+                    for edge in snapshot.cross_file_graph.get_dependencies(current) {
+                        if visited.len() >= max_visited {
+                            break;
+                        }
+                        if visited.insert(edge.to.clone()) {
+                            collect_libraries_from(
+                                &edge.to,
+                                &mut packages,
+                                &mut attached_packages_for_meta,
+                            );
+                            next.push(edge.to.clone());
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
     }
     for pkg in snapshot.scope_contribution.full_imports.iter() {
         packages.insert(pkg.clone());
@@ -5265,6 +5624,7 @@ fn collect_undefined_variables_from_snapshot(
     diagnostics: &mut Vec<Diagnostic>,
     scope_cache: &mut HashMap<(u32, u32), scope::ScopeAtPosition>,
     cancel: &DiagCancelToken,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
     use crate::cross_file::config::BackwardDependencyMode;
     use crate::cross_file::types::byte_offset_to_utf16_column;
@@ -5287,7 +5647,7 @@ fn collect_undefined_variables_from_snapshot(
     // should be skipped) instead of blanket-suppressing every call-like
     // argument. Built once from the file's local definitions and the file/
     // workspace package context.
-    let in_play_packages = collect_in_play_packages(snapshot);
+    let in_play_packages = collect_in_play_packages(snapshot, uri);
     let nse_analysis = NseAnalysis::build(
         node,
         text,
@@ -5375,6 +5735,38 @@ fn collect_undefined_variables_from_snapshot(
             map
         })
         .unwrap_or_default();
+    // Precompute function-local definitions by name for the nested-closure
+    // late-binding check. A closure body can textually reference a binding that
+    // is installed later in an enclosing function before the closure is called
+    // (base::tryCatch's `tryCatchList` -> `tryCatchOne` is the motivating
+    // package-corpus case). Same-function forward uses remain diagnostics.
+    let function_defs_by_name: HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> =
+        snapshot
+            .artifacts_map
+            .get(uri)
+            .map(|artifacts| {
+                let mut map: HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>> =
+                    HashMap::new();
+                for event in &artifacts.timeline {
+                    if let scope::ScopeEvent::Def {
+                        symbol,
+                        function_scope: Some(function_scope),
+                        ..
+                    } = event
+                    {
+                        map.entry(symbol.name.to_string()).or_default().push((
+                            *function_scope,
+                            symbol.defined_line,
+                            symbol.defined_column,
+                        ));
+                    }
+                }
+                for defs in map.values_mut() {
+                    defs.sort_by_key(|(_, line, col)| (*line, *col));
+                }
+                map
+            })
+            .unwrap_or_default();
 
     let parent_symbol_names: HashSet<String> = {
         scope_cache
@@ -5466,11 +5858,38 @@ fn collect_undefined_variables_from_snapshot(
 
         let usage_line = usage_node.start_position().row as u32;
 
-        if crate::cross_file::directive::is_line_ignored(&snapshot.directive_meta, usage_line) {
+        // Whether this usage's line carries a suppression covering
+        // undefined-variable. Fast path skips immediately when not tracking
+        // unused suppressions; when tracking we proceed so a real suppressed
+        // diagnostic can be recorded at the would-be push site (F2 Step 3).
+        let suppressed_line = crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            usage_line,
+            Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
+        );
+        if suppressed_line && suppressed_out.is_none() {
+            continue;
+        }
+        let unquoted_usage_name = unquote_backtick_name(&name).map(str::to_string);
+        let replacement_function_name = replacement_function_name_for_lhs_call(&name, usage_node);
+        if replacement_function_name.as_deref().is_some_and(is_builtin) {
             continue;
         }
 
         if is_builtin(&name) {
+            continue;
+        }
+        if is_implicit_search_path_binding(&name) {
+            continue;
+        }
+        if is_s3_method_special_variable_usage(usage_node, text, &name) {
+            continue;
+        }
+        if is_reference_class_method_special_variable_usage(usage_node, text, &name, &nse_analysis)
+        {
+            continue;
+        }
+        if is_r6_method_special_variable_usage(usage_node, text, &name, &top_level_defs_by_name) {
             continue;
         }
 
@@ -5503,6 +5922,34 @@ fn collect_undefined_variables_from_snapshot(
         if parent_symbol_names.contains(name.as_str()) {
             continue;
         }
+        if unquoted_usage_name
+            .as_deref()
+            .is_some_and(|unquoted| parent_symbol_names.contains(unquoted))
+        {
+            continue;
+        }
+
+        if default_expression_resolves_lazily(
+            usage_node,
+            text,
+            &name,
+            usage_line,
+            usage_col_utf16,
+            &top_level_defs_by_name,
+        ) {
+            continue;
+        }
+        if let Some((_, function_scope_tree)) = &local_opt
+            && nested_closure_late_binding_resolves(
+                &name,
+                usage_line,
+                usage_col_utf16,
+                function_scope_tree,
+                &function_defs_by_name,
+            )
+        {
+            continue;
+        }
 
         // Advance the stream cursor and query visibility. Fall back to
         // the legacy snapshot.get_scope path if stream construction
@@ -5514,7 +5961,12 @@ fn collect_undefined_variables_from_snapshot(
             // `symbol_for` walk is cheaper than materializing a full
             // ScopeAtPosition because it short-circuits on the first
             // matching frame.
-            if let Some(sym) = stream.symbol_for(&name)
+            let stream_symbol = stream.symbol_for(&name).or_else(|| {
+                unquoted_usage_name
+                    .as_deref()
+                    .and_then(|unquoted| stream.symbol_for(unquoted))
+            });
+            if let Some(sym) = stream_symbol
                 && !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16)
             {
                 continue;
@@ -5541,6 +5993,30 @@ fn collect_undefined_variables_from_snapshot(
         // before the snapshot materialization).
         if stream_opt.is_none()
             && let Some(sym) = scope.symbols.get(name.as_str())
+            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+        {
+            continue;
+        }
+        if stream_opt.is_none()
+            && let Some(sym) = unquoted_usage_name
+                .as_deref()
+                .and_then(|unquoted| scope.symbols.get(unquoted))
+            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+        {
+            continue;
+        }
+        let replacement_backtick_name = replacement_function_name
+            .as_ref()
+            .map(|name| format!("`{name}`"));
+        let replacement_symbol = replacement_function_name
+            .as_deref()
+            .and_then(|name| scope.symbols.get(name))
+            .or_else(|| {
+                replacement_backtick_name
+                    .as_deref()
+                    .and_then(|name| scope.symbols.get(name))
+            });
+        if let Some(sym) = replacement_symbol
             && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
         {
             continue;
@@ -5661,6 +6137,16 @@ fn collect_undefined_variables_from_snapshot(
             None => format!("Undefined variable: {}", name),
         };
 
+        if suppressed_line {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    usage_line,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                ));
+            }
+            continue;
+        }
+
         diagnostics.push(Diagnostic {
             range: Range {
                 start: Position::new(usage_node.start_position().row as u32, start_col),
@@ -5668,6 +6154,9 @@ fn collect_undefined_variables_from_snapshot(
             },
             severity: Some(severity),
             message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
             ..Default::default()
         });
     }
@@ -5706,6 +6195,27 @@ fn assignment_target_node(binop: Node) -> Option<Node> {
         "->" | "->>" => binop.child_by_field_name("rhs"),
         _ => None,
     }
+}
+
+/// If `name` is the call head in replacement syntax (`name(x) <- value`),
+/// return the actual binding R resolves (`name<-`).
+fn replacement_function_name_for_lhs_call(name: &str, node: Node) -> Option<String> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let call = node.parent().filter(|parent| parent.kind() == "call")?;
+    if call
+        .child_by_field_name("function")
+        .is_none_or(|function| function.id() != node.id())
+    {
+        return None;
+    }
+    let parent = call
+        .parent()
+        .filter(|parent| parent.kind() == "binary_operator")?;
+    assignment_target_node(parent)
+        .is_some_and(|target| target.id() == call.id())
+        .then(|| format!("{name}<-"))
 }
 
 /// Returns true for the *non-definition* structural non-references: identifiers
@@ -5871,6 +6381,127 @@ fn containing_default_parameter(node: Node) -> Option<Node> {
         current = parent;
     }
     None
+}
+
+/// True when a default-expression identifier can be resolved only through R's
+/// lazy default-argument semantics, rather than by ordinary source-order scope.
+///
+/// Defaults are promises evaluated in the eventual call frame, not when the
+/// function is defined. That means two otherwise-forward references are valid:
+/// a top-level helper declared later in the same file, and a binding created in
+/// the containing function body before the promise is forced. This is still
+/// evidence-based: a genuinely missing default name remains diagnosable.
+fn default_expression_resolves_lazily(
+    node: Node,
+    text: &str,
+    name: &str,
+    usage_line: u32,
+    usage_col_utf16: u32,
+    top_level_defs_by_name: &HashMap<String, Vec<(u32, u32)>>,
+) -> bool {
+    if containing_default_parameter(node).is_none() {
+        return false;
+    }
+
+    if top_level_defs_by_name.get(name).is_some_and(|positions| {
+        positions
+            .iter()
+            .any(|&(line, col)| (line, col) > (usage_line, usage_col_utf16))
+    }) {
+        return true;
+    }
+
+    containing_function_definition(node)
+        .and_then(function_body_node)
+        .is_some_and(|body| function_body_binds_name(body, text, name))
+}
+
+/// True when a usage inside a nested closure can resolve `name` from a later
+/// binding in an active enclosing function scope.
+///
+/// This intentionally excludes same-function forward uses: `f <- function() {
+/// later(); later <- function() 1 }` still runs `later()` before the binding is
+/// installed. It only covers nested closures whose body is textually before a
+/// sibling binding in an enclosing function, because R resolves closure free
+/// variables at call time through that enclosing environment.
+fn nested_closure_late_binding_resolves(
+    name: &str,
+    usage_line: u32,
+    usage_col_utf16: u32,
+    function_scope_tree: &scope::FunctionScopeTree,
+    function_defs_by_name: &HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>>,
+) -> bool {
+    let active_scopes =
+        function_scope_tree.query_point(scope::Position::new(usage_line, usage_col_utf16));
+    if active_scopes.len() < 2 {
+        return false;
+    }
+    let Some(innermost) = innermost_function_scope(&active_scopes) else {
+        return false;
+    };
+    function_defs_by_name.get(name).is_some_and(|defs| {
+        defs.iter().any(|(def_scope, def_line, def_col)| {
+            (*def_line, *def_col) > (usage_line, usage_col_utf16)
+                && *def_scope != innermost
+                && function_scope_contains(*def_scope, innermost)
+        })
+    })
+}
+
+fn innermost_function_scope(
+    scopes: &[scope::FunctionScopeInterval],
+) -> Option<scope::FunctionScopeInterval> {
+    scopes.iter().copied().find(|candidate| {
+        !scopes
+            .iter()
+            .any(|other| *other != *candidate && function_scope_contains(*candidate, *other))
+    })
+}
+
+fn function_scope_contains(
+    ancestor: scope::FunctionScopeInterval,
+    descendant: scope::FunctionScopeInterval,
+) -> bool {
+    ancestor.start <= descendant.start && descendant.end <= ancestor.end
+}
+
+fn containing_function_definition(node: Node) -> Option<Node> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
+fn function_body_binds_name(node: Node, text: &str, name: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "function_definition" {
+            continue;
+        }
+
+        if assignment_target_node(child)
+            .is_some_and(|target| target.kind() == "identifier" && node_text(target, text) == name)
+        {
+            return true;
+        }
+
+        if child.kind() == "for_statement"
+            && child
+                .child_by_field_name("variable")
+                .is_some_and(|var| var.kind() == "identifier" && node_text(var, text) == name)
+        {
+            return true;
+        }
+
+        if function_body_binds_name(child, text, name) {
+            return true;
+        }
+    }
+    false
 }
 
 fn parameter_node_name<'a>(node: Node<'a>, text: &'a str) -> Option<&'a str> {
@@ -6503,6 +7134,9 @@ fn collect_syntax_errors_inner(
                     range: diag.range,
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: diag.message,
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                    )),
                     ..Default::default()
                 });
             }
@@ -6512,6 +7146,9 @@ fn collect_syntax_errors_inner(
                     range: minimize_error_range(node, text),
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: "Syntax error".to_string(),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                    )),
                     ..Default::default()
                 });
             }
@@ -6521,6 +7158,9 @@ fn collect_syntax_errors_inner(
                         range: diag.range,
                         severity: Some(DiagnosticSeverity::ERROR),
                         message: diag.message,
+                        code: Some(NumberOrString::String(
+                            crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                        )),
                         ..Default::default()
                     });
                 }
@@ -6552,6 +7192,9 @@ fn collect_syntax_errors_inner(
                             k.opener_str(),
                             k.closer_str(),
                         ),
+                        code: Some(NumberOrString::String(
+                            crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                        )),
                         ..Default::default()
                     });
                 } else {
@@ -6588,6 +7231,9 @@ fn collect_syntax_errors_inner(
             },
             severity: Some(DiagnosticSeverity::ERROR),
             message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+            )),
             ..Default::default()
         });
     }
@@ -7310,6 +7956,140 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
          For assignment use `<-`; for a pipeline use `|>` (R 4.1+) or `%>%`."
             .to_string(),
     )
+}
+
+#[cfg(test)]
+mod unused_suppression_tests {
+    use super::collect_unused_suppression_diagnostics;
+    use crate::cross_file::types::{LineSuppression, SuppressionDirective, SuppressionFlavor};
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+
+    fn directive(
+        line: u32,
+        what: LineSuppression,
+        flavor: SuppressionFlavor,
+    ) -> SuppressionDirective {
+        SuppressionDirective {
+            directive_line: line,
+            target_start: line,
+            target_end: line,
+            what,
+            flavor,
+        }
+    }
+
+    fn unused_codes(diags: &[Diagnostic]) -> Vec<u32> {
+        diags
+            .iter()
+            .filter(|d| {
+                matches!(&d.code, Some(NumberOrString::String(c)) if c == crate::diagnostic_code::UNUSED_SUPPRESSION)
+            })
+            .map(|d| d.range.start.line)
+            .collect()
+    }
+
+    #[test]
+    fn used_expect_is_not_reported() {
+        let dirs = vec![directive(
+            2,
+            LineSuppression::Codes(vec!["undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let suppressed = vec![(2u32, "undefined-variable".to_string())];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &suppressed, false, &mut out);
+        assert!(unused_codes(&out).is_empty());
+    }
+
+    #[test]
+    fn unused_expect_is_reported_as_hint() {
+        let dirs = vec![directive(
+            5,
+            LineSuppression::Codes(vec!["undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert_eq!(unused_codes(&out), vec![5]);
+        assert_eq!(out[0].severity, Some(DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn unused_ignore_is_silent_by_default_but_swept_when_enabled() {
+        let dirs = vec![directive(
+            3,
+            LineSuppression::All,
+            SuppressionFlavor::Ignore,
+        )];
+        // Default: ignore that suppressed nothing is silent.
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert!(unused_codes(&out).is_empty());
+        // Sweep on: now reported.
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], true, &mut out);
+        assert_eq!(unused_codes(&out), vec![3]);
+    }
+
+    #[test]
+    fn code_mismatch_counts_as_unused() {
+        // expect[line-length] but only an undefined-variable was suppressed on
+        // the line → the expect covered nothing it asked for.
+        let dirs = vec![directive(
+            1,
+            LineSuppression::Codes(vec!["line-length".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let suppressed = vec![(1u32, "undefined-variable".to_string())];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &suppressed, false, &mut out);
+        assert_eq!(unused_codes(&out), vec![1]);
+    }
+
+    #[test]
+    fn expect_non_suppressible_code_does_not_report_unused() {
+        // `# raven: expect[syntax-error]` targets a non-suppressible code —
+        // it can never match, so no unused-suppression should be emitted.
+        let dirs = vec![directive(
+            4,
+            LineSuppression::Codes(vec!["syntax-error".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert!(
+            unused_codes(&out).is_empty(),
+            "non-suppressible code should not produce unused-suppression"
+        );
+    }
+
+    #[test]
+    fn expect_suppressible_code_on_clean_line_still_reports_unused() {
+        // `# raven: expect[undefined-variable]` on a line with no diagnostic →
+        // still reports unused because the code IS suppressible.
+        let dirs = vec![directive(
+            7,
+            LineSuppression::Codes(vec!["undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert_eq!(unused_codes(&out), vec![7]);
+    }
+
+    #[test]
+    fn expect_mixed_codes_reports_unused_if_any_is_suppressible() {
+        // If at least one code is suppressible, the directive participates in
+        // the sweep (and reports unused if nothing matched).
+        let dirs = vec![directive(
+            9,
+            LineSuppression::Codes(vec!["syntax-error".into(), "undefined-variable".into()]),
+            SuppressionFlavor::Expect,
+        )];
+        let mut out = Vec::new();
+        collect_unused_suppression_diagnostics(&dirs, &[], false, &mut out);
+        assert_eq!(unused_codes(&out), vec![9]);
+    }
 }
 
 #[cfg(test)]
@@ -9916,7 +10696,7 @@ mod invalid_assignment_target_tests {
     fn collect(code: &str) -> Vec<Diagnostic> {
         let tree = parse_r(code);
         let mut diagnostics = Vec::new();
-        collect_invalid_assignment_targets(tree.root_node(), code, &mut diagnostics);
+        collect_invalid_assignment_targets(tree.root_node(), code, false, &mut diagnostics, None);
         diagnostics
     }
 
@@ -10232,6 +11012,26 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn raven_ignore_suppresses_diagnostic_on_ast_path() {
+        // F2: `# raven:` aliases on the analyzer AST suppression path.
+        assert_none("TRUE <- 1 # raven: ignore");
+        assert_none("TRUE <- 1 # raven: ignore[assign-to-string-literal]");
+        assert_none("# raven: ignore-next\nTRUE <- 1");
+    }
+
+    #[test]
+    fn code_selector_on_ast_path_targets_only_named_code() {
+        // F2: a `[code]` selector that does not name `assign-to-string-literal`
+        // must NOT suppress the assignment diagnostic.
+        let diags = collect("TRUE <- 1 # raven: ignore[line-length]");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        let diags = collect("TRUE <- 1 # @lsp-ignore[undefined-variable]");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        // The matching code (or a bare ignore) does suppress.
+        assert_none("TRUE <- 1 # @lsp-ignore[assign-to-string-literal]");
+    }
+
+    #[test]
     fn lsp_ignore_marker_requires_word_boundary() {
         // `@lsp-ignored` and `@lsp-ignore_foo` aren't the directive — must
         // not be picked up by substring matching.
@@ -10306,6 +11106,163 @@ mod invalid_assignment_target_tests {
         assert_eq!(diags[0].range.start.character, 7);
         assert_eq!(diags[0].range.end.character, 11);
     }
+
+    // ---- Idiomatic quoted-string LHS defining a function ----------------------
+
+    #[test]
+    fn string_lhs_with_function_rhs_not_flagged() {
+        // Quoted-string LHS defining a function is idiomatic R, semantically
+        // identical to the backtick form: S3 methods for syntactically
+        // invalid generics ("[.Surv"), replacement methods ("coef<-.varPower"),
+        // operators ('%+%'), and plain old-S-style definitions ("area").
+        assert_none("\"[.Surv\" <- function(x, i, drop = FALSE) x");
+        assert_none("\"coef<-.varPower\" <- function(object, value) object");
+        assert_none("\"area\" <- function(r) pi * r^2");
+        assert_none("'%+%' <- function(a, b) paste0(a, b)");
+        // R 4.1 backslash-lambda is a function_definition too.
+        assert_none("\"f\" <- \\(x) x + 1");
+        // All assignment spellings, not just `<-`.
+        assert_none("\"f\" = function(x) x");
+        assert_none("\"f\" <<- function(x) x");
+        assert_none("(function(x) x) -> \"f\"");
+    }
+
+    #[test]
+    fn string_lhs_with_parenthesized_function_rhs_not_flagged() {
+        assert_none("\"f\" <- (function(x) x)");
+        // Parens on both sides.
+        assert_none("(\"f\") <- (function(x) x)");
+    }
+
+    #[test]
+    fn chained_string_lhs_function_rhs_not_flagged() {
+        // nlme's R/newGenerics.R defines two generics in one statement:
+        // `"coef<-" <- "coefficients<-" <- function(...) ...`. The value of
+        // the outer assignment is the inner assignment, whose value is the
+        // function — both targets are function bindings.
+        assert_none(
+            "\"coef<-\" <- \"coefficients<-\" <- function(object, ..., value) UseMethod(\"coef<-\")",
+        );
+        // Chained through `=` and a backtick inner target too.
+        assert_none("\"f\" <- `g` <- function(x) x");
+    }
+
+    #[test]
+    fn chained_string_lhs_non_function_rhs_still_flagged() {
+        // Both string targets in a chained non-function assignment warn.
+        let diags = collect("\"a\" <- \"b\" <- 1");
+        assert_eq!(diags.len(), 2, "got {diags:?}");
+    }
+
+    #[test]
+    fn string_lhs_with_primitive_rhs_not_flagged() {
+        // `.Primitive(...)` always returns a function; R-core's methods
+        // package defines `"el<-" <- .Primitive("[[<-")` this way.
+        assert_none("\"el<-\" <- .Primitive(\"[[<-\")");
+    }
+
+    #[test]
+    fn string_lhs_with_other_call_rhs_still_flagged() {
+        // Arbitrary calls may or may not return functions — only the
+        // always-a-function `.Primitive` is exempt.
+        assert_one_with_severity(
+            "\"f\" <- match.fun(\"sum\")",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+    }
+
+    #[test]
+    fn string_lhs_with_function_rhs_inside_function_body_not_flagged() {
+        // Old-S-style local function definitions are the same idiom.
+        assert_none("outer <- function() {\n  \"helper\" <- function(x) x\n  helper(1)\n}");
+    }
+
+    #[test]
+    fn string_lhs_with_non_function_rhs_inside_function_body_still_flagged() {
+        assert_one_with_severity(
+            "f <- function() {\n  \"x\" <- 1\n}",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+    }
+
+    #[test]
+    fn dots_lhs_with_function_rhs_still_flagged() {
+        // The function-RHS exemption is for string-literal targets only;
+        // `... <- function(x) x` is still a binding the `...` accessors
+        // can't reach.
+        assert_one_with_severity(
+            "... <- function(x) x",
+            DiagnosticSeverity::WARNING,
+            "`...` accessors",
+        );
+    }
+
+    // ---- Package data/*.R files ------------------------------------------------
+
+    fn collect_in_data_file(code: &str) -> Vec<Diagnostic> {
+        let tree = parse_r(code);
+        let mut diagnostics = Vec::new();
+        collect_invalid_assignment_targets(tree.root_node(), code, true, &mut diagnostics, None);
+        diagnostics
+    }
+
+    #[test]
+    fn data_file_top_level_string_assign_not_flagged() {
+        // R-core datasets' canonical data/*.R form: `"iris" <- <value>` at
+        // top level registers the dataset object when `data()` sources the
+        // file.
+        let diags = collect_in_data_file("\"iris\" <- structure(list(), class = \"data.frame\")");
+        assert!(diags.is_empty(), "got {diags:?}");
+        let diags = collect_in_data_file("\"BJsales\" <- ts(c(1, 2, 3))");
+        assert!(diags.is_empty(), "got {diags:?}");
+    }
+
+    #[test]
+    fn data_file_nested_string_assign_still_flagged() {
+        // Only the top-level registration form is canonical; a string-target
+        // assignment inside a function body in a data file is as suspicious
+        // as anywhere else.
+        let diags = collect_in_data_file("f <- function() {\n  \"x\" <- 1\n}");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(diags[0].message.contains("string literal"));
+    }
+
+    #[test]
+    fn data_file_error_tier_targets_still_flagged() {
+        let diags = collect_in_data_file("TRUE <- 1");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn package_data_file_uri_detection() {
+        use super::is_package_data_file;
+        use tower_lsp::lsp_types::Url;
+        let yes = |s: &str| {
+            assert!(
+                is_package_data_file(&Url::parse(s).unwrap()),
+                "expected data file: {s}"
+            )
+        };
+        let no = |s: &str| {
+            assert!(
+                !is_package_data_file(&Url::parse(s).unwrap()),
+                "expected non-data file: {s}"
+            )
+        };
+        yes("file:///pkg/data/iris.R");
+        yes("file:///pkg/data/iris.r");
+        no("file:///pkg/R/iris.R");
+        // `data()` only sources files directly under data/, not subdirs.
+        no("file:///pkg/data/sub/iris.R");
+        // A file literally named data.R is not in a data/ directory.
+        no("file:///data.R");
+        // R requires the directory to be lowercase `data`.
+        no("file:///pkg/Data/iris.R");
+        no("file:///pkg/data/iris.csv");
+    }
 }
 
 /// Build a `DiagnosticsSnapshot` for an Rmd document inserted directly into
@@ -10365,6 +11322,28 @@ mod semantic_warning_pipeline_tests {
             .insert(uri.clone(), Document::new(code, None));
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
         (snapshot, uri)
+    }
+
+    /// Regression: a cross-package `source(system.file(..., package = "p"))`
+    /// for an uninstalled package, resolved with empty `lib_paths` (e.g. a
+    /// headless `raven check` with no R), leaves the source entry deferred
+    /// (`system_file` Some, empty `path`). It must degrade silently rather than
+    /// emit a spurious `Cannot resolve path: ''`. `WorldState::new()` has an
+    /// empty package library, so this reproduces the deferred-retain state
+    /// deterministically without depending on a local R installation.
+    #[test]
+    fn unresolved_system_file_source_emits_no_cannot_resolve_path() {
+        let code = "source(system.file(\"scripts/setup.R\", package = \"otherpkg\"))\nx <- 1\n";
+        let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.starts_with("Cannot resolve path")),
+            "unresolved system.file() must not produce a path diagnostic; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     /// Build a snapshot for a `.Rmd` document with the opt-in lint master switch
@@ -10488,6 +11467,36 @@ mod semantic_warning_pipeline_tests {
             diags.iter().any(|d| d.message.contains("==")),
             "condition_assignment must fire regardless of LintConfig::enabled; got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn data_file_uri_exempts_top_level_string_assign_through_pipeline() {
+        // The data/*.R exemption is keyed off the document URI at the
+        // `diagnostics_from_snapshot` call site (`is_package_data_file`), not
+        // inside `collect_invalid_assignment_targets` — so the collector unit
+        // tests cannot catch a regression in that wiring. Same content, two
+        // URIs: the canonical dataset registration form is exempt under
+        // data/, still flagged elsewhere.
+        let code = "\"iris\" <- structure(list(), class = \"data.frame\")\n";
+        let string_literal_count = |uri_str: &str| {
+            let (snapshot, uri) = build_rmd_snapshot(code, uri_str, |_| {});
+            let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+                .expect("diagnostics returned");
+            diags
+                .iter()
+                .filter(|d| d.message.contains("string literal"))
+                .count()
+        };
+        assert_eq!(
+            string_literal_count("file:///pkg/data/iris.R"),
+            0,
+            "top-level string assign in data/*.R must be exempt through the pipeline"
+        );
+        assert_eq!(
+            string_literal_count("file:///pkg/R/iris.R"),
+            1,
+            "same content outside data/ must still be flagged (control arm)"
         );
     }
 }
@@ -10704,6 +11713,13 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// `...` / `..N` accessors can't reach). Suppressible via `# @lsp-ignore`
 /// when the binding really is intentional.
 ///
+/// Two idiomatic string-target forms are exempt from the WARNING tier:
+/// a quoted-string target whose assigned value is a function definition
+/// (`"[.Surv" <- function(x, i) ...` — see [`is_function_definition_value`]),
+/// and, when `in_package_data_file` is set (see [`is_package_data_file`]),
+/// top-level string assignments — the canonical `data/*.R` dataset
+/// registration form (`"iris" <- <value>`).
+///
 /// Covers the LHS of `<-`, `<<-`, `=` and the RHS of `->`, `->>`. Cases
 /// tree-sitter reports as an `ERROR` node (`if <- 1`, `for <- 1`,
 /// `while <- 1`, `function <- 1`) are deliberately left to
@@ -10711,23 +11727,78 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// `=` inside a call (`f(name = value)`) is skipped, matching the existing
 /// assignment-operator lint's logic. `T <- FALSE` is **not** flagged: `T`
 /// and `F` are regular bindings, not reserved words.
-fn collect_invalid_assignment_targets(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+/// True when a document URI points at a top-level `data/*.R` file — the
+/// canonical place where R packages register datasets via the quoted-name
+/// form (`"iris" <- <value>`); `data()` sources exactly these files. Used to
+/// exempt that idiom from the assign-to-string-literal diagnostic.
+///
+/// Heuristic on the path alone (no filesystem access from the diagnostics
+/// path, so no DESCRIPTION check): the file's immediate parent directory must
+/// be literally `data` (R requires lowercase) and the extension `.R`/`.r`.
+/// Files in subdirectories of `data/` are not sourced by `data()` and don't
+/// qualify.
+fn is_package_data_file(uri: &Url) -> bool {
+    let Some(mut segments) = uri.path_segments() else {
+        return false;
+    };
+    let Some(file) = segments.next_back() else {
+        return false;
+    };
+    let Some(dir) = segments.next_back() else {
+        return false;
+    };
+    dir == "data"
+        && std::path::Path::new(file)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("r"))
+}
+
+fn collect_invalid_assignment_targets(
+    node: Node,
+    text: &str,
+    in_package_data_file: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
     let ignored = lsp_ignored_lines_from_tree(node, text);
-    collect_invalid_assignment_targets_inner(node, text, &ignored, diagnostics);
+    collect_invalid_assignment_targets_inner(
+        node,
+        text,
+        in_package_data_file,
+        &ignored,
+        diagnostics,
+        &mut suppressed_out,
+    );
 }
 
 fn collect_invalid_assignment_targets_inner(
     node: Node,
     text: &str,
-    ignored: &std::collections::HashSet<u32>,
+    in_package_data_file: bool,
+    ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
+    suppressed_out: &mut Option<&mut Vec<(u32, String)>>,
 ) {
     if node.kind() == "binary_operator" {
-        check_invalid_assignment_target(node, text, ignored, diagnostics);
+        check_invalid_assignment_target(
+            node,
+            text,
+            in_package_data_file,
+            ignored,
+            diagnostics,
+            suppressed_out,
+        );
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_invalid_assignment_targets_inner(child, text, ignored, diagnostics);
+        collect_invalid_assignment_targets_inner(
+            child,
+            text,
+            in_package_data_file,
+            ignored,
+            diagnostics,
+            suppressed_out,
+        );
     }
 }
 
@@ -10748,13 +11819,40 @@ fn collect_invalid_assignment_targets_inner(
 /// `# nolint: line_length` for an unrelated style lint would be a
 /// surprise; restricting to `@lsp-ignore` keeps the suppression channel
 /// the same one the rest of `handlers.rs` uses.
-fn lsp_ignored_lines_from_tree(root: Node<'_>, text: &str) -> std::collections::HashSet<u32> {
-    let mut out = std::collections::HashSet::new();
+fn lsp_ignored_lines_from_tree(
+    root: Node<'_>,
+    text: &str,
+) -> std::collections::HashMap<u32, crate::cross_file::types::LineSuppression> {
+    let mut out = std::collections::HashMap::new();
     visit_comments_for_ignore(root, text, &mut out);
     out
 }
 
-fn visit_comments_for_ignore(node: Node<'_>, text: &str, out: &mut std::collections::HashSet<u32>) {
+/// Test-only entry point for the cross-parser parity property test in
+/// `cross_file::property_tests`: parse `text` with `tree_sitter_r` and return
+/// the same suppressed-line map [`lsp_ignored_lines_from_tree`] produces. Keeps
+/// the tree-sitter comment-node path's string-vs-comment decision comparable
+/// against the two byte-scanners (`directive::comment_region_outside_strings`
+/// and `nolint::first_hash_body`).
+#[cfg(test)]
+pub(crate) fn lsp_ignored_lines_from_text_for_parity_test(
+    text: &str,
+) -> std::collections::HashMap<u32, crate::cross_file::types::LineSuppression> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .expect("load tree-sitter-r");
+    let Some(tree) = parser.parse(text, None) else {
+        return std::collections::HashMap::new();
+    };
+    lsp_ignored_lines_from_tree(tree.root_node(), text)
+}
+
+fn visit_comments_for_ignore(
+    node: Node<'_>,
+    text: &str,
+    out: &mut std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
+) {
     if node.kind() == "comment" {
         classify_comment_for_ignore(node, text, out);
         // Comments have no AST children we care about.
@@ -10769,8 +11867,9 @@ fn visit_comments_for_ignore(node: Node<'_>, text: &str, out: &mut std::collecti
 fn classify_comment_for_ignore(
     comment: Node<'_>,
     text: &str,
-    out: &mut std::collections::HashSet<u32>,
+    out: &mut std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
 ) {
+    use crate::cross_file::types::LineSuppression;
     let raw = text
         .get(comment.start_byte()..comment.end_byte())
         .unwrap_or("");
@@ -10784,27 +11883,35 @@ fn classify_comment_for_ignore(
     let prefix = line_text.get(..start_col).unwrap_or("");
     let standalone = prefix.trim().is_empty();
 
+    let insert = |out: &mut std::collections::HashMap<u32, LineSuppression>,
+                  line: u32,
+                  what: LineSuppression| {
+        out.entry(line)
+            .and_modify(|e| e.merge(what.clone()))
+            .or_insert(what);
+    };
+
     // Collapsing these inner `if`s into match guards would force a wildcard
     // arm and lose exhaustiveness over `LspIgnoreKind` variants.
     #[allow(clippy::collapsible_match)]
     match classify_lsp_ignore_marker(body) {
-        Some(LspIgnoreKind::SameLine) => {
+        Some((LspIgnoreKind::SameLine, what)) => {
             // Inline `# @lsp-ignore` suppresses *this* line — but only
             // when there's code before the marker. A standalone
             // `# @lsp-ignore` on its own line has nothing to suppress
             // (use `# @lsp-ignore-next` instead).
             if !standalone {
-                out.insert(row);
+                insert(out, row, what);
             }
         }
-        Some(LspIgnoreKind::NextLine) => {
+        Some((LspIgnoreKind::NextLine, what)) => {
             // `@lsp-ignore-next` only applies when the comment is on its
             // own line, matching the directive parser in
             // `cross_file/directive.rs`. A trailing
             // `x <- 1 # @lsp-ignore-next` does NOT suppress the next
             // line.
             if standalone {
-                out.insert(row.saturating_add(1));
+                insert(out, row.saturating_add(1), what);
             }
         }
         None => {}
@@ -10817,28 +11924,88 @@ enum LspIgnoreKind {
     NextLine,
 }
 
-/// Classify the text after a `#` that opens a comment. Returns `SameLine`
-/// for `@lsp-ignore` (with optional rule filter) and `NextLine` for
-/// `@lsp-ignore-next`. Returns `None` otherwise. Matches word-boundary so
+/// Classify the text after a `#` that opens a comment. Returns the ignore kind
+/// (`SameLine` for `@lsp-ignore` / `# raven: ignore`, `NextLine` for the
+/// `-next` forms) paired with what it suppresses (a blanket
+/// [`LineSuppression::All`] or a code-scoped set parsed from the `[code]`
+/// selector). Returns `None` otherwise. Matches word-boundary so
 /// `@lsp-ignored` does not match `@lsp-ignore`.
-fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
+fn classify_lsp_ignore_marker(
+    after_hash: &str,
+) -> Option<(LspIgnoreKind, crate::cross_file::types::LineSuppression)> {
+    use crate::cross_file::types::LineSuppression;
+
+    // Parse an optional `[code, code2]` selector immediately following the
+    // marker keyword into a `LineSuppression`.
+    fn codes_from(after: &str) -> LineSuppression {
+        let after = after.trim_start();
+        let Some(rest) = after.strip_prefix('[') else {
+            return LineSuppression::All;
+        };
+        let Some(end) = rest.find(']') else {
+            return LineSuppression::All;
+        };
+        let body = &rest[..end];
+        let codes: Vec<String> = body
+            .split(',')
+            .map(crate::diagnostic_code::normalize)
+            .filter(|c| !c.is_empty())
+            .collect();
+        if codes.is_empty() {
+            LineSuppression::All
+        } else {
+            LineSuppression::Codes(codes)
+        }
+    }
+
     // Allow extra leading `#` characters (`## @lsp-ignore`) and whitespace,
     // mirroring `linting::nolint::classify`.
     let trimmed = after_hash.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
-    let rest = trimmed.strip_prefix("@lsp-ignore")?;
+
+    // `# raven:` primary namespace (F2): the analyzer track aliases the line /
+    // next-line ignore forms. `expect` is the asserting flavor; on this AST
+    // path it suppresses identically to `ignore` (the `unused-suppression`
+    // distinction is driven by the directive enumeration in `directive.rs`).
+    if let Some(rest) = trimmed.strip_prefix("raven:") {
+        let rest = rest.trim_start();
+        let action = rest.split('[').next().unwrap_or(rest).trim();
+        let suffix = action
+            .strip_prefix("ignore")
+            .or_else(|| action.strip_prefix("expect"))?;
+        let suffix = suffix.trim_start_matches('-').trim();
+        // The `[code]` selector, if any, starts at the first `[` in `rest`.
+        let what = match rest.find('[') {
+            Some(i) => codes_from(&rest[i..]),
+            None => LineSuppression::All,
+        };
+        return if suffix.starts_with("next") {
+            Some((LspIgnoreKind::NextLine, what))
+        } else if suffix.is_empty() {
+            Some((LspIgnoreKind::SameLine, what))
+        } else {
+            // `ignore-start`/`ignore-end`/`ignore-file` are not modeled on the
+            // analyzer AST path yet; don't misclassify them as a line ignore.
+            None
+        };
+    }
+
+    let rest = trimmed
+        .strip_prefix("@lsp-ignore")
+        .or_else(|| trimmed.strip_prefix("@lsp-expect"))?;
     // Word-boundary: the next byte (if any) must not be an identifier byte.
-    // `-` and `:` are explicitly allowed because they begin the `-next`
-    // suffix or rule filter.
+    // `-`, `:`, `[`, and whitespace are allowed because they begin the `-next`
+    // suffix, a rule filter, or a `[code]` selector.
     match rest.as_bytes().first() {
-        None => Some(LspIgnoreKind::SameLine),
+        None => Some((LspIgnoreKind::SameLine, LineSuppression::All)),
         Some(b) if b.is_ascii_alphanumeric() || *b == b'_' => None,
         Some(_) => {
+            // `[code]` may directly follow `@lsp-ignore` or `@lsp-ignore-next`.
             let suffix =
                 rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
-            if suffix.starts_with("next") {
-                Some(LspIgnoreKind::NextLine)
+            if let Some(after_next) = suffix.strip_prefix("next") {
+                Some((LspIgnoreKind::NextLine, codes_from(after_next)))
             } else {
-                Some(LspIgnoreKind::SameLine)
+                Some((LspIgnoreKind::SameLine, codes_from(rest)))
             }
         }
     }
@@ -10847,16 +12014,24 @@ fn classify_lsp_ignore_marker(after_hash: &str) -> Option<LspIgnoreKind> {
 fn check_invalid_assignment_target(
     binop: Node,
     text: &str,
-    ignored: &std::collections::HashSet<u32>,
+    in_package_data_file: bool,
+    ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
+    suppressed_out: &mut Option<&mut Vec<(u32, String)>>,
 ) {
     let Some(op) = binop.child_by_field_name("operator") else {
         return;
     };
     let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
-    let target = match op_text {
-        "<-" | "<<-" | "=" => binop.child_by_field_name("lhs"),
-        "->" | "->>" => binop.child_by_field_name("rhs"),
+    let (target, value) = match op_text {
+        "<-" | "<<-" | "=" => (
+            binop.child_by_field_name("lhs"),
+            binop.child_by_field_name("rhs"),
+        ),
+        "->" | "->>" => (
+            binop.child_by_field_name("rhs"),
+            binop.child_by_field_name("lhs"),
+        ),
         _ => return,
     };
     // No special case for named-argument `=`: tree-sitter-r parses a valid
@@ -10883,8 +12058,40 @@ fn check_invalid_assignment_target(
         return;
     };
 
+    // Idiomatic exemption: a quoted-string LHS whose assigned value is a
+    // function definition (`"[.Surv" <- function(x, i) ...`,
+    // `"coef<-.varPower" <- function(...) ...`, `"area" <- function(r) ...`)
+    // is semantically identical to the backtick form and standard in
+    // base/survival/nlme/MASS/lattice. Only the WARNING-tier string-literal
+    // classification is exempt — `... <- function(x) x` stays flagged, and
+    // ERROR-tier targets R itself rejects are unaffected.
+    if classification.label == "string literal"
+        && value.is_some_and(|v| is_function_definition_value(v, text))
+    {
+        return;
+    }
+
+    // Idiomatic exemption: R-core packages register datasets in data/*.R
+    // files with `"name" <- <value>` at top level (`data()` sources these
+    // files). Nested string-target assignments in such files stay flagged.
+    if classification.label == "string literal"
+        && in_package_data_file
+        && binop.parent().is_some_and(|p| p.kind() == "program")
+    {
+        return;
+    }
+
     let row = target.start_position().row as u32;
-    if ignored.contains(&row) {
+    if ignored
+        .get(&row)
+        .is_some_and(|s| s.covers(Some(crate::diagnostic_code::ASSIGN_TO_STRING_LITERAL)))
+    {
+        if let Some(out) = suppressed_out.as_deref_mut() {
+            out.push((
+                row,
+                crate::diagnostic_code::ASSIGN_TO_STRING_LITERAL.to_string(),
+            ));
+        }
         return;
     }
     let line_text = text.lines().nth(row as usize).unwrap_or("");
@@ -10908,6 +12115,9 @@ fn check_invalid_assignment_target(
         },
         severity: Some(classification.severity),
         message: classification.format_message(target_text),
+        code: Some(NumberOrString::String(
+            crate::diagnostic_code::ASSIGN_TO_STRING_LITERAL.to_string(),
+        )),
         ..Default::default()
     });
 }
@@ -11038,6 +12248,41 @@ fn unary_operator_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
     None
 }
 
+/// True when an assignment's value node is a function definition, possibly
+/// parenthesized (`"f" <- (function(x) x)`) or reached through a chained
+/// assignment (`"coef<-" <- "coefficients<-" <- function(...) ...`, as in
+/// nlme's `R/newGenerics.R` — the value of the outer assignment is the inner
+/// assignment, whose value is the function). Covers both the `function`
+/// keyword and the R 4.1 backslash-lambda — tree-sitter-r normalizes both
+/// into `function_definition` — plus `.Primitive(...)` calls, which always
+/// return a function (R-core's methods package uses
+/// `"el<-" <- .Primitive("[[<-")`). Other calls are NOT treated as function
+/// values: they may return anything, and exempting them would gut the
+/// warning.
+fn is_function_definition_value(node: Node, text: &str) -> bool {
+    match node.kind() {
+        "function_definition" => true,
+        "parenthesized_expression" => node
+            .child_by_field_name("body")
+            .is_some_and(|inner| is_function_definition_value(inner, text)),
+        "call" => node
+            .child_by_field_name("function")
+            .is_some_and(|callee| node_text(callee, text) == ".Primitive"),
+        "binary_operator" => {
+            let Some(op) = node.child_by_field_name("operator") else {
+                return false;
+            };
+            let value = match op.kind() {
+                "<-" | "<<-" | "=" => node.child_by_field_name("rhs"),
+                "->" | "->>" => node.child_by_field_name("lhs"),
+                _ => return false,
+            };
+            value.is_some_and(|v| is_function_definition_value(v, text))
+        }
+        _ => false,
+    }
+}
+
 /// Classify an assignment-target node as suspicious (R accepts, but the
 /// binding is almost certainly unintended). Returns `Some(label)` for cases
 /// like `"foo" <- 1`, `... <- 1`, `..N <- 1`.
@@ -11136,6 +12381,14 @@ enum DataTableClass {
     Unknown,
 }
 
+#[derive(Clone, Default)]
+struct ReferenceClassInfo {
+    class_name: Option<String>,
+    contains: Vec<String>,
+    fields: HashSet<String>,
+    methods: HashSet<String>,
+}
+
 /// Pre-computed inputs the undefined-variable collector needs to decide, per
 /// `call` / `subset` / `subset2`, which argument subtrees are NSE and should be
 /// suppressed (issue #398). All AST-derived facts are owned, so this carries no
@@ -11166,6 +12419,21 @@ pub(crate) struct NseAnalysis<'a> {
     /// Variable names whose defining RHS is a known data.frame-family
     /// constructor (so `[` indices are checked even when data.table is loaded).
     non_data_table_objects: HashSet<String>,
+    /// By-reference class-transition events (`setDT`/`setDF`/`setattr`) per
+    /// variable, sorted ascending by source byte offset. A transition at or
+    /// before a `[` overrides the constructor-derived classification from that
+    /// point onward (F1), analogous to how `load()` bindings become visible
+    /// from the call site forward.
+    class_transitions: HashMap<String, Vec<(usize, DataTableClass)>>,
+    /// Reference Class generator variables assigned from `setRefClass(...)`.
+    reference_class_generators: HashMap<String, ReferenceClassInfo>,
+    /// Class name to generator-variable name for same-file `contains = ...`
+    /// inheritance links.
+    reference_class_by_class: HashMap<String, String>,
+    /// Top-level helper functions later registered as Reference Class methods
+    /// via `Generator$methods(name = helper)`, mapped to the generator(s) that
+    /// registered each helper.
+    reference_class_method_functions: HashMap<String, HashSet<String>>,
     /// Package library, for confirming whether a bare callee is an in-play
     /// package export (standard-eval) rather than an unresolved name.
     package_library: Option<&'a crate::package_library::PackageLibrary>,
@@ -11189,6 +12457,10 @@ impl<'a> NseAnalysis<'a> {
         let mut local_function_policies = HashMap::new();
         let mut data_table_objects = HashSet::new();
         let mut non_data_table_objects = HashSet::new();
+        let mut class_transitions: HashMap<String, Vec<(usize, DataTableClass)>> = HashMap::new();
+        let mut reference_class_generators = HashMap::new();
+        let mut reference_class_by_class = HashMap::new();
+        let mut reference_class_method_functions = HashMap::new();
         let mut data_table_qualifier_seen = false;
         collect_nse_facts(
             root,
@@ -11196,9 +12468,18 @@ impl<'a> NseAnalysis<'a> {
             &mut local_function_policies,
             &mut data_table_objects,
             &mut non_data_table_objects,
+            &mut class_transitions,
+            &mut reference_class_generators,
+            &mut reference_class_by_class,
+            &mut reference_class_method_functions,
             &mut data_table_qualifier_seen,
             false,
         );
+        // Keep each variable's transition list ordered by position so the
+        // as-of-position lookup can scan from the end.
+        for events in class_transitions.values_mut() {
+            events.sort_by_key(|(start, _)| *start);
+        }
         // data.table is "in play" if it is an in-play package (library()/import)
         // or the file uses a `data.table::` qualified reference (Phase 3).
         let data_table_in_play =
@@ -11211,9 +12492,67 @@ impl<'a> NseAnalysis<'a> {
             data_table_in_play,
             data_table_objects,
             non_data_table_objects,
+            class_transitions,
+            reference_class_generators,
+            reference_class_by_class,
+            reference_class_method_functions,
             package_library,
             base_exports,
         }
+    }
+
+    /// The data.table class of `name` as of byte `pos`, per the latest
+    /// by-reference transition at or before `pos`. `None` when no such
+    /// transition exists (the caller then falls back to the constructor-derived
+    /// classification).
+    fn class_transition_before(&self, name: &str, pos: usize) -> Option<DataTableClass> {
+        self.class_transitions
+            .get(name)?
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= pos)
+            .map(|(_, class)| *class)
+    }
+
+    fn reference_class_generator_has_member(
+        &self,
+        generator: &str,
+        name: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if !visited.insert(generator.to_string()) {
+            return false;
+        }
+
+        let Some(info) = self.reference_class_generators.get(generator) else {
+            return false;
+        };
+        self.reference_class_info_has_member(info, name, visited)
+    }
+
+    fn reference_class_info_has_member(
+        &self,
+        info: &ReferenceClassInfo,
+        name: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if info.methods.contains(name)
+            || info.fields.contains(name)
+            || info
+                .fields
+                .iter()
+                .any(|field| reference_class_field_accessor_matches(field, name))
+        {
+            return true;
+        }
+
+        info.contains.iter().any(|class_name| {
+            self.reference_class_by_class
+                .get(class_name)
+                .is_some_and(|parent_generator| {
+                    self.reference_class_generator_has_member(parent_generator, name, visited)
+                })
+        })
     }
 }
 
@@ -11227,12 +12566,17 @@ impl<'a> NseAnalysis<'a> {
 /// maps and mis-shadow a sibling callee of the same name. A nested NSE helper
 /// simply falls to the conservative unresolved-callee path. The `data.table::`
 /// qualifier scan stays file-wide because data.table-in-play is a file fact.
+#[allow(clippy::too_many_arguments)] // collector pattern: accumulates into multiple pre-existing sets
 fn collect_nse_facts(
     node: Node,
     text: &str,
     local_function_policies: &mut HashMap<String, crate::nse::ArgPolicy>,
     data_table_objects: &mut HashSet<String>,
     non_data_table_objects: &mut HashSet<String>,
+    class_transitions: &mut HashMap<String, Vec<(usize, DataTableClass)>>,
+    reference_class_generators: &mut HashMap<String, ReferenceClassInfo>,
+    reference_class_by_class: &mut HashMap<String, String>,
+    reference_class_method_functions: &mut HashMap<String, HashSet<String>>,
     data_table_qualifier_seen: &mut bool,
     in_function: bool,
 ) {
@@ -11243,6 +12587,22 @@ fn collect_nse_facts(
     {
         *data_table_qualifier_seen = true;
     }
+    // F1: a statement-level by-reference converter (`setDT`/`setDF`/`setattr`)
+    // flips its first argument's class from this call onward. Recorded only at
+    // top level (like the constructor bindings below) to avoid cross-scope
+    // contamination between sibling functions.
+    if !in_function && let Some((name, class)) = by_reference_class_transition(node, text) {
+        class_transitions
+            .entry(name)
+            .or_default()
+            .push((node.start_byte(), class));
+    }
+    collect_reference_class_method_registrations(
+        node,
+        text,
+        reference_class_generators,
+        reference_class_method_functions,
+    );
 
     if !in_function
         && let Some(target) = assignment_target_node(node)
@@ -11251,7 +12611,13 @@ fn collect_nse_facts(
     {
         let name = node_text(target, text);
         let value = unwrap_parenthesized(value);
-        if value.kind() == "function_definition" {
+        if let Some(info) = reference_class_info_from_set_ref_class(value, text) {
+            let generator = name.to_string();
+            if let Some(class_name) = info.class_name.clone() {
+                reference_class_by_class.insert(class_name, generator.clone());
+            }
+            reference_class_generators.insert(generator, info);
+        } else if value.kind() == "function_definition" {
             local_function_policies.insert(name.to_string(), user_defined_call_policy(value, text));
         } else {
             match constructor_data_table_class(value, text) {
@@ -11277,10 +12643,219 @@ fn collect_nse_facts(
             local_function_policies,
             data_table_objects,
             non_data_table_objects,
+            class_transitions,
+            reference_class_generators,
+            reference_class_by_class,
+            reference_class_method_functions,
             data_table_qualifier_seen,
             child_in_function,
         );
     }
+}
+
+/// Gather helper names from `Generator$methods(name = helper)` registrations.
+/// Direct `function(...)` values are recognized from their syntax later; only
+/// identifier-valued helpers need this file-level pre-pass.
+fn collect_reference_class_method_registrations(
+    node: Node,
+    text: &str,
+    reference_class_generators: &mut HashMap<String, ReferenceClassInfo>,
+    reference_class_method_functions: &mut HashMap<String, HashSet<String>>,
+) {
+    if node.kind() != "call" || !call_is_reference_class_methods_registration(node, text) {
+        return;
+    }
+    let Some(generator) = reference_class_methods_registration_generator(node, text) else {
+        return;
+    };
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(method_name) = argument_name(arg, text) {
+            reference_class_generators
+                .entry(generator.clone())
+                .or_default()
+                .methods
+                .insert(method_name);
+        }
+        let Some(value) = arg.child_by_field_name("value") else {
+            continue;
+        };
+        let value = unwrap_parenthesized(value);
+        if value.kind() == "identifier" {
+            reference_class_method_functions
+                .entry(node_text(value, text).to_string())
+                .or_default()
+                .insert(generator.clone());
+        }
+    }
+}
+
+fn reference_class_info_from_set_ref_class(call: Node, text: &str) -> Option<ReferenceClassInfo> {
+    if call.kind() != "call"
+        || call
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            != Some("setRefClass")
+    {
+        return None;
+    }
+
+    let args = call.child_by_field_name("arguments")?;
+    let mut info = ReferenceClassInfo::default();
+    let mut positional_index = 0usize;
+
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        let Some(value) = arg.child_by_field_name("value") else {
+            continue;
+        };
+        let value = unwrap_parenthesized(value);
+        match argument_name(arg, text).as_deref() {
+            Some("Class") => {
+                info.class_name = literal_string_value(value, text);
+            }
+            Some("fields") => {
+                collect_reference_class_fields(value, text, &mut info.fields);
+            }
+            Some("contains") => {
+                collect_string_values(value, text, &mut info.contains);
+            }
+            Some("methods" | "refMethods") => {
+                collect_reference_class_method_names(value, text, &mut info.methods);
+            }
+            Some(_) => {}
+            None => {
+                match positional_index {
+                    0 => info.class_name = literal_string_value(value, text),
+                    1 => collect_reference_class_fields(value, text, &mut info.fields),
+                    _ => {}
+                }
+                positional_index += 1;
+            }
+        }
+    }
+
+    Some(info)
+}
+
+fn collect_reference_class_fields(node: Node, text: &str, fields: &mut HashSet<String>) {
+    if let Some(value) = literal_string_value(node, text) {
+        fields.insert(value);
+        return;
+    }
+
+    if node.kind() != "call" {
+        return;
+    }
+    let Some(callee) = node
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+    else {
+        return;
+    };
+    if !matches!(callee, "c" | "list") {
+        return;
+    }
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(name) = argument_name(arg, text) {
+            fields.insert(name);
+        } else if let Some(value) = arg
+            .child_by_field_name("value")
+            .and_then(|value| literal_string_value(unwrap_parenthesized(value), text))
+        {
+            fields.insert(value);
+        }
+    }
+}
+
+fn collect_reference_class_method_names(node: Node, text: &str, methods: &mut HashSet<String>) {
+    if node.kind() != "call"
+        || node
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            != Some("list")
+    {
+        return;
+    }
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(name) = argument_name(arg, text) {
+            methods.insert(name);
+        }
+    }
+}
+
+fn collect_string_values(node: Node, text: &str, values: &mut Vec<String>) {
+    if let Some(value) = literal_string_value(node, text) {
+        values.push(value);
+        return;
+    }
+
+    if node.kind() != "call"
+        || node
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            != Some("c")
+    {
+        return;
+    }
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = args.walk();
+    for arg in args
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if let Some(value) = arg
+            .child_by_field_name("value")
+            .and_then(|value| literal_string_value(unwrap_parenthesized(value), text))
+        {
+            values.push(value);
+        }
+    }
+}
+
+fn argument_name(arg: Node, text: &str) -> Option<String> {
+    let name = arg.child_by_field_name("name")?;
+    normalized_assignment_target_name(name, text).map(|s| s.to_string())
+}
+
+fn literal_string_value(node: Node, text: &str) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(node, text);
+    raw.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .map(|s| s.to_string())
 }
 
 /// The operand an assignment *reads* — the `rhs` for `<-` / `=` / `<<-`, the
@@ -11337,9 +12912,63 @@ fn constructor_data_table_class(node: Node, text: &str) -> DataTableClass {
     }
 }
 
+/// F1: classify a statement-level by-reference class converter. `setDT(x)` and
+/// `setDF(x)` flip `x` to data.table / data.frame respectively; `setattr(x,
+/// "class", value)` sets the class explicitly. Returns the affected variable
+/// name (the first positional argument, which must be a bare identifier) and
+/// the class it transitions to, or `None` when the call is not a recognized
+/// by-reference converter or its target is not a plain name.
+fn by_reference_class_transition(node: Node, text: &str) -> Option<(String, DataTableClass)> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let leaf = node
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))?;
+    let args = node.child_by_field_name("arguments")?;
+    let first = unwrap_parenthesized(first_positional_arg_value(args)?);
+    if first.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(first, text).to_string();
+    match leaf {
+        "setDT" => Some((name, DataTableClass::DataTable)),
+        "setDF" => Some((name, DataTableClass::NonDataTable)),
+        "setattr" => setattr_class_transition(node, text).map(|class| (name, class)),
+        _ => None,
+    }
+}
+
+/// Classify the class assigned by `setattr(x, "class", value)`. Only a literal
+/// `"class"` attribute name is recognized; the value is matched textually — a
+/// value mentioning `data.table` makes `x` a data.table, a data.frame-family
+/// class makes it a non-data.table, and anything else is not modeled (`None`).
+fn setattr_class_transition(call: Node, text: &str) -> Option<DataTableClass> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let positional: Vec<Node> = args
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "argument" && c.child_by_field_name("name").is_none())
+        .filter_map(|c| c.child_by_field_name("value"))
+        .collect();
+    // setattr(x, name, value): the attribute name must be the literal "class".
+    if literal_string_value(unwrap_parenthesized(*positional.get(1)?), text)?.as_str() != "class" {
+        return None;
+    }
+    let value_text = node_text(unwrap_parenthesized(*positional.get(2)?), text);
+    if value_text.contains("data.table") {
+        Some(DataTableClass::DataTable)
+    } else if value_text.contains("data.frame") || value_text.contains("tbl_df") {
+        Some(DataTableClass::NonDataTable)
+    } else {
+        None
+    }
+}
+
 /// Infer the argument policy for a user-defined function (Phase 2.5): a formal
 /// is captured when the body calls `substitute` / `enquo` / `enexpr` / `ensym`
-/// with that formal as its first argument. With no captured formals the
+/// with that formal as its first argument, or forwards it as a native routine
+/// name through `.Call`-family interfaces. With no captured formals the
 /// function is treated as standard-eval (so a local `filter <- function(x) x`
 /// recovers checking of `filter(undefined_var)`). Nested function definitions
 /// are not descended into — their captures bind their own formals.
@@ -11396,10 +13025,8 @@ fn function_body_node(fn_def: Node) -> Option<Node> {
     })
 }
 
-/// Recursively scan a function body for capture helpers
-/// (`substitute` / `enquo` / `enexpr` / `ensym`) whose first argument is a
-/// direct reference to one of `formals`, appending each such formal to
-/// `captured`.
+/// Recursively scan a function body for calls whose first argument captures one
+/// of `formals`, appending each such formal to `captured`.
 fn collect_captured_formals(
     node: Node,
     text: &str,
@@ -11413,20 +13040,68 @@ fn collect_captured_formals(
     if node.kind() == "call"
         && let Some(func) = node.child_by_field_name("function")
         && let Some(helper) = callee_leaf_name(func, text)
-        && crate::nse::is_capture_helper(helper)
         && let Some(args) = node.child_by_field_name("arguments")
         && let Some(value) = first_positional_arg_value(args)
-        && value.kind() == "identifier"
+        && let Some(name) = captured_formal_for_first_arg(helper, value, text, formals)
+        && !captured.iter().any(|c| c == name)
     {
-        let name = node_text(value, text);
-        if formals.iter().any(|f| f == name) && !captured.iter().any(|c| c == name) {
-            captured.push(name.to_string());
-        }
+        captured.push(name.to_string());
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_captured_formals(child, text, formals, captured);
     }
+}
+
+fn captured_formal_for_first_arg<'t>(
+    helper: &str,
+    value: Node<'t>,
+    text: &'t str,
+    formals: &[String],
+) -> Option<&'t str> {
+    if crate::nse::is_capture_helper(helper) && value.kind() == "identifier" {
+        let name = node_text(value, text);
+        return formals.iter().any(|f| f == name).then_some(name);
+    }
+
+    if is_native_interface_callee(helper) {
+        return native_routine_formal_value(value, text, formals);
+    }
+
+    None
+}
+
+fn is_native_interface_callee(name: &str) -> bool {
+    matches!(
+        name,
+        ".Call" | ".Call.graphics" | ".External" | ".External2" | ".C" | ".Fortran"
+    )
+}
+
+fn native_routine_formal_value<'t>(
+    value: Node<'t>,
+    text: &'t str,
+    formals: &[String],
+) -> Option<&'t str> {
+    if value.kind() == "identifier" {
+        let name = node_text(value, text);
+        return formals.iter().any(|f| f == name).then_some(name);
+    }
+
+    if value.kind() == "call"
+        && value
+            .child_by_field_name("function")
+            .and_then(|func| callee_leaf_name(func, text))
+            == Some("dontCheck")
+        && let Some(args) = value.child_by_field_name("arguments")
+        && let Some(inner) = first_positional_arg_value(args)
+        && inner.kind() == "identifier"
+    {
+        let name = node_text(inner, text);
+        return formals.iter().any(|f| f == name).then_some(name);
+    }
+
+    None
 }
 
 /// The leaf callee name of a call's `function` field — the identifier itself,
@@ -11578,6 +13253,11 @@ fn subset_object_data_table_class(
     };
     if obj.kind() == "identifier" {
         let name = node_text(obj, text);
+        // F1: a by-reference transition (setDT/setDF/setattr) at or before this
+        // `[` overrides the constructor-derived classification.
+        if let Some(class) = analysis.class_transition_before(name, node.start_byte()) {
+            return class;
+        }
         if analysis.data_table_objects.contains(name) {
             return DataTableClass::DataTable;
         }
@@ -11613,6 +13293,17 @@ fn collect_usages_with_analysis<'a>(
             return;
         }
         if references_formal_from_default_expression(node, text) {
+            return;
+        }
+        // Magrittr dot pronoun: `.` on the RHS of `%>%` is the piped value,
+        // not a free variable. Walk up to find a binary_operator parent whose
+        // operator is `%>%` and whose RHS contains this node.
+        if node_text(node, text) == "." && is_inside_magrittr_rhs(node, text) {
+            return;
+        }
+        // Native pipe placeholder: `_` on the RHS of `|>` (R 4.2+) is the
+        // placeholder for the piped value, not a free variable.
+        if node_text(node, text) == "_" && is_inside_native_pipe_rhs(node, text) {
             return;
         }
         // Pipeline-specific skip: an identifier following an ERROR node that
@@ -11679,7 +13370,10 @@ fn collect_call_usages<'a>(
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
-    let policy = if context.suppressed || !analysis.call_args_enabled {
+    let internal_routine_call = call_is_internal_routine_argument(node, text);
+    let policy = if internal_routine_call {
+        crate::nse::ArgPolicy::Standard
+    } else if context.suppressed || !analysis.call_args_enabled {
         crate::nse::ArgPolicy::WholeCall
     } else {
         resolve_call_arg_policy(node, text, analysis)
@@ -11687,12 +13381,51 @@ fn collect_call_usages<'a>(
     // A pipe (`df %>% f(...)` / `df |> f(...)`) supplies the first formal, so
     // the syntactic positional arguments bind starting one formal later.
     let pipe_fed = call_is_pipe_fed(node, text);
-    if let Some(func) = node.child_by_field_name("function") {
+    if let Some(func) = node.child_by_field_name("function")
+        && !internal_routine_call
+    {
         collect_usages_with_analysis(func, text, analysis, context, used);
     }
     if let Some(args) = node.child_by_field_name("arguments") {
         apply_arg_policy(args, text, analysis, context, &policy, pipe_fed, used);
     }
+}
+
+/// True for the routine call nested as `.Internal(<routine>(...))`.
+///
+/// The nested call head names a hidden C entry point (for example
+/// `getRegisteredNamespace` or `.addCondHands`), not an R binding. Its
+/// arguments still follow the routine's normal evaluation rules, so the caller
+/// skips only the nested callee and walks the argument list as standard-eval.
+fn call_is_internal_routine_argument(call_node: Node, text: &str) -> bool {
+    if call_node.kind() != "call" {
+        return false;
+    }
+    let Some(arg) = call_node.parent().filter(|node| node.kind() == "argument") else {
+        return false;
+    };
+    if arg.child_by_field_name("name").is_some() {
+        return false;
+    }
+    if arg
+        .child_by_field_name("value")
+        .is_none_or(|value| value.id() != call_node.id())
+    {
+        return false;
+    }
+    let Some(args) = arg.parent().filter(|node| node.kind() == "arguments") else {
+        return false;
+    };
+    if first_positional_arg_value(args).is_none_or(|value| value.id() != call_node.id()) {
+        return false;
+    }
+    let Some(outer_call) = args.parent().filter(|node| node.kind() == "call") else {
+        return false;
+    };
+    outer_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        == Some(".Internal")
 }
 
 /// True when `call_node` is the right-hand side of a pipe operator
@@ -11712,6 +13445,57 @@ fn call_is_pipe_fed(call_node: Node, text: &str) -> bool {
     parent.children(&mut cursor).any(|child| {
         child.kind() == "|>" || (child.kind() == "special" && node_text(child, text) == "%>%")
     })
+}
+
+/// True when `node` (an identifier `.`) is inside the RHS of a magrittr `%>%`
+/// pipe operator. In magrittr, `.` on the RHS is the pronoun for the piped
+/// value — it is always defined and should not be flagged as undefined.
+fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "binary_operator" {
+            // Check if the operator is %> % and `current` is on the RHS.
+            let is_rhs = parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| rhs.byte_range().contains(&current.start_byte()));
+            if is_rhs {
+                let mut cursor = parent.walk();
+                let has_magrittr = parent
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "special" && node_text(child, text) == "%>%");
+                if has_magrittr {
+                    return true;
+                }
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+/// True when `node` (an identifier `_`) is inside the RHS of a native `|>`
+/// pipe operator. In R 4.2+, `_` on the RHS is the placeholder for the piped
+/// value — it is always defined and should not be flagged as undefined.
+fn is_inside_native_pipe_rhs(node: Node, _text: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "binary_operator" {
+            let is_rhs = parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| rhs.byte_range().contains(&current.start_byte()));
+            if is_rhs {
+                let mut cursor = parent.walk();
+                let has_native_pipe = parent
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "|>");
+                if has_native_pipe {
+                    return true;
+                }
+            }
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Visit a `subset` / `subset2` node: the indexed object is checked, and the
@@ -11762,7 +13546,16 @@ fn apply_arg_policy<'a>(
         .iter()
         .map(|a| a.child_by_field_name("name").map(|n| node_text(n, text)))
         .collect();
-    let mask = crate::nse::suppressed_arguments(policy, &labels, pipe_fed);
+    let mut mask = crate::nse::suppressed_arguments(policy, &labels, pipe_fed);
+    // Universal suppression: any argument named `subset` is data-masked by
+    // convention across virtually all R modeling functions (lm, glm, svyglm,
+    // survival::coxph, etc.). Suppress it regardless of whether the callee has
+    // an explicit NSE policy.
+    for (i, label) in labels.iter().enumerate() {
+        if matches!(label, Some("subset")) {
+            mask[i] = true;
+        }
+    }
     for (arg, suppress) in arg_nodes.iter().zip(mask) {
         let arg_context = UsageContext {
             in_formula: context.in_formula,
@@ -11815,8 +13608,392 @@ fn is_builtin(name: &str) -> bool {
     ) {
         return true;
     }
+    // Platform-specific base functions that the builtin generator misses when
+    // it runs on a non-Windows host (the symbols are only registered in base R
+    // on Windows). Code guards their use with `.Platform$OS.type == "windows"`
+    // or places them under `R/windows/`, but the names are part of base R.
+    if matches!(
+        name,
+        "shell"
+            | "shell.exec"
+            | "Sys.junction"
+            | "getClipboardFormats"
+            | "readClipboard"
+            | "writeClipboard"
+            | "setWindowTitle"
+            | "getWindowTitle"
+            | "getIdentification"
+            | "win.version"
+            | "readRegistry"
+            | "DLL.version"
+            | "zip.unpack"
+            | "choose.files"
+            | "choose.dir"
+            | "winDialog"
+            | "winDialogString"
+            | "winMenuAdd"
+            | "winMenuAddItem"
+            | "winMenuDel"
+            | "winMenuDelItem"
+            | "winMenuNames"
+            | "winMenuItems"
+            | "winProgressBar"
+            | "getWinProgressBar"
+            | "setWinProgressBar"
+            | "bringToTop"
+            | "arrangeWindows"
+            | "shortPathName"
+    ) {
+        return true;
+    }
     // Check comprehensive builtin list
-    builtins::is_builtin(name)
+    builtins::is_builtin(name) || unquote_backtick_name(name).is_some_and(is_builtin)
+}
+
+fn unquote_backtick_name(name: &str) -> Option<&str> {
+    name.strip_prefix('`')?.strip_suffix('`')
+}
+
+/// Returns true for names R exposes through startup search-path environments
+/// rather than ordinary package exports.
+///
+/// `.Autoloaded` lives in the default `Autoloads` environment (`.AutoloadEnv`),
+/// which is on the search path in normal R sessions. Base's `autoload()`
+/// legitimately reads it as a bare name even though it is not a binding in the
+/// base package environment.
+fn is_implicit_search_path_binding(name: &str) -> bool {
+    let normalized = unquote_backtick_name(name).unwrap_or(name);
+    matches!(normalized, ".Autoloaded")
+}
+
+/// Returns true when `node` is one of R's method-frame special variables that
+/// R6 class method bodies run with `self`, `private`, and `super` injected by
+/// R6 at construction time. Treat them as implicit locals when the use is inside
+/// a function value within the `public`, `private`, or `active` list arguments
+/// of `R6Class(...)` or `R6::R6Class(...)`. A top-level local named `R6Class`
+/// disables the treatment (shadow).
+fn is_r6_method_special_variable_usage(
+    node: Node,
+    text: &str,
+    name: &str,
+    top_level_defs: &HashMap<String, Vec<(u32, u32)>>,
+) -> bool {
+    if !matches!(name, "self" | "private" | "super") {
+        return false;
+    }
+    if top_level_defs.contains_key("R6Class") {
+        return false;
+    }
+
+    let mut current = node;
+    while let Some(function) = containing_function_definition(current) {
+        if function_definition_is_r6_method(function, text) {
+            return true;
+        }
+        current = function;
+    }
+
+    false
+}
+
+/// Returns true when `function` is a value inside a `public=list(...)`,
+/// `private=list(...)`, or `active=list(...)` argument of an `R6Class(...)`
+/// or `R6::R6Class(...)` call.
+fn function_definition_is_r6_method(function: Node, text: &str) -> bool {
+    // function_definition → argument(value) → arguments → call (the list() call)
+    // then: list() call → argument(name=public|private|active, value) → arguments → call (R6Class)
+    let Some(list_arg) = containing_argument_value(function) else {
+        return false;
+    };
+    let Some(list_args) = list_arg.parent().filter(|p| p.kind() == "arguments") else {
+        return false;
+    };
+    let Some(list_call) = list_args.parent().filter(|p| p.kind() == "call") else {
+        return false;
+    };
+    // The list() call should be named `list`
+    if list_call
+        .child_by_field_name("function")
+        .is_none_or(|f| node_text(f, text) != "list")
+    {
+        return false;
+    }
+    // The list() call must be the value of a named argument (public/private/active)
+    let Some(r6_arg) = list_call.parent().filter(|p| p.kind() == "argument") else {
+        return false;
+    };
+    let Some(arg_name_node) = r6_arg.child_by_field_name("name") else {
+        return false;
+    };
+    let arg_name = node_text(arg_name_node, text);
+    if !matches!(arg_name, "public" | "private" | "active") {
+        return false;
+    }
+    // The named argument must be inside an R6Class(...) / R6::R6Class(...) call
+    let Some(r6_args) = r6_arg.parent().filter(|p| p.kind() == "arguments") else {
+        return false;
+    };
+    let Some(r6_call) = r6_args.parent().filter(|p| p.kind() == "call") else {
+        return false;
+    };
+    let Some(r6_func) = r6_call.child_by_field_name("function") else {
+        return false;
+    };
+    let func_text = node_text(r6_func, text);
+    func_text == "R6Class" || func_text == "R6::R6Class"
+}
+
+/// the dispatcher injects.
+///
+/// R injects `.Generic`, `.Method`, and `.Class` when a method runs. Treat them
+/// as implicit locals only when the use is inside:
+/// - a function assigned to an S3 method-shaped name (`generic.class`), or
+/// - a function passed to `setMethod(...)` (S4 dispatch, including group
+///   generics like `Ops`/`Math`/`Summary`/`Complex`).
+///
+/// so ordinary `.Generic` references in non-method functions remain diagnosable.
+fn is_s3_method_special_variable_usage(node: Node, _text: &str, name: &str) -> bool {
+    if !matches!(name, ".Generic" | ".Method" | ".Class" | ".Group") {
+        return false;
+    }
+
+    // These names are injected by R's S3/S4 dispatch mechanism into method
+    // bodies. They are so distinctive that no one uses them as ordinary
+    // variable names. Suppress the diagnostic whenever they appear inside
+    // any function definition — this covers:
+    //   • S3 methods (`generic.class <- function(...)`)
+    //   • S4 methods (`setMethod(...)`)
+    //   • S4 group-generic methods (`setGroupGeneric(...)`)
+    //   • Functions registered later via `registerS3method()`
+    containing_function_definition(node).is_some()
+}
+
+fn normalized_assignment_target_name<'a>(target: Node<'a>, text: &'a str) -> Option<&'a str> {
+    let raw = node_text(target, text).trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        unquote_backtick_name(raw)
+            .or_else(|| raw.strip_prefix('\"')?.strip_suffix('\"'))
+            .or_else(|| raw.strip_prefix('\'')?.strip_suffix('\''))
+            .unwrap_or(raw),
+    )
+}
+
+/// Returns true when `node` names something injected into a Reference Class
+/// method environment.
+///
+/// Reference Class methods are ordinary R functions installed into a generated
+/// method environment, where `.self`, `.refClassDef`, and `callSuper` are
+/// injected by the methods package and fields / methods are visible as bare
+/// names. Keep this contextual: ordinary functions using the same names should
+/// still get undefined-variable diagnostics.
+fn is_reference_class_method_special_variable_usage(
+    node: Node,
+    text: &str,
+    name: &str,
+    analysis: &NseAnalysis,
+) -> bool {
+    let is_special = matches!(name, ".self" | ".refClassDef" | "callSuper");
+
+    let mut current = node;
+    while let Some(function) = containing_function_definition(current) {
+        if let Some(generators) = reference_class_method_generators(function, text, analysis) {
+            if is_special {
+                return true;
+            }
+            if generators.iter().any(|generator| {
+                analysis.reference_class_generator_has_member(generator, name, &mut HashSet::new())
+            }) {
+                return true;
+            }
+        }
+        if let Some(info) = direct_set_ref_class_method_info(function, text) {
+            if is_special {
+                return true;
+            }
+            if analysis.reference_class_info_has_member(&info, name, &mut HashSet::new()) {
+                return true;
+            }
+        }
+        current = function;
+    }
+
+    false
+}
+
+fn reference_class_method_generators(
+    function: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> Option<Vec<String>> {
+    if let Some(generators) =
+        function_definition_registered_reference_class_generators(function, text, analysis)
+    {
+        return Some(generators);
+    }
+
+    function_definition_direct_reference_class_generators(function, text)
+}
+
+fn function_definition_registered_reference_class_generators(
+    function: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+) -> Option<Vec<String>> {
+    let parent = function
+        .parent()
+        .filter(|parent| parent.kind() == "binary_operator")?;
+    let target = assignment_target_node(parent)?;
+    if target.id() == function.id() {
+        return None;
+    }
+
+    let name = normalized_assignment_target_name(target, text)?;
+    analysis
+        .reference_class_method_functions
+        .get(name)
+        .map(|generators| generators.iter().cloned().collect())
+}
+
+fn function_definition_direct_reference_class_generators(
+    function: Node,
+    text: &str,
+) -> Option<Vec<String>> {
+    let arg = containing_argument_value(function)?;
+    let args = arg.parent().filter(|parent| parent.kind() == "arguments")?;
+    let call = args.parent().filter(|parent| parent.kind() == "call")?;
+
+    if call_is_reference_class_methods_registration(call, text) {
+        return Some(
+            reference_class_methods_registration_generator(call, text)
+                .into_iter()
+                .collect(),
+        );
+    }
+    if let Some(set_ref_class_call) = set_ref_class_call_for_methods_list(call, text) {
+        return Some(
+            set_ref_class_call_generator(set_ref_class_call, text)
+                .into_iter()
+                .collect(),
+        );
+    }
+    if list_call_is_env_ref_methods_table(call, text) {
+        return Some(Vec::new());
+    }
+
+    None
+}
+
+fn direct_set_ref_class_method_info(function: Node, text: &str) -> Option<ReferenceClassInfo> {
+    let arg = containing_argument_value(function)?;
+    let args = arg.parent().filter(|parent| parent.kind() == "arguments")?;
+    let call = args.parent().filter(|parent| parent.kind() == "call")?;
+    let set_ref_class_call = set_ref_class_call_for_methods_list(call, text)?;
+    reference_class_info_from_set_ref_class(set_ref_class_call, text)
+}
+
+fn containing_argument_value(node: Node) -> Option<Node> {
+    let parent = node.parent()?;
+    if parent.kind() != "argument" {
+        return None;
+    }
+    parent
+        .child_by_field_name("value")
+        .is_some_and(|value| unwrap_parenthesized(value).id() == node.id())
+        .then_some(parent)
+}
+
+fn set_ref_class_call_for_methods_list<'a>(list_call: Node<'a>, text: &str) -> Option<Node<'a>> {
+    if list_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        != Some("list")
+    {
+        return None;
+    }
+
+    let arg = containing_argument_value(list_call)?;
+    if arg
+        .child_by_field_name("name")
+        .is_none_or(|name| !matches!(node_text(name, text), "methods" | "refMethods"))
+    {
+        return None;
+    }
+    let args = arg.parent().filter(|parent| parent.kind() == "arguments")?;
+    let parent_call = args.parent().filter(|parent| parent.kind() == "call")?;
+    (parent_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        == Some("setRefClass"))
+    .then_some(parent_call)
+}
+
+fn set_ref_class_call_generator(call: Node, text: &str) -> Option<String> {
+    let mut value = call;
+    let mut parent = value.parent()?;
+    while parent.kind() == "parenthesized_expression" {
+        value = parent;
+        parent = value.parent()?;
+    }
+
+    if parent.kind() != "binary_operator" {
+        return None;
+    }
+    if assignment_value_node(parent).is_none_or(|rhs| unwrap_parenthesized(rhs).id() != value.id())
+    {
+        return None;
+    }
+    assignment_target_node(parent)
+        .and_then(|target| normalized_assignment_target_name(target, text))
+        .map(|name| name.to_string())
+}
+
+fn reference_class_methods_registration_generator(call: Node, text: &str) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "extract_operator" {
+        return None;
+    }
+    let rhs = func.child_by_field_name("rhs")?;
+    let op = func.child_by_field_name("operator")?;
+    if crate::extract_op::op_from_node(op) != Some(crate::extract_op::ExtractOp::Dollar)
+        || rhs.kind() != "identifier"
+        || node_text(rhs, text) != "methods"
+    {
+        return None;
+    }
+    let lhs = func.child_by_field_name("lhs")?;
+    (lhs.kind() == "identifier").then(|| node_text(lhs, text).to_string())
+}
+
+fn list_call_is_env_ref_methods_table(call: Node, text: &str) -> bool {
+    if call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, text))
+        != Some("list")
+    {
+        return false;
+    }
+
+    let Some(parent) = call
+        .parent()
+        .filter(|parent| parent.kind() == "binary_operator")
+    else {
+        return false;
+    };
+    if assignment_value_node(parent)
+        .is_none_or(|value| unwrap_parenthesized(value).id() != call.id())
+    {
+        return false;
+    }
+    assignment_target_node(parent)
+        .and_then(|target| normalized_assignment_target_name(target, text))
+        == Some(".envRefMethods")
+}
+
+fn call_is_reference_class_methods_registration(call: Node, text: &str) -> bool {
+    reference_class_methods_registration_generator(call, text).is_some()
 }
 
 /// Determines whether an identifier is exported by any of the currently loaded packages.
@@ -11865,12 +14042,16 @@ fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> 
         return Vec::new();
     };
     match crate::package_state::is_r_source_path(&path, root) {
-        Some(crate::package_state::RFileKind::Test) => snapshot
-            .scope_contribution
-            .test_attached_packages
-            .iter()
-            .cloned()
-            .collect(),
+        Some(crate::package_state::RFileKind::Test)
+            if crate::package_state::is_testthat_or_testit_test(&path, root) =>
+        {
+            snapshot
+                .scope_contribution
+                .test_attached_packages
+                .iter()
+                .cloned()
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -16665,6 +18846,18 @@ mod tests {
     }
 
     #[test]
+    fn test_windows_only_base_builtins() {
+        // These are base/utils functions only registered on Windows, so the
+        // builtin generator (run on non-Windows) misses them. They must still
+        // be recognized so platform-guarded code doesn't draw FPs.
+        assert!(is_builtin("shell.exec"));
+        assert!(is_builtin("shell"));
+        assert!(is_builtin("Sys.junction"));
+        assert!(is_builtin("readRegistry"));
+        assert!(is_builtin("choose.files"));
+    }
+
+    #[test]
     fn test_not_builtin() {
         assert!(!is_builtin("my_custom_function"));
         assert!(!is_builtin("undefined_var"));
@@ -17625,6 +19818,84 @@ mod tests {
         );
     }
 
+    /// Magrittr dot pronoun (`.`) on RHS of `%>%` is never a free variable.
+    #[test]
+    fn magrittr_dot_pronoun_curly_brace_pipe() {
+        let code = "df %>% { .$x }";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot pronoun inside curly-brace pipe must be suppressed"
+        );
+    }
+
+    #[test]
+    fn magrittr_dot_pronoun_explicit_arg() {
+        let code = "df %>% nrow(.)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot pronoun as explicit argument must be suppressed"
+        );
+    }
+
+    #[test]
+    fn dot_without_pipe_is_still_flagged() {
+        let code = "x <- .$field";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "."),
+            "dot without pipe context must still be collected as a usage"
+        );
+    }
+
+    /// Native pipe placeholder `_` on RHS of `|>` is never a free variable.
+    #[test]
+    fn native_pipe_placeholder_in_named_arg() {
+        let code = "df |> lm(y ~ x, data = _)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "_"),
+            "_ placeholder in native pipe named arg must be suppressed"
+        );
+    }
+
+    #[test]
+    fn native_pipe_placeholder_without_pipe_still_flagged() {
+        let code = "x <- _";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "_"),
+            "_ without pipe context must still be collected as a usage"
+        );
+    }
+
+    /// Any argument named `subset` is universally suppressed (data-masked by
+    /// convention across R modeling functions).
+    #[test]
+    fn subset_arg_universally_suppressed() {
+        // Use lm (a known base function) but imagine it didn't have an explicit
+        // subset policy — the universal override still suppresses it.
+        let code = "unknown_model(y ~ x, subset = at_risk == 1, data = df)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(
+            !was_collected(&used, "at_risk"),
+            "subset arg contents must be suppressed regardless of callee"
+        );
+    }
+
     /// A qualified capture helper (`rlang::enquo`) in a local body still marks
     /// the formal captured (Phase 2.5).
     #[test]
@@ -17634,6 +19905,61 @@ mod tests {
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
         assert!(!was_collected(&used, "col"));
+    }
+
+    /// grid's native wrappers pass their routine-name formal through
+    /// `.Call(dontCheck(fnname), ...)`; that formal is captured like `.Call`'s
+    /// own `.NAME`, while later arguments remain evaluated.
+    #[test]
+    fn nse_phase25_native_dontcheck_wrapper_captures_formal() {
+        let code = "grid.Call <- function(fnname, ...) .Call(dontCheck(fnname), ...)\n\
+                    grid.Call(C_getGPar, evaluated_arg)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            !was_collected(&used, "C_getGPar"),
+            "native routine name passed through dontCheck(fnname) must be captured"
+        );
+        assert!(
+            was_collected(&used, "evaluated_arg"),
+            "non-routine wrapper arguments must remain standard-eval"
+        );
+    }
+    /// `.Internal(getRegisteredNamespace(name))` names a hidden base C entry
+    /// point in the nested call head; that routine name is not an R variable,
+    /// but its ordinary arguments are still evaluated and should be checked.
+    #[test]
+    fn nse_internal_call_suppresses_routine_callee_only() {
+        use std::collections::HashSet;
+        let code = ".Internal(getRegisteredNamespace(name))";
+        let tree = parse_r_code(code);
+        let base_exports = HashSet::from([".Internal".to_string()]);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            Vec::new(),
+            None,
+            Some(&base_exports),
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            !was_collected(&used, "getRegisteredNamespace"),
+            ".Internal routine callee must not be collected as an R variable"
+        );
+        assert!(
+            was_collected(&used, "name"),
+            ".Internal routine arguments must remain standard-eval"
+        );
     }
 
     /// A nested helper definition does not leak into file-level resolution: a
@@ -17864,6 +20190,69 @@ mod tests {
                 "constructor {ctor} should classify as non-data.table"
             );
         }
+    }
+
+    // ---- F1: data.table by-reference class transitions (setDT/setDF/setattr) ----
+
+    /// A statement-level `setDT(x)` flips `x` to data.table from that call
+    /// onward, so a subsequent `x[, newcol := val]` suppresses `newcol`/`val`.
+    #[test]
+    fn nse_setdt_flips_class_to_data_table() {
+        let code = "x <- read.csv(\"f.csv\")\nsetDT(x)\nx[, newcol := val]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "newcol"));
+        assert!(!was_collected(&used, "val"));
+    }
+
+    /// `setDT(x)` works even when `x` has no constructor-derived classification
+    /// (e.g. a function argument or loaded frame): the call itself establishes
+    /// the data.table class from that point onward.
+    #[test]
+    fn nse_setdt_without_prior_constructor_suppresses() {
+        let code = "setDT(x)\nx[, mean(value), by = grp]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "value"));
+        assert!(!was_collected(&used, "grp"));
+    }
+
+    /// `setDF(x)` flips a data.table back to a plain data.frame from that call
+    /// onward, so a later `x[undefined_idx, ]` is checked again.
+    #[test]
+    fn nse_setdf_flips_class_back_to_data_frame() {
+        let code = "x <- as.data.table(d)\nsetDF(x)\nx[undefined_idx, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "undefined_idx"));
+    }
+
+    /// A bracket index *before* the `setDT(x)` transition keeps the prior
+    /// classification (here: non-data.table constructor), so it is still
+    /// checked; only indices after the call are suppressed.
+    #[test]
+    fn nse_setdt_transition_is_positional() {
+        let code = "x <- data.frame(a = 1)\nx[before_idx, ]\nsetDT(x)\nx[, after := 1]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "before_idx"));
+        assert!(!was_collected(&used, "after"));
+    }
+
+    /// `setattr(x, "class", "data.table")` is a by-reference class set: `x`
+    /// becomes a data.table from that call onward.
+    #[test]
+    fn nse_setattr_class_data_table_flips_class() {
+        let code = "x <- read.csv(\"f.csv\")\nsetattr(x, \"class\", c(\"data.table\", \"data.frame\"))\nx[, j := val]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "j"));
+        assert!(!was_collected(&used, "val"));
     }
 
     // ========================================================================
@@ -19171,6 +21560,9 @@ clean_data <- function(x) {
                         full_imports: Default::default(),
                         test_attached_packages: Default::default(),
                         test_helper_symbols: Default::default(),
+                        dataset_symbols: Default::default(),
+                        sysdata_symbols: Default::default(),
+                        onload_symbols: Default::default(),
                     },
                     ..Default::default()
                 });
@@ -19250,6 +21642,9 @@ clean_data <- function(x) {
                         full_imports: std::sync::Arc::new(full),
                         test_attached_packages: Default::default(),
                         test_helper_symbols: Default::default(),
+                        dataset_symbols: Default::default(),
+                        sysdata_symbols: Default::default(),
+                        onload_symbols: Default::default(),
                     },
                     ..Default::default()
                 });
@@ -19316,6 +21711,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -19344,6 +21742,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Sanity: the baseline undefined symbol MUST still be flagged —
@@ -19368,6 +21767,291 @@ clean_data <- function(x) {
                 .iter()
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Workstream B: a NAMESPACE `importFrom(pkg, fn)` MUST suppress
+    /// "Undefined variable: fn" for `R/*.R` files even when `pkg` is NOT
+    /// installed — the explicit symbol name is statically known from the
+    /// NAMESPACE directive and needs no package library lookup.
+    ///
+    /// This test exercises the FULL derivation path (NAMESPACE text →
+    /// `derive_package_state` → `scope_contribution.imported_symbols` →
+    /// scope injection → diagnostic suppression), unlike
+    /// `test_diagnostic_suppresses_importFrom_in_package_file` which uses
+    /// manual `set_from`.
+    #[tokio::test]
+    async fn test_importfrom_resolves_without_source_package_installed() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        // package_library_ready is FALSE — simulates R unavailable / source
+        // package not installed (CI environment with no R).
+        state.package_library_ready = false;
+
+        // Set up package inputs with NAMESPACE containing importFrom for a
+        // non-installed package.
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: mypkg\nImports: nonexistent_pkg_xyz\n".into(),
+        });
+        state.package_inputs.namespace = Some(NamespaceInput {
+            text:
+                "importFrom(nonexistent_pkg_xyz, imported_fn, another_imported)\nexport(my_func)\n"
+                    .into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "my_func <- function() {\n  imported_fn()\n  another_imported()\n  genuine_undefined()\n}\n"
+                .into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/main.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // Verify derivation produced the imported symbols.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .imported_symbols
+                .contains_key("imported_fn"),
+            "derivation must populate imported_symbols from NAMESPACE importFrom: {:?}",
+            state.package_state.scope_contribution().imported_symbols,
+        );
+
+        let code = "my_func <- function() {\n  imported_fn()\n  another_imported()\n  genuine_undefined()\n}\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.contains(&"Undefined variable: genuine_undefined"),
+            "baseline undefined MUST still fire; got: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("imported_fn")),
+            "importFrom symbol must not be flagged even when source package is absent; got: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("another_imported")),
+            "all importFrom symbols must resolve; got: {messages:?}",
+        );
+    }
+
+    /// Workstream B negative test: `import(pkg)` (whole-package import) does
+    /// NOT make arbitrary symbols resolve when the package is not installed.
+    /// Only explicitly NAMED `importFrom(pkg, fn)` symbols are trusted
+    /// without install; whole-package imports legitimately need the package's
+    /// export list to know what's available.
+    #[tokio::test]
+    async fn test_whole_package_import_does_not_resolve_arbitrary_symbols_when_uninstalled() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = false;
+
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: mypkg\nImports: nonexistent_pkg_xyz\n".into(),
+        });
+        // Only whole-package import — no importFrom for specific symbols.
+        state.package_inputs.namespace = Some(NamespaceInput {
+            text: "import(nonexistent_pkg_xyz)\nexport(my_func)\n".into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "my_func <- function() {\n  some_function_from_pkg()\n}\n".into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/main.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // `imported_symbols` must be empty — only importFrom populates it.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .imported_symbols
+                .is_empty(),
+            "whole-package import must NOT populate imported_symbols: {:?}",
+            state.package_state.scope_contribution().imported_symbols,
+        );
+        // `full_imports` must contain the package name.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .full_imports
+                .contains("nonexistent_pkg_xyz"),
+            "import(pkg) must appear in full_imports: {:?}",
+            state.package_state.scope_contribution().full_imports,
+        );
+
+        let code = "my_func <- function() {\n  some_function_from_pkg()\n}\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        // When the package is NOT installed and library is NOT ready, the
+        // symbol cannot be resolved via the package library. The undefined-
+        // variable diagnostic SHOULD fire (the pending-cache suppression
+        // only kicks in when `package_library_ready` is true and the
+        // package exists on disk).
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("some_function_from_pkg")),
+            "whole-package import with uninstalled package must NOT resolve arbitrary symbols; got: {messages:?}",
+        );
+    }
+
+    /// Workstream B negative test: a symbol NOT listed in any `importFrom`
+    /// directive must still be flagged as undefined even when other symbols
+    /// from the same package ARE imported. Ensures no leak of unnamed imports.
+    #[tokio::test]
+    async fn test_importfrom_does_not_leak_unnamed_symbols() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = false;
+
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: mypkg\nImports: somepkg\n".into(),
+        });
+        // Import only `allowed_fn` from somepkg — `not_imported_fn` is NOT listed.
+        state.package_inputs.namespace = Some(NamespaceInput {
+            text: "importFrom(somepkg, allowed_fn)\nexport(my_func)\n".into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "my_func <- function() {\n  allowed_fn()\n  not_imported_fn()\n}\n".into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/main.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        let code = "my_func <- function() {\n  allowed_fn()\n  not_imported_fn()\n}\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("allowed_fn")),
+            "explicitly imported symbol must resolve; got: {messages:?}",
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("not_imported_fn")),
+            "symbol NOT in importFrom must still be flagged as undefined; got: {messages:?}",
         );
     }
 
@@ -19406,6 +22090,9 @@ clean_data <- function(x) {
                     full_imports: std::sync::Arc::new(full_imports),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -19434,6 +22121,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -19503,6 +22191,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
@@ -19573,6 +22262,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Sanity: the baseline undefined symbol MUST be flagged — otherwise the
@@ -19599,6 +22289,1219 @@ clean_data <- function(x) {
         );
     }
 
+    /// A nested closure can refer to a binding installed later in its enclosing
+    /// function before the closure is called. R resolves that name at call time
+    /// through the enclosing function environment, so this is not a true
+    /// forward-reference error.
+    #[test]
+    fn test_diagnostic_suppresses_later_enclosing_function_binding_in_nested_closure() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "outer <- function() {\n  inner <- function() later()\n  later <- function() 1\n  inner()\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("later")),
+            "nested closure should late-bind later enclosing function binding; messages: {messages:?}"
+        );
+    }
+
+    /// The nested-closure late-binding carve-out must not hide a direct use
+    /// before definition in the same function body: `later()` runs before
+    /// `later <- ...` installs the binding.
+    #[test]
+    fn test_diagnostic_flags_same_function_use_before_later_binding() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "outer <- function() {\n  later()\n  later <- function() 1\n}\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: later"),
+            "direct same-function use before binding must remain diagnostic; messages: {messages:?}"
+        );
+    }
+
+    /// Assignments inside a top-level if/else/for/while/repeat block are
+    /// top-level bindings visible from that statement onward. This is the
+    /// pattern used by rlang vendored standalone files:
+    /// `if (!exists("is_true")) is_true <- function(x) x`
+    /// followed by `is_true(something)`.
+    #[test]
+    fn test_diagnostic_suppresses_conditional_def_after_if_block() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "if (!exists(\"is_true\")) {\n  is_true <- function(x) x\n}\nis_true(y)\nna_chr <- NA_character_\nif (TRUE) {\n  deferred_run <- function(fn) fn()\n}\ndeferred_run(identity)\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined must fire; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("is_true")),
+            "conditional def inside if block must not be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("deferred_run")),
+            "conditional def inside if block must not be flagged; messages: {messages:?}"
+        );
+    }
+
+    /// Assignments inside a function body must stay local — they must NOT
+    /// be promoted to top-level even when nested inside control flow.
+    #[test]
+    fn test_diagnostic_function_body_conditional_def_stays_local() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "f <- function() {\n  if (TRUE) {\n    local_var <- 42\n  }\n  local_var\n}\nlocal_var\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined must fire; messages: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("local_var")),
+            "function-body def must be flagged at top-level usage; messages: {messages:?}"
+        );
+    }
+
+    /// A binding defined inside a top-level control-flow block must NOT be
+    /// visible before its statement (used-before-defined).
+    #[test]
+    fn test_diagnostic_flags_use_before_conditional_def() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "is_true(y)\nif (!exists(\"is_true\")) {\n  is_true <- function(x) x\n}\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("is_true")),
+            "use-before-defined must still be flagged for conditional defs; messages: {messages:?}"
+        );
+    }
+
+    /// `mostattributes(x) <- value` dispatches to the replacement binding
+    /// `mostattributes<-`; the syntactic call head `mostattributes` is not a
+    /// separate variable lookup.
+    #[test]
+    fn test_diagnostic_suppresses_base_replacement_function_call_head() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "f <- function(x, value) {\n  mostattributes(x) <- value\n  x\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("mostattributes")),
+            "replacement call head must resolve via `mostattributes<-`; messages: {messages:?}"
+        );
+    }
+
+    /// User-defined replacement functions use the same `name(x) <- value`
+    /// syntax and should resolve against the `name<-` binding in scope.
+    #[test]
+    fn test_diagnostic_suppresses_user_defined_replacement_function_call_head() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "`foo<-` <- function(x, value) x\nbar <- function(x) {\n  foo(x) <- 1\n  x\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("foo")),
+            "replacement call head must resolve via the in-scope `foo<-` binding; messages: {messages:?}"
+        );
+    }
+
+    /// R accepts string-literal assignment targets (`"foo<-" <- function(...)`)
+    /// and binds the value to that name. Defining a function through a quoted
+    /// name is idiomatic R (semantically identical to the backtick form), so
+    /// no assign-to-string-literal warning is emitted, and scope resolution
+    /// must treat it as a real binding so later replacement-call syntax
+    /// resolves.
+    #[test]
+    fn test_diagnostic_suppresses_string_literal_replacement_function_binding() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "\"foo<-\" <- function(x, value) x\nbar <- function(x) {\n  foo(x) <- 1\n  x\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("string literal")),
+            "quoted-string LHS defining a function is idiomatic and must not be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: foo"),
+            "string-literal assignment target `foo<-` must define the replacement binding; messages: {messages:?}"
+        );
+    }
+
+    /// Formals after `...` are still ordinary parameters. The base `rm`
+    /// implementation uses this shape and must not report `envir` as
+    /// undefined inside the body.
+    #[test]
+    fn test_diagnostic_suppresses_formal_after_dots() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "rm2 <-\n    function (..., list = character(), pos = -1, envir = as.environment(pos),\n              inherits = FALSE)\n{\n    .Internal(remove(list, envir, inherits))\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("envir")),
+            "formal after `...` must be visible in function body; messages: {messages:?}"
+        );
+    }
+
+    /// `.Internal(remove(...))` is how base implements rm()/remove(); the
+    /// nested `remove` is a C routine name, not an R-level scope-removal call.
+    #[test]
+    fn test_diagnostic_internal_remove_routine_does_not_remove_formals() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "rm <- function(..., list = character(), pos = -1, envir = as.environment(pos),\n              inherits = FALSE) {\n  if (missing(list)) {\n    list <- vapply(substitute(list(...))[-1L], deparse, \"\")\n  }\n  .Internal(remove(list, envir, inherits))\n}\nremove <- rm\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: envir"),
+            "`.Internal(remove(...))` must not remove the formal `envir`; messages: {messages:?}"
+        );
+    }
+
+    /// `.Autoloaded` is provided by R's startup `Autoloads` search-path
+    /// environment, so base's `autoload()` can read it as a bare name.
+    #[test]
+    fn test_diagnostic_suppresses_autoloaded_search_path_binding() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        let code = "autoload <- function(name, package, reset = FALSE, ...) {\n  if (is.na(match(package, .Autoloaded)))\n    assign(\".Autoloaded\", c(package, .Autoloaded), envir = .AutoloadEnv)\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains(".Autoloaded")),
+            "`.Autoloaded` should resolve from R's default Autoloads environment; messages: {messages:?}"
+        );
+    }
+
+    /// R injects `.Generic`, `.Method`, and `.Class` into S3 method frames. They
+    /// are not ordinary top-level variables, so `Ops.raster`-style method bodies
+    /// must not report them as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_s3_method_special_variables() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "Ops.raster <- function(e1, e2) {\n  list(.Generic, .Method, .Class)\n}\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in [".Generic", ".Method", ".Class"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "S3 method special variable `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// S4 group-generic method bodies (defined via `setMethod("Ops"|"Math"|...)`)
+    /// run with `.Generic`, `.Method`, and `.Class` injected by the dispatcher.
+    /// These must not be flagged as undefined. Regression for Matrix's 45 FPs.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_s4_setmethod_special_variables() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "setMethod(\"Ops\", \"myClass\", function(e1, e2) {\n  callGeneric(.Generic, e1, e2)\n  list(.Method, .Class)\n})\ny <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged. messages: {messages:?}",
+        );
+        for special in [".Generic", ".Method", ".Class"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "S4 method special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// `.Generic`, `.Method`, `.Class`, and `.Group` inside a function that is
+    /// registered later via `registerS3method()` — the lubridate/S4 group-generic
+    /// pattern — must not be flagged as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_group_generic_special_variables() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        // Simulates lubridate's R/ops-compare.r pattern: a helper function that
+        // uses .Generic and is registered later via registerS3method().
+        let code = r#"comp_posix_date <- function(e1, e2) {
+  if (nargs() == 1) stop(.Generic)
+  NextMethod(.Generic)
+}
+group_handler <- function(e1, e2) {
+  list(.Group, .Method, .Class)
+}
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged. messages: {messages:?}",
+        );
+        for special in [".Generic", ".Method", ".Class", ".Group"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "group-generic special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// R6 class method bodies run with `self`, `private`, and `super` injected
+    /// by R6 at construction time. They must not be flagged as undefined inside
+    /// `public`, `private`, or `active` method bodies of `R6Class(...)`.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_self_private_super() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6::R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+      private$helper()
+      super$initialize()
+    }
+  ),
+  private = list(
+    helper = function() {
+      self$data
+      private$internal
+    }
+  ),
+  active = list(
+    value = function() {
+      self$compute()
+      private$cache
+      super$value
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged. messages: {messages:?}",
+        );
+        for pronoun in ["self", "private", "super"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                "R6 pronoun `{pronoun}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// R6 pronouns must also resolve inside nested helper functions within
+    /// R6Class method bodies.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_pronouns_in_nested_function() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6::R6Class("MyClass",
+  public = list(
+    run = function() {
+      helper <- function() {
+        self$data
+        private$x
+      }
+      helper()
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        for pronoun in ["self", "private"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                "R6 pronoun `{pronoun}` in nested fn must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// A top-level local named `R6Class` shadows the package function and
+    /// disables R6 pronoun injection.
+    #[tokio::test]
+    async fn test_r6_shadow_disables_pronoun_suppression() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"R6Class <- function(...) list(...)
+MyClass <- R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        // With R6Class shadowed, `self` should be flagged as undefined
+        assert!(
+            messages.iter().any(|m| m == "Undefined variable: self"),
+            "R6 pronoun `self` must be flagged when R6Class is shadowed. messages: {messages:?}",
+        );
+    }
+
+    /// A genuine undefined inside an R6 method body must still be flagged.
+    #[tokio::test]
+    async fn test_r6_method_genuine_undefined_still_flags() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6::R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+      completely_nonexistent_var
+    }
+  )
+)
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: completely_nonexistent_var"),
+            "genuine undefined inside R6 method must still be flagged. messages: {messages:?}",
+        );
+        // But `self` should NOT be flagged
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: self"),
+            "R6 pronoun `self` must not be flagged. messages: {messages:?}",
+        );
+    }
+
+    /// R6 pronouns must also be suppressed with bare `R6Class(...)` calls
+    /// (without the `R6::` namespace prefix).
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_r6_bare_r6class_call() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = r#"MyClass <- R6Class("MyClass",
+  public = list(
+    greet = function() {
+      self$name
+      private$helper()
+    }
+  )
+)
+y <- totally_undefined_baseline()
+"#;
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must fire. messages: {messages:?}",
+        );
+        for pronoun in ["self", "private"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                "R6 pronoun `{pronoun}` must not be flagged with bare R6Class. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// Reference Class method bodies run with injected method-frame helpers.
+    /// Direct methods supplied through `setRefClass(..., methods = list(...))`
+    /// must not report `.self`, `.refClassDef`, or `callSuper` as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_refclass_method_specials_in_setrefclass_methods() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "Foo <- setRefClass(\"Foo\", methods = list(\
+            initialize = function(...) {\
+                callSuper(...);\
+                .self$initFields(...);\
+                .refClassDef@className\
+            }))\n\
+            y <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in ["callSuper", ".self", ".refClassDef"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "Reference Class method special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// The `methods` package defines the shared Reference Class default-method
+    /// table as `.envRefMethods <- list(...)`; entries in that table are also
+    /// Reference Class method bodies with the same implicit method-frame names.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_refclass_specials_in_env_ref_methods_table() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = ".envRefMethods <- list(\
+            copy = function() {\
+                value <- .self;\
+                .refClassDef@className\
+            })\n\
+            y <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in [".self", ".refClassDef"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "Reference Class table special `{special}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    /// Helper functions registered through `Generator$methods(name = helper)`
+    /// become Reference Class methods, so their bodies may also use the injected
+    /// method-frame names.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_refclass_specials_in_registered_method_helper() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "changeAllFields <- function(replacement) {\
+                fields <- names(.refClassDef@fieldClasses);\
+                .self$field <- replacement$field\
+            }\n\
+            Foo$methods(change = changeAllFields)\n\
+            y <- totally_undefined_baseline()\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; pipeline may not be firing. \
+             messages: {messages:?}",
+        );
+        for special in [".self", ".refClassDef"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "registered Reference Class method helper special `{special}` must not be flagged. \
+                 messages: {messages:?}",
+            );
+        }
+    }
+
+    /// The same names remain diagnosable in ordinary functions; the Reference
+    /// Class suppression must be tied to method registration contexts.
+    #[tokio::test]
+    async fn test_diagnostic_flags_refclass_specials_in_ordinary_function() {
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let code = "ordinary <- function() list(.self, .refClassDef, callSuper)\n";
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        for special in [".self", ".refClassDef", "callSuper"] {
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {special}")),
+                "ordinary function special `{special}` should still be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    fn undefined_messages_for_code(code: &str) -> Vec<String> {
+        let workspace_root = Url::parse("file:///work").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root];
+        state.workspace_scan_complete = true;
+
+        let uri = Url::parse("file:///work/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    #[test]
+    fn test_diagnostic_suppresses_refclass_fields_in_setrefclass_methods() {
+        let code = "Foo <- setRefClass(\"Foo\", fields = list(bar = \"numeric\"),\
+            methods = list(addToBar = function(incr) {\
+                bar <<- bar + incr\
+            }))\n\
+            y <- totally_undefined_baseline()\n";
+        let messages = undefined_messages_for_code(code);
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m == "Undefined variable: bar"),
+            "Reference Class field `bar` must not be flagged inside its method. messages: {messages:?}",
+        );
+    }
+
+    #[test]
+    fn test_diagnostic_suppresses_refclass_inherited_members_and_accessors() {
+        let code = "Foo <- setRefClass(\"Foo\", fields = list(bar = \"numeric\"),\
+            methods = list(addToBar = function(incr) { bar <<- bar + incr }))\n\
+            Foo2 <- setRefClass(\"Foo2\", fields = list(b2 = \"numeric\"), contains = \"Foo\",\
+            methods = list(addBoth = function(incr) {\
+                addToBar(incr);\
+                b2 <<- b2 + incr;\
+                setB2(getB2() + incr)\
+            }))\n\
+            y <- totally_undefined_baseline()\n";
+        let messages = undefined_messages_for_code(code);
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}",
+        );
+        for name in ["addToBar", "b2", "setB2", "getB2"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {name}")),
+                "Reference Class inherited/member name `{name}` must not be flagged. messages: {messages:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_diagnostic_suppresses_refclass_fields_in_generator_methods_call() {
+        let code = "Foo <- setRefClass(\"Foo\", c(\"bar\", \"flag\"))\n\
+            Foo$methods(showAll = function() c(bar, flag))\n\
+            y <- totally_undefined_baseline()\n";
+        let messages = undefined_messages_for_code(code);
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}",
+        );
+        for name in ["bar", "flag"] {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m == &format!("Undefined variable: {name}")),
+                "Reference Class field `{name}` must not be flagged in `$methods(...)`. messages: {messages:?}",
+            );
+        }
+    }
     /// Package-internal symbols from `r_internal_symbols` must also suppress
     /// the undefined-variable diagnostic in the hot ScopeStream path.
     #[tokio::test]
@@ -19625,6 +23528,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -19653,6 +23559,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -19705,6 +23612,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: std::sync::Arc::new(helpers),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -19733,6 +23643,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -19781,6 +23692,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: std::sync::Arc::new(helpers),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -19809,6 +23723,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -19867,6 +23782,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -19895,6 +23813,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -19977,6 +23896,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -20018,6 +23940,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -20089,6 +24012,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -20123,6 +24049,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -20176,6 +24103,9 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
                 },
                 ..Default::default()
             });
@@ -20204,6 +24134,7 @@ clean_data <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -20211,6 +24142,356 @@ clean_data <- function(x) {
                 .iter()
                 .any(|d| d.message == "Undefined variable: test_that"),
             "R/ files must flag testthat exports as undefined. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    // ========================================================================
+    // Dataset symbols: package data/ directory (Workstream D)
+    // ========================================================================
+
+    /// Package dataset symbols suppress undefined-variable in a vignette file.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_dataset_in_vignette() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut datasets = BTreeSet::new();
+        datasets.insert("mpg".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: std::sync::Arc::new(datasets),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "head(mpg)\n";
+        let uri = Url::parse("file:///work/pkg/vignettes/intro.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d.message.contains("mpg")),
+            "dataset 'mpg' must suppress undefined-variable in vignettes/. got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Package dataset symbols suppress undefined-variable in a test file.
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_dataset_in_test() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut datasets = BTreeSet::new();
+        datasets.insert("starwars".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: std::sync::Arc::new(datasets),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "nrow(starwars)\n";
+        let uri = Url::parse("file:///work/pkg/tests/testthat/test-data.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d.message.contains("starwars")),
+            "dataset 'starwars' must suppress undefined-variable in tests/. got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// NEGATIVE: a non-dataset bare name still flags as undefined.
+    #[tokio::test]
+    async fn test_diagnostic_flags_non_dataset_in_vignette() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut datasets = BTreeSet::new();
+        datasets.insert("mpg".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: std::sync::Arc::new(datasets),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "head(not_a_dataset)\n";
+        let uri = Url::parse("file:///work/pkg/vignettes/intro.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("not_a_dataset")),
+            "non-dataset name must still flag as undefined. got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Sysdata symbols suppress undefined-variable in R/ source files.
+    #[tokio::test]
+    async fn test_sysdata_symbol_suppresses_undefined_in_r_source() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut sysdata = BTreeSet::new();
+        sysdata.insert("builtin_data".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: std::sync::Arc::new(sysdata),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "nrow(builtin_data)\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("builtin_data")),
+            "sysdata symbol must suppress undefined-variable in R/. got: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// .onLoad binding symbols suppress undefined-variable in R/ source files.
+    #[tokio::test]
+    async fn test_onload_binding_suppresses_undefined_in_r_source() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+
+        let mut onload = BTreeSet::new();
+        onload.insert("cached_value".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: std::sync::Arc::new(onload),
+                },
+                ..Default::default()
+            });
+
+        let code = "print(cached_value)\n";
+        let uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("cached_value")),
+            "onload binding must suppress undefined-variable in R/. got: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
@@ -24137,6 +28418,78 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
+    fn rmd_man_file_sees_package_exports() {
+        // A .Rmd under man/rmd/ is a dev-context file: it must see the
+        // package's own r_internal_symbols and imported_symbols, so
+        // references to package exports are NOT flagged as undefined.
+        let code = "# Topic\n\n```{r}\nabort(\"oops\")\n```\n";
+        let diags = rmd_diagnostics(code, "file:///work/pkg/man/rmd/topic.Rmd", |state| {
+            use std::collections::{BTreeMap, BTreeSet};
+            let workspace_root = tower_lsp::lsp_types::Url::parse("file:///work/pkg").unwrap();
+            state.workspace_folders = vec![workspace_root];
+            let mut internal = BTreeSet::new();
+            internal.insert("abort".to_string());
+            state
+                .package_state
+                .set_from(crate::package_state::PackageState {
+                    scope_contribution: crate::package_state::PackageScopeContribution {
+                        workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        r_internal_symbols: std::sync::Arc::new(internal),
+                        imported_symbols: std::sync::Arc::new(BTreeMap::new()),
+                        full_imports: Default::default(),
+                        test_attached_packages: Default::default(),
+                        test_helper_symbols: Default::default(),
+                        dataset_symbols: Default::default(),
+                        sysdata_symbols: Default::default(),
+                        onload_symbols: Default::default(),
+                    },
+                    ..Default::default()
+                });
+        });
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: abort")),
+            "man/rmd/ file must see package exports, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmd_genuine_undefined_in_later_chunk_still_flagged() {
+        // Cross-chunk scope means earlier-chunk bindings flow to later
+        // chunks, but a genuinely undefined symbol still flags even when
+        // it appears after valid definitions.
+        let code = "```{r}\nx <- 1\n```\n\n```{r}\ny <- x + 1\n```\n\n```{r}\nprint(never_defined_anywhere)\n```\n";
+        let diags = rmd_diagnostics(code, "file:///cross_undef.Rmd", |_| {});
+        // x must NOT be flagged (cross-chunk resolution)
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Undefined variable: x")),
+            "x from chunk 1 must resolve in chunk 2, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        // never_defined_anywhere MUST be flagged
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: never_defined_anywhere"),
+            "genuinely undefined symbol must still flag in later chunk, got {:?}",
+            diags
+                .iter()
+                .map(|d| (d.range.start.line, d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn rmd_nolint_inside_chunk_respected() {
         // A lint-triggering line inside a chunk carrying `# nolint` must be
         // suppressed; the same rule must still fire on a sibling line without
@@ -24170,16 +28523,17 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
-    fn rmd_eval_false_chunk_still_diagnosed() {
-        // `eval=FALSE` only affects knitr execution, not static analysis: a
-        // syntax error inside such a chunk is still flagged.
+    fn rmd_eval_false_chunk_not_diagnosed() {
+        // `eval=FALSE` chunks are display-only: their body may contain
+        // intentionally malformed R (vignette snippets), so the mask blanks
+        // them and no syntax diagnostic should appear.
         let code = "# Title\n\n```{r, eval=FALSE}\nx <- (\n```\n";
         let diags = rmd_diagnostics(code, "file:///eval.Rmd", |_| {});
         assert!(
-            diags
+            !diags
                 .iter()
-                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR) && d.range.start.line == 3),
-            "a syntax error inside an eval=FALSE chunk must still be flagged on line 3, got {:?}",
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "an eval=FALSE chunk must NOT produce syntax diagnostics, got {:?}",
             diags
                 .iter()
                 .map(|d| (d.range.start.line, d.message.clone()))
@@ -30940,7 +35294,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
@@ -30994,7 +35348,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
@@ -31046,7 +35400,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
@@ -31097,7 +35451,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this variable
             let undefined_diags: Vec<_> = diagnostics
@@ -32023,7 +36377,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this variable
             let undefined_diags: Vec<_> = diagnostics
@@ -32082,7 +36436,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this function
             let undefined_diags: Vec<_> = diagnostics
@@ -32144,7 +36498,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this symbol
             let undefined_diags: Vec<_> = diagnostics
@@ -32223,7 +36577,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Exact match should NOT produce diagnostic
             let exact_diags: Vec<_> = diagnostics
@@ -32306,7 +36660,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // var1 on line 0 (before declaration) should produce diagnostic
             let var1_before_diags: Vec<_> = diagnostics
@@ -32424,7 +36778,7 @@ mod proptests {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
-            );
+            None);
 
             // Filter for "Undefined variable" diagnostics for this symbol
             let undefined_diags: Vec<_> = diagnostics
@@ -40817,7 +45171,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -40859,7 +45213,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -40890,7 +45244,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -40921,7 +45275,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -40946,7 +45300,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -40971,7 +45325,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -41010,7 +45364,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         let _ = fs::remove_dir_all(&tmp);
 
@@ -41180,7 +45534,7 @@ result <- helper_with_spaces(42)"#;
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
         let mut diagnostics = Vec::new();
-        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics);
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
 
         assert_eq!(
             diagnostics.len(),
@@ -41388,6 +45742,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -42285,6 +46640,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -42355,6 +46711,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Snapshot-path message format: "'j' is used before it's available (sourced on line N)".
@@ -42428,6 +46785,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -42494,6 +46852,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -42559,6 +46918,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -42628,6 +46988,7 @@ result <- helper_with_spaces(42)"#;
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let used_before_x: Vec<_> = diagnostics
@@ -43795,6 +48156,7 @@ x <- 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
@@ -43838,6 +48200,7 @@ greet <- function() \"hi\"
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let greet_diags: Vec<_> = diagnostics
@@ -43884,6 +48247,7 @@ g <- \\(x) x + 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let g_diags: Vec<_> = diagnostics
@@ -43936,6 +48300,7 @@ f <- function() {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let x_diags: Vec<_> = diagnostics
@@ -43985,6 +48350,7 @@ x <- 2
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let x_diags: Vec<_> = diagnostics
@@ -44024,6 +48390,7 @@ totally_unknown
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
@@ -44058,6 +48425,7 @@ x <- 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
@@ -44127,6 +48495,7 @@ x <- 1
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // food is used on lines 0 and 1, defined on line 2 → 2 forward references
@@ -44193,6 +48562,7 @@ x
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
@@ -44224,6 +48594,7 @@ x <- 2
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
@@ -44259,6 +48630,7 @@ myvar
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -44293,6 +48665,7 @@ myfunc()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -44327,6 +48700,7 @@ myfunc()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -44365,6 +48739,7 @@ MyVar
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -44402,6 +48777,7 @@ MyVar
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             assert_eq!(
@@ -44439,6 +48815,7 @@ MyVar
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             assert_eq!(
@@ -44475,6 +48852,7 @@ myvar
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Both usages should be flagged since the directive is not recognized as a trailing comment
@@ -44576,6 +48954,7 @@ mysymbol
             &mut diagnostics1,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -44604,6 +48983,7 @@ mysymbol
             &mut diagnostics2,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert_eq!(
@@ -46441,6 +50821,7 @@ mod function_parameter_tests {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         diagnostics
@@ -46747,6 +51128,7 @@ add <- function(a, b) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
@@ -46805,6 +51187,7 @@ outer_func <- function(x) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
@@ -46862,6 +51245,7 @@ my_func <- function(a = undefined_var) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings
@@ -46894,6 +51278,115 @@ my_func <- function(a = undefined_var) {
             "Undefined variable 'undefined_var' in default expression should be flagged"
         );
     }
+    #[test]
+    fn test_default_parameter_can_reference_later_top_level_helper() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(x = make_default()) {
+  x
+}
+make_default <- function() 42
+
+other_func <- function(y = still_missing) {
+  y
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message.contains("make_default")),
+            "Default expression should resolve a top-level helper declared later, \
+             because the promise is evaluated after the function is called. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+        assert!(
+            undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: still_missing"),
+            "A genuinely missing default expression symbol must still be flagged. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_can_reference_body_local_binding() {
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(x = local_default) {
+  local_default <- 42
+  x
+}
+
+other_func <- function(y = still_missing) {
+  local_default <- 42
+  y
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+
+        assert!(
+            !undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: local_default"),
+            "Default expression should resolve a binding created in the function \
+             body before the default is forced. Diagnostics: {:?}",
+            undefined_var_diags
+        );
+        assert!(
+            undefined_var_diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: still_missing"),
+            "A genuinely missing default expression symbol must still be flagged. \
+             Diagnostics: {:?}",
+            undefined_var_diags
+        );
+    }
 
     #[test]
     fn test_default_parameter_can_reference_prior_parameter_with_default() {
@@ -46919,6 +51412,7 @@ my_func()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -46960,6 +51454,7 @@ my_func(1)
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -47001,6 +51496,7 @@ my_func()
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -47043,6 +51539,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         // Filter to only undefined variable warnings
@@ -47098,6 +51595,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -47230,6 +51728,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -47285,6 +51784,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -47339,6 +51839,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -47400,6 +51901,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         assert!(
             !diagnostics
@@ -47425,6 +51927,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         assert!(
             diagnostics
@@ -47467,6 +51970,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -47522,6 +52026,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         assert!(
@@ -47572,6 +52077,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -47620,6 +52126,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -47699,6 +52206,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let merp_diags: Vec<_> = diagnostics
@@ -47759,6 +52267,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let x_diags_on_print: Vec<_> = diagnostics
@@ -47813,6 +52322,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_self_diags: Vec<_> = diagnostics
@@ -47855,6 +52365,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
 
         let undefined_var_diags: Vec<_> = diagnostics
@@ -47916,6 +52427,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
 
             let undefined_var_diags: Vec<_> = diagnostics
@@ -47967,6 +52479,7 @@ my_func <- function(a = default_value) {
                 &mut diagnostics,
                 &mut std::collections::HashMap::new(),
                 &DiagCancelToken::never(),
+                None,
             );
             let messages: Vec<&String> = diagnostics.iter().map(|d| &d.message).collect();
 
@@ -48033,6 +52546,7 @@ my_func <- function(a = default_value) {
             &mut diagnostics,
             &mut std::collections::HashMap::new(),
             &DiagCancelToken::never(),
+            None,
         );
         diagnostics.into_iter().map(|d| d.message).collect()
     }

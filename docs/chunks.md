@@ -34,6 +34,42 @@ Cross-file awareness ([Cross-File Analysis](./cross-file.md)) reads only chunk b
 
 The relationship also works in the other direction: a plain `.R` file can declare `# @lsp-sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
 
+### Suppressing diagnostics in a chunk
+
+Two ways to silence Raven's diagnostics for an entire chunk:
+
+- **knitr chunk option** `raven.ignore` in the chunk header:
+
+  ````markdown
+  ```{r, raven.ignore=TRUE}
+  result <- some_undefined_thing   # no diagnostics in this chunk
+  ```
+  ````
+
+  `raven.ignore=TRUE` (or `=T`) suppresses everything in the chunk body;
+  `raven.ignore=FALSE` (the default) does nothing. Narrow it to specific codes
+  with a quoted, comma-separated list:
+  `raven.ignore="undefined-variable, line-length"`. An explicitly empty list
+  (`raven.ignore=""`) is the empty set of codes and therefore suppresses
+  nothing — use `raven.ignore=TRUE` to silence the whole chunk.
+
+- **in-chunk directive** `# raven: ignore-chunk` anywhere in the chunk body
+  (optionally `# raven: ignore-chunk[undefined-variable]`):
+
+  ````markdown
+  ```{r}
+  # raven: ignore-chunk
+  result <- some_undefined_thing
+  ```
+  ````
+
+Both map the chunk body onto the same machinery as the file/line/block
+[ignore directives](directives.md#ignore-directives), so the `[code]` selector
+is enforced the same way. For finer control you can still use ordinary
+`# raven: ignore` / `# raven: ignore-next` / `# raven: ignore-start` …
+`# raven: ignore-end` markers inside a chunk body — they work exactly as in a
+plain `.R` file.
+
 ## Keyboard shortcuts
 
 | Mac | Windows/Linux | Action |
@@ -127,6 +163,7 @@ Raven parses the header inside `{…}` and recognizes:
 Two options affect Raven specifically:
 
 - `eval = FALSE` (or `eval = F`) — Raven dims the chunk's background tint to signal that it will not be evaluated by `knitr` or `quarto render`. The CodeLens still offers to run the chunk manually if you want.
+- `raven.ignore` — suppresses Raven's diagnostics for the chunk body: `raven.ignore=TRUE` silences everything, `raven.ignore="undefined-variable, line-length"` narrows it to the listed codes (`raven.ignore=FALSE` is the default no-op). See [Suppressing diagnostics in a chunk](#suppressing-diagnostics-in-a-chunk).
 
 Every other option is preserved on the parsed chunk but Raven does not interpret it.
 

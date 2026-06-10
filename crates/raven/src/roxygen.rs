@@ -1581,6 +1581,15 @@ fn extract_first_identifier(line: &str) -> Option<String> {
 ///
 /// Delegates to `cross_file::scope::compute_artifacts` so the result agrees
 /// with the workspace index. Uses a synthetic `memory:///` URI for the call.
+///
+/// Returns only genuine file-scope bindings via `live_top_level_exports`
+/// (which keeps `function_scope == None` Defs and is `rm()`-aware). The flat
+/// `exported_interface` map must NOT be used here: it records every
+/// assignment in the file, including ones nested inside function bodies, so
+/// reading its keys would leak function-locals into the package-visible
+/// symbol set. That leak previously masked real undefined-variable
+/// diagnostics once dev-context dirs (demo/, vignettes/, …) gained package
+/// visibility — e.g. stats `demo/smooth.R`'s genuine `x1` bug.
 pub fn extract_top_level_defs(text: &str) -> std::collections::BTreeSet<String> {
     use tree_sitter::Parser;
     let mut parser = Parser::new();
@@ -1598,10 +1607,8 @@ pub fn extract_top_level_defs(text: &str) -> std::collections::BTreeSet<String> 
         Err(_) => return std::collections::BTreeSet::new(),
     };
     let artifacts = crate::cross_file::scope::compute_artifacts(&uri, &tree, text);
-    artifacts
-        .exported_interface
-        .keys()
-        .map(|s| s.to_string())
+    crate::cross_file::scope::live_top_level_exports(&artifacts)
+        .into_iter()
         .collect()
 }
 
@@ -1894,5 +1901,53 @@ bar <- function() {}
         assert!(defs.contains("foo"), "got: {:?}", defs);
         assert!(defs.contains("bar"), "got: {:?}", defs);
         assert!(defs.contains("baz"), "got: {:?}", defs);
+    }
+
+    #[test]
+    fn extract_top_level_defs_excludes_function_local_assignments() {
+        // Function-body assignments — plain or nested in control flow — must
+        // NOT be collected as package-visible top-level definitions; only
+        // genuine file-scope bindings are. Regression guard: a function-local
+        // `x1 <- ...` inside an `if` block was leaking into
+        // `r_internal_symbols` and, once dev-context dirs (demo/, vignettes/, …)
+        // gained package visibility, masking real undefined-variable
+        // diagnostics (e.g. stats `demo/smooth.R`'s genuine `x1` bug).
+        let text = "\
+f <- function(center) {
+  y_plain <- 0.5
+  if (center) { y_ctrl <- 0.5 }
+  for (i in 1:3) { y_loop <- i }
+  y_plain
+}
+g_top <- 1
+if (TRUE) { h_top <- 2 }
+";
+        let defs = extract_top_level_defs(text);
+        assert!(defs.contains("f"), "top-level fn f missing: {:?}", defs);
+        assert!(
+            defs.contains("g_top"),
+            "top-level g_top missing: {:?}",
+            defs
+        );
+        assert!(
+            defs.contains("h_top"),
+            "top-level control-flow def h_top missing: {:?}",
+            defs
+        );
+        assert!(
+            !defs.contains("y_plain"),
+            "function-local y_plain leaked: {:?}",
+            defs
+        );
+        assert!(
+            !defs.contains("y_ctrl"),
+            "function-local control-flow y_ctrl leaked: {:?}",
+            defs
+        );
+        assert!(
+            !defs.contains("y_loop"),
+            "function-local loop y_loop leaked: {:?}",
+            defs
+        );
     }
 }

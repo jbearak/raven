@@ -834,7 +834,10 @@ impl DependencyGraph {
         let mut ast_edges: Vec<DependencyEdge> = Vec::new();
         for source in &meta.sources {
             if !source.is_directive
-                && let Some(to_uri) = do_resolve(&source.path)
+                && let Some(to_uri) = source
+                    .resolved_uri
+                    .clone()
+                    .or_else(|| do_resolve(&source.path))
             {
                 let edge = DependencyEdge {
                     from: uri.clone(),

@@ -365,6 +365,13 @@ pub(crate) fn parse_cross_file_config(
         {
             config.condition_assignment_severity = parse_severity(sev);
         }
+        // Parse diagnostics.reportUnusedSuppressions (F2 Step 3)
+        if let Some(v) = diag
+            .get("reportUnusedSuppressions")
+            .and_then(|v| v.as_bool())
+        {
+            config.report_unused_suppressions = v;
+        }
     }
 
     // Parse package settings (Requirement 12, Task 14.2)
@@ -1612,6 +1619,26 @@ fn is_package_source_dir(path: &std::path::Path, root: &std::path::Path) -> bool
         || path.starts_with(testthat_dir)
 }
 
+/// Whether `path` lives under the package's `data/` or `data-raw/` directories.
+///
+/// CREATED/CHANGED watched-file events for these directories must reach
+/// `package_state::event::translate`, which has dedicated handlers that rescan
+/// `dataset_names` (from `data/`) and `sysdata_names` (from `data-raw/`).
+/// The R-source gate (`is_r_source_path` / [`is_package_source_dir`]) does not
+/// cover them, so without this predicate adding or editing a `data/*.rda` or
+/// `data-raw/*.R` file would leave those symbol sets stale until an unrelated
+/// `R/` edit. (DELETE events already reach `translate` unconditionally.)
+///
+/// The directory boundaries mirror `event.rs`'s own detection: a path strictly
+/// *under* `data/` or `data-raw/` (not the directory node itself). `Path::starts_with`
+/// is component-wise, so `data-raw/` does not match the `data/` prefix.
+fn is_package_data_path(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let data_dir = root.join("data");
+    let data_raw_dir = root.join("data-raw");
+    (path.starts_with(&data_dir) && path != data_dir)
+        || (path.starts_with(&data_raw_dir) && path != data_raw_dir)
+}
+
 fn is_package_manifest_path(path: &std::path::Path, root: &std::path::Path) -> bool {
     path == root.join("DESCRIPTION") || path == root.join("NAMESPACE")
 }
@@ -1732,7 +1759,14 @@ pub(crate) fn initialize_package_inputs_from_state(
 
     let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
     state.package_inputs.r_files = new_r_files;
+    state.package_inputs.dataset_names = crate::package_state::scan_own_package_data_dir(&root);
+    state.package_inputs.sysdata_names =
+        crate::package_state::sysdata::scan_sysdata_generating_scripts(&root);
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+
+    // Resolve system.file() sources in workspace index now that package state
+    // (workspace name, lib paths) is available.
+    state.resolve_system_file_in_workspace();
 }
 
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
@@ -2571,6 +2605,15 @@ impl LanguageServer for Backend {
             self.surface_load_notes(&load_notes).await;
         }
 
+        // Re-resolve system.file() sources now that lib_paths are available.
+        // The workspace scan (Task A) may have called resolve_system_file_in_workspace()
+        // before the library was ready, leaving branch-2 (installed-package)
+        // targets unresolved. This second pass picks them up.
+        if package_library_ready {
+            let mut state = self.state.write().await;
+            state.resolve_system_file_in_workspace();
+        }
+
         // Start the libpath watcher if enabled and we have a real package
         // library. `lib_paths` is captured here as a one-time snapshot — if the
         // user later changes `.libPaths()` mid-session (e.g. `renv` switches
@@ -2580,6 +2623,73 @@ impl LanguageServer for Backend {
         // rebuilds `PackageLibrary` (re-running `.libPaths()`) and restarts the
         // watcher over the newly-discovered paths. See `docs/packages.md`.
         restart_libpath_watcher(&self.state, &self.client, true).await;
+
+        // R fallback for sysdata: when the AST scan found nothing AND
+        // R/sysdata.rda exists, try loading via an R subprocess.
+        {
+            let needs_fallback = {
+                let state = self.state.read().await;
+                let has_sysdata_rda = state
+                    .package_inputs
+                    .workspace_root
+                    .as_ref()
+                    .map(|r| r.join("R").join("sysdata.rda").is_file())
+                    .unwrap_or(false);
+                state.package_inputs.sysdata_names.is_empty() && has_sysdata_rda
+            };
+            if needs_fallback {
+                let state_arc = self.state.clone();
+                let client = self.client.clone();
+                let traversal_truncation = self.traversal_truncation.clone();
+                tokio::spawn(async move {
+                    let (r_path, workspace_root) = {
+                        let state = state_arc.read().await;
+                        let r = state
+                            .package_library
+                            .r_subprocess()
+                            .map(|r| r.r_path().clone());
+                        let root = state.package_inputs.workspace_root.clone();
+                        (r, root)
+                    };
+                    if let (Some(r_path), Some(root)) = (r_path, workspace_root)
+                        && let Some(r) = crate::r_subprocess::RSubprocess::new(Some(r_path))
+                    {
+                        let names =
+                            crate::package_state::sysdata::load_sysdata_via_r(&r, &root).await;
+                        if !names.is_empty() {
+                            // Apply the fallback names under the write lock, then
+                            // snapshot the open URIs to republish. Without this,
+                            // open package buffers keep their pre-fallback
+                            // diagnostics (e.g. undefined-variable on sysdata
+                            // symbols) until the next edit.
+                            let open_uris: Vec<tower_lsp::lsp_types::Url> = {
+                                let mut state = state_arc.write().await;
+                                state.package_inputs.sysdata_names = names;
+                                state.apply_package_event(
+                                    &crate::package_state::PackageInputDelta::DataDirChanged,
+                                );
+                                let uris: Vec<_> = state.documents.keys().cloned().collect();
+                                state
+                                    .diagnostics_gate
+                                    .mark_force_republish_many(uris.iter());
+                                uris
+                            };
+                            // Route through the same debounced, bounded pipeline
+                            // the watcher consumer and `raven.refreshPackages`
+                            // use, so the republish cooperates with revalidation
+                            // cancellation/freshness gates.
+                            Backend::publish_diagnostics_for_uris_bounded(
+                                state_arc.clone(),
+                                client,
+                                open_uris,
+                                Some(traversal_truncation),
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
+        }
 
         // Register dynamic file watches for raven.toml / .lintr. VS Code also
         // covers these via its synchronize.fileEvents glob, so this is a no-op
@@ -2678,6 +2788,15 @@ impl LanguageServer for Backend {
                     let mut state = self.state.write().await;
                     state.package_library = new_lib;
                     state.package_library_ready = ready;
+                    // Swapping the library may have changed `lib_paths`
+                    // (renv switch, `.Rprofile` edit). Re-resolve
+                    // `source(system.file(...))` edges against the new paths
+                    // BEFORE the force-republish below, so a file whose target
+                    // lives in a newly-discovered libpath stops being
+                    // stale/unresolved. See `rebuild_package_library`'s invariant.
+                    if ready {
+                        state.resolve_system_file_in_workspace();
+                    }
                 }
 
                 // Restart the watcher over the freshly-discovered libpaths so
@@ -2921,6 +3040,17 @@ impl LanguageServer for Backend {
                 max_chain_depth,
             );
 
+            // Resolve system.file() source entries into concrete paths
+            {
+                let ws = state.package_state.workspace();
+                let ws_name = ws.map(|w| w.name.as_str());
+                let ws_root = ws.map(|w| w.root.as_path());
+                let lib_paths = state.package_library.lib_paths();
+                crate::cross_file::resolve_system_file_sources(
+                    &mut meta, ws_name, ws_root, lib_paths,
+                );
+            }
+
             // Update new DocumentStore with enriched metadata (Requirement 1.3).
             // `chunk_kind` was classified above by languageId-then-URI so
             // untitled `.Rmd`/`.qmd` buffers mask their tree/artifacts (#343).
@@ -2984,14 +3114,17 @@ impl LanguageServer for Backend {
                 );
 
                 for source in &meta.sources {
-                    if let Some(ctx) = path_ctx.as_ref()
-                        && let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                                &source.path,
-                                ctx,
-                            )
-                        && let Ok(source_uri) = Url::from_file_path(resolved)
-                    {
+                    let source_uri_opt = source.resolved_uri.clone().or_else(|| {
+                        path_ctx.as_ref().and_then(|ctx| {
+                            let resolved =
+                                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                                    &source.path,
+                                    ctx,
+                                );
+                            resolved.and_then(|p| Url::from_file_path(p).ok())
+                        })
+                    });
+                    if let Some(source_uri) = source_uri_opt {
                         // Check if file needs indexing (not open, not in workspace index)
                         if !state.documents.contains_key(&source_uri)
                             && !state.cross_file_workspace_index.contains(&source_uri)
@@ -3296,6 +3429,12 @@ impl LanguageServer for Backend {
 
             // Re-enrich metadata now that backward/forward chains are indexed.
             // This ensures working-directory inheritance is accurate before diagnostics.
+            // Ensure the package library is ready so resolve_system_file_sources
+            // sees populated lib_paths (Finding 3: don't hold the write lock
+            // across the await).
+            if packages_enabled {
+                let _ = self.ensure_package_library_initialized().await;
+            }
             {
                 let mut state = self.state.write().await;
                 let workspace_root = state.workspace_folders.first().cloned();
@@ -3326,6 +3465,17 @@ impl LanguageServer for Backend {
                     meta.working_directory,
                     meta.inherited_working_directory
                 );
+
+                // Resolve system.file() source entries into concrete paths
+                {
+                    let ws = state.package_state.workspace();
+                    let ws_name = ws.map(|w| w.name.as_str());
+                    let ws_root = ws.map(|w| w.root.as_path());
+                    let lib_paths = state.package_library.lib_paths();
+                    crate::cross_file::resolve_system_file_sources(
+                        &mut meta, ws_name, ws_root, lib_paths,
+                    );
+                }
 
                 state
                     .document_store
@@ -3425,34 +3575,32 @@ impl LanguageServer for Backend {
                 }
 
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
-                if let Some(forward_ctx) =
-                    crate::cross_file::path_resolve::PathContext::from_metadata(
-                        &uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                    )
-                {
-                    for source in &meta.sources {
-                        if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                                &source.path,
-                                &forward_ctx,
-                            )
-                            && let Ok(child_uri) = Url::from_file_path(resolved)
-                        {
-                            let needs_indexing = {
-                                !state.documents.contains_key(&child_uri)
-                                    && !state.cross_file_workspace_index.contains(&child_uri)
-                            };
-                            if needs_indexing {
-                                log::trace!(
-                                    "did_open re-enrich: indexing direct source {}",
-                                    child_uri
+                let forward_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                    &uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                );
+                for source in &meta.sources {
+                    let child_uri_opt = source.resolved_uri.clone().or_else(|| {
+                        forward_ctx.as_ref().and_then(|ctx| {
+                            let resolved =
+                                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                                    &source.path,
+                                    ctx,
                                 );
-                                drop(state);
-                                let _ = self.index_file_on_demand(&child_uri).await;
-                                state = self.state.write().await;
-                            }
+                            resolved.and_then(|p| Url::from_file_path(p).ok())
+                        })
+                    });
+                    if let Some(child_uri) = child_uri_opt {
+                        let needs_indexing = {
+                            !state.documents.contains_key(&child_uri)
+                                && !state.cross_file_workspace_index.contains(&child_uri)
+                        };
+                        if needs_indexing {
+                            log::trace!("did_open re-enrich: indexing direct source {}", child_uri);
+                            drop(state);
+                            let _ = self.index_file_on_demand(&child_uri).await;
+                            state = self.state.write().await;
                         }
                     }
                 }
@@ -3461,6 +3609,11 @@ impl LanguageServer for Backend {
         // Even when on-demand indexing is disabled, re-enrich metadata so inherited
         // working-directory context and graph edges match did_change behavior.
         else {
+            // Ensure library is ready so resolve_system_file_sources sees
+            // populated lib_paths (Finding 3: await outside write lock).
+            if packages_enabled {
+                let _ = self.ensure_package_library_initialized().await;
+            }
             let mut state = self.state.write().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
@@ -3478,6 +3631,17 @@ impl LanguageServer for Backend {
                 |parent_uri| state.get_enriched_metadata(parent_uri),
                 max_chain_depth,
             );
+
+            // Resolve system.file() source entries into concrete paths
+            {
+                let ws = state.package_state.workspace();
+                let ws_name = ws.map(|w| w.name.as_str());
+                let ws_root = ws.map(|w| w.root.as_path());
+                let lib_paths = state.package_library.lib_paths();
+                crate::cross_file::resolve_system_file_sources(
+                    &mut meta, ws_name, ws_root, lib_paths,
+                );
+            }
 
             state
                 .document_store
@@ -3762,6 +3926,17 @@ impl LanguageServer for Backend {
                     |parent_uri| state.get_enriched_metadata(parent_uri),
                     max_chain_depth,
                 );
+
+                // Resolve system.file() source entries into concrete paths
+                {
+                    let ws = state.package_state.workspace();
+                    let ws_name = ws.map(|w| w.name.as_str());
+                    let ws_root = ws.map(|w| w.root.as_path());
+                    let lib_paths = state.package_library.lib_paths();
+                    crate::cross_file::resolve_system_file_sources(
+                        &mut meta, ws_name, ws_root, lib_paths,
+                    );
+                }
 
                 // Collect package names for prefetch (validate names to
                 // reject suspicious inputs before R subprocess calls)
@@ -4887,7 +5062,23 @@ impl LanguageServer for Backend {
                     };
 
                     // Compute metadata and artifacts
-                    let cross_file_meta = crate::cross_file::extract_metadata(&content);
+                    let mut cross_file_meta = crate::cross_file::extract_metadata(&content);
+
+                    // Resolve system.file() source entries into concrete paths
+                    {
+                        let state = state_arc.read().await;
+                        let ws = state.package_state.workspace();
+                        let ws_name = ws.map(|w| w.name.as_str());
+                        let ws_root = ws.map(|w| w.root.as_path());
+                        let lib_paths = state.package_library.lib_paths();
+                        crate::cross_file::resolve_system_file_sources(
+                            &mut cross_file_meta,
+                            ws_name,
+                            ws_root,
+                            lib_paths,
+                        );
+                    }
+
                     let artifacts = std::sync::Arc::new({
                         let mut parser = tree_sitter::Parser::new();
                         if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
@@ -5050,6 +5241,10 @@ impl LanguageServer for Backend {
                             u.to_file_path().ok().is_some_and(|p| {
                                 crate::package_state::is_r_source_path(&p, root).is_some()
                                     || is_package_source_dir(&p, root)
+                                    // data/ and data-raw/ CREATED/CHANGED events
+                                    // also have dedicated translate() handlers
+                                    // (dataset_names / sysdata_names rescans).
+                                    || is_package_data_path(&p, root)
                             })
                         })
                     });
@@ -5975,6 +6170,17 @@ impl Backend {
                 let mut state = self.state.write().await;
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
+                // The new library may carry different `lib_paths` (the user
+                // changed `raven.packages.additionalLibraryPaths`, or a
+                // raven.toml reload re-ran `.libPaths()`). Re-resolve
+                // `source(system.file(...))` edges against the new paths BEFORE
+                // the force-republish (the helper's returned `open_uris` are
+                // marked and republished by the caller), so targets in a
+                // newly-discovered libpath stop being stale/unresolved. See
+                // `rebuild_package_library`'s invariant.
+                if package_library_ready {
+                    state.resolve_system_file_in_workspace();
+                }
             }
 
             // Help/HTML help caches index by (topic, package); the package
@@ -6093,7 +6299,16 @@ impl Backend {
             None => crate::cross_file::scope::ScopeArtifacts::default(),
         });
 
-        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) = {
+        let (
+            workspace_root,
+            packages_enabled,
+            open_docs,
+            workspace_index_version,
+            parent_content,
+            sys_file_ws_name,
+            sys_file_ws_root,
+            sys_file_lib_paths,
+        ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
@@ -6130,14 +6345,29 @@ impl Backend {
             let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
             let workspace_index_version = state.workspace_index_new.version();
 
+            // Capture system.file() resolution inputs for post-enrich resolve
+            let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
+
             (
                 workspace_root,
                 packages_enabled,
                 open_docs,
                 workspace_index_version,
                 parent_content,
+                ws_name,
+                ws_root,
+                lib_paths,
             )
         };
+
+        // Resolve system.file() source entries into concrete paths so
+        // transitive on-demand walks don't stop at this hop.
+        crate::cross_file::resolve_system_file_sources(
+            &mut cross_file_meta,
+            sys_file_ws_name.as_deref(),
+            sys_file_ws_root.as_deref(),
+            &sys_file_lib_paths,
+        );
 
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -6437,7 +6667,16 @@ impl Backend {
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-        let (workspace_root, packages_enabled, open_docs, workspace_index_version, parent_content) = {
+        let (
+            workspace_root,
+            packages_enabled,
+            open_docs,
+            workspace_index_version,
+            parent_content,
+            sys_file_ws_name,
+            sys_file_ws_root,
+            sys_file_lib_paths,
+        ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let packages_enabled = state.cross_file_config.packages_enabled;
@@ -6465,14 +6704,29 @@ impl Backend {
             let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
             let workspace_index_version = state.workspace_index_new.version();
 
+            // Capture system.file() resolution inputs for post-enrich resolve
+            let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
+
             (
                 workspace_root,
                 packages_enabled,
                 open_docs,
                 workspace_index_version,
                 parent_content,
+                ws_name,
+                ws_root,
+                lib_paths,
             )
         };
+
+        // Resolve system.file() source entries into concrete paths so
+        // transitive on-demand walks don't stop at this hop.
+        crate::cross_file::resolve_system_file_sources(
+            &mut cross_file_meta,
+            sys_file_ws_name.as_deref(),
+            sys_file_ws_root.as_deref(),
+            &sys_file_lib_paths,
+        );
 
         let loaded_packages =
             extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
@@ -7010,6 +7264,15 @@ pub(crate) async fn refresh_packages_command_body(
 /// mid-session changes to `.libPaths()` (e.g. renv switching projects, the user
 /// editing `.Rprofile`, or a `.libPaths(new, ...)` call) are picked up without
 /// requiring an LSP restart.
+///
+/// INVARIANT: any path that swaps the result into `state.package_library` (and
+/// thereby changes `lib_paths`) MUST call
+/// `WorldState::resolve_system_file_in_workspace()` under the write lock BEFORE
+/// force-republishing open documents. Otherwise a file whose
+/// `source(system.file(...))` resolves against a package in a newly-discovered
+/// libpath keeps its stale/unresolved `system_file` index entry until restart.
+/// Call sites: `raven.refreshPackages`, `reconcile_after_config_recompute`, and
+/// the post-Task-B startup retry in `initialized`.
 pub(crate) async fn rebuild_package_library(
     state_arc: &Arc<RwLock<WorldState>>,
 ) -> (Arc<crate::package_library::PackageLibrary>, bool) {
@@ -7873,8 +8136,8 @@ mod tests {
         use super::super::{
             collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
             extend_with_open_package_docs, hydrate_package_r_files_from_state,
-            initialize_package_inputs_from_state, is_package_relevant_open_uri,
-            is_package_source_dir,
+            initialize_package_inputs_from_state, is_package_data_path,
+            is_package_relevant_open_uri, is_package_source_dir,
         };
         use crate::state::{Document, WorldState};
         use std::path::PathBuf;
@@ -8102,6 +8365,44 @@ mod tests {
                 &root
             ));
             assert!(!is_package_source_dir(&root.join("scratch.R"), &root));
+        }
+
+        #[test]
+        fn package_data_path_matches_data_and_data_raw_files() {
+            // FIX 2: CREATED/CHANGED events under data/ and data-raw/ must route
+            // through the package-state gate (they have dedicated translate()
+            // handlers that rescan dataset_names / sysdata_names).
+            let root = pkg_root();
+            assert!(is_package_data_path(
+                &root.join("data").join("mtcars.rda"),
+                &root
+            ));
+            assert!(is_package_data_path(
+                &root.join("data-raw").join("prep.R"),
+                &root
+            ));
+            assert!(is_package_data_path(
+                &root.join("data").join("sub").join("x.rda"),
+                &root
+            ));
+            // The directory nodes themselves are not data *files*.
+            assert!(!is_package_data_path(&root.join("data"), &root));
+            assert!(!is_package_data_path(&root.join("data-raw"), &root));
+            // Unrelated paths and sibling dirs with the `data` prefix must not match.
+            assert!(!is_package_data_path(&root.join("R").join("foo.R"), &root));
+            assert!(!is_package_data_path(
+                &root.join("database").join("x.R"),
+                &root
+            ));
+            // The gate must accept either source files or data files together,
+            // mirroring the `has_pkg_files` predicate in the watched-file handler.
+            let data_path = root.join("data-raw").join("prep.R");
+            assert!(
+                crate::package_state::is_r_source_path(&data_path, &root).is_none()
+                    && !is_package_source_dir(&data_path, &root)
+                    && is_package_data_path(&data_path, &root),
+                "data-raw/*.R is reached only via the data-path branch"
+            );
         }
 
         #[test]

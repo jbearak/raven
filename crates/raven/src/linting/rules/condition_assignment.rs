@@ -95,7 +95,7 @@ fn emit(
     out: &mut Vec<Diagnostic>,
 ) {
     let line_no = op.start_position().row as u32;
-    if suppressions.is_suppressed(line_no) {
+    if suppressions.is_suppressed_code(line_no, rule_ids::CONDITION_ASSIGNMENT) {
         return;
     }
     let line_text = text.lines().nth(line_no as usize).unwrap_or("");

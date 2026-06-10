@@ -119,7 +119,8 @@ fn split_on_skip_lines<'a>(
     for (idx, c) in group.iter().enumerate() {
         let line_text = lines.get(c.line as usize).copied().unwrap_or("");
         let is_first_line = c.line == 0;
-        let skip = is_skip_line(line_text, is_first_line) || suppressions.is_suppressed(c.line);
+        let skip = is_skip_line(line_text, is_first_line)
+            || suppressions.is_suppressed_code(c.line, rule_ids::COMMENTED_CODE);
         if skip {
             if idx > start {
                 out.push(&group[start..idx]);
@@ -230,7 +231,17 @@ fn is_directive_marker(trimmed_line: &str) -> bool {
             Some(c) => c.is_whitespace() || c == ':' || c == '-',
         };
     }
-    body.starts_with("@lsp-")
+    if body.starts_with("@lsp-") {
+        return true;
+    }
+    // `# raven:` primary suppression namespace (F2), including the next-line
+    // forms (`ignore-next` / `expect-next`) that never suppress their own line.
+    // Treat the directive line itself as a marker so the `commented_code` rule
+    // never parses it as commented-out code or glues it into a comment block.
+    if let Some(after) = body_lower.strip_prefix("raven") {
+        return after.trim_start().starts_with(':');
+    }
+    false
 }
 
 /// Emacs-style mode line, e.g. `# -*- coding: utf-8 -*-`. R code rarely uses
@@ -352,5 +363,16 @@ mod tests {
         assert!(is_directive_marker("# @lsp-source ../helpers.R"));
         assert!(!is_directive_marker("# nolinter"));
         assert!(!is_directive_marker("# lsp-ignore"));
+    }
+
+    #[test]
+    fn directive_detector_recognizes_raven_namespace() {
+        // `# raven:` suppression directives (incl. next-line forms) are markers,
+        // not commented-out code.
+        assert!(is_directive_marker("# raven: ignore-next"));
+        assert!(is_directive_marker("# raven: expect-next"));
+        // Near-misses must NOT be treated as markers.
+        assert!(!is_directive_marker("# raven-ignore-next"));
+        assert!(!is_directive_marker("# ravene: ignore-next"));
     }
 }

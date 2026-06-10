@@ -113,6 +113,17 @@ pub(crate) fn base_policy(name: &str) -> Option<ArgPolicy> {
         "alist" => ArgPolicy::WholeCall,
         "evalq" => ArgPolicy::per_formal(&["expr", "envir", "enclos"], &["expr"], false),
         "on.exit" => ArgPolicy::per_formal(&["expr", "add", "after"], &["expr"], false),
+        // Native-code interfaces: the first argument is a native routine name
+        // or string, not a normal R variable reference; later arguments are
+        // evaluated and passed through to the routine.
+        ".Call" | ".Call.graphics" | ".External" | ".External2" | ".External.graphics" => {
+            ArgPolicy::per_formal(&[".NAME", "...", "PACKAGE"], &[".NAME"], false)
+        }
+        ".C" | ".Fortran" => ArgPolicy::per_formal(
+            &[".NAME", "...", "NAOK", "DUP", "PACKAGE", "ENCODING"],
+            &[".NAME"],
+            false,
+        ),
         // `curve(sin(x), 0, 1)`: the expression is evaluated against an implicit
         // `x`, so capture it but check the numeric range/control arguments.
         "curve" => ArgPolicy::per_formal(&["expr", "from", "to", "n"], &["expr"], false),
@@ -282,12 +293,37 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
         "gt" => gt_policy(name)?,
         "gtsummary" => gtsummary_policy(name)?,
         "recipes" => recipes_policy(name)?,
+        "htmltools" => match name {
+            "withTags" => ArgPolicy::per_formal(&["code"], &["code"], false),
+            _ => return None,
+        },
+        "grid" => match name {
+            "grid.Call" | "grid.Call.graphics" => {
+                ArgPolicy::per_formal(&["fnname", "..."], &["fnname"], false)
+            }
+            _ => return None,
+        },
         "dbplyr" => match name {
             // window_order(.data, ...): the ordering columns in `...` are
             // data-masked (a bare undefined symbol there errors "not found");
             // `window_frame`/`sql`/`build_sql` take numerics/strings and stay
             // checked. Verified against dbplyr 2.5.2 + R 4.6.0.
             "window_order" => ArgPolicy::per_formal(&[".data", "..."], &[], true),
+            _ => return None,
+        },
+        "survival" => match name {
+            // tmerge(data1, data2, id, ..., tstart, tstop, options):
+            // `id`, `tstart`, and `tstop` are data-masked (column expressions
+            // evaluated within `data1`) — e.g. tmerge(..., tstart=age, tstop=futime).
+            // Every `...` argument is a data-masked time-dependent term — typically
+            // a call to the tmerge-only NSE helpers `tdc`/`event`/`cumtdc`/`cumevent`.
+            // `options` is a plain control list (e.g. list(tdcstart=...)) and is
+            // NOT data-masked, so it stays checked.
+            "tmerge" => ArgPolicy::per_formal(
+                &["data1", "data2", "id", "...", "tstart", "tstop", "options"],
+                &["id", "tstart", "tstop"],
+                true,
+            ),
             _ => return None,
         },
         _ => return None,
@@ -1237,6 +1273,12 @@ mod tests {
         let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
         assert_eq!(mask, vec![true, true]);
     }
+    #[test]
+    fn htmltools_with_tags_captures_tag_expression() {
+        let p = package_policy("htmltools", "withTags").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None]), false);
+        assert_eq!(mask, vec![true]);
+    }
 
     #[test]
     fn rlang_enquo_captures_single_arg() {
@@ -1304,6 +1346,36 @@ mod tests {
                 base_policy(name).is_none(),
                 "{name} should be standard-eval"
             );
+        }
+    }
+    #[test]
+    fn native_interfaces_capture_routine_name_only() {
+        for name in [
+            ".Call",
+            ".Call.graphics",
+            ".C",
+            ".Fortran",
+            ".External",
+            ".External2",
+            ".External.graphics",
+        ] {
+            let policy = base_policy(name).unwrap_or_else(|| panic!("{name} should have a policy"));
+            // .Call(C_symbol, evaluated_arg, PACKAGE = "pkg"): the native
+            // routine name is special; regular arguments remain standard-eval.
+            let mask =
+                suppressed_arguments(&policy, &labels(&[None, None, Some("PACKAGE")]), false);
+            assert_eq!(mask, vec![true, false, false], "{name}");
+            assert_eq!(package_policy("base", name), base_policy(name));
+        }
+    }
+
+    #[test]
+    fn grid_native_wrappers_capture_routine_name_only() {
+        for name in ["grid.Call", "grid.Call.graphics"] {
+            let policy = package_policy("grid", name)
+                .unwrap_or_else(|| panic!("{name} should have a policy"));
+            let mask = suppressed_arguments(&policy, &labels(&[None, None]), false);
+            assert_eq!(mask, vec![true, false], "{name}");
         }
     }
 
@@ -1919,6 +1991,47 @@ mod tests {
         let p = package_policy("dbplyr", "window_order").unwrap();
         let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
         assert_eq!(mask, vec![false, true]);
+    }
+
+    #[test]
+    fn survival_tmerge_suppresses_id_and_dots_keeps_data() {
+        // tmerge(data1, data2, id = idcol, death = event(t, s), x = tdc(t, v)):
+        // data1/data2 stay checked; `id` and every `...` term are suppressed.
+        let p = package_policy("survival", "tmerge").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, None, Some("id"), Some("death"), Some("x")]),
+            false,
+        );
+        assert_eq!(mask, vec![false, false, true, true, true]);
+    }
+
+    #[test]
+    fn survival_tmerge_suppresses_tstart_tstop_flags_options() {
+        // tstart and tstop are data-masked (column expressions in data1), so
+        // they must be suppressed. `options` is a plain control list — flagged.
+        let p = package_policy("survival", "tmerge").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[
+                None,
+                None,
+                Some("id"),
+                Some("ev"),
+                Some("tstart"),
+                Some("tstop"),
+                Some("options"),
+            ]),
+            false,
+        );
+        // data1, data2: checked; id: masked; ev: dots-captured;
+        // tstart, tstop: data-masked → suppressed; options: control → flagged.
+        assert_eq!(mask, vec![false, false, true, true, true, true, false]);
+    }
+
+    #[test]
+    fn survival_non_tmerge_has_no_policy() {
+        assert!(package_policy("survival", "coxph").is_none());
     }
 
     #[test]

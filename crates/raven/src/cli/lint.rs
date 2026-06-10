@@ -337,7 +337,25 @@ fn walk(
                 return;
             }
         };
+        // F2 Step 4: chunk-level suppression (`raven.ignore=…` chunk option,
+        // `# raven: ignore-chunk`). Computed from the RAW text (the chunk header
+        // carrying the option is blanked in `effective_text`) and applied to the
+        // lint findings, mirroring the diagnostics pipeline. `run_lints` already
+        // honors per-line `# nolint` / `# raven:` markers inside chunk bodies.
+        let chunk_meta = if chunk_kind == crate::chunks::ChunkKind::Rmd {
+            let mut m = crate::cross_file::types::CrossFileMetadata::default();
+            crate::chunks::append_chunk_suppressions(&mut m, &text);
+            Some(m)
+        } else {
+            None
+        };
         for d in crate::linting::run_lints(effective_text.as_ref(), tree.root_node(), &effective) {
+            if let Some(meta) = &chunk_meta
+                && let Some(tower_lsp::lsp_types::NumberOrString::String(code)) = &d.code
+                && crate::linting::range_or_file_suppresses(meta, d.range.start.line, code)
+            {
+                continue;
+            }
             out.push((path.to_path_buf(), d));
         }
     } else if path.is_dir() {
@@ -823,6 +841,53 @@ mod tests {
                         ))
             }),
             "prose line must not produce an assignment_operator finding"
+        );
+    }
+
+    #[test]
+    fn lint_chunk_option_raven_ignore_suppresses_lint_finding() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // `x=1` (assignment_operator finding) inside a `raven.ignore=TRUE`
+        // chunk must be suppressed for `raven lint`, mirroring the diagnostics
+        // pipeline (F2 Step 4).
+        let content = "---\ntitle: T\n---\n\n```{r, raven.ignore=TRUE}\nx=1\n```\n";
+        let file = root.join("doc.Rmd");
+        fs::write(&file, content).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+        assert!(!operator_error, "unexpected operator error");
+        assert!(
+            !diags.iter().any(|(_, d)| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "assignment_operator".to_string()
+                ))),
+            "raven.ignore=TRUE chunk must suppress the lint finding; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn lint_in_chunk_ignore_chunk_directive_suppresses_lint_finding() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let content = "---\ntitle: T\n---\n\n```{r}\n# raven: ignore-chunk\nx=1\n```\n";
+        let file = root.join("doc.Rmd");
+        fs::write(&file, content).unwrap();
+
+        let settings = assignment_warn_settings();
+        let (diags, operator_error) = lint_one(root, &file, &settings);
+        assert!(!operator_error, "unexpected operator error");
+        assert!(
+            !diags.iter().any(|(_, d)| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "assignment_operator".to_string()
+                ))),
+            "# raven: ignore-chunk must suppress the lint finding; got {diags:?}"
         );
     }
 

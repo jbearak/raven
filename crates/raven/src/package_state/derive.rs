@@ -41,6 +41,8 @@ pub fn derive_package_state(
         &namespace_model,
         &r_file_facts,
         inputs.description.as_ref(),
+        &inputs.dataset_names,
+        &inputs.sysdata_names,
     );
     PackageState {
         workspace,
@@ -55,6 +57,8 @@ fn build_scope_contribution(
     namespace_model: &Option<PackageNamespaceModel>,
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
     description: Option<&DescriptionInput>,
+    dataset_names: &BTreeSet<String>,
+    sysdata_names: &BTreeSet<String>,
 ) -> PackageScopeContribution {
     let Some(ws) = workspace else {
         return PackageScopeContribution::default();
@@ -81,12 +85,16 @@ fn build_scope_contribution(
     // symmetry with `r_internal_symbols` (which has the same limitation
     // for R/ files).
     let mut r_internal_symbols: BTreeSet<String> = BTreeSet::new();
+    let mut onload_all: BTreeSet<String> = BTreeSet::new();
     let mut test_helper_symbols: BTreeMap<PathBuf, Arc<BTreeSet<String>>> = BTreeMap::new();
     for (path, facts) in r_file_facts {
         match facts.kind {
             RFileKind::Source => {
                 for def in facts.top_level_defs.iter() {
                     r_internal_symbols.insert(def.clone());
+                }
+                for sym in facts.onload_bindings.iter() {
+                    onload_all.insert(sym.clone());
                 }
             }
             RFileKind::Test => {
@@ -134,6 +142,9 @@ fn build_scope_contribution(
         full_imports: Arc::new(full_imports),
         test_attached_packages: Arc::new(test_attached_packages),
         test_helper_symbols: Arc::new(test_helper_symbols),
+        dataset_symbols: Arc::new(dataset_names.clone()),
+        sysdata_symbols: Arc::new(sysdata_names.clone()),
+        onload_symbols: Arc::new(onload_all),
     }
 }
 
@@ -239,6 +250,9 @@ fn derive_r_file_facts(
                 kind: file.kind,
                 roxygen_namespace: crate::roxygen::extract_roxygen_namespace_tags(&file.text),
                 top_level_defs: Arc::new(crate::roxygen::extract_top_level_defs(&file.text)),
+                onload_bindings: Arc::new(crate::package_state::sysdata::extract_onload_bindings(
+                    &file.text,
+                )),
                 content_digest: file.content_digest,
             },
         };
@@ -254,10 +268,19 @@ fn effective_workspace(inputs: &PackageInputs) -> Option<PackageWorkspace> {
         .as_ref()
         .and_then(|d| parse_dcf_field_pub(&d.text, "Package"))
         .filter(|s| !s.is_empty());
+    let has_namespace_and_sources = inputs.namespace.is_some()
+        && inputs
+            .r_files
+            .values()
+            .any(|file| file.kind == RFileKind::Source);
     match (inputs.package_mode, parsed_name.as_deref()) {
         (PackageMode::Disabled, _) => None,
         (PackageMode::Auto, Some(name)) => Some(PackageWorkspace {
             name: name.to_string(),
+            root: root.clone(),
+        }),
+        (PackageMode::Auto, None) if has_namespace_and_sources => Some(PackageWorkspace {
+            name: "unknown".to_string(),
             root: root.clone(),
         }),
         (PackageMode::Auto, None) => None,
@@ -283,6 +306,8 @@ mod tests {
             description: None,
             namespace: None,
             r_files: BTreeMap::new(),
+            dataset_names: BTreeSet::new(),
+            sysdata_names: BTreeSet::new(),
         }
     }
 
@@ -310,6 +335,30 @@ mod tests {
             &PackageInputDelta::Initial,
         );
         assert!(s.workspace.is_none());
+    }
+    #[test]
+    fn auto_with_namespace_and_source_yields_workspace() {
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.namespace = Some(NamespaceInput {
+            text: "export(foo)\n".into(),
+        });
+        let text: Arc<str> = "foo <- function() 1\n".into();
+        inputs.r_files.insert(
+            "/work/pkg/R/foo.R".into(),
+            RFileInput {
+                kind: RFileKind::Source,
+                content_digest: ContentDigest::of(&text),
+                text,
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
     }
 
     #[test]
@@ -629,21 +678,42 @@ mod tests {
     }
 
     /// Phase 5b behavior change: a workspace with NAMESPACE but no DESCRIPTION
-    /// does NOT activate package mode (Auto mode requires a valid `Package:` field
-    /// in DESCRIPTION). Consequently, `scope_contribution` is empty — no
-    /// importFrom symbols or internal symbols are injected, matching script-mode.
-    ///
-    /// This codifies spec §11.1 behavior: "package mode requires both DESCRIPTION
-    /// (with a Package: field) and NAMESPACE". Non-package workspaces run as
-    /// script mode regardless of NAMESPACE presence.
+    /// and no R source files does NOT activate package mode in Auto mode.
+    /// However, if both a NAMESPACE and R source files exist (even without
+    /// DESCRIPTION), package mode activates with name "unknown" to support
+    /// `raven check --workspace` on minimal package directories.
     #[test]
-    fn non_package_namespace_does_not_produce_scope_contribution() {
-        // Auto mode with NAMESPACE but no DESCRIPTION.
+    fn namespace_alone_without_sources_does_not_produce_scope_contribution() {
+        // Auto mode with NAMESPACE but no DESCRIPTION and no R source files.
         let mut inputs = empty_inputs(PackageMode::Auto);
         inputs.namespace = Some(NamespaceInput {
             text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
         });
-        // Add an R file with a top-level definition.
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        // No source files → no package mode → empty scope contribution.
+        assert!(
+            s.workspace.is_none(),
+            "Auto mode with NAMESPACE but no source files must not produce a workspace"
+        );
+        assert!(s.scope_contribution.workspace_root.is_none());
+        assert!(s.scope_contribution.imported_symbols.is_empty());
+        assert!(s.scope_contribution.full_imports.is_empty());
+    }
+
+    /// When both NAMESPACE and R source files exist (but no DESCRIPTION),
+    /// Auto mode activates package mode with name "unknown".
+    #[test]
+    fn namespace_with_sources_activates_package_mode_without_description() {
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.namespace = Some(NamespaceInput {
+            text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
+        });
         let r_path: PathBuf = "/work/pkg/R/utils.R".into();
         let text: Arc<str> = "helper <- function() 1\n".into();
         inputs.r_files.insert(
@@ -661,23 +731,14 @@ mod tests {
             &PackageInputDelta::Initial,
         );
 
-        // No workspace → no package mode → empty scope contribution.
         assert!(
-            s.workspace.is_none(),
-            "Auto mode without DESCRIPTION must not produce a workspace"
+            s.workspace.is_some(),
+            "Auto mode with NAMESPACE + source files should produce a workspace"
         );
-        assert!(s.scope_contribution.workspace_root.is_none());
+        assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
         assert!(
-            s.scope_contribution.r_internal_symbols.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject internal symbols"
-        );
-        assert!(
-            s.scope_contribution.imported_symbols.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject importFrom symbols"
-        );
-        assert!(
-            s.scope_contribution.full_imports.is_empty(),
-            "NAMESPACE without DESCRIPTION must not inject full imports"
+            s.scope_contribution.r_internal_symbols.contains("helper"),
+            "internal symbols should be injected"
         );
     }
 
@@ -1097,5 +1158,48 @@ foo <- function() 1
         let b_syms = map.get(&helper_b).expect("helper-b entry");
         assert!(b_syms.contains("fixture_b"));
         assert!(!b_syms.contains("fixture_a"));
+    }
+
+    // ------------------------------------------------------------------
+    // Dataset symbols from data/ directory (Workstream D)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn scope_contribution_carries_dataset_names_from_inputs() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.dataset_names.insert("mpg".to_string());
+        inputs.dataset_names.insert("diamonds".to_string());
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        assert!(
+            s.scope_contribution.dataset_symbols.contains("mpg"),
+            "dataset_symbols must contain mpg: {:?}",
+            s.scope_contribution.dataset_symbols,
+        );
+        assert!(
+            s.scope_contribution.dataset_symbols.contains("diamonds"),
+            "dataset_symbols must contain diamonds: {:?}",
+            s.scope_contribution.dataset_symbols,
+        );
+    }
+
+    #[test]
+    fn scope_contribution_empty_datasets_when_no_workspace() {
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.dataset_names.insert("mpg".to_string());
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        // No workspace → no scope contribution → datasets not injected.
+        assert!(s.scope_contribution.dataset_symbols.is_empty());
     }
 }

@@ -40,6 +40,10 @@ fn arb_path() -> impl Strategy<Value = (PathBuf, RFileKind)> {
             PathBuf::from(format!("/work/pkg/tests/testthat/test-{}.R", n)),
             RFileKind::Test
         )),
+        "[a-z]{1,4}".prop_map(|n| (
+            PathBuf::from(format!("/work/pkg/tests/testit/test-{}.R", n)),
+            RFileKind::Test
+        )),
     ]
 }
 
@@ -145,6 +149,8 @@ fn initial_inputs() -> PackageInputs {
         }),
         namespace: None,
         r_files: BTreeMap::new(),
+        dataset_names: BTreeSet::new(),
+        sysdata_names: BTreeSet::new(),
     }
 }
 

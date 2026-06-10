@@ -8,11 +8,55 @@ Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, 
 
 ## Quick Reference
 
-- **Silence one site** — add `# @lsp-ignore` on the line, or `# @lsp-ignore-next` on the line above
+- **Silence one site** — add `# raven: ignore` on the line (or `# raven: ignore-next` on the line above). `# @lsp-ignore` is a permanent alias. See [Suppressing diagnostics](#suppressing-diagnostics)
 - **Declare a symbol the analyzer can't see** — use [`@lsp-var`, `@lsp-func`](directives.md#declaration-directives)
 - **Bring a parent file's symbols into scope** — usually nothing to do (auto mode infers relationships). Add `@lsp-sourced-by` only when auto-discovery can't see the link. See [Cross-File Awareness](cross-file.md)
 - **Turn a category off globally** — set the matching severity to `"off"` (see [Configuration](configuration.md))
 - **Disable everything** — set `raven.diagnostics.enabled` to `false`
+
+## Diagnostic codes
+
+Every diagnostic carries a stable, kebab-case `code` (never an opaque number).
+Not every code is suppressible: only codes marked **suppressible** below can be
+targeted by a `[code]` selector inside a `# raven: ignore[...]` directive.
+Writing `# raven: ignore[syntax-error]` or `# raven: ignore[unresolved-source-path]`
+is a silent no-op — those codes are deliberately excluded from suppression (parse
+errors cannot be suppressed; path-resolution and other dependency-graph diagnostics
+are governed only by their severity settings). The suppressible analyzer codes are:
+
+| Code | Diagnostic | Suppressible? |
+|---|---|---|
+| `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") | Yes |
+| `syntax-error` | Parse errors (the umbrella code for every parse-error message above) | No |
+| `unresolved-source-path` | A `source()` / `@lsp-source` path that does not resolve to a file | No |
+| `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
+| `package-not-installed` | `library()` / `require()` of a package that is not installed | Yes |
+| `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |
+
+The opt-in style/lint rules contribute their own codes (`line-length`,
+`object-name`, …); the full list is in [Linting](linting.md). Both the
+kebab-case spelling and lintr's `snake_case` spelling are accepted in a
+selector.
+
+## Suppressing diagnostics
+
+Use the `# raven:` directives (and their `@lsp-` aliases) to silence
+diagnostics on a line, the next line, a block, a whole file, or an R Markdown
+chunk — optionally narrowed to a `[code]`. The full syntax, including the
+file/block forms, lives in [Directives → Ignore Directives](directives.md#ignore-directives).
+
+Two flavors:
+
+- **`# raven: ignore`** — silent. It never warns, even if it matched nothing.
+- **`# raven: expect`** — asserts the suppression is used. If an `expect`
+  directive matches no diagnostic, Raven emits an `unused-suppression` **hint**
+  at the directive's line (like Rust's `#[expect]` / TypeScript's
+  `@ts-expect-error`), so a now-stale directive can be deleted. Set
+  [`raven.diagnostics.reportUnusedSuppressions`](configuration.md) to `true` to
+  extend that unused check to *every* ignore directive (Pyright-style).
+
+`unused-suppression` is **hint** severity, so it never gates
+`raven check --max-severity error` by default.
 
 ## Diagnostic Categories
 
@@ -51,6 +95,16 @@ If the symbol is defined later in the same file at top level, the message also r
 - A declaration directive (`@lsp-var`, `@lsp-func`)
 - An `@lsp-ignore` on the line
 
+Raven also recognizes a few call forms that bind a name at runtime, so the bound name resolves without a directive:
+- `assign("x", ...)` and write/append-mode `textConnection("x", "w")` bind `x`.
+- `load("foo.rda")` binds the conventional object name `foo`.
+- `data(foo, bar)` binds each named dataset (`foo`, `bar`) from the call onward, whether given as a bare name or a string; named arguments such as `package=` are ignored.
+- `setGeneric("g", ...)` / `setGroupGeneric("g", ...)` bind the generic `g`, so other files in the same package that call it resolve (common in S4-heavy packages like Matrix, whose generics live in a single `R/` file).
+- Inside an S4 method body (`setMethod("Ops"|"Math"|"Summary"|…, ...)`) or an S3 method bound to a `generic.class` name, the dispatcher-injected specials `.Generic`, `.Method`, and `.Class` are in scope.
+- Inside an R6 class method body — a function value within the `public`, `private`, or `active` list arguments of `R6Class(...)` or `R6::R6Class(...)` — the pronouns `self`, `private`, and `super` are in scope (R6 injects them at construction time). A top-level definition of `R6Class` in the same file shadows the package function and disables this treatment.
+
+Windows-only base functions (`shell.exec`, `Sys.junction`, `readRegistry`, the `win*`/clipboard helpers, …) are recognized as builtins even though Raven's builtin list is generated on non-Windows hosts, so platform-guarded code does not draw a false positive.
+
 **Never checked:** Symbols on the RHS of `$` or `@` (member access), function parameters, named-argument labels, and formula variables (`y ~ x`).
 
 #### Call arguments and bracket indices
@@ -63,6 +117,8 @@ Raven checks identifiers inside ordinary call arguments and `[` / `[[` indices b
 - An **unresolved** callee (not local, not a builtin, not a known export of an in-play package) suppresses its arguments rather than guess — `unknown_fn(typo)` still flags `unknown_fn`, but not `typo`.
 
 For `[`, base subscripting is standard-eval, so indices are checked unless the indexed object is data.table-like: a known `data.table()` / `as.data.table()` / `fread()` object, or an unresolved object when data.table is detectably in play (a `library(data.table)` call, a `data.table::` reference, or a package `Imports:`/`importFrom`). `[[` is always checked — `DT[[x]]` references `x` as a real variable.
+
+data.table's by-reference converters are also recognized: a statement-level `setDT(x)` flips `x` to a data.table from that line onward (so a later `x[, newcol := val]` no longer flags `newcol`/`val`), `setDF(x)` flips it back to a plain data.frame, and `setattr(x, "class", ...)` sets the class explicitly. The transition is positional — a `[` *above* the converter keeps the object's prior classification.
 
 #### Shiny deferred-expression scopes
 
@@ -81,7 +137,7 @@ Two opt-out settings turn off this descent and restore blanket suppression for h
 - `raven.diagnostics.undefinedVariableInCallArguments` (default `true`)
 - `raven.diagnostics.undefinedVariableInBracketIndices` (default `true`)
 
-**Limitations:** The NSE policy table covers the common, slow-moving surface (base/utils metaprogramming and object-name helpers, default-attached `stats` model-fitting `subset`/`weights` data-masking, `dplyr`/`tidyr` data-masking and tidy-select verbs including attached Bioconductor tidy-omics generics from `plyranges`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`, `tibble`/`targets` constructors and target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes` step/role column captures, ggplot2 mapping helpers, rlang capture helpers, a few DSLs) but is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive. In data.table projects, an unresolved non-data.table object such as `df[typo, ]` may be silently skipped. In-place `setDT()` conversions are not detected. Use `# nolint`, `@lsp-ignore`, or the opt-out settings as escape hatches.
+**Limitations:** The NSE policy table covers the common, slow-moving surface (base/utils metaprogramming and object-name helpers, default-attached `stats` model-fitting `subset`/`weights` data-masking, `dplyr`/`tidyr` data-masking and tidy-select verbs including attached Bioconductor tidy-omics generics from `plyranges`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`, `tibble`/`targets` constructors and target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes` step/role column captures, ggplot2 mapping helpers, rlang capture helpers, `survival::tmerge` time-dependent terms, a few DSLs) but is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive. In data.table projects, an unresolved non-data.table object such as `df[typo, ]` may be silently skipped. In-place `setDT()` conversions are not detected. Use `# nolint`, `@lsp-ignore`, or the opt-out settings as escape hatches.
 
 ### Package Diagnostics
 
@@ -131,6 +187,8 @@ Always on whenever diagnostics are enabled; not configurable per rule. Applies t
 | Suspicious assignment target | warning | Target is something R technically accepts, but the binding is almost always unintended: a string literal (`"foo" <- 1` — R binds the value to a variable named `foo`) or a dots argument (`... <- 1`, `..1 <- 1` — R creates a binding the standard `...` / `..N` accessors can't reach) |
 
 **Not flagged:**
+- `"[.Surv" <- function(x, i) …`, `"coef<-.varPower" <- function(…) …`, `"area" <- function(r) …` — a quoted-string target whose assigned value is a function definition is idiomatic R (S3/replacement/operator methods for syntactically invalid names, and old-S-style definitions), semantically identical to the backtick form. Exempt for every assignment spelling, including chained definitions (`"coef<-" <- "coefficients<-" <- function(…) …`) and `.Primitive(…)` values; any other non-function value on a string target is still flagged.
+- `"iris" <- <value>` at top level of a package's `data/*.R` file — the canonical form `data()` expects for registering dataset objects (used throughout R-core's `datasets` package). String-target assignments nested inside functions in those files are still flagged.
 - `T <- FALSE` / `F <- TRUE` — `T` and `F` are ordinary bindings that default to `TRUE`/`FALSE`; R accepts the assignment. Use the [`T` / `F` symbol](#style-lints) style lint if you want these reported.
 - `f(name = value)` — named-argument syntax inside a call, not assignment.
 - `function(x = TRUE)` — default values in formal parameters, not assignment.
@@ -190,7 +248,7 @@ The object-name lint has independent style settings for **functions** (`objectNa
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 
-- `# nolint` on a line suppresses lints on that line (rule-name filters like `# nolint: line_length` are accepted; for now, all rules are suppressed on suppressed lines).
+- `# nolint` on a line suppresses lints on that line (rule-name filters like `# nolint: line_length` narrow suppression to the named rules).
 - `# nolint start` / `# nolint end` brackets a region.
 - The standard `# @lsp-ignore` and `# @lsp-ignore-next` markers also apply to lint diagnostics.
 
@@ -258,7 +316,7 @@ In R Markdown (`.Rmd`) and Quarto (`.qmd`) documents, the R code inside chunks i
 - Syntax errors, undefined variables, and lint findings inside `{r}` (and `{rscript}`) chunks are reported at the document's own coordinates, exactly as they would be in a `.R` file.
 - Prose, YAML, markdown links, and non-R chunks never produce diagnostics.
 - Symbols defined in one R chunk are in scope in later R chunks (the chunks share a single analysis), so a variable assigned in an early chunk and used in a later one is not flagged as undefined.
-- Chunk options that only affect knitr execution (such as `eval=FALSE`) do not suppress static analysis — a syntax error in an `eval=FALSE` chunk is still flagged.
+- Chunk options that only affect knitr execution (such as `eval=FALSE`) suppress diagnostics for that chunk body — it may hold intentionally incomplete snippets — but language intelligence (completions, semantic tokens, indentation) still works inside it.
 - `# nolint` markers and `# @lsp-ignore` directives work inside chunks just as in plain R.
 
 ### Parameterized reports (`params`)

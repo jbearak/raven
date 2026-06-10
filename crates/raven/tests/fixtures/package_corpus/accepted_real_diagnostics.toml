@@ -1,0 +1,866 @@
+# Accepted real diagnostics observed in the real-package corpus.
+#
+# False positives do not belong here. Add a TDD Raven regression and fix them
+# instead. For a real diagnostic, first make a minimal edit in the temp package
+# checkout that removes the diagnostic, then record that evidence in this file.
+
+[[diagnostic]]
+package = "base"
+path = "R/RNG.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around the right-hand `&&` clause: `vnum[1L] == 0 || (vnum[1L] == 1 && vnum[2L] <= 6)`."
+
+[diagnostic.range]
+start_line = 131
+start_character = 27
+end_line = 131
+end_character = 29
+[[diagnostic]]
+package = "base"
+path = "R/RNG.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around the right-hand `&&` clause: `vnum[1L] <= 2 || (vnum[1L] == 3 && vnum[2L] <= 5)`."
+
+[diagnostic.range]
+start_line = 133
+start_character = 27
+end_line = 133
+end_character = 29
+[[diagnostic]]
+package = "base"
+path = "R/character.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around `li$codepage >= 1250L && li$codepage <= 1258L` before the `|| li$codepage == 874L` branch."
+
+[diagnostic.range]
+start_line = 137
+start_character = 19
+end_line = 137
+end_character = 21
+[[diagnostic]]
+package = "base"
+path = "R/character.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around `li$codepage >= 1250L && li$codepage <= 1258L` before the `|| li$codepage == 874L` branch."
+
+[diagnostic.range]
+start_line = 169
+start_character = 20
+end_line = 169
+end_character = 22
+[[diagnostic]]
+package = "base"
+path = "R/dataframe.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around both mixed operands: `(char.i && nextra) || (all(i >= 0L) && (nn <- max(i)) > nrows)`."
+
+[diagnostic.range]
+start_line = 864
+start_character = 23
+end_line = 864
+end_character = 25
+[[diagnostic]]
+package = "base"
+path = "R/library.R"
+message = "Assigning to string literal \"__library_can_mask__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__library_can_mask__` <- canMaskEnv ``."
+
+[diagnostic.range]
+start_line = 342
+start_character = 20
+end_line = 342
+end_character = 42
+[[diagnostic]]
+package = "base"
+path = "R/all.equal.R"
+message = "Assigning to string literal \"__all.eq.E__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Same dynGet-sentinel idiom as the accepted `__library_can_mask__` / `__NameSpacesLoading__` / `__LoadingNamespaceInfo__` entries: `\"__all.eq.E__\" <- environment()` inside a function body, read back via `dynGet(\"__all.eq.E__\", NULL)`. The value is not a function, so the idiomatic function-definition exemption deliberately does not apply; the backtick-quoted spelling would silence it."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__all.eq.E__` <- environment() ``."
+
+[diagnostic.range]
+start_line = 268
+start_character = 1
+end_line = 268
+end_character = 15
+[[diagnostic]]
+package = "base"
+path = "R/match.fun.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Add parentheses around the character/function disjunction: `((is.character(FUN) && length(FUN) == 1L) || is.symbol(FUN))`."
+
+[diagnostic.range]
+start_line = 25
+start_character = 49
+end_line = 25
+end_character = 51
+[[diagnostic]]
+package = "base"
+path = "R/namespace.R"
+message = "Assigning to string literal \"__NameSpacesLoading__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__NameSpacesLoading__` <- c(package, loading) ``."
+
+[diagnostic.range]
+start_line = 194
+start_character = 4
+end_line = 194
+end_character = 27
+[[diagnostic]]
+package = "base"
+path = "R/namespace.R"
+message = "Assigning to string literal \"__LoadingNamespaceInfo__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__LoadingNamespaceInfo__` <- list(...) ``."
+
+[diagnostic.range]
+start_line = 558
+start_character = 8
+end_line = 558
+end_character = 34
+[[diagnostic]]
+package = "compiler"
+path = "tests/assign.R"
+message = "Assigning to string literal \"x\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
+source = "R SVN trunk src/library/compiler"
+minimal_edit = "Rewrite as backtick-quoted assignment: `` `x` <- ... ``."
+
+[diagnostic.range]
+start_line = 126
+start_character = 38
+end_line = 126
+end_character = 41
+[[diagnostic]]
+package = "compiler"
+path = "tests/assign.R"
+message = "Cannot assign to numeric literal `3`."
+evidence = "Confirmed real: inside quote() testing the compiler checkAssign error for numeric-literal assignment."
+source = "R SVN trunk src/library/compiler"
+minimal_edit = "Intentional test case; no edit needed."
+
+[diagnostic.range]
+start_line = 127
+start_character = 38
+end_line = 127
+end_character = 39
+[[diagnostic]]
+package = "compiler"
+path = "tests/envir.R"
+message = "Assigning to string literal \"v\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
+source = "R SVN trunk src/library/compiler"
+minimal_edit = "Rewrite as backtick-quoted assignment: `` `v` <- ... ``."
+
+[diagnostic.range]
+start_line = 49
+start_character = 41
+end_line = 49
+end_character = 44
+[[diagnostic]]
+package = "methods"
+path = "R/BasicClasses.R"
+message = "Assigning to string literal \"<undef>\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
+source = "R SVN trunk src/library/methods"
+minimal_edit = "Rewrite as backtick-quoted assignment: `` `<undef>` <- ... ``."
+
+[diagnostic.range]
+start_line = 130
+start_character = 54
+end_line = 130
+end_character = 63
+[[diagnostic]]
+package = "splines"
+path = "R/splines.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/splines"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 63
+start_character = 28
+end_line = 63
+end_character = 30
+[[diagnostic]]
+package = "stats"
+path = "R/family.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/stats"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 580
+start_character = 59
+end_line = 580
+end_character = 61
+[[diagnostic]]
+package = "stats"
+path = "R/models.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/stats"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 124
+start_character = 20
+end_line = 124
+end_character = 22
+[[diagnostic]]
+package = "stats"
+path = "R/nlm.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/stats"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 78
+start_character = 51
+end_line = 78
+end_character = 53
+[[diagnostic]]
+package = "stats"
+path = "R/prop.test.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/stats"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 70
+start_character = 14
+end_line = 70
+end_character = 16
+[[diagnostic]]
+package = "tools"
+path = "R/check.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/tools"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 4085
+start_character = 69
+end_line = 4085
+end_character = 71
+[[diagnostic]]
+package = "tools"
+path = "R/news.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/tools"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 878
+start_character = 36
+end_line = 878
+end_character = 38
+[[diagnostic]]
+package = "tools"
+path = "R/utils.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/tools"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 912
+start_character = 43
+end_line = 912
+end_character = 45
+[[diagnostic]]
+package = "utils"
+path = "R/sourceutils.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "R SVN trunk src/library/utils"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 86
+start_character = 51
+end_line = 86
+end_character = 53
+[[diagnostic]]
+package = "codetools"
+path = "tests/tests.R"
+message = "Assigning to string literal \"v\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
+source = "CRAN/git codetools"
+minimal_edit = "Rewrite as backtick-quoted assignment: `` `v` <- ... ``."
+
+[diagnostic.range]
+start_line = 21
+start_character = 38
+end_line = 21
+end_character = 41
+[[diagnostic]]
+package = "mgcv"
+path = "R/plots.r"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "CRAN/git mgcv"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 1514
+start_character = 63
+end_line = 1514
+end_character = 65
+[[diagnostic]]
+package = "mgcv"
+path = "R/soap.r"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "CRAN/git mgcv"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 325
+start_character = 33
+end_line = 325
+end_character = 35
+[[diagnostic]]
+package = "nlme"
+path = "R/newFunc.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "CRAN/git nlme"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 324
+start_character = 32
+end_line = 324
+end_character = 34
+[[diagnostic]]
+package = "nlme"
+path = "R/pdMat.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "CRAN/git nlme"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 561
+start_character = 21
+end_line = 561
+end_character = 23
+[[diagnostic]]
+package = "nlme"
+path = "tests/deparse.R"
+message = "Assigning to string literal \"mydata2\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
+source = "CRAN/git nlme"
+minimal_edit = "Rewrite as backtick-quoted assignment: `` `mydata2` <- ... ``."
+
+[diagnostic.range]
+start_line = 39
+start_character = 0
+end_line = 39
+end_character = 9
+[[diagnostic]]
+package = "survival"
+path = "R/Surv2.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "CRAN/git survival"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 10
+start_character = 32
+end_line = 10
+end_character = 34
+[[diagnostic]]
+package = "survival"
+path = "R/predict.coxph.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "CRAN/git survival"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 66
+start_character = 45
+end_line = 66
+end_character = 47
+[[diagnostic]]
+package = "survival"
+path = "R/predict.coxphms.R"
+message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
+evidence = "Confirmed real: adding precedence-preserving parentheses removes the diagnostic."
+source = "CRAN/git survival"
+minimal_edit = "Add parentheses around the `&&` clause(s) adjacent to `||`."
+
+[diagnostic.range]
+start_line = 76
+start_character = 45
+end_line = 76
+end_character = 47
+[[diagnostic]]
+package = "stats"
+path = "tests/drop1-polr.R"
+message = "Undefined variable: lreg1"
+evidence = "Confirmed real: `lreg` is defined at line 19 but `lreg1` is referenced at line 20; this is a genuine typo in the R test code."
+source = "R SVN trunk src/library/stats"
+minimal_edit = "Correct `lreg1` to `lreg`."
+
+[diagnostic.range]
+start_line = 19
+start_character = 18
+end_line = 19
+end_character = 23
+[[diagnostic]]
+package = "ggplot2"
+path = "R/geom-text.R"
+message = "Mixed `&` and `|` without parentheses; `&` binds tighter than `|`. Add parentheses to clarify intent: `(a & b) | c` or `a & (b | c)`."
+evidence = "Mixed bitwise `&` and `|` without explicit parentheses; adding parentheses removes this diagnostic."
+source = "ggplot2 GitHub dev"
+minimal_edit = "Add parentheses to clarify operator precedence."
+
+[diagnostic.range]
+start_line = 229
+start_character = 37
+end_line = 229
+end_character = 38
+[[diagnostic]]
+package = "methods"
+path = "R/SClasses.R"
+message = "Undefined variable: fields"
+evidence = "inferProperties() has parameter `props` but error message references `fields` (should be `class(props)`)"
+
+[diagnostic.range]
+start_line = 1011
+start_character = 49
+end_line = 1011
+end_character = 55
+[[diagnostic]]
+package = "stats"
+path = "demo/smooth.R"
+message = "Undefined variable: x1"
+evidence = "x1 referenced at line 36 in for-loop argument, never defined anywhere in demo/smooth.R"
+
+[diagnostic.range]
+start_line = 35
+start_character = 14
+end_line = 35
+end_character = 16
+[[diagnostic]]
+package = "survival"
+path = "R/residuals.survfitcox.R"
+message = "Undefined variable: mf"
+evidence = "model.extract(mf, ...) called but `mf` is never computed in residuals.survfitcox()"
+
+[diagnostic.range]
+start_line = 130
+start_character = 37
+end_line = 130
+end_character = 39
+[[diagnostic]]
+package = "survival"
+path = "R/summary.survfit.R"
+message = "Undefined variable: newdata"
+evidence = "names(newdata) used but function has no `newdata` param; should be `names(fit$newdata)`"
+
+[diagnostic.range]
+start_line = 219
+start_character = 22
+end_line = 219
+end_character = 29
+[[diagnostic]]
+package = "survival"
+path = "R/summary.survfit.R"
+message = "Undefined variable: newdata"
+evidence = "second `newdata` reference on same line; should be `fit$newdata`"
+
+[diagnostic.range]
+start_line = 219
+start_character = 47
+end_line = 219
+end_character = 54
+[[diagnostic]]
+package = "survival"
+path = "R/survcallback.R"
+message = "Undefined variable: pcol"
+evidence = "Same pcol/pcols typo as survpenal.fit.R; entire file is dead code wrapped in if(FALSE)"
+
+[diagnostic.range]
+start_line = 63
+start_character = 22
+end_line = 63
+end_character = 26
+[[diagnostic]]
+package = "survival"
+path = "R/survcallback.R"
+message = "Undefined variable: nstrat2"
+evidence = "nstrat2 defined in survpenal.fit.R but not in this extracted stub; dead code wrapped in if(FALSE)"
+
+[diagnostic.range]
+start_line = 123
+start_character = 20
+end_line = 123
+end_character = 27
+[[diagnostic]]
+package = "survival"
+path = "R/survdiff.R"
+message = "Undefined variable: Call"
+evidence = "Line 2 defines `call` (lowercase) but line 13 references `Call` (uppercase); R is case-sensitive"
+
+[diagnostic.range]
+start_line = 12
+start_character = 29
+end_line = 12
+end_character = 33
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 276
+start_character = 13
+end_line = 276
+end_character = 23
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 281
+start_character = 16
+end_line = 281
+end_character = 26
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 332
+start_character = 8
+end_line = 332
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "R/survnew.R"
+message = "Undefined variable: individual"
+evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
+
+[diagnostic.range]
+start_line = 392
+start_character = 8
+end_line = 392
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "R/survpenal.fit.R"
+message = "Undefined variable: pcol"
+evidence = "Line 165 reads `pcols[[i]]` (function param) but line 166 writes to `pcol[[i]]` - typo for `pcols`"
+
+[diagnostic.range]
+start_line = 165
+start_character = 22
+end_line = 165
+end_character = 26
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx1"
+evidence = "Typo for `sindx1`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 101
+start_character = 13
+end_line = 101
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx2"
+evidence = "Typo for `sindx2`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 102
+start_character = 13
+end_line = 102
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx3"
+evidence = "Typo for `sindx3`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 103
+start_character = 13
+end_line = 103
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx1"
+evidence = "Typo for `sindx1`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 104
+start_character = 13
+end_line = 104
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx2"
+evidence = "Typo for `sindx2`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 105
+start_character = 13
+end_line = 105
+end_character = 18
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: indx3"
+evidence = "Typo for `sindx3`; dead code inside if(FALSE) block"
+
+[diagnostic.range]
+start_line = 106
+start_character = 13
+end_line = 106
+end_character = 18
+[[diagnostic]]
+package = "Matrix"
+path = "R/subassign.R"
+message = "Undefined variable: i"
+evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
+
+[diagnostic.range]
+start_line = 18
+start_character = 17
+end_line = 18
+end_character = 18
+[[diagnostic]]
+package = "Matrix"
+path = "R/subassign.R"
+message = "Undefined variable: i"
+evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
+
+[diagnostic.range]
+start_line = 19
+start_character = 67
+end_line = 19
+end_character = 68
+[[diagnostic]]
+package = "Matrix"
+path = "R/subassign.R"
+message = "Undefined variable: i"
+evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
+
+[diagnostic.range]
+start_line = 20
+start_character = 68
+end_line = 20
+end_character = 69
+[[diagnostic]]
+package = "mgcv"
+path = "R/sparse.r"
+message = "Undefined variable: ind"
+evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
+
+[diagnostic.range]
+start_line = 399
+start_character = 6
+end_line = 399
+end_character = 9
+[[diagnostic]]
+package = "mgcv"
+path = "R/sparse.r"
+message = "Undefined variable: ind"
+evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
+
+[diagnostic.range]
+start_line = 403
+start_character = 4
+end_line = 403
+end_character = 7
+[[diagnostic]]
+package = "mgcv"
+path = "R/sparse.r"
+message = "Undefined variable: ind"
+evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
+
+[diagnostic.range]
+start_line = 406
+start_character = 16
+end_line = 406
+end_character = 19
+[[diagnostic]]
+package = "lubridate"
+path = "R/coercion.r"
+message = "Undefined variable: x"
+evidence = "Function signature is function(new, orig) but body uses class(x). Parameter name mismatch — should be class(new)."
+
+[diagnostic.range]
+start_line = 116
+start_character = 73
+end_line = 116
+end_character = 74
+[[diagnostic]]
+package = "grDevices"
+path = "R/postscript.R"
+message = "Undefined variable: cmd"
+evidence = "stop(gettextf(..., cmd)) at line 992 (0-indexed 991) uses `cmd` which isn't assigned until line 995. Used-before-defined that will crash if system2() returns non-zero."
+
+[diagnostic.range]
+start_line = 991
+start_character = 64
+end_line = 991
+end_character = 67
+[[diagnostic]]
+package = "dbplyr"
+path = "R/verb-pivot-wider.R"
+message = "Undefined variable: error_call"
+evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
+
+[diagnostic.range]
+start_line = 364
+start_character = 17
+end_line = 364
+end_character = 27
+[[diagnostic]]
+package = "dbplyr"
+path = "R/verb-pivot-wider.R"
+message = "Undefined variable: error_call"
+evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
+
+[diagnostic.range]
+start_line = 371
+start_character = 17
+end_line = 371
+end_character = 27
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 35
+start_character = 21
+end_line = 35
+end_character = 28
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 35
+start_character = 46
+end_line = 35
+end_character = 53
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 35
+start_character = 59
+end_line = 35
+end_character = 66
+[[diagnostic]]
+package = "survival"
+path = "R/points.survfit.R"
+message = "Undefined variable: cumprob"
+evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
+
+[diagnostic.range]
+start_line = 41
+start_character = 27
+end_line = 41
+end_character = 34
+[[diagnostic]]
+package = "httr"
+path = "demo/oauth2-yelp.R"
+message = "Undefined variable: token"
+evidence = "File defines yelp_token (line 24) but uses undefined token (line 41); should be config(token = yelp_token)."
+
+[diagnostic.range]
+start_line = 40
+start_character = 31
+end_line = 40
+end_character = 36
+[[diagnostic]]
+package = "survival"
+path = "tests/multi2.R"
+message = "Undefined variable: d1"
+evidence = "d1 never defined anywhere in file; dead code inside if(FALSE) block; same pattern as accepted indx1/2/3 entries."
+
+[diagnostic.range]
+start_line = 78
+start_character = 8
+end_line = 78
+end_character = 10
+[[diagnostic]]
+package = "utils"
+path = "R/mach-o.R"
+message = "Undefined variable: f"
+evidence = "isSeekable(f) called at line 48 but f <- filename assigned at line 49; used-before-defined."
+
+[diagnostic.range]
+start_line = 47
+start_character = 24
+end_line = 47
+end_character = 25
+[[diagnostic]]
+package = "survival"
+path = "R/parsecovar.R"
+message = "Undefined variable: k"
+evidence = "any(k = expr) passes named arg to any(), does not bind k in calling scope. k undefined at stop() call."
+
+[diagnostic.range]
+start_line = 178
+start_character = 48
+end_line = 178
+end_character = 49
+[[diagnostic]]
+package = "survival"
+path = "R/parsecovar.R"
+message = "Undefined variable: k"
+evidence = "any(k = expr) passes named arg to any(), does not bind k in calling scope. k undefined at stop() call."
+
+[diagnostic.range]
+start_line = 181
+start_character = 46
+end_line = 181
+end_character = 47

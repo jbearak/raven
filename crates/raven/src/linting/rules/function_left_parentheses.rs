@@ -76,7 +76,7 @@ fn check(
         .get(name.start_byte()..name.end_byte())
         .unwrap_or("function");
     let line_no = name.end_position().row as u32;
-    if suppressions.is_suppressed(line_no) {
+    if suppressions.is_suppressed_code(line_no, rule_ids::FUNCTION_LEFT_PARENTHESES) {
         return;
     }
     let line_text = text.lines().nth(line_no as usize).unwrap_or("");

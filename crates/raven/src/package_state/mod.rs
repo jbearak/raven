@@ -12,6 +12,7 @@ pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
 pub mod event;
+pub mod sysdata;
 
 #[cfg(test)]
 mod proptest_machine;
@@ -83,6 +84,16 @@ pub struct PackageInputs {
     pub description: Option<DescriptionInput>,
     pub namespace: Option<NamespaceInput>,
     pub r_files: BTreeMap<PathBuf, RFileInput>,
+    /// Dataset names discovered from `<root>/data/`. Populated by startup
+    /// scan and updated on watched-file changes. Includes file stems of
+    /// `data/*.{rda,RData,rds,tab,txt,csv}` and top-level assignments from
+    /// `data/*.R` scripts.
+    pub dataset_names: BTreeSet<String>,
+    /// Symbol names from `R/sysdata.rda`. Populated by AST-scanning
+    /// `data-raw/**/*.R` for `use_data(..., internal=TRUE)` and
+    /// `save(..., file="...sysdata.rda")` calls, with an R-subprocess
+    /// fallback when AST finds nothing and an R executable is available.
+    pub sysdata_names: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +141,7 @@ pub enum PackageInputDelta {
     NamespaceChanged,
     DescriptionChanged,
     SettingChanged,
+    DataDirChanged,
     Batch(Vec<PackageInputDelta>),
 }
 
@@ -143,7 +155,17 @@ use std::path::Path;
 /// Rules:
 /// - `<root>/R/**/*.R` (or `*.r`) → `Source`
 /// - `<root>/tests/testthat/**/*.R` (or `*.r`) → `Test`
+/// - `<root>/tests/testit/**/*.R` (or `*.r`) → `Test`
+/// - `<root>/tests/*.R` (direct children only, or `*.r`) → `Test`
+/// - `<root>/inst/tinytest/**/*.R` (or `*.r`) → `Test`
+/// - `<root>/inst/unitTests/**/*.R` (or `*.r`) → `Test`
 /// - everything else → `None`
+///
+/// `inst/tinytest/` and `inst/unitTests/` are installed test suites that run
+/// with the package loaded, so they are `Test`-kind (one-way package R/
+/// visibility) like `tests/testthat/`. They are NOT testthat-managed, so
+/// [`is_testthat_or_testit_test`] still excludes them from testthat-specific
+/// helper/attached-package injection.
 pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind> {
     let rel = path.strip_prefix(workspace_root).ok()?;
     let mut comps = rel.components();
@@ -156,9 +178,22 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
 
     match first {
         "R" => Some(RFileKind::Source),
+        "inst" => {
+            // Installed test suites run with the package loaded.
+            let second = comps.next()?.as_os_str().to_str()?;
+            if second == "tinytest" || second == "unitTests" {
+                Some(RFileKind::Test)
+            } else {
+                None
+            }
+        }
         "tests" => {
             let second = comps.next()?.as_os_str().to_str()?;
-            if second == "testthat" {
+            if second == "testthat" || second == "testit" {
+                Some(RFileKind::Test)
+            } else if comps.next().is_none() {
+                // Direct child of tests/ (no further path components) —
+                // plain R CMD check test script.
                 Some(RFileKind::Test)
             } else {
                 None
@@ -166,6 +201,175 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
         }
         _ => None,
     }
+}
+
+/// Returns `true` when `path` is under `<root>/tests/testthat/` or
+/// `<root>/tests/testit/` — i.e. a testthat/testit-managed test file,
+/// NOT a plain `tests/*.R` script. Used to gate testthat-specific
+/// injections (helper symbols, test_attached_packages).
+pub fn is_testthat_or_testit_test(path: &Path, workspace_root: &Path) -> bool {
+    let Some(rel) = path.strip_prefix(workspace_root).ok() else {
+        return false;
+    };
+    let mut comps = rel.components();
+    let Some(first) = comps.next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    if first != "tests" {
+        return false;
+    }
+    let Some(second) = comps.next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    second == "testthat" || second == "testit"
+}
+
+/// Returns `true` when `path` is an R file under one of the package's
+/// "dev-context" directories: `demo/`, `vignettes/`, `data-raw/`, `man/`.
+/// These directories see the package's own R/ top-level symbols and NAMESPACE
+/// imports (one-way: their defs never leak into R/, and they don't see each
+/// other) because the package is loaded when their code runs. Package mode
+/// only.
+///
+/// `inst/` and `revdep/` are deliberately excluded: plain `inst/` scripts
+/// (examples, shiny apps, rmarkdown templates) and reverse-dependency checks
+/// are not run with the package implicitly loaded, so they rely on explicit
+/// `library()`/directives like any other script. (Installed test suites under
+/// `inst/tinytest/` and `inst/unitTests/` are handled separately as `Test`-kind
+/// files by [`is_r_source_path`].)
+pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
+    let Some(rel) = path.strip_prefix(workspace_root).ok() else {
+        return false;
+    };
+    let is_r_extension = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
+    );
+    if !is_r_extension {
+        return false;
+    }
+    let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    matches!(first, "demo" | "data-raw" | "vignettes" | "man")
+}
+
+/// Returns `true` when `path` is an R file anywhere under the workspace root
+/// that should see the package's own dataset symbols. This is broader than
+/// `is_r_source_path`: datasets are visible in R/, tests/, vignettes/, inst/,
+/// demo/, and data-raw/ — essentially any `.R` file in the package tree.
+pub fn is_package_workspace_r_file(path: &Path, workspace_root: &Path) -> bool {
+    if path.strip_prefix(workspace_root).is_err() {
+        return false;
+    }
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
+    )
+}
+
+/// Synchronously scan `<workspace_root>/data/` for dataset names.
+///
+/// Returns file stems of recognized data file extensions plus top-level
+/// assignment names from `data/*.R` scripts. This mirrors
+/// [`crate::namespace_parser::parse_data_symbols`] but operates synchronously
+/// and additionally extracts top-level defs from `.R` scripts (which create
+/// dataset objects at load time via side-effects).
+pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
+    use std::fs;
+
+    let data_dir = workspace_root.join("data");
+    let mut symbols = BTreeSet::new();
+
+    let data_meta = match fs::symlink_metadata(&data_dir) {
+        Ok(m) => m,
+        Err(_) => return symbols,
+    };
+    if !data_meta.is_dir() {
+        return symbols;
+    }
+
+    // datalist file (same format as installed packages)
+    let datalist_path = data_dir.join("datalist");
+    if let Ok(content) = fs::read_to_string(&datalist_path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((primary, rest)) = line.split_once(':') {
+                let primary = primary.trim();
+                if !primary.is_empty() {
+                    symbols.insert(primary.to_string());
+                }
+                for sub in rest.split_whitespace() {
+                    if !sub.is_empty() {
+                        symbols.insert(sub.to_string());
+                    }
+                }
+            } else if !line.is_empty() {
+                symbols.insert(line.to_string());
+            }
+        }
+    }
+
+    // Recognized data-file extensions (matches namespace_parser::data_file_stem)
+    const SERIALIZED_EXTS: &[&str] = &["rda", "rdata", "rds"];
+    const TABULAR_EXTS: &[&str] = &["csv", "tab", "txt"];
+    const COMPRESSION_EXTS: &[&str] = &["gz", "bz2", "xz"];
+    const SKIP_FILES: &[&str] = &["Rdata.rdb", "Rdata.rdx", "Rdata.rds", "datalist"];
+
+    let entries = match fs::read_dir(&data_dir) {
+        Ok(e) => e,
+        Err(_) => return symbols,
+    };
+
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if SKIP_FILES.contains(&file_name) {
+            continue;
+        }
+
+        // Check for .R scripts — parse for top-level defs
+        let ext_lc = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext_lc == "r" {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let defs = crate::roxygen::extract_top_level_defs(&content);
+                symbols.extend(defs);
+            }
+            continue;
+        }
+
+        // Serialized data files: stem is dataset name
+        if SERIALIZED_EXTS.contains(&ext_lc.as_str()) || TABULAR_EXTS.contains(&ext_lc.as_str()) {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                symbols.insert(stem.to_string());
+            }
+            continue;
+        }
+
+        // Compressed tabular: strip compression ext, check inner ext
+        if COMPRESSION_EXTS.contains(&ext_lc.as_str()) {
+            let stem_outer = file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
+            if let Some((inner_stem, inner_ext)) = stem_outer.rsplit_once('.')
+                && TABULAR_EXTS.contains(&inner_ext.to_ascii_lowercase().as_str())
+            {
+                symbols.insert(inner_stem.to_string());
+            }
+        }
+    }
+
+    symbols
 }
 
 /// Returns `true` for testthat-recognized helper files: files under
@@ -221,6 +425,17 @@ mod path_tests {
         assert_eq!(
             is_r_source_path(
                 Path::new("/work/pkg/tests/testthat/test-utils.R"),
+                Path::new("/work/pkg")
+            ),
+            Some(RFileKind::Test),
+        );
+    }
+
+    #[test]
+    fn r_source_path_recognizes_testit() {
+        assert_eq!(
+            is_r_source_path(
+                Path::new("/work/pkg/tests/testit/test-utils.R"),
                 Path::new("/work/pkg")
             ),
             Some(RFileKind::Test),
@@ -308,6 +523,154 @@ mod path_tests {
         // A non-ASCII-leading name that happens to share a tail must not match either.
         assert!(!is_test_helper_filename("éhelper.R"));
     }
+
+    #[test]
+    fn r_source_path_recognizes_plain_tests() {
+        let root = Path::new("/work/pkg");
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/Simple.R"), root),
+            Some(RFileKind::Test),
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/indexing.R"), root),
+            Some(RFileKind::Test),
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/foo.r"), root),
+            Some(RFileKind::Test),
+        );
+    }
+
+    #[test]
+    fn r_source_path_rejects_tests_subdirs_other_than_testthat_testit() {
+        let root = Path::new("/work/pkg");
+        // files in unrecognized subdirs of tests/ should NOT be tracked
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/tests/other/foo.R"), root),
+            None
+        );
+    }
+
+    #[test]
+    fn is_testthat_or_testit_test_distinguishes_correctly() {
+        let root = Path::new("/work/pkg");
+        assert!(is_testthat_or_testit_test(
+            Path::new("/work/pkg/tests/testthat/test-x.R"),
+            root
+        ));
+        assert!(is_testthat_or_testit_test(
+            Path::new("/work/pkg/tests/testit/test-x.R"),
+            root
+        ));
+        assert!(!is_testthat_or_testit_test(
+            Path::new("/work/pkg/tests/Simple.R"),
+            root
+        ));
+        assert!(!is_testthat_or_testit_test(
+            Path::new("/work/pkg/R/utils.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn dev_context_path_recognizes_all_dirs() {
+        let root = Path::new("/work/pkg");
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/demo/example.R"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/data-raw/prepare.R"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/vignettes/intro.Rmd"),
+            root
+        ));
+        assert!(is_dev_context_path(
+            Path::new("/work/pkg/man/rmd/topic.Rmd"),
+            root
+        ));
+    }
+
+    /// F4: `inst/` and `revdep/` are no longer blanket dev-context — plain
+    /// `inst/` scripts and revdep checks rely on explicit `library()`.
+    #[test]
+    fn dev_context_path_excludes_inst_and_revdep() {
+        let root = Path::new("/work/pkg");
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/inst/script.R"),
+            root
+        ));
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/inst/extdata/helper.R"),
+            root
+        ));
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/revdep/check.R"),
+            root
+        ));
+        // A bare reference inside an installed rmarkdown template skeleton is
+        // NOT silenced: the file sees no implicit package symbols.
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/inst/rmarkdown/templates/report/skeleton/skeleton.Rmd"),
+            root
+        ));
+    }
+
+    /// F4: installed test suites under `inst/tinytest/` and `inst/unitTests/`
+    /// are `Test`-kind (one-way package R/ visibility) — they run with the
+    /// package loaded.
+    #[test]
+    fn r_source_path_recognizes_inst_test_suites() {
+        let root = Path::new("/work/pkg");
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/inst/tinytest/test_a.R"), root),
+            Some(RFileKind::Test),
+        );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/inst/unitTests/runit.foo.R"), root),
+            Some(RFileKind::Test),
+        );
+        // Other inst/ R files remain untracked.
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/inst/script.R"), root),
+            None,
+        );
+        // tinytest/unitTests are not testthat-managed, so testthat-specific
+        // injection still excludes them.
+        assert!(!is_testthat_or_testit_test(
+            Path::new("/work/pkg/inst/tinytest/test_a.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn dev_context_path_rejects_non_dev_dirs() {
+        let root = Path::new("/work/pkg");
+        // R/ is not dev-context (it's Source)
+        assert!(!is_dev_context_path(Path::new("/work/pkg/R/utils.R"), root));
+        // tests/ is not dev-context (it's Test)
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/tests/testthat/test-x.R"),
+            root
+        ));
+        // Outside workspace
+        assert!(!is_dev_context_path(
+            Path::new("/other/inst/script.R"),
+            root
+        ));
+        // Non-R extension
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/inst/data.csv"),
+            root
+        ));
+        // Random dir
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/src/code.R"),
+            root
+        ));
+    }
 }
 
 // ============== OUTPUTS (continued) ==============
@@ -324,6 +687,8 @@ pub struct RFileFacts {
     pub kind: RFileKind,
     pub roxygen_namespace: RoxygenNamespace,
     pub top_level_defs: Arc<BTreeSet<String>>,
+    /// Symbols bound inside `.onLoad`/`.onAttach` hooks in this file.
+    pub onload_bindings: Arc<BTreeSet<String>>,
     pub content_digest: ContentDigest,
 }
 
@@ -364,4 +729,155 @@ pub struct PackageScopeContribution {
     /// deterministic so cached `PackageState` equality (used by the
     /// proptest machine) is stable across runs.
     pub test_helper_symbols: Arc<BTreeMap<PathBuf, Arc<BTreeSet<String>>>>,
+
+    /// Dataset names from the package's own `data/` directory. These are
+    /// visible to any `.R` file under the workspace root — R/, tests/,
+    /// vignettes/, inst/, demo/, data-raw/ — matching `data()` semantics
+    /// for the package's own lazy-data objects.
+    ///
+    /// Populated from `PackageInputs::dataset_names` which is computed by
+    /// scanning `<root>/data/` for file stems of recognized data extensions
+    /// plus top-level assignments in `data/*.R` scripts.
+    pub dataset_symbols: Arc<BTreeSet<String>>,
+
+    /// Symbols from `R/sysdata.rda` — internal data objects available to
+    /// all code within the package namespace at runtime. Visible in R/,
+    /// tests/testthat/, and dev-context files. Populated via AST scanning
+    /// of `data-raw/**/*.R` for generating calls, with an R-subprocess
+    /// fallback.
+    pub sysdata_symbols: Arc<BTreeSet<String>>,
+
+    /// Symbols bound inside `.onLoad`/`.onAttach` hooks via
+    /// `assign("x", ..., envir=ns)` or `ns$x <- ...`. Visible alongside
+    /// `r_internal_symbols`.
+    pub onload_symbols: Arc<BTreeSet<String>>,
+}
+
+#[cfg(test)]
+mod scan_data_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn scan_finds_rda_file_stems() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(data_dir.join("mpg.rda"), b"fake").unwrap();
+        fs::write(data_dir.join("diamonds.RData"), b"fake").unwrap();
+        fs::write(data_dir.join("storms.rds"), b"fake").unwrap();
+
+        let syms = scan_own_package_data_dir(tmp.path());
+        assert!(syms.contains("mpg"), "got: {:?}", syms);
+        assert!(syms.contains("diamonds"), "got: {:?}", syms);
+        assert!(syms.contains("storms"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn scan_finds_tabular_file_stems() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(data_dir.join("relig_income.csv"), b"fake").unwrap();
+        fs::write(data_dir.join("table1.tab"), b"fake").unwrap();
+        fs::write(data_dir.join("words.txt"), b"fake").unwrap();
+
+        let syms = scan_own_package_data_dir(tmp.path());
+        assert!(syms.contains("relig_income"), "got: {:?}", syms);
+        assert!(syms.contains("table1"), "got: {:?}", syms);
+        assert!(syms.contains("words"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn scan_extracts_top_level_defs_from_r_scripts() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("starwars.R"),
+            "starwars <- data.frame(name = 'Luke')\nstarwars_films <- list()\n",
+        )
+        .unwrap();
+
+        let syms = scan_own_package_data_dir(tmp.path());
+        assert!(syms.contains("starwars"), "got: {:?}", syms);
+        assert!(syms.contains("starwars_films"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn scan_handles_compressed_tabular() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(data_dir.join("big_data.csv.gz"), b"fake").unwrap();
+        fs::write(data_dir.join("compressed.tab.bz2"), b"fake").unwrap();
+
+        let syms = scan_own_package_data_dir(tmp.path());
+        assert!(syms.contains("big_data"), "got: {:?}", syms);
+        assert!(syms.contains("compressed"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn scan_reads_datalist() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(
+            data_dir.join("datalist"),
+            "flights\nairlines: name carrier\n",
+        )
+        .unwrap();
+
+        let syms = scan_own_package_data_dir(tmp.path());
+        assert!(syms.contains("flights"), "got: {:?}", syms);
+        assert!(syms.contains("airlines"), "got: {:?}", syms);
+        assert!(syms.contains("name"), "got: {:?}", syms);
+        assert!(syms.contains("carrier"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn scan_returns_empty_when_no_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let syms = scan_own_package_data_dir(tmp.path());
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn is_package_workspace_r_file_detects_vignettes() {
+        let root = Path::new("/work/pkg");
+        assert!(is_package_workspace_r_file(
+            Path::new("/work/pkg/vignettes/intro.R"),
+            root
+        ));
+        assert!(is_package_workspace_r_file(
+            Path::new("/work/pkg/vignettes/intro.Rmd"),
+            root
+        ));
+        assert!(is_package_workspace_r_file(
+            Path::new("/work/pkg/inst/script.R"),
+            root
+        ));
+        assert!(is_package_workspace_r_file(
+            Path::new("/work/pkg/demo/demo.R"),
+            root
+        ));
+        assert!(is_package_workspace_r_file(
+            Path::new("/work/pkg/data-raw/prep.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn is_package_workspace_r_file_rejects_outside() {
+        let root = Path::new("/work/pkg");
+        assert!(!is_package_workspace_r_file(
+            Path::new("/other/script.R"),
+            root
+        ));
+        assert!(!is_package_workspace_r_file(
+            Path::new("/work/pkg/data/foo.csv"),
+            root
+        ));
+    }
 }

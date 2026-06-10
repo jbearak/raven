@@ -136,7 +136,7 @@ fn emit_after_open(
     out: &mut Vec<Diagnostic>,
 ) {
     let line_no = open.end_position().row as u32;
-    if suppressions.is_suppressed(line_no) {
+    if suppressions.is_suppressed_code(line_no, rule_ids::SPACES_INSIDE) {
         return;
     }
     let line_text = text.lines().nth(line_no as usize).unwrap_or("");
@@ -165,7 +165,7 @@ fn emit_before_close(
     out: &mut Vec<Diagnostic>,
 ) {
     let line_no = close.start_position().row as u32;
-    if suppressions.is_suppressed(line_no) {
+    if suppressions.is_suppressed_code(line_no, rule_ids::SPACES_INSIDE) {
         return;
     }
     let line_text = text.lines().nth(line_no as usize).unwrap_or("");

@@ -4,7 +4,7 @@ Raven recognizes special comment directives that provide hints the static analyz
 
 ## General Syntax
 
-All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # @lsp-source file.R`. The one exception is `@lsp-ignore`, which works as a trailing comment.
+All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # @lsp-source file.R`. The exceptions are the line-level ignore markers `# raven: ignore` / `# raven: expect` and their aliases `@lsp-ignore` / `@lsp-expect`, which work as trailing comments.
 
 All directives support optional colon and quotes:
 ```r
@@ -184,13 +184,89 @@ eval(parse(text = code_string))
 
 ## Ignore Directives
 
-Suppress diagnostics on a specific line:
+Raven's primary suppression namespace is **`# raven:`**. It works both in the
+editor (LSP) and in `raven check`, and covers **all** diagnostics — the
+always-on analyzer diagnostics ([Diagnostics](diagnostics.md)) and the opt-in
+[style/lint rules](linting.md) alike. The legacy `@lsp-ignore` /
+`@lsp-ignore-next` markers remain permanent aliases for the line and next-line
+forms.
+
+### Line and next-line
 
 ```r
-x <- foo # @lsp-ignore  # Trailing form: suppresses diagnostics on this line
-# @lsp-ignore-next      # Standalone form: suppresses diagnostics on the next line
+x <- foo # raven: ignore    # Trailing form: suppresses diagnostics on this line
+# raven: ignore-next        # Standalone form: suppresses diagnostics on the next line
+
+x <- foo # @lsp-ignore      # Alias of `# raven: ignore`
+# @lsp-ignore-next          # Alias of `# raven: ignore-next`
 ```
 
-A standalone `# @lsp-ignore` on its own line has no effect — comment lines carry no diagnostics. Use `# @lsp-ignore-next` to suppress the following line, or place `# @lsp-ignore` as a trailing comment on the line you want suppressed.
+A standalone `# raven: ignore` (or `# @lsp-ignore`) on its own line has no
+effect — comment lines carry no diagnostics. Use the `-next` form to suppress
+the following line, or place the marker as a trailing comment on the line you
+want suppressed. The plain `ignore` / `@lsp-ignore` line forms may appear as
+trailing comments; the `-next`, file, and block forms must be standalone (on
+their own line) — a trailing `x <- 1 # raven: ignore-next` is silently
+ignored.
 
-`@lsp-ignore` is the only directive that can appear as a trailing comment.
+### Per-code selector
+
+An optional `[code]` selector narrows a suppression to one or more diagnostic
+codes, e.g. `# raven: ignore[undefined-variable]` or
+`x <- foo # @lsp-ignore[undefined-variable]`. List several codes
+comma-separated: `# raven: ignore[undefined-variable, line-length]`. The codes
+are the kebab-case names listed in [Diagnostics](diagnostics.md) and the lint
+rule names in [Linting](linting.md) (both `kebab-case` and lintr's `snake_case`
+spelling are accepted). A bare `# raven: ignore` with no selector suppresses
+every diagnostic on the target line. The selector is **enforced**: a
+`[code]` directive leaves diagnostics with other codes in place.
+
+### File and block forms
+
+```r
+# raven: ignore-file                     # suppress the whole file
+# raven: ignore-file[undefined-variable] # …only this code
+
+# raven: ignore-start                    # open a block
+x <- foo
+y <- bar
+# raven: ignore-end                      # close it (inclusive of both directive lines)
+```
+
+These cover both the analyzer diagnostics and the lint rules. An unterminated
+`ignore-start` extends to the end of the file. For lintr compatibility,
+`# nolint` / `# nolint start` / `# nolint end` also remain (lint diagnostics
+only) — see the [Linting suppression matrix](linting.md).
+
+### `expect` — assert that a suppression is used
+
+Every form above also comes in an **`expect`** flavor: `# raven: expect`,
+`# raven: expect-next`, `# raven: expect[code]`, `# raven: expect-file`,
+`# raven: expect-start` / `# raven: expect-end`, and the `@lsp-expect` /
+`@lsp-expect-next` aliases. `expect` suppresses exactly like `ignore`, but it
+also **asserts that it actually suppressed something**: if an `expect`
+directive matches no diagnostic, Raven reports an
+[`unused-suppression`](diagnostics.md) hint at the directive's line. This
+mirrors Rust's `#[expect]` and TypeScript's `@ts-expect-error`: use `ignore`
+for a silent suppression, `expect` when you want to be told once the underlying
+diagnostic is gone so the now-stale directive can be removed.
+
+```r
+result <- compute() # raven: expect[undefined-variable]
+# If `compute` later becomes defined/imported, the expect no longer suppresses
+# anything and Raven flags it as an unused suppression (a HINT) — your cue to
+# delete the directive.
+```
+
+A plain `ignore` is never reported as unused by default. Set
+[`raven.diagnostics.reportUnusedSuppressions`](configuration.md) to `true` to
+extend the unused-suppression sweep to **every** ignore directive
+(Pyright-style), not just `expect`.
+
+### Chunk-level suppression (R Markdown / Quarto)
+
+Inside `.Rmd` / `.qmd` documents you can suppress a whole chunk with the knitr
+chunk option `raven.ignore` or the in-chunk `# raven: ignore-chunk` directive.
+See [Code chunks](chunks.md#suppressing-diagnostics-in-a-chunk).
+
+

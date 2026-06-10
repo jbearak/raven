@@ -12,6 +12,17 @@ use tree_sitter::{Node, Tree};
 use super::scope::FunctionScopeInterval;
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
+/// A statically-extracted `system.file(...)` call used as the path argument
+/// to `source()`. Contains the string-literal positional parts and the
+/// `package = "P"` value needed to resolve the path at analysis time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SystemFileCall {
+    /// Positional string-literal parts (joined with `/` to form the relative path).
+    pub parts: Vec<String>,
+    /// The `package` argument value (must be a string literal).
+    pub package: String,
+}
+
 /// Detected rm()/remove() call with extracted symbol names
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RmCall {
@@ -126,7 +137,22 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
     };
 
     let args_node = node.child_by_field_name("arguments")?;
-    let path = find_file_argument(&args_node, content)?;
+
+    // Try normal string-literal path first
+    let path = find_file_argument(&args_node, content);
+
+    // If no string literal, try system.file() call in the path position
+    let system_file = if path.is_none() {
+        try_extract_system_file_argument(&args_node, content)
+    } else {
+        None
+    };
+
+    // Need either a path or a system.file() call
+    if path.is_none() && system_file.is_none() {
+        return None;
+    }
+
     let local = find_bool_argument(&args_node, content, "local").unwrap_or(false);
     let chdir = find_bool_argument(&args_node, content, "chdir").unwrap_or(false);
 
@@ -142,7 +168,7 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
     let column = byte_offset_to_utf16_column(line_text, start.column);
 
     Some(ForwardSource {
-        path,
+        path: path.unwrap_or_default(),
         line: start.row as u32,
         column,
         is_directive: false,
@@ -154,6 +180,8 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
         directive_line: 0,     // Not applicable for AST-detected sources
         user_line_zero: false, // Not applicable for AST-detected sources
         is_function_scoped: has_function_definition_ancestor(node),
+        system_file,
+        resolved_uri: None,
     })
 }
 
@@ -226,6 +254,113 @@ fn find_file_argument(args_node: &Node, content: &str) -> Option<String> {
     None
 }
 
+/// Try to extract a `system.file(...)` call from the file-argument position of
+/// a `source()` call. Returns `Some(SystemFileCall)` when the argument is a call
+/// to `system.file` with all-string-literal positional parts and a literal
+/// `package = "P"` named argument. Returns `None` for computed/variable args.
+fn try_extract_system_file_argument(args_node: &Node, content: &str) -> Option<SystemFileCall> {
+    let mut cursor = args_node.walk();
+    let children: Vec<_> = args_node.children(&mut cursor).collect();
+
+    // Look for named "file" argument first
+    for child in &children {
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let name = node_text(name_node, content);
+            if name == "file"
+                && let Some(value_node) = child.child_by_field_name("value")
+            {
+                return try_parse_system_file_call(value_node, content);
+            }
+        }
+    }
+
+    // Use first positional argument
+    for child in &children {
+        if child.kind() == "argument"
+            && child.child_by_field_name("name").is_none()
+            && let Some(value_node) = child.child_by_field_name("value")
+        {
+            return try_parse_system_file_call(value_node, content);
+        }
+    }
+
+    None
+}
+
+/// Parse a `system.file(part1, part2, ..., package = "P")` call node.
+/// Returns `Some(SystemFileCall)` when:
+/// - The callee is `system.file`
+/// - All positional arguments are string literals
+/// - There is at least one positional string-literal part
+/// - There is a named `package = "P"` argument with a string-literal value
+fn try_parse_system_file_call(node: Node, content: &str) -> Option<SystemFileCall> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let func_node = node.child_by_field_name("function")?;
+    let func_text = node_text(func_node, content);
+    if func_text != "system.file" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    if args_node.has_error() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut package: Option<String> = None;
+
+    let mut arg_cursor = args_node.walk();
+    for child in args_node.children(&mut arg_cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            let name = node_text(name_node, content);
+            if name == "package" {
+                let value_node = child.child_by_field_name("value")?;
+                package = extract_string_literal(value_node, content);
+                // Non-literal package arg → bail
+                package.as_ref()?;
+            }
+            // lib.loc: accept when the value is a standard-library reference
+            // (.Library, .Library.site, .libPaths()) — these resolve to the
+            // default search path our resolver already uses. Reject otherwise.
+            if name == "lib.loc" {
+                let value_node = child.child_by_field_name("value")?;
+                if !is_standard_lib_loc(value_node, content) {
+                    return None;
+                }
+            }
+            // fsep: the default is "/"; accept that (no-op), reject others.
+            if name == "fsep" {
+                let value_node = child.child_by_field_name("value")?;
+                let text = node_text(value_node, content);
+                if text != "\"/\"" && text != "'/'" {
+                    return None;
+                }
+            }
+            // Other named args (e.g. mustWork) don't affect path layout
+        } else {
+            // Positional argument — must be a string literal
+            let value_node = child.child_by_field_name("value")?;
+            let part = extract_string_literal(value_node, content)?;
+            parts.push(part);
+        }
+    }
+
+    // Must have at least one part and a package
+    let package = package?;
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(SystemFileCall { parts, package })
+}
+
 fn find_bool_argument(args_node: &Node, content: &str, param_name: &str) -> Option<bool> {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
@@ -258,6 +393,23 @@ fn extract_string_literal(node: Node, content: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Returns true when a `lib.loc` value node refers to a standard library path
+/// that our resolver already searches (`.Library`, `.Library.site`, or a call
+/// to `.libPaths()`), or is `NULL` (identical to omitting `lib.loc`).
+fn is_standard_lib_loc(node: Node, content: &str) -> bool {
+    let text = node_text(node, content);
+    if text == ".Library" || text == ".Library.site" || text == "NULL" {
+        return true;
+    }
+    // .libPaths() — a call node whose function leaf is `.libPaths`
+    if node.kind() == "call"
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        return node_text(func, content) == ".libPaths";
+    }
+    false
 }
 
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
@@ -313,6 +465,9 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
     if func_text != "rm" && func_text != "remove" {
         return None;
     }
+    if call_is_internal_routine_argument(node, content) {
+        return None;
+    }
 
     let args_node = node.child_by_field_name("arguments")?;
 
@@ -342,6 +497,63 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
         line: start.row as u32,
         column,
         symbols,
+    })
+}
+
+/// True for the routine call nested as `.Internal(<routine>(...))`.
+///
+/// The nested call head names a hidden C entry point, not an R binding. For
+/// rm/remove detection that means `.Internal(remove(list, envir, inherits))`
+/// is the implementation of `rm()`/`remove()`, not a user-level removal call.
+fn call_is_internal_routine_argument(call_node: Node, content: &str) -> bool {
+    if call_node.kind() != "call" {
+        return false;
+    }
+    let Some(arg) = call_node.parent().filter(|node| node.kind() == "argument") else {
+        return false;
+    };
+    if arg.child_by_field_name("name").is_some() {
+        return false;
+    }
+    if arg
+        .child_by_field_name("value")
+        .is_none_or(|value| value.id() != call_node.id())
+    {
+        return false;
+    }
+    let Some(args) = arg.parent().filter(|node| node.kind() == "arguments") else {
+        return false;
+    };
+    if first_positional_arg_value(args).is_none_or(|value| value.id() != call_node.id()) {
+        return false;
+    }
+    let Some(outer_call) = args.parent().filter(|node| node.kind() == "call") else {
+        return false;
+    };
+    outer_call
+        .child_by_field_name("function")
+        .and_then(|func| callee_leaf_name(func, content))
+        == Some(".Internal")
+}
+
+/// The leaf callee name of a call's `function` field.
+fn callee_leaf_name<'t>(func: Node<'t>, content: &'t str) -> Option<&'t str> {
+    match func.kind() {
+        "identifier" => Some(node_text(func, content)),
+        "namespace_operator" => func
+            .child_by_field_name("rhs")
+            .map(|rhs| node_text(rhs, content)),
+        _ => None,
+    }
+}
+
+/// The value node of a call's first positional argument, if any.
+fn first_positional_arg_value(args: Node) -> Option<Node> {
+    let mut cursor = args.walk();
+    args.children(&mut cursor).find_map(|child| {
+        (child.kind() == "argument" && child.child_by_field_name("name").is_none())
+            .then(|| child.child_by_field_name("value"))
+            .flatten()
     })
 }
 
@@ -1434,6 +1646,17 @@ source("b.R")"#;
         let rm_calls = detect_rm_calls(&tree, code);
         assert_eq!(rm_calls.len(), 1);
         assert_eq!(rm_calls[0].symbols, vec!["a", "b", "c"]);
+    }
+    #[test]
+    fn test_internal_remove_routine_call_ignored() {
+        // In base/R/rm.R, `.Internal(remove(list, envir, inherits))`
+        // names the C entry point used to implement rm()/remove(); it is
+        // not an R-level `remove()` call and must not remove `envir` from
+        // the surrounding function scope.
+        let code = ".Internal(remove(list, envir, inherits))";
+        let tree = parse_r(code);
+        let rm_calls = detect_rm_calls(&tree, code);
+        assert_eq!(rm_calls.len(), 0);
     }
 
     #[test]
@@ -2531,6 +2754,136 @@ library(ggplot2)"#;
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
+    }
+
+    // ==================== system.file() detection in source() ====================
+
+    #[test]
+    fn test_source_system_file_single_part() {
+        let code = r#"source(system.file("helper.R", package = "Matrix"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].path.is_empty());
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["helper.R"]);
+        assert_eq!(sf.package, "Matrix");
+    }
+
+    #[test]
+    fn test_source_system_file_multi_part() {
+        let code = r#"source(system.file("a", "b.R", package = "P"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["a", "b.R"]);
+        assert_eq!(sf.package, "P");
+    }
+
+    #[test]
+    fn test_source_system_file_non_literal_arg_skipped() {
+        // A variable positional arg → bail (unresolved = no ForwardSource)
+        let code = r#"source(system.file(x, package = "P"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_no_package_skipped() {
+        // No package= arg → not parseable
+        let code = r#"source(system.file("helper.R"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_variable_package_skipped() {
+        // Non-literal package= → bail
+        let code = r#"source(system.file("helper.R", package = pkg))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_rejected() {
+        // lib.loc alters search path — unresolvable statically
+        let code = r#"source(system.file("x.R", package = "p", lib.loc = foo))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_fsep_rejected() {
+        // Non-default fsep alters path construction — unresolvable statically
+        let code = r#"source(system.file("x.R", package = "p", fsep = "\\"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_source_system_file_must_work_accepted() {
+        // mustWork doesn't affect path layout — still resolvable
+        let code = r#"source(system.file("x.R", package = "p", mustWork = FALSE))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_dot_library_accepted() {
+        // .Library is the default library path — safe to resolve as-if-absent
+        let code = r#"source(system.file("test-tools-1.R", package = "Matrix", lib.loc = .Library), keep.source = FALSE)"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["test-tools-1.R"]);
+        assert_eq!(sf.package, "Matrix");
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_lib_paths_accepted() {
+        // .libPaths() returns the default search paths — safe to resolve
+        let code = r#"source(system.file("x.R", package = "p", lib.loc = .libPaths()))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
+    }
+
+    #[test]
+    fn test_source_system_file_lib_loc_null_accepted() {
+        // lib.loc = NULL is identical to omitting lib.loc — safe to resolve
+        let code = r#"source(system.file("x.R", package = "p", lib.loc = NULL))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
+    }
+
+    #[test]
+    fn test_source_system_file_fsep_default_accepted() {
+        // fsep = "/" is the default — no-op, safe to resolve
+        let code = r#"source(system.file("x.R", package = "p", fsep = "/"))"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        let sf = sources[0].system_file.as_ref().unwrap();
+        assert_eq!(sf.parts, vec!["x.R"]);
+        assert_eq!(sf.package, "p");
     }
 }
 

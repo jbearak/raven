@@ -23,7 +23,7 @@ pub(crate) fn collect(
     // Detect a missing trailing newline.
     if !text.ends_with('\n') {
         let last_line_idx = text.lines().count().saturating_sub(1) as u32;
-        if !suppressions.is_suppressed(last_line_idx) {
+        if !suppressions.is_suppressed_code(last_line_idx, rule_ids::TRAILING_BLANK_LINES) {
             let last = text.lines().next_back().unwrap_or("");
             let col: u32 = last.chars().map(|c| c.len_utf16() as u32).sum();
             out.push(Diagnostic {
@@ -58,7 +58,7 @@ pub(crate) fn collect(
     }
     let first_blank = lines.len() - trailing;
     let line_no = first_blank as u32;
-    if suppressions.is_suppressed(line_no) {
+    if suppressions.is_suppressed_code(line_no, rule_ids::TRAILING_BLANK_LINES) {
         return;
     }
     out.push(Diagnostic {

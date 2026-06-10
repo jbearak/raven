@@ -5,10 +5,60 @@
 //
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use tower_lsp::lsp_types::Url;
 
 use super::source_detect::LibraryCall;
+
+/// What a `# raven: ignore` / `@lsp-ignore` directive on a given line targets.
+///
+/// A blanket directive suppresses every analyzer diagnostic on its line; a
+/// code-scoped directive (`# raven: ignore[undefined-variable]`) suppresses
+/// only diagnostics whose code is covered by one of the listed codes, with
+/// cascading sub-kinds via [`crate::diagnostic_code::suppresses`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LineSuppression {
+    /// Blanket ignore — suppresses all analyzer diagnostics on the line.
+    All,
+    /// Suppress only diagnostics whose code is covered by one of these
+    /// (normalized, kebab-case) codes.
+    Codes(Vec<String>),
+}
+
+impl LineSuppression {
+    /// Does this suppression cover a diagnostic with the given code?
+    ///
+    /// `All` covers everything. `Codes` covers a diagnostic only when its code
+    /// is known (`Some`) and one of the listed codes
+    /// [`suppresses`](crate::diagnostic_code::suppresses) it.
+    pub fn covers(&self, diagnostic_code: Option<&str>) -> bool {
+        match self {
+            LineSuppression::All => true,
+            LineSuppression::Codes(codes) => match diagnostic_code {
+                Some(dc) => codes
+                    .iter()
+                    .any(|c| crate::diagnostic_code::suppresses(c, dc)),
+                None => false,
+            },
+        }
+    }
+
+    /// Merge another suppression into this one. `All` is absorbing; otherwise
+    /// the code lists are concatenated.
+    pub fn merge(&mut self, other: LineSuppression) {
+        match (&mut *self, other) {
+            (LineSuppression::All, _) => {}
+            (slot, LineSuppression::All) => *slot = LineSuppression::All,
+            (LineSuppression::Codes(existing), LineSuppression::Codes(more)) => {
+                for c in more {
+                    if !existing.contains(&c) {
+                        existing.push(c);
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// A declared symbol from an @lsp-var or @lsp-func directive.
 /// These directives allow users to declare symbols that cannot be statically
@@ -21,6 +71,66 @@ pub struct DeclaredSymbol {
     pub line: u32,
     /// true for @lsp-func, false for @lsp-var
     pub is_function: bool,
+}
+
+/// An inclusive line range suppressed by a `# raven: ignore-start` …
+/// `# raven: ignore-end` block (or a chunk-level suppression mapped onto the
+/// chunk's line range). 0-based, `end` inclusive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuppressionRange {
+    pub start: u32,
+    pub end: u32,
+    pub what: LineSuppression,
+}
+
+/// The flavor of a suppression directive (F2 Step 3).
+///
+/// `Ignore` is silent: it never warns, even when it suppressed nothing (like
+/// Rust's `#[allow]` / `@ts-ignore`). `Expect` asserts that a diagnostic *will*
+/// be suppressed: if it suppressed nothing, an `unused-suppression` hint is
+/// emitted at the directive's line (like Rust's `#[expect]` /
+/// `@ts-expect-error`). Both flavors suppress diagnostics identically; they
+/// differ only in the `unused-suppression` sweep.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SuppressionFlavor {
+    /// Silent suppression — never reported as unused unless the global
+    /// `reportUnusedSuppressions` sweep is enabled.
+    Ignore,
+    /// Asserting suppression — reported as unused whenever it suppressed
+    /// nothing, regardless of the global sweep.
+    Expect,
+}
+
+/// One parsed suppression directive, retained for the `unused-suppression`
+/// sweep (F2 Step 3).
+///
+/// Unlike the inline `ignored_*` maps — which are keyed by *target* line for
+/// fast per-diagnostic lookup — this records the directive's own line (the
+/// anchor where an `unused-suppression` hint is reported), the inclusive target
+/// line range it governs, what it suppresses, and its flavor. A directive is
+/// "used" iff at least one diagnostic on a covered line carries a code its
+/// `what` covers; an unused `Expect` (or, under the global sweep, an unused
+/// `Ignore`) produces an `unused-suppression` diagnostic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuppressionDirective {
+    /// 0-based line of the directive comment itself (hint anchor).
+    pub directive_line: u32,
+    /// First 0-based line the directive suppresses (inclusive).
+    pub target_start: u32,
+    /// Last 0-based line the directive suppresses (inclusive). `u32::MAX` for a
+    /// file-level directive, which covers every line.
+    pub target_end: u32,
+    /// What the directive suppresses (blanket or code-scoped).
+    pub what: LineSuppression,
+    /// `Ignore` (silent) or `Expect` (asserts a suppression occurs).
+    pub flavor: SuppressionFlavor,
+}
+
+impl SuppressionDirective {
+    /// Does this directive govern `line`?
+    pub fn covers_line(&self, line: u32) -> bool {
+        line >= self.target_start && line <= self.target_end
+    }
 }
 
 /// Complete cross-file metadata for a document
@@ -37,10 +147,27 @@ pub struct CrossFileMetadata {
     /// pointing to a parent file, and the parent has an effective working directory.
     /// Priority for path resolution: explicit working_directory > inherited > file's directory.
     pub inherited_working_directory: Option<String>,
-    /// Lines with @lsp-ignore (0-based)
-    pub ignored_lines: HashSet<u32>,
-    /// Lines following @lsp-ignore-next (0-based)
-    pub ignored_next_lines: HashSet<u32>,
+    /// Lines with a line-scoped ignore (`@lsp-ignore` / `# raven: ignore`),
+    /// 0-based, mapped to what each suppresses.
+    pub ignored_lines: HashMap<u32, LineSuppression>,
+    /// Lines targeted by a next-line ignore (`@lsp-ignore-next` /
+    /// `# raven: ignore-next`), 0-based, mapped to what each suppresses.
+    pub ignored_next_lines: HashMap<u32, LineSuppression>,
+    /// File-level ignore (`# raven: ignore-file`), if present. Suppresses the
+    /// matching analyzer diagnostics on every line in the file. Header-only.
+    #[serde(default)]
+    pub ignored_file: Option<LineSuppression>,
+    /// Block/range ignores (`# raven: ignore-start` … `# raven: ignore-end`).
+    /// Each entry is `(start_line, end_line_inclusive, what)`, 0-based.
+    #[serde(default)]
+    pub ignored_ranges: Vec<SuppressionRange>,
+    /// All parsed suppression directives (both `ignore` and `expect` flavors),
+    /// retained for the `unused-suppression` sweep (F2 Step 3). Separate from
+    /// the inline `ignored_*` maps, which are keyed by *target* line for fast
+    /// per-diagnostic lookup; this list keeps each directive's own line and
+    /// flavor so an unused directive can be reported at its source.
+    #[serde(default)]
+    pub suppression_directives: Vec<SuppressionDirective>,
     /// Detected library(), require(), loadNamespace() calls
     pub library_calls: Vec<LibraryCall>,
     /// Variables declared via @lsp-var directives
@@ -114,6 +241,19 @@ pub struct ForwardSource {
     /// which are header-only and run at load time.
     #[serde(default)]
     pub is_function_scoped: bool,
+    /// If the `source()` file argument is a `system.file(...)` call with
+    /// statically determinable string-literal parts and package, store the
+    /// extracted call here. Resolution is deferred to the path-resolve layer
+    /// because it needs workspace and library-path information unavailable at
+    /// parse time. When `Some`, `path` is empty.
+    #[serde(default)]
+    pub system_file: Option<super::source_detect::SystemFileCall>,
+    /// Pre-resolved absolute file URI for cross-package `system.file()` targets.
+    /// When set, dependency and scope resolution use this directly instead of
+    /// calling `resolve_path` (which can't handle true absolute paths outside
+    /// the workspace). Set by `resolve_system_file_sources` for branch-2 hits.
+    #[serde(default)]
+    pub resolved_uri: Option<tower_lsp::lsp_types::Url>,
 }
 
 fn default_sys_source_global_env() -> bool {
@@ -241,11 +381,12 @@ mod tests {
             }],
             working_directory: Some("/data".to_string()),
             inherited_working_directory: None,
-            ignored_lines: HashSet::from([10, 20]),
-            ignored_next_lines: HashSet::from([15]),
+            ignored_lines: HashMap::from([(10, LineSuppression::All), (20, LineSuppression::All)]),
+            ignored_next_lines: HashMap::from([(15, LineSuppression::All)]),
             library_calls: vec![],
             declared_variables: vec![],
             declared_functions: vec![],
+            ..Default::default()
         };
 
         // Round-trip serialization
@@ -255,8 +396,8 @@ mod tests {
         assert_eq!(parsed.sourced_by.len(), 1);
         assert_eq!(parsed.sources.len(), 1);
         assert_eq!(parsed.working_directory, Some("/data".to_string()));
-        assert!(parsed.ignored_lines.contains(&10));
-        assert!(parsed.ignored_next_lines.contains(&15));
+        assert!(parsed.ignored_lines.contains_key(&10));
+        assert!(parsed.ignored_next_lines.contains_key(&15));
     }
 
     #[test]
@@ -280,11 +421,12 @@ mod tests {
             sources: vec![],
             working_directory: None,
             inherited_working_directory: Some("/project/data".to_string()),
-            ignored_lines: HashSet::new(),
-            ignored_next_lines: HashSet::new(),
+            ignored_lines: HashMap::new(),
+            ignored_next_lines: HashMap::new(),
             library_calls: vec![],
             declared_variables: vec![],
             declared_functions: vec![],
+            ..Default::default()
         };
 
         // Round-trip serialization
@@ -322,11 +464,12 @@ mod tests {
             }],
             working_directory: Some("/child/explicit".to_string()),
             inherited_working_directory: Some("/parent/inherited".to_string()),
-            ignored_lines: HashSet::new(),
-            ignored_next_lines: HashSet::new(),
+            ignored_lines: HashMap::new(),
+            ignored_next_lines: HashMap::new(),
             library_calls: vec![],
             declared_variables: vec![],
             declared_functions: vec![],
+            ..Default::default()
         };
 
         // Round-trip serialization

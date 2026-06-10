@@ -28,7 +28,7 @@ run_analysis <- function(data) {
 }
 ```
 
-Files outside `R/` (e.g., `tests/`, `inst/`, `vignettes/`) are not included in mutual visibility.
+Files outside `R/` (e.g., `tests/`, `inst/`, `vignettes/`) are not included in mutual visibility — but they get one-way read access to `R/` symbols (see below).
 
 ### Tests directory awareness
 
@@ -36,6 +36,13 @@ Files under `tests/testthat/` get one-way read access to package-internal
 symbols (`R/*.R`) and to symbols imported via NAMESPACE/roxygen. Tests can
 call internal package functions without "undefined variable" diagnostics.
 Symbols defined in test files are not visible from `R/*.R`.
+
+The same one-way access extends to plain top-level `tests/*.R` scripts (the
+old-style files `R CMD check` runs directly, e.g. `tests/Simple.R`): because
+the package is loaded when its tests run, those scripts see all `R/` top-level
+symbols and NAMESPACE imports. Unlike `tests/testthat/helper-*.R`, plain test
+scripts do **not** see each other's definitions — `R CMD check` runs each in a
+separate process — and their own definitions never leak into `R/`.
 
 ```r
 # R/helpers.R
@@ -103,6 +110,42 @@ test_that("works on demo_input", {
 
 Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
 for visibility purposes; declare any cross-file fixtures in `helper*.R`.
+
+### Dev-context directories (`demo/`, `data-raw/`, `vignettes/`, `man/`)
+
+Files under these directories get the same one-way read access to package
+symbols as test files: they see all `R/*.R` top-level symbols and NAMESPACE
+imports, so calling your own package functions from a vignette, demo script,
+data-preparation script, or man-page Rmd helper produces no "undefined
+variable" diagnostic.
+
+Their own definitions never leak back into `R/`, and they don't see each
+other — a function defined in `data-raw/prepare.R` is not visible from
+`vignettes/intro.Rmd`, and vice versa.
+
+```r
+# R/analysis.R
+run_model <- function(data) { ... }
+
+# vignettes/tutorial.Rmd (or vignettes/tutorial.R)
+result <- run_model(example_data)  # No diagnostic — visible from R/
+
+# demo/walkthrough.R
+output <- run_model(sample_input)  # No diagnostic
+```
+
+Symbols that are NOT exported or defined in `R/` still flag as undefined
+in these directories — the one-way visibility is limited to what the package
+actually provides.
+
+**`inst/` and `revdep/` are not dev-context.** Plain `inst/` scripts (shiny
+apps, rmarkdown template skeletons, example scripts) and reverse-dependency
+checks are not run with the package implicitly loaded, so they rely on an
+explicit `library(yourpkg)` or a [directive](directives.md) just like any other
+script — a bare reference to a package function there *is* flagged. The one
+exception is installed test suites: R files under `inst/tinytest/` and
+`inst/unitTests/` are treated as **test files** (one-way package R/ visibility),
+since those suites run with the package loaded.
 
 ### Build commands
 
@@ -256,6 +299,9 @@ suppresses indices on **unresolved** objects (such as a function parameter
 does not flag the column names `value` / `grp`. Objects you construct locally
 with `data.frame()` / `tibble()` / `read.csv()` are still treated as
 non-data.table, so `df[undefined_var, ]` is flagged. `[[` is always checked.
+A statement-level by-reference converter updates that classification from the
+call onward: `setDT(x)` makes `x` a data.table, `setDF(x)` makes it a plain
+data.frame, and `setattr(x, "class", ...)` sets the class explicitly.
 See [Diagnostics](diagnostics.md#call-arguments-and-bracket-indices) for the
 full rules and the `undefinedVariableInBracketIndices` opt-out.
 

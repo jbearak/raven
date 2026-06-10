@@ -526,6 +526,20 @@ impl WorldState {
         );
         self.package_state.set_from(new_package_state);
     }
+
+    /// Snapshot the owned inputs `resolve_system_file_sources` needs (workspace
+    /// name + root, and the library search paths) so a caller can drop the state
+    /// lock before resolving system.file() source edges (AGENTS.md locking
+    /// discipline: never hold the WorldState lock across cross-file resolution).
+    pub(crate) fn snapshot_system_file_inputs(
+        &self,
+    ) -> (Option<String>, Option<PathBuf>, Vec<PathBuf>) {
+        let ws = self.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str().to_owned());
+        let ws_root = ws.map(|w| w.root.clone());
+        let lib_paths = self.package_library.lib_paths().to_vec();
+        (ws_name, ws_root, lib_paths)
+    }
 }
 
 impl Default for WorldState {
@@ -978,6 +992,13 @@ impl WorldState {
     fn build_dependency_graph_from_workspace(&mut self) {
         let workspace_root = self.workspace_folders.first().cloned();
 
+        // Resolve system.file() entries before building the graph so that
+        // dependency edges reflect the concrete paths.
+        let ws = self.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str()).map(|s| s.to_owned());
+        let ws_root = ws.map(|w| w.root.clone());
+        let lib_paths = self.package_library.lib_paths().to_vec();
+
         // Collect URIs and metadata to avoid borrow conflicts with self.
         // `entry.metadata` is `Arc<CrossFileMetadata>`, so the clone is a
         // refcount bump rather than a deep clone of Vec/HashSet/String fields.
@@ -994,7 +1015,17 @@ impl WorldState {
             ..
         } = self;
 
-        for (uri, meta) in &entries {
+        for (uri, meta) in &mut entries {
+            // Resolve system.file() sources if any are present
+            if meta.sources.iter().any(|s| s.system_file.is_some()) {
+                let m = Arc::make_mut(meta);
+                crate::cross_file::resolve_system_file_sources(
+                    m,
+                    ws_name.as_deref(),
+                    ws_root.as_deref(),
+                    &lib_paths,
+                );
+            }
             let get_content = |parent_uri: &Url| -> Option<String> {
                 workspace_index_new
                     .get(parent_uri)
@@ -1012,6 +1043,133 @@ impl WorldState {
             "Built dependency graph from {} workspace files",
             entries.len()
         );
+    }
+
+    /// Resolve `system.file()` sources in workspace index metadata and rebuild
+    /// affected dependency graph edges. Must be called after `apply_package_event`
+    /// so that `package_state.workspace()` is populated.
+    pub fn resolve_system_file_in_workspace(&mut self) {
+        let ws = self.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str()).map(|s| s.to_owned());
+        let ws_root = ws.map(|w| w.root.clone());
+        let lib_paths = self.package_library.lib_paths().to_vec();
+
+        // Collect URIs that have unresolved system.file entries.
+        // `workspace_index_new.iter()` returns an owned Vec snapshot, so
+        // filter it in place rather than re-iterating.
+        let mut affected: Vec<(Url, crate::workspace_index::IndexEntry)> =
+            self.workspace_index_new.iter();
+        affected.retain(|(_, entry)| {
+            entry
+                .metadata
+                .sources
+                .iter()
+                .any(|s| s.system_file.is_some())
+        });
+
+        if affected.is_empty() {
+            return;
+        }
+
+        // Resolve in stored metadata and re-insert
+        let affected_uris: Vec<Url> = affected.iter().map(|(u, _)| u.clone()).collect();
+        for (uri, mut entry) in affected {
+            let meta = Arc::make_mut(&mut entry.metadata);
+            crate::cross_file::resolve_system_file_sources(
+                meta,
+                ws_name.as_deref(),
+                ws_root.as_deref(),
+                &lib_paths,
+            );
+            self.workspace_index_new.insert(uri, entry);
+        }
+
+        // Rebuild graph edges for affected files
+        let workspace_root = self.workspace_folders.first().cloned();
+        for uri in &affected_uris {
+            if let Some(entry) = self.workspace_index_new.get(uri) {
+                let meta = entry.metadata.clone();
+                let get_content = |parent_uri: &Url| -> Option<String> {
+                    self.workspace_index_new
+                        .get(parent_uri)
+                        .map(|e| e.contents.to_string())
+                };
+                self.cross_file_graph.update_file(
+                    uri,
+                    meta.as_ref(),
+                    workspace_root.as_ref(),
+                    get_content,
+                );
+            }
+        }
+
+        // Index outside-workspace files resolved via cross-package system.file
+        // so their artifacts are available to scope resolution.
+        self.index_cross_package_resolved_files();
+    }
+
+    /// Read, parse, and index outside-workspace files that were resolved via
+    /// cross-package `system.file()`. Called after `resolve_system_file_sources`
+    /// populates `resolved_uri` fields and graph edges are rebuilt.
+    fn index_cross_package_resolved_files(&mut self) {
+        // Collect resolved_uris from all workspace entries
+        let mut external_uris: Vec<Url> = Vec::new();
+        for (_, entry) in self.workspace_index_new.iter() {
+            for source in &entry.metadata.sources {
+                if let Some(ref uri) = source.resolved_uri
+                    && !self.workspace_index_new.contains(uri)
+                {
+                    external_uris.push(uri.clone());
+                }
+            }
+        }
+        external_uris.sort();
+        external_uris.dedup();
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
+
+        for uri in external_uris {
+            if self.workspace_index_new.contains(&uri) {
+                continue;
+            }
+            let Some(path) = uri.to_file_path().ok() else {
+                continue;
+            };
+            let Ok(content) = read_source(&path) else {
+                continue;
+            };
+            let Ok(fs_meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+
+            let tree = parser.parse(&content, None);
+            let metadata = Arc::new(crate::cross_file::extract_metadata(&content));
+            let artifacts = tree.as_ref().map_or_else(
+                || Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+                |t| {
+                    Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                        &uri,
+                        t,
+                        &content,
+                        Some(&metadata),
+                    ))
+                },
+            );
+            let snapshot =
+                crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_meta, &content);
+
+            let entry = crate::workspace_index::IndexEntry {
+                contents: Rope::from_str(&content),
+                tree,
+                loaded_packages: Vec::new(),
+                snapshot,
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            self.workspace_index_new.insert(uri, entry);
+        }
     }
 }
 
@@ -1479,6 +1637,7 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 /// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
     ".git",         // Git internal files
+    ".github",      // GitHub Actions workflows (not package code)
     ".svn",         // Subversion internal files
     ".hg",          // Mercurial internal files
     "node_modules", // JavaScript dependencies (can have 100k+ files)
@@ -2196,6 +2355,96 @@ mod tests {
         assert!(
             tree_has_identifier(doc_tree, &analysis, "chunk_symbol"),
             "masked tree must contain the chunk-defined identifier"
+        );
+    }
+
+    /// `resolve_system_file_in_workspace` is what every library-swap site
+    /// (startup post-ready retry, `raven.refreshPackages`,
+    /// `reconcile_after_config_recompute`) calls to re-resolve deferred
+    /// `system.file()` sources once `lib_paths` become available. Exercise the
+    /// full wiring at the `WorldState` level: a workspace-index entry whose
+    /// source was deferred (indexed while `lib_paths` was empty) must resolve
+    /// in place after the library swap, not just in a detached metadata value.
+    #[test]
+    fn resolve_system_file_in_workspace_re_resolves_after_library_swap() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::source_detect::SystemFileCall;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use crate::workspace_index::IndexEntry;
+        use std::sync::Arc;
+
+        // "otherpkg" installed at libdir/otherpkg/helper.R (installed layout).
+        let libdir = tempfile::tempdir().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        let metadata = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                system_file: Some(SystemFileCall {
+                    parts: vec!["helper.R".to_string()],
+                    package: "otherpkg".to_string(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let entry = IndexEntry {
+            contents: ropey::Rope::from_str(
+                "source(system.file(\"helper.R\", package = \"otherpkg\"))\n",
+            ),
+            tree: None,
+            loaded_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: Some(1),
+            },
+            metadata: Arc::new(metadata),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 1,
+        };
+
+        let mut state = WorldState::new();
+        state.workspace_index_new.insert(uri.clone(), entry);
+
+        // Before the swap: lib_paths is empty, so the source stays deferred.
+        state.resolve_system_file_in_workspace();
+        let deferred = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed");
+        assert!(
+            deferred.metadata.sources[0].system_file.is_some(),
+            "source must stay deferred while lib_paths is empty"
+        );
+
+        // The library swap: replace the Arc with a library whose lib_paths
+        // contain the installed package — the same shape as the production
+        // swap sites.
+        let mut swapped = crate::package_library::PackageLibrary::new_empty();
+        swapped.set_lib_paths(vec![libdir.path().to_path_buf()]);
+        state.package_library = Arc::new(swapped);
+        state.resolve_system_file_in_workspace();
+
+        let resolved = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed");
+        assert_eq!(resolved.metadata.sources.len(), 1);
+        assert!(
+            resolved.metadata.sources[0].system_file.is_none(),
+            "source must be resolved after the swap"
+        );
+        let resolved_uri = resolved.metadata.sources[0]
+            .resolved_uri
+            .as_ref()
+            .expect("resolved_uri must be set in the stored index entry");
+        let resolved_path = resolved_uri.to_file_path().unwrap();
+        assert!(
+            resolved_path.ends_with("otherpkg/helper.R"),
+            "must resolve into the new lib path, got {resolved_path:?}"
         );
     }
 }

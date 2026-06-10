@@ -138,7 +138,7 @@ fn check_name(
         return;
     }
     let line_no = name_node.start_position().row as u32;
-    if suppressions.is_suppressed(line_no) {
+    if suppressions.is_suppressed_code(line_no, rule_ids::OBJECT_LENGTH) {
         return;
     }
     let line_text = text.lines().nth(line_no as usize).unwrap_or("");

@@ -78,6 +78,11 @@ pub struct CrossFileConfig {
     pub circular_dependency_severity: Option<DiagnosticSeverity>,
     /// Severity for out-of-scope symbol diagnostics (None = disabled)
     pub out_of_scope_severity: Option<DiagnosticSeverity>,
+    /// Extend the `unused-suppression` sweep to *every* suppression directive
+    /// (`# raven: ignore` / `@lsp-ignore` / `# nolint`-equivalent), not just
+    /// `# raven: expect` (F2 Step 3). Pyright-style; default `false`. When
+    /// `false`, only `expect` directives that suppressed nothing are reported.
+    pub report_unused_suppressions: bool,
     /// Severity for max chain depth exceeded diagnostics (None = disabled)
     pub max_chain_depth_severity: Option<DiagnosticSeverity>,
     /// Whether on-demand indexing is enabled
@@ -185,6 +190,7 @@ impl Default for CrossFileConfig {
             missing_file_severity: Some(DiagnosticSeverity::WARNING),
             circular_dependency_severity: Some(DiagnosticSeverity::ERROR),
             out_of_scope_severity: Some(DiagnosticSeverity::WARNING),
+            report_unused_suppressions: false,
             max_chain_depth_severity: Some(DiagnosticSeverity::WARNING),
             on_demand_indexing_enabled: true,
             packages_enabled: true,

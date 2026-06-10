@@ -10,11 +10,15 @@ pub struct ContentDigest {
 
 impl ContentDigest {
     pub fn of(text: &str) -> Self {
-        let hash = blake3::hash(text.as_bytes());
+        Self::of_bytes(text.as_bytes())
+    }
+
+    pub fn of_bytes(data: &[u8]) -> Self {
+        let hash = blake3::hash(data);
         let bytes = hash.as_bytes();
         let blake3_prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         Self {
-            byte_len: u32::try_from(text.len()).unwrap_or(u32::MAX),
+            byte_len: u32::try_from(data.len()).unwrap_or(u32::MAX),
             blake3_prefix,
         }
     }

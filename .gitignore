@@ -15,3 +15,7 @@ bin/raven.exe
 
 scratch.R
 
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+

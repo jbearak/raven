@@ -19,7 +19,7 @@ pub(crate) fn collect(
 ) {
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx as u32;
-        if suppressions.is_suppressed(line_no) {
+        if suppressions.is_suppressed_code(line_no, rule_ids::NO_TAB) {
             continue;
         }
         let bytes = line.as_bytes();
