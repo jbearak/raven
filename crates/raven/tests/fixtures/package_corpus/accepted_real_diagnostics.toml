@@ -744,28 +744,6 @@ start_character = 64
 end_line = 991
 end_character = 67
 [[diagnostic]]
-package = "dbplyr"
-path = "R/verb-pivot-wider.R"
-message = "Undefined variable: error_call"
-evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
-
-[diagnostic.range]
-start_line = 364
-start_character = 17
-end_line = 364
-end_character = 27
-[[diagnostic]]
-package = "dbplyr"
-path = "R/verb-pivot-wider.R"
-message = "Undefined variable: error_call"
-evidence = "Function build_wider_id_cols_expr has parameter `call = caller_env()` but passes `error_call = error_call` to tidyselect::eval_select(). Copied from tidyr where parameter WAS named error_call. Will crash if tidyselect throws."
-
-[diagnostic.range]
-start_line = 371
-start_character = 17
-end_line = 371
-end_character = 27
-[[diagnostic]]
 package = "survival"
 path = "R/points.survfit.R"
 message = "Undefined variable: cumprob"
