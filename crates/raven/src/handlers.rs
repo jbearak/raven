@@ -11469,6 +11469,36 @@ mod semantic_warning_pipeline_tests {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn data_file_uri_exempts_top_level_string_assign_through_pipeline() {
+        // The data/*.R exemption is keyed off the document URI at the
+        // `diagnostics_from_snapshot` call site (`is_package_data_file`), not
+        // inside `collect_invalid_assignment_targets` — so the collector unit
+        // tests cannot catch a regression in that wiring. Same content, two
+        // URIs: the canonical dataset registration form is exempt under
+        // data/, still flagged elsewhere.
+        let code = "\"iris\" <- structure(list(), class = \"data.frame\")\n";
+        let string_literal_count = |uri_str: &str| {
+            let (snapshot, uri) = build_rmd_snapshot(code, uri_str, |_| {});
+            let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+                .expect("diagnostics returned");
+            diags
+                .iter()
+                .filter(|d| d.message.contains("string literal"))
+                .count()
+        };
+        assert_eq!(
+            string_literal_count("file:///pkg/data/iris.R"),
+            0,
+            "top-level string assign in data/*.R must be exempt through the pipeline"
+        );
+        assert_eq!(
+            string_literal_count("file:///pkg/R/iris.R"),
+            1,
+            "same content outside data/ must still be flagged (control arm)"
+        );
+    }
 }
 
 /// Detect and report diagnostics for `else` keywords that R rejects but

@@ -24,6 +24,23 @@ fn run_check(workspace: &std::path::Path) -> String {
         .args(["--max-severity", "off", "--no-color"])
         .output()
         .expect("failed to execute raven check");
+    // `raven check` exit codes: 0 = no diagnostic exceeded `--max-severity`,
+    // 1 = a diagnostic exceeded it (these tests run with `--max-severity off`,
+    // so *any* emitted diagnostic yields exit 1 — that is the normal, healthy
+    // outcome for the positive-assertion tests here), 2 = operator error
+    // (bad path / unreadable workspace). A code outside {0, 1} — or no exit
+    // code at all (killed by a signal / crash) — means the binary did not run
+    // the analysis to completion. Without this guard, negative
+    // `!output.contains(...)` checks would pass vacuously on a crashed binary.
+    let code = output.status.code();
+    assert!(
+        matches!(code, Some(0) | Some(1)),
+        "raven check did not complete cleanly (exit {code:?}); \
+         expected 0 (clean) or 1 (diagnostic exceeded threshold).\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
@@ -270,5 +287,204 @@ fn marker_inside_closed_single_line_string_does_not_suppress() {
     assert!(
         out.contains("Undefined variable: totally_undefined_thing"),
         "a marker inside a closed single-line string must NOT suppress. Output:\n{out}"
+    );
+}
+
+// ---- P2: CLI e2e for string-literal function-RHS exemption (commit bcbebaa6) ----
+//
+// R idiom: a quoted-string LHS with a function RHS defines an S3 method or
+// replacement function. These are NOT genuine "assign to string literal" mistakes
+// and must be exempt from the diagnostic.
+
+#[test]
+fn string_lhs_function_rhs_not_flagged_e2e() {
+    // Canonical S3 method for a syntactically invalid generic.
+    let out = check_one("\"[.Surv\" <- function(x, i) x\n");
+    assert!(
+        !out.contains("string literal"),
+        "\"[.Surv\" <- function(...) is idiomatic R; must not flag. Output:\n{out}"
+    );
+}
+
+#[test]
+fn string_lhs_primitive_rhs_not_flagged_e2e() {
+    // R-core methods package pattern: `.Primitive(...)` always returns a function.
+    let out = check_one("\"el<-\" <- .Primitive(\"[[<-\")\n");
+    assert!(
+        !out.contains("string literal"),
+        "\"el<-\" <- .Primitive(...) must not flag. Output:\n{out}"
+    );
+}
+
+#[test]
+fn string_lhs_chained_function_rhs_not_flagged_e2e() {
+    // nlme pattern: two targets chained, final value is a function.
+    let out = check_one(
+        "\"coef<-\" <- \"coefficients<-\" <- function(object, ..., value) UseMethod(\"coef<-\")\n",
+    );
+    assert!(
+        !out.contains("string literal"),
+        "chained string LHS with function RHS must not flag. Output:\n{out}"
+    );
+}
+
+/// Control: plain string LHS with a literal-value RHS MUST still be flagged.
+#[test]
+fn string_lhs_literal_rhs_still_flagged_e2e() {
+    let out = check_one("\"x\" <- 1\n");
+    assert!(
+        out.contains("string literal"),
+        "\"x\" <- 1 must still be flagged. Output:\n{out}"
+    );
+}
+
+/// Control: string LHS with an arbitrary call RHS (not `.Primitive`) must still
+/// be flagged — arbitrary calls may or may not return functions.
+#[test]
+fn string_lhs_arbitrary_call_rhs_still_flagged_e2e() {
+    let out = check_one("\"x\" <- some_call()\n");
+    assert!(
+        out.contains("string literal"),
+        "\"x\" <- some_call() must still flag (not a known-function call). Output:\n{out}"
+    );
+}
+
+// ---- P3: Rmd e2e for raven.ignore="" empty-list semantics (commit a2b88a2d) ----
+//
+// An empty quoted code list (`raven.ignore=""`) is NOT a blanket suppress; it
+// means "empty set of codes", so it suppresses nothing.
+
+#[test]
+fn chunk_option_empty_quoted_list_does_not_suppress_e2e() {
+    // raven.ignore="" → empty code list → diagnostics still fire.
+    let out = check_one_rmd(
+        "---\ntitle: T\n---\n\n```{r, raven.ignore=\"\"}\nresult <- totally_undefined_thing\n```\n",
+    );
+    assert!(
+        out.contains("Undefined variable: totally_undefined_thing"),
+        "raven.ignore=\"\" must NOT suppress undefined-variable (empty code list). Output:\n{out}"
+    );
+}
+
+/// Control: same chunk with `raven.ignore="undefined-variable"` DOES suppress.
+#[test]
+fn chunk_option_named_code_suppresses_e2e() {
+    let out = check_one_rmd(
+        "---\ntitle: T\n---\n\n```{r, raven.ignore=\"undefined-variable\"}\nresult <- totally_undefined_thing\n```\n",
+    );
+    assert!(
+        !out.contains("Undefined variable: totally_undefined_thing"),
+        "raven.ignore=\"undefined-variable\" should suppress. Output:\n{out}"
+    );
+}
+
+// ---- P4: CLI regression for sysdata basename exact-match (commit a2b88a2d) ----
+//
+// A `save(z, file = "notsysdata.rda")` whose file-path's final component merely
+// CONTAINS the token "sysdata" (but is not exactly "sysdata.rda" or
+// "sysdata.RData") must NOT whitelist the saved symbol `z` as a sysdata name.
+// A workspace reference to `z` (undefined elsewhere) must therefore still
+// produce an undefined-variable diagnostic.
+//
+// Control: the same workspace but with `save(z, file = "R/sysdata.rda")` must
+// whitelist `z`, suppressing the diagnostic.
+
+fn make_package_workspace(dir: &std::path::Path) {
+    // Minimal DESCRIPTION so raven treats this as a package workspace.
+    std::fs::write(
+        dir.join("DESCRIPTION"),
+        "Package: testpkg\nTitle: Test\nVersion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("R")).unwrap();
+    std::fs::create_dir_all(dir.join("data-raw")).unwrap();
+}
+
+#[test]
+fn save_non_sysdata_basename_does_not_whitelist_symbol() {
+    // `notsysdata.rda` is NOT `sysdata.rda` — must not whitelist `z2_internal`.
+    let dir = tempfile::TempDir::new().unwrap();
+    make_package_workspace(dir.path());
+
+    // data-raw script saves to a non-sysdata file.
+    std::fs::write(
+        dir.path().join("data-raw").join("prep.R"),
+        "z2_internal <- 1\nsave(z2_internal, file = \"notsysdata.rda\")\n",
+    )
+    .unwrap();
+
+    // R/use.R references z2_internal — undefined because not in sysdata set.
+    std::fs::write(
+        dir.path().join("R").join("use.R"),
+        "result <- z2_internal\n",
+    )
+    .unwrap();
+
+    let out = run_check(dir.path());
+    assert!(
+        out.contains("Undefined variable: z2_internal"),
+        "notsysdata.rda must NOT whitelist z2_internal. Output:\n{out}"
+    );
+}
+
+/// Control: the same workspace but with the canonical `R/sysdata.rda` path
+/// DOES whitelist `z2_internal` — no undefined-variable diagnostic.
+#[test]
+fn save_sysdata_rda_basename_whitelists_symbol() {
+    let dir = tempfile::TempDir::new().unwrap();
+    make_package_workspace(dir.path());
+
+    // data-raw script saves to the canonical sysdata file.
+    std::fs::write(
+        dir.path().join("data-raw").join("prep.R"),
+        "z2_internal <- 1\nsave(z2_internal, file = \"R/sysdata.rda\")\n",
+    )
+    .unwrap();
+
+    // R/use.R references z2_internal — should be whitelisted via sysdata.
+    std::fs::write(
+        dir.path().join("R").join("use.R"),
+        "result <- z2_internal\n",
+    )
+    .unwrap();
+
+    let out = run_check(dir.path());
+    assert!(
+        !out.contains("Undefined variable: z2_internal"),
+        "R/sysdata.rda MUST whitelist z2_internal. Output:\n{out}"
+    );
+}
+
+// ---- P5: Rmd e2e for directive string-awareness (commit a2b88a2d) ----
+//
+// A `# @lsp-ignore` (or `# raven: ignore`) that appears inside a multi-line
+// string literal opened on the same line as a genuine diagnostic must NOT
+// suppress that diagnostic. The parser must be string-aware.
+//
+// Mirrors the existing `.R` tests (`lsp_ignore_inside_line_opening_multiline_string_does_not_suppress`)
+// on the Rmd/chunk surface.
+
+#[test]
+fn rmd_chunk_lsp_ignore_inside_multiline_string_does_not_suppress() {
+    // The `"` opens a string that continues to the next line; `# @lsp-ignore`
+    // is string content, not a trailing comment.
+    let out = check_one_rmd(
+        "---\ntitle: T\n---\n\n```{r}\nresult <- totally_undefined + \"abc # @lsp-ignore\nstill string\"\n```\n",
+    );
+    assert!(
+        out.contains("Undefined variable: totally_undefined"),
+        "# @lsp-ignore inside a chunk multi-line string must NOT suppress. Output:\n{out}"
+    );
+}
+
+/// Control: a genuine trailing `# @lsp-ignore` comment in a chunk DOES suppress.
+#[test]
+fn rmd_chunk_genuine_trailing_lsp_ignore_suppresses() {
+    let out = check_one_rmd(
+        "---\ntitle: T\n---\n\n```{r}\nresult <- totally_undefined # @lsp-ignore\n```\n",
+    );
+    assert!(
+        !out.contains("Undefined variable: totally_undefined"),
+        "genuine trailing # @lsp-ignore in a chunk must suppress. Output:\n{out}"
     );
 }

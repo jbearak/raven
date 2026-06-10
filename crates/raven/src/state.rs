@@ -2357,4 +2357,94 @@ mod tests {
             "masked tree must contain the chunk-defined identifier"
         );
     }
+
+    /// `resolve_system_file_in_workspace` is what every library-swap site
+    /// (startup post-ready retry, `raven.refreshPackages`,
+    /// `reconcile_after_config_recompute`) calls to re-resolve deferred
+    /// `system.file()` sources once `lib_paths` become available. Exercise the
+    /// full wiring at the `WorldState` level: a workspace-index entry whose
+    /// source was deferred (indexed while `lib_paths` was empty) must resolve
+    /// in place after the library swap, not just in a detached metadata value.
+    #[test]
+    fn resolve_system_file_in_workspace_re_resolves_after_library_swap() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::source_detect::SystemFileCall;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use crate::workspace_index::IndexEntry;
+        use std::sync::Arc;
+
+        // "otherpkg" installed at libdir/otherpkg/helper.R (installed layout).
+        let libdir = tempfile::tempdir().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        let metadata = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                system_file: Some(SystemFileCall {
+                    parts: vec!["helper.R".to_string()],
+                    package: "otherpkg".to_string(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let entry = IndexEntry {
+            contents: ropey::Rope::from_str(
+                "source(system.file(\"helper.R\", package = \"otherpkg\"))\n",
+            ),
+            tree: None,
+            loaded_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: Some(1),
+            },
+            metadata: Arc::new(metadata),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 1,
+        };
+
+        let mut state = WorldState::new();
+        state.workspace_index_new.insert(uri.clone(), entry);
+
+        // Before the swap: lib_paths is empty, so the source stays deferred.
+        state.resolve_system_file_in_workspace();
+        let deferred = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed");
+        assert!(
+            deferred.metadata.sources[0].system_file.is_some(),
+            "source must stay deferred while lib_paths is empty"
+        );
+
+        // The library swap: replace the Arc with a library whose lib_paths
+        // contain the installed package — the same shape as the production
+        // swap sites.
+        let mut swapped = crate::package_library::PackageLibrary::new_empty();
+        swapped.set_lib_paths(vec![libdir.path().to_path_buf()]);
+        state.package_library = Arc::new(swapped);
+        state.resolve_system_file_in_workspace();
+
+        let resolved = state
+            .workspace_index_new
+            .get(&uri)
+            .expect("entry still indexed");
+        assert_eq!(resolved.metadata.sources.len(), 1);
+        assert!(
+            resolved.metadata.sources[0].system_file.is_none(),
+            "source must be resolved after the swap"
+        );
+        let resolved_uri = resolved.metadata.sources[0]
+            .resolved_uri
+            .as_ref()
+            .expect("resolved_uri must be set in the stored index entry");
+        let resolved_path = resolved_uri.to_file_path().unwrap();
+        assert!(
+            resolved_path.ends_with("otherpkg/helper.R"),
+            "must resolve into the new lib path, got {resolved_path:?}"
+        );
+    }
 }

@@ -364,3 +364,78 @@ fn transitive_ancestor_chain_library_propagates_nse() {
          the ancestor chain to leaf.R's filter(). Output:\n{output}"
     );
 }
+
+// ---- P8: Rmd diamond sibling-library contamination test ----
+//
+// Mirrors `diamond_sibling_library_does_not_suppress_undefined_in_other_branch`
+// on the Rmd surface: the entry point is an Rmd chunk rather than a plain .R
+// file.
+//
+// Topology:
+//   main.Rmd (chunk sources helper.R)
+//   other.R  (library(dplyr) + sources helper.R) — the "sibling/uncle"
+//   helper.R (shared child, no library calls)
+//
+// The Rmd chunk uses `df |> filter(undefined_col > 1)`. Because dplyr is only
+// loaded in other.R (reachable only via the shared child, not from the Rmd's
+// own ancestor chain), it must NOT suppress the undefined-variable for
+// `undefined_col` in the Rmd chunk.
+
+/// Rmd variant: sibling's library(dplyr) (via the shared helper.R) must NOT
+/// suppress the genuine undefined-variable diagnostic in the Rmd chunk.
+#[test]
+fn rmd_diamond_sibling_library_does_not_suppress_undefined_in_chunk() {
+    let dir = TempDir::new().unwrap();
+
+    // main.Rmd: entry point. Chunk sources helper.R and uses dplyr-style NSE.
+    std::fs::write(
+        dir.path().join("main.Rmd"),
+        "---\ntitle: T\n---\n\n```{r}\nsource(\"helper.R\")\ndf <- data.frame(x = 1:10)\nresult <- df |> filter(undefined_col > 1)\n```\n",
+    )
+    .unwrap();
+
+    // helper.R: shared child, no library() call.
+    std::fs::write(
+        dir.path().join("helper.R"),
+        "shared_helper <- function() 1\n",
+    )
+    .unwrap();
+
+    // other.R: sibling/uncle — sources the same helper and loads dplyr.
+    std::fs::write(
+        dir.path().join("other.R"),
+        "library(dplyr)\nsource(\"helper.R\")\n",
+    )
+    .unwrap();
+
+    let output = run_check(dir.path());
+    assert!(
+        output.contains("Undefined variable: undefined_col"),
+        "The sibling other.R's library(dplyr) (reached via the shared helper.R) \
+         must NOT suppress the genuine undefined-variable diagnostic for \
+         undefined_col in the Rmd chunk. Output:\n{output}"
+    );
+}
+
+/// Positive control for the Rmd diamond fix: when the Rmd chunk's own ancestry
+/// includes library(dplyr) (loader.Rmd sources the Rmd, or the Rmd itself
+/// calls library(dplyr) in an earlier chunk), NSE is suppressed.
+///
+/// Simple form: the Rmd chunk itself calls library(dplyr) then filter().
+#[test]
+fn rmd_own_library_in_chunk_suppresses_filter_nse() {
+    let dir = TempDir::new().unwrap();
+
+    std::fs::write(
+        dir.path().join("main.Rmd"),
+        "---\ntitle: T\n---\n\n```{r}\nlibrary(dplyr)\ndf <- data.frame(x = 1:10)\nresult <- df |> filter(x > 5)\n```\n",
+    )
+    .unwrap();
+
+    let output = run_check(dir.path());
+    assert!(
+        !output.contains("Undefined variable: x"),
+        "library(dplyr) in the Rmd chunk itself must suppress filter() NSE for x. \
+         Output:\n{output}"
+    );
+}
