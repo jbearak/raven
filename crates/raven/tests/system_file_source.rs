@@ -476,6 +476,58 @@ mod lifecycle {
         );
     }
 
+    /// Open buffers are authoritative: their metadata lives in the document
+    /// store, not the workspace index, so the resolution pass must cover it
+    /// too. An open buffer (here not even present in the workspace index —
+    /// e.g. an unsaved buffer, or `index_workspace = false`) whose
+    /// `system.file()` source was unresolved must re-resolve after the
+    /// install event, report its URI for republish, and gain a graph edge.
+    #[tokio::test]
+    async fn open_buffer_metadata_re_resolves_after_package_install() {
+        let libdir = tempfile::tempdir().unwrap();
+        let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
+        let text = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+
+        let mut state = state_with_lib(libdir.path());
+        state.document_store.open(uri.clone(), text, 1).await;
+
+        // Startup pass: otherpkg not installed → stays unresolved.
+        state.resolve_system_file_in_workspace();
+
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+        let changed = state.resolve_system_file_in_workspace();
+
+        let doc = state
+            .document_store
+            .get_without_touch(&uri)
+            .expect("document still open");
+        let resolved_uri = doc.metadata.sources[0]
+            .resolved_uri
+            .clone()
+            .expect("open-buffer metadata must re-resolve after the install event");
+        assert!(
+            resolved_uri
+                .to_file_path()
+                .unwrap()
+                .ends_with("otherpkg/helper.R"),
+            "must resolve into the installed package"
+        );
+        assert!(
+            changed.contains(&uri),
+            "the open buffer must be reported as changed for republish, got {changed:?}"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&uri)
+                .iter()
+                .any(|e| e.to == resolved_uri),
+            "dependency edge must form from the open buffer's metadata"
+        );
+    }
+
     /// Open transitive dependents of a file whose system.file resolution
     /// changed must be in the republish set: file_b sources file_a, file_a's
     /// system.file edge forms after a package install — file_b's cross-file

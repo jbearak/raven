@@ -645,6 +645,26 @@ impl DocumentStore {
         self.documents.get(uri)
     }
 
+    /// Replace an open document's cross-file metadata in place.
+    ///
+    /// Used by `WorldState::resolve_system_file_in_workspace*` to re-resolve
+    /// `system.file()` source entries on open buffers after package lifecycle
+    /// events. Only the resolution fields of `metadata.sources`
+    /// (`path`/`resolved_uri`) change in that pass; `tree` and `artifacts` do
+    /// not derive from source path resolution, so no re-parse or artifact
+    /// recompute is needed. Does not touch LRU order.
+    ///
+    /// Returns false if the document is not open.
+    pub fn replace_metadata(&mut self, uri: &Url, metadata: Arc<CrossFileMetadata>) -> bool {
+        match self.documents.get_mut(uri) {
+            Some(doc) => {
+                doc.metadata = metadata;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Check if document is open
     ///
     /// # Arguments

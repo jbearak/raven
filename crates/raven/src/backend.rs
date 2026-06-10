@@ -7535,13 +7535,20 @@ async fn run_libpath_consumer(
                 // library-swap site performs under this lock.
                 let touches_system_file = {
                     let state = state_arc.read().await;
-                    state.workspace_index_new.any_entry(|entry| {
-                        entry.metadata.sources.iter().any(|s| {
-                            s.system_file
-                                .as_ref()
-                                .is_some_and(|sf| affected.contains(&sf.package))
+                    let selected = |s: &crate::cross_file::ForwardSource| {
+                        s.system_file
+                            .as_ref()
+                            .is_some_and(|sf| affected.contains(&sf.package))
+                    };
+                    state
+                        .workspace_index_new
+                        .any_entry(|entry| entry.metadata.sources.iter().any(selected))
+                        || state.document_store.uris().iter().any(|uri| {
+                            state
+                                .document_store
+                                .get_without_touch(uri)
+                                .is_some_and(|doc| doc.metadata.sources.iter().any(selected))
                         })
-                    })
                 };
                 let system_file_republish: Vec<Url> = if touches_system_file {
                     let mut state = state_arc.write().await;

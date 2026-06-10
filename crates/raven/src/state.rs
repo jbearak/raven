@@ -1073,6 +1073,15 @@ impl WorldState {
     /// every resolved entry in the workspace. Callers reacting to events that
     /// can shift resolution for arbitrary packages (startup, library swaps,
     /// a workspace `Package:` rename) pass `None`.
+    ///
+    /// Covers BOTH metadata stores: the workspace index (closed files) and
+    /// the document store (open buffers, which are authoritative and whose
+    /// metadata is read in preference to the index — see
+    /// `get_enriched_metadata`). Without the open-document pass, an open
+    /// buffer with a `system.file()` source would stay stale across package
+    /// lifecycle events until the user edited it, and would never recover at
+    /// all when the file is absent from the index (unsaved buffer,
+    /// `index_workspace = false`).
     pub fn resolve_system_file_in_workspace_for_packages(
         &mut self,
         only_packages: Option<&std::collections::HashSet<String>>,
@@ -1082,18 +1091,33 @@ impl WorldState {
         let ws_root = ws.map(|w| w.root.clone());
         let lib_paths = self.package_library.lib_paths().to_vec();
 
-        // Snapshot only the entries with a selected system.file source —
+        let source_selected = |s: &crate::cross_file::ForwardSource| {
+            s.system_file
+                .as_ref()
+                .is_some_and(|sf| only_packages.is_none_or(|pkgs| pkgs.contains(&sf.package)))
+        };
+
+        // Snapshot only the index entries with a selected system.file source —
         // `entries_matching` clones just that subset, so workspaces without
         // system.file sources (the common case) pay one predicate pass.
-        let affected = self.workspace_index_new.entries_matching(|entry| {
-            entry.metadata.sources.iter().any(|s| {
-                s.system_file
-                    .as_ref()
-                    .is_some_and(|sf| only_packages.is_none_or(|pkgs| pkgs.contains(&sf.package)))
-            })
-        });
+        let affected = self
+            .workspace_index_new
+            .entries_matching(|entry| entry.metadata.sources.iter().any(source_selected));
 
-        if affected.is_empty() {
+        // Open buffers with a selected system.file source (authoritative
+        // metadata lives in the document store, not the index).
+        let open_affected: Vec<Url> = self
+            .document_store
+            .uris()
+            .into_iter()
+            .filter(|uri| {
+                self.document_store
+                    .get_without_touch(uri)
+                    .is_some_and(|doc| doc.metadata.sources.iter().any(source_selected))
+            })
+            .collect();
+
+        if affected.is_empty() && open_affected.is_empty() {
             return Vec::new();
         }
 
@@ -1117,7 +1141,7 @@ impl WorldState {
             }
         }
 
-        // Rebuild graph edges for changed files
+        // Rebuild graph edges for changed index entries
         let workspace_root = self.workspace_folders.first().cloned();
         for uri in &changed_uris {
             if let Some(entry) = self.workspace_index_new.get(uri) {
@@ -1133,6 +1157,43 @@ impl WorldState {
                     workspace_root.as_ref(),
                     get_content,
                 );
+            }
+        }
+
+        // Open-document pass. Runs AFTER the index pass so for a file present
+        // in both stores the graph edges rebuilt here — from the buffer's
+        // (authoritative) metadata — win over the index-derived ones.
+        for uri in open_affected {
+            let Some(doc) = self.document_store.get_without_touch(&uri) else {
+                continue;
+            };
+            let mut new_sources = doc.metadata.sources.clone();
+            crate::cross_file::resolve_system_file_source_entries(
+                &mut new_sources,
+                ws_name.as_deref(),
+                ws_root.as_deref(),
+                &lib_paths,
+            );
+            if new_sources == doc.metadata.sources {
+                continue;
+            }
+            let mut new_meta = (*doc.metadata).clone();
+            new_meta.sources = new_sources;
+            let new_meta = Arc::new(new_meta);
+            self.document_store.replace_metadata(&uri, new_meta.clone());
+            let get_content = |parent_uri: &Url| -> Option<String> {
+                self.workspace_index_new
+                    .get(parent_uri)
+                    .map(|e| e.contents.to_string())
+            };
+            self.cross_file_graph.update_file(
+                &uri,
+                new_meta.as_ref(),
+                workspace_root.as_ref(),
+                get_content,
+            );
+            if !changed_uris.contains(&uri) {
+                changed_uris.push(uri);
             }
         }
 
@@ -1182,7 +1243,9 @@ impl WorldState {
     /// cross-package `system.file()`. Called after `resolve_system_file_sources`
     /// populates `resolved_uri` fields and graph edges are rebuilt.
     fn index_cross_package_resolved_files(&mut self) {
-        // Collect resolved_uris from all workspace entries
+        // Collect resolved_uris from all workspace entries AND open buffers
+        // (open-document metadata is authoritative and may carry resolutions
+        // the index does not — unsaved buffers, index_workspace = false).
         let mut external_uris: Vec<Url> = Vec::new();
         for (_, entry) in self.workspace_index_new.iter() {
             for source in &entry.metadata.sources {
@@ -1190,6 +1253,17 @@ impl WorldState {
                     && !self.workspace_index_new.contains(uri)
                 {
                     external_uris.push(uri.clone());
+                }
+            }
+        }
+        for doc_uri in self.document_store.uris() {
+            if let Some(doc) = self.document_store.get_without_touch(&doc_uri) {
+                for source in &doc.metadata.sources {
+                    if let Some(ref uri) = source.resolved_uri
+                        && !self.workspace_index_new.contains(uri)
+                    {
+                        external_uris.push(uri.clone());
+                    }
                 }
             }
         }
